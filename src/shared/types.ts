@@ -307,6 +307,8 @@ export interface Workspace {
   cowSupported?: boolean;
   /** How the daemon provisioned this workspace's checkout (PROTOCOL §5.1). Immutable; omitted for rows without a daemon-provisioned checkout (skip-isolation/direct, remote, …). */
   checkoutMode?: 'cow' | 'worktree';
+  /** Execution environment selected at creation (PROTOCOL §5.1, v3.3). Persisted and immutable like checkoutMode; omitted for pre-v3.3 rows and legacy direct rows without an explicit selection. */
+  executionEnvironment?: 'direct' | 'worktree' | 'cow' | 'microvm';
   /** Cached physical disk usage of the workspace directory (PROTOCOL §5.1); omitted until the daemon's first computation completes. */
   diskUsage?: WorkspaceDiskUsage;
 }
@@ -1400,6 +1402,7 @@ export interface CreateWorkspaceRequest {
   environmentConfig?: EnvironmentConfig; // Remote environment configuration
   isNewRepo?: boolean; // If true, initialize a new git repository at repositoryPath
   skipIsolation?: boolean; // If true, skip the isolated checkout (worktree or CoW clone) and work directly in the repo folder (wire: canonical for the deprecated skipWorktree alias)
+  executionEnvironment?: 'direct' | 'worktree' | 'cow' | 'microvm'; // Explicit execution-environment selection (PROTOCOL §5.1, v3.3); validated daemon-side against enabled profiles + host capabilities
   initialAgent?: {
     /**
      * DEPRECATED: the daemon assigns the initial agent's id and returns it on

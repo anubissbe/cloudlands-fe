@@ -1564,6 +1564,28 @@ function handleGitHubAuthChangedEvent(event: WorkspaceEvent): void {
   }
 }
 
+/**
+ * `sandbox:vm:error` / `sandbox:image:error` (§6.5, sandbox families) — hard
+ * failures in the microVM pipeline (VM boot/bridge failure, guest-image fetch
+ * failure). These are terminal for the affected agent spawn and must be
+ * rendered to the user, never silently swallowed: surface an error toast with
+ * the daemon's message. The toast lib is imported lazily to keep this
+ * middleware-reachable module light (agent-attention-toast-service precedent).
+ */
+function handleSandboxErrorEvent(event: WorkspaceEvent): void {
+  const type = (event as { type?: unknown }).type;
+  const data = (event as { data?: Record<string, unknown> }).data;
+  const message = typeof data?.error === 'string' && data.error.length > 0 ? data.error : '';
+  logger.error('[sandbox] daemon reported sandbox error', { type, data });
+  void import('svelte-sonner').then(({ toast }) => {
+    toast.error(
+      type === 'sandbox:image:error'
+        ? m.sandbox_imageError_toast({ error: message })
+        : m.sandbox_vmError_toast({ error: message }),
+    );
+  });
+}
+
 function handleMcpServerStatusChangedEvent(event: WorkspaceEvent): void {
   const data = (event as { data?: Record<string, unknown> }).data;
   if (!data) return;
@@ -1820,6 +1842,15 @@ function handleNotification(method: string, params: unknown): void {
   // it must also run before the workspace-id gate below.
   if (type === 'github:auth-changed') {
     handleGitHubAuthChangedEvent(event);
+    return;
+  }
+
+  // Sandbox hard failures (§6.5): `sandbox:image:error` may be global (no
+  // workspaceId when a settings-triggered prefetch fails), so both run before
+  // the workspace-id gate. Non-error sandbox lifecycle events are consumed by
+  // feature UIs (ExecutionEnvironmentSettings) via their own listeners.
+  if (type === 'sandbox:vm:error' || type === 'sandbox:image:error') {
+    handleSandboxErrorEvent(event);
     return;
   }
 
@@ -2254,6 +2285,13 @@ const BRIDGE_SUBSCRIBE_EVENT_TYPES = [
   'app:ui-navigate',
   'app:ui-highlight',
   'app:workspace-open',
+  // microVM sandbox families (§6.5, monorepo#1120): image pipeline +
+  // per-agent VM lifecycle. The bridge surfaces the hard failures
+  // (`sandbox:vm:error` / `sandbox:image:error`) as error toasts; the
+  // non-error events feed feature UIs (ExecutionEnvironmentSettings image
+  // state) through the shared notification stream.
+  'sandbox:image:*',
+  'sandbox:vm:*',
 ] as const;
 
 /**

@@ -356,6 +356,8 @@ describe('daemonEventsBridge (wire contract — agent:idle clears the spinner)',
         'app:ui-navigate',
         'app:ui-highlight',
         'app:workspace-open',
+        'sandbox:image:*',
+        'sandbox:vm:*',
       ],
     });
   });
@@ -2312,6 +2314,8 @@ describe('daemonEventsBridge (fan-out scope gate — subscriptionId-aware delive
         'app:ui-navigate',
         'app:ui-highlight',
         'app:workspace-open',
+        'sandbox:image:*',
+        'sandbox:vm:*',
       ],
     });
   });

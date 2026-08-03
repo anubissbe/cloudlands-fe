@@ -28,8 +28,15 @@
   // label always matches the workspace whose diskUsage the tooltip shows.
   const mode = $derived(workspace ? workspace.checkoutMode : checkoutMode);
 
-  // i18n-ignore (CoW / Worktree are technical terms)
-  const label = $derived(mode === 'cow' ? 'CoW' : mode === 'worktree' ? 'Worktree' : null);
+  // microVM workspaces (PROTOCOL §5.1 `executionEnvironment`, v3.3) provision
+  // a CoW checkout but agents run isolated in per-agent VMs — surface that
+  // instead of the raw checkout mode.
+  const isMicrovm = $derived(workspace?.executionEnvironment === 'microvm');
+
+  // i18n-ignore (CoW / Worktree / MicroVM are technical terms)
+  const label = $derived(
+    isMicrovm ? 'MicroVM' : mode === 'cow' ? 'CoW' : mode === 'worktree' ? 'Worktree' : null,
+  );
 
   const diskUsage = $derived(workspace?.diskUsage);
   const formattedSize = $derived(diskUsage ? formatBytesBinary(diskUsage.bytes) : '');
@@ -62,7 +69,9 @@
       {#snippet content()}
         <div class="flex flex-col gap-1.5 text-left whitespace-normal">
           <div class="text-xs text-subtle">
-            {m.workspace_checkoutModePill_tooltip({ label: label ?? '' })}
+            {isMicrovm
+              ? m.workspace_microvmPill_tooltip()
+              : m.workspace_checkoutModePill_tooltip({ label: label ?? '' })}
           </div>
           <div class="font-medium">
             {m.workspace_diskUsagePill_totalSize_label({ size: formattedSize })}
@@ -100,6 +109,10 @@
       {@render pill()}
     </Tooltip>
   {:else}
-    {@render pill(m.workspace_checkoutModePill_tooltip({ label }))}
+    {@render pill(
+      isMicrovm
+        ? m.workspace_microvmPill_tooltip()
+        : m.workspace_checkoutModePill_tooltip({ label }),
+    )}
   {/if}
 {/if}

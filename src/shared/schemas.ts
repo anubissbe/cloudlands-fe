@@ -153,6 +153,8 @@ export const WorkspaceSchema = z.object({
   cowSupported: z.boolean().optional(),
   /** How the checkout was provisioned (PROTOCOL §5.1); omitted for rows without a daemon-provisioned checkout (skip-isolation/direct, remote, …). */
   checkoutMode: z.enum(['cow', 'worktree']).optional(),
+  /** Execution environment selected at creation (PROTOCOL §5.1, v3.3); omitted for pre-v3.3 rows and legacy direct rows without an explicit selection. */
+  executionEnvironment: z.enum(['direct', 'worktree', 'cow', 'microvm']).optional(),
   /** Cached physical disk usage of the workspace directory (PROTOCOL §5.1); omitted until first computation completes. */
   diskUsage: z
     .object({
@@ -189,6 +191,48 @@ export const EnvironmentConfigSchema = z.object({
   workspace_path: z.string().optional(),
 });
 
+// Execution-environment profile surface (`sandbox.profiles.*` / `sandbox.options`,
+// PROTOCOL §5.5b). Fixed catalog order: direct, worktree, cow, microvm.
+export const SandboxTypeSchema = z.enum(['direct', 'worktree', 'cow', 'microvm']);
+
+/** Optional microVM guest-image override (`{ manifestUrl, sha256 }`, `null` when unset). */
+export const SandboxImageSchema = z.object({
+  manifestUrl: z.string(),
+  sha256: z.string(),
+});
+
+/** `sandbox.profiles.list` / `sandbox.profiles.update` result shape (PROTOCOL §5.5b). */
+export const SandboxProfilesSchema = z.object({
+  defaultType: SandboxTypeSchema,
+  profiles: z.array(
+    z.object({
+      type: SandboxTypeSchema,
+      enabled: z.boolean(),
+      // microvm row only: the optional default guest-image override.
+      image: SandboxImageSchema.nullable().optional(),
+    }),
+  ),
+});
+
+/** `sandbox.options` result shape — capability-resolved availability matrix (PROTOCOL §5.5b). */
+export const SandboxOptionsSchema = z.object({
+  defaultType: SandboxTypeSchema,
+  options: z.array(
+    z.object({
+      type: SandboxTypeSchema,
+      enabled: z.boolean(),
+      available: z.boolean(),
+      default: z.boolean(),
+      // Present exactly when `available` is false.
+      reason: z.string().optional(),
+    }),
+  ),
+});
+
+export type SandboxType = z.infer<typeof SandboxTypeSchema>;
+export type SandboxProfiles = z.infer<typeof SandboxProfilesSchema>;
+export type SandboxOptions = z.infer<typeof SandboxOptionsSchema>;
+
 export const CreateWorkspaceRequestSchema = z.object({
   title: z.string().max(100).optional(),
   statusMessage: WorkspaceStatusMessageSchema.optional(),
@@ -203,6 +247,9 @@ export const CreateWorkspaceRequestSchema = z.object({
   environmentConfig: EnvironmentConfigSchema.optional(),
   isNewRepo: z.boolean().optional(),
   skipIsolation: z.boolean().optional(), // Canonical wire name; the daemon still accepts the deprecated skipWorktree alias
+  // Execution environment for the workspace (PROTOCOL §5.5b); validated
+  // daemon-side against enabled profiles + host capabilities.
+  executionEnvironment: SandboxTypeSchema.optional(),
 });
 
 export const UpdateWorkspaceRequestSchema = z.object({

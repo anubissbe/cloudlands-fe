@@ -98,6 +98,8 @@
     type IssueSelectionData,
   } from './initializer/IssueSuggestions.svelte';
   import RepoAndBranchPicker from './initializer/RepoAndBranchPicker.svelte';
+  import ExecutionEnvironmentPicker from './initializer/ExecutionEnvironmentPicker.svelte';
+  import type { SandboxType } from '$shared/schemas';
   import SetupScriptModal from '../modals/SetupScriptModal.svelte';
   import { noteUrl } from '$shared/constants/intent-links';
   import { selectActiveProviderId } from '$store/renderer/slices/provider-settings/provider-settings-selectors';
@@ -500,6 +502,30 @@
 
   // Skip isolation toggle (work directly in the repo folder, no isolated checkout)
   let skipIsolation = $state(readSkipIsolation(savedState) ?? false);
+
+  // Execution environment selected in the picker (PROTOCOL §5.5b / §5.1 v3.3).
+  // `null` until sandbox.options loads (older daemons never load it — the
+  // picker stays hidden and the legacy skipIsolation-only flow applies).
+  let selectedEnvironment = $state<SandboxType | null>(null);
+
+  // Keep the legacy skip-isolation checkbox and the picker coherent:
+  // "work directly" IS the `direct` environment, and the daemon rejects
+  // `skipIsolation: true` combined with a non-direct executionEnvironment.
+  function handleEnvironmentChange(next: SandboxType) {
+    skipIsolation = next === 'direct';
+  }
+  function handleSkipIsolationChange(next: boolean) {
+    skipIsolation = next;
+    if (selectedEnvironment !== null) {
+      if (next) {
+        selectedEnvironment = 'direct';
+      } else if (selectedEnvironment === 'direct') {
+        // Unchecking "work directly" returns to an isolated checkout; the
+        // daemon default (worktree) matches the legacy behavior.
+        selectedEnvironment = 'worktree';
+      }
+    }
+  }
 
   // Git availability state: null = checking, true = found, false = not found
   let gitAvailable: boolean | null = $state(null);
@@ -1324,7 +1350,7 @@
 
     // GitHub repos require an isolated checkout - reset skipIsolation if switching to github type
     if (event.detail.type === 'github') {
-      skipIsolation = false;
+      handleSkipIsolationChange(false);
     }
 
     // Reset GitHub auth state when repo changes - will be updated by BranchSelector
@@ -1801,11 +1827,31 @@
         environmentConfig,
         isNewRepo: Boolean(isNewRepo),
         skipIsolation: skipIsolation || undefined,
+        // Explicit execution-environment selection (PROTOCOL §5.1, v3.3);
+        // omitted when the picker never loaded (older daemon) so the legacy
+        // skipIsolation/cowIsolation derivation applies.
+        executionEnvironment: selectedEnvironment ?? undefined,
         scope: scope || undefined, // Scope for subdirectories of git repos
         initialAgent,
       });
 
-      if (!result.ok) throw new Error(result.error || 'Failed to create workspace');
+      if (!result.ok) {
+        // Structured execution-environment failures (§9): the daemon rejected
+        // the selection (disabled/unavailable environment, or a selected
+        // environment without a daemon implementation). Surface the daemon's
+        // human-readable cause — never silently fall back to another
+        // environment.
+        if (
+          result.errorCode === 'execution-environment-unavailable' ||
+          result.errorCode === 'execution-environment-not-implemented'
+        ) {
+          error = m.workspaceInitializer_executionEnvironmentUnavailable_error({
+            message: result.error || result.errorCode,
+          });
+          return;
+        }
+        throw new Error(result.error || 'Failed to create workspace');
+      }
 
       const workspace = result.data.workspace;
       // The daemon assigns the initial agent's id and returns it on the
@@ -2587,7 +2633,10 @@
         <div class="flex-1 min-w-fit flex-col">
           <!-- Repo + Branch picker row (above border) -->
           {#if isExpanded}
-            <div class="repo-picker-row" transition:slide={{ axis: 'y', duration: 200 }}>
+            <div
+              class="repo-picker-row flex flex-wrap items-center gap-1"
+              transition:slide={{ axis: 'y', duration: 200 }}
+            >
               <RepoAndBranchPicker
                 bind:this={repoAndBranchPicker}
                 {repoPath}
@@ -2602,9 +2651,13 @@
                 suggestedBranch={selectedPRBranch}
                 onRepoChange={handleRepoChange}
                 onBranchChange={handleBranchChange}
-                onSkipIsolationChange={(value) => (skipIsolation = value)}
+                onSkipIsolationChange={handleSkipIsolationChange}
                 onGitHubAuthNeededChange={(value) => (githubAuthNeeded = value)}
                 onBranchStatusChange={handleBranchStatusChange}
+              />
+              <ExecutionEnvironmentPicker
+                bind:value={selectedEnvironment}
+                onchange={handleEnvironmentChange}
               />
             </div>
           {/if}
