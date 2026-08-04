@@ -870,6 +870,8 @@
   "workspace_compactInitializer_setupDevEnvWith_after": "脚本",
   "workspace_compactInitializer_selectRepoHint_label": "选择一个仓库以开始。",
   "workspace_compactInitializer_setupDevEnvWith_before": "设置开发环境，使用",
+  "workspace_compactInitializer_usingIsolation_before": "使用",
+  "workspace_compactInitializer_usingIsolation_after": "隔离。",
   "workspace_compactInitializer_stageAlmostReady_label": "即将就绪…",
   "workspace_compactInitializer_stageEnvironment_label": "正在配置环境…",
   "workspace_compactInitializer_stageGitBranch_label": "正在设置 Git 分支…",

@@ -871,6 +871,8 @@
   "workspace_compactInitializer_setupDevEnvWith_after": "script",
   "workspace_compactInitializer_selectRepoHint_label": "Select a repository to get started.",
   "workspace_compactInitializer_setupDevEnvWith_before": "Set up dev environment with",
+  "workspace_compactInitializer_usingIsolation_before": "using",
+  "workspace_compactInitializer_usingIsolation_after": "isolation.",
   "workspace_compactInitializer_stageAlmostReady_label": "Almost ready...",
   "workspace_compactInitializer_stageEnvironment_label": "Configuring environment...",
   "workspace_compactInitializer_stageGitBranch_label": "Setting up git branch...",

@@ -870,6 +870,8 @@
   "workspace_compactInitializer_setupDevEnvWith_after": "スクリプトで",
   "workspace_compactInitializer_selectRepoHint_label": "開始するにはリポジトリを選択してください。",
   "workspace_compactInitializer_setupDevEnvWith_before": "開発環境をセットアップ:",
+  "workspace_compactInitializer_usingIsolation_before": "",
+  "workspace_compactInitializer_usingIsolation_after": "分離を使用。",
   "workspace_compactInitializer_stageAlmostReady_label": "まもなく完了...",
   "workspace_compactInitializer_stageEnvironment_label": "環境を構成しています...",
   "workspace_compactInitializer_stageGitBranch_label": "Git ブランチをセットアップしています...",

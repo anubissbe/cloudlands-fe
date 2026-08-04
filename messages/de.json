@@ -870,6 +870,8 @@
   "workspace_compactInitializer_setupDevEnvWith_after": "Skript",
   "workspace_compactInitializer_selectRepoHint_label": "Wählen Sie ein Repository aus, um zu beginnen.",
   "workspace_compactInitializer_setupDevEnvWith_before": "Entwicklungsumgebung einrichten mit",
+  "workspace_compactInitializer_usingIsolation_before": "mit",
+  "workspace_compactInitializer_usingIsolation_after": "Isolation.",
   "workspace_compactInitializer_stageAlmostReady_label": "Fast fertig...",
   "workspace_compactInitializer_stageEnvironment_label": "Umgebung wird konfiguriert...",
   "workspace_compactInitializer_stageGitBranch_label": "Git-Branch wird eingerichtet...",

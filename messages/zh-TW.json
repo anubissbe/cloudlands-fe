@@ -870,6 +870,8 @@
   "workspace_compactInitializer_setupDevEnvWith_after": "指令碼",
   "workspace_compactInitializer_selectRepoHint_label": "選擇一個儲存庫以開始。",
   "workspace_compactInitializer_setupDevEnvWith_before": "設定開發環境，使用",
+  "workspace_compactInitializer_usingIsolation_before": "使用",
+  "workspace_compactInitializer_usingIsolation_after": "隔離。",
   "workspace_compactInitializer_stageAlmostReady_label": "即將就緒…",
   "workspace_compactInitializer_stageEnvironment_label": "正在設定環境…",
   "workspace_compactInitializer_stageGitBranch_label": "正在設定 Git 分支…",

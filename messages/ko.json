@@ -870,6 +870,8 @@
   "workspace_compactInitializer_setupDevEnvWith_after": "스크립트로",
   "workspace_compactInitializer_selectRepoHint_label": "시작하려면 저장소를 선택하세요.",
   "workspace_compactInitializer_setupDevEnvWith_before": "개발 환경 설정:",
+  "workspace_compactInitializer_usingIsolation_before": "",
+  "workspace_compactInitializer_usingIsolation_after": "격리 사용.",
   "workspace_compactInitializer_stageAlmostReady_label": "거의 완료...",
   "workspace_compactInitializer_stageEnvironment_label": "환경 구성 중...",
   "workspace_compactInitializer_stageGitBranch_label": "git 브랜치 설정 중...",

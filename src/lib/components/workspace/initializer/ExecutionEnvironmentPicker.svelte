@@ -68,7 +68,14 @@
 </script>
 
 {#if options && pickable.length > 0 && value}
-  <div class="flex items-center gap-1 text-sm text-subtle whitespace-nowrap">
+  <!-- Sentence fragment: "using <env> isolation" — completes the
+       "Set up dev environment with <script> script" sentence. The fragments
+       live here so they vanish with the picker (older daemon → plain
+       legacy sentence, no dangling "using … isolation"). -->
+  <div class="flex items-center gap-1 text-sm text-muted-foreground whitespace-nowrap">
+    {#if m.workspace_compactInitializer_usingIsolation_before()}
+      <span>{m.workspace_compactInitializer_usingIsolation_before()}</span>
+    {/if}
     <Select.Root bind:value={selectValue} onchange={handleSelectChange}>
       <Select.Trigger
         variant="ghost"
@@ -95,5 +102,8 @@
         {/each}
       </Select.Content>
     </Select.Root>
+    {#if m.workspace_compactInitializer_usingIsolation_after()}
+      <p class="text-sm text-subtle">{m.workspace_compactInitializer_usingIsolation_after()}</p>
+    {/if}
   </div>
 {/if}
