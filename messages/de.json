@@ -984,8 +984,6 @@
   "workspaceInitializer_executionEnvironment_microvm_label": "MicroVM",
   "workspaceInitializer_executionEnvironment_microvm_description": "Agenten laufen isoliert in eigenen virtuellen Maschinen",
   "workspaceInitializer_executionEnvironmentUnavailable_error": "Die ausgewählte Ausführungsumgebung ist nicht verfügbar: {message}",
-  "workspace_card_microvmBadge_label": "MicroVM",
-  "workspace_card_microvmBadge_tooltip": "Agenten in diesem Arbeitsbereich laufen isoliert in eigenen virtuellen Maschinen",
   "workspace_microvmPill_tooltip": "MicroVM-Arbeitsbereich: Agenten laufen isoliert in virtuellen Maschinen",
   "sandbox_vmError_toast": "MicroVM-Fehler: {error}",
   "sandbox_imageError_toast": "MicroVM-Image-Download fehlgeschlagen: {error}",

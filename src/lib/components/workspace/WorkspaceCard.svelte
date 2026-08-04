@@ -518,17 +518,6 @@
           </div>
         {/if}
 
-        {#if workspace.executionEnvironment === 'microvm'}
-          <!-- microVM workspaces: agents run isolated in per-agent VMs (PROTOCOL §5.1, v3.3) -->
-          <Tooltip content={m.workspace_card_microvmBadge_tooltip()} side="bottom" sideOffset={4}>
-            <span
-              class="wc-secondary text-ui font-medium px-1.5 py-0 rounded-full shrink-0 bg-sky-500/10 text-sky-600 dark:text-sky-400"
-            >
-              {m.workspace_card_microvmBadge_label()}
-            </span>
-          </Tooltip>
-        {/if}
-
         {#if prStatus}
           {@const statusColor =
             prStatus === PullRequestStatus.Merged

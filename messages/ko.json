@@ -984,8 +984,6 @@
   "workspaceInitializer_executionEnvironment_microvm_label": "MicroVM",
   "workspaceInitializer_executionEnvironment_microvm_description": "에이전트는 에이전트별 가상 머신에서 격리되어 실행됩니다",
   "workspaceInitializer_executionEnvironmentUnavailable_error": "선택한 실행 환경을 사용할 수 없습니다: {message}",
-  "workspace_card_microvmBadge_label": "MicroVM",
-  "workspace_card_microvmBadge_tooltip": "이 워크스페이스의 에이전트는 에이전트별 가상 머신에서 격리되어 실행됩니다",
   "workspace_microvmPill_tooltip": "MicroVM 워크스페이스: 에이전트는 가상 머신에서 격리되어 실행됩니다",
   "sandbox_vmError_toast": "MicroVM 오류: {error}",
   "sandbox_imageError_toast": "MicroVM 이미지 다운로드 실패: {error}",

@@ -984,8 +984,6 @@
   "workspaceInitializer_executionEnvironment_microvm_label": "MicroVM",
   "workspaceInitializer_executionEnvironment_microvm_description": "Los agentes se ejecutan aislados en máquinas virtuales por agente",
   "workspaceInitializer_executionEnvironmentUnavailable_error": "El entorno de ejecución seleccionado no está disponible: {message}",
-  "workspace_card_microvmBadge_label": "MicroVM",
-  "workspace_card_microvmBadge_tooltip": "Los agentes de este espacio de trabajo se ejecutan aislados en máquinas virtuales por agente",
   "workspace_microvmPill_tooltip": "Espacio de trabajo MicroVM: los agentes se ejecutan aislados en máquinas virtuales",
   "sandbox_vmError_toast": "Error de MicroVM: {error}",
   "sandbox_imageError_toast": "Error al descargar la imagen de MicroVM: {error}",

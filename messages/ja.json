@@ -984,8 +984,6 @@
   "workspaceInitializer_executionEnvironment_microvm_label": "MicroVM",
   "workspaceInitializer_executionEnvironment_microvm_description": "エージェントはエージェントごとの仮想マシン内で分離して実行されます",
   "workspaceInitializer_executionEnvironmentUnavailable_error": "選択した実行環境は利用できません: {message}",
-  "workspace_card_microvmBadge_label": "MicroVM",
-  "workspace_card_microvmBadge_tooltip": "このワークスペースのエージェントはエージェントごとの仮想マシン内で分離して実行されます",
   "workspace_microvmPill_tooltip": "MicroVM ワークスペース: エージェントは仮想マシン内で分離して実行されます",
   "sandbox_vmError_toast": "MicroVM エラー: {error}",
   "sandbox_imageError_toast": "MicroVM イメージのダウンロードに失敗しました: {error}",

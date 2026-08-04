@@ -984,8 +984,6 @@
   "workspaceInitializer_executionEnvironment_microvm_label": "MicroVM",
   "workspaceInitializer_executionEnvironment_microvm_description": "代理在独立的虚拟机中隔离运行",
   "workspaceInitializer_executionEnvironmentUnavailable_error": "所选执行环境不可用：{message}",
-  "workspace_card_microvmBadge_label": "MicroVM",
-  "workspace_card_microvmBadge_tooltip": "此工作区中的代理在独立的虚拟机中隔离运行",
   "workspace_microvmPill_tooltip": "MicroVM 工作区：代理在独立虚拟机中隔离运行",
   "sandbox_vmError_toast": "MicroVM 错误：{error}",
   "sandbox_imageError_toast": "MicroVM 镜像下载失败：{error}",
