@@ -1,4 +1,5 @@
 import {
+  afterEach,
   beforeEach,
   describe,
   expect,
@@ -65,7 +66,6 @@ const mocks = vi.hoisted(() => {
   const lifecycleReadMiddleware = createPassthroughMiddleware();
   const lifecycleIpcReadMiddleware = createPassthroughMiddleware();
   const uiLayoutPersistenceMiddleware = createPassthroughMiddleware();
-  const unreadTrackingPersistenceMiddleware = createPassthroughMiddleware();
   const tabStatePersistenceMiddleware = createPassthroughMiddleware();
   const panelLayoutPersistenceMiddleware = createPassthroughMiddleware();
   const fileContentPruneService = createPassthroughMiddleware();
@@ -156,7 +156,6 @@ const mocks = vi.hoisted(() => {
     createLifecycleReadMiddleware: vi.fn(() => lifecycleReadMiddleware),
     createLifecycleIpcReadMiddleware: vi.fn(() => lifecycleIpcReadMiddleware),
     createUiLayoutPersistenceMiddleware: vi.fn(() => uiLayoutPersistenceMiddleware),
-    createUnreadTrackingPersistenceMiddleware: vi.fn(() => unreadTrackingPersistenceMiddleware),
     createTabStatePersistenceMiddleware: vi.fn(() => tabStatePersistenceMiddleware),
     createPanelLayoutPersistenceMiddleware: vi.fn(() => panelLayoutPersistenceMiddleware),
     createFileContentPruneService: vi.fn(() => fileContentPruneService),
@@ -241,7 +240,6 @@ const mocks = vi.hoisted(() => {
     lifecycleReadMiddleware,
     lifecycleIpcReadMiddleware,
     uiLayoutPersistenceMiddleware,
-    unreadTrackingPersistenceMiddleware,
     tabStatePersistenceMiddleware,
     panelLayoutPersistenceMiddleware,
     fileContentPruneService,
@@ -418,9 +416,6 @@ vi.mock("./middlewares/lifecycle-ipc-read-service", () => ({
 vi.mock("./middlewares/ui-layout-persistence-service", () => ({
   createUiLayoutPersistenceMiddleware: mocks.createUiLayoutPersistenceMiddleware,
 }));
-vi.mock("./middlewares/unread-tracking-persistence-service", () => ({
-  createUnreadTrackingPersistenceMiddleware: mocks.createUnreadTrackingPersistenceMiddleware,
-}));
 vi.mock("./middlewares/tab-state-persistence-service", () => ({
   createTabStatePersistenceMiddleware: mocks.createTabStatePersistenceMiddleware,
 }));
@@ -593,7 +588,6 @@ describe("store middleware Redux logging gating", () => {
       mocks.statsReadMiddleware,
       mocks.backgroundHooksMiddleware,
       mocks.uiLayoutPersistenceMiddleware,
-      mocks.unreadTrackingPersistenceMiddleware,
       mocks.tabStatePersistenceMiddleware,
       mocks.sidebarNavPersistenceMiddleware,
       mocks.browserPersistenceMiddleware,
@@ -681,7 +675,6 @@ describe("store middleware Redux logging gating", () => {
       mocks.statsReadMiddleware,
       mocks.backgroundHooksMiddleware,
       mocks.uiLayoutPersistenceMiddleware,
-      mocks.unreadTrackingPersistenceMiddleware,
       mocks.tabStatePersistenceMiddleware,
       mocks.sidebarNavPersistenceMiddleware,
       mocks.browserPersistenceMiddleware,
@@ -769,7 +762,6 @@ describe("store middleware Redux logging gating", () => {
       mocks.statsReadMiddleware,
       mocks.backgroundHooksMiddleware,
       mocks.uiLayoutPersistenceMiddleware,
-      mocks.unreadTrackingPersistenceMiddleware,
       mocks.tabStatePersistenceMiddleware,
       mocks.sidebarNavPersistenceMiddleware,
       mocks.browserPersistenceMiddleware,
@@ -858,7 +850,6 @@ describe("store middleware Redux logging gating", () => {
       mocks.statsReadMiddleware,
       mocks.backgroundHooksMiddleware,
       mocks.uiLayoutPersistenceMiddleware,
-      mocks.unreadTrackingPersistenceMiddleware,
       mocks.tabStatePersistenceMiddleware,
       mocks.sidebarNavPersistenceMiddleware,
       mocks.browserPersistenceMiddleware,
@@ -964,7 +955,6 @@ describe("store middleware Redux logging gating", () => {
       mocks.statsReadMiddleware,
       mocks.backgroundHooksMiddleware,
       mocks.uiLayoutPersistenceMiddleware,
-      mocks.unreadTrackingPersistenceMiddleware,
       mocks.tabStatePersistenceMiddleware,
       mocks.sidebarNavPersistenceMiddleware,
       mocks.browserPersistenceMiddleware,
@@ -989,6 +979,81 @@ describe("store middleware Redux logging gating", () => {
       mocks.specialistsMutationMiddleware,
       mocks.structuredCloneMiddleware,
     ]);
+  });
+});
+
+describe("hardware-console middleware gating in the HUD window", () => {
+  const hardwareConsoleFactories = [
+    mocks.createHardwareConsoleConnectionToastMiddleware,
+    mocks.createHardwareConsoleIntegrationToggleMiddleware,
+    mocks.createHardwareConsoleKeyPinPersistenceMiddleware,
+    mocks.createHardwareConsoleKeySwitchMiddleware,
+    mocks.createHardwareConsoleLedStatusMiddleware,
+    mocks.createHardwareConsolePromptPickerMiddleware,
+    mocks.createHardwareConsoleActionKeyMiddleware,
+    mocks.createHardwareConsoleEncoderMiddleware,
+  ];
+
+  const hardwareConsoleMiddlewares = [
+    mocks.hardwareConsoleConnectionToastMiddleware,
+    mocks.hardwareConsoleIntegrationToggleMiddleware,
+    mocks.hardwareConsoleKeyPinPersistenceMiddleware,
+    mocks.hardwareConsoleKeySwitchMiddleware,
+    mocks.hardwareConsoleLedStatusMiddleware,
+    mocks.hardwareConsolePromptPickerMiddleware,
+    mocks.hardwareConsoleActionKeyMiddleware,
+    mocks.hardwareConsoleEncoderMiddleware,
+  ];
+
+  beforeEach(() => {
+    vi.resetModules();
+    vi.unstubAllEnvs();
+    vi.stubEnv("DEV", false);
+    vi.clearAllMocks();
+    setLocalStorageEntries({});
+    delete (window as Window & { intentFlags?: unknown }).intentFlags;
+  });
+
+  afterEach(() => {
+    window.history.pushState({}, "", "/");
+  });
+
+  it("skips all hardware-console middlewares in the HUD renderer (/hud)", async () => {
+    window.history.pushState({}, "", "/hud");
+
+    const { middleware } = await import("./middleware");
+
+    for (const factory of hardwareConsoleFactories) {
+      expect(factory).not.toHaveBeenCalled();
+    }
+    for (const hardwareConsoleMiddleware of hardwareConsoleMiddlewares) {
+      expect(middleware).not.toContain(hardwareConsoleMiddleware);
+    }
+    // The surrounding middlewares close the gap: agent-failure toast is
+    // immediately followed by daemon health.
+    expect(middleware.indexOf(mocks.daemonHealthMiddleware)).toBe(
+      middleware.indexOf(mocks.agentFailureToastMiddleware) + 1,
+    );
+  });
+
+  it("includes all hardware-console middlewares outside the HUD renderer", async () => {
+    window.history.pushState({}, "", "/workspace/ws-123");
+
+    const { middleware } = await import("./middleware");
+
+    for (const factory of hardwareConsoleFactories) {
+      expect(factory).toHaveBeenCalledTimes(1);
+    }
+    const start = middleware.indexOf(mocks.hardwareConsoleConnectionToastMiddleware);
+    expect(start).toBeGreaterThan(-1);
+    expect(middleware.slice(start, start + hardwareConsoleMiddlewares.length)).toEqual(
+      hardwareConsoleMiddlewares,
+    );
+    // Placement is unchanged: between the agent-failure toast and daemon health.
+    expect(middleware.indexOf(mocks.agentFailureToastMiddleware)).toBe(start - 1);
+    expect(middleware.indexOf(mocks.daemonHealthMiddleware)).toBe(
+      start + hardwareConsoleMiddlewares.length,
+    );
   });
 });
 

@@ -7,19 +7,24 @@ import {
   normalizeActionMapping,
   normalizeActionMappingsByModel,
 } from '../action-mapping';
-import type { ActionKeyState } from '../action-key-registry';
+import { resetActionKeyCycleCursors, type ActionKeyState } from '../action-key-registry';
+import { normalizeCycleScopeByFamily } from '../cycle-scope';
 
 const mockState: {
-  hardwareConsole: { actionMappingByModel: Record<string, string[]> };
+  hardwareConsole: {
+    actionMappingByModel: Record<string, string[]>;
+  } & ActionKeyState['hardwareConsole'];
 } & ActionKeyState = {
-  hardwareConsole: { actionMappingByModel: normalizeActionMappingsByModel(undefined) },
+  hardwareConsole: {
+    actionMappingByModel: normalizeActionMappingsByModel(undefined),
+    cycleScopeByFamily: normalizeCycleScopeByFamily(undefined),
+  },
   workspace: {
     activeWorkspaceId: 'ws-1',
     workspaces: createCollection('id', [{ id: 'ws-1' } as never]),
   },
   workspaceAgents: { byWorkspaceId: {} },
   agentSessions: { byAgentId: {} },
-  unreadTracking: { unreadAgentIds: [] },
   sidebarNav: { multiSelectTabOrder: [], multiSelectSelectedTabIdsByWorkspaceId: {} },
 };
 
@@ -48,6 +53,7 @@ vi.mock('$lib/client', () => ({
 
 vi.mock('$lib/utils/navigation.client', () => ({
   navigateToRoute: vi.fn(() => Promise.resolve()),
+  isHudWindowRenderer: () => false,
 }));
 
 vi.mock('$lib/utils/window-events', () => ({
@@ -91,10 +97,12 @@ function makeFakeManager(initialStatus: HardwareConsoleStatus = 'disconnected') 
 beforeEach(() => {
   dispatched.length = 0;
   mockState.hardwareConsole.actionMappingByModel = normalizeActionMappingsByModel(undefined);
+  mockState.hardwareConsole.cycleScopeByFamily = normalizeCycleScopeByFamily(undefined);
   mockState.workspace.activeWorkspaceId = 'ws-1';
+  mockState.workspace.workspaces = createCollection('id', [{ id: 'ws-1' } as never]);
   mockState.workspaceAgents.byWorkspaceId = {};
   mockState.agentSessions.byAgentId = {};
-  mockState.unreadTracking = { unreadAgentIds: [] };
+  resetActionKeyCycleCursors();
   vi.clearAllMocks();
 });
 
@@ -108,39 +116,39 @@ describe('handleActionKeyPress', () => {
     );
   });
 
-  it('no-ops with the no-active-agents hint when the workspace has no agents', () => {
-    // Slot 5 (ACT11) = cycle-workspace-agents; no foreground agents → unavailable.
+  it('no-ops with the no-attention-agents hint when no agents need attention', () => {
+    // Slot 5 (ACT11) = cycle-attention-agents; nothing needing attention → unavailable.
     const showUnavailableHint = vi.fn();
     const result = handleActionKeyPress('ACT11', { showUnavailableHint });
     expect(result).toBeNull();
     expect(showUnavailableHint).toHaveBeenCalledTimes(1);
     expect(showUnavailableHint).toHaveBeenCalledWith(
-      m.hardwareConsole_actionKey_noActiveAgents_message(),
+      m.hardwareConsole_actionKey_noAttentionAgents_message(),
     );
     expect(dispatched).toHaveLength(0);
   });
 
-  it('no-ops with the no-active-agents hint when no agents are in progress', () => {
+  it('no-ops with the no-in-progress-agents hint when no agents are in progress', () => {
     // Slot 4 (ACT10) = cycle-in-progress-agents; no in-progress agents anywhere.
     const showUnavailableHint = vi.fn();
     const result = handleActionKeyPress('ACT10', { showUnavailableHint });
     expect(result).toBeNull();
     expect(showUnavailableHint).toHaveBeenCalledTimes(1);
     expect(showUnavailableHint).toHaveBeenCalledWith(
-      m.hardwareConsole_actionKey_noActiveAgents_message(),
+      m.hardwareConsole_actionKey_noInProgressAgents_message(),
     );
     expect(dispatched).toHaveLength(0);
   });
 
   it('no-ops with the generic hint for other unavailable actions', () => {
-    // Slot 5 (ACT11) = cycle-workspace-agents; no active workspace → generic hint.
+    // Slot 2 (ACT08) = see-spec; no active workspace → generic hint.
     mockState.workspace.activeWorkspaceId = null;
     const showUnavailableHint = vi.fn();
-    const result = handleActionKeyPress('ACT11', { showUnavailableHint });
+    const result = handleActionKeyPress('ACT08', { showUnavailableHint });
     expect(result).toBeNull();
     expect(showUnavailableHint).toHaveBeenCalledWith(
       m.hardwareConsole_actionKey_unavailable_message({
-        label: m.hardwareConsole_actionKey_cycleWorkspaceAgents_label(),
+        label: m.hardwareConsole_actionKey_seeSpec_label(),
       }),
     );
     expect(dispatched).toHaveLength(0);
@@ -178,7 +186,7 @@ describe('handleActionKeyPress', () => {
     const showUnavailableHint = vi.fn();
     expect(handleActionKeyPress('ACT06', { showUnavailableHint }, 'codex-micro')).toBeNull();
     expect(showUnavailableHint).toHaveBeenCalledWith(
-      m.hardwareConsole_actionKey_noActiveAgents_message(),
+      m.hardwareConsole_actionKey_noInProgressAgents_message(),
     );
     expect(dispatched).toHaveLength(0);
   });
@@ -199,7 +207,8 @@ describe('handleActionKeyPress', () => {
   });
 
   it('no-ops with the no-unread-agents hint on the default ACT12 slot', () => {
-    // Slot 6 (ACT12) = cycle-unread-agents; nothing unread → specific toast.
+    // CM2 slot 6 (ACT12, Settings row 4 key 3) = cycle-unread-agents;
+    // nothing unread → specific toast.
     const showUnavailableHint = vi.fn();
     const result = handleActionKeyPress('ACT12', { showUnavailableHint });
     expect(result).toBeNull();
@@ -210,20 +219,69 @@ describe('handleActionKeyPress', () => {
   });
 
   it('cycling to an unread agent focuses its chat composer', () => {
+    // Codex slot 4 (ACT10) = cycle-unread-agents.
     mockState.workspaceAgents.byWorkspaceId = {
-      'ws-1': { foregroundAgentIds: ['a-1'], activeAgentId: null },
+      'ws-1': { agentIds: ['a-1'], foregroundAgentIds: ['a-1'], activeAgentId: null },
     };
     mockState.agentSessions.byAgentId = {
       'a-1': { id: 'a-1', status: 'Completed', messages: [] } as never,
     };
-    mockState.unreadTracking = { unreadAgentIds: ['a-1'] };
+    mockState.workspace.workspaces = createCollection('id', [
+      { id: 'ws-1', attention: 'unread' } as never,
+    ]);
     const focusComposer = vi.fn();
-    const result = handleActionKeyPress('ACT12', { focusComposer });
+    const result = handleActionKeyPress('ACT10', { focusComposer }, 'codex-micro');
     expect(result).toBe('cycle-unread-agents');
     expect(focusComposer).toHaveBeenCalledWith('a-1');
     expect(dispatched).toContainEqual(
       expect.objectContaining({ type: 'workspaceAgents/setActiveAgentId', payload: ['ws-1', 'a-1'] }),
     );
+  });
+
+  it('shows the single-candidate toast when the only in-progress agent is focused', () => {
+    mockState.workspaceAgents.byWorkspaceId = {
+      'ws-1': { agentIds: ['a-1'], foregroundAgentIds: ['a-1'], activeAgentId: 'a-1' },
+    };
+    mockState.agentSessions.byAgentId = {
+      'a-1': { id: 'a-1', status: 'active', isProcessing: true, messages: [] } as never,
+    };
+    const showUnavailableHint = vi.fn();
+    // Slot 4 (ACT10) = cycle-in-progress-agents on the CM2.
+    const result = handleActionKeyPress('ACT10', { showUnavailableHint });
+    expect(result).toBe('cycle-in-progress-agents');
+    expect(showUnavailableHint).toHaveBeenCalledWith(
+      m.hardwareConsole_actionKey_noOtherInProgressAgents_message(),
+    );
+    expect(dispatched).toHaveLength(0);
+  });
+
+  it('a successful cycle press shows the action HUD with the action label', () => {
+    // Codex slot 4 (ACT10) = cycle-unread-agents.
+    mockState.workspaceAgents.byWorkspaceId = {
+      'ws-1': { agentIds: ['a-1'], foregroundAgentIds: ['a-1'], activeAgentId: null },
+    };
+    mockState.agentSessions.byAgentId = {
+      'a-1': { id: 'a-1', status: 'Completed', messages: [] } as never,
+    };
+    mockState.workspace.workspaces = createCollection('id', [
+      { id: 'ws-1', attention: 'unread' } as never,
+    ]);
+    const result = handleActionKeyPress('ACT10', {}, 'codex-micro');
+    expect(result).toBe('cycle-unread-agents');
+    expect(dispatched).toContainEqual(
+      expect.objectContaining({
+        type: 'hardwareConsole/actionHudShown',
+        payload: [m.hardwareConsole_actionKey_cycleUnreadAgents_label()],
+      }),
+    );
+  });
+
+  it('does not show the action HUD on unavailable cycle presses', () => {
+    // Slot 5 (ACT11) = cycle-workspace-agents; no agents anywhere → hint only.
+    const showUnavailableHint = vi.fn();
+    expect(handleActionKeyPress('ACT11', { showUnavailableHint })).toBeNull();
+    expect(showUnavailableHint).toHaveBeenCalledTimes(1);
+    expect(dispatched).toHaveLength(0);
   });
 });
 
@@ -278,6 +336,39 @@ describe('composer focus', () => {
       });
       vi.advanceTimersByTime(COMPOSER_FOCUS_DELAYS_MS[COMPOSER_FOCUS_DELAYS_MS.length - 1]);
       expect(dispatchWindowEvent).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe('action HUD inactivity timer', () => {
+  it('hides the HUD after the timeout; rapid shows re-arm it', async () => {
+    vi.useFakeTimers();
+    try {
+      (appClient.settings.get as ReturnType<typeof vi.fn>).mockResolvedValue({
+        path: 'hardwareConsole.state',
+        value: {},
+      });
+      const { ACTION_HUD_HIDE_MS, createHardwareConsoleActionKeyMiddleware } = await import(
+        '../action-key-service'
+      );
+      const middleware = createHardwareConsoleActionKeyMiddleware();
+      const invoke = middleware({} as never)(vi.fn((action) => action));
+      const hudHiddenDispatches = () =>
+        dispatched.filter((action) => action.type === 'hardwareConsole/actionHudHidden');
+
+      invoke({ type: 'hardwareConsole/actionHudShown', payload: ['Cycle idle agents'] });
+      vi.advanceTimersByTime(ACTION_HUD_HIDE_MS - 1);
+      expect(hudHiddenDispatches()).toHaveLength(0);
+
+      // A rapid second press re-arms the timer.
+      invoke({ type: 'hardwareConsole/actionHudShown', payload: ['Cycle idle agents'] });
+      vi.advanceTimersByTime(ACTION_HUD_HIDE_MS - 1);
+      expect(hudHiddenDispatches()).toHaveLength(0);
+
+      vi.advanceTimersByTime(1);
+      expect(hudHiddenDispatches()).toHaveLength(1);
     } finally {
       vi.useRealTimers();
     }
@@ -374,6 +465,84 @@ describe('persistence key on the daemon bag', () => {
     });
   });
 
+  it.each([
+    [
+      'oldest (pre-attention) defaults',
+      [
+        'new-workspace',
+        'new-agent',
+        'see-spec',
+        'switch-window-layouts',
+        'cycle-in-progress-agents',
+        'cycle-workspace-agents',
+        'cycle-unread-agents',
+      ],
+    ],
+    [
+      'previous (cycle-workspace) defaults',
+      [
+        'new-workspace',
+        'new-agent',
+        'see-spec',
+        'switch-window-layouts',
+        'cycle-in-progress-agents',
+        'cycle-workspace-agents',
+        'cycle-attention-agents',
+      ],
+    ],
+  ])('migrates a persisted CM2 mapping equal to the %s and writes it back', async (_label, priorDefaults) => {
+    (appClient.settings.get as ReturnType<typeof vi.fn>).mockResolvedValue({
+      path: 'hardwareConsole.state',
+      value: { actionMappingByModel: { 'creator-micro-2': priorDefaults } },
+    });
+    const { createHardwareConsoleActionKeyMiddleware } = await import('../action-key-service');
+    const middleware = createHardwareConsoleActionKeyMiddleware();
+    const invoke = middleware({} as never)(vi.fn((action) => action));
+
+    invoke({ type: 'any/action' });
+    await vi.waitFor(() => {
+      expect(dispatched).toContainEqual(
+        expect.objectContaining({
+          type: 'hardwareConsole/hydrateActionMapping',
+          payload: [
+            expect.objectContaining({
+              'creator-micro-2': [...DEFAULT_ACTION_MAPPINGS['creator-micro-2']],
+            }),
+          ],
+        }),
+      );
+      expect(appClient.settings.update).toHaveBeenCalledWith([
+        {
+          path: 'hardwareConsole.state',
+          value: expect.objectContaining({
+            actionMappingByModel: expect.objectContaining({
+              'creator-micro-2': [...DEFAULT_ACTION_MAPPINGS['creator-micro-2']],
+            }),
+          }),
+        },
+      ]);
+    });
+  });
+
+  it('does not write back when the persisted CM2 mapping is customized', async () => {
+    const customized = new Array(7).fill('see-spec');
+    (appClient.settings.get as ReturnType<typeof vi.fn>).mockResolvedValue({
+      path: 'hardwareConsole.state',
+      value: { actionMappingByModel: { 'creator-micro-2': customized } },
+    });
+    const { createHardwareConsoleActionKeyMiddleware } = await import('../action-key-service');
+    const middleware = createHardwareConsoleActionKeyMiddleware();
+    const invoke = middleware({} as never)(vi.fn((action) => action));
+
+    invoke({ type: 'any/action' });
+    await vi.waitFor(() => {
+      expect(dispatched).toContainEqual(
+        expect.objectContaining({ type: 'hardwareConsole/hydrateActionMapping' }),
+      );
+    });
+    expect(appClient.settings.update).not.toHaveBeenCalled();
+  });
+
   it('hydrates a legacy flat actionMapping array as the CM2 entry', async () => {
     (appClient.settings.get as ReturnType<typeof vi.fn>).mockResolvedValue({
       path: 'hardwareConsole.state',
@@ -396,6 +565,72 @@ describe('persistence key on the daemon bag', () => {
           ],
         }),
       );
+    });
+  });
+
+  it('hydrates cycleScopeByFamily with defaults filling missing families', async () => {
+    (appClient.settings.get as ReturnType<typeof vi.fn>).mockResolvedValue({
+      path: 'hardwareConsole.state',
+      value: { cycleScopeByFamily: { 'cycle-in-progress-agents': 'all' } },
+    });
+    const { createHardwareConsoleActionKeyMiddleware } = await import('../action-key-service');
+    const middleware = createHardwareConsoleActionKeyMiddleware();
+    const invoke = middleware({} as never)(vi.fn((action) => action));
+
+    invoke({ type: 'any/action' });
+    await vi.waitFor(() => {
+      expect(dispatched).toContainEqual(
+        expect.objectContaining({
+          type: 'hardwareConsole/hydrateCycleScopes',
+          payload: [
+            {
+              'cycle-in-progress-agents': 'all',
+              'cycle-attention-agents': 'top-level',
+              'cycle-idle-agents': 'top-level',
+              'cycle-failed-agents': 'all',
+            },
+          ],
+        }),
+      );
+    });
+  });
+
+  it('persists cycleScopeByFamily via RMW, preserving sibling bag fields', async () => {
+    (appClient.settings.get as ReturnType<typeof vi.fn>).mockResolvedValue({
+      path: 'hardwareConsole.state',
+      value: { keyPins: ['ws-1'] },
+    });
+    const { createHardwareConsoleActionKeyMiddleware } = await import('../action-key-service');
+    const middleware = createHardwareConsoleActionKeyMiddleware();
+    const invoke = middleware({} as never)(vi.fn((action) => action));
+
+    invoke({ type: 'any/action' });
+    await vi.waitFor(() => {
+      expect(dispatched).toContainEqual(
+        expect.objectContaining({ type: 'hardwareConsole/hydrateCycleScopes' }),
+      );
+    });
+
+    mockState.hardwareConsole.cycleScopeByFamily = {
+      ...mockState.hardwareConsole.cycleScopeByFamily,
+      'cycle-attention-agents': 'top-level',
+    };
+    invoke({
+      type: 'hardwareConsole/setCycleScope',
+      payload: ['cycle-attention-agents', 'top-level'],
+    });
+    await vi.waitFor(() => {
+      expect(appClient.settings.update).toHaveBeenCalledWith([
+        {
+          path: 'hardwareConsole.state',
+          value: expect.objectContaining({
+            keyPins: ['ws-1'],
+            cycleScopeByFamily: expect.objectContaining({
+              'cycle-attention-agents': 'top-level',
+            }),
+          }),
+        },
+      ]);
     });
   });
 });

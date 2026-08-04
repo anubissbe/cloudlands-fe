@@ -27,6 +27,7 @@ import type {
   TaskStatus,
   UpdateWorkspaceRequest,
   Workspace,
+  WorkspaceDiskUsage,
   WorkspaceTask,
   WorkspaceTaskStats,
 } from "$shared/types";
@@ -295,6 +296,17 @@ export interface WorkspaceCreateResult extends MutationResult {
   errorCode?: string;
 }
 
+/**
+ * Result of the on-demand `workspace.diskUsage` poll (PROTOCOL §5.1).
+ * `diskUsage` is omitted until the daemon's first walk completes and for
+ * rows without a daemon-managed directory; `refreshing: true` means a
+ * background walk is in flight so callers may poll again shortly.
+ */
+export interface WorkspaceDiskUsageResult {
+  diskUsage?: WorkspaceDiskUsage;
+  refreshing: boolean;
+}
+
 export interface WorkspacesClient {
   list(options?: { includeArchived?: boolean }): Promise<Workspace[]>;
   get(id: string): Promise<Workspace | null>;
@@ -324,6 +336,13 @@ export interface WorkspacesClient {
   archive(id: string): Promise<MutationResult>;
   /** Unarchive a workspace (`workspace.unarchive`, §5.1) — the archive-undo path. */
   unarchive(id: string): Promise<MutationResult>;
+  /**
+   * Mark a workspace seen (`workspace.markSeen`, §5.1) — clears the unread
+   * `attention` flag only (unlike `workspace.dismissAttention`, which also
+   * clears `review_required`). The daemon returns `{ workspace }` and emits
+   * `workspace:attention-changed`, which drives the reactive UI clear.
+   */
+  markSeen(id: string): Promise<MutationResult>;
   setActive(id: string): Promise<MutationResult>;
   recentViews(): Promise<Record<string, number>>;
   /**
@@ -333,6 +352,14 @@ export interface WorkspacesClient {
    * `workspace:tokenUsage-changed` event (§6.5).
    */
   getTokenUsage(workspaceId: string): Promise<TokenUsage | null>;
+  /**
+   * `workspace.diskUsage` (PROTOCOL §5.1): on-demand cached footprint of the
+   * workspace's daemon-managed directory — `{ diskUsage?, refreshing }`.
+   * Never populated on list/get rows (monorepo#1396); clients fetch it here
+   * when needed. Returns `null` when the daemon predates the method
+   * (-32601 METHOD_NOT_FOUND) so callers can fall back gracefully.
+   */
+  diskUsage(workspaceId: string): Promise<WorkspaceDiskUsageResult | null>;
   /**
    * `workspace.getContext` (PROTOCOL §5.1): the daemon-owned chat-context
    * attachment list for one workspace (notes, linear / github / sentry issues,
@@ -709,8 +736,21 @@ export interface TerminalEventHandlers {
   onTitle?(event: TerminalTitleEvent): void;
 }
 
+/**
+ * `terminal.list` result envelope (PROTOCOL §5.13). `daemonBootId` identifies
+ * the daemon boot that produced the snapshot, letting the store distinguish an
+ * authoritative same-boot empty list (every PTY genuinely gone — converge to
+ * zero tabs) from a post-restart empty (PTYs respawn via auto-reconnect —
+ * preserve tabs). Absent when a legacy pre-envelope daemon returned a bare
+ * array.
+ */
+export interface TerminalListResult {
+  terminals: TerminalTab[];
+  daemonBootId?: string;
+}
+
 export interface TerminalsClient {
-  list(workspaceId: string): Promise<TerminalTab[]>;
+  list(workspaceId: string): Promise<TerminalListResult>;
   /**
    * `terminal.create` (PROTOCOL §5.13). On success the daemon-assigned
    * terminalId is surfaced as `MutationResult.id`.
@@ -1379,7 +1419,7 @@ export interface SkillsClient {
  * Wire `SpecialistDef` (`specialist.list`, PROTOCOL §5.11): the resolved view
  * of one definition. `source` is the winning tier (project > user > bundled)
  * and `path` the file it resolved from (omitted for `bundled`). The optional
- * frontmatter scalars (`codingAgent`/`model`/`modelTier`/`roleReminder`/
+ * frontmatter scalars (`codingAgent`/`model`/`roleReminder`/
  * `agentType`/`hidden`) are carried through verbatim when present;
  * `behaviorPrompt` mirrors `prompt` (the markdown body). `hidden: true`
  * excludes the specialist from picker surfaces (absent ⇒ not hidden).
@@ -1390,7 +1430,6 @@ export interface SpecialistDef {
   description: string;
   codingAgent?: string;
   model?: string;
-  modelTier?: string;
   roleReminder?: string;
   agentType?: string;
   hidden?: boolean;

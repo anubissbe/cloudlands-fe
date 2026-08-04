@@ -263,6 +263,8 @@ const ALLOWED_CHANNELS = [
   "window:set-in-workspace",
   "window:set-open-workspace-tabs",
   "window:set-browser-focused",
+  "window:set-full-screen",
+  "window:get-full-screen",
   "terminal:createWithCommand",
   "terminal:professional:create",
   "terminal:professional:list",
@@ -399,7 +401,6 @@ const ALLOWED_CHANNELS = [
   "specialists:read-file",
   "specialists:write-file",
   "specialists:delete-file",
-  "specialists:open-folder",
   "specialists:get-folder-path",
   "specialists:export-builtin",
   "specialists:file-exists",
@@ -524,6 +525,8 @@ const ALLOWED_CHANNELS = [
   "backend:status",
   "backend:spawn-sidecar",
   "backend:get-sidecar-run-log",
+  "hardware-console:clear-lighting",
+  "hardware-console:clear-lighting-done",
   "event:workspace:created",
   "event:workspace:updated",
   "event:workspace:deleted",
@@ -670,7 +673,8 @@ const ALLOWED_CHANNELS = [
   "websocket-api:discovery-auto-disabled",
   "token-usage:changed",
   "backend:notification",
-  "backend:status"
+  "backend:status",
+  "hardware-console:clear-lighting"
 ];
 
 // Dynamic channel patterns that are matched with startsWith()
@@ -840,7 +844,8 @@ const EVENT_CHANNELS = [
   "websocket-api:discovery-auto-disabled",
   "token-usage:changed",
   "backend:notification",
-  "backend:status"
+  "backend:status",
+  "hardware-console:clear-lighting"
 ];
 
 /**
@@ -925,13 +930,6 @@ const electronAPI = {
     const isDynamicChannel = dynamicPrefixes.some((prefix) => channel.startsWith(prefix));
     if (isDynamicChannel) {
       ipcRenderer.setMaxListeners(50); // Higher limit for dynamic channels
-    }
-
-    // backend:status legitimately accumulates ~12 listeners (one reconnect-replay
-    // subscription per backend client), so raise the cap to at least 15 without
-    // lowering a higher cap already in effect (dynamic channels set 50)
-    if (channel === 'backend:status') {
-      ipcRenderer.setMaxListeners(Math.max(ipcRenderer.getMaxListeners(), 15));
     }
 
     // Use generated allowed channels (includes dynamic patterns)

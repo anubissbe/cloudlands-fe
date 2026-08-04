@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { createCollection } from '$lib/store-shim/utils/collections/collection-utils';
-import type { Workspace } from '$shared/types';
+import { WorkspaceStatus, type Workspace } from '$shared/types';
 import type { StoredAgentSession } from '$store/renderer/slices/agent-session/agent-session-types';
 import {
   collectCycleAgents,
@@ -20,19 +20,26 @@ function makeSession(id: string, overrides: Record<string, unknown> = {}): Store
 function makeState(
   agentsByWorkspace: Record<string, string[]>,
   sessions: Record<string, StoredAgentSession>,
+  subAgentsByWorkspace: Record<string, string[]> = {},
+  workspaceOverrides: Record<string, Partial<Workspace>> = {},
 ): AgentCycleState {
   return {
     workspace: {
       workspaces: createCollection(
         'id',
-        Object.keys(agentsByWorkspace).map((id) => ({ id }) as unknown as Workspace),
+        Object.keys(agentsByWorkspace).map(
+          (id) => ({ id, ...workspaceOverrides[id] }) as unknown as Workspace,
+        ),
       ),
     },
     workspaceAgents: {
       byWorkspaceId: Object.fromEntries(
         Object.entries(agentsByWorkspace).map(([wsId, ids]) => [
           wsId,
-          { foregroundAgentIds: ids },
+          {
+            agentIds: [...ids, ...(subAgentsByWorkspace[wsId] ?? [])],
+            foregroundAgentIds: ids,
+          },
         ]),
       ),
     },
@@ -140,5 +147,71 @@ describe('collectCycleAgents', () => {
     );
     const entries = collectCycleAgents(state, () => true, compareLastIdleDesc);
     expect(entries.map((entry) => entry.agentId)).toEqual(['a-2', 'a-1']);
+  });
+
+  it("scope 'all' includes sub-agents; the default top-level scope does not", () => {
+    const state = makeState(
+      { 'ws-1': ['a-1'], 'ws-2': ['b-1'] },
+      {
+        'a-1': makeSession('a-1', { isProcessing: true, status: 'active' }),
+        'sub-1': makeSession('sub-1', { isProcessing: true, status: 'active' }),
+        'b-1': makeSession('b-1', { isProcessing: true, status: 'active' }),
+        'sub-2': makeSession('sub-2', { isProcessing: true, status: 'active' }),
+      },
+      { 'ws-1': ['sub-1'], 'ws-2': ['sub-2'] },
+    );
+    expect(collectCycleAgents(state, isSessionInProgress).map((e) => e.agentId)).toEqual([
+      'a-1',
+      'b-1',
+    ]);
+    expect(
+      collectCycleAgents(state, isSessionInProgress, undefined, 'all').map((e) => e.agentId),
+    ).toEqual(['a-1', 'sub-1', 'b-1', 'sub-2']);
+  });
+
+  it('excludes agents in archived workspaces in both scopes', () => {
+    const state = makeState(
+      { 'ws-1': ['a-1'], 'ws-2': ['b-1'], 'ws-3': ['c-1'] },
+      {
+        'a-1': makeSession('a-1'),
+        'sub-1': makeSession('sub-1'),
+        'b-1': makeSession('b-1'),
+        'sub-2': makeSession('sub-2'),
+        'c-1': makeSession('c-1'),
+      },
+      { 'ws-1': ['sub-1'], 'ws-2': ['sub-2'] },
+      {
+        'ws-1': { status: WorkspaceStatus.Archived },
+        'ws-3': { archived: true },
+      },
+    );
+    expect(collectCycleAgents(state, () => true)).toEqual([{ wsId: 'ws-2', agentId: 'b-1' }]);
+    expect(collectCycleAgents(state, () => true, undefined, 'all')).toEqual([
+      { wsId: 'ws-2', agentId: 'b-1' },
+      { wsId: 'ws-2', agentId: 'sub-2' },
+    ]);
+  });
+
+  it('excludes agents in deleted workspaces', () => {
+    const state = makeState(
+      { 'ws-1': ['a-1'], 'ws-2': ['b-1'] },
+      { 'a-1': makeSession('a-1'), 'b-1': makeSession('b-1') },
+      {},
+      { 'ws-1': { status: WorkspaceStatus.Deleted } },
+    );
+    expect(collectCycleAgents(state, () => true)).toEqual([{ wsId: 'ws-2', agentId: 'b-1' }]);
+  });
+
+  it("scope 'all' keeps workspace order and applies the comparator across both levels", () => {
+    const state = makeState(
+      { 'ws-1': ['a-1'] },
+      {
+        'a-1': makeSession('a-1', { stopReasonTimestamp: '2026-08-01T08:00:00.000Z' }),
+        'sub-1': makeSession('sub-1', { stopReasonTimestamp: '2026-08-01T10:00:00.000Z' }),
+      },
+      { 'ws-1': ['sub-1'] },
+    );
+    const entries = collectCycleAgents(state, () => true, compareLastIdleDesc, 'all');
+    expect(entries.map((entry) => entry.agentId)).toEqual(['sub-1', 'a-1']);
   });
 });

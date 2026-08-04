@@ -28,6 +28,7 @@
   faCog,
   faBell,
   faChartColumn,
+  faGaugeHigh,
   faWandMagicSparkles,
 } from '@fortawesome/free-solid-svg-icons';
   import Fa from 'svelte-fa';
@@ -58,15 +59,10 @@
   toggleStatsOverlay,
 } from '$store/renderer/slices/sidebar-nav/sidebar-nav-slice';
 
-  import {
-  selectUnreadAgentIds,
-  selectUnreadAgentIdsForWorkspace,
-} from '$store/renderer/slices/unread-tracking/unread-tracking-selectors';
   import { isWorkspaceActivityWithin } from '$shared/utils/workspace-activity-time';
   import { store as appStore } from '$store/renderer/store';
 
   const workspaceItems = selectWorkspaceItems();
-  const unreadAgentIds$ = selectUnreadAgentIds();
   const panelItem$ = selectPanelItem();
   const activeCard$ = selectActiveCard();
   const onboardingActive$ = selectOnboardingActive();
@@ -87,20 +83,17 @@
   const ONE_DAY_MS = 24 * 60 * 60 * 1000;
 
   const unreadCount = $derived.by(() => {
-    // Read shared version counters so this re-runs when streams/unread state changes
+    // Read shared version counters so this re-runs when streams state changes
     void activeStreamsVersion;
-    // Reading unreadAgentIds$ triggers re-evaluation when unread state changes
-    void $unreadAgentIds$;
     const now = Date.now();
-    const state = appStore.state;
     let count = 0;
     for (const ws of $workspaceItems) {
       if (ws.status === WorkspaceStatusEnum.Archived || ws.status === WorkspaceStatusEnum.Deleted)
         continue;
       // Skip if currently streaming (not "unread")
       if (activeStreamsTracker.getStreamingAgentIdsForWorkspace(ws.id).length > 0) continue;
-      const unreadIds = selectUnreadAgentIdsForWorkspace.select(state, ws.id);
-      if (unreadIds.length > 0 && isWorkspaceActivityWithin(ws, now, ONE_DAY_MS)) count++;
+      // BE-owned attention flag (blue dot)
+      if (ws.attention === 'unread' && isWorkspaceActivityWithin(ws, now, ONE_DAY_MS)) count++;
     }
     return count;
   });
@@ -119,6 +112,7 @@
     { id: 'active', icon: faBell, label: m.layout_sidebarNav_active_label(), badge: () => unreadCount },
     { id: 'all-workspaces', icon: faLayerGroup, label: m.layout_sidebarNav_all_label() },
     { id: 'chief', icon: faWandMagicSparkles, label: m.layout_sidebarNav_assistant_label() },
+    { id: 'hud', icon: faGaugeHigh, label: m.layout_sidebarNav_hud_label() },
     { id: 'stats', icon: faChartColumn, label: m.layout_sidebarNav_stats_label() },
     { id: 'settings', icon: faCog, label: m.layout_sidebarNav_settings_label() },
   ];
@@ -175,8 +169,8 @@
       return;
     }
 
-    // Home, stats, and settings don't have hover cards — skip
-    if (item === 'home' || item === 'stats' || item === 'settings') return;
+    // Home, HUD, stats, and settings don't have hover cards — skip
+    if (item === 'home' || item === 'hud' || item === 'stats' || item === 'settings') return;
 
     // Otherwise delay hover card appearance
     hoverTimeout = setTimeout(() => {
@@ -229,6 +223,13 @@
     } else if (id === 'stats') {
       appStore.dispatch(closeAll(false));
       appStore.dispatch(toggleStatsOverlay());
+    } else if (id === 'hud') {
+      appStore.dispatch(closeAll(false));
+      // Open the Fleet HUD in its own window
+      invoke(IPC_CHANNELS.WINDOW.OPEN_NEW, { route: '/hud' }).catch(() => {
+        // Fallback to navigation in current window if IPC fails
+        goto('/hud');
+      });
     } else if (id === 'new-workspace') {
       appStore.dispatch(closeAll(false));
       // Command-click (or Ctrl-click on non-Mac) opens in new window

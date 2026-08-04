@@ -1,17 +1,19 @@
 /**
  * Shared helpers for the global agent-cycling action keys: one parameterized
- * collect step (predicate + optional ordering) over top-level (foreground)
- * agents across all workspaces, plus the next-entry step the cycle actions
- * share.
+ * collect step (predicate + optional ordering + scope) over agents across
+ * all workspaces, plus the next-entry step the cycle actions share. Scope
+ * picks the walked list: `top-level` = foreground agents only, `all` =
+ * every listed agent including delegated sub-agents (see cycle-scope.ts).
  *
  * The attention/failed predicates mirror the LED engine (led/snapshot.ts)
- * definitions so key behavior and lighting agree. Dependency-light per
- * src/store/renderer/AGENTS.md middleware conventions: no selector imports —
- * narrow structural state only.
+ * definitions so key behavior and lighting agree. Workspaces are filtered
+ * through `isKeyAssignableWorkspace` (assignment/key-assignment.ts), so the
+ * chief virtual workspace and archived/deleted workspaces are never cycled
+ * into. Dependency-light per src/store/renderer/AGENTS.md middleware
+ * conventions: no selector imports — narrow structural state only.
  */
 
 import { AgentStatus, type Workspace } from '$shared/types';
-import { CHIEF_WORKSPACE_ID } from '$shared/types/branded-ids';
 import { AgentActivationState } from '$shared/types/agent-session';
 import {
   getAgentAttentionRequest,
@@ -20,12 +22,17 @@ import {
 import { derivePendingQuestions } from '$lib/components/chat/questions/pending-questions';
 import { getItems, type Collection } from '$lib/store-shim/utils/collections/collection-utils';
 import type { StoredAgentSession } from '$store/renderer/slices/agent-session/agent-session-types';
+import { isKeyAssignableWorkspace } from '../assignment/key-assignment';
+import type { CycleScope } from './cycle-scope';
 
 /** The narrow slice of the app store state the cycle helpers read. */
 export interface AgentCycleState {
   workspace: { workspaces: Collection<Workspace, 'id'> };
   workspaceAgents: {
-    byWorkspaceId: Record<string, { foregroundAgentIds: readonly string[] }>;
+    byWorkspaceId: Record<
+      string,
+      { agentIds: readonly string[]; foregroundAgentIds: readonly string[] }
+    >;
   };
   agentSessions: { byAgentId: Record<string, StoredAgentSession> };
 }
@@ -104,6 +111,11 @@ export function sessionHasFailed(session: StoredAgentSession | undefined): boole
   return session?.status === AgentStatus.Error;
 }
 
+/** All-agents family: every listed top-level agent that is not deleted. */
+export function isSessionCyclable(session: StoredAgentSession | undefined): boolean {
+  return session !== undefined && session.status !== AgentStatus.Deleted;
+}
+
 /** Idle = not deleted, not failed, not needing attention, turn not active. */
 export function isSessionIdle(session: StoredAgentSession | undefined): boolean {
   if (!session || session.status === AgentStatus.Deleted) return false;
@@ -136,19 +148,25 @@ export function compareLastIdleDesc(a: StoredAgentSession, b: StoredAgentSession
 }
 
 /**
- * Collect matching top-level (foreground) agents across all workspaces, in
- * workspace order. An optional comparator re-orders the result (stable sort,
- * ties keep workspace order).
+ * Collect matching agents across all key-assignable workspaces (the chief
+ * virtual workspace and archived/deleted workspaces are skipped), in
+ * workspace order. Scope picks the walked list per workspace: `top-level`
+ * (default) walks the foreground agents; `all` walks every listed agent
+ * (sub-agents included). An optional comparator re-orders the result
+ * (stable sort, ties keep workspace order).
  */
 export function collectCycleAgents(
   state: AgentCycleState,
   predicate: (session: StoredAgentSession, agentId: string) => boolean,
   compare?: (a: StoredAgentSession, b: StoredAgentSession) => number,
+  scope: CycleScope = 'top-level',
 ): CycleAgentEntry[] {
   const entries: { entry: CycleAgentEntry; session: StoredAgentSession }[] = [];
   for (const workspace of getItems(state.workspace.workspaces)) {
-    if (workspace.id === CHIEF_WORKSPACE_ID) continue;
-    const ids = state.workspaceAgents.byWorkspaceId[workspace.id]?.foregroundAgentIds ?? [];
+    if (!isKeyAssignableWorkspace(workspace)) continue;
+    const workspaceState = state.workspaceAgents.byWorkspaceId[workspace.id];
+    const ids =
+      (scope === 'all' ? workspaceState?.agentIds : workspaceState?.foregroundAgentIds) ?? [];
     for (const rawId of ids) {
       const agentId = String(rawId);
       const session = state.agentSessions.byAgentId[agentId];

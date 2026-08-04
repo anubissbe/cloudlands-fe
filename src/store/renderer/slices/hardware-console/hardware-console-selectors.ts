@@ -20,6 +20,11 @@ export const selectHardwareConsoleActionMappingsByModel = store.createSelector(
   (state) => state.hardwareConsole.actionMappingByModel,
 );
 
+/** Per-family agent-cycle scopes (`all` includes sub-agents, `top-level` does not). */
+export const selectHardwareConsoleCycleScopes = store.createSelector(
+  (state) => state.hardwareConsole.cycleScopeByFamily,
+);
+
 /** Raw 6-slot pin array (slot 0 = agent key AG00). */
 export const selectHardwareConsoleKeyPins = store.createSelector<[], (string | null)[]>(
   (state) => state.hardwareConsole.keyPins,
@@ -32,7 +37,11 @@ export const selectHardwareConsoleKeyPins = store.createSelector<[], (string | n
 export const selectHardwareConsoleKeySlots = store.createSelector<[], (string | null)[]>(
   (state) => {
     const workspaces = selectWorkspaceItems.select(state).filter(isKeyAssignableWorkspace);
-    return resolveKeySlots(state.hardwareConsole.keyPins, workspaces);
+    return resolveKeySlots(
+      state.hardwareConsole.keyPins,
+      workspaces,
+      state.hardwareConsole.excludedWorkspaceIds,
+    );
   },
 );
 
@@ -65,4 +74,9 @@ export const selectHardwareConsoleRadialPrompt = store.createSelector(
 /** Workspace targeted by the encoder-rotate HUD; `null` = HUD hidden. */
 export const selectEncoderHudWorkspaceId = store.createSelector(
   (state) => state.hardwareConsole.encoderHudWorkspaceId,
+);
+
+/** Label of the last-fired cycle action key shown by the action HUD; `null` = HUD hidden. */
+export const selectActionHudLabel = store.createSelector(
+  (state) => state.hardwareConsole.actionHudLabel,
 );

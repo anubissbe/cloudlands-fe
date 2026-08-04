@@ -325,6 +325,8 @@ export const IPC_CHANNELS = {
     SET_IN_WORKSPACE: 'window:set-in-workspace',
     SET_OPEN_WORKSPACE_TABS: 'window:set-open-workspace-tabs',
     SET_BROWSER_FOCUSED: 'window:set-browser-focused',
+    SET_FULL_SCREEN: 'window:set-full-screen',
+    GET_FULL_SCREEN: 'window:get-full-screen',
   },
 
   // Terminal
@@ -579,7 +581,6 @@ export const IPC_CHANNELS = {
     READ_FILE: 'specialists:read-file',
     WRITE_FILE: 'specialists:write-file',
     DELETE_FILE: 'specialists:delete-file',
-    OPEN_FOLDER: 'specialists:open-folder',
     GET_FOLDER_PATH: 'specialists:get-folder-path',
     EXPORT_BUILTIN: 'specialists:export-builtin',
     FILE_EXISTS: 'specialists:file-exists',
@@ -829,6 +830,16 @@ export const IPC_CHANNELS = {
     SPAWN_SIDECAR: 'backend:spawn-sidecar',
     GET_SIDECAR_RUN_LOG: 'backend:get-sidecar-run-log',
   },
+
+  // Hardware console (Codex Micro / Creator Micro 2)
+  HARDWARE_CONSOLE: {
+    // Main → renderer: ask the renderer to send the lighting off-frame
+    // during graceful shutdown.
+    CLEAR_LIGHTING: 'hardware-console:clear-lighting',
+    // Renderer → main one-way ack once lighting is cleared (or there was
+    // nothing to do).
+    CLEAR_LIGHTING_DONE: 'hardware-console:clear-lighting-done',
+  },
 } as const;
 
 // Event channels that are sent from main to renderer
@@ -1001,6 +1012,8 @@ export const EVENT_CHANNELS = [
   // and connection-status changes pushed from the main-process client.
   'backend:notification',
   'backend:status',
+  // Hardware console shutdown handshake (main → renderer)
+  'hardware-console:clear-lighting',
 ] as const;
 
 // Dynamic channel patterns that use runtime IDs

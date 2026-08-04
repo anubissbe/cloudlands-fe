@@ -1104,6 +1104,10 @@ export const WindowSetOpenWorkspaceTabsSchema = z.object({
   workspaceIds: z.array(z.string()),
 });
 
+export const WindowSetFullScreenSchema = z.object({
+  fullScreen: z.boolean(),
+});
+
 export const WindowSetBrowserFocusedSchema = z.object({
   browserFocused: z.boolean(),
 });
@@ -1119,6 +1123,7 @@ export const DialogMessageSchema = z.object({
 export const DialogOpenSchema = z.object({
   title: z.string().optional(),
   defaultPath: z.string().optional(),
+  mode: z.enum(['directory', 'file']).optional(),
 });
 
 // SHELL_CHANNELS schemas
@@ -1429,7 +1434,6 @@ export const SpecialistWriteSchema = z
     description: z.string().min(1, 'Description is required'),
     codingAgent: z.string().optional(),
     model: z.string().optional(),
-    modelTier: z.enum(['fast', 'balanced', 'smart']).optional(),
     roleReminder: z.string().optional(),
     hidden: z.boolean().optional(),
     behaviorPrompt: z.string().min(1, 'Behavior prompt is required'),

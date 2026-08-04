@@ -17,7 +17,7 @@ import {
   type SupportedHardwareConsoleDevice,
 } from './supported-devices';
 import { VendorChannelTransport } from './transport';
-import type { HidDeviceLike } from './webhid-types';
+import type { HidCollectionInfoLike, HidDeviceLike } from './webhid-types';
 
 const logger = new Logger('HardwareConsoleManager');
 
@@ -45,6 +45,18 @@ export class HardwareConsoleManager {
   private readonly rawMessageListeners = new Set<(message: unknown) => void>();
   private readonly logListeners = new Set<(text: string) => void>();
   private started = false;
+  private opening = false;
+  private openInFlight: Promise<void> | null = null;
+  /**
+   * Lifecycle generation token, incremented by every start()/stop(). Async
+   * lifecycle paths capture it before awaiting and bail when it has moved
+   * on, so a stop() (or rapid stop→start toggle) racing an in-flight await
+   * can never let a stale continuation attach a connection or tear down a
+   * newer generation's connection (intent-hq/monorepo#1434). Deliberately
+   * not a `started` check: requestConnect() must keep working on a
+   * never-started manager.
+   */
+  private generation = 0;
 
   constructor(
     private readonly platform: HidPlatform | null = createWebHidPlatform(),
@@ -69,15 +81,20 @@ export class HardwareConsoleManager {
   }
 
   /**
-   * Number of granted HID collections matching the connected device's
-   * VID/PID (each usage pair enumerates as one granted device). Feeds the
-   * transport heuristic in transport-heuristic.ts; `0` while disconnected.
+   * Flattened top-level collections of all granted HID devices matching the
+   * connected device's VID/PID. macOS may enumerate one granted device per
+   * usage pair or coalesce all pairs onto a single device, so callers must
+   * inspect collections, not device count (intent-hq/monorepo#1422). Feeds
+   * the transport heuristic in transport-heuristic.ts; empty while
+   * disconnected.
    */
-  async connectedCollectionCount(): Promise<number> {
-    if (!this.platform || !this.device) return 0;
+  async connectedCollections(): Promise<HidCollectionInfoLike[]> {
+    if (!this.platform || !this.device) return [];
     const { vendorId, productId } = this.device;
     const devices = await this.platform.getDevices();
-    return devices.filter((d) => d.vendorId === vendorId && d.productId === productId).length;
+    return devices
+      .filter((d) => d.vendorId === vendorId && d.productId === productId)
+      .flatMap((d) => [...d.collections]);
   }
 
   onStatusChange(listener: (status: HardwareConsoleStatus) => void): () => void {
@@ -114,12 +131,16 @@ export class HardwareConsoleManager {
    */
   async start(): Promise<void> {
     if (!this.platform || this.started) return;
+    const generation = ++this.generation;
     this.started = true;
     this.platformUnsubs.push(
       this.platform.onConnect((device) => void this.handleDeviceArrival(device)),
       this.platform.onDisconnect((device) => this.handleDeviceRemoval(device)),
     );
     const granted = await this.platform.getDevices();
+    // A stop() during the await already unsubscribed our hotplug listeners;
+    // opening now would attach a connection on a stopped manager.
+    if (generation !== this.generation) return;
     const candidate = selectVendorDevice(granted);
     if (candidate) await this.openDevice(candidate);
   }
@@ -139,9 +160,17 @@ export class HardwareConsoleManager {
 
   /** Tear down the connection and stop listening for hotplug events. */
   async stop(): Promise<void> {
+    const generation = ++this.generation;
     for (const unsub of this.platformUnsubs) unsub();
     this.platformUnsubs = [];
     this.started = false;
+    // An in-flight openDevice() assigns the connection fields only after its
+    // awaits settle; tearing down before it completes would read null fields
+    // and leak the freshly opened connection. Wait for it to finish first.
+    if (this.openInFlight) await this.openInFlight.catch(() => undefined);
+    // A start() during the await owns any connection attached since; tearing
+    // it down here would leave started === true with a closed device.
+    if (generation !== this.generation) return;
     await this.teardown('manager stopped');
   }
 
@@ -159,16 +188,75 @@ export class HardwareConsoleManager {
   private handleDeviceRemoval(device: HidDeviceLike): void {
     if (device !== this.device) return;
     logger.info('Connected device removed');
-    void this.teardown('device disconnected');
+    void this.teardown('device disconnected')
+      .then(() => this.reopenRemainingDevice(device))
+      .catch((error: unknown) => {
+        logger.warn('Removal rescan failed', { error: String(error) });
+      });
+  }
+
+  /**
+   * After the connected device drops, another already-granted surface of the
+   * same hardware may still be present (e.g. BLE→USB hand-off: the USB
+   * surface was granted while BLE was connected, so its arrival never fires
+   * a WebHID `connect` event). Rescan and open it instead of sitting
+   * disconnected until the integration is toggled. Removal-only — never runs
+   * on `stop()` (`started` is false by then and the hotplug listeners are
+   * unsubscribed).
+   */
+  private async reopenRemainingDevice(removed: HidDeviceLike): Promise<void> {
+    if (!this.platform || !this.started || this.device || this.opening) return;
+    const granted = await this.platform.getDevices();
+    const candidate = selectVendorDevice(granted.filter((d) => d !== removed));
+    if (!candidate) return;
+    logger.info('Reconnecting to remaining granted device after removal', {
+      vendorId: candidate.vendorId,
+      productId: candidate.productId,
+    });
+    await this.openDevice(candidate);
   }
 
   private async openDevice(device: HidDeviceLike): Promise<void> {
-    if (this.device) return;
+    // `opening` closes the async gap between this guard and `this.device`
+    // being assigned below: without it, a hotplug arrival racing an in-flight
+    // open would attach a SECOND transport whose subscription is never torn
+    // down (duplicate clients → "unknown or stale id" warnings).
+    if (this.device || this.opening) return;
+    this.opening = true;
+    // Also expose the in-flight open so stop() can await it before teardown
+    // (otherwise a stop() racing this open would leak the new connection).
+    const open = this.performOpen(device);
+    this.openInFlight = open;
+    try {
+      await open;
+    } finally {
+      this.opening = false;
+      if (this.openInFlight === open) this.openInFlight = null;
+    }
+  }
+
+  private async performOpen(device: HidDeviceLike): Promise<void> {
+    const generation = this.generation;
     this.setStatus('connecting');
     try {
       if (!device.opened) await device.open();
     } catch (error) {
       logger.warn('Failed to open device', { error: String(error) });
+      this.setStatus('disconnected');
+      return;
+    }
+    if (generation !== this.generation) {
+      // A stop() (or stop→start toggle) superseded this open while
+      // device.open() was in flight: release the device instead of attaching
+      // to the stale lifecycle, and never emit the 'connected' blip status
+      // listeners would otherwise see.
+      if (device.opened) {
+        try {
+          await device.close();
+        } catch {
+          // Already gone (e.g. unplugged) — nothing to release.
+        }
+      }
       this.setStatus('disconnected');
       return;
     }

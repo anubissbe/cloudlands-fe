@@ -31,8 +31,12 @@ import { navigateToRoute } from '$lib/utils/navigation.client';
 import { dispatchWindowEvent } from '$lib/utils/window-events';
 import { m } from '$shared/paraglide/messages.js';
 import {
+  actionHudHidden,
+  actionHudShown,
   hydrateHardwareConsoleActionMapping,
+  hydrateHardwareConsoleCycleScopes,
   setActionKeyMapping,
+  setCycleScope,
 } from '$store/renderer/slices/hardware-console/hardware-console-slice';
 import { openAgentTabRequested } from '$store/renderer/slices/app-layout/app-layout-slice';
 import type { HardwareConsoleManager } from '../device/device-manager';
@@ -42,16 +46,22 @@ import type { HardwareDeviceModel, LogicalKeyId } from '../input/types';
 import { HARDWARE_CONSOLE_SETTINGS_PATH } from '../assignment/key-pin-persistence-service';
 import {
   actionKeyToSlot,
+  migrateLegacyCm2DefaultActionMapping,
   normalizeActionMappingsByModel,
   type ActionKeyActionId,
 } from './action-mapping';
+import { normalizeCycleScopeByFamily } from './cycle-scope';
 import { getActionKeyDefinition, type ActionKeyContext } from './action-key-registry';
+import { ENCODER_HUD_HIDE_MS } from '../encoder/encoder-service';
 
 const logger = createLogger('HardwareConsoleActionKeys');
 
 /** Shared id: rapid presses update one hint toast instead of stacking. */
 const UNAVAILABLE_HINT_TOAST_ID = 'hardware-console-action-unavailable';
 const UNAVAILABLE_HINT_DURATION_MS = 2000;
+
+/** The action HUD hides after the same inactivity timeout as the encoder HUD. */
+export const ACTION_HUD_HIDE_MS = ENCODER_HUD_HIDE_MS;
 
 /**
  * Composer-focus retry delays: the target chat tab may still be opening
@@ -130,6 +140,7 @@ function buildContext(deps: ActionKeyDeps): ActionKeyContext {
     dispatch: (action) => appStore.dispatch(action as { type: string }),
     navigate: deps.navigate ?? navigateToRoute,
     focusComposer: deps.focusComposer ?? focusAgentComposer,
+    showHint: deps.showUnavailableHint ?? ((hint: string) => void showUnavailableToast(hint)),
   };
 }
 
@@ -154,9 +165,7 @@ export function handleActionKeyPress(
     const message =
       definition.getUnavailableHint?.(context) ??
       m.hardwareConsole_actionKey_unavailable_message({ label: definition.label });
-    const showHint =
-      deps.showUnavailableHint ?? ((hint: string) => void showUnavailableToast(hint));
-    showHint(message);
+    context.showHint(message);
     return null;
   }
   try {
@@ -234,6 +243,16 @@ async function persistActionMapping(
   ]);
 }
 
+/** Read-modify-write: replace only `cycleScopeByFamily`, preserving sibling fields. */
+async function persistCycleScopes(
+  cycleScopeByFamily: Record<string, string>,
+): Promise<void> {
+  const bag = (await readBag()) ?? {};
+  await appClient.settings.update([
+    { path: HARDWARE_CONSOLE_SETTINGS_PATH, value: { ...bag, cycleScopeByFamily } },
+  ]);
+}
+
 async function hydrateOnce(): Promise<boolean> {
   try {
     const bag = await readBag();
@@ -243,17 +262,23 @@ async function hydrateOnce(): Promise<boolean> {
       );
     }
     const legacy = Array.isArray(bag.actionMapping) ? bag.actionMapping : undefined;
+    const mappings = normalizeActionMappingsByModel(bag.actionMappingByModel, legacy);
+    // One-shot default migration: a persisted CM2 mapping still exactly equal
+    // to a prior default generation (never customized) picks up the current
+    // defaults and is written back.
+    const migrated = migrateLegacyCm2DefaultActionMapping(mappings);
+    appStore.dispatch(hydrateHardwareConsoleActionMapping(mappings));
     appStore.dispatch(
-      hydrateHardwareConsoleActionMapping(
-        normalizeActionMappingsByModel(bag.actionMappingByModel, legacy),
-      ),
+      hydrateHardwareConsoleCycleScopes(normalizeCycleScopeByFamily(bag.cycleScopeByFamily)),
     );
+    if (migrated) await persistActionMapping(mappings);
     return true;
   } catch (error) {
     logger.error('Action-mapping hydration failed; dispatching defaults', { error });
     appStore.dispatch(
       hydrateHardwareConsoleActionMapping(normalizeActionMappingsByModel(undefined)),
     );
+    appStore.dispatch(hydrateHardwareConsoleCycleScopes(normalizeCycleScopeByFamily(undefined)));
     return false;
   }
 }
@@ -262,15 +287,33 @@ let installed = false;
 
 /**
  * Lazily install on the first dispatched action (same pattern as the
- * key-switch middleware): starts the shared manager — idempotent, a no-op
- * without WebHID — wires action-key handling, hydrates the mapping from the
- * daemon bag, and persists mapping changes (deferred until hydration
- * settles, mirroring the key-pin persistence service).
+ * key-switch middleware): wires action-key handling, hydrates the mapping
+ * from the daemon bag, and persists mapping changes (deferred until
+ * hydration settles, mirroring the key-pin persistence service). The shared
+ * manager is started by the integration-toggle middleware once the
+ * persisted enabled flag hydrates on. Also drives the action-HUD inactivity
+ * timer from the `actionHudShown` action itself (mirrors the encoder-HUD
+ * timer): rapid presses re-arm it.
  */
 export function createHardwareConsoleActionKeyMiddleware(): StoreMiddleware {
   let hydrationStarted = false;
   let hydrationSettled = false;
   let persistQueued = false;
+  let persistScopesQueued = false;
+  let hudTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const clearHudTimer = (): void => {
+    if (hudTimer !== null) clearTimeout(hudTimer);
+    hudTimer = null;
+  };
+
+  const armHudTimer = (): void => {
+    clearHudTimer();
+    hudTimer = setTimeout(() => {
+      hudTimer = null;
+      appStore.dispatch(actionHudHidden());
+    }, ACTION_HUD_HIDE_MS);
+  };
 
   const persist = (): void => {
     void persistActionMapping(appStore.state.hardwareConsole.actionMappingByModel).catch(
@@ -278,6 +321,14 @@ export function createHardwareConsoleActionKeyMiddleware(): StoreMiddleware {
         logger.error(`Failed to persist ${HARDWARE_CONSOLE_SETTINGS_PATH} actionMappingByModel`, {
           error,
         }),
+    );
+  };
+
+  const persistScopes = (): void => {
+    void persistCycleScopes(appStore.state.hardwareConsole.cycleScopeByFamily).catch((error) =>
+      logger.error(`Failed to persist ${HARDWARE_CONSOLE_SETTINGS_PATH} cycleScopeByFamily`, {
+        error,
+      }),
     );
   };
 
@@ -289,12 +340,18 @@ export function createHardwareConsoleActionKeyMiddleware(): StoreMiddleware {
     persist();
   };
 
+  const schedulePersistScopes = (): void => {
+    if (!hydrationSettled) {
+      persistScopesQueued = true;
+      return;
+    }
+    persistScopes();
+  };
+
   return () => (next) => (action) => {
     if (!installed) {
       installed = true;
-      const manager = getHardwareConsoleManager();
-      installHardwareConsoleActionKeys(manager);
-      void manager.start();
+      installHardwareConsoleActionKeys(getHardwareConsoleManager());
     }
     if (!hydrationStarted) {
       hydrationStarted = true;
@@ -303,8 +360,11 @@ export function createHardwareConsoleActionKeyMiddleware(): StoreMiddleware {
         .then((hydrated) => {
           hydrationSettled = true;
           const shouldFlush = persistQueued && hydrated;
+          const shouldFlushScopes = persistScopesQueued && hydrated;
           persistQueued = false;
+          persistScopesQueued = false;
           if (shouldFlush) persist();
+          if (shouldFlushScopes) persistScopes();
         });
     }
 
@@ -312,6 +372,16 @@ export function createHardwareConsoleActionKeyMiddleware(): StoreMiddleware {
 
     if (action && action.type === setActionKeyMapping.type) {
       schedulePersist();
+    }
+
+    if (action && action.type === setCycleScope.type) {
+      schedulePersistScopes();
+    }
+
+    if (action && action.type === actionHudShown.type) {
+      armHudTimer();
+    } else if (action && action.type === actionHudHidden.type) {
+      clearHudTimer();
     }
 
     if (action && action.type === openAgentTabRequested.type && consumeArmedComposerFocus()) {

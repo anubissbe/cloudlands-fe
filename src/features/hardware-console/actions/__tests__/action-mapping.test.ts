@@ -5,9 +5,12 @@ import {
   CODEX_MIC_LINKED_SLOT,
   DEFAULT_ACTION_MAPPING,
   DEFAULT_ACTION_MAPPINGS,
+  LEGACY_CM2_DEFAULT_ACTION_MAPPING,
+  PREVIOUS_CM2_DEFAULT_ACTION_MAPPING,
   actionKeyToSlot,
   getDefaultActionMapping,
   isActionKeyActionId,
+  migrateLegacyCm2DefaultActionMapping,
   normalizeActionMapping,
   normalizeActionMappingsByModel,
 } from '../action-mapping';
@@ -37,12 +40,22 @@ describe('per-model default mappings', () => {
       'see-spec',
       'switch-window-layouts',
       'cycle-in-progress-agents',
-      'cycle-workspace-agents',
+      'cycle-attention-agents',
       'cycle-unread-agents',
     ]);
     expect(DEFAULT_ACTION_MAPPINGS['creator-micro-2']).toHaveLength(ACTION_KEY_COUNT);
     expect(DEFAULT_ACTION_MAPPINGS['creator-micro-2']).not.toContain('stop-agent');
     expect(DEFAULT_ACTION_MAPPINGS['creator-micro-2']).not.toContain('toggle-sidebar-tabs');
+    expect(DEFAULT_ACTION_MAPPINGS['creator-micro-2']).not.toContain('cycle-workspace-agents');
+  });
+
+  it('CM2 row 4 (ACT10–ACT12) defaults to in-progress / attention / unread cycling', () => {
+    expect(ACTION_KEY_IDS.slice(4)).toEqual(['ACT10', 'ACT11', 'ACT12']);
+    expect(DEFAULT_ACTION_MAPPINGS['creator-micro-2'].slice(4)).toEqual([
+      'cycle-in-progress-agents',
+      'cycle-attention-agents',
+      'cycle-unread-agents',
+    ]);
   });
 
   it('DEFAULT_ACTION_MAPPING remains the CM2 defaults (legacy seam)', () => {
@@ -180,6 +193,47 @@ describe('normalizeActionMappingsByModel', () => {
     expect(normalizeActionMappingsByModel([1, 2, 3])).toEqual(
       normalizeActionMappingsByModel(undefined),
     );
+  });
+});
+
+describe('migrateLegacyCm2DefaultActionMapping', () => {
+  it('upgrades a CM2 mapping still equal to the oldest (pre-attention) defaults', () => {
+    const mappings = normalizeActionMappingsByModel({
+      'creator-micro-2': [...LEGACY_CM2_DEFAULT_ACTION_MAPPING],
+    });
+    expect(migrateLegacyCm2DefaultActionMapping(mappings)).toBe(true);
+    expect(mappings['creator-micro-2']).toEqual([
+      ...DEFAULT_ACTION_MAPPINGS['creator-micro-2'],
+    ]);
+  });
+
+  it('upgrades a CM2 mapping still equal to the previous (cycle-workspace) defaults', () => {
+    const mappings = normalizeActionMappingsByModel({
+      'creator-micro-2': [...PREVIOUS_CM2_DEFAULT_ACTION_MAPPING],
+    });
+    expect(migrateLegacyCm2DefaultActionMapping(mappings)).toBe(true);
+    expect(mappings['creator-micro-2']).toEqual([
+      ...DEFAULT_ACTION_MAPPINGS['creator-micro-2'],
+    ]);
+  });
+
+  it('leaves a customized CM2 mapping untouched', () => {
+    for (const priorDefaults of [
+      LEGACY_CM2_DEFAULT_ACTION_MAPPING,
+      PREVIOUS_CM2_DEFAULT_ACTION_MAPPING,
+    ]) {
+      const customized = [...priorDefaults];
+      customized[0] = 'stop-agent';
+      const mappings = normalizeActionMappingsByModel({ 'creator-micro-2': customized });
+      expect(migrateLegacyCm2DefaultActionMapping(mappings)).toBe(false);
+      expect(mappings['creator-micro-2']).toEqual(customized);
+    }
+  });
+
+  it('is a no-op on the current defaults and never touches the Codex entry', () => {
+    const mappings = normalizeActionMappingsByModel(undefined);
+    expect(migrateLegacyCm2DefaultActionMapping(mappings)).toBe(false);
+    expect(mappings).toEqual(normalizeActionMappingsByModel(undefined));
   });
 });
 

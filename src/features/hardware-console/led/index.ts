@@ -2,6 +2,7 @@ export {
   AGENT_KEY_LED_COUNT,
   LED_EFFECT_BREATH,
   LED_EFFECT_OFF,
+  LED_EFFECT_SNAKE,
   LED_EFFECT_SOLID,
   buildRgbcfgParams,
   buildThStatusParams,
@@ -28,3 +29,11 @@ export {
   installHardwareConsoleLedStatus,
   type LedStatusDeps,
 } from './led-status-service';
+export {
+  DEFAULT_CLEAR_LIGHTING_TIMEOUT_MS,
+  clearHardwareConsoleLighting,
+  installHardwareConsoleClearLightingListener,
+  type ClearHardwareConsoleLightingOptions,
+  type ClearLightingIpcLike,
+  type ClearLightingListenerDeps,
+} from './clear-lighting';

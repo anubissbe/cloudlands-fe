@@ -128,7 +128,7 @@ import type {
   TaskStatus,
   Workspace,
 } from '$shared/types';
-import { WorkspaceStatus, isWorkspaceDisplayStatus } from '$shared/types';
+import { WorkspaceStatus, isWorkspaceAttention, isWorkspaceDisplayStatus } from '$shared/types';
 import type { AppliedSettingChange } from '$lib/client/app-client';
 import { store as appStore } from '$store/renderer/store';
 import { eventReceived } from '$store/renderer/slices/workspace-events/workspace-events-slice';
@@ -160,12 +160,15 @@ import {
 import { refreshRequested } from '$store/renderer/slices/changes/changes-slice';
 import {
   bulkUpdateWorkspaceEntities,
+  setWorkspaceEntity,
   updateWorkspaceEntity,
 } from '$store/renderer/slices/workspace/workspace-slice';
 import { navigateAwayIfViewing } from '$features/workspace/navigate-away-if-viewing';
+import { markWorkspaceSeenIfViewing } from '$features/workspace/mark-workspace-seen';
 import { applyNoteFromEvent } from '$features/notes/notes-read-service';
 import { applyCommentFromEvent } from '$features/comments/comments-read-service';
 import { ensureAgentSession } from '$features/agent/agent-read-service';
+import { notifyInterruptedAgentUpdated } from '$features/agent/interrupted-agents-service';
 import { hasLiveChatSubscription } from '$features/agent/chat-subscribe-service';
 import { recordAgentFailure, removeAgentFailure } from '$features/agent/agent-failure-registry';
 import { showAgentAttentionToast } from '$features/agent/agent-attention-toast-service';
@@ -319,7 +322,9 @@ function extractSubscriptionId(params: unknown): string | undefined {
  * `agent:stream:activity` / terminal `agent:stream:end` (intentd#792) into
  * the agent-session slice — no RPC, no client-side debounce (the daemon
  * already throttles the activity signal to 1s leading-edge). The `updateSession`
- * reducer is a no-op for unknown agents, so this never conjures a session.
+ * reducer is a no-op for unknown agents, so this never conjures a session —
+ * the stream handlers instead kick off `hydrateSessionIfUnknown` so the
+ * fields land via the next ping once the fetched session arrives.
  * Empty/whitespace values are dropped (the daemon omits fields until
  * derivable; an empty string would only arise from a contract regression).
  * The viewed agent's standing `chat.subscribe` buffer stays the authoritative
@@ -342,6 +347,23 @@ function applyStreamPreviewFields(
 }
 
 /**
+ * A live-stream event can arrive for an agent the agent-session slice does
+ * not know yet — e.g. a delegated sub-agent whose session was never hydrated
+ * in this window. `updateSession` no-ops for unknown agents, so the
+ * push-applied preview fields (`lastAgentResponse`/`digest`) and busy flags
+ * would be silently dropped until an unrelated refetch. Kick off the
+ * read-service hydration instead: `ensureAgentSession` coalesces concurrent
+ * calls per agent via its in-flight map and the daemon throttles activity to
+ * ≤1/s, so this cannot stampede. Already-hydrated agents never refetch. The
+ * callers still dispatch their chat-state actions unconditionally (chat-state
+ * materializes entries for unknown agents by design).
+ */
+function hydrateSessionIfUnknown(agentId: string): void {
+  if (appStore.state.agentSessions?.byAgentId[agentId]) return;
+  void ensureAgentSession(agentId);
+}
+
+/**
  * `agent:stream:activity` (PROTOCOL §7) is the content-free liveness ping —
  * no raw transcript content, leading-edge throttled per agent (first ping of
  * a turn immediate, then ≤1/s until the turn ends). The standing
@@ -361,9 +383,10 @@ function handleStreamActivityEvent(event: WorkspaceEvent): void {
   if (!data) return;
   const agentId = data.agentId;
   const messageId = data.messageId;
-  if (typeof agentId !== 'string' || typeof messageId !== 'string') {
+  if (typeof agentId !== 'string' || agentId.length === 0 || typeof messageId !== 'string') {
     return;
   }
+  hydrateSessionIfUnknown(agentId);
   const lastAgentResponse =
     typeof data.lastAgentResponse === 'string' ? data.lastAgentResponse : undefined;
   const digest = typeof data.digest === 'string' ? data.digest : undefined;
@@ -516,6 +539,7 @@ function handleStreamStatusEvent(event: WorkspaceEvent): void {
   if (typeof agentId !== 'string' || agentId.length === 0 || typeof phase !== 'string') {
     return;
   }
+  hydrateSessionIfUnknown(agentId);
   const message = typeof data.message === 'string' ? data.message : '';
   const levelRaw = data.level;
   const level: 'info' | 'warn' | 'error' =
@@ -566,6 +590,7 @@ function handleStreamStartEvent(event: WorkspaceEvent, workspaceId: string): voi
   ) {
     return;
   }
+  hydrateSessionIfUnknown(agentId);
   if (wakeTurnMessageIdByAgent.get(agentId) === messageId) return;
   wakeTurnMessageIdByAgent.set(agentId, messageId);
   appStore.dispatch(chatSendStarted(agentId, workspaceId));
@@ -689,6 +714,11 @@ function handleAgentUpdatedEvent(event: WorkspaceEvent): void {
   const agentId = data.agentId;
   if (typeof agentId !== 'string' || agentId.length === 0) return;
   void ensureAgentSession(agentId);
+  // Cross-window InterruptedAgentsModal reconciliation (§5.35):
+  // agent.resolveInterrupted emits agent:updated per resolved agent, so an
+  // open modal listing this agent re-checks agent.listInterrupted (debounced;
+  // no-op when the modal is closed or the agent is not listed).
+  notifyInterruptedAgentUpdated(agentId);
 }
 
 /**
@@ -1170,6 +1200,31 @@ function handleDisplayStatusChangedEvent(event: WorkspaceEvent, envelopeWorkspac
 }
 
 /**
+ * `workspace:attention-changed` (PROTOCOL §6.5 / §9.9) carries the
+ * self-sufficient payload `{ workspaceId, attention }` — the daemon emits it
+ * only on an actual change, so the FE mirrors the new value directly into the
+ * workspace entity without a follow-up `workspace.get`. The wire values are
+ * snake_case and match the FE type exactly, so no mapping is needed. The
+ * HUD consumes this same event through its own subscription
+ * (`hud-subscription.ts`) with independent bucket semantics — this handler
+ * only feeds the workspace entity store.
+ */
+function handleAttentionChangedEvent(event: WorkspaceEvent, workspaceId: string): void {
+  const data = (event as { data?: Record<string, unknown> }).data;
+  if (!data) return;
+  const attention = data.attention;
+  if (!isWorkspaceAttention(attention)) return;
+  appStore.dispatch(
+    bulkUpdateWorkspaceEntities([updateWorkspaceEntity(workspaceId, { attention })]),
+  );
+  // An unread raise for the workspace the user is currently viewing is marked
+  // seen immediately (fire-and-forget `workspace.markSeen`, §5.1) — no
+  // self-blue-dot while the user is looking at it. The daemon answers with a
+  // fresh attention-changed (`none`) that flows back through this handler.
+  if (attention === 'unread') markWorkspaceSeenIfViewing(workspaceId);
+}
+
+/**
  * Reconcile workspace.activity when a missed edge is detected. The daemon only
  * emits `workspace:activity-changed` on the 0↔1 edge; for coordinator-only
  * workspaces that edge can fire before the FE bridge subscribed or before the
@@ -1227,6 +1282,31 @@ async function reconcileWorkspaceActivity(
 }
 
 /**
+ * Refresh the workspace entity's BE-owned `agentSummary` aggregate (PROTOCOL
+ * §5.1) after an `agent:deleted` event. The HUD card agent rows are built
+ * from `workspace.agentSummary.agents` (`agentInfosOf` in hud-selectors.ts),
+ * which the `agent.list` hydration path does NOT touch — without this
+ * refetch a deleted agent lingers on its card until an unrelated workspace
+ * refetch. Fetch `workspace.get` and merge the fresh entity via
+ * `setWorkspaceEntity` (the `mergeWorkspaceEnrichment` path takes the
+ * incoming `agentSummary` when present). Best-effort like
+ * `reconcileWorkspaceActivity`: errors (workspace itself deleted, transport)
+ * are swallowed.
+ */
+async function reconcileWorkspaceAgentSummary(workspaceId: string): Promise<void> {
+  try {
+    const response = (await backendRequest('workspace.get', { workspaceId })) as
+      | { workspace?: Workspace }
+      | undefined;
+    const workspace = response?.workspace;
+    if (!workspace) return;
+    appStore.dispatch(setWorkspaceEntity(workspace));
+  } catch (_error) {
+    // Workspace might have been deleted or transport error; no-op is safe.
+  }
+}
+
+/**
  * `workspace:updated` (PROTOCOL §6.5 / §7) carries `{ workspaceId, changes }`
  * where `changes` is the applied `WorkspaceUpdate` delta — the fields the
  * caller actually asked to mutate, with `Option::is_none` fields skipped in
@@ -1239,8 +1319,9 @@ async function reconcileWorkspaceActivity(
  * `WorkspaceProgressCard`'s `listenSync`, but never touched Redux).
  *
  * The wire delta is whitelisted against the applied-delta shape rather than
- * blind-spread, so unknown fields (e.g. `attention`, which has no FE
- * `Workspace` field) are dropped rather than leaking into the entity. Field
+ * blind-spread, so unknown fields are dropped rather than leaking into the
+ * entity (`attention` is deliberately absent from the whitelist — its changes
+ * arrive via the dedicated `workspace:attention-changed` event). Field
  * names match FE `Workspace` camelCase 1:1 with the daemon struct.
  *
  * The legacy `relayLegacyIpcEvent` re-emit (case `"workspace:updated"`) stays
@@ -1889,6 +1970,12 @@ function handleNotification(method: string, params: unknown): void {
   if (type === 'workspace:displayStatus-changed') {
     handleDisplayStatusChangedEvent(event, workspaceId);
   }
+  // `workspace:attention-changed` (§6.5 / §9.9) — merge the BE-owned
+  // dismissible attention flag onto the workspace entity so unread indicators
+  // update live without a refetch. Side effect, never an early return.
+  if (type === 'workspace:attention-changed') {
+    handleAttentionChangedEvent(event, workspaceId);
+  }
 
   // Legacy mock-IPC re-emit (side effect, never an early return) — components
   // still listening on the legacy channels get the daemon event too.
@@ -1902,9 +1989,10 @@ function handleNotification(method: string, params: unknown): void {
     refreshWorkspaceSubscriptionEntries(workspaceId);
   }
 
-  // STAB-9: Agent lifecycle events (status-changed, idle) should refresh the
-  // agent list so the sidebar shows live status/last-activity updates.
-  if (type === 'agent:status-changed' || type === 'agent:idle') {
+  // STAB-9: Agent lifecycle events (status-changed, idle, deleted) should
+  // refresh the agent list so the sidebar shows live status/last-activity
+  // updates and drops deleted agents without an unrelated refetch.
+  if (type === 'agent:status-changed' || type === 'agent:idle' || type === 'agent:deleted') {
     appStore.dispatch(hydrateAgentsRequested(workspaceId));
   }
 
@@ -1935,6 +2023,11 @@ function handleNotification(method: string, params: unknown): void {
       // bounded by live agents.
       previewTurnMessageIdByAgent.delete(data.agentId);
     }
+    // Refresh the workspace entity's BE-owned `agentSummary` aggregate so the
+    // HUD card rows drop the deleted agent immediately — the `agent.list`
+    // hydration above does not touch it. Fire-and-forget side effect, falls
+    // through to the timeline dispatch below.
+    void reconcileWorkspaceAgentSummary(workspaceId);
   }
 
   // monorepo#1106: a redrive that bypasses chat-send-service — coordinator
@@ -2256,6 +2349,9 @@ const BRIDGE_SUBSCRIBE_EVENT_TYPES = [
   // current-cycle display status transitions so the sidebar grouping updates
   // without a refetch.
   'workspace:displayStatus-changed',
+  // `workspace:attention-changed` (§6.5 / §9.9) — self-sufficient dismissible
+  // attention flag changes so unread indicators update without a refetch.
+  'workspace:attention-changed',
   'workspace:updated',
   'workspace:created',
   'workspace:deleted',

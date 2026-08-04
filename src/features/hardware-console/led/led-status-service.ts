@@ -14,6 +14,7 @@ import type { StoreMiddleware } from '$lib/store-shim/types';
 import { store as appStore } from '$store/renderer/store';
 import type { HardwareConsoleManager } from '../device/device-manager';
 import { getHardwareConsoleManager } from '../instance';
+import { installHardwareConsoleClearLightingListener } from './clear-lighting';
 import { HardwareLedEngine } from './engine';
 import { buildHardwareLedSnapshot, type LedSnapshotState } from './snapshot';
 
@@ -73,16 +74,19 @@ let installed = false;
 
 /**
  * Lazily install on the first dispatched action (same pattern as the
- * connection-toast / key-switch middlewares): starts the shared manager —
- * idempotent, a no-op without WebHID — and wires LED status updates.
+ * connection-toast / key-switch middlewares): wires LED status updates plus
+ * the shutdown clear-lighting IPC listener (which tears the LED wiring down
+ * before sending the off-frame; see clear-lighting.ts). The shared manager
+ * is started by the integration-toggle middleware once the persisted
+ * enabled flag hydrates on.
  */
 export function createHardwareConsoleLedStatusMiddleware(): StoreMiddleware {
   return () => (next) => (action) => {
     if (!installed) {
       installed = true;
       const manager = getHardwareConsoleManager();
-      installHardwareConsoleLedStatus(manager);
-      void manager.start();
+      const disposeLedWiring = installHardwareConsoleLedStatus(manager);
+      installHardwareConsoleClearLightingListener(manager, { disposeLedWiring });
     }
     return next(action);
   };

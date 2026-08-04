@@ -6,6 +6,8 @@
   import { onMount } from 'svelte';
   import { m } from '$shared/paraglide/messages.js';
   import { validateBranchPrefix, sanitizeBranchPrefix } from '$lib/utils/workspace-validation';
+  import PathSettingField from './PathSettingField.svelte';
+  import { Select } from '$lib/components/ui/select';
 
   // Settings state
   let worktreesLocation = $state('');
@@ -59,6 +61,16 @@
           { value: '/usr/bin/fish', label: 'Fish' },
         ]),
   ];
+
+  // Unknown/custom values (e.g. hand-edited settings) fall back to the raw value.
+  const selectedShellLabel = $derived(
+    shellOptions.find((option) => option.value === defaultShell)?.label ?? defaultShell,
+  );
+
+  function handleShellChange(value: string) {
+    defaultShell = value;
+    handleSave();
+  }
 
   onMount(async () => {
     await loadSettings();
@@ -170,16 +182,17 @@
       <label for="worktreesLocation" class="text-sm font-medium text-foreground shrink-0">
         {m.settings_gitWorkspace_worktreesLocation_label()}
       </label>
-      <div class="flex gap-2 flex-1 max-w-md">
-        <input
-          id="worktreesLocation"
-          type="text"
-          bind:value={worktreesLocation}
-          onblur={handleSave}
-          class="flex-1 px-3 py-1.5 bg-background border border-border rounded-md text-sm text-foreground transition-all focus:outline-none focus:border-primary focus:ring-2 focus:ring-primary/10"
-          placeholder={'~/intent/workspaces' /* i18n-ignore (file path) */}
-        />
-      </div>
+      <PathSettingField
+        id="worktreesLocation"
+        bind:value={worktreesLocation}
+        placeholder={'~/intent/workspaces' /* i18n-ignore (file path) */}
+        pickerTitle={m.settings_gitWorkspace_worktreesLocation_label()}
+        confirm={{
+          title: m.settings_gitWorkspace_worktreesLocation_confirm_title(),
+          message: m.settings_gitWorkspace_worktreesLocation_confirm_message(),
+        }}
+        onchange={handleSave}
+      />
     </div>
   </section>
 
@@ -196,16 +209,15 @@
           <code class="bg-muted px-1 rounded">~/.ssh/id_ed25519</code>)
         </p>
       </div>
-      <div class="flex gap-2 flex-1 max-w-md">
-        <input
-          id="sshKeyPath"
-          type="text"
-          bind:value={sshKeyPath}
-          onblur={handleSave}
-          class="flex-1 px-3 py-1.5 bg-background border border-border rounded-md text-sm text-foreground transition-all focus:outline-none focus:border-primary focus:ring-2 focus:ring-primary/10"
-          placeholder={'~/.ssh/id_ed25519' /* i18n-ignore (file path) */}
-        />
-      </div>
+      <PathSettingField
+        mode="file"
+        id="sshKeyPath"
+        bind:value={sshKeyPath}
+        placeholder={'~/.ssh/id_ed25519' /* i18n-ignore (file path) */}
+        defaultPath={'~/.ssh' /* i18n-ignore (file path) */}
+        pickerTitle={m.settings_gitWorkspace_sshKeyPath_label()}
+        onchange={handleSave}
+      />
     </div>
   </section>
 
@@ -215,16 +227,20 @@
       <label for="defaultShell" class="text-sm font-medium text-foreground shrink-0">
         {m.settings_gitWorkspace_defaultShell_label()}
       </label>
-      <select
-        id="defaultShell"
-        bind:value={defaultShell}
-        onchange={handleSave}
-        class="w-56 px-3 py-1.5 bg-background border border-border rounded-md text-sm text-foreground transition-all focus:outline-none focus:border-primary focus:ring-2 focus:ring-primary/10"
-      >
-        {#each shellOptions as option (option.value)}
-          <option value={option.value}>{option.label}</option>
-        {/each}
-      </select>
+      <div class="w-56 shrink-0">
+        <Select.Root value={defaultShell} onchange={handleShellChange}>
+          <Select.Trigger id="defaultShell" class="py-1.5">
+            <span class="truncate">{selectedShellLabel}</span>
+          </Select.Trigger>
+          <Select.Content portal class="max-h-[300px] w-56">
+            {#each shellOptions as option (option.value)}
+              <Select.Item value={option.value}>
+                <span class="truncate">{option.label}</span>
+              </Select.Item>
+            {/each}
+          </Select.Content>
+        </Select.Root>
+      </div>
     </div>
   </section>
 
