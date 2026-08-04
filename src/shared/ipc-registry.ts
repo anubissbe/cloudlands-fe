@@ -808,6 +808,13 @@ export const IPC_CHANNELS = {
     CHANGED: 'token-usage:changed',
   },
 
+  // Execution-environment profiles (sandbox.profiles.* / sandbox.options, PROTOCOL §5.5b)
+  SANDBOX: {
+    PROFILES_LIST: 'sandbox:profiles:list',
+    PROFILES_UPDATE: 'sandbox:profiles:update',
+    OPTIONS: 'sandbox:options',
+  },
+
   // Live backend transport (JSON-RPC 2.0 bridge to the intentd daemon).
   // The JSON-RPC client lives in the main process; the renderer reaches it
   // through these request/subscription channels and receives daemon

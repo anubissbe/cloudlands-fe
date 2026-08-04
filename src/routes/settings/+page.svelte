@@ -17,6 +17,7 @@
     type AIBehaviorView,
   } from '$lib/components/settings/AIBehaviorSidebar.svelte';
   import ConnectionsSettings from '$lib/components/settings/ConnectionsSettings.svelte';
+  import ExecutionEnvironmentSettings from '$lib/components/settings/ExecutionEnvironmentSettings.svelte';
   import GitWorkspaceSettings from '$lib/components/settings/GitWorkspaceSettings.svelte';
   import LegacyImportSettings from '$lib/components/settings/LegacyImportSettings.svelte';
   import OpenInAppsSettings from '$lib/components/settings/OpenInAppsSettings.svelte';
@@ -442,6 +443,14 @@
             {m.settings_section_gitWorkspace()}
           </h2>
           <GitWorkspaceSettings bind:this={gitWorkspaceSettingsRef} />
+        </div>
+
+        <!-- Execution Environments -->
+        <div id="execution-environments" class="mb-12">
+          <h2 class="text-xs font-medium text-muted-foreground uppercase tracking-wider mb-3">
+            {m.settings_section_executionEnvironments()}
+          </h2>
+          <ExecutionEnvironmentSettings />
         </div>
 
         <!-- Notifications -->

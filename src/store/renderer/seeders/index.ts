@@ -32,3 +32,4 @@ import './window-state-bridge-seeder';
 import './native-dialog-bridge-seeder';
 import './notification-bridge-seeder';
 import './language-preference-bridge-seeder';
+import './sandbox-bridge-seeder';

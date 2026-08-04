@@ -730,6 +730,52 @@ export class ProtocolAdapter {
   }
 
   // ============================================================================
+  // Execution-Environment Profiles (sandbox.profiles.* / sandbox.options, §5.5b)
+  // ============================================================================
+
+  /** `sandbox.profiles.list` — the configured execution-environment profiles (daemon-global). */
+  async listSandboxProfiles(): Promise<Result<any, string>> {
+    try {
+      const result = await getBackendClient().request<any>('sandbox.profiles.list');
+      return { ok: true, data: result };
+    } catch (error) {
+      logger.error('Failed to list sandbox profiles', error as Error);
+      return { ok: false, error: (error as Error).message };
+    }
+  }
+
+  /**
+   * `sandbox.profiles.update` — typed façade over settings.update for the
+   * `sandbox.*` group. Validation failures (-32602) apply nothing.
+   */
+  async updateSandboxProfiles(changes: {
+    defaultType?: string;
+    profiles?: Record<string, { enabled?: boolean; image?: unknown }>;
+  }): Promise<Result<any, string>> {
+    try {
+      const daemonParams: Record<string, unknown> = {};
+      if (changes.defaultType !== undefined) daemonParams.defaultType = changes.defaultType;
+      if (changes.profiles !== undefined) daemonParams.profiles = changes.profiles;
+      const result = await getBackendClient().request<any>('sandbox.profiles.update', daemonParams);
+      return { ok: true, data: result };
+    } catch (error) {
+      logger.error('Failed to update sandbox profiles', error as Error);
+      return { ok: false, error: (error as Error).message };
+    }
+  }
+
+  /** `sandbox.options` — the capability-resolved availability matrix (daemon-global). */
+  async getSandboxOptions(): Promise<Result<any, string>> {
+    try {
+      const result = await getBackendClient().request<any>('sandbox.options');
+      return { ok: true, data: result };
+    } catch (error) {
+      logger.error('Failed to get sandbox options', error as Error);
+      return { ok: false, error: (error as Error).message };
+    }
+  }
+
+  // ============================================================================
   // Helper Methods
   // ============================================================================
 

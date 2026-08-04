@@ -12,7 +12,6 @@
   let sshKeyPath = $state('');
   let autoFetch = $state(false);
   let autoCommit = $state(true);
-  let cowIsolation = $state(false);
   let exposeGitCredential = $state(true);
   let defaultShell = $state('auto');
   let branchPrefix = $state('');
@@ -24,20 +23,15 @@
   // to a daemon that didn't report it.
   let gitCredentialSettingSupported = $state(false);
 
-  // CoW toggle is visible only when the machine supports it — a direct probe
-  // of the workspaces root via `system.capabilities` (PROTOCOL §5.7), with no
-  // dependency on an active/hydrated workspace.
-  let cowSupported = $state(false);
-  const showCowToggle = $derived(cowSupported);
-
   // Daemon setting path per field (PROTOCOL §5.12, BE-owned workspace/git group).
+  // The legacy `workspace.cowIsolation` toggle moved to the Execution
+  // Environments section (`cow` profile row, PROTOCOL §5.5b).
   const SETTING_PATHS = {
     worktreesLocation: 'workspace.worktreesLocation',
     sshKeyPath: 'workspace.sshKeyPath',
     defaultShell: 'workspace.defaultShell',
     autoFetch: 'workspace.autoFetch',
     autoCommit: 'git.autoCommit',
-    cowIsolation: 'workspace.cowIsolation',
     branchPrefix: 'workspace.branchPrefix',
     exposeGitCredential: 'sourceControl.github.exposeGitCredentialToChildren',
   } as const;
@@ -67,16 +61,8 @@
   ];
 
   onMount(async () => {
-    void loadCowCapability();
     await loadSettings();
   });
-
-  async function loadCowCapability() {
-    // capabilities() always resolves ({} on failure), so unknown/error keeps
-    // the toggle hidden rather than crashing the settings pane.
-    const caps = await appClient.system.capabilities();
-    cowSupported = caps.cowSupported === true;
-  }
 
   function stringValue(value: unknown): string {
     return typeof value === 'string' ? value : '';
@@ -89,7 +75,6 @@
       [SETTING_PATHS.defaultShell]: defaultShell,
       [SETTING_PATHS.autoFetch]: autoFetch,
       [SETTING_PATHS.autoCommit]: autoCommit,
-      [SETTING_PATHS.cowIsolation]: cowIsolation,
       [SETTING_PATHS.branchPrefix]: branchPrefix,
       ...(gitCredentialSettingSupported
         ? { [SETTING_PATHS.exposeGitCredential]: exposeGitCredential }
@@ -110,7 +95,6 @@
     defaultShell = stringValue(byPath.get(SETTING_PATHS.defaultShell)) || 'auto';
     autoFetch = byPath.get(SETTING_PATHS.autoFetch) === true;
     autoCommit = byPath.get(SETTING_PATHS.autoCommit) !== false;
-    cowIsolation = byPath.get(SETTING_PATHS.cowIsolation) === true;
     branchPrefix = stringValue(byPath.get(SETTING_PATHS.branchPrefix));
     gitCredentialSettingSupported = byPath.has(SETTING_PATHS.exposeGitCredential);
     // Security-sensitive: only an explicit boolean `true` counts as enabled, so
@@ -161,7 +145,6 @@
     sshKeyPath = '';
     autoFetch = false;
     autoCommit = true;
-    cowIsolation = false;
     exposeGitCredential = true;
     defaultShell = 'auto';
     branchPrefix = '';
@@ -300,32 +283,6 @@
       </label>
     </div>
   </section>
-
-  <!-- Copy-on-Write isolation -->
-  {#if showCowToggle}
-    <section class="px-6 py-2">
-      <div class="flex items-center gap-2">
-        <label class="flex items-center gap-2 text-sm text-foreground cursor-pointer">
-          <input
-            type="checkbox"
-            bind:checked={cowIsolation}
-            onchange={handleSave}
-            class="cursor-pointer"
-            aria-describedby="cow-isolation-description"
-          />
-          <span>{m.settings_gitWorkspace_cowIsolation_label()}</span>
-        </label>
-        <span
-          class="inline-flex items-center shrink-0 rounded-full bg-muted/20 px-1 text-ui-sm leading-4 text-subtle"
-        >
-          {m.settings_gitWorkspace_experimental_badge()}
-        </span>
-      </div>
-      <p id="cow-isolation-description" class="text-xs text-subtle mt-0.5 ml-6">
-        {m.settings_gitWorkspace_cowIsolation_description()}
-      </p>
-    </section>
-  {/if}
 
   <!-- Git credentials -->
   {#if gitCredentialSettingSupported}
