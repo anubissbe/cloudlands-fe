@@ -211,9 +211,28 @@ export const SandboxProfilesSchema = z.object({
       enabled: z.boolean(),
       // microvm row only: the optional default guest-image override.
       image: SandboxImageSchema.nullable().optional(),
+      // microvm row only: default VM sizing (sandbox.microvm.vcpus/memMib).
+      vcpus: z.number().optional(),
+      memMib: z.number().optional(),
     }),
   ),
 });
+
+/** `sandbox.image.check` result shape — dry-run guest-image validity (PROTOCOL §5.5b, v3.4). */
+export const SandboxImageCheckSchema = z.union([
+  z.object({
+    valid: z.literal(true),
+    imageId: z.string(),
+    version: z.string(),
+    arch: z.string(),
+    // Hex sha of the fetched manifest — the pin to save with the override.
+    manifestSha256: z.string(),
+  }),
+  z.object({
+    valid: z.literal(false),
+    error: z.string(),
+  }),
+]);
 
 /** `sandbox.options` result shape — capability-resolved availability matrix (PROTOCOL §5.5b). */
 export const SandboxOptionsSchema = z.object({
@@ -233,6 +252,7 @@ export const SandboxOptionsSchema = z.object({
 export type SandboxType = z.infer<typeof SandboxTypeSchema>;
 export type SandboxProfiles = z.infer<typeof SandboxProfilesSchema>;
 export type SandboxOptions = z.infer<typeof SandboxOptionsSchema>;
+export type SandboxImageCheck = z.infer<typeof SandboxImageCheckSchema>;
 
 export const CreateWorkspaceRequestSchema = z.object({
   title: z.string().max(100).optional(),

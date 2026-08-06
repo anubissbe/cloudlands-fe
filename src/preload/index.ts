@@ -517,6 +517,7 @@ const ALLOWED_CHANNELS = [
   "sandbox:profiles:list",
   "sandbox:profiles:update",
   "sandbox:options",
+  "sandbox:image:check",
   "backend:request",
   "backend:subscribe",
   "backend:unsubscribe",

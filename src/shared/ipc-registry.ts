@@ -814,6 +814,7 @@ export const IPC_CHANNELS = {
     PROFILES_LIST: 'sandbox:profiles:list',
     PROFILES_UPDATE: 'sandbox:profiles:update',
     OPTIONS: 'sandbox:options',
+    IMAGE_CHECK: 'sandbox:image:check',
   },
 
   // Live backend transport (JSON-RPC 2.0 bridge to the intentd daemon).

@@ -44,6 +44,29 @@ const baseOptions = {
   ],
 };
 
+/** PROTOCOL §5.5b-shaped `sandbox.profiles.list` fixture (default sizing, no override). */
+const baseProfiles = {
+  defaultType: 'worktree',
+  profiles: [
+    { type: 'direct', enabled: true },
+    { type: 'worktree', enabled: true },
+    { type: 'cow', enabled: false },
+    { type: 'microvm', enabled: false, image: null, vcpus: 2, memMib: 2048 },
+  ],
+};
+
+/** Channel-aware default mock: options matrix + configured profiles. */
+function mockChannels(
+  overrides: Partial<Record<string, unknown>> = {},
+): (channel: string, arg?: unknown) => Promise<unknown> {
+  return async (channel: string) => {
+    if (channel in overrides) return overrides[channel];
+    if (channel === SANDBOX_CHANNELS.OPTIONS) return { success: true, data: baseOptions };
+    if (channel === SANDBOX_CHANNELS.PROFILES_LIST) return { success: true, data: baseProfiles };
+    return { success: true, data: baseProfiles };
+  };
+}
+
 function emitEvent(type: string, data: Record<string, unknown> = {}) {
   for (const handler of mocks.notificationHandlers) {
     handler({ method: 'events.event', params: { event: { type, data } } });
@@ -55,7 +78,7 @@ describe('ExecutionEnvironmentSettings (§5.5b)', () => {
     vi.clearAllMocks();
     mocks.notificationHandlers.length = 0;
     mocks.mockSettingsGet.mockResolvedValue(null);
-    mocks.mockInvoke.mockResolvedValue({ success: true, data: baseOptions });
+    mocks.mockInvoke.mockImplementation(mockChannels());
   });
 
   afterEach(() => {
@@ -202,9 +225,23 @@ describe('ExecutionEnvironmentSettings (§5.5b)', () => {
         { type: 'microvm', enabled: true, available: true, default: false },
       ],
     };
+    const microvmOnProfiles = {
+      defaultType: 'worktree',
+      profiles: [
+        { type: 'direct', enabled: true },
+        { type: 'worktree', enabled: true },
+        { type: 'cow', enabled: true },
+        { type: 'microvm', enabled: true, image: null, vcpus: 4, memMib: 4096 },
+      ],
+    };
 
     beforeEach(() => {
-      mocks.mockInvoke.mockResolvedValue({ success: true, data: microvmOnOptions });
+      mocks.mockInvoke.mockImplementation(
+        mockChannels({
+          [SANDBOX_CHANNELS.OPTIONS]: { success: true, data: microvmOnOptions },
+          [SANDBOX_CHANNELS.PROFILES_LIST]: { success: true, data: microvmOnProfiles },
+        }),
+      );
     });
 
     it('shows the claude-code not-set-up state when the token setting is absent', async () => {
@@ -307,6 +344,155 @@ describe('ExecutionEnvironmentSettings (§5.5b)', () => {
       });
       await waitFor(() => {
         expect(screen.getByText(/Guest image download failed: checksum mismatch/)).toBeTruthy();
+      });
+    });
+
+    it('seeds the sizing inputs from sandbox.profiles.list and commits changes via profiles.update', async () => {
+      render(ExecutionEnvironmentSettings);
+
+      const vcpus = (await screen.findByLabelText('vCPUs')) as HTMLInputElement;
+      const memMib = (await screen.findByLabelText('Memory (MiB)')) as HTMLInputElement;
+      // Seeded from the microvm profile row (vcpus: 4, memMib: 4096).
+      expect(vcpus.value).toBe('4');
+      expect(memMib.value).toBe('4096');
+
+      await fireEvent.input(vcpus, { target: { value: '8' } });
+      await fireEvent.change(vcpus);
+      await waitFor(() => {
+        expect(mocks.mockInvoke).toHaveBeenCalledWith(SANDBOX_CHANNELS.PROFILES_UPDATE, {
+          profiles: { microvm: { vcpus: 8 } },
+        });
+      });
+
+      await fireEvent.input(memMib, { target: { value: '8192' } });
+      await fireEvent.change(memMib);
+      await waitFor(() => {
+        expect(mocks.mockInvoke).toHaveBeenCalledWith(SANDBOX_CHANNELS.PROFILES_UPDATE, {
+          profiles: { microvm: { memMib: 8192 } },
+        });
+      });
+    });
+
+    it('shows the built-in image state when no override is configured', async () => {
+      render(ExecutionEnvironmentSettings);
+
+      await waitFor(() => {
+        expect(screen.getByText('Using the built-in default image.')).toBeTruthy();
+      });
+      // No override → no reset action.
+      expect(screen.queryByText('Reset to default')).toBeNull();
+    });
+
+    it('checks a manifest URL via sandbox:image:check and persists the pinned override on valid', async () => {
+      mocks.mockInvoke.mockImplementation(
+        mockChannels({
+          [SANDBOX_CHANNELS.OPTIONS]: { success: true, data: microvmOnOptions },
+          [SANDBOX_CHANNELS.PROFILES_LIST]: { success: true, data: microvmOnProfiles },
+          [SANDBOX_CHANNELS.IMAGE_CHECK]: {
+            success: true,
+            data: {
+              valid: true,
+              imageId: 'intent-guest-base',
+              version: '2.0.0',
+              arch: 'aarch64',
+              manifestSha256: 'a'.repeat(64),
+            },
+          },
+        }),
+      );
+
+      render(ExecutionEnvironmentSettings);
+
+      const input = (await screen.findByLabelText(
+        'Guest image manifest URL',
+      )) as HTMLInputElement;
+      await fireEvent.input(input, { target: { value: 'https://example.test/m.json' } });
+      await fireEvent.click(screen.getByText('Check & save'));
+
+      await waitFor(() => {
+        expect(mocks.mockInvoke).toHaveBeenCalledWith(SANDBOX_CHANNELS.IMAGE_CHECK, {
+          manifestUrl: 'https://example.test/m.json',
+        });
+        // Valid → persisted with the checked document's sha as the pin.
+        expect(mocks.mockInvoke).toHaveBeenCalledWith(SANDBOX_CHANNELS.PROFILES_UPDATE, {
+          profiles: {
+            microvm: {
+              image: { manifestUrl: 'https://example.test/m.json', sha256: 'a'.repeat(64) },
+            },
+          },
+        });
+        expect(screen.getByText(/Valid: intent-guest-base 2\.0\.0 \(aarch64\)/)).toBeTruthy();
+      });
+    });
+
+    it('surfaces an invalid check result and does not persist', async () => {
+      mocks.mockInvoke.mockImplementation(
+        mockChannels({
+          [SANDBOX_CHANNELS.OPTIONS]: { success: true, data: microvmOnOptions },
+          [SANDBOX_CHANNELS.PROFILES_LIST]: { success: true, data: microvmOnProfiles },
+          [SANDBOX_CHANNELS.IMAGE_CHECK]: {
+            success: true,
+            data: { valid: false, error: 'failed to fetch image manifest' },
+          },
+        }),
+      );
+
+      render(ExecutionEnvironmentSettings);
+
+      const input = (await screen.findByLabelText(
+        'Guest image manifest URL',
+      )) as HTMLInputElement;
+      await fireEvent.input(input, { target: { value: 'https://bad.test/m.json' } });
+      await fireEvent.click(screen.getByText('Check & save'));
+
+      await waitFor(() => {
+        expect(screen.getByText(/Invalid image: failed to fetch image manifest/)).toBeTruthy();
+      });
+      expect(mocks.mockInvoke).not.toHaveBeenCalledWith(
+        SANDBOX_CHANNELS.PROFILES_UPDATE,
+        expect.anything(),
+      );
+    });
+
+    it('resets a configured override back to the built-in default (explicit image: null)', async () => {
+      const overrideProfiles = {
+        defaultType: 'worktree',
+        profiles: [
+          { type: 'direct', enabled: true },
+          { type: 'worktree', enabled: true },
+          { type: 'cow', enabled: true },
+          {
+            type: 'microvm',
+            enabled: true,
+            image: { manifestUrl: 'https://example.test/m.json', sha256: 'b'.repeat(64) },
+            vcpus: 4,
+            memMib: 4096,
+          },
+        ],
+      };
+      mocks.mockInvoke.mockImplementation(
+        mockChannels({
+          [SANDBOX_CHANNELS.OPTIONS]: { success: true, data: microvmOnOptions },
+          [SANDBOX_CHANNELS.PROFILES_LIST]: { success: true, data: overrideProfiles },
+        }),
+      );
+
+      render(ExecutionEnvironmentSettings);
+
+      await waitFor(() => {
+        expect(screen.getByText('Using a custom image manifest.')).toBeTruthy();
+      });
+      const input = (await screen.findByLabelText(
+        'Guest image manifest URL',
+      )) as HTMLInputElement;
+      expect(input.value).toBe('https://example.test/m.json');
+
+      await fireEvent.click(screen.getByText('Reset to default'));
+
+      await waitFor(() => {
+        expect(mocks.mockInvoke).toHaveBeenCalledWith(SANDBOX_CHANNELS.PROFILES_UPDATE, {
+          profiles: { microvm: { image: null } },
+        });
       });
     });
   });

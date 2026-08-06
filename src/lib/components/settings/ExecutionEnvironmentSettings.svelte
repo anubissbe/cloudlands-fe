@@ -23,12 +23,22 @@
   import { m } from '$shared/paraglide/messages.js';
   import { invoke } from '$shared/generated/ipc-client';
   import { SANDBOX_CHANNELS } from '$shared/ipc/channels';
-  import type { SandboxOptions, SandboxType } from '$shared/schemas';
+  import type {
+    SandboxImageCheck,
+    SandboxOptions,
+    SandboxProfiles,
+    SandboxType,
+  } from '$shared/schemas';
   import { appClient } from '$lib/client';
   import { onBackendNotification } from '$lib/client/live/backend-transport';
   import Toggle from '$lib/components/ui/toggle/toggle.svelte';
 
   const CLAUDE_TOKEN_PATH = 'providers.claudeCodeOauthToken';
+
+  // Mirrors the daemon's sandbox.microvm.vcpus / memMib bounds (§5.12).
+  const MIN_VCPUS = 1;
+  const MAX_VCPUS = 16;
+  const MIN_MEM_MIB = 128;
 
   interface SandboxEnvelope<T> {
     success: boolean;
@@ -40,6 +50,20 @@
   let options = $state<SandboxOptions | null>(null);
   let settingsError = $state('');
   let updating = $state(false);
+
+  // microVM sizing drafts (bound to the number inputs; committed on change).
+  let vcpusDraft = $state(2);
+  let memMibDraft = $state(2048);
+
+  // Guest-image override state ("check before save", sandbox.image.check).
+  let imageOverride = $state<{ manifestUrl: string; sha256: string } | null>(null);
+  let imageUrlDraft = $state('');
+  let imageChecking = $state(false);
+  let imageCheckResult = $state<
+    | { kind: 'valid'; imageId: string; version: string; arch: string }
+    | { kind: 'invalid'; error: string }
+    | null
+  >(null);
 
   // microVM guest-image download state, driven by sandbox:image:* events.
   let imageStatus = $state<
@@ -81,6 +105,7 @@
 
   onMount(() => {
     void loadOptions();
+    void loadProfiles();
     void loadTokenState();
     // Guest-image pipeline events (PROTOCOL §6.5, sandbox image family).
     const dispose = onBackendNotification((n) => {
@@ -147,6 +172,27 @@
     }
   }
 
+  /** Read the configured profiles (microvm sizing + image override) into the drafts. */
+  async function loadProfiles() {
+    try {
+      const result = await invoke<SandboxEnvelope<SandboxProfiles>>(
+        SANDBOX_CHANNELS.PROFILES_LIST,
+        undefined,
+      );
+      if (result?.success && result.data) {
+        const microvm = result.data.profiles.find((p) => p.type === 'microvm');
+        if (microvm) {
+          if (typeof microvm.vcpus === 'number') vcpusDraft = microvm.vcpus;
+          if (typeof microvm.memMib === 'number') memMibDraft = microvm.memMib;
+          imageOverride = microvm.image ?? null;
+          imageUrlDraft = microvm.image?.manifestUrl ?? '';
+        }
+      }
+    } catch (error) {
+      console.error('Failed to load sandbox profiles:', error);
+    }
+  }
+
   async function loadTokenState() {
     // Sensitive setting: reads return null (absent) or a redacted placeholder
     // (present) — never plaintext (§5.12). Any non-null value means "ready".
@@ -157,7 +203,17 @@
   /** Send one profile-shaped update and re-render from the daemon's response. */
   async function applyUpdate(changes: {
     defaultType?: SandboxType;
-    profiles?: Partial<Record<SandboxType, { enabled?: boolean }>>;
+    profiles?: Partial<
+      Record<
+        SandboxType,
+        {
+          enabled?: boolean;
+          vcpus?: number;
+          memMib?: number;
+          image?: { manifestUrl: string; sha256: string } | null;
+        }
+      >
+    >;
   }) {
     if (updating) return;
     updating = true;
@@ -180,6 +236,7 @@
       // A rejected update (-32602, nothing applied) keeps its error visible
       // across the refresh.
       await loadOptions();
+      await loadProfiles();
       settingsError = updateError;
     }
   }
@@ -191,6 +248,62 @@
   function handleDefaultChange(event: Event) {
     const value = (event.currentTarget as HTMLSelectElement).value as SandboxType;
     void applyUpdate({ defaultType: value });
+  }
+
+  /** Commit a sizing field on change; the daemon range-validates (§5.12). */
+  function handleSizingChange(field: 'vcpus' | 'memMib', raw: number) {
+    if (!Number.isFinite(raw)) return;
+    const value = Math.trunc(raw);
+    void applyUpdate({ profiles: { microvm: { [field]: value } } });
+  }
+
+  /**
+   * Check-before-save: dry-run validate the manifest URL via
+   * `sandbox.image.check`; only a valid manifest is persisted (pinned to the
+   * checked document's sha).
+   */
+  async function handleImageCheckAndSave() {
+    const manifestUrl = imageUrlDraft.trim();
+    if (!manifestUrl || imageChecking) return;
+    imageChecking = true;
+    imageCheckResult = null;
+    try {
+      const result = await invoke<SandboxEnvelope<SandboxImageCheck>>(
+        SANDBOX_CHANNELS.IMAGE_CHECK,
+        { manifestUrl },
+      );
+      if (result?.success && result.data) {
+        if (result.data.valid) {
+          const { imageId, version, arch, manifestSha256 } = result.data;
+          imageCheckResult = { kind: 'valid', imageId, version, arch };
+          await applyUpdate({
+            profiles: { microvm: { image: { manifestUrl, sha256: manifestSha256 } } },
+          });
+        } else {
+          imageCheckResult = { kind: 'invalid', error: result.data.error };
+        }
+      } else {
+        imageCheckResult = {
+          kind: 'invalid',
+          error: result?.error || m.executionEnvironmentSettings_saveError(),
+        };
+      }
+    } catch (error) {
+      imageCheckResult = {
+        kind: 'invalid',
+        error: error instanceof Error ? error.message : String(error),
+      };
+    } finally {
+      imageChecking = false;
+    }
+  }
+
+  /** Clear the override (explicit `image: null`) — back to the built-in pin. */
+  async function handleImageReset() {
+    if (imageChecking) return;
+    imageCheckResult = null;
+    imageUrlDraft = '';
+    await applyUpdate({ profiles: { microvm: { image: null } } });
   }
 
   function handleShowTokenInput() {
@@ -291,6 +404,108 @@
               {/if}
             </p>
           {/if}
+
+          <!-- microVM sizing (sandbox.microvm.vcpus / memMib, §5.12) -->
+          <div class="mt-3 space-y-1" data-testid="ee-vm-sizing">
+            <p class="text-xs font-medium text-foreground">
+              {m.executionEnvironmentSettings_sizing_label()}
+            </p>
+            <p class="text-xs text-subtle">
+              {m.executionEnvironmentSettings_sizing_description()}
+            </p>
+            <div class="flex items-center gap-4 pt-1">
+              <label class="flex items-center gap-2 text-xs text-foreground">
+                {m.executionEnvironmentSettings_sizing_vcpus_label()}
+                <input
+                  type="number"
+                  min={MIN_VCPUS}
+                  max={MAX_VCPUS}
+                  step="1"
+                  bind:value={vcpusDraft}
+                  onchange={() => handleSizingChange('vcpus', vcpusDraft)}
+                  disabled={updating}
+                  aria-label={m.executionEnvironmentSettings_sizing_vcpus_label()}
+                  class="w-20 px-2 py-1 bg-background border border-border rounded-md text-xs text-foreground transition-all focus:outline-none focus:border-primary focus:ring-2 focus:ring-primary/10"
+                />
+              </label>
+              <label class="flex items-center gap-2 text-xs text-foreground">
+                {m.executionEnvironmentSettings_sizing_memMib_label()}
+                <input
+                  type="number"
+                  min={MIN_MEM_MIB}
+                  step="128"
+                  bind:value={memMibDraft}
+                  onchange={() => handleSizingChange('memMib', memMibDraft)}
+                  disabled={updating}
+                  aria-label={m.executionEnvironmentSettings_sizing_memMib_label()}
+                  class="w-24 px-2 py-1 bg-background border border-border rounded-md text-xs text-foreground transition-all focus:outline-none focus:border-primary focus:ring-2 focus:ring-primary/10"
+                />
+              </label>
+            </div>
+          </div>
+
+          <!-- Guest-image override (check-before-save via sandbox.image.check) -->
+          <div class="mt-3 space-y-1" data-testid="ee-image-override">
+            <p class="text-xs font-medium text-foreground">
+              {m.executionEnvironmentSettings_imageOverride_label()}
+            </p>
+            <p class="text-xs text-subtle">
+              {imageOverride
+                ? m.executionEnvironmentSettings_imageOverride_custom()
+                : m.executionEnvironmentSettings_imageOverride_builtIn()}
+            </p>
+            <div class="flex items-center gap-2 pt-1">
+              <input
+                type="text"
+                bind:value={imageUrlDraft}
+                placeholder={'https://…/manifest.json' /* i18n-ignore (URL format) */}
+                aria-label={m.executionEnvironmentSettings_imageOverride_inputAriaLabel()}
+                class="flex-1 px-3 py-1.5 bg-background border border-border rounded-md text-xs text-foreground transition-all focus:outline-none focus:border-primary focus:ring-2 focus:ring-primary/10"
+                onkeydown={(e) => {
+                  if (e.key === 'Enter') handleImageCheckAndSave();
+                }}
+              />
+              <button
+                type="button"
+                class="text-primary hover:text-primary/80 cursor-pointer transition-colors font-medium text-xs shrink-0"
+                onclick={handleImageCheckAndSave}
+                disabled={!imageUrlDraft.trim() || imageChecking || updating}
+              >
+                {imageChecking
+                  ? m.executionEnvironmentSettings_imageOverride_checking()
+                  : m.executionEnvironmentSettings_imageOverride_check()}
+              </button>
+              {#if imageOverride}
+                <button
+                  type="button"
+                  class="text-muted-foreground hover:text-foreground cursor-pointer transition-colors text-xs shrink-0"
+                  onclick={handleImageReset}
+                  disabled={imageChecking || updating}
+                >
+                  {m.executionEnvironmentSettings_imageOverride_reset()}
+                </button>
+              {/if}
+            </div>
+            {#if imageCheckResult}
+              <p class="text-xs" data-testid="ee-image-check-result">
+                {#if imageCheckResult.kind === 'valid'}
+                  <span class="text-subtle"
+                    >{m.executionEnvironmentSettings_imageOverride_valid({
+                      imageId: imageCheckResult.imageId,
+                      version: imageCheckResult.version,
+                      arch: imageCheckResult.arch,
+                    })}</span
+                  >
+                {:else}
+                  <span class="text-destructive-foreground"
+                    >{m.executionEnvironmentSettings_imageOverride_invalid({
+                      error: imageCheckResult.error,
+                    })}</span
+                  >
+                {/if}
+              </p>
+            {/if}
+          </div>
 
           <!-- claude-code setup-token action (issue #1120) -->
           <div class="mt-3 space-y-2" data-testid="ee-claude-setup">
