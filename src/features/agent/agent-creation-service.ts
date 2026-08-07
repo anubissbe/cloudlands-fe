@@ -96,11 +96,12 @@ async function loadCreationDeps() {
     selectWorkspaceById: wsSel.selectWorkspaceById,
     selectAllWorkspaceAgents: waSel.selectAllWorkspaceAgents,
     selectActiveProviderId: provSel.selectActiveProviderId,
+    selectIsActiveProviderAvailable: provSel.selectIsActiveProviderAvailable,
     selectSpecialists: specSel.selectSpecialists,
     selectEffectiveCodingAgent: specSel.selectEffectiveCodingAgent,
     selectEffectiveBehaviorPrompt: specSel.selectEffectiveBehaviorPrompt,
     selectNoteById: notesSel.selectNoteById,
-    selectCatalogDefaultProviderId: catalogSel.selectCatalogDefaultProviderId,
+    selectEffectiveDefaultProviderId: catalogSel.selectEffectiveDefaultProviderId,
   };
 }
 type CreationDeps = Awaited<ReturnType<typeof loadCreationDeps>>;
@@ -156,7 +157,7 @@ function getWorkspaceInitialAgentProvider(wsId: string, deps: CreationDeps): str
   const sessions = deps.selectAllWorkspaceAgents.select(appStore.state, wsId);
   const initialAgent = sessions.find((s) => String(s.workspaceId) === wsId && s.isInitialAgent);
   return initialAgent
-    ? getAgentProvider(initialAgent, deps.selectCatalogDefaultProviderId.select(appStore.state))
+    ? getAgentProvider(initialAgent, deps.selectEffectiveDefaultProviderId.select(appStore.state))
     : undefined;
 }
 
@@ -166,11 +167,43 @@ function getCreationError(error: unknown, fallback?: string): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+/** Lazily pull the toast lib so this middleware-reachable module stays light. */
+async function getToast() {
+  const { toast } = await import('svelte-sonner');
+  return toast;
+}
+
+/**
+ * Surface a creation failure raised on a fire-and-forget path, which has no
+ * caller promise to settle. Best-effort: never throws.
+ */
+async function showCreationError(error: unknown): Promise<void> {
+  try {
+    const toast = await getToast();
+    toast.error(cleanErrorMessage(getCreationError(error)));
+  } catch (toastError) {
+    logger.error('Failed to surface agent-creation error', toastError);
+  }
+}
+
+/**
+ * Surface an already-localized precondition failure (no factory error to map)
+ * on a fire-and-forget path. Same best-effort semantics as `showCreationError`.
+ */
+function showCreationMessage(message: string): void {
+  void showCreationError(new Error(message));
+}
+
 /** Cmd/Ctrl+T and the New-agent button: create a chat agent and open its tab. */
 async function handleCreateAgentRequested(wsId: string, agentType?: string): Promise<void> {
   const deps = await loadCreationDeps();
   const workspace = validateWorkspace(wsId, deps);
-  if (!workspace) return;
+  if (!workspace) {
+    const errorMessage = m.agent_creation_workspaceUnavailable_error();
+    logger.error('Failed to create agent', { workspaceId: wsId, error: errorMessage });
+    showCreationMessage(errorMessage);
+    return;
+  }
 
   const agents = deps.selectAllWorkspaceAgents.select(appStore.state, wsId);
   const provider = deps.selectActiveProviderId.select(appStore.state);
@@ -192,12 +225,14 @@ async function handleCreateAgentRequested(wsId: string, agentType?: string): Pro
     });
     if (!result.success || !result.agent) {
       logger.error('Failed to create agent', { workspaceId: wsId, error: result.error });
+      void showCreationError(result.error);
       return;
     }
     registerCreatedAgent(wsId, result.agent, agents);
     openCreatedAgentTab(wsId, result.agent.id);
   } catch (error) {
     logger.error('Failed to create agent', { workspaceId: wsId, error: getCreationError(error) });
+    void showCreationError(error);
   }
 }
 
@@ -208,10 +243,23 @@ async function handleCreateAgentWithSpecialist(
 ): Promise<void> {
   const deps = await loadCreationDeps();
   const workspace = validateWorkspace(wsId, deps);
-  if (!workspace) return;
+  if (!workspace) {
+    const errorMessage = m.agent_creation_workspaceUnavailable_error();
+    logger.error('Failed to create specialist agent', { workspaceId: wsId, error: errorMessage });
+    showCreationMessage(errorMessage);
+    return;
+  }
 
   const agents = deps.selectAllWorkspaceAgents.select(appStore.state, wsId);
-  let provider = deps.selectActiveProviderId.select(appStore.state);
+  // D1(B): only thread the active provider when it's actually available —
+  // an unavailable active provider must not be handed to the factory as an
+  // explicit `provider`, since that would bypass the factory's own
+  // active-provider availability guard (which only fires when no explicit
+  // provider is supplied) and spawn on a doomed provider (e.g. uninstalled
+  // Auggie) instead of surfacing a failure.
+  let provider = deps.selectIsActiveProviderAvailable.select(appStore.state)
+    ? deps.selectActiveProviderId.select(appStore.state)
+    : undefined;
 
   const existingNames = agents.map((a) => a.name).filter(Boolean) as string[];
   let behaviorPrompt: string | undefined;
@@ -245,6 +293,7 @@ async function handleCreateAgentWithSpecialist(
     });
     if (!result.success || !result.agent) {
       logger.error('Failed to create specialist agent', { workspaceId: wsId, error: result.error });
+      void showCreationError(result.error);
       return;
     }
     registerCreatedAgent(wsId, result.agent, agents);
@@ -254,6 +303,7 @@ async function handleCreateAgentWithSpecialist(
       workspaceId: wsId,
       error: getCreationError(error),
     });
+    void showCreationError(error);
   }
 }
 
@@ -269,11 +319,22 @@ async function handleRunAgentForNote(
 ): Promise<void> {
   const deps = await loadCreationDeps();
   const workspace = validateWorkspace(wsId, deps);
-  if (!workspace) return;
+  if (!workspace) {
+    const errorMessage = m.agent_creation_workspaceUnavailable_error();
+    logger.error('Failed to run agent for note', { workspaceId: wsId, noteId, error: errorMessage });
+    showCreationMessage(errorMessage);
+    return;
+  }
 
   const note = deps.selectNoteById.select(appStore.state, wsId, noteId);
   if (!note) {
-    logger.error('Cannot run agent: note not found', { workspaceId: wsId, noteId });
+    const errorMessage = m.agent_creation_noteNotFound_error();
+    logger.error('Cannot run agent: note not found', {
+      workspaceId: wsId,
+      noteId,
+      error: errorMessage,
+    });
+    showCreationMessage(errorMessage);
     return;
   }
 
@@ -315,6 +376,7 @@ async function handleRunAgentForNote(
         noteId,
         error: result.error,
       });
+      void showCreationError(result.error);
       return;
     }
     openCreatedAgentTab(wsId, result.agentId);
@@ -324,6 +386,7 @@ async function handleRunAgentForNote(
       noteId,
       error: getCreationError(error),
     });
+    void showCreationError(error);
   }
 }
 

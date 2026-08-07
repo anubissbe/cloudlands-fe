@@ -164,6 +164,8 @@ export interface AgentCreateRequest {
   workspaceId: string;
   prompt?: string;
   model?: string;
+  /** Reasoning effort for the session's model (Option B session field, §5.5). */
+  reasoningEffort?: string;
   specialist?: string | null;
   name?: string;
   nameExplicitlySet?: boolean;
@@ -557,6 +559,36 @@ export interface AgentsClient {
     agentId: string;
     workspaceId: string;
     messageId: string;
+  }): Promise<MutationResult>;
+  /**
+   * Advance the per-conversation seen marker (`agent.markSeen`, §5.5). The
+   * daemon persists `lastSeenMessageId` in session metadata — served on
+   * `AgentLite` and converging via `agent:updated`. The wire ack carries
+   * `{ success: true, lastSeenMessageId }`, but this seam folds it into a
+   * plain `MutationResult` — callers read the advanced marker from session
+   * metadata, not from this result. Fired fire-and-forget by the viewport
+   * trigger while the user is viewing the conversation at-bottom; callers
+   * never await it for UI flow. A nonexistent agent or a workspace mismatch
+   * rejects (folded into `{ success: false, error }`).
+   */
+  markSeen(params: {
+    agentId: string;
+    workspaceId: string;
+    messageId: string;
+  }): Promise<MutationResult>;
+  /**
+   * Set or clear the session-level reasoning effort (`agent.update`, §5.5 —
+   * the partial-mutation writer; `reasoningEffort` joins the `changes`
+   * whitelist with the Option B session field). A string sets the level, an
+   * explicit `null` clears it back to the provider default. The daemon
+   * persists the field (survives restarts), applies it on the next prompt
+   * send, and emits `agent:updated` so other windows converge. Transport /
+   * daemon errors fold into `{ success: false, error }`.
+   */
+  setReasoningEffort(params: {
+    agentId: string;
+    workspaceId: string;
+    reasoningEffort: string | null;
   }): Promise<MutationResult>;
   /**
    * Rename an agent session (`agent.rename`, §5.5). The daemon persists the
@@ -1433,6 +1465,18 @@ export interface SpecialistDef {
   roleReminder?: string;
   agentType?: string;
   hidden?: boolean;
+  /**
+   * Ordered delegation model options (additive, PROTOCOL §5.11): emitted on
+   * `list`/`get` when the resolved list is non-empty, omitted otherwise
+   * (never `null`/`[]` on the wire); accepted in `create`/`edit` spec bodies.
+   */
+  modelOptions?: { model: string; hint: string; reasoningEffort?: string }[];
+  /**
+   * Reasoning-effort level for the specialist's model (additive, PROTOCOL
+   * §5.11): one of the model's catalog `effortLevels`. Omitted when the
+   * specialist inherits the model default (never `null`/`""` on the wire).
+   */
+  reasoningEffort?: string;
   prompt?: string;
   behaviorPrompt?: string;
   source: "project" | "user" | "bundled";
@@ -1484,7 +1528,7 @@ export interface ModelsClient {
 /**
  * Provider registry domain (`providers.catalog`, PROTOCOL §5.38, v2.6).
  * Daemon-global: no `workspaceId`. Returns the full static provider registry
- * (gated-off rows included, in registry order) plus `defaultProviderId`.
+ * (gated-off rows included, in registry order).
  * THROWS on transport/daemon failure so the seeder can decide the fallback
  * (keep the last hydrated catalog rather than wiping it).
  */
@@ -1554,6 +1598,54 @@ export interface StatsClient {
     key: string | undefined,
     tzOffsetMinutes: number,
   ): Promise<UsageStatsResult>;
+}
+
+/** Optional domain-vocabulary hints for `voice.transcribe` (PROTOCOL §5.41). */
+export interface VoiceTranscribeContext {
+  /** Free-form style/context hint (OpenAI prompt; ignored by ElevenLabs). */
+  prompt?: string;
+  /** Domain keyterms (workspace title, branch, agent names, …). */
+  keyterms?: string[];
+}
+
+/** `voice.transcribe` result (PROTOCOL §5.41). */
+export interface VoiceTranscribeResult {
+  text: string;
+  /** The provider that actually served the request. */
+  provider: "elevenlabs" | "openai";
+  /** Transcribed audio duration in ms; always present, `null` when unknown. */
+  durationMs: number | null;
+}
+
+/** `voice.getWorkspaceVocabulary` result (PROTOCOL §5.41, v5.1). */
+export interface VoiceWorkspaceVocabularyResult {
+  /** The auto-derived workspace terms only (user `voice.vocabulary` not merged in). */
+  terms: string[];
+}
+
+export interface VoiceClient {
+  /**
+   * Daemon-owned speech-to-text (`voice.transcribe`, PROTOCOL §5.41).
+   * Base64-encodes the recorded audio and forwards it with the container
+   * MIME type and optional context hints. Daemon-global — the optional
+   * `workspaceId` (v5.1) opts the call into workspace-vocabulary injection
+   * (tolerant server-side: a stale/unknown id is never an error).
+   * THROWS on transport/daemon errors — including the descriptive
+   * no-API-key `-32603` — so callers surface them explicitly.
+   */
+  transcribe(
+    audio: Blob,
+    mimeType: string,
+    context?: VoiceTranscribeContext,
+    workspaceId?: string,
+  ): Promise<VoiceTranscribeResult>;
+  /**
+   * A workspace's auto-derived vocabulary (`voice.getWorkspaceVocabulary`,
+   * PROTOCOL §5.41, v5.1) — derived terms only, for client-side (OS-engine)
+   * transcription biasing and Settings previews. `workspaceId` is required;
+   * an unknown id is the standard not-found `-32602`.
+   */
+  getWorkspaceVocabulary(workspaceId: string): Promise<VoiceWorkspaceVocabularyResult>;
 }
 
 export interface BrowserClient {
@@ -1712,6 +1804,7 @@ export interface AppClient {
   models: ModelsClient;
   providers: ProvidersClient;
   stats: StatsClient;
+  voice: VoiceClient;
   browser: BrowserClient;
   integrations: IntegrationsClient;
   system: SystemClient;

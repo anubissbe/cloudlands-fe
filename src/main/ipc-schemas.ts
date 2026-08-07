@@ -354,6 +354,7 @@ export const WorkspaceAddRecentRepositorySchema = z.object({
   repository: z.string().min(1, 'Repository is required'),
   name: z.string().optional(),
   owner: z.string().optional(),
+  githubUrl: z.string().optional(),
 });
 
 export const WorkspaceClearRecentRepositoriesSchema = z.object({});
@@ -1436,6 +1437,16 @@ export const SpecialistWriteSchema = z
     model: z.string().optional(),
     roleReminder: z.string().optional(),
     hidden: z.boolean().optional(),
+    modelOptions: z
+      .array(
+        z.object({
+          model: z.string().min(1, 'Model is required'),
+          hint: z.string(),
+          reasoningEffort: z.string().optional(),
+        }),
+      )
+      .optional(),
+    reasoningEffort: z.string().optional(),
     behaviorPrompt: z.string().min(1, 'Behavior prompt is required'),
     scope: z.enum(['user', 'project']).optional(),
     workspacePath: z.string().optional(),
@@ -1472,3 +1483,23 @@ export const AuggieMcpCheckCodexSchema = z.object({}).strict();
 export const AuggieMcpCheckOpenCodeSchema = z.object({}).strict();
 
 export const AuggieMcpCheckDroidSchema = z.object({}).strict();
+
+// ============================================================================
+// Voice (local OS transcription) Schemas
+// ============================================================================
+
+export const VoiceLocalAvailableSchema = EmptySchema;
+
+export const VoiceRequestLocalAuthorizationSchema = EmptySchema;
+
+/** ~25 MB of base64 ≈ 60s+ of 16 kHz mono WAV — generous dictation ceiling. */
+export const VoiceTranscribeLocalSchema = z.object({
+  /** Base64-encoded audio bytes (no data: URL prefix). */
+  audioBase64: z.string().min(1, 'Audio data is required').max(25_000_000, 'Audio too large'),
+  /** Container MIME type of the recorded audio (e.g. audio/wav). */
+  mimeType: z.string().min(1, 'MIME type is required'),
+  /** Domain keyterms forwarded as SFSpeechRecognizer contextual strings. */
+  contextualStrings: z.array(z.string().max(100)).max(100).optional(),
+  /** BCP-47 locale for the recognizer (e.g. "de"); absent = system locale. */
+  locale: z.string().min(1).max(35).optional(),
+});

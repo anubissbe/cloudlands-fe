@@ -4,7 +4,7 @@
  * (and only it, when stacked under other overlays — see the NewSpaceModal
  * regression test in modals/__tests__).
  * Also covers the Recent list rendering (owner-qualified repo names) and
- * plain-text search filtering from the GitHub tab (intent-hq/monorepo#859).
+ * plain-text search filtering from the "Pick a repo" tab (intent-hq/monorepo#859).
  */
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { render, screen, fireEvent, waitFor, cleanup } from '@testing-library/svelte';
@@ -105,6 +105,7 @@ vi.mock('$lib/components/workspace/initializer/AddRemoteSetupModal.svelte', asyn
 }));
 
 import RepoSelector from '../RepoSelector.svelte';
+import { warmImport } from '../../../../../test/warm-import';
 
 const DROPDOWN_HEADING = 'What repo should we work on?';
 
@@ -114,6 +115,11 @@ async function openDropdown(container: HTMLElement) {
   expect(trigger).toBeTruthy();
   await fireEvent.click(trigger!);
 }
+
+// Pre-warm the component module graph so the cold dynamic import is not
+// billed to the first test's timeout (intent-hq/monorepo#1464).
+warmImport(() => import('../../../ui/__tests__/mocks/Fa.svelte'));
+warmImport(() => import('./mocks/MockComponent.svelte'));
 
 describe('RepoSelector Escape handling (escape-layer stack)', () => {
   afterEach(() => {
@@ -193,6 +199,9 @@ describe('RepoSelector Recent list owner rendering', () => {
       expect(screen.getByText(DROPDOWN_HEADING)).toBeTruthy();
     });
 
+    // Local repos live under the "Copy local repo" tab (no longer the default)
+    await fireEvent.click(screen.getByText('Copy local repo'));
+
     await waitFor(() => {
       expect(screen.getByText('acme /')).toBeTruthy();
       expect(screen.getByText('app')).toBeTruthy();
@@ -208,7 +217,7 @@ describe('RepoSelector Recent list owner rendering', () => {
   });
 });
 
-describe('RepoSelector Recent list search filtering (GitHub tab)', () => {
+describe('RepoSelector Recent list search filtering ("Pick a repo" tab)', () => {
   afterEach(() => {
     mockRepos.recentRepos = [];
     cleanup();
@@ -217,14 +226,14 @@ describe('RepoSelector Recent list search filtering (GitHub tab)', () => {
   async function openGitHubTab() {
     mockRepos.recentRepos = [
       {
-        path: '/Users/dev/clones/monorepo',
+        path: 'intent-hq/monorepo',
         type: 'github',
         githubUrl: 'https://github.com/intent-hq/monorepo',
         name: 'monorepo',
         owner: 'intent-hq',
       },
       {
-        path: '/Users/dev/clones/react',
+        path: 'facebook/react',
         type: 'github',
         githubUrl: 'https://github.com/facebook/react',
         name: 'react',
@@ -237,7 +246,7 @@ describe('RepoSelector Recent list search filtering (GitHub tab)', () => {
       expect(screen.getByText(DROPDOWN_HEADING)).toBeTruthy();
     });
 
-    await fireEvent.click(screen.getByText('Clone from GitHub'));
+    // "Pick a repo" is the first and default tab — GitHub repos show right away
     await waitFor(() => {
       expect(screen.getByText('monorepo')).toBeTruthy();
       expect(screen.getByText('react')).toBeTruthy();

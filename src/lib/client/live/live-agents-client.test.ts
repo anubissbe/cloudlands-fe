@@ -91,6 +91,23 @@ describe('LiveAgentsClient mutations (fake transport)', () => {
     expect(backend.requests[0]?.params).not.toHaveProperty('agentId');
   });
 
+  it('create forwards reasoningEffort when supplied (Option B session field, §5.5)', async () => {
+    backend.onRequest('agent.create', () => ({
+      agent: { id: 'agent-effort-1', workspaceId: 'ws-p212a', status: 'pending' },
+    }));
+    const client = new LiveAgentsClient();
+
+    await client.create({
+      workspaceId: 'ws-p212a',
+      model: 'gpt-5.3-codex',
+      reasoningEffort: 'xhigh',
+    });
+
+    expect(backend.requests[0]?.params).toEqual(
+      expect.objectContaining({ model: 'gpt-5.3-codex', reasoningEffort: 'xhigh' }),
+    );
+  });
+
   it('create forwards nameExplicitlySet:true verbatim (user-chosen name)', async () => {
     backend.onRequest('agent.create', () => ({
       agent: { id: 'agent-explicit-1', workspaceId: 'ws-p212a', status: 'pending' },
@@ -122,6 +139,7 @@ describe('LiveAgentsClient mutations (fake transport)', () => {
     // Every optional param stays off the wire when the caller didn't supply it.
     for (const key of [
       'model',
+      'reasoningEffort',
       'specialistId',
       'behaviorPrompt',
       'name',
@@ -760,6 +778,111 @@ describe('LiveAgentsClient mutations (fake transport)', () => {
     });
     expect(result.success).toBe(false);
     expect(result.error).toContain('not found: agent session');
+  });
+
+  it('markSeen forwards agent.markSeen with §5.5 params and folds the ack into success', async () => {
+    // PROTOCOL §5.5: agent.markSeen takes `{ workspaceId, agentId,
+    // messageId }` (all required) and returns `{ success: true,
+    // lastSeenMessageId }`. The daemon persists the marker in session
+    // metadata (served on AgentLite) and emits `agent:updated`.
+    backend.onRequest('agent.markSeen', () => ({
+      success: true,
+      lastSeenMessageId: 'msg-9',
+    }));
+    const client = new LiveAgentsClient();
+
+    const result = await client.markSeen({
+      agentId: 'agent-1',
+      workspaceId: 'ws-1',
+      messageId: 'msg-9',
+    });
+    expect(result).toEqual({ success: true });
+    expect(backend.requests[0]).toEqual({
+      method: 'agent.markSeen',
+      params: { workspaceId: 'ws-1', agentId: 'agent-1', messageId: 'msg-9' },
+    });
+  });
+
+  it('markSeen folds a daemon NotFound rejection into {success:false,error} (no throw)', async () => {
+    // Workspace mismatch / unknown agent rejects with NotFound (-32004) —
+    // the mutation seam never throws (the trigger is fire-and-forget).
+    backend.onRequest('agent.markSeen', () => {
+      throw new BackendError(
+        buildErrorPayload('BACKEND_ERROR', 'not found: agent session agent-x', {
+          rpcCode: -32004,
+        }),
+      );
+    });
+    const client = new LiveAgentsClient();
+
+    const result = await client.markSeen({
+      agentId: 'agent-x',
+      workspaceId: 'ws-1',
+      messageId: 'msg-9',
+    });
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('not found: agent session');
+  });
+
+  it('setReasoningEffort forwards agent.update with the reasoningEffort change (§5.5)', async () => {
+    // Option B: reasoningEffort is a first-class session field mutated via
+    // the agent.update partial writer's `changes` object. The daemon
+    // persists it and emits `agent:updated`.
+    backend.onRequest('agent.update', () => ({ success: true }));
+    const client = new LiveAgentsClient();
+
+    const result = await client.setReasoningEffort({
+      agentId: 'agent-1',
+      workspaceId: 'ws-1',
+      reasoningEffort: 'high',
+    });
+    expect(result).toEqual({ success: true });
+    expect(backend.requests[0]).toEqual({
+      method: 'agent.update',
+      params: {
+        agentId: 'agent-1',
+        workspaceId: 'ws-1',
+        changes: { reasoningEffort: 'high' },
+      },
+    });
+  });
+
+  it('setReasoningEffort forwards an explicit null to clear back to the provider default', async () => {
+    // null is a meaningful wire value ("reset to provider default"), not an
+    // omitted key — it must reach the changes object verbatim.
+    backend.onRequest('agent.update', () => ({ success: true }));
+    const client = new LiveAgentsClient();
+
+    const result = await client.setReasoningEffort({
+      agentId: 'agent-1',
+      workspaceId: 'ws-1',
+      reasoningEffort: null,
+    });
+    expect(result).toEqual({ success: true });
+    expect(backend.requests[0]?.params).toEqual({
+      agentId: 'agent-1',
+      workspaceId: 'ws-1',
+      changes: { reasoningEffort: null },
+    });
+  });
+
+  it('setReasoningEffort folds a daemon rejection into {success:false,error} (no throw)', async () => {
+    backend.onRequest('agent.update', () => {
+      throw new BackendError(
+        buildErrorPayload('BACKEND_ERROR', 'invalid params: unsupported reasoningEffort', {
+          rpcCode: -32602,
+        }),
+      );
+    });
+    const client = new LiveAgentsClient();
+
+    const result = await client.setReasoningEffort({
+      agentId: 'agent-1',
+      workspaceId: 'ws-1',
+      reasoningEffort: 'ultra',
+    });
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('unsupported reasoningEffort');
   });
 
   it('rename forwards agent.rename with §5.5 params and folds the ack into success', async () => {

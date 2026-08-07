@@ -3,7 +3,7 @@
  * workspace top-level agents, the global cross-workspace cycle family
  * (in-progress, attention, idle, unread, failed agents), stop agent, see
  * spec, toggle workspace sidebar tabs, new agent, new workspace, switch
- * panel layouts, and none/unassigned.
+ * panel layouts, push to talk (hold-capable), and none/unassigned.
  *
  * Each entry carries a label (i18n getter), an icon, an availability
  * predicate, and an execute function. Both evaluate against an
@@ -22,6 +22,7 @@ import {
   faEnvelope,
   faFileLines,
   faFolderPlus,
+  faMicrophone,
   faMoon,
   faPersonRunning,
   faRobot,
@@ -48,6 +49,17 @@ import {
   setActiveAgentId,
 } from '$store/renderer/slices/workspace-agents/workspace-agents-slice';
 import { openWorkspaceNote } from '$store/renderer/slices/workspace-navigation/workspace-navigation-slice';
+import {
+  resolveEffectiveVoiceEngine,
+  type EffectiveVoiceEngineInputs,
+} from '$features/voice/effective-voice-engine';
+import { isVoiceRecordingSupported } from '../voice/voice-recorder';
+import {
+  handleVoiceKeyDown,
+  handleVoiceKeyUp,
+  isPttRecordingActive,
+} from '../voice/ptt-controller';
+import { showVoiceSetupToast } from '../voice/voice-setup-toast';
 import type { ActionKeyActionId } from './action-mapping';
 import {
   collectCycleAgents,
@@ -83,6 +95,8 @@ export interface ActionKeyState {
     multiSelectTabOrder: string[];
     multiSelectSelectedTabIdsByWorkspaceId: Record<string, string[]>;
   };
+  /** Engine preference + configuration reality for the push-to-talk gate. */
+  voiceSettings: EffectiveVoiceEngineInputs;
 }
 
 /** Everything an action needs to check availability and run. */
@@ -110,6 +124,17 @@ export interface ActionKeyDefinition {
    */
   getUnavailableHint?(context: ActionKeyContext): string | null;
   execute(context: ActionKeyContext): void;
+  /**
+   * Optional hold support: when present, the action is hold-capable —
+   * `execute` runs on `keydown` (hold start) and `executeUp` on the
+   * matching `keyup` (hold end). Actions without it keep the existing
+   * press-only behavior (`execute` on keydown, keyup ignored). Release
+   * runs without an availability re-check so an in-progress hold always
+   * ends cleanly, and it must be idempotent — the Codex Micro's factory
+   * 2U Mic keycap presses ACT10 + ACT11 together, so two slots mapped to
+   * the same hold action deliver duplicate keydown/keyup pairs.
+   */
+  executeUp?(context: ActionKeyContext): void;
 }
 
 /** Mirror of the sidebar TAB_DEFINITIONS ids (MultiSelectTabbedSidebar). */
@@ -153,6 +178,44 @@ function inProgressAgents(state: ActionKeyState): CycleAgentEntry[] {
 }
 
 /**
+ * The unread-cycle walk: union of two walks, deduped by agent id — each
+ * walk is in workspace order, and unread-workspace entries precede
+ * attention-only entries: (a) the top-level agents of each unread
+ * workspace (unread is workspace-level, BE-owned `workspace.attention`) —
+ * a fixed top-level walk; and (b) every attention-requesting agent (the
+ * LED attention definition), which follows the `cycle-attention-agents`
+ * configured scope so the settings toggle also governs this portion.
+ * `attentionAgentIds` records walk (b) membership independent of dedup
+ * position, for the remaining-stop count.
+ */
+function collectUnreadCycleEntries(state: ActionKeyState): {
+  entries: CycleAgentEntry[];
+  attentionAgentIds: Set<string>;
+} {
+  const unreadWorkspaceIds = new Set<string>(
+    getItems(state.workspace.workspaces)
+      .filter((workspace) => workspace.attention === 'unread')
+      .map((workspace) => workspace.id),
+  );
+  const unreadEntries = collectCycleAgents(state, isSessionCyclable).filter((entry) =>
+    unreadWorkspaceIds.has(entry.wsId),
+  );
+  const attentionEntries = collectCycleAgents(
+    state,
+    sessionNeedsAttention,
+    undefined,
+    familyScope(state, 'cycle-attention-agents'),
+  );
+  const seen = new Set<string>();
+  const entries = [...unreadEntries, ...attentionEntries].filter((entry) => {
+    if (seen.has(entry.agentId)) return false;
+    seen.add(entry.agentId);
+    return true;
+  });
+  return { entries, attentionAgentIds: new Set(attentionEntries.map((entry) => entry.agentId)) };
+}
+
+/**
  * Focus one agent: mark it active, open (or focus) its conversation tab, and
  * focus its chat composer so typing starts immediately.
  */
@@ -187,6 +250,18 @@ interface GlobalCycleSpec {
   getEmptyHint(): string;
   /** Toast shown when the only candidate is already the focused agent. */
   getSingleCandidateHint(): string;
+  /**
+   * Optional HUD label for a successful step, given how many stops remain
+   * to visit after this one. Families without it show the plain label.
+   */
+  getHudLabel?(remaining: number): string;
+  /**
+   * Optional override of the remaining-stop count fed to `getHudLabel`.
+   * The default, `entries.length - 1`, is right when every candidate
+   * needs its own visit; override it when one step clears several
+   * entries at once (e.g. workspace-level unread).
+   */
+  countRemaining?(state: ActionKeyState, entries: CycleAgentEntry[], next: CycleAgentEntry): number;
   collect(state: ActionKeyState): CycleAgentEntry[];
 }
 
@@ -234,7 +309,8 @@ function makeGlobalCycleAction(spec: GlobalCycleSpec): ActionKeyDefinition {
       lastCycledAgentByAction.set(spec.id, next.agentId);
       // Successful step: surface what the button did in the bottom-center
       // HUD (the middleware hides it after inactivity).
-      context.dispatch(actionHudShown(spec.getLabel()));
+      const remaining = spec.countRemaining?.(state, entries, next) ?? entries.length - 1;
+      context.dispatch(actionHudShown(spec.getHudLabel?.(remaining) ?? spec.getLabel()));
       if (next.wsId !== activeWorkspaceId(state)) {
         void context.navigate(`/workspace/${next.wsId}`);
       }
@@ -290,35 +366,25 @@ export const ACTION_KEY_REGISTRY: readonly ActionKeyDefinition[] = [
     getLabel: () => m.hardwareConsole_actionKey_cycleUnreadAgents_label(),
     getEmptyHint: () => m.hardwareConsole_actionKey_noUnreadAgents_message(),
     getSingleCandidateHint: () => m.hardwareConsole_actionKey_noOtherUnreadAgents_message(),
-    collect: (state) => {
-      // Union of two walks, deduped by agent id — each walk is in workspace
-      // order, and unread-workspace entries precede attention-only entries:
-      // (a) the top-level agents of each unread workspace (unread is
-      // workspace-level, BE-owned `workspace.attention`) — a fixed top-level
-      // walk; and (b) every attention-requesting agent (the LED attention
-      // definition), which follows the `cycle-attention-agents` configured
-      // scope so the settings toggle also governs this portion.
-      const unreadWorkspaceIds = new Set<string>(
-        getItems(state.workspace.workspaces)
-          .filter((workspace) => workspace.attention === 'unread')
-          .map((workspace) => workspace.id),
-      );
-      const unreadEntries = collectCycleAgents(state, isSessionCyclable).filter((entry) =>
-        unreadWorkspaceIds.has(entry.wsId),
-      );
-      const attentionEntries = collectCycleAgents(
-        state,
-        sessionNeedsAttention,
-        undefined,
-        familyScope(state, 'cycle-attention-agents'),
-      );
-      const seen = new Set<string>();
-      return [...unreadEntries, ...attentionEntries].filter((entry) => {
-        if (seen.has(entry.agentId)) return false;
-        seen.add(entry.agentId);
-        return true;
-      });
+    getHudLabel: (remaining) =>
+      remaining === 0
+        ? m.hardwareConsole_actionKey_cycleUnreadAgents_label()
+        : remaining === 1
+          ? m.hardwareConsole_actionKey_cycleUnreadAgents_hudRemaining_one({ count: remaining })
+          : m.hardwareConsole_actionKey_cycleUnreadAgents_hudRemaining_many({ count: remaining }),
+    countRemaining: (state, entries, next) => {
+      // Stepping to `next` visits its workspace, which clears the whole
+      // workspace's unread flag — every unread-only entry of that workspace
+      // stops being a candidate along with it. Attention entries persist
+      // individually until handled, so they always count as their own stop.
+      const { attentionAgentIds } = collectUnreadCycleEntries(state);
+      return entries.filter(
+        (entry) =>
+          entry.agentId !== next.agentId &&
+          (attentionAgentIds.has(entry.agentId) || entry.wsId !== next.wsId),
+      ).length;
     },
+    collect: (state) => collectUnreadCycleEntries(state).entries,
   }),
   makeGlobalCycleAction({
     id: 'cycle-failed-agents',
@@ -436,6 +502,43 @@ export const ACTION_KEY_REGISTRY: readonly ActionKeyDefinition[] = [
       const next = ((layoutPresetCursor.get(wsId) ?? -1) + 1) % LAYOUT_PRESETS.length;
       layoutPresetCursor.set(wsId, next);
       dispatch(applyPreset(wsId, LAYOUT_PRESETS[next]));
+    },
+  },
+  {
+    id: 'push-to-talk',
+    get label() {
+      return m.hardwareConsole_actionKey_pushToTalk_label();
+    },
+    icon: faMicrophone,
+    isAvailable() {
+      return isVoiceRecordingSupported();
+    },
+    getUnavailableHint() {
+      return m.hardwareConsole_ptt_unavailable_message();
+    },
+    execute(context) {
+      // No engine can transcribe ('unavailable': key missing on a host
+      // with no OS dictation — Windows/Linux or a helper-missing mac, see
+      // effective-voice-engine): surface the actionable setup toast
+      // instead of recording audio that could never be transcribed. A
+      // capable mac always resolves `os` (even pre-authorization, so the
+      // permission prompt can fire) and is never gated here. A live
+      // (latched) session is never gated — its stop-tap must always land.
+      if (
+        !isPttRecordingActive() &&
+        resolveEffectiveVoiceEngine(context.state.voiceSettings) === 'unavailable'
+      ) {
+        showVoiceSetupToast();
+        return;
+      }
+      // Keydown feeds the gesture decoder (hold = PTT, tap = latch, double
+      // press = send, double press & hold = PTT + send); recording starts
+      // on the first keydown. Permission denial surfaces via the
+      // controller's error hint (getUserMedia only fails on first use).
+      handleVoiceKeyDown(context);
+    },
+    executeUp(context) {
+      handleVoiceKeyUp(context);
     },
   },
   {

@@ -31,6 +31,7 @@ import {
   type SpecialistFileFrontmatter,
   type SpecialistFilesResult,
   type SpecialistFileScope,
+  type SpecialistModelOption,
   type SpecialistSource,
   SPECIALISTS_FOLDER,
   SPECIALIST_FILE_EXTENSIONS,
@@ -327,6 +328,50 @@ function parseFrontmatter(content: string): {
 }
 
 /**
+ * Parse a frontmatter `modelOptions` scalar (single-line JSON array) with the
+ * daemon's lenient read semantics (PROTOCOL §5.11): an unparseable scalar or
+ * non-array is treated as an omitted key (undefined ⇒ inherits); unusable
+ * entries — non-objects, or no non-empty string `model` — are skipped
+ * individually; a non-string/empty `reasoningEffort` reads as omitted on the
+ * entry; only a literal `[]` yields an explicit empty list, and a non-empty
+ * array whose entries are ALL unusable is treated as omitted.
+ * Exported for testing purposes.
+ */
+export function parseModelOptionsScalar(
+  raw: string | undefined,
+): SpecialistModelOption[] | undefined {
+  if (raw === undefined || raw.trim() === '') return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return undefined;
+  }
+  if (!Array.isArray(parsed)) return undefined;
+  if (parsed.length === 0) return [];
+  const options: SpecialistModelOption[] = [];
+  for (const entry of parsed) {
+    if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) continue;
+    const { model, hint, reasoningEffort } = entry as {
+      model?: unknown;
+      hint?: unknown;
+      reasoningEffort?: unknown;
+    };
+    if (typeof model !== 'string' || model === '') continue;
+    options.push({
+      model,
+      hint: typeof hint === 'string' ? hint : '',
+      // A non-string or empty level reads as an omitted key (inherits).
+      ...(typeof reasoningEffort === 'string' && reasoningEffort !== ''
+        ? { reasoningEffort }
+        : {}),
+    });
+  }
+  // All entries unusable ⇒ treated as omitted (inherits), never a clear.
+  return options.length > 0 ? options : undefined;
+}
+
+/**
  * Parse a specialist file from its content.
  * Exported for testing purposes.
  */
@@ -371,6 +416,8 @@ export function parseSpecialistFile(
     roleReminder: frontmatter.roleReminder,
     agentType: frontmatter.agentType,
     hidden: frontmatter.hidden === 'true' ? true : undefined,
+    modelOptions: parseModelOptionsScalar(frontmatter.modelOptions),
+    reasoningEffort: frontmatter.reasoningEffort || undefined,
   };
 
   return {
@@ -492,6 +539,8 @@ export async function writeSpecialistFile(specialist: {
   model?: string;
   roleReminder?: string;
   hidden?: boolean;
+  modelOptions?: SpecialistModelOption[];
+  reasoningEffort?: string;
   behaviorPrompt: string;
   scope?: SpecialistFileScope;
   workspacePath?: string;
@@ -534,6 +583,16 @@ export async function writeSpecialistFile(specialist: {
 
     if (specialist.hidden) {
       frontmatterParts.push('hidden: true');
+    }
+
+    // Single-line JSON-array scalar (PROTOCOL §5.11). An explicit [] is the
+    // inherit-clearing form and is written verbatim; undefined writes no key.
+    if (specialist.modelOptions !== undefined) {
+      frontmatterParts.push(`modelOptions: ${JSON.stringify(specialist.modelOptions)}`);
+    }
+
+    if (specialist.reasoningEffort) {
+      frontmatterParts.push(`reasoningEffort: "${escapeYamlValue(specialist.reasoningEffort)}"`);
     }
 
     const content = `---\n${frontmatterParts.join('\n')}\n---\n\n${specialist.behaviorPrompt}`;

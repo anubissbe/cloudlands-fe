@@ -1,6 +1,7 @@
 <script lang="ts">
   /* eslint-disable max-lines */
   import {
+  onMount,
   tick,
   untrack,
 } from 'svelte';
@@ -30,6 +31,7 @@
   import {
   selectSelectedModel,
   selectAvailableModels,
+  selectAvailableModelsProviderId,
   selectModelFallbackInfo,
   selectModelPickerCollapsedGroups,
   selectIsLoadingModels,
@@ -45,10 +47,15 @@
   setModelPickerGroupCollapsed,
 } from '$store/renderer/slices/model/model-slice';
   import type { ModelFallbackInfo } from '$store/renderer/slices/model/model-types';
-  import { selectManagedInstallStatusByProvider } from '$store/renderer/slices/agent-availability/agent-availability-selectors';
+  import {
+  selectHasCheckedOnce,
+  selectManagedInstallStatusByProvider,
+} from '$store/renderer/slices/agent-availability/agent-availability-selectors';
+  import { selectDaemonHealth } from '$store/renderer/slices/daemon-health/daemon-health-selectors';
+  import { ensureProvidersChecked } from '$store/renderer/slices/agent-availability/agent-availability-slice';
   import {
   selectActiveProviderId,
-  selectEnabledProviderIds,
+  selectAvailableEnabledProviderIds,
 } from '$store/renderer/slices/provider-settings/provider-settings-selectors';
   import {
   getModelsForProvider,
@@ -57,12 +64,11 @@
 
   import { parseCompoundModelId as parseCompoundModelIdWithDefault } from '$shared/utils/compound-model-id';
   import {
-  selectCatalogDefaultProviderId,
+  selectEffectiveDefaultProviderId,
   selectNormalizedProviderId,
   selectProviderDisplayName,
 } from '$store/renderer/slices/provider-catalog/provider-catalog-selectors';
   import { getAgentProvider } from '$shared/types/agent-session';
-  import { MODEL_DEFAULTS } from '$shared/constants/agent-services';
   import {
   formatProviderLoadError,
   type ProviderLoadError,
@@ -90,7 +96,7 @@
 
   const logger = createLogger('ModelPicker');
 
-  const defaultProviderId$ = selectCatalogDefaultProviderId();
+  const defaultProviderId$ = selectEffectiveDefaultProviderId();
 
   // Catalog-backed local shims for the legacy provider-config helpers, so the
   // picker's many call sites keep their shape. Reads are reactive via the
@@ -109,14 +115,26 @@
   }
 
   const activeProviderId$ = selectActiveProviderId();
-  const enabledProviderIds$ = selectEnabledProviderIds();
+  const availableEnabledProviderIds$ = selectAvailableEnabledProviderIds();
   const selectedModel$ = selectSelectedModel();
   const availableModels$ = selectAvailableModels();
+  const availableModelsProviderId$ = selectAvailableModelsProviderId();
   const collapsedGroupKeys$ = selectModelPickerCollapsedGroups();
   const isLoadingModels$ = selectIsLoadingModels();
   const loadError$ = selectLoadError();
   const allProviderWarnings$ = selectAllProviderWarnings();
   const codexManagedInstallStatus$ = selectManagedInstallStatusByProvider('codex');
+  const hasCheckedOnce$ = selectHasCheckedOnce();
+  const daemonHealth$ = selectDaemonHealth();
+
+  // The availability status map gates which providers the picker offers, but
+  // outside onboarding nothing else triggers the bulk check — a fresh session
+  // that never mounted AgentGrid would sit on an empty map forever. The
+  // trigger is ensure-once and the middleware coalesces overlapping bulk
+  // checks, so multiple pickers mounting concurrently cause no duplicate probes.
+  onMount(() => {
+    appStore.dispatch(ensureProvidersChecked());
+  });
 
   interface Props {
     selectedModel?: string | null;
@@ -312,15 +330,15 @@
     );
   }
 
-  const isEffectiveProviderEnabled = $derived(
-    isProviderEnabled($enabledProviderIds$, effectiveProviderId),
+  const isEffectiveProviderAvailable = $derived(
+    isProviderEnabled($availableEnabledProviderIds$, effectiveProviderId),
   );
 
   // The per-agent fetch is only needed when the effective provider's models
   // aren't already covered by the all-providers fetch because the agent's
-  // provider was since disabled. Skipping it otherwise avoids a duplicate fetch.
+  // provider is since unavailable. Skipping it otherwise avoids a duplicate fetch.
   const usesAgentProviderFetch = $derived(
-    effectiveProviderId !== $activeProviderId$ && !isEffectiveProviderEnabled,
+    effectiveProviderId !== $activeProviderId$ && !isEffectiveProviderAvailable,
   );
 
   // Separate generation counter from fetchAllProviderModels: in unlocked mode
@@ -363,7 +381,7 @@
 
   let fetchDebounceTimer: ReturnType<typeof setTimeout> | undefined;
   $effect(() => {
-    const providerIds = $enabledProviderIds$;
+    const providerIds = $availableEnabledProviderIds$;
     clearTimeout(fetchDebounceTimer);
     fetchDebounceTimer = setTimeout(() => fetchAllProviderModels(providerIds), 50);
   });
@@ -374,6 +392,14 @@
     agentProviderLoading
       ? []
       : (agentProviderModels ?? (agentProviderError ? [] : $availableModels$)),
+  );
+  // Which provider `availableModels` was loaded for: the per-agent fetch is
+  // for the effective provider by construction; the global catalog carries
+  // explicit provenance ('' before the first load).
+  const availableModelsProviderId = $derived(
+    !agentProviderLoading && agentProviderModels
+      ? effectiveProviderId
+      : $availableModelsProviderId$,
   );
   const isLoadingModels = $derived(
     agentProviderLoading ||
@@ -432,7 +458,7 @@
 
   async function handleRetry() {
     lastFetchedProviderIds = '';
-    const requests = [fetchAllProviderModels($enabledProviderIds$)];
+    const requests = [fetchAllProviderModels($availableEnabledProviderIds$)];
     if (usesAgentProviderFetch) {
       requests.push(fetchAgentProviderModels(effectiveProviderId));
     }
@@ -445,7 +471,7 @@
     isRefreshing = true;
     try {
       lastFetchedProviderIds = '';
-      const requests = [fetchAllProviderModels($enabledProviderIds$)];
+      const requests = [fetchAllProviderModels($availableEnabledProviderIds$)];
       if (usesAgentProviderFetch) {
         requests.push(fetchAgentProviderModels(effectiveProviderId));
       }
@@ -567,13 +593,31 @@
 
   // Get the label for a model ID from available models list; undefined when
   // the id resolves to no loaded model (callers pick the fallback).
+  // Legacy codex compound ids (`{model}/{effort}`) no longer exist as catalog
+  // rows (the daemon collapses them to one base row + effortLevels), so on an
+  // exact-id miss the base model's label is rendered with the effort suffix
+  // appended — existing sessions with a stored compound id keep a sensible
+  // label instead of the raw id.
   function getModelLabel(modelId: string | undefined): string | undefined {
     if (!modelId) return undefined;
-    for (const models of Object.values(allProviderModels)) {
-      const found = models.find((m) => m.value === modelId);
-      if (found) return found.label;
+    const lookup = (id: string): string | undefined => {
+      for (const models of Object.values(allProviderModels)) {
+        const found = models.find((m) => m.value === id);
+        if (found) return found.label;
+      }
+      return availableModels.find((m) => m.value === id)?.label;
+    };
+    const exact = lookup(modelId);
+    if (exact) return exact;
+    const slashIndex = modelId.indexOf('/');
+    if (slashIndex > 0 && slashIndex < modelId.length - 1) {
+      const baseLabel = lookup(modelId.slice(0, slashIndex));
+      if (baseLabel) {
+        const effort = modelId.slice(slashIndex + 1);
+        return `${baseLabel} (${effort.charAt(0).toUpperCase()}${effort.slice(1)})`;
+      }
     }
-    return availableModels.find((m) => m.value === modelId)?.label;
+    return undefined;
   }
 
   const currentModelLabel = $derived.by(() => {
@@ -641,12 +685,21 @@
     },
   };
 
+  // Same provenance gate as the grouped fallback: only offer the shared
+  // catalog for a disabled effective provider when it was loaded for it.
+  const fallbackModelsMatchEffectiveProvider = $derived(
+    availableModelsProviderId !== '' &&
+      normalizeProviderId(availableModelsProviderId) === normalizeProviderId(effectiveProviderId),
+  );
+
   const flatModelOptions = $derived<DropdownOption[]>([
     ...(showDefaultOption ? [useDefaultOption] : []),
-    ...$enabledProviderIds$.flatMap((pid) => allProviderModels[normalizeProviderId(pid)] ?? []),
+    ...$availableEnabledProviderIds$.flatMap((pid) => allProviderModels[normalizeProviderId(pid)] ?? []),
     // Keep the agent's current provider selectable even if it was since
     // disabled, so the selected model isn't treated as unavailable.
-    ...(isEffectiveProviderEnabled ? [] : toDropdownOptions(availableModels)),
+    ...(isEffectiveProviderAvailable || !fallbackModelsMatchEffectiveProvider
+      ? []
+      : toDropdownOptions(availableModels)),
   ]);
 
   const hasLoadedModelOptions = $derived(
@@ -654,7 +707,7 @@
   );
 
   const providerLoadWarnings = $derived.by<ProviderLoadError[]>(() => {
-    return $enabledProviderIds$
+    return $availableEnabledProviderIds$
       .map((pid) => allProviderErrors[normalizeProviderId(pid)])
       .filter((error): error is ProviderLoadError => Boolean(error));
   });
@@ -669,7 +722,7 @@
 
   const providerFallbackWarnings = $derived.by<ProviderWarningNotice[]>(() => {
     const warnings = $allProviderWarnings$;
-    return $enabledProviderIds$
+    return $availableEnabledProviderIds$
       .map((pid) => getProviderWarningNotice(pid, warnings))
       .filter((warning): warning is ProviderWarningNotice => Boolean(warning));
   });
@@ -688,6 +741,41 @@
     return m.chat_modelPicker_downloadProgress_label({
       percent: formatInteger(Math.round(progress * 100)),
     });
+  });
+
+  // D1(B): when no provider is available at all, never fall back to a
+  // default provider/model — surface an explicit failure instead.
+  // Per-provider fetch failures / a single unavailable effective provider
+  // are handled by the existing warning/fallback paths.
+  // Gated on hasCheckedOnce: before the first availability check resolves,
+  // availableEnabledProviderIds is empty by default, which is "unknown" —
+  // not "confirmed unavailable" — so this must not trip during initial load.
+  // Also gated on backend-connected (daemon health): the mount-time
+  // ensureProvidersChecked can run its bulk probe before the daemon socket is
+  // up — every probe fails and hasCheckedOnce still flips, which would
+  // transiently satisfy this condition (and fire the toast in every mounted
+  // picker) until the connect listener re-runs the check and heals the map.
+  // A daemon-down failure is surfaced by the daemon-loss UI, not this notice.
+  const hasNoAvailableProvider = $derived(
+    !providerId &&
+      $hasCheckedOnce$ &&
+      $daemonHealth$ !== 'down' &&
+      $availableEnabledProviderIds$.length === 0,
+  );
+
+  let noProviderToastShown = false;
+
+  $effect(() => {
+    if (hasNoAvailableProvider) {
+      if (!noProviderToastShown) {
+        noProviderToastShown = true;
+        toast.error(m.chat_modelPicker_noProviderAvailable_toast(), {
+          duration: 6000,
+        });
+      }
+    } else {
+      noProviderToastShown = false;
+    }
   });
 
   const blockingLoadError = $derived.by<ProviderLoadError | null>(() => {
@@ -717,7 +805,8 @@
       useDefaultOption,
       effectiveProviderId,
       availableModels,
-      enabledProviderIds: $enabledProviderIds$,
+      availableModelsProviderId,
+      enabledProviderIds: $availableEnabledProviderIds$,
       allProviderModels,
       allProviderLoading,
       allProviderErrors,
@@ -809,7 +898,6 @@
       options: flatModelOptions,
       excludeValue: USE_DEFAULT_VALUE,
       restrictToProvider,
-      preferredModels: MODEL_DEFAULTS.UI_MODEL_PREFERENCE,
       globallySelectedModel: $selectedModel$,
     });
   }
@@ -833,7 +921,7 @@
       !isUserProviderSettled({
         agentProviderModels,
         agentProviderError,
-        enabledProviderIds: $enabledProviderIds$,
+        enabledProviderIds: $availableEnabledProviderIds$,
         allProviderModels,
         modelProvider,
       })
@@ -868,14 +956,12 @@
     // artefact. During a provider switch the session may still hold a model from the
     // old provider (e.g. "haiku4.5") which doesn't match the new provider's prefixed
     // IDs (e.g. "claude-code:haiku4.5"). If the base model name matches an available
-    // model, the model is just the default initial model, or the model's provider
-    // prefix differs from the active provider, skip the warning — the user didn't
-    // lose their model, the provider just changed.
+    // model, or the model's provider prefix differs from the active provider, skip
+    // the warning — the user didn't lose their model, the provider just changed.
     const { providerId: unavailableModelProvider, modelId: unavailableBaseId } =
       parseCompoundModelId(unavailableModelName);
     const activeProvider = normalizeProviderId($activeProviderId$);
     const isProviderSwitch =
-      unavailableModelName === MODEL_DEFAULTS.UI_INITIAL_MODEL ||
       unavailableModelProvider !== activeProvider ||
       flatModelOptions.some((opt) => {
         const { modelId: optBaseId } = parseCompoundModelId(opt.value);
@@ -1192,7 +1278,7 @@
               </div>
             {/if}
             {#if effortLevels && effortLevels.length > 0}
-              <div class="text-xs text-subtle/60 truncate hidden">
+              <div class="text-xs text-subtle/60 truncate">
                 {m.chat_modelPicker_effort_label({ levels: effortLevels.join(' · ') })}
               </div>
             {/if}
@@ -1231,6 +1317,14 @@
       <ModelPickerEmptyState {isLoadingModels} {blockingLoadError} onRetry={handleRetry} />
     {/snippet}
   </Dropdown>
+
+  <ModelPickerProviderNotice
+    warning={hasNoAvailableProvider ? m.chat_modelPicker_noProviderAvailable_title() : undefined}
+    show={hasNoAvailableProvider}
+    title={m.chat_modelPicker_noProviderAvailable_title()}
+    description={m.chat_modelPicker_noProviderAvailable_description()}
+    variant="warning"
+  />
 
   <ModelPickerProviderNotice
     warning={isCodexManagedInstallInstalling

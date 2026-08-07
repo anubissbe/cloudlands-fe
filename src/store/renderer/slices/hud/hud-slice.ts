@@ -16,7 +16,8 @@
 
 import { createAction } from '$lib/store-shim/utils/store/create-action';
 import { createReducer } from '$lib/store-shim/utils/store/create-reducer';
-import type { WorkspaceDisplayStatus } from '$shared/types';
+import type { Workspace, WorkspaceDisplayStatus } from '$shared/types';
+import { replaceWorkspaceList, setWorkspaceEntity } from '../workspace/workspace-slice';
 import {
   EMPTY_HUD_GRID_FILTER,
   isHudTrackedAttentionValue,
@@ -114,21 +115,6 @@ export interface HudAttentionFlag {
   raisedAtTs: string;
 }
 
-/** One 5s token bucket for the AGENT ACTIVITY · TOK/S chart. */
-export interface HudRate5sBucket {
-  /** Bucket start — epoch-ms floored to the 5s grid (computed at the boundary). */
-  startMs: number;
-  /** Tokens attributed to the bucket. */
-  tokens: number;
-}
-
-export interface HudRate5sState {
-  /** Sparse 5s buckets, chronological, capped at the trailing chart window. */
-  buckets: HudRate5sBucket[];
-  /** Whether the pre-open window was backfilled from `stats.getRateHistory`. */
-  backfilled: boolean;
-}
-
 /**
  * Latest clarifying question an agent asked — captured from the
  * `agent:stream:end` `trailingBlocks` question resource (PROTOCOL §7.1,
@@ -162,13 +148,17 @@ export interface HudState {
   attentionByWorkspaceId: Record<string, HudAttentionFlag>;
   /** Live overrides from `workspace:displayStatus-changed`. */
   displayStatusByWorkspaceId: Record<string, WorkspaceDisplayStatus>;
+  /**
+   * Ids whose live override one entity delivery has already contradicted.
+   * Second-delivery guard for the override retirement — see
+   * `reconcileDisplayStatusOverride`.
+   */
+  displayStatusOverridesContradicted: Record<string, true>;
   usage: HudUsageState | null;
   usageError: string | null;
   /** Per-minute TOK/MIN history from `stats.getRateHistory` (PROTOCOL §5.39). */
   rateHistory: HudRateHistoryState | null;
   rateHistoryError: string | null;
-  /** Live 5s token buckets for the AGENT ACTIVITY · TOK/S chart. */
-  rate5s: HudRate5sState;
   /** Latest captured clarifying question per agent (§7.1 trailingBlocks). */
   questionsByAgentId: Record<string, HudCapturedQuestion>;
   /** Header FLEET OPS repo + status grid filter (shared with the center grid). */
@@ -183,38 +173,20 @@ export interface HudState {
 
 export const HUD_FEED_LIMIT = 50;
 
-/** Mock's TOK/S chart: 40 bars × 5s buckets = the trailing 200s window. */
-export const HUD_RATE_5S_BUCKET_MS = 5_000;
-export const HUD_RATE_5S_BAR_COUNT = 40;
-export const HUD_RATE_5S_WINDOW_MS = HUD_RATE_5S_BUCKET_MS * HUD_RATE_5S_BAR_COUNT;
-
 export const initialState: HudState = {
   active: false,
   feed: [],
   attentionByWorkspaceId: {},
   displayStatusByWorkspaceId: {},
+  displayStatusOverridesContradicted: {},
   usage: null,
   usageError: null,
   rateHistory: null,
   rateHistoryError: null,
-  rate5s: { buckets: [], backfilled: false },
   questionsByAgentId: {},
   gridFilter: EMPTY_HUD_GRID_FILTER,
   takeoverRequestWorkspaceId: null,
 };
-
-/** Floor an epoch-ms instant to its 5s bucket start. */
-export function toRate5sBucketStart(atMs: number): number {
-  return Math.floor(atMs / HUD_RATE_5S_BUCKET_MS) * HUD_RATE_5S_BUCKET_MS;
-}
-
-/** Drop buckets that left the trailing window relative to the newest one. */
-function pruneRate5sBuckets(buckets: HudRate5sBucket[]): HudRate5sBucket[] {
-  if (buckets.length === 0) return buckets;
-  const newestStart = buckets[buckets.length - 1].startMs;
-  const cutoff = newestStart - HUD_RATE_5S_WINDOW_MS + HUD_RATE_5S_BUCKET_MS;
-  return buckets.filter((bucket) => bucket.startMs >= cutoff);
-}
 
 // ── Actions ──
 
@@ -237,19 +209,6 @@ export const hudRateHistoryFailed = createAction<[error: string]>('hud/rateHisto
 export const hudTakeoverRequested = createAction<[workspaceId: string]>('hud/takeoverRequested');
 /** Clear the pending takeover request (overlay consumed or dismissed it). */
 export const hudTakeoverRequestCleared = createAction('hud/takeoverRequestCleared');
-/** Live token delta observed at `atMs` → accumulate into its 5s bucket. */
-export const hudRate5sTokensObserved = createAction<[tokens: number, atMs: number]>(
-  'hud/rate5sTokensObserved',
-);
-/**
- * One-shot pre-open backfill: per-minute `stats.getRateHistory` samples split
- * evenly across their twelve 5s slots so the chart is not empty on open.
- * `nowMs` anchors the window; live buckets already observed win over the
- * backfill values.
- */
-export const hudRate5sBackfilled = createAction<
-  [samples: Array<{ bucketUtc: string; tokens: number }>, nowMs: number]
->('hud/rate5sBackfilled');
 /** A question block arrived on `agent:stream:end` trailingBlocks (§7.1). */
 export const hudQuestionCaptured = createAction<[question: HudCapturedQuestion]>(
   'hud/questionCaptured',
@@ -273,6 +232,66 @@ export const hudGridFilterStateToggled = createAction<[stateKey: HudCardStateKey
 export const hudGridFilterStatesCleared = createAction('hud/gridFilterStatesCleared');
 
 // ── Reducer ──
+
+/**
+ * Reconcile live `displayStatus` overrides against entities that just arrived
+ * carrying a BE value.
+ *
+ * The override bridges the gap between a `workspace:displayStatus-changed`
+ * event and the entity catching up, but nothing retired it, so a dropped
+ * event left a stale override winning forever. Retirement cannot simply be
+ * "an entity carries a value" though: neither delivery order nor entity
+ * freshness is guaranteed. The daemon derives `displayStatus` at serve time
+ * (PROTOCOL §5.1), so a `workspace.list` issued BEFORE the event can resolve
+ * after it and carry the older value — clearing on that response would
+ * reintroduce the very staleness the override exists to cover.
+ *
+ * Two-strike rule: the FIRST entity delivery that disagrees with an override
+ * is assumed to be that in-flight response and only marks the override
+ * contradicted; a SECOND disagreeing delivery retires it (an in-flight
+ * response cannot predate the event twice, so by then the entity is the
+ * fresher value). An entity that AGREES with the override retires it
+ * immediately — the entity has caught up and the override is redundant — and
+ * also clears the contradicted mark, since agreement proves the store is
+ * current as of the override.
+ */
+function reconcileDisplayStatusOverride(state: HudState, workspaces: readonly Workspace[]) {
+  let overrides = state.displayStatusByWorkspaceId;
+  let contradicted = state.displayStatusOverridesContradicted;
+  let changed = false;
+
+  for (const workspace of workspaces) {
+    const id = String(workspace.id);
+    const override = overrides[id];
+    // An entity without a value carries nothing fresher — leave it alone.
+    if (override === undefined || workspace.displayStatus === undefined) continue;
+
+    const retire = workspace.displayStatus === override || contradicted[id] === true;
+    if (!retire) {
+      if (!changed) {
+        overrides = { ...overrides };
+        contradicted = { ...contradicted };
+        changed = true;
+      }
+      contradicted[id] = true;
+      continue;
+    }
+    if (!changed) {
+      overrides = { ...overrides };
+      contradicted = { ...contradicted };
+      changed = true;
+    }
+    delete overrides[id];
+    delete contradicted[id];
+  }
+
+  if (!changed) return state;
+  return {
+    ...state,
+    displayStatusByWorkspaceId: overrides,
+    displayStatusOverridesContradicted: contradicted,
+  };
+}
 
 export const hudReducer = createReducer<HudState>(initialState)
   // Activation resets to a clean slate — the feed is live-only (no backfill).
@@ -307,13 +326,27 @@ export const hudReducer = createReducer<HudState>(initialState)
       },
     };
   })
-  .with(hudDisplayStatusChanged, (state, { payload: [workspaceId, displayStatus] }) => ({
-    ...state,
-    displayStatusByWorkspaceId: {
-      ...state.displayStatusByWorkspaceId,
-      [workspaceId]: displayStatus,
-    },
-  }))
+  .with(hudDisplayStatusChanged, (state, { payload: [workspaceId, displayStatus] }) => {
+    // A newer event restarts the two-strike count: entity deliveries that
+    // contradicted the PREVIOUS override say nothing about this one.
+    const contradicted = { ...state.displayStatusOverridesContradicted };
+    delete contradicted[workspaceId];
+    return {
+      ...state,
+      displayStatusByWorkspaceId: {
+        ...state.displayStatusByWorkspaceId,
+        [workspaceId]: displayStatus,
+      },
+      displayStatusOverridesContradicted: contradicted,
+    };
+  })
+  // Entity deliveries reconcile the override (see `reconcileDisplayStatusOverride`).
+  .with(setWorkspaceEntity, (state, { payload: [workspace] }) =>
+    reconcileDisplayStatusOverride(state, [workspace]),
+  )
+  .with(replaceWorkspaceList, (state, { payload: [workspaces] }) =>
+    reconcileDisplayStatusOverride(state, workspaces),
+  )
   .with(hudUsageLoaded, (state, { payload: [usage] }) => ({ ...state, usage, usageError: null }))
   .with(hudUsageFailed, (state, { payload: [error] }) => ({ ...state, usageError: error }))
   .with(hudRateHistoryLoaded, (state, { payload: [rateHistory] }) => ({
@@ -335,42 +368,6 @@ export const hudReducer = createReducer<HudState>(initialState)
       ? state
       : { ...state, takeoverRequestWorkspaceId: null },
   )
-  .with(hudRate5sTokensObserved, (state, { payload: [tokens, atMs] }) => {
-    if (!state.active || !Number.isFinite(tokens) || tokens <= 0 || !Number.isFinite(atMs)) {
-      return state;
-    }
-    const startMs = toRate5sBucketStart(atMs);
-    const buckets = [...state.rate5s.buckets];
-    const index = buckets.findIndex((bucket) => bucket.startMs === startMs);
-    if (index >= 0) {
-      buckets[index] = { startMs, tokens: buckets[index].tokens + tokens };
-    } else {
-      buckets.push({ startMs, tokens });
-      buckets.sort((a, b) => a.startMs - b.startMs);
-    }
-    return { ...state, rate5s: { ...state.rate5s, buckets: pruneRate5sBuckets(buckets) } };
-  })
-  .with(hudRate5sBackfilled, (state, { payload: [samples, nowMs] }) => {
-    // One-shot: live-observed buckets always win over the backfill split.
-    if (!state.active || state.rate5s.backfilled) return state;
-    const cutoff = toRate5sBucketStart(nowMs) - HUD_RATE_5S_WINDOW_MS + HUD_RATE_5S_BUCKET_MS;
-    const byStart = new Map<number, HudRate5sBucket>(
-      state.rate5s.buckets.map((bucket) => [bucket.startMs, bucket]),
-    );
-    const slotsPerMinute = 60_000 / HUD_RATE_5S_BUCKET_MS;
-    for (const sample of samples) {
-      const minuteMs = Date.parse(sample.bucketUtc);
-      if (!Number.isFinite(minuteMs) || sample.tokens <= 0) continue;
-      const perSlot = sample.tokens / slotsPerMinute;
-      for (let slot = 0; slot < slotsPerMinute; slot++) {
-        const startMs = minuteMs + slot * HUD_RATE_5S_BUCKET_MS;
-        if (startMs < cutoff || startMs > nowMs || byStart.has(startMs)) continue;
-        byStart.set(startMs, { startMs, tokens: perSlot });
-      }
-    }
-    const buckets = [...byStart.values()].sort((a, b) => a.startMs - b.startMs);
-    return { ...state, rate5s: { buckets: pruneRate5sBuckets(buckets), backfilled: true } };
-  })
   .with(hudQuestionCaptured, (state, { payload: [question] }) => {
     if (!state.active) return state;
     return {

@@ -38,8 +38,9 @@ import {
   selectSpecialistSourceLabel,
 } from "./specialists-selectors";
 import { createCollection } from "$lib/store-shim/utils/collections/collection-utils";
-import { initialState } from "./specialists-slice";
+import { initialState, type FileSpecialist } from "./specialists-slice";
 import type { StoreState } from "../../types";
+import type { ProviderStatus } from "../agent-availability/agent-availability-types";
 import { SPECIALISTS } from "$lib/constants/specialists";
 import { seedProviderCatalog } from "../../../../test/fixtures/provider-catalog.fixture";
 import { store as appStore } from "$store/renderer/store";
@@ -49,11 +50,23 @@ import type { SpecialistDef } from "$lib/client/app-client";
 /**
  * Create a minimal mock StoreState with specialists slice populated.
  */
-function mockState(overrides: Partial<typeof initialState> = {}): StoreState {
+function mockState(
+  overrides: Partial<typeof initialState> = {},
+  activeProviderId = "auggie",
+  providerStatusMap: Record<string, ProviderStatus> = {},
+): StoreState {
   return {
     specialists: { ...initialState, ...overrides },
     featureCodes: { activeFeatures: [], initialized: true },
-    providerSettings: { activeProviderId: "auggie", enabledProviders: {} },
+    providerSettings: { activeProviderId, enabledProviders: {} },
+    agentAvailability: {
+      providerStatusMap,
+      providerLoadingMap: {},
+      providerUserInfoLoadingMap: {},
+      hasCheckedOnce: false,
+      watchedTerminalIds: [],
+      npxStatus: null,
+    },
     githubAuth: { isAuthenticated: false },
   } as unknown as StoreState;
 }
@@ -348,6 +361,67 @@ describe("specialists selectors", () => {
     });
   });
 
+  describe("selectHasOverrides (diff-based Modified state, monorepo#1450)", () => {
+    const implementor = SPECIALISTS.find((s) => s.id === "implementor")!;
+
+    function overrideFile(overrides: Partial<FileSpecialist> = {}): FileSpecialist {
+      return {
+        id: "implementor",
+        name: implementor.name,
+        description: implementor.description,
+        model: "",
+        behaviorPrompt: implementor.defaultBehaviorPrompt,
+        roleReminder: implementor.roleReminder,
+        filePath: "/Users/test/.intent/specialists/implementor.md",
+        source: "user" as const,
+        ...overrides,
+      };
+    }
+
+    it("is false when the user override file is identical to the bundled defaults", () => {
+      const state = mockState({
+        bundledSpecialists: SPECIALISTS,
+        fileSpecialists: createCollection("id", [overrideFile()]),
+      });
+      expect(selectHasOverrides.select(state, "implementor")).toBe(false);
+    });
+
+    it("is true when the override pins an explicit model", () => {
+      const state = mockState({
+        bundledSpecialists: SPECIALISTS,
+        fileSpecialists: createCollection("id", [
+          overrideFile({ model: "claude-code:opus4.5" }),
+        ]),
+      });
+      expect(selectHasOverrides.select(state, "implementor")).toBe(true);
+    });
+
+    it("is true when the override customizes the prompt", () => {
+      const state = mockState({
+        bundledSpecialists: SPECIALISTS,
+        fileSpecialists: createCollection("id", [
+          overrideFile({ behaviorPrompt: "Custom prompt." }),
+        ]),
+      });
+      expect(selectHasOverrides.select(state, "implementor")).toBe(true);
+    });
+
+    it("is false when no override file exists", () => {
+      const state = mockState({ bundledSpecialists: SPECIALISTS });
+      expect(selectHasOverrides.select(state, "implementor")).toBe(false);
+    });
+
+    it("is false for non-built-in specialists", () => {
+      const state = mockState({
+        bundledSpecialists: SPECIALISTS,
+        fileSpecialists: createCollection("id", [
+          overrideFile({ id: "my-custom", model: "gpt-4" }),
+        ]),
+      });
+      expect(selectHasOverrides.select(state, "my-custom")).toBe(false);
+    });
+  });
+
   describe("selectors with missing codingAgentOverrides (legacy electron-store data)", () => {
     /** Simulate old persisted data where codingAgentOverrides didn't exist yet */
     function legacyState() {
@@ -371,8 +445,49 @@ describe("specialists selectors", () => {
         providerSettings: { activeProviderId: "auggie", enabledProviders: {} },
       } as StoreState;
       expect(() => selectEffectiveCodingAgent.select(state, "nonexistent-specialist")).not.toThrow();
+      // The active provider ("auggie") has no reported availability in this
+      // state, so per D1(B) it must NOT be silently handed back.
       const result = selectEffectiveCodingAgent.select(state, "nonexistent-specialist");
-      expect(result).toBe("auggie");
+      expect(result).toBe("");
+    });
+  });
+
+  describe("availability-gated coding agent resolution (D1-B)", () => {
+    it("selectEffectiveCodingAgent honors an explicit specialist codingAgent regardless of availability", () => {
+      const state = mockState(
+        {
+          fileSpecialists: createCollection("id", [
+            {
+              id: "custom-spec",
+              name: "Custom",
+              description: "d",
+              codingAgent: "codex",
+              model: "",
+              behaviorPrompt: "prompt",
+              filePath: "/Users/test/.intent/specialists/custom-spec.md",
+              source: "user" as const,
+            },
+          ]),
+        },
+        "auggie",
+        {},
+      );
+      expect(selectEffectiveCodingAgent.select(state, "custom-spec")).toBe("codex");
+    });
+
+    it("selectEffectiveCodingAgent returns the active provider when it is available", () => {
+      const state = mockState({}, "auggie", { auggie: { available: true } });
+      expect(selectEffectiveCodingAgent.select(state, "implementor")).toBe("auggie");
+    });
+
+    it("selectEffectiveCodingAgent returns '' (not a silent switch) when the active provider is unavailable", () => {
+      const state = mockState({}, "auggie", { auggie: { available: false } });
+      expect(selectEffectiveCodingAgent.select(state, "implementor")).toBe("");
+    });
+
+    it("selectEffectiveCodingAgent returns '' when nothing has been checked yet (none available)", () => {
+      const state = mockState({}, "auggie", {});
+      expect(selectEffectiveCodingAgent.select(state, "implementor")).toBe("");
     });
   });
 

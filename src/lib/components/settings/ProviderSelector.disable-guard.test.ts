@@ -4,6 +4,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, waitFor } from '@testing-library/svelte';
 import { AUGGIE_CHANNELS, PROVIDERS_CHANNELS } from '$shared/ipc/channels';
+import { warmImport } from '../../../test/warm-import';
 
 const mocks = vi.hoisted(() => ({
   dispatch: vi.fn(),
@@ -31,15 +32,12 @@ vi.mock('svelte-sonner', () => ({
 }));
 
 vi.mock('./ProviderPathConfig.svelte', async () => ({
-  default: (
-    await import('../workspace/sidebar/__tests__/mocks/MockSimple.svelte')
-  ).default,
+  default: (await import('../workspace/sidebar/__tests__/mocks/MockSimple.svelte')).default,
 }));
 
 vi.mock('$store/renderer/store', async () => {
-  const { createAppStoreMockModule } = await import(
-    '$store/renderer/utils/test-helpers/store-mock'
-  );
+  const { createAppStoreMockModule } =
+    await import('$store/renderer/utils/test-helpers/store-mock');
   return createAppStoreMockModule({
     state: () => mocks.state.current,
     dispatch: mocks.dispatch,
@@ -47,23 +45,17 @@ vi.mock('$store/renderer/store', async () => {
 });
 
 async function buildState(fileSpecialists: object[]) {
-  const { initialState: specialistsInitialState } = await import(
-    '$store/renderer/slices/specialists/specialists-slice'
-  );
-  const { initialState: modelInitialState } = await import(
-    '$store/renderer/slices/model/model-slice'
-  );
-  const { createCollection } = await import(
-    '$lib/store-shim/utils/collections/collection-utils'
-  );
+  const { initialState: specialistsInitialState } =
+    await import('$store/renderer/slices/specialists/specialists-slice');
+  const { initialState: modelInitialState } =
+    await import('$store/renderer/slices/model/model-slice');
+  const { createCollection } = await import('$lib/store-shim/utils/collections/collection-utils');
   const {
     initialState: providerCatalogInitialState,
     providerCatalogLoaded,
     providerCatalogReducer,
   } = await import('$store/renderer/slices/provider-catalog/provider-catalog-slice');
-  const { MOCK_PROVIDER_CATALOG } = await import(
-    '../../../test/fixtures/provider-catalog.fixture'
-  );
+  const { MOCK_PROVIDER_CATALOG } = await import('../../../test/fixtures/provider-catalog.fixture');
   return {
     providerCatalog: providerCatalogReducer(
       providerCatalogInitialState,
@@ -82,6 +74,17 @@ async function buildState(fileSpecialists: object[]) {
     },
     featureCodes: { activeFeatures: [], initialized: true },
     githubAuth: { isAuthenticated: false },
+    agentAvailability: {
+      providerStatusMap: {
+        'claude-code': { available: true, authenticated: true },
+        codex: { available: true, authenticated: true },
+      },
+      providerLoadingMap: { 'claude-code': false, codex: false },
+      providerUserInfoLoadingMap: {},
+      hasCheckedOnce: true,
+      watchedTerminalIds: [],
+      npxStatus: null,
+    },
   };
 }
 
@@ -101,6 +104,11 @@ const availability = {
   },
   hiddenProviders: ['mock', 'cortex', 'opencode', 'pi', 'droid', 'grok'],
 };
+
+// Pre-warm the component module graph so the cold dynamic import is not
+// billed to the first test's timeout (intent-hq/monorepo#1464).
+warmImport(() => import('../workspace/sidebar/__tests__/mocks/MockSimple.svelte'));
+warmImport(() => import('./ProviderSelector.svelte'));
 
 describe('ProviderSelector disable guard', () => {
   beforeEach(async () => {
@@ -185,5 +193,107 @@ describe('ProviderSelector disable guard', () => {
     expect(mocks.dispatch).not.toHaveBeenCalledWith(
       expect.objectContaining({ type: 'providerSettings/setProviderEnabled' }),
     );
+  });
+
+  it('dispatches ensureProvidersChecked on mount so availability is populated outside onboarding', async () => {
+    await renderSelector();
+    expect(mocks.dispatch).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'agentAvailability/ensureProvidersChecked' }),
+    );
+  });
+});
+
+describe('ProviderSelector default-unavailable honesty', () => {
+  afterEach(() => {
+    cleanup();
+  });
+
+  it('shows "Default (unavailable)" for a generic active provider that is not installed', async () => {
+    const base = await buildState([]);
+    mocks.state.current = {
+      ...base,
+      providerSettings: {
+        activeProviderId: 'codex',
+        enabledProviders: { 'claude-code': true, codex: true },
+      },
+      agentAvailability: {
+        ...base.agentAvailability,
+        providerStatusMap: {
+          ...base.agentAvailability.providerStatusMap,
+          codex: { available: false },
+        },
+      },
+    };
+    mocks.invoke.mockImplementation(async (channel: string) => {
+      if (channel === AUGGIE_CHANNELS.STATUS) {
+        return {
+          success: true,
+          data: {
+            installed: true,
+            authenticated: true,
+            versionOk: true,
+            nodeVersionOk: true,
+            minimumVersion: '0.0.0',
+          },
+        };
+      }
+      if (channel === PROVIDERS_CHANNELS.GET_AVAILABILITY) {
+        return {
+          success: true,
+          data: {
+            ...availability,
+            providers: { ...availability.providers, codex: { available: false } },
+          },
+        };
+      }
+      if (channel === PROVIDERS_CHANNELS.GET_PATHS) {
+        return { success: true, data: { auggie: null, 'claude-code': null, codex: null } };
+      }
+      return { success: true, data: {} };
+    });
+
+    const ProviderSelector = (await import('./ProviderSelector.svelte')).default;
+    const result = render(ProviderSelector);
+    await waitFor(() => {
+      expect(result.getByText('OpenAI Codex')).toBeTruthy();
+    });
+    expect(result.getByText('Default (unavailable)')).toBeTruthy();
+  });
+
+  it('shows "Default (unavailable)" when Auggie is active but not installed', async () => {
+    mocks.state.current = {
+      ...(await buildState([])),
+      providerSettings: {
+        activeProviderId: 'auggie',
+        enabledProviders: { 'claude-code': true, codex: true },
+      },
+    };
+    mocks.invoke.mockImplementation(async (channel: string) => {
+      if (channel === AUGGIE_CHANNELS.STATUS) {
+        return {
+          success: true,
+          data: {
+            installed: false,
+            authenticated: false,
+            versionOk: false,
+            nodeVersionOk: true,
+            minimumVersion: '0.0.0',
+          },
+        };
+      }
+      if (channel === PROVIDERS_CHANNELS.GET_AVAILABILITY) {
+        return { success: true, data: availability };
+      }
+      if (channel === PROVIDERS_CHANNELS.GET_PATHS) {
+        return { success: true, data: { auggie: null, 'claude-code': null, codex: null } };
+      }
+      return { success: true, data: {} };
+    });
+
+    const ProviderSelector = (await import('./ProviderSelector.svelte')).default;
+    const result = render(ProviderSelector);
+    await waitFor(() => {
+      expect(result.getByText('Default (unavailable)')).toBeTruthy();
+    });
   });
 });

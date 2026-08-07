@@ -148,7 +148,6 @@ export const mockModels: AuggieModel[] = [
     description: "Most capable model for complex coding and reasoning.",
     modelGroupPriority: 1,
     costTier: 3,
-    isDefault: true,
   },
   {
     value: "opus4.6",
@@ -163,6 +162,8 @@ export const mockModels: AuggieModel[] = [
     description: "Balanced speed and capability for everyday tasks.",
     modelGroupPriority: 2,
     costTier: 2,
+    // Mirrors the real CLI: sonnet4.5 is the row the provider marks default.
+    isDefault: true,
   },
   {
     value: "gpt5.4",
@@ -220,12 +221,14 @@ export const mockRecentUrls: RecentUrl[] = [
 
 export const mockReleaseNotes: ReleaseNotes = {
   version: "1.8.0",
-  date: "2026-01-01",
-  highlights: [
-    "Dark mode is here — toggle it from the settings panel.",
-    "Faster workspace switching with cached file trees.",
-    "Improved agent activity stream with richer event details.",
-  ],
+  notes: [
+    "## Highlights",
+    "",
+    "- Dark mode is here — toggle it from the settings panel.",
+    "- Faster workspace switching with cached file trees.",
+    "- Improved agent activity stream with richer event details.",
+  ].join("\n"),
+  url: "https://github.com/intent-hq/cloudlands-releases/releases/tag/v1.8.0",
 };
 
 export const mockSystemStatus: SystemStatusState = {

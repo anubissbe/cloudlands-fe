@@ -37,7 +37,10 @@ vi.mock('$store/renderer/store', async () => {
   const { createAppStoreMockModule } = await import(
     '$store/renderer/utils/test-helpers/store-mock'
   );
-  return createAppStoreMockModule({ state: () => ({}), dispatch: mocks.dispatch });
+  return createAppStoreMockModule({
+    state: () => ({ hardwareConsole: { pttRecording: false, voiceTranscribing: false } }),
+    dispatch: mocks.dispatch,
+  });
 });
 
 vi.mock('$store/renderer/slices/workspace-initializer/workspace-initializer-selectors', () => ({
@@ -46,6 +49,8 @@ vi.mock('$store/renderer/slices/workspace-initializer/workspace-initializer-sele
   selectWorkspaceInitializerLastSelectedRepo: () => mocks.readable(() => null),
   selectWorkspaceInitializerLastSubmittedAgent: () => mocks.readable(() => null),
   selectWorkspaceInitializerRecentRepos: () => mocks.readable(() => []),
+  selectWorkspaceInitializerPendingGitHubPrefill: () => mocks.readable(() => null),
+  selectWorkspaceInitializerDefaultParentPath: () => mocks.readable(() => ''),
 }));
 
 vi.mock('$store/renderer/slices/model/model-selectors', () => ({
@@ -167,6 +172,7 @@ vi.mock('svelte-fa', async () => ({
 
 import CompactWorkspaceInitializer from '../CompactWorkspaceInitializer.svelte';
 import { REPO_CONFIG_SCRIPT_NAME } from '$features/setup-scripts';
+import { warmImport } from '../../../../test/warm-import';
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -206,6 +212,12 @@ function selectGitHubRepo(overrides: Record<string, unknown> = {}) {
     },
   });
 }
+
+// Pre-warm the component module graph so the cold dynamic import is not
+// billed to the first test's timeout (intent-hq/monorepo#1464).
+warmImport(() => import('./mocks/MockRichTextarea.svelte'));
+warmImport(() => import('../initializer/__tests__/mocks/MockComponent.svelte'));
+warmImport(() => import('./mocks/MockRepoAndBranchPicker.svelte'));
 
 describe('CompactWorkspaceInitializer repo-config setup script detection', () => {
   beforeEach(() => {

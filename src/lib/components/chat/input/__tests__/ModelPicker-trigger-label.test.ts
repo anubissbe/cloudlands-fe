@@ -177,6 +177,7 @@ vi.mock('$store/renderer/slices/agent-session/agent-session-slice', () => ({
 vi.mock('$store/renderer/slices/model/model-selectors', () => ({
   selectSelectedModel: () => selectedModel$,
   selectAvailableModels: () => availableModels$,
+  selectAvailableModelsProviderId: () => writable('auggie'),
   selectModelFallbackInfo: () => writable(null),
   selectModelPickerCollapsedGroups: () => writable([]),
   selectIsLoadingModels: () => isLoadingModels$,
@@ -186,11 +187,16 @@ vi.mock('$store/renderer/slices/model/model-selectors', () => ({
 
 vi.mock('$store/renderer/slices/agent-availability/agent-availability-selectors', () => ({
   selectManagedInstallStatusByProvider: () => writable(null),
+  selectHasCheckedOnce: () => writable(true),
+}));
+
+vi.mock('$store/renderer/slices/daemon-health/daemon-health-selectors', () => ({
+  selectDaemonHealth: () => writable('healthy'),
 }));
 
 vi.mock('$store/renderer/slices/provider-settings/provider-settings-selectors', () => ({
   selectActiveProviderId: () => activeProviderId$,
-  selectEnabledProviderIds: () => enabledProviderIds$,
+  selectAvailableEnabledProviderIds: () => enabledProviderIds$,
 }));
 
 vi.mock('$store/renderer/slices/model/model-utils', () => ({
@@ -224,6 +230,14 @@ import { store as appStore } from '$store/renderer/store';
 import { updateSession as updateAgentSessionFields } from '$store/renderer/slices/agent-session/agent-session-slice';
 import { getModelsForProviderForLoadingState } from '$store/renderer/slices/model/model-utils';
 import ModelPicker from '../ModelPicker.svelte';
+import { warmImport } from '../../../../../test/warm-import';
+
+// Pre-warm the component module graph so the cold dynamic import is not
+// billed to the first test's timeout (intent-hq/monorepo#1464).
+warmImport(() => import('../../../ui/__tests__/mocks/Fa.svelte'));
+warmImport(() => import('../../../ui/__tests__/mocks/button.svelte'));
+warmImport(() => import('../../__tests__/mocks/SlotOnly.svelte'));
+warmImport(() => import('../../__tests__/mocks/ProviderIcon.svelte'));
 
 describe('ModelPicker trigger label regressions', () => {
   beforeEach(() => {

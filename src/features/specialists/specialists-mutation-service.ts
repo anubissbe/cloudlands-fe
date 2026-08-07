@@ -94,6 +94,8 @@ function toBundledSpecialist(def: SpecialistDef): (typeof SPECIALISTS)[number] {
     hidden: def.hidden,
     resolvedModel: def.resolvedModel,
     resolvedProvider: def.resolvedProvider,
+    modelOptions: def.modelOptions,
+    reasoningEffort: def.reasoningEffort,
   };
 }
 
@@ -112,6 +114,8 @@ function toFileSpecialist(def: SpecialistDef): FileSpecialist {
     hidden: def.hidden,
     resolvedModel: def.resolvedModel,
     resolvedProvider: def.resolvedProvider,
+    modelOptions: def.modelOptions,
+    reasoningEffort: def.reasoningEffort,
   };
 }
 
@@ -199,6 +203,13 @@ async function handleSaveFileSpecialist(
       // clearing `model: ""` frontmatter key (PROTOCOL §5.11 config scalars).
       model: payload.model || undefined,
       roleReminder: payload.roleReminder,
+      // Empty list likewise means "inherit": omit the key — an explicit []
+      // would write a clearing `modelOptions: []` frontmatter scalar
+      // (PROTOCOL §5.11 modelOptions).
+      modelOptions: payload.modelOptions?.length ? payload.modelOptions : undefined,
+      // Empty effort likewise means "inherit the model default": omit the key
+      // (PROTOCOL §5.11 reasoningEffort — never null/"" on the wire).
+      reasoningEffort: payload.reasoningEffort || undefined,
       behaviorPrompt: payload.behaviorPrompt,
       source: (payload.scope ?? 'user') as 'user' | 'project',
       hidden,
@@ -248,6 +259,8 @@ async function handleExportBuiltinToFile(
       codingAgent: bundled.codingAgent,
       model: bundled.defaultModel,
       roleReminder: bundled.roleReminder,
+      modelOptions: bundled.modelOptions,
+      reasoningEffort: bundled.reasoningEffort,
       behaviorPrompt: bundled.defaultBehaviorPrompt,
       source: 'user',
       hidden: bundled.hidden,

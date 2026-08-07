@@ -14,6 +14,7 @@ import {
   waitFor,
 } from '@testing-library/svelte';
 import {
+  derived,
   readable,
   writable,
 } from 'svelte/store';
@@ -21,6 +22,9 @@ import {
 const mockModelState = vi.hoisted(() => ({
   selectedModel: 'gpt5.4',
   availableModels: [{ value: 'gpt5.4', label: 'GPT 5.4', description: 'Smart model' }],
+  // Provenance of the global catalog (model.availableModelsProviderId).
+  // Defaults to the active provider used by most tests.
+  availableModelsProviderId: 'auggie',
   loadError: null as string | null,
 }));
 
@@ -129,6 +133,7 @@ vi.mock('$store/renderer/slices/model/model-utils', () => ({
 vi.mock('$store/renderer/slices/model/model-selectors', () => ({
   selectSelectedModel: () => readable(mockModelState.selectedModel),
   selectAvailableModels: () => readable(mockModelState.availableModels),
+  selectAvailableModelsProviderId: () => readable(mockModelState.availableModelsProviderId),
   selectModelFallbackInfo: () => readable(null),
   selectModelPickerCollapsedGroups: () => readable([]),
   selectIsLoadingModels: () => readable(false),
@@ -136,18 +141,36 @@ vi.mock('$store/renderer/slices/model/model-selectors', () => ({
   selectAllProviderWarnings: () => providerWarnings$,
 }));
 
+const hasCheckedOnce$ = writable(true);
 vi.mock('$store/renderer/slices/agent-availability/agent-availability-selectors', () => ({
   selectManagedInstallStatusByProvider: () => codexManagedInstallStatus$,
+  selectHasCheckedOnce: () => hasCheckedOnce$,
+}));
+
+// Daemon connection health ('healthy' | 'degraded' | 'down'); the D1(B)
+// no-provider surface is suppressed while the daemon is down.
+const daemonHealth$ = writable<'healthy' | 'degraded' | 'down'>('healthy');
+vi.mock('$store/renderer/slices/daemon-health/daemon-health-selectors', () => ({
+  selectDaemonHealth: () => daemonHealth$,
 }));
 
 const enabledProviderIds$ = writable(['auggie']);
 const activeProviderId$ = writable('auggie');
+// Mirrors `enabledProviderIds$` by default (available === enabled), so every
+// existing test that only manipulates `enabledProviderIds$` keeps working
+// unchanged. Tests exercising availability gating set this override to a
+// distinct list (or `[]`) to diverge available from enabled.
+const availableProviderOverride$ = writable<string[] | null>(null);
+const availableEnabledProviderIds$ = derived(
+  [enabledProviderIds$, availableProviderOverride$],
+  ([enabled, override]) => override ?? enabled,
+);
 const mockAgentSession$ = writable<
   { id: string; workspaceId: string; provider?: string } | undefined
 >(undefined);
 vi.mock('$store/renderer/slices/provider-settings/provider-settings-selectors', () => ({
   selectActiveProviderId: () => activeProviderId$,
-  selectEnabledProviderIds: () => enabledProviderIds$,
+  selectAvailableEnabledProviderIds: () => availableEnabledProviderIds$,
 }));
 
 vi.mock('$shared/types/agent-session', () => ({
@@ -175,6 +198,18 @@ import {
 } from '$store/renderer/slices/model/model-utils';
 import { selectModel } from '$store/renderer/slices/model/model-slice';
 import ModelPicker from './ModelPicker.svelte';
+import { warmImport } from '../../../../test/warm-import';
+
+// Pre-warm the component module graph so the cold dynamic import is not
+// billed to the first test's timeout (intent-hq/monorepo#1464).
+warmImport(() => import('../../ui/__tests__/mocks/Fa.svelte'));
+warmImport(() => import('../../ui/__tests__/mocks/button.svelte'));
+
+afterEach(() => {
+  availableProviderOverride$.set(null);
+  mockModelState.availableModelsProviderId = 'auggie';
+  daemonHealth$.set('healthy');
+});
 
 describe('ModelPicker locked state', () => {
   beforeEach(() => {
@@ -731,6 +766,207 @@ describe('ModelPicker multi-provider mode', () => {
       expect(onModelChange).toHaveBeenCalledWith('opencode:real-model');
     });
     expect(vi.mocked(toast.info)).toHaveBeenCalled();
+
+    // Reset for other tests
+    activeProviderId$.set('auggie');
+  });
+});
+
+describe('ModelPicker availability gating', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockModelState.selectedModel = 'gpt5.4';
+    mockModelState.loadError = null;
+    mockModelState.availableModels = [];
+    providerWarnings$.set({});
+    codexManagedInstallStatus$.set(null);
+    mockSvelteDispatch.mockClear();
+    vi.mocked(getModelsForProviderForLoadingState).mockResolvedValue({ models: [] });
+    enabledProviderIds$.set(['auggie']);
+    activeProviderId$.set('auggie');
+    availableProviderOverride$.set(null);
+    hasCheckedOnce$.set(true);
+    daemonHealth$.set('healthy');
+  });
+
+  afterEach(() => {
+    cleanup();
+    document.body.innerHTML = '';
+    availableProviderOverride$.set(null);
+    hasCheckedOnce$.set(true);
+    daemonHealth$.set('healthy');
+  });
+
+  it('does not show the no-provider failure notice or toast while availability has not been checked yet', async () => {
+    const { toast } = await import('svelte-sonner');
+    hasCheckedOnce$.set(false);
+    availableProviderOverride$.set([]);
+
+    render(ModelPicker, {
+      props: { portal: false },
+    });
+
+    await screen.findByRole('button');
+
+    expect(screen.queryByText('No provider available')).toBeNull();
+    expect(vi.mocked(toast.error)).not.toHaveBeenCalled();
+  });
+
+  it('shows a failure notice and fires a toast when no provider is available', async () => {
+    const { toast } = await import('svelte-sonner');
+    availableProviderOverride$.set([]);
+
+    render(ModelPicker, {
+      props: { portal: false },
+    });
+
+    await waitFor(() => {
+      expect(vi.mocked(toast.error)).toHaveBeenCalled();
+    });
+    expect(screen.getByText('No provider available')).toBeTruthy();
+  });
+
+  it('suppresses the no-provider notice and toast while the daemon is not yet connected (pre-connect probe failure)', async () => {
+    // Regression (startup window): the mount-time ensureProvidersChecked can
+    // run its bulk probe before the daemon socket is up — every probe fails,
+    // hasCheckedOnce flips, and availableEnabledProviderIds is [] — which
+    // must NOT fire the D1(B) toast/notice while daemon health is 'down'.
+    const { toast } = await import('svelte-sonner');
+    daemonHealth$.set('down');
+    hasCheckedOnce$.set(true);
+    availableProviderOverride$.set([]);
+
+    render(ModelPicker, {
+      props: { portal: false },
+    });
+
+    await screen.findByRole('button');
+    await new Promise((r) => setTimeout(r, 50));
+
+    expect(screen.queryByText('No provider available')).toBeNull();
+    expect(vi.mocked(toast.error)).not.toHaveBeenCalled();
+
+    // Once the daemon connects, a still-empty availability map is a real
+    // confirmed failure — the notice and toast surface as before.
+    daemonHealth$.set('healthy');
+
+    await waitFor(() => {
+      expect(vi.mocked(toast.error)).toHaveBeenCalled();
+    });
+    expect(screen.getByText('No provider available')).toBeTruthy();
+  });
+
+  it('does not show the no-provider failure notice or toast when a provider is available', async () => {
+    const { toast } = await import('svelte-sonner');
+    vi.mocked(getModelsForProviderForLoadingState).mockResolvedValue({
+      models: [{ value: 'auggie:sonnet4.6', label: 'Sonnet 4.6', description: 'Smart model' }],
+    });
+
+    render(ModelPicker, {
+      props: { portal: false },
+    });
+
+    await waitFor(() => {
+      expect(vi.mocked(getModelsForProviderForLoadingState)).toHaveBeenCalledWith('auggie');
+    });
+
+    expect(screen.queryByText('No provider available')).toBeNull();
+    expect(vi.mocked(toast.error)).not.toHaveBeenCalled();
+  });
+
+  it('excludes an enabled-but-unavailable provider from the rendered model list', async () => {
+    const { toast } = await import('svelte-sonner');
+    vi.mocked(getModelsForProviderForLoadingState).mockImplementation(async (providerId) => {
+      if (providerId === 'codex') {
+        return {
+          models: [{ value: 'codex:gpt-5-codex', label: 'GPT-5 Codex', description: 'Smart' }],
+        };
+      }
+      return { models: [{ value: 'auggie:sonnet4.6', label: 'Sonnet 4.6', description: 'Smart' }] };
+    });
+    enabledProviderIds$.set(['auggie', 'codex']);
+    availableProviderOverride$.set(['codex']);
+
+    render(ModelPicker, {
+      props: { selectedModel: 'codex:gpt-5-codex', portal: false },
+    });
+
+    await waitFor(() => {
+      expect(vi.mocked(getModelsForProviderForLoadingState)).toHaveBeenCalledWith('codex');
+    });
+    expect(vi.mocked(getModelsForProviderForLoadingState)).not.toHaveBeenCalledWith('auggie');
+
+    await fireEvent.click(screen.getByRole('button'));
+
+    expect(await screen.findByRole('option', { name: /GPT-5 Codex/ })).toBeTruthy();
+    expect(screen.queryByRole('option', { name: /Sonnet 4\.6/ })).toBeNull();
+    expect(vi.mocked(toast.error)).not.toHaveBeenCalled();
+  });
+
+  it('dispatches ensureProvidersChecked on mount so availability is populated outside onboarding', async () => {
+    const { ensureProvidersChecked } = await import(
+      '$store/renderer/slices/agent-availability/agent-availability-slice'
+    );
+
+    render(ModelPicker, {
+      props: { portal: false },
+    });
+
+    expect(
+      mockSvelteDispatch.mock.calls.some(
+        ([action]) => (action as { type?: string }).type === ensureProvidersChecked.type,
+      ),
+    ).toBe(true);
+  });
+
+  it('does not render stale models from another provider under the active provider group label', async () => {
+    // Regression (mislabeled group): availability map still empty, active
+    // provider switched to grok, but the globally-loaded catalog still holds
+    // the previously loaded Auggie models. Those rows must NOT render under
+    // a "Grok Build" group label.
+    hasCheckedOnce$.set(false);
+    availableProviderOverride$.set([]);
+    enabledProviderIds$.set(['grok']);
+    activeProviderId$.set('grok');
+    mockModelState.availableModels = [
+      { value: 'gpt5.4', label: 'GPT 5.4', description: 'Smart model' },
+    ];
+    mockModelState.availableModelsProviderId = 'auggie';
+
+    render(ModelPicker, {
+      props: { portal: false },
+    });
+
+    await fireEvent.click(screen.getByRole('button'));
+
+    expect(screen.queryByRole('option', { name: /GPT 5\.4/ })).toBeNull();
+    expect(screen.queryByText('Grok Build')).toBeNull();
+
+    // Reset for other tests
+    activeProviderId$.set('auggie');
+  });
+
+  it('still renders the disabled effective provider group when the catalog was loaded for it', async () => {
+    // Positive control for the provenance gate: when the global catalog DOES
+    // belong to the (unavailable) effective provider, the fallback group must
+    // keep rendering so the selected model isn't orphaned.
+    hasCheckedOnce$.set(false);
+    availableProviderOverride$.set([]);
+    enabledProviderIds$.set(['grok']);
+    activeProviderId$.set('grok');
+    mockModelState.availableModels = [
+      { value: 'grok:grok-4', label: 'Grok 4', description: 'Smart model' },
+    ];
+    mockModelState.availableModelsProviderId = 'grok';
+
+    render(ModelPicker, {
+      props: { portal: false },
+    });
+
+    await fireEvent.click(screen.getByRole('button'));
+
+    expect(await screen.findByRole('option', { name: /Grok 4/ })).toBeTruthy();
+    expect(screen.getAllByText('Grok Build').length).toBeGreaterThan(0);
 
     // Reset for other tests
     activeProviderId$.set('auggie');

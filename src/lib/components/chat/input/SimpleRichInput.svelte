@@ -10,7 +10,7 @@ import { selectAgentSession } from '$store/renderer/slices/agent-session/agent-s
   import type { Workspace } from '$shared/types';
   import { parseCompoundModelId as parseCompoundModelIdWithDefault } from '$shared/utils/compound-model-id';
   import {
-  selectCatalogDefaultProviderId,
+  selectEffectiveDefaultProviderId,
   selectNormalizedProviderId,
   selectProviderDisplayName,
 } from '$store/renderer/slices/provider-catalog/provider-catalog-selectors';
@@ -19,7 +19,6 @@ import { selectAgentSession } from '$store/renderer/slices/agent-session/agent-s
     EnhancePromptUnavailableError,
     isEnhancePromptAvailable,
   } from '$lib/client/live/live-prompt-enhancement';
-  import { selectActiveProviderId } from '$store/renderer/slices/provider-settings/provider-settings-selectors';
   import { TooltipShortcut } from '$lib/components/ui/tooltip';
   import TooltipRich from '$lib/components/ui/tooltip/TooltipRich.svelte';
 
@@ -31,15 +30,31 @@ import { selectAgentSession } from '$store/renderer/slices/agent-session/agent-s
   import Fa from 'svelte-fa';
   import {
   faMagicWandSparkles,
+  faMicrophone,
   faPaperclip,
   faPaperPlane,
+  faSpinner,
   faXmark,
   faLayerGroup,
   faStop,
 } from '@fortawesome/free-solid-svg-icons';
+  import {
+  selectPttRecording,
+  selectVoiceTranscribing,
+} from '$store/renderer/slices/hardware-console/hardware-console-selectors';
+  import {
+  cancelComposerMicRecording,
+  isComposerMicRecording,
+  toggleComposerMicRecording,
+} from '$features/hardware-console/voice/composer-mic-controller';
+  import { cancelActiveTranscription } from '$features/hardware-console/voice/transcription-cancellation';
+  import { showVoiceSetupToast } from '$features/hardware-console/voice/voice-setup-toast';
+  import { selectEffectiveVoiceEngine } from '$store/renderer/slices/voice-settings/voice-settings-selectors';
+  import type { PttContext } from '$features/hardware-console/voice/ptt-controller';
   import Button from '../../ui/button/button.svelte';
   import TipTapEditor from './TipTapEditor.svelte';
   import ModelPicker from './ModelPicker.svelte';
+  import EffortPicker from './EffortPicker.svelte';
   import ModelSwitchConfirmDialog from '../ModelSwitchConfirmDialog.svelte';
   import Header from '$lib/components/ui/Header.svelte';
   import AttachmentPreview from '../AttachmentPreview.svelte';
@@ -60,8 +75,10 @@ import { selectAgentSession } from '$store/renderer/slices/agent-session/agent-s
 
   const logger = createLogger('SimpleRichInput');
 
-  const defaultProviderId$ = selectCatalogDefaultProviderId();
-  const activeProviderId$ = selectActiveProviderId();
+  const defaultProviderId$ = selectEffectiveDefaultProviderId();
+  const pttRecording$ = selectPttRecording();
+  const voiceTranscribing$ = selectVoiceTranscribing();
+  const effectiveVoiceEngine$ = selectEffectiveVoiceEngine();
 
   // Catalog-backed local shims for the legacy provider-config helpers.
   function normalizeProviderId(providerId: string): string {
@@ -178,8 +195,9 @@ import { selectAgentSession } from '$store/renderer/slices/agent-session/agent-s
     onHistoryNext,
   }: Props = $props();
 
-  // §5.31 gate — enhance is auggie-only; unset active provider defaults to auggie
-  const enhanceAvailable = $derived(isEnhancePromptAvailable($activeProviderId$));
+  // §5.31 gate — enhance is auggie-only; gated on the settings-derived
+  // effective provider, matching the daemon's derivation.
+  const enhanceAvailable = $derived(isEnhancePromptAvailable($defaultProviderId$));
 
   // Track if enhancement is in progress
   let isEnhancing = $state(false);
@@ -222,6 +240,52 @@ import { selectAgentSession } from '$store/renderer/slices/agent-session/agent-s
   // no turn to stop while a parent is idle-waiting, and that affordance lives
   // on sidebar/list surfaces (IDLE-1).
   let showStopButton = $derived(isStreaming || isResponding);
+
+  // Mic latch button: "recording" renders only for the session THIS button
+  // started (ownership via the controller's session token) — a live hardware
+  // PTT session leaves the button idle-looking, and a click then hints
+  // instead of hijacking it. `$pttRecording$` drives re-evaluation (it flips
+  // exactly when a session starts/ends); transcribing disables the button
+  // with a spinner while `voice.transcribe` is in flight.
+  const micRecording = $derived($pttRecording$ && isComposerMicRecording());
+  const micTranscribing = $derived($voiceTranscribing$);
+
+  /** Dispatch + hint context for the shared PTT session API. */
+  const micContext: PttContext = {
+    dispatch: (action) => appStore.dispatch(action as { type: string }),
+    showHint: (message) => toast.info(message),
+  };
+
+  function handleMicClick() {
+    // The button is hidden while the effective engine is 'unavailable'
+    // (no engine can transcribe at all — non-mac or helper-missing mac
+    // with no cloud key), so this gate only catches the render race where
+    // a click lands before the template reacts to a settings change. A
+    // live recording is never gated — its stop-click must always land.
+    if (
+      !micRecording &&
+      selectEffectiveVoiceEngine.select(appStore.state) === 'unavailable'
+    ) {
+      showVoiceSetupToast();
+      return;
+    }
+    toggleComposerMicRecording(micContext);
+  }
+
+  function handleMicEscape(event: KeyboardEvent) {
+    if (event.key !== 'Escape' || !micRecording) return;
+    if (cancelComposerMicRecording(micContext)) {
+      event.preventDefault();
+      event.stopPropagation();
+    }
+  }
+
+  // Cancel-while-transcribing: abandon the in-flight session so a hung or
+  // slow transcribe can never insert a late result — the transcribing state
+  // clears immediately and a new recording can start right away.
+  function handleMicCancelTranscription() {
+    cancelActiveTranscription();
+  }
 
   $effect(() => {
     const justEnabled = previousDisabled && !disabled;
@@ -621,7 +685,7 @@ import { selectAgentSession } from '$store/renderer/slices/agent-session/agent-s
   }
 
   function handleSubmit() {
-    if (!canSend || disabled) {
+    if (!canSend || disabled || isEnhancing) {
       return;
     }
     // Clear any model fallback warning since user is sending a message with the new model
@@ -631,7 +695,7 @@ import { selectAgentSession } from '$store/renderer/slices/agent-session/agent-s
   }
 
   function handleForceSubmit() {
-    if (!canSend || disabled) {
+    if (!canSend || disabled || isEnhancing) {
       return;
     }
     // Force submit interrupts streaming and sends immediately
@@ -990,6 +1054,12 @@ import { selectAgentSession } from '$store/renderer/slices/agent-session/agent-s
   });
 </script>
 
+<!-- Esc cancels an in-progress composer mic recording (discard, no
+     transcription). Capture phase so the editor's own Escape handling
+     never wins while dictation is live; a no-op unless this instance owns
+     the recording session. -->
+<svelte:window onkeydowncapture={handleMicEscape} />
+
 <div
   bind:this={containerRef}
   class={cn(
@@ -1110,8 +1180,8 @@ import { selectAgentSession } from '$store/renderer/slices/agent-session/agent-s
         {autoFocus}
         {value}
         {placeholder}
-        {disabled}
-        {editableWhileDisabled}
+        disabled={disabled || isEnhancing}
+        editableWhileDisabled={editableWhileDisabled && !isEnhancing}
         workspace={workspace ?? undefined}
         onUpdate={(text) => {
           value = text;
@@ -1201,6 +1271,10 @@ import { selectAgentSession } from '$store/renderer/slices/agent-session/agent-s
         }}
       />
 
+      <!-- Reasoning effort indicator + slider popover; renders only when the
+           session's model advertises effort levels. -->
+      <EffortPicker {agentId} workspaceId={workspace?.id} {disabled} />
+
       <!-- Context Picker Button (@ icon with popover) - includes panels and selections -->
       <ContextPickerButton
         panels={availablePanels}
@@ -1226,6 +1300,57 @@ import { selectAgentSession } from '$store/renderer/slices/agent-session/agent-s
           <Fa icon={faPaperclip} size="sm" />
         </Button>
       </TooltipShortcut>
+
+      <!-- Mic latch button: click starts dictation, click again (Esc cancels)
+           stops and transcribes into the composer at the caret. Hidden when
+           no engine can transcribe at all ('unavailable': Windows/Linux or
+           helper-missing mac with no cloud key — see effective-voice-engine);
+           on macOS the button stays visible pre-authorization and the click
+           proceeds down the OS path so the permission prompt can fire. -->
+      {#if micTranscribing}
+        <!-- Clickable while transcribing: cancel abandons the in-flight
+             session (a hung provider's late result is discarded) and
+             returns the button to idle immediately. -->
+        <TooltipShortcut label={m.chat_richInput_micCancelTranscribing_label()} side="top">
+          <Button
+            variant="ghost-light"
+            size="icon-sm"
+            onclick={handleMicCancelTranscription}
+            aria-label={m.chat_richInput_micCancelTranscribing_label()}
+            data-testid="composer-mic-button"
+          >
+            <Fa icon={faSpinner} size="sm" class="animate-spin" />
+          </Button>
+        </TooltipShortcut>
+      {:else if micRecording}
+        <TooltipShortcut label={m.chat_richInput_micStop_label()} shortcut="Escape" side="top">
+          <Button
+            variant="ghost-light"
+            size="icon-sm"
+            onclick={handleMicClick}
+            aria-label={m.chat_richInput_micStop_label()}
+            aria-pressed="true"
+            class="text-destructive-foreground animate-pulse"
+            data-testid="composer-mic-button"
+          >
+            <Fa icon={faMicrophone} size="sm" />
+          </Button>
+        </TooltipShortcut>
+      {:else if $effectiveVoiceEngine$ !== 'unavailable'}
+        <TooltipShortcut label={m.chat_richInput_micStart_label()} side="top">
+          <Button
+            variant="ghost-light"
+            size="icon-sm"
+            {disabled}
+            onclick={handleMicClick}
+            aria-label={m.chat_richInput_micStart_label()}
+            aria-pressed="false"
+            data-testid="composer-mic-button"
+          >
+            <Fa icon={faMicrophone} size="sm" />
+          </Button>
+        </TooltipShortcut>
+      {/if}
 
       {#if enhanceAvailable}
         {#if isEnhancing}
@@ -1279,8 +1404,9 @@ import { selectAgentSession } from '$store/renderer/slices/agent-session/agent-s
           >
             <!-- Queue button -->
             <button
-              class="relative flex-1 flex flex-col items-center justify-center gap-1 px-2 py-2.5 min-w-9 bg-transparent border-none cursor-pointer transition-colors text-primary not-disabled:hover:bg-background overflow-visible"
+              class="relative flex-1 flex flex-col items-center justify-center gap-1 px-2 py-2.5 min-w-9 bg-transparent border-none cursor-pointer disabled:cursor-not-allowed disabled:opacity-50 transition-colors text-primary not-disabled:hover:bg-background overflow-visible"
               onclick={handleSubmit}
+              disabled={isEnhancing}
               aria-label={m.chat_richInput_queueMessage_ariaLabel()}
             >
               <div class="absolute top-0 left-1/2 transform -translate-x-1/2 -translate-y-full">
@@ -1299,8 +1425,9 @@ import { selectAgentSession } from '$store/renderer/slices/agent-session/agent-s
 
             <!-- Interrupt button (stop + send immediately) -->
             <button
-              class="relative flex-1 flex flex-col items-center justify-center gap-1 px-2 py-2.5 min-w-9 bg-transparent border-none cursor-pointer transition-colors text-destructive-foreground not-disabled:hover:bg-background"
+              class="relative flex-1 flex flex-col items-center justify-center gap-1 px-2 py-2.5 min-w-9 bg-transparent border-none cursor-pointer disabled:cursor-not-allowed disabled:opacity-50 transition-colors text-destructive-foreground not-disabled:hover:bg-background"
               onclick={handleForceSubmit}
+              disabled={isEnhancing}
               aria-label={m.chat_richInput_interruptAndSend_ariaLabel()}
               data-testid="interrupt-btn"
             >
@@ -1340,7 +1467,7 @@ import { selectAgentSession } from '$store/renderer/slices/agent-session/agent-s
               size="icon-sm"
               class="text-primary disabled:text-subtle"
               onclick={handleSubmit}
-              disabled={disabled || !canSend}
+              disabled={disabled || !canSend || isEnhancing}
             >
               <Fa icon={faPaperPlane} class="mr-1" size="sm" />
             </Button>
@@ -1353,7 +1480,7 @@ import { selectAgentSession } from '$store/renderer/slices/agent-session/agent-s
             size="icon-sm"
             class="text-primary disabled:text-subtle"
             onclick={handleSubmit}
-            disabled={disabled || !canSend}
+            disabled={disabled || !canSend || isEnhancing}
             aria-label={m.chat_richInput_sendMessage_ariaLabel()}
           >
             <Fa icon={faPaperPlane} size="sm" />

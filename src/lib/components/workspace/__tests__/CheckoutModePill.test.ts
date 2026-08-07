@@ -2,8 +2,8 @@
  * @vitest-environment jsdom
  *
  * CheckoutModePill tests. The pill renders "CoW" for `checkoutMode === 'cow'`,
- * "Worktree" for `'worktree'`, and nothing at all when the field is absent
- * (direct / non-daemon-provisioned checkouts).
+ * "Worktree" for `'worktree'`, "Direct" for `'direct'`, and nothing at all
+ * when the field is absent (non-daemon-provisioned checkouts).
  *
  * When a workspace is provided, opening the tooltip fetches the footprint
  * on demand via `appClient.workspaces.diskUsage` (`workspace.diskUsage`,
@@ -18,6 +18,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { cleanup, render, screen, fireEvent } from '@testing-library/svelte';
 import { tick } from 'svelte';
 import type { Workspace } from '$shared/types';
+import { warmImport } from '../../../../test/warm-import';
 
 const mocks = vi.hoisted(() => ({
   runShrinkWorkspaceAction: vi.fn().mockResolvedValue(undefined),
@@ -74,6 +75,11 @@ async function renderPill(props: Record<string, unknown>) {
   return render(CheckoutModePill, { props });
 }
 
+// Pre-warm the component module graph so the cold dynamic import is not
+// billed to the first test's timeout (intent-hq/monorepo#1464).
+warmImport(() => import('./mocks/MockTooltipWithContent.svelte'));
+warmImport(() => import('../CheckoutModePill.svelte'));
+
 describe('CheckoutModePill', () => {
   beforeEach(() => {
     mocks.runShrinkWorkspaceAction.mockClear();
@@ -94,7 +100,12 @@ describe('CheckoutModePill', () => {
     expect(screen.getByText('Worktree')).toBeTruthy();
   });
 
-  it('renders nothing when checkoutMode is undefined (direct)', async () => {
+  it('renders "Direct" when checkoutMode is direct (cache-hydrated local clone)', async () => {
+    await renderPill({ checkoutMode: 'direct' });
+    expect(screen.getByText('Direct')).toBeTruthy();
+  });
+
+  it('renders nothing when checkoutMode is undefined (non-daemon-provisioned)', async () => {
     const { container } = await renderPill({});
     expect(container.textContent?.trim()).toBe('');
     expect(container.querySelector('span')).toBeNull();

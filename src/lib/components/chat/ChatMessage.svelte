@@ -33,7 +33,7 @@
   import { selectAllNotes } from '$store/renderer/slices/workspace-notes/workspace-notes-selectors';
   import { selectAgentMessageById } from '$store/renderer/slices/agent-session/agent-session-selectors';
   import { shouldShowStoppedIndicator as resolveShouldShowStoppedIndicator } from './message-display-utils';
-  import { isQuestionOnlyContent } from './message-display-utils';
+  import { isQuestionOnlyContent, resolveStoppedIndicatorLabel } from './message-display-utils';
   import ImageLightbox from '$lib/components/ui/ImageLightbox.svelte';
   import EditRegenerateConfirmDialog from './EditRegenerateConfirmDialog.svelte';
   import { isImageBlock } from '$shared/types/content-block.guards';
@@ -44,6 +44,8 @@
   import { getQueueInfo, stripDequeueWaitNote } from '$lib/utils/queue-info';
   import HookWakeAttributionHeader from './HookWakeAttributionHeader.svelte';
   import { getHookWakeAttribution, stripHookWakePrefix } from '$lib/utils/hook-wake-attribution';
+  import QuestionsDismissedNotice from './QuestionsDismissedNotice.svelte';
+  import { getQuestionsDismissedNotice } from './questions-dismissed-notice';
 
   import { WorkspaceId } from '$shared/types/branded-ids';
   import { store as appStore } from '$store/renderer/store';
@@ -219,12 +221,40 @@
   // Daemon-persisted attention-request row (meta.kind "discussion-request"/"blocker-report")
   let attentionNotice = $derived(getAttentionNotice(message));
 
+  // Daemon-delivered dismissal notification row (metadata type "questions_dismissed")
+  let questionsDismissedNotice = $derived(getQuestionsDismissedNotice(message));
+
   let shouldShowStoppedIndicator = $derived.by(() => {
     return resolveShouldShowStoppedIndicator({
       message,
       isStreaming,
       suppressCoordinationStoppedIndicator,
     });
+  });
+
+  // Reason-specific Stopped label (PROTOCOL §7 interrupted-row metadata);
+  // legacy rows without `interruptReason` keep the generic "Stopped".
+  let stoppedIndicatorLabel = $derived.by(() => {
+    const label = resolveStoppedIndicatorLabel(message);
+    switch (label.kind) {
+      case 'preempted-by-message':
+        return m.chat_chatMessage_stoppedPreemptedByMessage_label();
+      case 'preempted-by-agent':
+        return m.chat_chatMessage_stoppedPreemptedByAgent_label({ name: label.name });
+      case 'daemon-shutdown':
+        return m.chat_chatMessage_stoppedDaemonRestarted_label();
+      case 'agent-stopped':
+        return m.chat_chatMessage_stoppedAgentTerminated_label();
+      case 'stopped':
+        return m.chat_chatMessage_stopped_label();
+      default: {
+        // Compile-time exhaustiveness: a new descriptor kind is a type error
+        // here; at runtime it still falls back to the generic "Stopped".
+        const _exhaustive: never = label;
+        void _exhaustive;
+        return m.chat_chatMessage_stopped_label();
+      }
+    }
   });
 
   // Sender attribution for agent-to-agent messages (metadata-first, null when
@@ -969,6 +999,9 @@
 {:else if modelChangeNotice}
   <!-- Daemon-persisted model-change notice row - centered inline divider -->
   <ModelChangeNotice notice={modelChangeNotice} fallbackText={extractAllContent(message) || undefined} />
+{:else if questionsDismissedNotice}
+  <!-- Daemon-delivered dismissal notification row - compact centered chip -->
+  <QuestionsDismissedNotice title={extractAllContent(message) || undefined} />
 {:else if questionOnlyTurn && !shouldShowStoppedIndicator}
   <!-- Agent Q&A is wizard-only: question-only turns render no bubble -->{:else}
   <div
@@ -1226,7 +1259,7 @@
         {#if shouldShowStoppedIndicator}
           <div class="flex items-center gap-2 text-subtle font-medium text-sm mt-5">
             <Fa icon={faSquare} class="size-2.5 opacity-50 mt-px" />
-            <span>{m.chat_chatMessage_stopped_label()}</span>
+            <span>{stoppedIndicatorLabel}</span>
           </div>
         {/if}
 

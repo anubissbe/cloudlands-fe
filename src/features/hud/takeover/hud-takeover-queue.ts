@@ -6,15 +6,25 @@
  * `nextDeadline()` when to schedule its next `tick()`. Rules (task spec):
  *  - overlapping/burst triggers enqueue; each takeover plays its full
  *    blink → open → dwell → close cycle before the next starts;
- *  - triggers for the workspace already displayed or queued COALESCE into
- *    that entry (latest trigger wins the banner; earlier banners of the same
- *    display are kept so multi-event takeovers can stack banners, mock
- *    `ovDefs().banners`);
+ *  - the active display is FROZEN from 'opening' onward: its workspace and
+ *    banners never change while it is in the foreground. Same-workspace
+ *    triggers COALESCE into the active entry only during the pre-roll
+ *    'blinking' phase (latest trigger wins the banner; earlier banners of
+ *    the same display are kept so multi-event takeovers can stack banners,
+ *    mock `ovDefs().banners`); triggers for a QUEUED workspace always
+ *    coalesce into its pending EVENT entry (never into a pending viewer);
+ *  - a trigger for the workspace currently displayed (opening, dwelling or
+ *    closing) queues at the FRONT of pending — behind any pending manual
+ *    VIEWER entries, which keep precedence — and bypasses the pending cap,
+ *    so that workspace re-animates next with the new banners after the
+ *    close; other workspaces queue FIFO at the back;
  *  - DISMISS skips the dwell — the close animation still plays, then the
  *    next queued entry opens;
  *  - a manual card-click opens a VIEWER entry: it dwells with NO deadline
  *    (no auto-dismiss — only DISMISS closes it) and event triggers never
- *    coalesce into it or race it, they queue behind it in pending.
+ *    coalesce into it or race it — its own workspace's triggers queue at the
+ *    front of pending (behind pending viewers), other workspaces queue FIFO
+ *    behind it.
  *
  * Phase timing mirrors the mock choreography: every open is preceded by a
  * fast card pre-roll blink (`wsflash .18s step-end 3` inside a 630ms window —
@@ -33,6 +43,11 @@ export const HUD_TAKEOVER_KINDS = [
   'agent_failed',
   'question_asked',
   'status_update',
+  'workspace_idle',
+  'pr_open',
+  'pr_ready',
+  'pr_merged',
+  'workspace_complete',
   'manual',
 ] as const;
 
@@ -80,6 +95,15 @@ export type HudTakeoverPhase = 'idle' | 'blinking' | 'opening' | 'dwelling' | 'c
 /** Caller-supplied animation gate: `blink: false` (reduced motion) skips the pre-roll. */
 export interface HudTakeoverOptions {
   blink?: boolean;
+  /**
+   * Extra dwell (ms, >= 0) added at the opening → dwelling transition on top
+   * of the CLAMPED `takeoverDwellMs` — the caller's measured banner-scroll
+   * duration (see `bannerScrollDurationS` in `hud-takeover-layout.ts`), so a
+   * long overflow scroll is never eaten by the dwell cap. Ignored everywhere
+   * else (and for viewers, which dwell with no deadline); negative values are
+   * treated as 0. Default 0 keeps timing byte-identical.
+   */
+  extraDwellMs?: number;
 }
 
 export interface HudTakeoverQueueState {
@@ -195,12 +219,32 @@ function appendTrigger(entry: HudTakeoverEntry, trigger: HudTakeoverTrigger): Hu
 }
 
 /**
- * Enqueue a trigger. Coalesces into the active display (while it is blinking,
- * opening or dwelling — a closing one is already on its way out) or into a
- * pending entry for the same workspace; otherwise appends a new entry.
- * Coalescing into the dwelling display restarts its dwell so the new banner
- * gets a full read window. An active manual VIEWER is never coalesced into or
- * raced: event triggers (even for the same workspace) queue behind it.
+ * Insert a queue-jumping entry behind any leading pending VIEWER entries:
+ * manual card-clicks keep precedence over an event-driven re-queue.
+ */
+function insertBehindLeadingViewers(
+  pending: HudTakeoverEntry[],
+  entry: HudTakeoverEntry,
+): HudTakeoverEntry[] {
+  let at = 0;
+  while (at < pending.length && pending[at].isViewer) at += 1;
+  return [...pending.slice(0, at), entry, ...pending.slice(at)];
+}
+
+/**
+ * Enqueue a trigger. A same-workspace trigger coalesces into the active
+ * display only while it is still 'blinking' (pre-roll — the overlay is not
+ * yet in the foreground); from 'opening' onward the active entry is FROZEN
+ * and never mutated. A trigger for the workspace currently displayed
+ * (opening, dwelling or closing — or shown by a viewer) merges into or
+ * creates a pending entry at the FRONT of the queue — behind any pending
+ * manual viewers, and exempt from the pending cap (it adds at most one
+ * entry for the on-screen workspace) — so that workspace re-animates next
+ * after the close; other workspaces coalesce into their pending entry or
+ * append FIFO at the back. A manual VIEWER — active OR pending — is never
+ * coalesced into: the pending lookup skips viewer entries, so an event
+ * trigger always lands in its own non-viewer entry, subject to the pending
+ * cap for non-displayed workspaces (monorepo#1492).
  */
 export function enqueueTakeover(
   state: HudTakeoverQueueState,
@@ -219,28 +263,40 @@ export function enqueueTakeover(
   if (
     !state.active.isViewer &&
     state.active.workspaceId === trigger.workspaceId &&
-    (state.phase === 'blinking' || state.phase === 'opening' || state.phase === 'dwelling')
+    state.phase === 'blinking'
   ) {
-    const active = appendTrigger(state.active, trigger);
-    return state.phase === 'dwelling'
-      ? { ...state, active, phaseEndsAtMs: nowMs + takeoverDwellMs(active) }
-      : { ...state, active };
+    return { ...state, active: appendTrigger(state.active, trigger) };
   }
+  const jumpsQueue = state.active.workspaceId === trigger.workspaceId;
   const pendingIndex = state.pending.findIndex(
-    (entry) => entry.workspaceId === trigger.workspaceId,
+    (entry) => !entry.isViewer && entry.workspaceId === trigger.workspaceId,
   );
   if (pendingIndex >= 0) {
+    const merged = appendTrigger(state.pending[pendingIndex], trigger);
+    if (jumpsQueue) {
+      return {
+        ...state,
+        pending: insertBehindLeadingViewers(
+          state.pending.filter((_, index) => index !== pendingIndex),
+          merged,
+        ),
+      };
+    }
     const pending = state.pending.slice();
-    pending[pendingIndex] = appendTrigger(pending[pendingIndex], trigger);
+    pending[pendingIndex] = merged;
     return { ...state, pending };
   }
-  if (state.pending.length >= HUD_TAKEOVER_MAX_PENDING) return state;
+  if (!jumpsQueue && state.pending.length >= HUD_TAKEOVER_MAX_PENDING) return state;
+  const entry: HudTakeoverEntry = {
+    workspaceId: trigger.workspaceId,
+    triggers: [trigger],
+    isViewer: false,
+  };
   return {
     ...state,
-    pending: [
-      ...state.pending,
-      { workspaceId: trigger.workspaceId, triggers: [trigger], isViewer: false },
-    ],
+    pending: jumpsQueue
+      ? insertBehindLeadingViewers(state.pending, entry)
+      : [...state.pending, entry],
   };
 }
 
@@ -312,46 +368,56 @@ export function requestImmediateTakeover(
 }
 
 /**
- * Advance past any elapsed phase deadlines. Loops so a long-stalled clock
- * (e.g. a background tab) settles in one call: blinking → opening → dwelling
- * → closing → next entry (or idle). A VIEWER dwells with NO deadline: its
- * opening phase ends into a deadline-free dwell that only `dismissTakeover`
- * leaves. `options.blink` also gates the pre-roll of entries chained in from
- * pending after a close.
+ * Advance past an elapsed phase deadline. The next phase's deadline is
+ * anchored at `nowMs` (which the elapsed-deadline guard guarantees is >= the
+ * old deadline): an on-time timer fire keeps exact phase chaining, while a
+ * long-stalled clock (e.g. a background tab) re-anchors to now — so the new
+ * deadline always lies in the future and a tick advances AT MOST ONE phase.
+ * The queue therefore never
+ * fast-forwards past 'closing': the close animation always gets its full
+ * visible window before the next entry opens (or the queue goes idle). A
+ * VIEWER dwells with NO deadline: its opening phase ends into a deadline-free
+ * dwell that only `dismissTakeover` leaves. `options.blink` also gates the
+ * pre-roll of entries chained in from pending after a close.
  */
 export function tickTakeoverQueue(
   state: HudTakeoverQueueState,
   nowMs: number,
   options: HudTakeoverOptions = {},
 ): HudTakeoverQueueState {
-  let current = state;
-  while (current.phase !== 'idle' && current.phaseEndsAtMs !== null) {
-    if (nowMs < current.phaseEndsAtMs) break;
-    const endedAt = current.phaseEndsAtMs;
-    if (current.phase === 'blinking') {
-      current = { ...current, phase: 'opening', phaseEndsAtMs: endedAt + HUD_TAKEOVER_OPEN_MS };
-    } else if (current.phase === 'opening') {
-      current = {
-        ...current,
-        phase: 'dwelling',
-        phaseEndsAtMs: current.active?.isViewer ? null : endedAt + takeoverDwellMs(current.active),
-      };
-    } else if (current.phase === 'dwelling') {
-      current = { ...current, phase: 'closing', phaseEndsAtMs: endedAt + HUD_TAKEOVER_CLOSE_MS };
-    } else {
-      const [next, ...rest] = current.pending;
-      const blink = options.blink !== false;
-      current = next
-        ? {
-            phase: blink ? 'blinking' : 'opening',
-            active: next,
-            pending: rest,
-            phaseEndsAtMs: endedAt + (blink ? HUD_TAKEOVER_BLINK_MS : HUD_TAKEOVER_OPEN_MS),
-          }
-        : { phase: 'idle', active: null, pending: [], phaseEndsAtMs: null };
-    }
+  if (state.phase === 'idle' || state.phaseEndsAtMs === null || nowMs < state.phaseEndsAtMs) {
+    return state;
   }
-  return current;
+  // The guard above ensures nowMs >= phaseEndsAtMs, so now IS the anchor.
+  const anchor = nowMs;
+  if (state.phase === 'blinking') {
+    return { ...state, phase: 'opening', phaseEndsAtMs: anchor + HUD_TAKEOVER_OPEN_MS };
+  }
+  if (state.phase === 'opening') {
+    // `extraDwellMs` (measured banner-scroll time) is additive AFTER the
+    // dwell clamp so the scroll always gets its full window.
+    const extraDwellMs = Math.max(0, options.extraDwellMs ?? 0);
+    return {
+      ...state,
+      phase: 'dwelling',
+      phaseEndsAtMs: state.active?.isViewer
+        ? null
+        : anchor + takeoverDwellMs(state.active) + extraDwellMs,
+    };
+  }
+  if (state.phase === 'dwelling') {
+    return { ...state, phase: 'closing', phaseEndsAtMs: anchor + HUD_TAKEOVER_CLOSE_MS };
+  }
+  const [next, ...rest] = state.pending;
+  const blink = options.blink !== false;
+  return next
+    ? {
+        phase: blink ? 'blinking' : 'opening',
+        active: next,
+        pending: rest,
+        phaseEndsAtMs: anchor + (blink ? HUD_TAKEOVER_BLINK_MS : HUD_TAKEOVER_OPEN_MS),
+      }
+    : { phase: 'idle', active: null, pending: [], phaseEndsAtMs: null };
 }
 
 /** Epoch-ms of the next phase transition; null when idle (no timer needed). */

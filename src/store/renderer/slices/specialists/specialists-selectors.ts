@@ -9,9 +9,13 @@ import {
   GITHUB_DEPENDENT_SPECIALIST_IDS,
   type Specialist,
 } from "$lib/constants/specialists";
-import { selectActiveProviderId } from "../provider-settings/provider-settings-selectors";
+import {
+    selectActiveProviderId,
+    selectIsActiveProviderAvailable,
+} from "../provider-settings/provider-settings-selectors";
 import type { FileSpecialist, SpecialistOverrides } from "./specialists-slice";
 import { selectGitHubAuthIsAuthenticated } from "../github-auth/github-auth-selectors";
+import { isRedundantBuiltInOverride } from "$lib/components/settings/utils/builtin-override-redundancy";
 // ============================================================================
 // Basic state selectors
 // ============================================================================
@@ -93,6 +97,8 @@ export const selectSpecialists = store.createSelector((state): Specialist[] => {
                 hidden: file.hidden,
                 resolvedModel: file.resolvedModel,
                 resolvedProvider: file.resolvedProvider,
+                modelOptions: file.modelOptions,
+                reasoningEffort: file.reasoningEffort,
             });
         }
     }
@@ -189,6 +195,17 @@ export const selectExplicitModel = store.createSelector((state, specialistId: st
     return specialist?.defaultModel || undefined;
 });
 
+/**
+ * Get the explicit reasoning-effort level for a specialist, or undefined when
+ * the specialist inherits the model default (no `reasoningEffort:` key in the
+ * winning tier, PROTOCOL §5.11).
+ */
+export const selectExplicitReasoningEffort = store.createSelector((state, specialistId: string): string | undefined => {
+    const specialists = selectSpecialists.select(state);
+    const specialist = specialists.find((s: Specialist) => s.id === specialistId);
+    return specialist?.reasoningEffort || undefined;
+});
+
 /** Get the effective behavior prompt for a specialist (file override → bundled default) */
 export const selectEffectiveBehaviorPrompt = store.createSelector((state, specialistId: string): string => {
     const specialists = selectSpecialists.select(state);
@@ -206,12 +223,18 @@ export const selectIsBuiltIn = store.createSelector((state, specialistId: string
 export const selectIsFileBased = store.createSelector((state, specialistId: string): boolean => {
     return !!getItem(state.specialists.fileSpecialists, specialistId);
 });
-/** Check if a built-in specialist has been overridden by a user file */
+/**
+ * Check if a built-in specialist has been overridden by a user file that
+ * actually differs from the bundled defaults. A lingering override file that
+ * is identical to the bundled definition (no model pin, all compared fields
+ * equal) never reads as "Modified" (monorepo#1450).
+ */
 export const selectHasOverrides = store.createSelector((state, specialistId: string): boolean => {
     const isBuiltIn = state.specialists.bundledSpecialists.some((s: Specialist) => s.id === specialistId);
     if (!isBuiltIn) return false;
     const file = getItem(state.specialists.fileSpecialists, specialistId);
-    return !!file && file.source === 'user';
+    if (!file || file.source !== 'user') return false;
+    return !isRedundantBuiltInOverride(file, state.specialists.bundledSpecialists);
 });
 /** Get a file specialist by ID */
 export const selectGetFileSpecialist = store.createSelector((state, specialistId: string): FileSpecialist | undefined => {
@@ -242,7 +265,12 @@ export const selectSpecialistFilePath = store.createSelector((state, specialistI
         }).filePath;
     return undefined;
 });
-/** Get the effective coding agent for a specialist (file value → bundled default → active provider) */
+/**
+ * Get the effective coding agent for a specialist (file value → bundled
+ * default → active provider, when available). Returns `''` when nothing
+ * resolvable (D1(B) — never a doomed/unavailable provider); pair with
+ * `selectIsActiveProviderAvailable` or check for `''` to surface a failure.
+ */
 export const selectEffectiveCodingAgent = store.createSelector((state, specialistId: string): string => {
     // Wave 2: File specialists already have the correct codingAgent baked in.
     // Check file specialist first, then fall back to bundled/hardcoded.
@@ -250,9 +278,20 @@ export const selectEffectiveCodingAgent = store.createSelector((state, specialis
     if (file?.codingAgent) return file.codingAgent;
     return selectResolvedDefaultCodingAgent.select(state, specialistId);
 });
-/** Get the resolved default coding agent for a specialist (specialist default → active provider) */
+/**
+ * Get the resolved default coding agent for a specialist (specialist default
+ * → active provider, when available).
+ *
+ * Per decision D1(B): never silently switch to a different provider. The
+ * specialist's own explicit `codingAgent` is always honored (it's a
+ * deliberate choice). Absent that, the active provider is only used when
+ * it's actually available — an unavailable active provider resolves to `''`
+ * so callers can detect and surface the failure instead of spawning on a
+ * doomed (e.g. uninstalled Auggie) provider.
+ */
 const selectResolvedDefaultCodingAgent = store.createSelector((state, specialistId: string): string => {
     const specialists = selectSpecialists.select(state);
     const specialist = specialists.find((s: Specialist) => s.id === specialistId);
-    return specialist?.codingAgent || selectActiveProviderId.select(state);
+    if (specialist?.codingAgent) return specialist.codingAgent;
+    return selectIsActiveProviderAvailable.select(state) ? selectActiveProviderId.select(state) : '';
 });

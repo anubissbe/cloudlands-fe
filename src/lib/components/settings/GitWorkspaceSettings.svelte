@@ -12,7 +12,6 @@
   // Settings state
   let worktreesLocation = $state('');
   let sshKeyPath = $state('');
-  let autoFetch = $state(false);
   let autoCommit = $state(true);
   let exposeGitCredential = $state(true);
   let defaultShell = $state('auto');
@@ -32,7 +31,6 @@
     worktreesLocation: 'workspace.worktreesLocation',
     sshKeyPath: 'workspace.sshKeyPath',
     defaultShell: 'workspace.defaultShell',
-    autoFetch: 'workspace.autoFetch',
     autoCommit: 'git.autoCommit',
     branchPrefix: 'workspace.branchPrefix',
     exposeGitCredential: 'sourceControl.github.exposeGitCredentialToChildren',
@@ -85,7 +83,6 @@
       [SETTING_PATHS.worktreesLocation]: worktreesLocation,
       [SETTING_PATHS.sshKeyPath]: sshKeyPath,
       [SETTING_PATHS.defaultShell]: defaultShell,
-      [SETTING_PATHS.autoFetch]: autoFetch,
       [SETTING_PATHS.autoCommit]: autoCommit,
       [SETTING_PATHS.branchPrefix]: branchPrefix,
       ...(gitCredentialSettingSupported
@@ -105,7 +102,6 @@
     worktreesLocation = stringValue(byPath.get(SETTING_PATHS.worktreesLocation));
     sshKeyPath = stringValue(byPath.get(SETTING_PATHS.sshKeyPath));
     defaultShell = stringValue(byPath.get(SETTING_PATHS.defaultShell)) || 'auto';
-    autoFetch = byPath.get(SETTING_PATHS.autoFetch) === true;
     autoCommit = byPath.get(SETTING_PATHS.autoCommit) !== false;
     branchPrefix = stringValue(byPath.get(SETTING_PATHS.branchPrefix));
     gitCredentialSettingSupported = byPath.has(SETTING_PATHS.exposeGitCredential);
@@ -155,7 +151,6 @@
   export function resetToDefaults() {
     worktreesLocation = '';
     sshKeyPath = '';
-    autoFetch = false;
     autoCommit = true;
     exposeGitCredential = true;
     defaultShell = 'auto';
@@ -279,15 +274,6 @@
   <!-- Auto options -->
   <section class="px-6 py-2">
     <div class="flex flex-wrap gap-x-8 gap-y-2">
-      <label class="flex items-center gap-2 text-sm text-foreground cursor-pointer">
-        <input
-          type="checkbox"
-          bind:checked={autoFetch}
-          onchange={handleSave}
-          class="cursor-pointer"
-        />
-        {m.settings_gitWorkspace_autoFetch_label()}
-      </label>
       <label class="flex items-center gap-2 text-sm text-foreground cursor-pointer">
         <input
           type="checkbox"

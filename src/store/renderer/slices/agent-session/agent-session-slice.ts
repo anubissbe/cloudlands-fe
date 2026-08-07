@@ -33,6 +33,7 @@ import {
   chatReset,
   chatStreamingReconciled,
   chatInitialized,
+  chatQueueProcessingReceived,
   streamEnded,
   streamFailed,
 } from '../chat-state/chat-state-slice';
@@ -264,6 +265,7 @@ type CanonicalAgentSessionUpdates = {
   isWaitingForOtherAgents?: boolean;
   waitingForAgentIds?: string[];
   liveTurnOpen?: boolean;
+  reasoningEffort?: string | null;
 };
 
 /** Wire statuses that mean a turn is running (lowercase IPC + PascalCase enum). */
@@ -294,6 +296,7 @@ type CanonicalAgentStatusWithSummary = CanonicalAgentStatusFields & {
   lastResponseSummary?: unknown;
   isWaitingForOtherAgents?: unknown;
   waitingForAgentIds?: unknown;
+  reasoningEffort?: unknown;
 };
 
 function canonicalSessionUpdates(
@@ -350,6 +353,13 @@ function canonicalSessionUpdates(
     updates.waitingForAgentIds = fields.waitingForAgentIds.filter(
       (id): id is string => typeof id === 'string',
     );
+  }
+  // Session-level reasoning effort (Option B, §5.5): fold the field from
+  // `agent:updated` / `agent:session-updated` convergence payloads when
+  // present — a string sets it, an explicit null clears it back to the
+  // provider default. Absent keys leave the stored value untouched.
+  if (typeof fields.reasoningEffort === 'string' || fields.reasoningEffort === null) {
+    updates.reasoningEffort = fields.reasoningEffort;
   }
 
   // A live running transition ends the parked completion-watch state. The
@@ -558,6 +568,7 @@ type SessionComparisonSnapshot = Pick<
   | 'status'
   | 'name'
   | 'model'
+  | 'reasoningEffort'
   | 'isStreaming'
   | 'isProcessing'
   | 'isResponding'
@@ -590,6 +601,7 @@ type SessionComparisonSnapshot = Pick<
   completionReport: string | undefined;
   taskNoteId: string | undefined;
   dismissedQuestionsMessageId: string | undefined;
+  lastSeenMessageId: string | undefined;
   sandboxId: string | undefined;
   sandboxPath: string | undefined;
   sandboxBranch: string | undefined;
@@ -606,6 +618,10 @@ function toSessionComparisonSnapshot(session: StoredAgentSession): SessionCompar
     status: session.status,
     name: session.name,
     model: session.model,
+    // Session-level reasoning effort (Option B) — an upsert whose only change
+    // is this field (e.g. the agent:updated convergence after an effort
+    // change in another window) must not be swallowed as a no-op.
+    reasoningEffort: session.reasoningEffort,
     isStreaming: session.isStreaming,
     isProcessing: session.isProcessing,
     isResponding: session.isResponding,
@@ -648,6 +664,11 @@ function toSessionComparisonSnapshot(session: StoredAgentSession): SessionCompar
       typeof metadata?.dismissedQuestionsMessageId === 'string'
         ? metadata.dismissedQuestionsMessageId
         : undefined,
+    // Seen marker (PROTOCOL §5.5 agent.markSeen) — anchors the "New messages"
+    // divider; a cross-client agent:updated convergence whose only change is
+    // this marker must not be swallowed as a no-op.
+    lastSeenMessageId:
+      typeof metadata?.lastSeenMessageId === 'string' ? metadata.lastSeenMessageId : undefined,
     // Sandbox fields settle onto the session AFTER creation (async CoW
     // provisioning, settle_provisioned_sandbox) and gate the reveal-sandbox
     // affordance — the settling re-hydration must not be swallowed either.
@@ -780,6 +801,17 @@ function applySessionUpsert(
       !Object.prototype.hasOwnProperty.call(session, 'lastAgentResponse')
     ) {
       finalSession.lastAgentResponse = existing.lastAgentResponse;
+    }
+
+    // Same guard for the live tool preview (§7 `lastToolUse`, push-applied
+    // from `agent:stream:activity`): no hydration payload carries it, so an
+    // upsert that applies for any other reason would otherwise erase the
+    // pushed value mid-turn and flicker the row back to stale text.
+    if (
+      existing.lastToolUse !== undefined &&
+      !Object.prototype.hasOwnProperty.call(session, 'lastToolUse')
+    ) {
+      finalSession.lastToolUse = existing.lastToolUse;
     }
 
     // Sticky FE turn slot (liveTurnOpen): hydration snapshots never carry
@@ -1222,6 +1254,24 @@ export const agentSessionReducer = createReducer<AgentSessionState>(initialState
   )
   .with(chatStreamingReconciled, (state, { payload: { agentId } }) =>
     updateSessionFields(state, agentId, { isStreaming: true, isProcessing: true }),
+  )
+  // Queue-delivery wake (`agent:queue:processing`, §6.5): the daemon dequeued
+  // an entry and is starting its turn. Unlike a user send (chatSendStarted)
+  // or a harness wake (`agent:stream:start`), nothing else opens the busy
+  // flags for this turn-start shape, so the card stays idle/completed until
+  // the first status-changed lands. Treat it as the turn start it is — the
+  // turn-end clears (streamEnded / agent:idle) close it through the existing
+  // paths. The wake also ends any parked completion-watch wait the preceding
+  // `agent:idle` froze into the session, the same way a running
+  // `agent:status-changed` transition does above; otherwise the frozen
+  // `isWaitingForOtherAgents` keeps the hourglass up for the whole new turn.
+  .with(chatQueueProcessingReceived, (state, { payload: [agentId] }) =>
+    updateSessionFields(state, agentId, {
+      isStreaming: true,
+      isProcessing: true,
+      isWaitingForOtherAgents: false,
+      waitingForAgentIds: [],
+    }),
   )
   .with(chatInitialized, (state, { payload: [agentId, data] }) => {
     const session = getSession(state, agentId);

@@ -4,7 +4,6 @@ import {
   it,
 } from 'vitest';
 import {
-  CODEX_DEFAULT_MODEL_ID,
   CODEX_MODELS,
   getCodexModelList,
   supportedReasoningEfforts,
@@ -19,16 +18,27 @@ describe('OpenAI Codex model config', () => {
     });
   });
 
-  it('generates reasoning effort variants for effort-capable Codex models', () => {
-    for (const effort of supportedReasoningEfforts) {
-      expect(CODEX_MODELS[`gpt-5.3-codex/${effort}`]).toBeDefined();
+  it('keeps effort-capable Codex models as single rows with effortLevels metadata (no {model}/{effort} expansion)', () => {
+    for (const baseModel of ['gpt-5.3-codex', 'gpt-5.2-codex', 'gpt-5.1-codex-max']) {
+      expect(CODEX_MODELS[baseModel]?.effortLevels).toEqual([...supportedReasoningEfforts]);
+      for (const effort of supportedReasoningEfforts) {
+        expect(CODEX_MODELS[`${baseModel}/${effort}`]).toBeUndefined();
+      }
     }
+    // Non-effort models carry no effortLevels metadata.
+    expect(CODEX_MODELS['gpt-5.4']?.effortLevels).toBeUndefined();
   });
 
-  it('keeps the existing Codex default model selected', () => {
-    const defaultEntry = getCodexModelList().find((model) => model.isDefault);
+  it('surfaces effortLevels on the UI model list rows', () => {
+    const list = getCodexModelList();
+    const capable = list.find((model) => model.value === 'gpt-5.3-codex');
+    expect(capable?.effortLevels).toEqual([...supportedReasoningEfforts]);
+    const plain = list.find((model) => model.value === 'gpt-5.4');
+    expect(plain).toBeDefined();
+    expect('effortLevels' in (plain ?? {})).toBe(false);
+  });
 
-    expect(CODEX_DEFAULT_MODEL_ID).toBe('gpt-5.3-codex/medium');
-    expect(defaultEntry?.value).toBe(CODEX_DEFAULT_MODEL_ID);
+  it('marks no static Codex model as default (defaults come from the provider CLI)', () => {
+    expect(getCodexModelList().every((model) => !('isDefault' in model))).toBe(true);
   });
 });

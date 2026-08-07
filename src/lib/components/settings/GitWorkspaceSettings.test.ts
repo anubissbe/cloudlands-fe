@@ -4,6 +4,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/svelte';
 import GitWorkspaceSettings from './GitWorkspaceSettings.svelte';
+import { warmImport } from '../../../test/warm-import';
 
 // Mock appClient - use vi.hoisted to avoid hoisting issues
 const mocks = vi.hoisted(() => ({
@@ -62,10 +63,14 @@ const baseSettings = [
   { path: 'workspace.worktreesLocation', value: '' },
   { path: 'workspace.sshKeyPath', value: '' },
   { path: 'workspace.defaultShell', value: 'auto' },
-  { path: 'workspace.autoFetch', value: false },
   { path: 'git.autoCommit', value: true },
   { path: 'workspace.branchPrefix', value: '' },
 ];
+
+// Pre-warm the component module graph so the cold dynamic import is not
+// billed to the first test's timeout (intent-hq/monorepo#1464).
+warmImport(() => import('../ui/__tests__/mocks/Fa.svelte'));
+warmImport(() => import('$features/onboarding/messages/__tests__/mocks/MockDirectoryPickerModal.svelte'));
 
 describe('GitWorkspaceSettings — git credential toggle (§5.12)', () => {
   beforeEach(() => {
@@ -126,7 +131,9 @@ describe('GitWorkspaceSettings — git credential toggle (§5.12)', () => {
 
     // Wait for load to settle (a sibling toggle is rendered), then assert absence.
     await waitFor(() => {
-      expect(screen.getByRole('checkbox', { name: /Auto-fetch updates/ })).toBeTruthy();
+      expect(
+        screen.getByRole('checkbox', { name: /Enable auto-commit for new workspaces/ }),
+      ).toBeTruthy();
     });
     expect(screen.queryByRole('checkbox', { name: GIT_CRED_LABEL })).toBeNull();
   });
@@ -211,11 +218,11 @@ describe('GitWorkspaceSettings — legacy CoW toggle removed (§5.5b migration)'
   });
 
   it('resetToDefaults never writes workspace.cowIsolation', async () => {
-    // autoFetch loads as non-default true so the reset produces a real
+    // autoCommit loads as non-default false so the reset produces a real
     // settings.update batch to inspect.
     mocks.mockSettingsList.mockResolvedValue([
-      ...baseSettings.filter((setting) => setting.path !== 'workspace.autoFetch'),
-      { path: 'workspace.autoFetch', value: true },
+      ...baseSettings.filter((setting) => setting.path !== 'git.autoCommit'),
+      { path: 'git.autoCommit', value: false },
       { path: 'workspace.cowIsolation', value: true },
     ]);
     mocks.mockSettingsUpdate.mockResolvedValue([]);
@@ -223,7 +230,9 @@ describe('GitWorkspaceSettings — legacy CoW toggle removed (§5.5b migration)'
     const { component } = render(GitWorkspaceSettings);
 
     await waitFor(() => {
-      expect(screen.getByRole('checkbox', { name: /Auto-fetch updates/ })).toBeTruthy();
+      expect(
+        screen.getByRole('checkbox', { name: /Enable auto-commit for new workspaces/ }),
+      ).toBeTruthy();
     });
 
     component.resetToDefaults();
@@ -423,14 +432,14 @@ describe('GitWorkspaceSettings — path picker fields (PathSettingField)', () =>
     mocks.mockSettingsList.mockResolvedValue(withValues({ 'workspace.sshKeyPath': REDACTED }));
     render(GitWorkspaceSettings);
 
-    const autoFetch = await waitFor(() =>
-      screen.getByRole('checkbox', { name: /Auto-fetch updates/ }),
+    const autoCommit = await waitFor(() =>
+      screen.getByRole('checkbox', { name: /Enable auto-commit for new workspaces/ }),
     );
-    await fireEvent.click(autoFetch);
+    await fireEvent.click(autoCommit);
 
     await waitFor(() => {
       expect(mocks.mockSettingsUpdate).toHaveBeenCalledWith([
-        { path: 'workspace.autoFetch', value: true },
+        { path: 'git.autoCommit', value: false },
       ]);
     });
   });

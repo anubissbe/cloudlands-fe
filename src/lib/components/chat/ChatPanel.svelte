@@ -27,7 +27,7 @@
    * - workspace: Current workspace object
    * - agentId: Unique identifier for the agent
    * - agentName: Display name for the agent (default: 'Chat')
-   * - agentModel: AI model to use (default: DEFAULT_AGENT_MODEL)
+   * - agentModel: AI model to use (default: daemon/provider-resolved)
    * - isInitialWorkspaceAgent: Whether this is the first agent in a new workspace
    * - isNewWorkspace: Whether this is a newly created workspace
    * - onClose: Callback when chat is closed
@@ -115,12 +115,9 @@
   type SuggestedPrompt,
   AgentStatus,
 } from '$shared/types';
-  import { DEFAULT_AGENT_MODEL } from '$shared/constants/agent-services';
   import type { ContextItem } from './input/context-api';
-  import {
-    deserializeDraftAttachments,
-    serializeDraftAttachments,
-  } from './chat-draft-attachments';
+  import { createChatDraftManager } from './chat-panel-draft.svelte';
+  import ChatDraftLoadingGate from './ChatDraftLoadingGate.svelte';
   import SimpleRichInput from './input/SimpleRichInput.svelte';
   import {
     getQueueInfo,
@@ -130,6 +127,12 @@
   import { isUserQueuedMessage } from '$lib/utils/queued-message-visibility';
   import ChatMessage from './ChatMessage.svelte';
   import DateSeparator from './DateSeparator.svelte';
+  import NewMessagesDivider from './NewMessagesDivider.svelte';
+  import {
+    resolveNewMessagesDividerAnchor,
+    resolveLatchedDividerAnchor,
+    dividerVisibleWhenScrolledToBottom,
+  } from './new-messages-divider';
   import EventWakeupBanner from './EventWakeupBanner.svelte';
   import { parseAgentEvents } from './event-wake-summary';
   import AgentCard from './AgentCard.svelte';
@@ -150,6 +153,7 @@
   import { flattenAnswersToMessage } from './questions/answer-message';
   import { groupMessagesByDate } from '$lib/utils/timeFormatting';
   import {
+  animateScrollTo,
   followBottom,
   scrollToBottom as scrollToBottomUtil,
 } from '$lib/utils/smartScroll';
@@ -193,7 +197,9 @@
   import {
   markAgentAsViewed,
   clearCurrentlyViewedAgent,
+  startDividerSession,
 } from '$store/renderer/slices/unread-tracking/unread-tracking-slice';
+  import { selectDividerSession } from '$store/renderer/slices/unread-tracking/unread-tracking-selectors';
   import AuroraBackground from './AuroraBackground.svelte';
   import {
   invoke,
@@ -206,11 +212,13 @@
 } from '$store/renderer/slices/specialists/specialists-selectors';
 
   import { getAgentProvider } from '$shared/types/agent-session';
-  import { selectCatalogDefaultProviderId } from '$store/renderer/slices/provider-catalog/provider-catalog-selectors';
+  import { selectEffectiveDefaultProviderId } from '$store/renderer/slices/provider-catalog/provider-catalog-selectors';
   import { CHIEF_WORKSPACE_ID } from '$shared/types/branded-ids';
   import { canChangeAgentProvider as resolveCanChangeAgentProvider } from './provider-lock';
   import ModelChangeNotice from './ModelChangeNotice.svelte';
   import { getModelChangeNotice } from './model-change-notice';
+  import QuestionsDismissedNotice from './QuestionsDismissedNotice.svelte';
+  import { getQuestionsDismissedNotice } from './questions-dismissed-notice';
   import { resolveHydratedInputModel } from './input-hydration';
   import {
   deriveQueuedMessagesVisibility,
@@ -300,7 +308,7 @@
     workspace,
     agentId,
     agentName = 'Chat',
-    agentModel = DEFAULT_AGENT_MODEL,
+    agentModel = undefined,
     isActive = true,
     isInitialWorkspaceAgent = false,
     // eslint-disable-next-line @typescript-eslint/no-unused-vars
@@ -352,6 +360,8 @@
   // Canonical "agent is running" gate for idle-only affordances (next-steps links).
   const agentIsRunning$ = selectAgentIsRunning(agentIdStore);
   const transcriptHydration$ = selectTranscriptHydration(agentIdStore);
+  // Latched "New messages" divider viewing session (entry-only, frozen).
+  const dividerSession$ = selectDividerSession(agentIdStore);
   const isDelegatedBackgroundTaskAgent = $derived(
     isDelegatedBackgroundTaskSession($agentSession$),
   );
@@ -497,9 +507,17 @@
     if (pendingQuestions) {
       return [];
     }
-    const messageContent = extractAllContent(lastAssistantMessage);
-    const { prompts } = parseSuggestedPrompts(messageContent);
-    return prompts;
+    // Parse each text block on its own, mirroring MessageContent, which strips
+    // the block per text block when rendering the transcript. Parsing a joined
+    // string here would surface chips for a marker split across two blocks
+    // while MessageContent still rendered its raw lines. The last text block
+    // that yields prompts wins.
+    const textBlocks = (lastAssistantMessage.contentBlocks ?? []).filter((b) => b.type === 'text');
+    for (let i = textBlocks.length - 1; i >= 0; i--) {
+      const { prompts } = parseSuggestedPrompts(textBlocks[i].text ?? '');
+      if (prompts.length > 0) return prompts;
+    }
+    return [];
   });
 
   // Agent Q&A: question blocks on the LAST assistant message with NO later
@@ -651,6 +669,9 @@
     if (msg.role === 'user') {
       if (msg.metadata?.type === 'event_notification') return '';
       if (extractAllContent(msg).trimStart().startsWith('[WORKSPACE EVENTS]')) return '';
+      // Dismissal rows render as a compact chip; the raw delivered text never
+      // reaches the DOM, so keep it out of the search index too.
+      if (getQuestionsDismissedNotice(msg)) return '';
     }
     const grouped = groupContentBlocks(blocks, !!msg.isStreaming);
     const lastIndex = grouped.length - 1;
@@ -1080,49 +1101,21 @@
     }
   });
 
-  // Restore draft from backend on mount
-  let draftRestored = $state(false);
-  $effect(() => {
-    if (draftRestored || !workspace || !agentId) return;
-
-    untrack(async () => {
-      const draft = await appClient.drafts.get(workspace.id, agentId);
-      if (!draft) return;
-      if (draft.attachments?.length && contextItems.length === 0) {
-        contextItems = deserializeDraftAttachments(draft.attachments);
-      }
-      if (draft.text && !inputValue) {
-        inputValue = draft.text;
-        setTimeout(() => {
-          inputComponent?.setContent?.(draft.text);
-        }, 50);
-      }
-    });
-
-    draftRestored = true;
-  });
-
-  // Save draft to backend (debounced)
-  let saveTimeoutId: ReturnType<typeof setTimeout> | null = null;
-  $effect(() => {
-    if (!workspace || !agentId) return;
-    const currentValue = inputValue;
-    const currentAttachments = serializeDraftAttachments(contextItems);
-
-    if (saveTimeoutId) clearTimeout(saveTimeoutId);
-
-    saveTimeoutId = setTimeout(() => {
-      appClient.drafts
-        .set(
-          workspace.id,
-          agentId,
-          currentValue,
-          currentAttachments.length > 0 ? currentAttachments : undefined,
-        )
-        .catch((err) => {
-          logger.warn('[ChatPanel] Failed to save draft', { error: String(err) });
-        });
-    }, 500); // 500ms debounce
+  // Draft restore/save lifecycle (gated restore + debounced save); see
+  // chat-panel-draft.svelte.ts. While gateActive the composer blocks typing
+  // and shows the ChatDraftLoadingGate indicator.
+  const draftManager = createChatDraftManager({
+    drafts: appClient.drafts,
+    workspaceId: () => workspace?.id,
+    agentId: () => agentId,
+    inputValue: () => inputValue,
+    setInputValue: (text) => (inputValue = text),
+    contextItems: () => contextItems,
+    setContextItems: (items) => (contextItems = items),
+    applyEditorContent: (text) => inputComponent?.setContent?.(text),
+    onSaveError: (err) => {
+      logger.warn('[ChatPanel] Failed to save draft', { error: String(err) });
+    },
   });
 
   // Reference to QueuedMessageList for programmatic editing via Up arrow
@@ -1390,7 +1383,7 @@
   // Hydrated input model — uses session model when available, falls back to agentModel prop
   let hydratedInputModel = $derived(resolveHydratedInputModel($agentSession$, agentModel));
 
-  const catalogDefaultProviderId$ = selectCatalogDefaultProviderId();
+  const catalogDefaultProviderId$ = selectEffectiveDefaultProviderId();
 
   // Provider ID for the input — resolved from the agent session
   let inputProviderId = $derived.by(() => {
@@ -1419,6 +1412,45 @@
   // Grouped messages for display (include ALL messages)
   // We'll handle the streaming state when rendering
   let groupedMessages = $derived(groupMessagesByDate($agentMessages$));
+
+  // ── "New messages" divider (unread marker, PROTOCOL §5.5 agent.markSeen) ──
+  // The divider is entry-only and frozen per viewing session: on the first
+  // transcript hydration the anchor is derived ONCE from the seen marker and
+  // latched in Redux (unreadTracking.dividerSessionByAgentId) — `null` is
+  // latched too ("session started, no divider"). First-write-wins in the
+  // slice makes cached-panel remounts harmless; the latch clears only at
+  // stop-looking boundaries (tab close / active-workspace switch — see
+  // divider-session-boundary-service).
+  let latchedDividerSessionAgentId: string | null = null;
+  $effect(() => {
+    if (!agentId || latchedDividerSessionAgentId === agentId) return;
+    if ($transcriptHydration$ !== 'settled') return;
+    latchedDividerSessionAgentId = agentId;
+    appStore.dispatch(
+      startDividerSession(
+        agentId,
+        resolveNewMessagesDividerAnchor(
+          $agentMessages$.map((message) => message.id),
+          typeof $agentSession$?.metadata?.lastSeenMessageId === 'string'
+            ? $agentSession$.metadata.lastSeenMessageId
+            : undefined,
+        ),
+      ),
+    );
+  });
+  // Rendered position comes ONLY from the latched anchor — later
+  // lastSeenMessageId convergence never adds/moves/removes the divider. A
+  // latched anchor no longer in the transcript (e.g. edit-and-regenerate
+  // truncation) hides it without recomputing.
+  const newMessagesDividerAnchorId = $derived(
+    resolveLatchedDividerAnchor(
+      $agentMessages$.map((message) => message.id),
+      $dividerSession$?.anchorId ?? null,
+    ),
+  );
+  // One-shot guard: the divider entry-positioning happens once per panel mount
+  // (first transcript availability), never again on later marker convergence.
+  let hasAppliedNewMessagesEntryScroll = false;
 
   // Get the auggie session ID from the most recent assistant message's metadata
   // This is the raw UUID format that auggie uses, needed for debugging/support
@@ -1476,17 +1508,27 @@
       currentCount > previousMessageCount &&
       (isFirstMessage || (shouldFollowBottom && !isScrollUnlocked));
     if (shouldScroll) {
-      // New message added - scroll to bottom after DOM updates
-      // Re-enable auto-follow when first message is added
-      if (isFirstMessage) {
-        shouldFollowBottom = true;
-        isScrollUnlocked = false;
+      // Unread-marker entry: on the first transcript hydration with a latched
+      // divider anchor, land at the "New messages" divider with follow
+      // disabled when the unseen tail is taller than the viewport; when it
+      // fits on screen, scroll to the bottom with follow enabled instead
+      // (decided inside scrollToNewMessagesDivider).
+      if (isFirstMessage && !hasAppliedNewMessagesEntryScroll && newMessagesDividerAnchorId) {
+        hasAppliedNewMessagesEntryScroll = true;
+        void scrollToNewMessagesDivider(newMessagesDividerAnchorId);
+      } else {
+        // New message added - scroll to bottom after DOM updates
+        // Re-enable auto-follow when first message is added
+        if (isFirstMessage) {
+          shouldFollowBottom = true;
+          isScrollUnlocked = false;
+        }
+        tick().then(() => {
+          // Guard against component destruction during tick
+          if (isComponentDestroyed) return;
+          if (scrollContainer) scrollToBottomUtil(scrollContainer);
+        });
       }
-      tick().then(() => {
-        // Guard against component destruction during tick
-        if (isComponentDestroyed) return;
-        if (scrollContainer) scrollToBottomUtil(scrollContainer);
-      });
     }
     previousMessageCount = currentCount;
   });
@@ -1769,8 +1811,15 @@
     requestAnimationFrame(() => {
       if (scrollContainer) {
         if ($agentMessages$.length > 0) {
-          // Scroll to bottom if there are messages
-          scrollToBottomUtil(scrollContainer);
+          if (!hasAppliedNewMessagesEntryScroll && newMessagesDividerAnchorId) {
+            // Unread-marker entry (remount with the transcript already
+            // loaded): land at the "New messages" divider instead of the bottom.
+            hasAppliedNewMessagesEntryScroll = true;
+            void scrollToNewMessagesDivider(newMessagesDividerAnchorId);
+          } else {
+            // Scroll to bottom if there are messages
+            scrollToBottomUtil(scrollContainer);
+          }
         } else {
           // Scroll to top for empty panel (shows specialist switcher)
           scrollContainer.scrollTop = 0;
@@ -1886,54 +1935,14 @@
       targetScrollTop = scrollContainer.scrollTop + (elementRect.bottom - containerRect.bottom) + 1;
     }
 
-    const startScrollTop = scrollContainer.scrollTop;
-    const distance = targetScrollTop - startScrollTop;
-    const startTime = performance.now();
-
-    function easeOutCubic(t: number): number {
-      return 1 - Math.pow(1 - t, 3);
-    }
-
-    function animate(currentTime: number) {
-      const elapsed = currentTime - startTime;
-      const progress = Math.min(elapsed / duration, 1);
-
-      scrollContainer!.scrollTop = startScrollTop + distance * easeOutCubic(progress);
-
-      if (progress < 1) {
-        requestAnimationFrame(animate);
-      }
-    }
-
-    requestAnimationFrame(animate);
+    animateScrollTo(() => scrollContainer, targetScrollTop, duration);
   }
 
   /**
    * Smoothly scroll to a specific position with 150ms animation.
    */
   function smoothScrollToPosition(top: number, duration: number = 150) {
-    if (!scrollContainer) return;
-
-    const startScrollTop = scrollContainer.scrollTop;
-    const distance = top - startScrollTop;
-    const startTime = performance.now();
-
-    function easeOutCubic(t: number): number {
-      return 1 - Math.pow(1 - t, 3);
-    }
-
-    function animate(currentTime: number) {
-      const elapsed = currentTime - startTime;
-      const progress = Math.min(elapsed / duration, 1);
-
-      scrollContainer!.scrollTop = startScrollTop + distance * easeOutCubic(progress);
-
-      if (progress < 1) {
-        requestAnimationFrame(animate);
-      }
-    }
-
-    requestAnimationFrame(animate);
+    animateScrollTo(() => scrollContainer, top, duration);
   }
 
   // Navigate to a specific message by index
@@ -2133,6 +2142,46 @@
     }
     logger.warn('[ChatPanel] Message turn not rendered after force-visible', { messageId });
     return null;
+  }
+
+  // Entry positioning for the unread marker: force-render the anchor message's
+  // turn (it may be a virtualized LazyTurn placeholder), then decide where to
+  // land. If the divider would still be visible with the viewport scrolled
+  // fully to the bottom (the whole unseen tail fits on screen), enter like a
+  // normal conversation: scroll to the end with auto-follow enabled — the
+  // frozen divider stays rendered where it is. Otherwise land the viewport on
+  // the "New messages" divider with follow disabled
+  // (forceRenderAndFindMessage drops it) so streaming growth doesn't yank the
+  // viewport down. Falls back to today's scroll-to-bottom if the anchor never
+  // renders.
+  async function scrollToNewMessagesDivider(anchorMessageId: string) {
+    const anchorElement = await forceRenderAndFindMessage(anchorMessageId);
+    if (isComponentDestroyed || !scrollContainer) return;
+    const dividerElement = scrollContainer.querySelector(
+      '[data-new-messages-divider]',
+    ) as HTMLElement | null;
+    const targetElement = dividerElement ?? anchorElement;
+    if (!targetElement) {
+      shouldFollowBottom = true;
+      scrollToBottomUtil(scrollContainer);
+      return;
+    }
+    const containerRect = scrollContainer.getBoundingClientRect();
+    const targetRect = targetElement.getBoundingClientRect();
+    const targetOffsetTop = scrollContainer.scrollTop + (targetRect.top - containerRect.top);
+    if (
+      dividerVisibleWhenScrolledToBottom(
+        targetOffsetTop,
+        scrollContainer.scrollHeight,
+        scrollContainer.clientHeight,
+      )
+    ) {
+      shouldFollowBottom = true;
+      isScrollUnlocked = false;
+      scrollToBottomUtil(scrollContainer);
+      return;
+    }
+    smoothScrollTo(targetElement, 'center');
   }
 
   // Collect ranges for every case-insensitive occurrence of each query token
@@ -2503,6 +2552,13 @@
       }
     }
   });
+
+  // NOTE: the seen marker (agent.markSeen, PROTOCOL §5.5) is NOT advanced
+  // from this component. It advances at three discrete triggers handled in
+  // middleware — turn finish (streamEnded, gated on viewed tab + window
+  // focus), user send (sendMessage), and stop-looking boundaries (tab close /
+  // workspace switch via the divider-session boundary seam). See
+  // $features/agent/mark-agent-seen.
 
   onDestroy(() => {
     // CRITICAL: Set destruction flag FIRST, before any other cleanup.
@@ -3593,6 +3649,13 @@
                 />
               </div>
             {/if}
+            <!-- Presentation-only unread marker (PROTOCOL §5.5 agent.markSeen):
+                 rendered after the anchor message; never part of the transcript -->
+            {#snippet newMessagesDividerAfter(messageId: string)}
+              {#if newMessagesDividerAnchorId === messageId}
+                <NewMessagesDivider />
+              {/if}
+            {/snippet}
             <!-- PERF: Use keyed each blocks for efficient list diffing -->
             {#each groupedMessages as group, groupIndex (group.messages[0]?.id ?? groupIndex)}
               <DateSeparator label={formatDistanceToNow(group.date)} />
@@ -3686,6 +3749,7 @@
                             {/if}
                           </div>
                         {/if}
+                        {@render newMessagesDividerAfter(message.id)}
                       {/if}
                       <!-- User message (sticky within this turn) - skip for event notifications (already shown above) -->
                       <!-- Also skip messages starting with [WORKSPACE EVENTS] as a fallback in case metadata is missing -->
@@ -3695,9 +3759,11 @@
                           extractAllContent(turn.userMessage)
                             .trim()
                             .startsWith('[WORKSPACE EVENTS]'))}
+                      <!-- Daemon-delivered dismissal rows render as a compact chip, not a user bubble -->
+                      {@const isQuestionsDismissed = !!getQuestionsDismissedNotice(turn.userMessage)}
                       <!-- Sticky compact user message header - shows when scrolled past expanded message -->
                       <!-- Positioned BEFORE expanded message in DOM so it's naturally behind it -->
-                      {#if shouldEnableSticky && turn.userMessage && !isEventNotification}
+                      {#if shouldEnableSticky && turn.userMessage && !isEventNotification && !isQuestionsDismissed}
                         <div class="sticky -top-px w-full z-10 h-0 overflow-visible">
                           <div
                             class="h-fit min-w-0 px-2 pt-2 pb-2 text-subtle whitespace-nowrap text-ellipsis leading-normal bg-sidebar rounded-xs w-full max-w-full truncate"
@@ -3707,7 +3773,19 @@
                         </div>
                       {/if}
 
-                      {#if turn.userMessage && !isEventNotification}
+                      {#if turn.userMessage && isQuestionsDismissed}
+                        <!-- Compact centered chip outside the user-bubble wrapper (no user margins/background) -->
+                        <div
+                          data-message-id={turn.userMessage.id}
+                          data-message-index={getMessageIndex(turn.userMessage.id)}
+                          class="message-nav-target px-2"
+                        >
+                          <QuestionsDismissedNotice
+                            title={extractAllContent(turn.userMessage) || undefined}
+                          />
+                        </div>
+                        {@render newMessagesDividerAfter(turn.userMessage.id)}
+                      {:else if turn.userMessage && !isEventNotification}
                         {@const message = turn.userMessage}
                         {@const globalIndex = getMessageIndex(message.id)}
                         <!-- z-20 and bg-sidebar to cover the sticky compact header when in view -->
@@ -3730,6 +3808,7 @@
                             backendSessionId={auggieSessionId}
                           />
                         </div>
+                        {@render newMessagesDividerAfter(message.id)}
                       {/if}
 
                       <!-- Model-change notices (daemon-persisted, after the user row, before assistant output) -->
@@ -3742,6 +3821,7 @@
                               fallbackText={extractAllContent(noticeMessage) || undefined}
                             />
                           </div>
+                          {@render newMessagesDividerAfter(noticeMessage.id)}
                         {/if}
                       {/each}
 
@@ -3851,6 +3931,7 @@
                             workspaceId={workspace.id}
                           />
                         {/if}
+                        {@render newMessagesDividerAfter(message.id)}
                       {/each}
                     {/snippet}
                   </LazyTurn>
@@ -4043,6 +4124,9 @@
       {/key}
     {/if}
     {#if !pendingQuestions || questionWizardCollapsed}
+      {#if draftManager.gateActive}
+        <ChatDraftLoadingGate />
+      {/if}
       <SimpleRichInput
         bind:this={inputComponent}
         bind:contextItems
@@ -4052,7 +4136,7 @@
         onstop={handleStop}
         onHistoryPrev={handleHistoryPrev}
         onHistoryNext={handleHistoryNext}
-        disabled={!workspace || !$agentSession$}
+        disabled={!workspace || !$agentSession$ || draftManager.gateActive}
         isStreaming={$agentSessionIsStreaming$}
         isResponding={$agentIsResponding$}
         {workspace}

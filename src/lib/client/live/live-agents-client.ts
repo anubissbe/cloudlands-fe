@@ -162,6 +162,7 @@ export class LiveAgentsClient implements AgentsClient {
       idempotencyKey: newIdempotencyKey(),
     };
     if (request.model !== undefined) params.model = request.model;
+    if (request.reasoningEffort !== undefined) params.reasoningEffort = request.reasoningEffort;
     if (request.specialist !== undefined && request.specialist !== null) {
       params.specialistId = request.specialist;
     }
@@ -388,6 +389,42 @@ export class LiveAgentsClient implements AgentsClient {
       agentId: params.agentId,
       workspaceId: params.workspaceId,
       messageId: params.messageId,
+    });
+  }
+  async markSeen(params: {
+    agentId: string;
+    workspaceId: string;
+    messageId: string;
+  }): Promise<MutationResult> {
+    // `agent.markSeen` (§5.5) takes `{ workspaceId, agentId, messageId }`
+    // (all required — workspace mismatch surfaces as NotFound); the wire ack
+    // is `{ success: true, lastSeenMessageId }`, folded by `runMutation` into
+    // a plain `MutationResult`. The daemon persists the marker in session
+    // metadata (survives reload) and emits `agent:updated` so all clients
+    // converge on the advanced marker. Idempotent on the same messageId.
+    // Transport / daemon errors fold into `{ success: false, error }` — the
+    // fire-and-forget trigger never awaits this for UI flow.
+    return runMutation("agent.markSeen", {
+      workspaceId: params.workspaceId,
+      agentId: params.agentId,
+      messageId: params.messageId,
+    });
+  }
+  async setReasoningEffort(params: {
+    agentId: string;
+    workspaceId: string;
+    reasoningEffort: string | null;
+  }): Promise<MutationResult> {
+    // `agent.update` (§5.5) is the partial-mutation writer; `reasoningEffort`
+    // rides the `changes` object (Option B session field). Optional-string
+    // fields accept an explicit JSON `null` to clear, so `null` is forwarded
+    // verbatim — it means "reset to provider default", not "omit". The daemon
+    // persists the field and emits `agent:updated`, which reconciles other
+    // windows; the effort applies on the next prompt send.
+    return runMutation("agent.update", {
+      agentId: params.agentId,
+      workspaceId: params.workspaceId,
+      changes: { reasoningEffort: params.reasoningEffort },
     });
   }
   async rename(

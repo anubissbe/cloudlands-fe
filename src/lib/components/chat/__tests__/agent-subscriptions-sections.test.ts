@@ -31,6 +31,7 @@ vi.mock('$store/renderer/slices/agent-session/agent-session-selectors', () => ({
   selectAgentSession: () => makeReadable(null),
   selectAgentIsResponding: () => makeReadable(false),
   selectAgentIsWaiting: () => makeReadable(false),
+  selectAgentIsBlockedWaiting: () => makeReadable(false),
   selectAgentSessionStreamingContent: () => makeReadable(''),
   selectAgentSessionHasStreamOwnedMessage: () => makeReadable(false),
   selectAgentProvider: () => makeReadable(undefined),
@@ -222,7 +223,7 @@ describe('AgentSubscriptions sections', () => {
     ).toBeTruthy();
   });
 
-  it('shows a count-free "Waiting for agent" header with a single one-shot watch', async () => {
+  it('shows a counted "Waiting on 1 agent" header with a single one-shot watch', async () => {
     const WS = 'ws-sections-header-one';
     await renderWithSnapshot(WS, {
       subscriptions: [oneShotSubscription('watch-solo', WS, 'child-solo')],
@@ -231,12 +232,10 @@ describe('AgentSubscriptions sections', () => {
     });
 
     const header = screen.getByTestId('one-shot-header');
-    expect(header.textContent).toContain('Waiting for agent');
-    // Singular header carries no count
-    expect(header.textContent).not.toMatch(/\d/);
+    expect(header.textContent).toContain('Waiting on 1 agent');
   });
 
-  it('shows a counted "Waiting for {count} agents" header with multiple one-shot watches', async () => {
+  it('shows a distributive "Waiting on each of {count} agents" header with multiple one-shot watches', async () => {
     const WS = 'ws-sections-header-many';
     await renderWithSnapshot(WS, {
       subscriptions: [
@@ -247,7 +246,9 @@ describe('AgentSubscriptions sections', () => {
       agentStatuses: { [PARENT]: 'waiting', 'child-1': 'responding', 'child-2': 'responding' },
     });
 
-    expect(screen.getByTestId('one-shot-header').textContent).toContain('Waiting for 2 agents');
+    expect(screen.getByTestId('one-shot-header').textContent).toContain(
+      'Waiting on each of 2 agents',
+    );
   });
 
   it('renders no one-shot header when there are no one-shot watches', async () => {
@@ -274,8 +275,7 @@ describe('AgentSubscriptions sections', () => {
     const oneShots = screen.getByTestId('one-shot-watches');
     expect(within(oneShots).getAllByTestId('agent-list-item')).toHaveLength(1);
     const header = screen.getByTestId('one-shot-header');
-    expect(header.textContent).toContain('Waiting for agent');
-    expect(header.textContent).not.toMatch(/\d/);
+    expect(header.textContent).toContain('Waiting on 1 agent');
   });
 
   it('merged single-agent group cancel sends the scoped agent.cancelSubscriptions { groupId }', async () => {

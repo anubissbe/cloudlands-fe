@@ -1,8 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
   HUD_FEED_LIMIT,
-  HUD_RATE_5S_BAR_COUNT,
-  HUD_RATE_5S_BUCKET_MS,
   hudActivated,
   hudAttentionChanged,
   hudDeactivated,
@@ -13,8 +11,6 @@ import {
   hudGridFilterStateToggled,
   hudQuestionCaptured,
   hudQuestionSuperseded,
-  hudRate5sBackfilled,
-  hudRate5sTokensObserved,
   hudRateHistoryFailed,
   hudRateHistoryLoaded,
   hudReducer,
@@ -23,10 +19,11 @@ import {
   hudUsageFailed,
   hudUsageLoaded,
   initialState,
-  toRate5sBucketStart,
   type HudFeedEntry,
   type HudState,
 } from './hud-slice';
+import type { Workspace, WorkspaceDisplayStatus } from '$shared/types';
+import { replaceWorkspaceList, setWorkspaceEntity } from '../workspace/workspace-slice';
 
 function makeEntry(id: string, overrides: Partial<HudFeedEntry> = {}): HudFeedEntry {
   return {
@@ -158,6 +155,76 @@ describe('hud-slice reducer', () => {
     expect(state.displayStatusByWorkspaceId).toEqual({ 'ws-1': 'pr_merged' });
   });
 
+  describe('displayStatus override reconciliation', () => {
+    function withOverrides(): HudState {
+      let state = activeState();
+      state = hudReducer(state, hudDisplayStatusChanged('ws-1', 'pr_open'));
+      return hudReducer(state, hudDisplayStatusChanged('ws-2', 'in_progress'));
+    }
+
+    function entity(id: string, displayStatus?: WorkspaceDisplayStatus): Workspace {
+      return { id, displayStatus } as Workspace;
+    }
+
+    it('an entity that agrees with the override retires it immediately', () => {
+      const state = hudReducer(withOverrides(), setWorkspaceEntity(entity('ws-1', 'pr_open')));
+      expect(state.displayStatusByWorkspaceId).toEqual({ 'ws-2': 'in_progress' });
+    });
+
+    it('the FIRST contradicting entity keeps the override (it may be an in-flight refetch)', () => {
+      const state = hudReducer(withOverrides(), setWorkspaceEntity(entity('ws-1', 'pr_merged')));
+      expect(state.displayStatusByWorkspaceId).toEqual({
+        'ws-1': 'pr_open',
+        'ws-2': 'in_progress',
+      });
+      expect(state.displayStatusOverridesContradicted).toEqual({ 'ws-1': true });
+    });
+
+    it('a SECOND contradicting entity retires the override', () => {
+      let state = hudReducer(withOverrides(), setWorkspaceEntity(entity('ws-1', 'pr_merged')));
+      state = hudReducer(state, setWorkspaceEntity(entity('ws-1', 'pr_merged')));
+      expect(state.displayStatusByWorkspaceId).toEqual({ 'ws-2': 'in_progress' });
+      expect(state.displayStatusOverridesContradicted).toEqual({});
+    });
+
+    it('a refetch that predates the event cannot clobber the override (reverse race)', () => {
+      // `workspace.list` starts, the event lands mid-flight, then the stale
+      // response resolves: the override must survive and keep rendering.
+      let state = hudReducer(activeState(), hudDisplayStatusChanged('ws-1', 'failed'));
+      state = hudReducer(state, replaceWorkspaceList([entity('ws-1', 'in_progress')]));
+      expect(state.displayStatusByWorkspaceId).toEqual({ 'ws-1': 'failed' });
+    });
+
+    it('a newer event restarts the two-strike count', () => {
+      let state = hudReducer(withOverrides(), setWorkspaceEntity(entity('ws-1', 'pr_merged')));
+      state = hudReducer(state, hudDisplayStatusChanged('ws-1', 'complete'));
+      expect(state.displayStatusOverridesContradicted).toEqual({});
+      state = hudReducer(state, setWorkspaceEntity(entity('ws-1', 'pr_merged')));
+      expect(state.displayStatusByWorkspaceId['ws-1']).toBe('complete');
+    });
+
+    it('replaceWorkspaceList reconciles every row carrying a value', () => {
+      let state = hudReducer(
+        withOverrides(),
+        replaceWorkspaceList([entity('ws-1', 'complete'), entity('ws-2', 'in_progress')]),
+      );
+      // ws-2 agreed (retired now); ws-1 contradicted once (survives).
+      expect(state.displayStatusByWorkspaceId).toEqual({ 'ws-1': 'pr_open' });
+      state = hudReducer(state, replaceWorkspaceList([entity('ws-1', 'complete')]));
+      expect(state.displayStatusByWorkspaceId).toEqual({});
+    });
+
+    it('an entity without a displayStatus keeps the override (nothing fresher arrived)', () => {
+      const state = withOverrides();
+      expect(hudReducer(state, setWorkspaceEntity(entity('ws-1')))).toBe(state);
+    });
+
+    it('an unrelated workspace leaves the overrides untouched', () => {
+      const state = withOverrides();
+      expect(hudReducer(state, setWorkspaceEntity(entity('ws-9', 'complete')))).toBe(state);
+    });
+  });
+
   it('hudUsageLoaded stores the rollup and clears a prior error', () => {
     let state = hudReducer(activeState(), hudUsageFailed('boom'));
     const usage = {
@@ -221,69 +288,6 @@ describe('hud-slice reducer', () => {
     let state = hudReducer(activeState(), hudTakeoverRequested('ws-1'));
     state = hudReducer(state, hudTakeoverRequestCleared());
     expect(state.takeoverRequestWorkspaceId).toBeNull();
-  });
-});
-
-describe('hud-slice 5s token buckets (TOK/S chart)', () => {
-  // Aligned base instant so bucket math is exact.
-  const BASE = toRate5sBucketStart(1_753_900_000_000);
-
-  it('accumulates same-bucket deltas and keeps buckets chronological', () => {
-    let state = activeState();
-    state = hudReducer(state, hudRate5sTokensObserved(100, BASE + 1_000));
-    state = hudReducer(state, hudRate5sTokensObserved(50, BASE + 4_000));
-    state = hudReducer(state, hudRate5sTokensObserved(30, BASE + 6_000));
-    expect(state.rate5s.buckets).toEqual([
-      { startMs: BASE, tokens: 150 },
-      { startMs: BASE + HUD_RATE_5S_BUCKET_MS, tokens: 30 },
-    ]);
-  });
-
-  it('ignores non-positive deltas and observations while inactive', () => {
-    const inactive = hudReducer(initialState, hudRate5sTokensObserved(100, BASE));
-    expect(inactive.rate5s.buckets).toEqual([]);
-    let state = activeState();
-    state = hudReducer(state, hudRate5sTokensObserved(0, BASE));
-    state = hudReducer(state, hudRate5sTokensObserved(-5, BASE));
-    expect(state.rate5s.buckets).toEqual([]);
-  });
-
-  it('prunes buckets outside the trailing 40-slot window', () => {
-    let state = activeState();
-    state = hudReducer(state, hudRate5sTokensObserved(10, BASE));
-    const beyond = BASE + HUD_RATE_5S_BAR_COUNT * HUD_RATE_5S_BUCKET_MS;
-    state = hudReducer(state, hudRate5sTokensObserved(20, beyond));
-    expect(state.rate5s.buckets).toEqual([{ startMs: beyond, tokens: 20 }]);
-  });
-
-  it('backfills minute samples split evenly across 5s slots, once, live buckets winning', () => {
-    const nowMs = BASE + 60_000;
-    const minuteUtc = new Date(BASE).toISOString();
-    let state = activeState();
-    state = hudReducer(state, hudRate5sTokensObserved(99, BASE + 10_000));
-    state = hudReducer(
-      state,
-      hudRate5sBackfilled([{ bucketUtc: minuteUtc, tokens: 120 }], nowMs),
-    );
-    expect(state.rate5s.backfilled).toBe(true);
-    const bucketAt = (offset: number) =>
-      state.rate5s.buckets.find((b) => b.startMs === BASE + offset);
-    expect(bucketAt(0)?.tokens).toBe(10); // 120 / 12 slots
-    expect(bucketAt(10_000)?.tokens).toBe(99); // live delta wins
-    // Repeat backfills are ignored (one-shot).
-    const repeat = hudReducer(
-      state,
-      hudRate5sBackfilled([{ bucketUtc: minuteUtc, tokens: 999 }], nowMs),
-    );
-    expect(repeat).toBe(state);
-  });
-
-  it('backfill never writes future slots past nowMs', () => {
-    const nowMs = BASE + 20_000;
-    const minuteUtc = new Date(BASE).toISOString();
-    let state = activeState();
-    state = hudReducer(state, hudRate5sBackfilled([{ bucketUtc: minuteUtc, tokens: 120 }], nowMs));
-    expect(Math.max(...state.rate5s.buckets.map((b) => b.startMs))).toBeLessThanOrEqual(nowMs);
   });
 });
 

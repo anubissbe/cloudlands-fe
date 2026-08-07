@@ -2,7 +2,7 @@
   /**
    * CheckoutModePill - Tiny, quiet metadata pill showing how the workspace
    * checkout was provisioned (PROTOCOL §5.1). Renders nothing when
-   * `checkoutMode` is absent (direct / non-daemon-provisioned checkouts).
+   * `checkoutMode` is absent (non-daemon-provisioned checkouts).
    *
    * When a workspace is provided, hovering the pill opens the disk-usage
    * tooltip and fetches the footprint on demand via the `workspace.diskUsage`
@@ -24,7 +24,7 @@
   import { pollWorkspaceDiskUsage } from './disk-usage-poll';
 
   interface Props {
-    checkoutMode?: 'cow' | 'worktree';
+    checkoutMode?: 'cow' | 'worktree' | 'direct';
     workspace?: Workspace | null;
     class?: string;
   }
@@ -40,9 +40,17 @@
   // instead of the raw checkout mode.
   const isMicrovm = $derived(workspace?.executionEnvironment === 'microvm');
 
-  // i18n-ignore (CoW / Worktree / MicroVM are technical terms)
+  // i18n-ignore (CoW / Worktree / Direct / MicroVM are technical terms)
   const label = $derived(
-    isMicrovm ? 'MicroVM' : mode === 'cow' ? 'CoW' : mode === 'worktree' ? 'Worktree' : null,
+    isMicrovm
+      ? 'MicroVM'
+      : mode === 'cow'
+        ? 'CoW'
+        : mode === 'worktree'
+          ? 'Worktree'
+          : mode === 'direct'
+            ? 'Direct'
+            : null,
   );
 
   /** Poll cadence while the tooltip is open and a daemon walk is in flight. */

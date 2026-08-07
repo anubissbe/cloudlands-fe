@@ -24,14 +24,17 @@
   import { selectLastUsedScriptForRepo } from '$store/renderer/slices/setup-scripts/setup-scripts-selectors';
   import {
   setCompactWorkspaceInitializerFormState,
+  clearWorkspaceInitializerPendingGitHubPrefill,
   setWorkspaceInitializerBranchForRepo,
   setWorkspaceInitializerLastSubmittedAgent,
 } from '$store/renderer/slices/workspace-initializer/workspace-initializer-slice';
   import {
   selectCompactWorkspaceInitializerFormState,
+  selectWorkspaceInitializerDefaultParentPath,
   selectWorkspaceInitializerHydrated,
   selectWorkspaceInitializerLastSelectedRepo,
   selectWorkspaceInitializerLastSubmittedAgent,
+  selectWorkspaceInitializerPendingGitHubPrefill,
   selectWorkspaceInitializerRecentRepos,
 } from '$store/renderer/slices/workspace-initializer/workspace-initializer-selectors';
   import type {
@@ -68,13 +71,28 @@
   import { createAgentTypeId } from '$shared/types/agent.types';
   import {
   faMagicWandSparkles,
+  faMicrophone,
   faPaperclip,
   faSpinner,
   faStop,
   faExclamationTriangle,
   faCodeBranch,
 } from '@fortawesome/free-solid-svg-icons';
+  import {
+  selectPttRecording,
+  selectVoiceTranscribing,
+} from '$store/renderer/slices/hardware-console/hardware-console-selectors';
+  import { selectEffectiveVoiceEngine } from '$store/renderer/slices/voice-settings/voice-settings-selectors';
+  import {
+  cancelPromptMicRecording,
+  isPromptMicRecording,
+  togglePromptMicRecording,
+} from '$features/hardware-console/voice/prompt-mic-controller';
+  import { cancelActiveTranscription } from '$features/hardware-console/voice/transcription-cancellation';
+  import type { PttContext } from '$features/hardware-console/voice/ptt-controller';
+  import { showVoiceSetupToast } from '$features/hardware-console/voice/voice-setup-toast';
   import { invoke } from '$lib/electron-bridge';
+  import { WORKSPACE_CHANNELS } from '$shared/ipc/channels';
   import { appClient } from '$lib/client';
   import {
     enhancePrompt,
@@ -103,7 +121,7 @@
   import SetupScriptModal from '../modals/SetupScriptModal.svelte';
   import { noteUrl } from '$shared/constants/intent-links';
   import { selectActiveProviderId } from '$store/renderer/slices/provider-settings/provider-settings-selectors';
-  import { selectCatalogDefaultProviderId } from '$store/renderer/slices/provider-catalog/provider-catalog-selectors';
+  import { selectEffectiveDefaultProviderId } from '$store/renderer/slices/provider-catalog/provider-catalog-selectors';
   import { parseCompoundModelId } from '$shared/utils/compound-model-id';
   import { resolveSubmitProvider } from '$lib/utils/effective-model-resolution';
   import { store as appStore } from '$store/renderer/store';
@@ -115,9 +133,16 @@
   createNewWorkspaceDraftSaver,
   restoreNewWorkspaceDraft,
 } from './initializer/new-workspace-draft';
+  import { resolveGitHubPrefillSelection } from './initializer/github-prefill';
+  import {
+  matchGitHubPrefillRepo,
+  type GitHubPrefillRepoCandidate,
+} from './initializer/github-prefill-repo-match';
 
   const activeProviderId$ = selectActiveProviderId();
-  const defaultProviderId$ = selectCatalogDefaultProviderId();
+  const defaultProviderId$ = selectEffectiveDefaultProviderId();
+  const pttRecording$ = selectPttRecording();
+  const voiceTranscribing$ = selectVoiceTranscribing();
   const logger = createLogger('CompactWorkspaceInitializer');
 
   // Constants
@@ -389,6 +414,8 @@
   const lastSelectedRepo$ = selectWorkspaceInitializerLastSelectedRepo();
   const lastSubmittedAgent$ = selectWorkspaceInitializerLastSubmittedAgent();
   const recentRepos$ = selectWorkspaceInitializerRecentRepos();
+  const pendingGitHubPrefill$ = selectWorkspaceInitializerPendingGitHubPrefill();
+  const defaultParentPath$ = selectWorkspaceInitializerDefaultParentPath();
 
   const savedState = $compactFormState$;
   const lastSubmittedAgent = $lastSubmittedAgent$;
@@ -898,6 +925,96 @@
     }
   });
 
+  // Preselect the repo matching a pending prefill's owner/repo: current +
+  // recent repos first (stored metadata, then git-remote probes), GitHub clone
+  // flow when nothing matches, and 'keep' (no change) on errors so the
+  // last-used repo stays selected (non-fatal).
+  async function preselectGitHubPrefillRepo(
+    target: { owner: string; repo: string },
+    isStale?: () => boolean,
+  ) {
+    const candidates: GitHubPrefillRepoCandidate[] = [];
+    if (repoPath && repoType !== 'remote') {
+      candidates.push({ path: repoPath, type: repoType, githubUrl: githubUrl || undefined });
+    }
+    for (const recent of $recentRepos$) {
+      candidates.push({
+        path: recent.path,
+        type: recent.type,
+        name: recent.name,
+        owner: recent.owner,
+        githubUrl: recent.githubUrl,
+      });
+    }
+    const selection = await matchGitHubPrefillRepo({
+      owner: target.owner,
+      repo: target.repo,
+      candidates,
+      defaultParentPath: $defaultParentPath$,
+      probeRemote: async (path) => {
+        if (typeof window === 'undefined' || !window.electronAPI) return null;
+        const response = await invoke<{
+          success?: boolean;
+          data?: { owner?: string; repo?: string };
+        }>('git-tracking:get-remote-url', { repoPath: path });
+        return response?.success && response.data?.owner && response.data?.repo
+          ? { owner: response.data.owner, repo: response.data.repo }
+          : null;
+      },
+    });
+    if (isStale?.()) return;
+    if (selection.kind === 'keep') return;
+    if (selection.kind === 'local') {
+      // Already selected — leave the form (incl. branch) untouched
+      if (repoType === 'local' && repoPath === selection.path) return;
+      const detail = { path: selection.path, type: 'local' as const, isValidPath: true };
+      handleRepoChange({ detail } as CustomEvent<typeof detail>);
+    } else {
+      const detail = {
+        path: selection.clonePath,
+        type: 'github' as const,
+        githubUrl: selection.githubUrl,
+        clonePath: selection.clonePath,
+        isValidPath: true,
+      };
+      handleRepoChange({ detail } as CustomEvent<typeof detail>);
+    }
+  }
+
+  // Consume a pending GitHub issue/PR prefill (set by the chat link action menu's
+  // "Start new workspace…"): clear it from the store immediately so it never
+  // re-applies, preselect the repo matching the link's owner/repo, resolve PR
+  // branch info via git-tracking:get-pull-request (fetch failures degrade to a
+  // minimal mention), then insert the context mention pill through the same
+  // path as the Add-context issue picker.
+  //
+  // The pending value is cleared before the awaited work, so a rapid second
+  // prefill can start while an earlier one is still resolving. A generation
+  // counter drops stale runs after each await: only the latest prefill may
+  // change the repo selection or insert its mention.
+  let gitHubPrefillGeneration = 0;
+  $effect(() => {
+    const prefill = $pendingGitHubPrefill$;
+    if (prefill && richTextarea) {
+      appStore.dispatch(clearWorkspaceInitializerPendingGitHubPrefill());
+      const generation = ++gitHubPrefillGeneration;
+      const isStale = () => generation !== gitHubPrefillGeneration;
+      void (async () => {
+        try {
+          const snapshot = $state.snapshot(prefill);
+          await preselectGitHubPrefillRepo(snapshot, isStale);
+          if (isStale()) return;
+          const selection = await resolveGitHubPrefillSelection(snapshot);
+          if (isStale()) return;
+          handleIssueSelect(`#${prefill.number}`, selection);
+          richTextarea?.focus();
+        } catch (err) {
+          logger.error('Failed to apply GitHub prefill', err);
+        }
+      })();
+    }
+  });
+
   // Detected GitHub owner/repo from local git remote
   let detectedGitHubOwner = $state<string | null>(null);
   let detectedGitHubRepo = $state<string | null>(null);
@@ -1073,7 +1190,7 @@
   });
 
   // §5.31 gate — enhance is auggie-only; unset active provider defaults to auggie
-  const enhanceAvailable = $derived(isEnhancePromptAvailable($activeProviderId$));
+  const enhanceAvailable = $derived(isEnhancePromptAvailable($defaultProviderId$));
 
   // Enhance prompt state
   let isEnhancing = $state(false);
@@ -1440,7 +1557,7 @@
   }
 
   async function handleSubmit() {
-    if (!isValid || isCreating) return;
+    if (!isValid || isCreating || isEnhancing) return;
 
     isCreating = true;
     error = null;
@@ -1454,9 +1571,10 @@
       const promptValidation = validateInitialPrompt(initialPrompt);
       if (!promptValidation.valid) throw new Error(promptValidation.error);
 
-      // For GitHub repos with a clone path, validate the GitHub URL instead of the local clone path
-      // since the clone path won't exist until after cloning
-      if (repoType === 'github' && githubUrl && clonePath) {
+      // For GitHub repos, validate the GitHub URL instead of a local path —
+      // picked repos have no local path at all, and with an explicit clone
+      // path the destination won't exist until after cloning
+      if (repoType === 'github' && githubUrl) {
         const repoValidation = await validateRepoPath(githubUrl, false);
         if (!repoValidation.valid) throw new Error(repoValidation.error);
         // Note: We don't validate the parent directory here because:
@@ -1816,12 +1934,19 @@
         logger.debug('Saved branch per repo', { repoPath, branch: baseBranch });
       }
 
+      // Picked repo (GitHub selection with no explicit clone destination):
+      // the daemon hydrates the checkout from its repo cache — send
+      // githubUrl + branch fields ONLY, no clonePath/repositoryPath
+      // (repoPath holds the owner/repo shorthand, not a local path).
+      const isGithubPick = repoType === 'github' && !!githubUrl && !clonePath;
+
       const result = await workspaceClient.create({
         title: prefillTitle || '', // Use deep-link title if provided, otherwise agent will set it
-        repositoryPath: String(remoteSetupSnapshot?.workspacePath || repoPath),
+        repositoryPath: isGithubPick
+          ? undefined
+          : String(remoteSetupSnapshot?.workspacePath || repoPath),
         githubUrl: repoType === 'github' && githubUrl ? githubUrl : undefined, // GitHub URL to clone
-        clonePath:
-          repoType === 'github' && (clonePath || repoPath) ? clonePath || repoPath : undefined, // User-selected clone destination (falls back to repoPath since they're the same for GitHub repos)
+        clonePath: repoType === 'github' && clonePath ? clonePath : undefined, // User-selected clone destination (legacy explicit-clone flow)
         baseRef: String(baseBranch),
         setupScript: setupScript.trim() || undefined,
         environmentConfig,
@@ -1857,6 +1982,22 @@
       // The daemon assigns the initial agent's id and returns it on the
       // create result; the FE no longer pre-mints one.
       const initialAgentId = result.data.initialAgent?.id;
+
+      // Register a picked repo as a path-less GitHub recent so re-picking it
+      // prefills the tab (keyed by the owner/repo shorthand, no local path).
+      if (isGithubPick) {
+        const ghInfo = parseGitHubUrl(githubUrl);
+        if (ghInfo) {
+          void invoke(WORKSPACE_CHANNELS.ADD_RECENT_REPOSITORY, {
+            repository: `${ghInfo.owner}/${ghInfo.repo}`,
+            name: ghInfo.repo,
+            owner: ghInfo.owner,
+            githubUrl: `https://github.com/${ghInfo.owner}/${ghInfo.repo}`,
+          }).catch((err) => {
+            logger.warn('Failed to register picked repo as recent', { error: err });
+          });
+        }
+      }
 
       // If a PR context mention was used, store the PR number on the workspace
       // so PR discovery can find the right PR later. Daemon-backed
@@ -2436,7 +2577,63 @@
       isEnhancing = false;
     }
   }
+
+  // Prompt mic latch button: same three states as the chat composer's mic
+  // (idle / recording pulse / transcribing spinner). "Recording" renders
+  // only for the session THIS prompt started (ownership via the controller's
+  // session token); `$pttRecording$` drives re-evaluation.
+  const micRecording = $derived($pttRecording$ && isPromptMicRecording());
+  const micTranscribing = $derived($voiceTranscribing$);
+
+  /** Dispatch + hint context for the shared PTT session API. */
+  const micContext: PttContext = {
+    dispatch: (action) => appStore.dispatch(action as { type: string }),
+    showHint: (message) => toast.info(message),
+  };
+
+  function handleMicClick() {
+    // No engine can transcribe (daemon selected, key missing, no OS
+    // fallback): surface the actionable setup toast instead of recording
+    // audio that could never be transcribed. A live recording is never
+    // gated — its stop-click must always land.
+    if (
+      !micRecording &&
+      selectEffectiveVoiceEngine.select(appStore.state) === 'unavailable'
+    ) {
+      showVoiceSetupToast();
+      return;
+    }
+    togglePromptMicRecording(micContext, { focus: () => richTextarea?.focusEnd() });
+  }
+
+  function handleMicEscape(event: KeyboardEvent) {
+    if (event.key !== 'Escape' || !micRecording) return;
+    if (cancelPromptMicRecording(micContext)) {
+      event.preventDefault();
+      event.stopPropagation();
+    }
+  }
+
+  // Cancel-while-transcribing: abandon the in-flight session so a hung or
+  // slow transcribe can never insert a late result — the transcribing state
+  // clears immediately and a new recording can start right away.
+  function handleMicCancelTranscription() {
+    cancelActiveTranscription();
+  }
+
+  // A recording left running when this prompt unmounts (modal closed) can
+  // never insert into it — discard the session instead of transcribing into
+  // whatever holds focus later.
+  onDestroy(() => {
+    cancelPromptMicRecording(micContext);
+  });
 </script>
+
+<!-- Esc cancels an in-progress prompt mic recording (discard, no
+     transcription). Capture phase so the modal's own Escape handling (close)
+     never wins while dictation is live; a no-op unless this prompt owns the
+     recording session. -->
+<svelte:window onkeydowncapture={handleMicEscape} />
 
 <!-- Compact Initializer -->
 <div class="w-full mx-auto" bind:this={controlsContainer}>
@@ -2484,6 +2681,7 @@
         bind:this={richTextarea}
         bind:value={initialPrompt}
         placeholder={m.workspace_compactInitializer_prompt_placeholder()}
+        disabled={isEnhancing || isCreating}
         repoPath={repoType === 'local' ? repoPath : undefined}
         onfocus={() => {
           isExpanded = true;
@@ -2551,6 +2749,57 @@
           repositoryOwner={githubRepoInfo?.owner}
           repositoryName={githubRepoInfo?.repo}
         />
+
+        <!-- Mic latch button: click starts dictation, click again (Esc
+             cancels) stops and transcribes into this prompt at the caret. -->
+        <div class="absolute top-2 {enhanceAvailable ? 'right-[62px]' : 'right-9'}">
+          {#if micTranscribing}
+            <!-- Clickable while transcribing: cancel abandons the in-flight
+                 session (a hung provider's late result is discarded) and
+                 returns the button to idle immediately. -->
+            <Button
+              type="button"
+              size="icon-xs"
+              variant="ghost-light"
+              onclick={handleMicCancelTranscription}
+              tooltip={m.chat_richInput_micCancelTranscribing_label()}
+              tooltipSide="top"
+              aria-label={m.chat_richInput_micCancelTranscribing_label()}
+              data-testid="initializer-mic-button"
+            >
+              <Fa icon={faSpinner} size="xs" class="animate-spin" />
+            </Button>
+          {:else if micRecording}
+            <Button
+              type="button"
+              size="icon-xs"
+              variant="ghost-light"
+              onclick={handleMicClick}
+              tooltip={m.chat_richInput_micStop_label()}
+              tooltipSide="top"
+              aria-label={m.chat_richInput_micStop_label()}
+              aria-pressed="true"
+              class="text-destructive-foreground animate-pulse"
+              data-testid="initializer-mic-button"
+            >
+              <Fa icon={faMicrophone} size="xs" />
+            </Button>
+          {:else}
+            <Button
+              type="button"
+              size="icon-xs"
+              variant="ghost-light"
+              onclick={handleMicClick}
+              tooltip={m.chat_richInput_micStart_label()}
+              tooltipSide="top"
+              aria-label={m.chat_richInput_micStart_label()}
+              aria-pressed="false"
+              data-testid="initializer-mic-button"
+            >
+              <Fa icon={faMicrophone} size="xs" />
+            </Button>
+          {/if}
+        </div>
 
         <!-- Enhance prompt button (§5.31 auggie-only gate) -->
         {#if enhanceAvailable}
@@ -2661,7 +2910,7 @@
 
         <!-- Create button -->
         <div class="shrink-0">
-          <Button class="text-white" onclick={handleSubmit} disabled={!isValid || isCreating}>
+          <Button class="text-white" onclick={handleSubmit} disabled={!isValid || isCreating || isEnhancing}>
             {#if isCreating}
               <Fa icon={faSpinner} class="animate-spin" size="sm" />
               <span class="min-w-[160px] text-left">
