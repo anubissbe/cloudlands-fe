@@ -4,8 +4,9 @@
    *
    * - Running: workspaces with active streaming agents
    * - Unread: workspaces with unread messages (edited within last 24h)
-   * - Waiting: workspaces the daemon reports as in_progress with no streaming
-   *   agents (agents waiting on background hooks or delegated work)
+   * - Waiting: workspaces the daemon flags as `waiting` (agents purely waiting
+   *   on external conditions: hooks, PR monitors, watched agents) with no
+   *   streaming agents
    * - Pinned: user-pinned workspaces
    *
    * Supports mark-as-read and pin/unpin actions.
@@ -22,20 +23,16 @@
   import { onMount } from 'svelte';
   import Header from '$lib/components/ui/Header.svelte';
 
-  import {
-  selectPinnedWorkspaceIds,
-} from '$store/renderer/slices/sidebar-nav/sidebar-nav-selectors';
-  import {
-  closeAll,
-  togglePinWorkspace,
-} from '$store/renderer/slices/sidebar-nav/sidebar-nav-slice';
+  import { selectPinnedWorkspaceIds } from '$store/renderer/slices/sidebar-nav/sidebar-nav-selectors';
+  import { togglePinWorkspace } from '$store/renderer/slices/sidebar-nav/sidebar-nav-slice';
 
   import { markWorkspaceSeen } from '$features/workspace/mark-workspace-seen';
   import { focusFirstUnreadAgent } from '$features/agent/focus-first-unread-agent';
+  import { openWorkspaceTab } from '$store/renderer/slices/tab-state/tab-state-slice';
   import {
-  compareWorkspaceActivityDisplayTimeDesc,
-  isWorkspaceActivityWithin,
-} from '$shared/utils/workspace-activity-time';
+    compareWorkspaceActivityDisplayTimeDesc,
+    isWorkspaceActivityWithin,
+  } from '$shared/utils/workspace-activity-time';
   import { store as appStore } from '$store/renderer/store';
   import WorkspaceCard from '$lib/components/workspace/WorkspaceCard.svelte';
   import WorkspaceCardSkeleton from '../WorkspaceCardSkeleton.svelte';
@@ -93,18 +90,15 @@
         // Only show unread if display activity is within the last day.
         return isWorkspaceActivityWithin(w, now, ONE_DAY_MS);
       })
-      .map((w) => ({
-        workspace: w,
-        // Attention is workspace-level; show member agents as the unread set.
-        unreadIds: w.agentSummary?.agentIds ?? [],
-      }))
+      .map((w) => ({ workspace: w }))
       .sort((a, b) => compareWorkspaceActivityDisplayTimeDesc(a.workspace, b.workspace));
   });
 
-  // Waiting workspaces: the daemon promotes displayStatus to 'in_progress' when an
-  // agent runs, a background hook is ACTIVE, or an idle coordinator still awaits
-  // delegated agents (PROTOCOL §5.1). With no streaming agents, that leaves exactly
-  // the hook-waiting / delegation-waiting cases. Unread wins over Waiting.
+  // Waiting workspaces: keyed off the BE-derived orthogonal `waiting` flag
+  // (PROTOCOL §5.1) — true when the workspace's agents are purely waiting on
+  // external conditions (active hooks, PR monitors, watched agents). It
+  // overlays displayStatus rather than folding into it, so a `complete`
+  // workspace can still be Waiting. Running and Unread win over Waiting.
   const waitingWorkspaces = $derived.by(() => {
     void activeStreamsVersion;
     const unreadIds = new Set(unreadWorkspaces.map((u) => u.workspace.id));
@@ -112,7 +106,7 @@
       .filter((w) => {
         if (w.status === WorkspaceStatusEnum.Archived || w.status === WorkspaceStatusEnum.Deleted)
           return false;
-        if (w.displayStatus !== 'in_progress') return false;
+        if (w.waiting !== true) return false;
         if (activeStreamsTracker.getStreamingAgentIdsForWorkspace(w.id).length > 0) return false;
         if (unreadIds.has(w.id)) return false;
         return true;
@@ -215,8 +209,11 @@
 
     keyboardNavActive = false;
     highlightedIndex = -1;
-    appStore.dispatch(closeAll(false));
-    goto(route);
+    void markWorkspaceSeen(workspaceId);
+    // Keep tab state in sync with the route so columns mode tracks the
+    // clicked workspace (matches AllWorkspacesCard).
+    appStore.dispatch(openWorkspaceTab(workspaceId));
+    await goto(route);
   }
 
   /**
@@ -310,25 +307,25 @@
   }
 </script>
 
-<div
+<!-- svelte-ignore a11y_no_noninteractive_element_interactions (delegated keyboard and pointer tracking for child controls) -->
+<nav
   class="flex flex-col pb-2 outline-none"
   onkeydown={handleSearchKeydown}
   onmousemove={handleMouseMove}
-  role={$hasLoaded$ ? 'listbox' : undefined}
+  aria-label={m.layout_sidebarNav_activeWorkspaces_title()}
   aria-busy={!$hasLoaded$}
-  tabindex="0"
 >
   {#if !$hasLoaded$}
     <!-- Show skeleton placeholders while loading -->
     <div class="pt-2">
-      {#each Array(5) as _, i (i)}
-        <WorkspaceCardSkeleton />
+      {#each Array(5) as _, index (index)}
+        <WorkspaceCardSkeleton {index} />
       {/each}
     </div>
   {:else if totalCount === 0}
     <div class="px-3 py-4">
-      <p class="text-sm text-subtle">{m.layout_activeCard_noActive_label()}</p>
-      <p class="text-sm text-subtle mt-1 leading-tight">
+      <p class="text-sm text-muted-foreground">{m.layout_activeCard_noActive_label()}</p>
+      <p class="mt-1 text-sm leading-tight text-muted-foreground">
         {m.layout_activeCard_pinHint_description()}
       </p>
     </div>
@@ -339,8 +336,9 @@
           bind:this={searchInputEl}
           type="text"
           placeholder={m.layout_activeCard_search_placeholder()}
+          aria-label={m.layout_activeCard_search_placeholder()}
           bind:value={searchQuery}
-          class="w-full px-2.5 py-1.5 text-sm bg-background/30 rounded-md text-foreground placeholder:text-muted-foreground/40 focus:outline-none"
+          class="w-full rounded-md border border-input bg-background/30 px-2.5 py-1.5 text-sm text-foreground placeholder:text-muted-foreground/40 focus:border-ring focus:outline-none"
         />
       </div>
     {/if}
@@ -350,20 +348,22 @@
       <div class="section-header px-3 pt-2 pb-1 flex items-center gap-1.5 min-w-0">
         <Header size={3} class="truncate">{m.layout_activeCard_unread_header()}</Header>
       </div>
-      {#each filteredUnread as { workspace, unreadIds }, _i (workspace.id)}
+      {#each filteredUnread as { workspace }, _i (workspace.id)}
         <WorkspaceCard
           {workspace}
           variant="compact"
           isUnread={true}
           isPinned={$pinnedIds$.includes(workspace.id)}
-          unreadAgentIds={unreadIds}
-          highlighted={keyboardNavActive && highlightedIndex === (_visibleIdIndex.get(workspace.id) ?? -1)}
+          highlighted={keyboardNavActive &&
+            highlightedIndex === (_visibleIdIndex.get(workspace.id) ?? -1)}
           suppressHover={keyboardNavActive}
           onClick={(e) => handleUnreadClick(workspace.id, e)}
           onTogglePin={(e) => handleTogglePin(e, workspace.id)}
           onMarkAsRead={(e) => handleMarkAsRead(e, workspace.id)}
           onOpenInNewWindow={() => openWorkspaceInNewWindow(workspace.id)}
-          onHover={() => { hoveredIndex = _visibleIdIndex.get(workspace.id) ?? -1; }}
+          onHover={() => {
+            hoveredIndex = _visibleIdIndex.get(workspace.id) ?? -1;
+          }}
         />
       {/each}
     {/if}
@@ -372,7 +372,7 @@
     {#if filteredRunning.length > 0}
       <div class="section-header px-3 pt-2 pb-1 flex items-center gap-1.5 min-w-0">
         <Header size={3} class="truncate">{m.layout_activeCard_running_header()}</Header>
-        <span class="text-ui text-subtle shrink-0">{runningWorkspaces.length}</span>
+        <span class="text-ui shrink-0 text-muted-foreground">{runningWorkspaces.length}</span>
       </div>
       {#each filteredRunning as { workspace, streamingIds }, _i (workspace.id)}
         <WorkspaceCard
@@ -381,12 +381,15 @@
           isRunning={true}
           isPinned={$pinnedIds$.includes(workspace.id)}
           streamingAgentIds={streamingIds}
-          highlighted={keyboardNavActive && highlightedIndex === (_visibleIdIndex.get(workspace.id) ?? -1)}
+          highlighted={keyboardNavActive &&
+            highlightedIndex === (_visibleIdIndex.get(workspace.id) ?? -1)}
           suppressHover={keyboardNavActive}
           onClick={(e) => handleClick(workspace.id, e)}
           onTogglePin={(e) => handleTogglePin(e, workspace.id)}
           onOpenInNewWindow={() => openWorkspaceInNewWindow(workspace.id)}
-          onHover={() => { hoveredIndex = _visibleIdIndex.get(workspace.id) ?? -1; }}
+          onHover={() => {
+            hoveredIndex = _visibleIdIndex.get(workspace.id) ?? -1;
+          }}
         />
       {/each}
     {/if}
@@ -395,19 +398,23 @@
     {#if filteredWaiting.length > 0}
       <div class="section-header px-3 pt-2 pb-1 flex items-center gap-1.5 min-w-0">
         <Header size={3} class="truncate">{m.layout_activeCard_waiting_header()}</Header>
-        <span class="text-ui text-subtle shrink-0">{waitingWorkspaces.length}</span>
+        <span class="text-ui shrink-0 text-muted-foreground">{waitingWorkspaces.length}</span>
       </div>
       {#each filteredWaiting as { workspace }, _i (workspace.id)}
         <WorkspaceCard
           {workspace}
           variant="compact"
+          isWaiting={true}
           isPinned={$pinnedIds$.includes(workspace.id)}
-          highlighted={keyboardNavActive && highlightedIndex === (_visibleIdIndex.get(workspace.id) ?? -1)}
+          highlighted={keyboardNavActive &&
+            highlightedIndex === (_visibleIdIndex.get(workspace.id) ?? -1)}
           suppressHover={keyboardNavActive}
           onClick={(e) => handleClick(workspace.id, e)}
           onTogglePin={(e) => handleTogglePin(e, workspace.id)}
           onOpenInNewWindow={() => openWorkspaceInNewWindow(workspace.id)}
-          onHover={() => { hoveredIndex = _visibleIdIndex.get(workspace.id) ?? -1; }}
+          onHover={() => {
+            hoveredIndex = _visibleIdIndex.get(workspace.id) ?? -1;
+          }}
         />
       {/each}
     {/if}
@@ -422,17 +429,20 @@
           {workspace}
           variant="compact"
           isPinned={true}
-          highlighted={keyboardNavActive && highlightedIndex === (_visibleIdIndex.get(workspace.id) ?? -1)}
+          highlighted={keyboardNavActive &&
+            highlightedIndex === (_visibleIdIndex.get(workspace.id) ?? -1)}
           suppressHover={keyboardNavActive}
           onClick={(e) => handleClick(workspace.id, e)}
           onTogglePin={(e) => handleTogglePin(e, workspace.id)}
           onOpenInNewWindow={() => openWorkspaceInNewWindow(workspace.id)}
-          onHover={() => { hoveredIndex = _visibleIdIndex.get(workspace.id) ?? -1; }}
+          onHover={() => {
+            hoveredIndex = _visibleIdIndex.get(workspace.id) ?? -1;
+          }}
         />
       {/each}
     {/if}
   {/if}
-</div>
+</nav>
 
 <style>
   @container (max-width: 160px) {

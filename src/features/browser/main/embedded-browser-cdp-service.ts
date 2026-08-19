@@ -8,18 +8,27 @@
  * a network port - only the main process can access the debugger.
  */
 
-import {
-  webContents,
-  ipcMain,
-} from 'electron';
+import { webContents, ipcMain } from 'electron';
 import { Logger } from '../../../shared/logger';
 import { IPC_CHANNELS } from '../../../shared/ipc-registry';
 import { sendToWorkspaceWindows } from '../../system/main/system.ipc';
 
 const logger = new Logger('EmbeddedBrowserCdp');
 
-/** How long (ms) before a tab lease is considered idle and the tab can be reused by another agent */
-const IDLE_TIMEOUT_MS = 3 * 60 * 1000; // 3 minutes
+/**
+ * Default emulated viewport for agent-owned tabs whose size is unknown
+ * (agent openTab without an explicit width, or ownership rehydrated from a
+ * persisted layout after restart) — the standard desktop viewport
+ * (monorepo#2857).
+ */
+export const DEFAULT_AGENT_VIEWPORT = { width: 1280, height: 800 } as const;
+
+/**
+ * How long (ms) to wait for a tab's webview to mount and register after an
+ * openTab/focusTab request. Registration fires on the webview's dom-ready,
+ * so slow page loads (e.g. dev servers over a tunnel) need a generous bound.
+ */
+const TAB_REGISTRATION_TIMEOUT_MS = 15_000;
 
 interface TabInfo {
   tabId: string;
@@ -33,13 +42,35 @@ interface PanelBrowserTab {
   tabId: string;
   url: string;
   title: string;
+  /** Whether the tab may be closed by the user/agent (defaults to true when absent) */
+  closable?: boolean;
+  /** Persisted owner when the tab is agent-owned (monorepo#2857); null/absent = unowned. */
+  ownerAgentId?: string | null;
 }
 
-/** Tracks which agent is actively using a browser tab */
-interface TabLease {
-  agentId: string;
-  lastUsedAt: number;
+/**
+ * Persistent ownership record for an agent-owned tab (monorepo#2857).
+ * Replaces the former time-based TabLease: ownership never expires and is
+ * never transferred — it ends only when the tab is genuinely closed (or the
+ * owning agent is deleted; lifecycle handled separately).
+ */
+interface TabOwnership {
+  ownerAgentId: string;
+  /**
+   * Original URL the agent asked to open, recorded when it differs from the
+   * final URL (tunneled opens, where the final URL embeds an ephemeral
+   * forward port). Backs the openTab requested-URL dedupe fallback
+   * (intent-hq/monorepo#2787).
+   */
+  requestedUrl?: string;
+  /** Emulated viewport size (owned tabs are always emulated, monorepo#2857). */
+  emulatedSize: { width: number; height: number };
 }
+
+/** Result of an atomic claim attempt (monorepo#2857). */
+export type ClaimTabResult =
+  | { status: 'claimed'; alreadyOwned: boolean }
+  | { status: 'already-claimed'; ownerAgentId: string };
 
 /**
  * Service for managing CDP connections to embedded browser webviews.
@@ -57,60 +88,187 @@ class EmbeddedBrowserCdpService {
   /** Set of webContentsIds that have debugger attached */
   private attachedDebuggers = new Set<number>();
 
-  /** Cache of browser tabs from panel layout (includes unmounted tabs) */
-  private panelBrowserTabs: PanelBrowserTab[] = [];
+  /**
+   * Cache of browser tabs from panel layout (includes unmounted tabs),
+   * keyed by the workspaceId the request targeted ('' for untargeted
+   * broadcasts). Per-workspace keying keeps a timed-out request from
+   * falling back to another workspace's tab list.
+   */
+  private panelBrowserTabsCache = new Map<string, PanelBrowserTab[]>();
 
   /** Pending resolvers for list-tabs requests, keyed by request ID */
-  private pendingListTabsRequests = new Map<string, (tabs: PanelBrowserTab[]) => void>();
+  private pendingListTabsRequests = new Map<
+    string,
+    {
+      workspaceId?: string;
+      resolve: (tabs: PanelBrowserTab[]) => void;
+      reject: (error: Error) => void;
+    }
+  >();
 
   /** Counter for generating unique request IDs */
   private listTabsRequestCounter = 0;
 
-  /** Tracks which agent is using which tab. Key is tabId. */
-  private tabLeases = new Map<string, TabLease>();
+  /**
+   * Persistent tab ownership registry (monorepo#2857). Key is tabId. Main is
+   * the atomic claim arbiter; the renderer persists `ownerAgentId` on the
+   * panel-layout tab, and {@link hydrateOwnershipFromPanelTabs} re-seeds this
+   * map from renderer replies after a restart.
+   */
+  private tabOwnership = new Map<string, TabOwnership>();
+
+  /** Pending resolvers waiting for a tabId to register, keyed by tabId. */
+  private registrationWaiters = new Map<string, Set<(registered: boolean) => void>>();
 
   constructor() {
     // Listen for browser tab list responses from renderer
     ipcMain.handle(
       IPC_CHANNELS.BROWSER.LIST_TABS_RESPONSE,
-      (_event, data: { tabs: PanelBrowserTab[] }) => {
-        logger.debug('Received browser tab list from renderer', { count: data.tabs.length });
-        this.panelBrowserTabs = data.tabs;
-        // Resolve ALL pending requests with the same data
-        for (const [requestId, resolver] of this.pendingListTabsRequests) {
-          resolver(data.tabs);
-          this.pendingListTabsRequests.delete(requestId);
+      (_event, data: { tabs?: PanelBrowserTab[]; requestId?: string; error?: string } | null) => {
+        if (!data || typeof data !== 'object') return;
+        logger.debug('Received browser tab list from renderer', {
+          count: data.tabs?.length,
+          requestId: data.requestId,
+          error: data.error,
+        });
+        if (typeof data.error === 'string') {
+          // Truthful error from the renderer (e.g. background layout
+          // hydration failed, monorepo#2789): reject the matching request
+          // instead of letting it time out as "renderer did not respond".
+          // The cache is left untouched. Unlike the resolve path below, an
+          // error without a requestId is deliberately dropped (no
+          // reject-all-pending semantics): one window's hydration failure
+          // must not fail other windows' healthy pending requests.
+          if (data.requestId) {
+            const pending = this.pendingListTabsRequests.get(data.requestId);
+            if (pending) {
+              this.pendingListTabsRequests.delete(data.requestId);
+              pending.reject(new Error(data.error));
+            }
+          }
+          return;
+        }
+        if (!Array.isArray(data.tabs)) return;
+        const tabs = data.tabs;
+        // Re-seed the ownership registry from the renderer's persisted
+        // layout so ownership survives an app restart (monorepo#2857).
+        this.hydrateOwnershipFromPanelTabs(tabs);
+        if (data.requestId) {
+          // Resolve only the request this reply answers, so concurrent
+          // requests for different workspaces never consume each other's
+          // tab lists.
+          const pending = this.pendingListTabsRequests.get(data.requestId);
+          if (pending) {
+            this.pendingListTabsRequests.delete(data.requestId);
+            this.panelBrowserTabsCache.set(pending.workspaceId ?? '', tabs);
+            pending.resolve(tabs);
+          }
+        } else {
+          // Reply without a requestId — resolve all pending requests
+          for (const [requestId, pending] of this.pendingListTabsRequests) {
+            this.pendingListTabsRequests.delete(requestId);
+            this.panelBrowserTabsCache.set(pending.workspaceId ?? '', tabs);
+            pending.resolve(tabs);
+          }
         }
       },
     );
   }
 
   /**
-   * Request browser tab list from renderer and wait for response
+   * Request browser tab list from renderer and wait for response.
+   *
+   * Requires a workspaceId: an untargeted request used to broadcast to ALL
+   * windows, letting a caller enumerate tabs in unrelated workspaces'
+   * windows (intent-hq/monorepo#2602).
+   *
+   * Resolves `{ tabs, stale: false }` on a fresh renderer reply. When no
+   * reply is coming (nothing received the request, or it timed out), the
+   * same-workspace cache answers with `stale: true`; with no cache entry
+   * either, this REJECTS instead of fabricating an empty list — "renderer
+   * never answered" and "zero tabs" are different answers
+   * (intent-hq/monorepo#2756 RC4).
    */
-  async requestPanelBrowserTabs(workspaceId?: string): Promise<PanelBrowserTab[]> {
+  async requestPanelBrowserTabs(
+    workspaceId?: string,
+  ): Promise<{ tabs: PanelBrowserTab[]; stale: boolean }> {
+    if (typeof workspaceId !== 'string' || workspaceId.length === 0) {
+      // i18n-ignore (agent-facing protocol error, not user-facing)
+      throw new Error('workspaceId is required to list browser tabs');
+    }
+
     // Generate unique request ID to avoid race conditions
     const requestId = `req-${++this.listTabsRequestCounter}-${Date.now()}`;
 
-    // Create promise that will be resolved when response arrives
-    const requestPromise = new Promise<PanelBrowserTab[]>((resolve) => {
-      this.pendingListTabsRequests.set(requestId, resolve);
+    // Create promise that will be resolved when response arrives (or
+    // rejected when the renderer reports a truthful error, monorepo#2789).
+    const requestPromise = new Promise<{ tabs: PanelBrowserTab[]; stale: boolean }>(
+      (resolve, reject) => {
+        this.pendingListTabsRequests.set(requestId, {
+          workspaceId,
+          resolve: (tabs) => resolve({ tabs, stale: false }),
+          reject,
+        });
+      },
+    );
+
+    // Send only to windows displaying the requested workspace. The renderer
+    // echoes requestId back so the reply resolves this request specifically,
+    // not whichever request happens to be pending.
+    const delivery = sendToWorkspaceWindows(workspaceId, IPC_CHANNELS.BROWSER.LIST_TABS_REQUEST, {
+      requestId,
+      workspaceId,
     });
+    if (!delivery.delivered) {
+      // Nothing received the request, so no reply is coming — answer from the
+      // same-workspace cache right away instead of waiting for the timeout.
+      this.pendingListTabsRequests.delete(requestId);
+      const cached = this.panelBrowserTabsCache.get(workspaceId);
+      if (!cached) {
+        throw new Error(
+          // i18n-ignore (agent-facing protocol error, not user-facing)
+          `Cannot list browser tabs: workspace ${workspaceId} is not open in any window.`,
+        );
+      }
+      logger.warn('LIST_TABS_REQUEST reached no window; using cached data', {
+        workspaceId,
+        requestId,
+      });
+      return { tabs: cached, stale: true };
+    }
+    logger.debug('Sent LIST_TABS_REQUEST', { workspaceId, requestId });
 
-    // Send to workspace windows (falls back to all windows if no workspaceId)
-    sendToWorkspaceWindows(workspaceId, IPC_CHANNELS.BROWSER.LIST_TABS_REQUEST, undefined);
-    logger.debug('Sent LIST_TABS_REQUEST', { workspaceId });
-
-    // Create per-request timeout promise
-    const timeoutPromise = new Promise<PanelBrowserTab[]>((resolve) => {
-      setTimeout(() => {
-        if (this.pendingListTabsRequests.has(requestId)) {
-          logger.warn('Browser tab list request timed out, using cached data', { requestId });
+    // Create per-request timeout promise. The fallback only consults the
+    // cache entry for the SAME workspace target, so a timed-out request
+    // never answers with another workspace's tab list; without a cache
+    // entry it rejects instead of fabricating an empty list.
+    const timeoutPromise = new Promise<{ tabs: PanelBrowserTab[]; stale: boolean }>(
+      (resolve, reject) => {
+        setTimeout(() => {
+          if (!this.pendingListTabsRequests.has(requestId)) return;
           this.pendingListTabsRequests.delete(requestId);
-          resolve(this.panelBrowserTabs);
-        }
-      }, 500);
-    });
+          const cached = this.panelBrowserTabsCache.get(workspaceId);
+          if (cached) {
+            logger.warn('Browser tab list request timed out, using cached data', {
+              requestId,
+              workspaceId,
+            });
+            resolve({ tabs: cached, stale: true });
+            return;
+          }
+          logger.warn('Browser tab list request timed out with no cached data', {
+            requestId,
+            workspaceId,
+          });
+          reject(
+            new Error(
+              // i18n-ignore (agent-facing protocol error, not user-facing)
+              `Tab list for workspace ${workspaceId} is unavailable: the renderer did not respond and no cached tab list exists.`,
+            ),
+          );
+        }, 500);
+      },
+    );
 
     // Race between response and timeout - each request gets independent timeout
     return Promise.race([requestPromise, timeoutPromise]);
@@ -123,20 +281,75 @@ class EmbeddedBrowserCdpService {
     logger.info('Registering browser tab', { tabId, webContentsId });
     this.tabRegistry.set(tabId, webContentsId);
 
-    // Automatically clean up when webContents is destroyed
+    // Resolve any callers waiting for this tab to mount (openTab/focusTab).
+    const waiters = this.registrationWaiters.get(tabId);
+    if (waiters) {
+      this.registrationWaiters.delete(tabId);
+      for (const resolve of waiters) resolve(true);
+    }
+
+    // Automatically clean up when webContents is destroyed. Only drop the
+    // registry entry if the tab still points at THIS webContents — a tab
+    // handed off between hosts (offscreen keep-alive ↔ visible panel,
+    // monorepo#2789) re-registers with a new webContentsId before the old
+    // guest's destroyed event fires, and that newer mapping must survive.
+    // Ownership is deliberately NOT cleared here: a destroyed webContents
+    // also happens on unmount (panel caching), and ownership is persistent —
+    // it ends only on a confirmed tab close (monorepo#2857).
     const wc = webContents.fromId(webContentsId);
     if (wc && !wc.isDestroyed()) {
       wc.once('destroyed', () => {
         logger.info('WebContents destroyed, cleaning up tab registry', { tabId, webContentsId });
-        this.tabRegistry.delete(tabId);
+        if (this.tabRegistry.get(tabId) === webContentsId) {
+          this.tabRegistry.delete(tabId);
+        }
         this.attachedDebuggers.delete(webContentsId);
-        this.tabLeases.delete(tabId);
       });
     }
   }
 
   /**
-   * Unregister a browser tab (called when tab is closed)
+   * Wait for a tabId to register (its webview to mount and fire dom-ready).
+   *
+   * Resolves immediately when the tab is already registered with a live
+   * webContents. Otherwise resolves `true` on the next `registerTab(tabId)`
+   * call, or `false` after `timeoutMs` — never rejects, so callers can
+   * degrade to a truthful failure message.
+   */
+  waitForTabRegistration(
+    tabId: string,
+    timeoutMs: number = TAB_REGISTRATION_TIMEOUT_MS,
+  ): Promise<boolean> {
+    if (this.resolveTabId(tabId) !== undefined) {
+      return Promise.resolve(true);
+    }
+    return new Promise<boolean>((resolve) => {
+      let waiters = this.registrationWaiters.get(tabId);
+      if (!waiters) {
+        waiters = new Set();
+        this.registrationWaiters.set(tabId, waiters);
+      }
+      const settle = (registered: boolean) => {
+        clearTimeout(timer);
+        resolve(registered);
+      };
+      const timer = setTimeout(() => {
+        const pending = this.registrationWaiters.get(tabId);
+        if (pending) {
+          pending.delete(settle);
+          if (pending.size === 0) this.registrationWaiters.delete(tabId);
+        }
+        logger.warn('Timed out waiting for browser tab registration', { tabId, timeoutMs });
+        settle(false);
+      }, timeoutMs);
+      waiters.add(settle);
+    });
+  }
+
+  /**
+   * Unregister a browser tab (called when tab is closed).
+   * Ownership is NOT cleared here — unregistration also covers unmounts;
+   * use {@link clearTabOwnership} on a genuine close (monorepo#2857).
    */
   unregisterTab(tabId: string): void {
     const webContentsId = this.tabRegistry.get(tabId);
@@ -144,7 +357,6 @@ class EmbeddedBrowserCdpService {
       logger.info('Unregistering browser tab', { tabId, webContentsId });
       this.detachDebugger(webContentsId);
       this.tabRegistry.delete(tabId);
-      this.tabLeases.delete(tabId);
     }
   }
 
@@ -198,51 +410,68 @@ class EmbeddedBrowserCdpService {
    * Get all browser tabs including unmounted ones from panel layout.
    * This is the preferred method for agents as it shows all tabs the user has open.
    *
-   * Returns tabs with:
+   * The panel layout is the single source of truth for which tabs exist —
+   * the same source closeTab() validates against — so every listed tab is a
+   * valid closeTab target. Live webviews whose tabId is not in the panel
+   * list (e.g. a tab closed in the UI whose webContents hasn't been torn
+   * down yet, or a webview belonging to another workspace's layout) are NOT
+   * listed: appending them used to resurrect UI-closed tabs as
+   * `mounted: true` entries that closeTab then rejected as not found.
+   *
+   * Returns `{ tabs, stale }`: `stale: true` means the renderer did not
+   * answer and the tabs came from the same-workspace cache. Rejects when
+   * the tab list is unavailable (no reply AND no cache) — callers must not
+   * treat that as "zero tabs" (intent-hq/monorepo#2756 RC4).
+   *
+   * Each tab carries:
    * - webContentsId: number if mounted (can run CDP commands)
    * - webContentsId: -1 if unmounted (need to focusTab first)
    */
-  async listAllTabs(workspaceId?: string): Promise<(TabInfo & { mounted: boolean })[]> {
+  async listAllTabs(workspaceId?: string): Promise<{
+    tabs: (TabInfo & {
+      mounted: boolean;
+      ownerAgentId?: string;
+      emulatedSize?: { width: number; height: number };
+    })[];
+    stale: boolean;
+  }> {
     // Get panel layout tabs (includes unmounted)
-    const panelTabs = await this.requestPanelBrowserTabs(workspaceId);
+    const { tabs: panelTabs, stale } = await this.requestPanelBrowserTabs(workspaceId);
 
     // Get mounted webviews
     const mountedTabs = this.listTabs();
 
+    const orphaned = mountedTabs.filter((t) => !panelTabs.some((p) => p.tabId === t.tabId));
+    if (orphaned.length > 0) {
+      logger.debug('Ignoring live webviews not present in panel layout', {
+        tabIds: orphaned.map((t) => t.tabId),
+        workspaceId,
+      });
+    }
 
-    // Build combined list
-    const result: (TabInfo & { mounted: boolean })[] = [];
-
-    // Add all panel tabs, marking whether they're mounted
-    for (const panelTab of panelTabs) {
+    // Panel tabs only, marking whether each is backed by a live webview.
+    // Each tab is annotated with its owner from the ownership registry
+    // (rehydrated from the panel reply above) so agents can see which tabs
+    // they may manipulate (monorepo#2857).
+    const tabs = panelTabs.map((panelTab) => {
+      const ownership = this.tabOwnership.get(panelTab.tabId);
+      const owner = ownership
+        ? { ownerAgentId: ownership.ownerAgentId, emulatedSize: ownership.emulatedSize }
+        : {};
       const mounted = mountedTabs.find((t) => t.tabId === panelTab.tabId);
       if (mounted) {
-        result.push({
-          ...mounted,
-          mounted: true,
-        });
-      } else {
-        result.push({
-          tabId: panelTab.tabId,
-          webContentsId: -1, // Not mounted
-          url: panelTab.url,
-          title: panelTab.title,
-          mounted: false,
-        });
+        return { ...mounted, mounted: true, ...owner };
       }
-    }
-
-    // Add any mounted tabs not in panel layout (shouldn't happen, but be safe)
-    for (const mounted of mountedTabs) {
-      if (!panelTabs.some((p) => p.tabId === mounted.tabId)) {
-        result.push({
-          ...mounted,
-          mounted: true,
-        });
-      }
-    }
-
-    return result;
+      return {
+        tabId: panelTab.tabId,
+        webContentsId: -1, // Not mounted
+        url: panelTab.url,
+        title: panelTab.title,
+        mounted: false,
+        ...owner,
+      };
+    });
+    return { tabs, stale };
   }
 
   /**
@@ -254,28 +483,167 @@ class EmbeddedBrowserCdpService {
   }
 
   /**
-   * Focus a browser tab (bring it to the front in the UI)
+   * Focus a browser tab (bring it to the front in the UI) and wait for its
+   * webview to actually mount and register.
    *
-   * This sends an IPC message to the renderer to activate the tab.
-   * Useful when a tab's webContents has been garbage collected and
-   * needs to be remounted.
+   * This sends an IPC message to the renderer to activate the tab, then
+   * awaits the tab's `registerTab` (fired on the webview's dom-ready) so a
+   * successful focus means the tab is genuinely addressable — remounting
+   * unmounted tabs is the whole point of focusTab() (RC3,
+   * intent-hq/monorepo#2756).
    *
    * Note: We don't validate the tabId here because the renderer's panel
-   * layout knows about all tabs (including unmounted ones). The whole point
-   * of focusTab() is to remount unmounted tabs that aren't in our registry.
+   * layout knows about all tabs (including unmounted ones), so unknown tabs
+   * simply never register and resolve false after the bounded wait.
    *
-   * @returns true if the message was sent to at least one window
+   * Requires a workspaceId: an untargeted focus used to broadcast to ALL
+   * windows, so any window whose layout knew the tabId acted on it
+   * regardless of the calling agent's workspace (intent-hq/monorepo#2602).
+   *
+   * @returns true when the tab is mounted and registered; false when the
+   *          message reached no window or the tab never mounted within the
+   *          bounded wait; throws when workspaceId is missing
    */
-  focusTab(tabId: string, workspaceId?: string): boolean {
+  async focusTab(tabId: string, workspaceId?: string, pin?: boolean): Promise<boolean> {
     if (!tabId) {
       logger.warn('Cannot focus tab - no tabId provided');
       return false;
     }
+    if (typeof workspaceId !== 'string' || workspaceId.length === 0) {
+      // i18n-ignore (agent-facing protocol error, not user-facing)
+      throw new Error('workspaceId is required to focus a browser tab');
+    }
 
-    // Send to workspace windows (falls back to all windows if no workspaceId)
-    sendToWorkspaceWindows(workspaceId, IPC_CHANNELS.BROWSER.FOCUS_TAB, { tabId });
-    logger.info('Sent focus request for browser tab', { tabId, workspaceId });
-    return true;
+    // Send only to windows displaying the requested workspace. Include
+    // workspaceId so the renderer focuses the tab in the owning workspace's
+    // panel layout, not whichever workspace is currently visible.
+    const delivery = sendToWorkspaceWindows(workspaceId, IPC_CHANNELS.BROWSER.FOCUS_TAB, {
+      tabId,
+      workspaceId,
+      ...(pin === undefined ? {} : { pin }),
+    });
+    if (!delivery.delivered) {
+      logger.warn('Focus request for browser tab reached no window', { tabId, workspaceId });
+      return false;
+    }
+    logger.info('Sent focus request for browser tab', { tabId, workspaceId, pin });
+
+    // Success means "the tab is now addressable": already-mounted tabs
+    // resolve immediately, unmounted-but-listed tabs resolve when the
+    // remounted webview registers, and nonexistent tabs time out to false.
+    return this.waitForTabRegistration(tabId);
+  }
+
+  /**
+   * Tell the renderer that main navigated an existing tab (agent `navigate`
+   * or an openTab reuse branch) so the panel layout persists the new URL and
+   * its pre-rewrite requested URL — otherwise only the webview's
+   * `did-navigate` fires and a rewritten navigation would persist just the
+   * ephemeral tunneled URL, restoring a dead port after restart
+   * (monorepo#2789). Fire-and-forget: an undelivered event only means the
+   * layout keeps the webview-reported URL, matching pre-notify behavior.
+   */
+  notifyTabNavigated(
+    tabId: string,
+    workspaceId?: string,
+    url?: string,
+    requestedUrl?: string,
+  ): void {
+    if (!tabId || typeof workspaceId !== 'string' || workspaceId.length === 0 || !url) return;
+    sendToWorkspaceWindows(workspaceId, IPC_CHANNELS.BROWSER.TAB_NAVIGATED, {
+      tabId,
+      workspaceId,
+      url,
+      ...(requestedUrl === undefined ? {} : { requestedUrl }),
+    });
+  }
+
+  /**
+   * Close a browser tab (remove it from the panel layout in the UI).
+   *
+   * Validates against the panel layout's tab list first so unknown /
+   * already-closed tabs and non-closable tabs fail with a descriptive error
+   * instead of silently no-oping, then confirms the renderer actually removed
+   * the tab before reporting success — the renderer intentionally ignores
+   * closes for tabs that vanished or became non-closable after the pre-check,
+   * and no window may receive the event at all. On success the renderer
+   * removes the tab; unmounting the webview fires the `destroyed` hook from
+   * registerTab, which cleans the registry, debugger attachment, and lease —
+   * we also clean up proactively here for the unmounted-tab case.
+   *
+   * @returns the closed tabId on success; throws on unknown or non-closable
+   *          tabs, or when the close could not be confirmed
+   */
+  async closeTab(tabId: string, workspaceId?: string): Promise<{ tabId: string }> {
+    if (typeof workspaceId !== 'string' || workspaceId.length === 0) {
+      throw new Error('workspaceId is required to close a browser tab');
+    }
+    const { tabs: panelTabs, stale } = await this.requestPanelBrowserTabs(workspaceId);
+    const tab = panelTabs.find((t) => t.tabId === tabId);
+    if (!tab) {
+      if (stale) {
+        // A stale cache that lacks the tab proves nothing about whether it
+        // is closed — only a fresh renderer reply can (monorepo#2756 RC4).
+        throw new Error(
+          // i18n-ignore (agent-facing protocol error, not user-facing)
+          `Cannot close tab ${tabId}: the tab list for workspace ${workspaceId} is unavailable (the renderer did not respond), so whether the tab exists cannot be determined.`,
+        );
+      }
+      // i18n-ignore (agent-facing protocol error, not user-facing)
+      throw new Error(`Tab ${tabId} not found. It may already be closed.`);
+    }
+    if (tab.closable === false) {
+      // i18n-ignore (agent-facing protocol error, not user-facing)
+      throw new Error(`Tab ${tabId} is not closable.`);
+    }
+
+    // Send only to windows displaying the requested workspace. Include
+    // workspaceId so the renderer closes the tab in the owning workspace's
+    // panel layout, not whichever workspace is currently visible.
+    const delivery = sendToWorkspaceWindows(workspaceId, IPC_CHANNELS.BROWSER.CLOSE_TAB, {
+      tabId,
+      workspaceId,
+    });
+    if (!delivery.delivered) {
+      throw new Error(
+        `Cannot close tab ${tabId}: workspace ${workspaceId} is not open in any window.`, // i18n-ignore (agent-facing protocol error, not user-facing)
+      );
+    }
+    logger.info('Sent close request for browser tab', { tabId, workspaceId });
+
+    // Confirm the renderer removed the tab. If no window received the event,
+    // the fresh list request times out to the (still-uncleaned) cache; if the
+    // renderer ignored the close, the tab is still in the reply — either way
+    // the tab remains listed and we fail instead of claiming success. Only a
+    // fresh (non-stale) reply without the tab counts as confirmation.
+    let confirmed = false;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const after = await this.requestPanelBrowserTabs(workspaceId);
+      if (!after.stale && !after.tabs.some((t) => t.tabId === tabId)) {
+        confirmed = true;
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    if (!confirmed) {
+      // i18n-ignore (agent-facing protocol error, not user-facing)
+      throw new Error(`Tab ${tabId} could not be closed (the UI did not confirm the close).`);
+    }
+
+    // Proactive CDP cleanup: detach debugger, drop registry entry and
+    // ownership (the close is confirmed, so the tab is genuinely gone).
+    // For mounted tabs the webContents `destroyed` hook covers the registry
+    // too, but unmounted tabs have no webContents to fire it.
+    this.unregisterTab(tabId);
+    this.clearTabOwnership(tabId);
+    for (const [key, tabs] of this.panelBrowserTabsCache) {
+      this.panelBrowserTabsCache.set(
+        key,
+        tabs.filter((t) => t.tabId !== tabId),
+      );
+    }
+
+    return { tabId };
   }
 
   /**
@@ -415,81 +783,237 @@ class EmbeddedBrowserCdpService {
   }
 
   // ============================================================
-  // TAB LEASE MANAGEMENT - Tracks which agent is using which tab
+  // TAB OWNERSHIP - Persistent agent ownership registry (monorepo#2857)
   // ============================================================
 
   /**
-   * Record that an agent is actively using a tab.
-   * Call this on every action that targets a tab to keep the lease fresh.
+   * Record that an agent owns a tab (agent openTab, or a successful claim).
+   * Ownership is persistent: it never expires and is never reassigned to a
+   * different agent through this method — callers must consult
+   * {@link getTabOwner} / {@link claimTab} first.
+   *
+   * `requestedUrl` records the agent's original requested URL (tunneled
+   * opens): a string sets it, `null` clears it (the tab was repurposed for a
+   * new non-tunneled target, so a stale identity must not linger), and
+   * omitting it preserves a previously recorded value.
+   *
+   * `size` sets the tab's emulated viewport; omitting it preserves a
+   * previously recorded size, defaulting to {@link DEFAULT_AGENT_VIEWPORT}.
    */
-  touchLease(tabId: string, agentId: string): void {
-    this.tabLeases.set(tabId, { agentId, lastUsedAt: Date.now() });
+  setTabOwner(
+    tabId: string,
+    ownerAgentId: string,
+    requestedUrl?: string | null,
+    size?: { width: number; height: number },
+  ): void {
+    const previous = this.tabOwnership.get(tabId);
+    const recorded =
+      requestedUrl === null ? undefined : (requestedUrl ?? previous?.requestedUrl);
+    this.tabOwnership.set(tabId, {
+      ownerAgentId,
+      ...(recorded !== undefined ? { requestedUrl: recorded } : {}),
+      emulatedSize: size ?? previous?.emulatedSize ?? { ...DEFAULT_AGENT_VIEWPORT },
+    });
   }
 
   /**
-   * Release a tab lease (e.g., when an agent is done with a tab).
+   * The agent owning a tab, or undefined when the tab is unowned/unknown.
    */
-  releaseLease(tabId: string): void {
-    this.tabLeases.delete(tabId);
+  getTabOwner(tabId: string): string | undefined {
+    return this.tabOwnership.get(tabId)?.ownerAgentId;
+  }
+
+  /** A tab's emulated viewport size, when it is agent-owned. */
+  getTabEmulatedSize(tabId: string): { width: number; height: number } | undefined {
+    return this.tabOwnership.get(tabId)?.emulatedSize;
   }
 
   /**
-   * Check if a tab is currently leased by an active agent.
-   * A lease is considered active if it was touched within IDLE_TIMEOUT_MS.
+   * Drop a tab's ownership record. Only for genuinely closed/destroyed tabs
+   * (confirmed closeTab, agent deletion) — there is no release-to-unowned
+   * path (monorepo#2857).
    */
-  private isTabLeased(tabId: string): boolean {
-    const lease = this.tabLeases.get(tabId);
-    if (!lease) return false;
-    return Date.now() - lease.lastUsedAt < IDLE_TIMEOUT_MS;
+  clearTabOwnership(tabId: string): void {
+    this.tabOwnership.delete(tabId);
   }
 
   /**
-   * Find a mounted browser tab that is idle (not actively leased by any agent)
-   * and atomically claim it for the requesting agent.
+   * Atomically claim an unowned tab for an agent (monorepo#2857).
    *
-   * Returns the tabId if found, undefined otherwise.
+   * First claim wins: main's single-threaded event loop makes the
+   * check-and-set below atomic — two concurrent claimants can never both
+   * succeed. There is no stealing: a tab owned by another agent returns
+   * `already-claimed` naming the owner; the current owner re-claiming its
+   * own tab is an idempotent success (`alreadyOwned: true`, size updated).
    *
-   * The lease is touched immediately so that concurrent callers won't
-   * get the same tab (avoids race conditions across async boundaries).
-   *
-   * Only considers tabs that have a previous lease entry (i.e., were previously
-   * used by an agent). Tabs opened manually by the user are never reused.
-   *
-   * Prefers tabs previously used by the requesting agent, then falls back to
-   * any other agent's expired-lease tab.
+   * The caller (executor) validates the required `width` and verifies the
+   * tab exists in the workspace's panel layout BEFORE calling this — the
+   * check-and-set itself must stay synchronous so no await can interleave
+   * a competing claim between check and set.
    */
-  findIdleTab(requestingAgentId: string): string | undefined {
-    const mountedTabs = this.listTabs();
-    if (mountedTabs.length === 0) return undefined;
-
-    // First pass: find a tab previously used by this agent (expired lease = idle)
-    for (const tab of mountedTabs) {
-      const lease = this.tabLeases.get(tab.tabId);
-      if (lease && lease.agentId === requestingAgentId && !this.isTabLeased(tab.tabId)) {
-        logger.info('Claiming idle tab previously used by requesting agent', {
-          tabId: tab.tabId,
-          agentId: requestingAgentId,
-        });
-        this.touchLease(tab.tabId, requestingAgentId);
-        return tab.tabId;
+  claimTab(
+    tabId: string,
+    agentId: string,
+    size: { width: number; height: number },
+  ): ClaimTabResult {
+    const existing = this.tabOwnership.get(tabId);
+    if (existing) {
+      if (existing.ownerAgentId === agentId) {
+        this.setTabOwner(tabId, agentId, undefined, size);
+        return { status: 'claimed', alreadyOwned: true };
       }
+      return { status: 'already-claimed', ownerAgentId: existing.ownerAgentId };
     }
+    this.setTabOwner(tabId, agentId, undefined, size);
+    logger.info('Tab claimed by agent', { tabId, agentId, ...size });
+    return { status: 'claimed', alreadyOwned: false };
+  }
 
-    // Second pass: find any agent-opened tab with an expired lease.
-    // Tabs without a lease entry (user-opened) are never reused.
-    for (const tab of mountedTabs) {
-      const lease = this.tabLeases.get(tab.tabId);
-      if (lease && !this.isTabLeased(tab.tabId)) {
-        logger.info('Claiming idle tab for reuse (previously used by another agent)', {
-          tabId: tab.tabId,
-          previousAgentId: lease.agentId,
-          requestingAgentId,
-        });
-        this.touchLease(tab.tabId, requestingAgentId);
-        return tab.tabId;
-      }
+  /**
+   * Re-seed the ownership registry from a renderer tab-list reply so
+   * persisted ownership survives an app restart (monorepo#2857). Existing
+   * in-memory records win (they may carry a requestedUrl / size the layout
+   * does not); rehydrated records get the default viewport until resized.
+   */
+  private hydrateOwnershipFromPanelTabs(tabs: PanelBrowserTab[]): void {
+    for (const tab of tabs) {
+      if (typeof tab.ownerAgentId !== 'string' || tab.ownerAgentId.length === 0) continue;
+      if (this.tabOwnership.has(tab.tabId)) continue;
+      this.tabOwnership.set(tab.tabId, {
+        ownerAgentId: tab.ownerAgentId,
+        emulatedSize: { ...DEFAULT_AGENT_VIEWPORT },
+      });
+      logger.info('Rehydrated tab ownership from panel layout', {
+        tabId: tab.tabId,
+        ownerAgentId: tab.ownerAgentId,
+      });
     }
+  }
 
+  /**
+   * Resolve a tab's owner, hydrating from the renderer's panel layout when
+   * the tab is unknown to the in-memory registry (e.g. an enforcement check
+   * right after a restart, before any tab list crossed the IPC boundary).
+   * Best-effort: an unavailable tab list resolves to the in-memory answer.
+   */
+  async resolveTabOwner(tabId: string, workspaceId?: string): Promise<string | undefined> {
+    const known = this.tabOwnership.get(tabId);
+    if (known) return known.ownerAgentId;
+    try {
+      // listAllTabs → requestPanelBrowserTabs → LIST_TABS_RESPONSE hydrates
+      // the ownership registry as a side effect.
+      await this.listAllTabs(workspaceId);
+    } catch {
+      // Tab list unavailable — answer from what we know.
+    }
+    return this.tabOwnership.get(tabId)?.ownerAgentId;
+  }
+
+  /**
+   * Notify the renderer that a tab's owner changed (successful claim) so the
+   * panel layout persists `ownerAgentId` with the tab (monorepo#2857).
+   * Fire-and-forget, mirroring notifyTabNavigated.
+   */
+  notifyTabOwnerChanged(tabId: string, workspaceId: string | undefined, ownerAgentId: string): void {
+    if (!tabId || typeof workspaceId !== 'string' || workspaceId.length === 0) return;
+    sendToWorkspaceWindows(workspaceId, IPC_CHANNELS.BROWSER.TAB_OWNER_CHANGED, {
+      tabId,
+      workspaceId,
+      ownerAgentId,
+    });
+  }
+
+  /**
+   * Find a mounted tab OWNED BY THE REQUESTING AGENT whose current URL
+   * exactly matches the requested URL.
+   *
+   * Used by openTab dedupe (intent-hq/monorepo#2541): opening a URL the
+   * agent already has open focuses the existing tab instead of creating a
+   * duplicate. Dedupe is strictly per-agent (monorepo#2857): another
+   * agent's matching tab is never reused — across agents a new tab is
+   * opened — and user-opened (unowned) tabs are never returned, so an
+   * agent can never hijack a user tab.
+   *
+   * Candidates are restricted to tabs present in the requesting workspace's
+   * panel layout (the same source of truth listAllTabs/closeTab use), so a
+   * matching tab in another workspace is never reused or focused. Matching
+   * is exact string equality on the live webview URL — no normalization.
+   */
+  async findModelTabByExactUrl(
+    url: string,
+    requestingAgentId: string,
+    workspaceId?: string,
+  ): Promise<string | undefined> {
+    // Dedupe is best-effort: an unavailable tab list just means no reusable
+    // tab was found — it must not fail the enclosing openTab.
+    let tabs: (TabInfo & { mounted: boolean })[];
+    try {
+      ({ tabs } = await this.listAllTabs(workspaceId));
+    } catch (error) {
+      logger.debug('Tab list unavailable during openTab dedupe; skipping reuse', {
+        workspaceId,
+        error: (error as Error).message,
+      });
+      return undefined;
+    }
+    for (const tab of tabs) {
+      if (!tab.mounted || tab.url !== url) continue;
+      const ownership = this.tabOwnership.get(tab.tabId);
+      if (ownership?.ownerAgentId !== requestingAgentId) continue;
+      logger.info('Found own tab with exact URL match', {
+        tabId: tab.tabId,
+        url,
+        requestingAgentId,
+        workspaceId,
+      });
+      return tab.tabId;
+    }
+    return undefined;
+  }
+
+  /**
+   * Find a mounted tab OWNED BY THE REQUESTING AGENT whose ownership record
+   * carries the given requested URL.
+   *
+   * Fallback for openTab dedupe on tunneled opens (intent-hq/monorepo#2787):
+   * when the tunnel forward was re-minted, the final URL differs per call and
+   * {@link findModelTabByExactUrl} can never match — but the agent's original
+   * requested URL is stable, so the recorded requestedUrl identifies the
+   * logical duplicate. Same safety rules as the exact-URL variant: candidates
+   * come from the requesting workspace's panel layout only, and dedupe is
+   * strictly per-agent — unowned and other agents' tabs are never returned
+   * (monorepo#2857).
+   */
+  async findModelTabByRequestedUrl(
+    requestedUrl: string,
+    requestingAgentId: string,
+    workspaceId?: string,
+  ): Promise<string | undefined> {
+    // Dedupe is best-effort: an unavailable tab list just means no reusable
+    // tab was found — it must not fail the enclosing openTab.
+    let tabs: (TabInfo & { mounted: boolean })[];
+    try {
+      ({ tabs } = await this.listAllTabs(workspaceId));
+    } catch (error) {
+      logger.debug('Tab list unavailable during requestedUrl dedupe; skipping reuse', {
+        workspaceId,
+        error: (error as Error).message,
+      });
+      return undefined;
+    }
+    for (const tab of tabs) {
+      if (!tab.mounted) continue;
+      const ownership = this.tabOwnership.get(tab.tabId);
+      if (ownership?.ownerAgentId !== requestingAgentId) continue;
+      if (ownership.requestedUrl !== requestedUrl) continue;
+      logger.info('Found own tab with matching requested URL', {
+        tabId: tab.tabId,
+        requestedUrl,
+        requestingAgentId,
+        workspaceId,
+      });
+      return tab.tabId;
+    }
     return undefined;
   }
 
@@ -581,7 +1105,7 @@ class EmbeddedBrowserCdpService {
     if (webContentsId === undefined) {
       throw new Error(
         tabId
-          ? `Tab ${tabId} not found. The tab may have been garbage collected. Try { action: "focusTab", tabId: "${tabId}" } to remount it.` // i18n-ignore (agent-facing protocol error, not user-facing)
+          ? `Tab ${tabId} is not mounted. If it exists (check { action: "listTabs" }), { action: "focusTab", tabId: "${tabId}" } will remount it; if focusTab also fails, no tab with this id exists.` // i18n-ignore (agent-facing protocol error, not user-facing)
           : 'No browser tabs available. Open a browser tab in the app first.', // i18n-ignore (agent-facing protocol error, not user-facing)
       );
     }
@@ -659,7 +1183,7 @@ class EmbeddedBrowserCdpService {
     if (webContentsId === undefined) {
       throw new Error(
         tabId
-          ? `Tab ${tabId} not found. The tab may have been garbage collected. Try { action: "focusTab", tabId: "${tabId}" } to remount it.` // i18n-ignore (agent-facing protocol error, not user-facing)
+          ? `Tab ${tabId} is not mounted. If it exists (check { action: "listTabs" }), { action: "focusTab", tabId: "${tabId}" } will remount it; if focusTab also fails, no tab with this id exists.` // i18n-ignore (agent-facing protocol error, not user-facing)
           : 'No browser tabs available. Open a browser tab in the app first.', // i18n-ignore (agent-facing protocol error, not user-facing)
       );
     }
@@ -722,7 +1246,7 @@ class EmbeddedBrowserCdpService {
     if (webContentsId === undefined) {
       throw new Error(
         tabId
-          ? `Tab ${tabId} not found. The tab may have been garbage collected. Try { action: "focusTab", tabId: "${tabId}" } to remount it.` // i18n-ignore (agent-facing protocol error, not user-facing)
+          ? `Tab ${tabId} is not mounted. If it exists (check { action: "listTabs" }), { action: "focusTab", tabId: "${tabId}" } will remount it; if focusTab also fails, no tab with this id exists.` // i18n-ignore (agent-facing protocol error, not user-facing)
           : 'No browser tabs available. Open a browser tab in the app first.', // i18n-ignore (agent-facing protocol error, not user-facing)
       );
     }

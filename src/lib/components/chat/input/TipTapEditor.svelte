@@ -1,36 +1,25 @@
 <script lang="ts">
-/* eslint-disable max-lines */
-  import {
-  onMount,
-  onDestroy,
-  mount,
-  unmount,
-} from 'svelte';
+  /* eslint-disable max-lines */
+  import { onMount, onDestroy, mount, unmount } from 'svelte';
 
   import { Editor } from '@tiptap/core';
-  import {
-  PluginKey,
-  TextSelection,
-} from '@tiptap/pm/state';
+  import { PluginKey, TextSelection } from '@tiptap/pm/state';
   import StarterKit from '@tiptap/starter-kit';
   import Placeholder from '@tiptap/extension-placeholder';
   import Mention from '@tiptap/extension-mention';
   import Image from '@tiptap/extension-image';
   import {
-  ContextMention,
-  type ContextMentionAttributes,
-} from '$lib/components/tiptap/ContextMention';
+    ContextMention,
+    type ContextMentionAttributes,
+  } from '$lib/components/tiptap/ContextMention';
   import { PasteChip } from '$lib/components/tiptap/PasteChip';
   import { createLogger } from '$lib/utils/client-logger';
   import { m } from '$shared/paraglide/messages.js';
   import type { ContextItem } from './context-api';
-  import { isFileDragEvent } from './drop-guard';
+  import { isFileDragEvent } from '$lib/utils/drop-guard';
   import MentionHoverPreview from './MentionHoverPreview.svelte';
   import { createMentionSuggestionRenderer } from './mention-suggestion-renderer';
-  import {
-  getMentionSystem,
-  type SearchContext,
-} from '$lib/services/mentions';
+  import { getMentionSystem, type SearchContext } from '$lib/services/mentions';
   import type { Workspace } from '$shared/types';
   import { toPromptToken } from '$lib/services/mentions/format';
   import { noteUrl } from '$shared/constants/intent-links';
@@ -41,6 +30,11 @@
     serializeEditorText,
     pastedTextToParagraphNodes,
   } from './editor-text-serialization';
+  import {
+    TrailingHintExtension,
+    trailingHintPluginKey,
+    type TrailingHint,
+  } from './trailing-hint-extension';
 
   /** Represents an inline image in the editor content */
   export interface InlineImage {
@@ -127,6 +121,11 @@
     class?: string;
     disabled?: boolean;
     editableWhileDisabled?: boolean;
+    /**
+     * Transient lock (e.g. an in-flight draft restore): rejects focus/typing
+     * without the `disabled` styling path, so the placeholder stays visible.
+     */
+    inputLocked?: boolean;
     workspace?: Workspace;
     repoPath?: string;
     editorClassName?: string;
@@ -141,6 +140,7 @@
     onMentionSelect?: (item: any) => void;
     onSelectionChange?: (selectedText: string | null) => void;
     contextItems?: ContextItem[];
+    trailingHint?: TrailingHint | null;
     minHeight?: number;
     maxHeight?: number;
   }
@@ -150,6 +150,7 @@
     placeholder = m.chat_richInput_askAnything_placeholder(),
     disabled = false,
     editableWhileDisabled = false,
+    inputLocked = false,
     class: className = '',
     editorClassName = '',
     workspace,
@@ -166,9 +167,18 @@
     onSelectionChange,
 
     contextItems: _contextItems = [],
+    trailingHint = null,
     minHeight = 80,
     maxHeight = 300,
   }: Props = $props();
+
+  // `inputLocked` is an editability-only lock — it never routes through the
+  // `disabled` styling, so the placeholder keeps rendering while it is on.
+  const isEditable = $derived((!disabled || editableWhileDisabled) && !inputLocked);
+  // Placeholder is configured with `showOnlyWhenEditable: false` for the lock,
+  // which would otherwise also surface it in the plain-disabled state. The
+  // extension options are fixed at editor creation, so suppression is CSS-side.
+  const placeholderSuppressed = $derived(!isEditable && !inputLocked);
 
   let element: HTMLDivElement;
   let editor: Editor | null = $state(null);
@@ -194,6 +204,7 @@
 
   // Export focus method for parent components
   export function focus(): boolean {
+    if (inputLocked) return false;
     if (editor && editor.view) {
       try {
         editor.chain().focus().run();
@@ -211,6 +222,7 @@
 
   // Focus at the end of the content
   export function focusEnd(): boolean {
+    if (inputLocked) return false;
     if (editor && editor.view) {
       try {
         editor.chain().focus('end').run();
@@ -224,6 +236,7 @@
 
   // Focus and select all content
   export function focusAndSelectAll(): boolean {
+    if (inputLocked) return false;
     if (editor && editor.view) {
       try {
         editor.chain().focus().selectAll().run();
@@ -254,7 +267,9 @@
   }
 
   /**
-   * Set the editor content programmatically
+   * Set the editor content programmatically without changing DOM focus.
+   * Callers that represent an explicit user focus action must call focus()
+   * separately after updating the content.
    * @param text - The text content to set
    */
   export async function setContent(text: string) {
@@ -267,7 +282,6 @@
         return true;
       })
       .setContent(html)
-      .focus('end')
       .run();
   }
 
@@ -607,6 +621,9 @@
           Placeholder.configure({
             placeholder,
             emptyEditorClass: 'is-editor-empty text-subtle',
+            // `inputLocked` turns editability off; the placeholder must survive
+            // it, otherwise a gated draft restore blanks the composer.
+            showOnlyWhenEditable: false,
           }),
           Image.configure({
             inline: false,
@@ -678,9 +695,10 @@
           }),
           // Paste chip for multi-line pasted text (5+ lines)
           PasteChip,
+          TrailingHintExtension,
         ],
         content: initialHTML,
-        editable: !disabled || editableWhileDisabled,
+        editable: isEditable,
         // Disable the buggy 'delete' core extension that emits delete events.
         // It has a bug where it calls nodeAt(newStart - 1) without checking if newStart is 0,
         // causing "Position -1 outside of fragment" errors.
@@ -715,6 +733,7 @@
         editorProps: {
           attributes: {
             class: `tiptap-editor ${editorClassName}`,
+            autocomplete: 'off',
             spellcheck: 'false',
             autocorrect: 'off',
             autocapitalize: 'off',
@@ -736,8 +755,8 @@
               }
               if (/\r|\n/.test(text)) {
                 // Multi-line paste below the chip threshold: insert following the
-                // WYSIWYG convention (single \n → hardBreak, blank line → new
-                // paragraph) instead of ProseMirror's default one-<p>-per-line,
+                // WYSIWYG convention (every \n → one hardBreak, no paragraph
+                // splitting) instead of ProseMirror's default one-<p>-per-line,
                 // which would serialize each single break as \n\n (#1151)
                 const { state, dispatch } = view;
                 const paragraphs = pastedTextToParagraphNodes(state.schema, text);
@@ -767,8 +786,7 @@
             }
 
             const isMac =
-              typeof navigator !== 'undefined' &&
-              navigator.platform.toUpperCase().includes('MAC');
+              typeof navigator !== 'undefined' && navigator.platform.toUpperCase().includes('MAC');
 
             // Emacs-style shortcuts (Ctrl+key on macOS)
             // Only intercept if Ctrl is pressed without Meta (Cmd), and only on macOS.
@@ -1294,6 +1312,15 @@
       return;
     }
 
+    // Local editor transactions are authoritative while the user is typing.
+    // Under main-thread pressure, an older controlled-value echo can arrive
+    // after a newer transaction and must not replace it. Intentional focused
+    // updates use the exported setContent/clear/history commands instead.
+    if (editor.view.hasFocus()) {
+      valueUpdateRequestId += 1;
+      return;
+    }
+
     const hadFocus = editor.view.hasFocus();
     const { from } = editor.state.selection;
 
@@ -1335,14 +1362,20 @@
   // Update editable state
   $effect(() => {
     if (editor) {
-      editor.setEditable(!disabled || editableWhileDisabled);
+      editor.setEditable(isEditable);
     }
+  });
+
+  $effect(() => {
+    if (!editor || editor.isDestroyed) return;
+    editor.view.dispatch(editor.state.tr.setMeta(trailingHintPluginKey, trailingHint));
   });
 </script>
 
 <div
   bind:this={element}
   class="tiptap-container {className}"
+  class:placeholder-suppressed={placeholderSuppressed}
   style={`--tt-min-height:${minHeight}px;--tt-max-height:${maxHeight}px`}
 ></div>
 
@@ -1362,8 +1395,11 @@
     height: 100%;
     padding: 0.5rem 1rem 1rem;
     outline: none;
-    font-size: 1rem;
-    line-height: 1.5;
+    font-family: var(--font-ui);
+    font-size: var(--text-body-size);
+    line-height: var(--text-body-line-height);
+    font-weight: var(--text-body-weight);
+    letter-spacing: var(--text-body-tracking);
     overflow-wrap: break-word;
     word-wrap: break-word;
     word-break: break-word;
@@ -1380,8 +1416,133 @@
     color: var(--color-muted-foreground);
     opacity: 0.7;
     pointer-events: none;
+    opacity: 0.85;
     float: left;
     height: 0;
+  }
+
+  .tiptap-container :global(.prompt-trailing-hint) {
+    display: inline-flex;
+    position: relative;
+    z-index: 2;
+    align-items: baseline;
+    gap: 0.25rem;
+    margin-inline-start: 0.5rem;
+    border: 0;
+    background: transparent;
+    padding: 0;
+    color: var(--color-muted-foreground);
+    font: inherit;
+    opacity: 0.4;
+    user-select: none;
+    -webkit-user-select: none;
+    white-space: nowrap;
+    vertical-align: baseline;
+    transition: opacity var(--motion-fast);
+  }
+
+  .tiptap-container :global(.prompt-trailing-hint[data-state='ready']) {
+    cursor: pointer;
+  }
+
+  .tiptap-container :global(.prompt-trailing-hint:hover) {
+    opacity: 0.7;
+  }
+
+  .tiptap-container :global(.prompt-trailing-hint kbd) {
+    font: inherit;
+    opacity: 0.75;
+  }
+
+  .tiptap-container :global(.prompt-trailing-hint-action) {
+    display: inline-flex;
+    width: 1em;
+    height: 1em;
+    cursor: pointer;
+    align-items: center;
+    justify-content: center;
+    border: 0;
+    background: transparent;
+    padding: 0;
+    color: inherit;
+  }
+
+  .tiptap-container :global(.prompt-trailing-hint-action svg) {
+    width: 0.75em;
+    height: 0.75em;
+    fill: currentColor;
+  }
+
+  :global(.prompt-trailing-hint-tooltip) {
+    position: fixed;
+    z-index: var(--layer-tooltip);
+    max-width: 20rem;
+    pointer-events: none;
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-medium);
+    padding: var(--space-1) var(--space-2);
+    background: var(--color-popover);
+    color: var(--color-popover-foreground);
+    box-shadow: var(--elevation-overlay);
+    font-family: var(--font-ui);
+    font-size: var(--text-caption-size);
+    line-height: var(--text-caption-line-height);
+    white-space: nowrap;
+    animation: prompt-trailing-tooltip-in var(--motion-fast) var(--ease-emphasized-out);
+  }
+
+  :global(.prompt-trailing-hint-tooltip[data-side='top']) {
+    transform: translate(-50%, -100%);
+  }
+
+  :global(.prompt-trailing-hint-tooltip[data-side='bottom']) {
+    transform: translateX(-50%);
+  }
+
+  .tiptap-container :global(.prompt-trailing-hint[data-state='enhanced']) {
+    animation: prompt-enhanced 260ms ease-out both;
+  }
+
+  @keyframes prompt-enhanced {
+    0% {
+      opacity: 0.15;
+      transform: translateY(2px) scale(0.98);
+    }
+    55% {
+      opacity: 0.75;
+      transform: translateY(0) scale(1.03);
+    }
+    100% {
+      opacity: 0.4;
+      transform: translateY(0) scale(1);
+    }
+  }
+
+  @keyframes -global-prompt-trailing-tooltip-in {
+    from {
+      opacity: 0;
+    }
+    to {
+      opacity: 1;
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .tiptap-container :global(.prompt-trailing-hint[data-state='enhanced']) {
+      animation: none;
+    }
+
+    :global(.prompt-trailing-hint-tooltip) {
+      animation: none;
+    }
+  }
+
+  /* `showOnlyWhenEditable: false` keeps the placeholder alive for `inputLocked`;
+     the plain-disabled state must stay placeholder-free as before. */
+  .tiptap-container.placeholder-suppressed
+    :global(.tiptap-editor p.is-editor-empty:first-child::before),
+  .tiptap-container.placeholder-suppressed :global(.tiptap-editor p.is-empty:first-child::before) {
+    content: none;
   }
 
   /* Mention chip styles are defined in tiptap-editor.css */

@@ -1,93 +1,94 @@
 <script lang="ts">
-/* eslint-disable max-lines */
+  /* eslint-disable max-lines */
+  import { untrack, onMount, onDestroy } from 'svelte';
   import {
-  untrack,
-  onMount,
-  onDestroy,
-} from 'svelte';
-  import {
-  type InitialRepoInfo,
-  getLastSelectedRepoHydrationAction,
-  getInitialRepoKey,
-  mapInitialRepoToFormState,
-} from './initializer/initial-repo-utils';
+    type InitialRepoInfo,
+    getLastSelectedRepoHydrationAction,
+    getInitialRepoKey,
+    mapInitialRepoToFormState,
+    mapRecentRepoToSelection,
+  } from './initializer/initial-repo-utils';
   import { goto } from '$app/navigation';
-  import {
-  SETUP_SCRIPT_TEMPLATES,
-  getTemplateContent,
-  chooseDefaultSetupScript,
-  createRepoConfigProbeScheduler,
-  REPO_CONFIG_SCRIPT_NAME,
-} from '$features/setup-scripts';
   import { v4 as uuidv4 } from 'uuid';
-  import { saveScript } from '$store/renderer/slices/setup-scripts/setup-scripts-slice';
-  import { selectLastUsedScriptForRepo } from '$store/renderer/slices/setup-scripts/setup-scripts-selectors';
   import {
-  setCompactWorkspaceInitializerFormState,
-  clearWorkspaceInitializerPendingGitHubPrefill,
-  setWorkspaceInitializerBranchForRepo,
-  setWorkspaceInitializerLastSubmittedAgent,
-} from '$store/renderer/slices/workspace-initializer/workspace-initializer-slice';
+    SETUP_SCRIPT_TEMPLATES,
+    getTemplateContent,
+    chooseDefaultSetupScript,
+    createRepoConfigProbeScheduler,
+    resolveSetupScriptParam,
+    REPO_CONFIG_SCRIPT_NAME,
+  } from '$features/setup-scripts';
   import {
-  selectCompactWorkspaceInitializerFormState,
-  selectWorkspaceInitializerDefaultParentPath,
-  selectWorkspaceInitializerHydrated,
-  selectWorkspaceInitializerLastSelectedRepo,
-  selectWorkspaceInitializerLastSubmittedAgent,
-  selectWorkspaceInitializerPendingGitHubPrefill,
-  selectWorkspaceInitializerRecentRepos,
-} from '$store/renderer/slices/workspace-initializer/workspace-initializer-selectors';
+    getLastUsedSetupScript,
+    recordLastUsedSetupScript,
+  } from '$features/setup-scripts/last-used';
+  import {
+    setCompactWorkspaceInitializerFormState,
+    clearWorkspaceInitializerPendingGitHubPrefill,
+    setWorkspaceInitializerBranchForRepo,
+    setWorkspaceInitializerLastSubmittedAgent,
+  } from '$store/renderer/slices/workspace-initializer/workspace-initializer-slice';
+  import {
+    beginWorkspaceCreateProgress,
+    clearWorkspaceCreateProgress,
+  } from '$store/renderer/slices/workspace-create-progress/workspace-create-progress-slice';
+  import {
+    selectCompactWorkspaceInitializerFormState,
+    selectWorkspaceInitializerHydrated,
+    selectWorkspaceInitializerLastSelectedRepo,
+    selectWorkspaceInitializerLastSubmittedAgent,
+    selectWorkspaceInitializerPendingGitHubPrefill,
+    selectWorkspaceInitializerRecentRepos,
+  } from '$store/renderer/slices/workspace-initializer/workspace-initializer-selectors';
   import type {
     CompactWorkspaceInitializerFormState,
     WorkspaceInitializerRepoSelection,
   } from '$store/renderer/slices/workspace-initializer/workspace-initializer-types';
   import {
-  hydrateWorkspaceNavigation,
-  type WorkspaceNavigationWorkspaceState,
-} from '$store/renderer/slices/workspace-navigation/workspace-navigation-slice';
+    hydrateWorkspaceNavigation,
+    type WorkspaceNavigationWorkspaceState,
+  } from '$store/renderer/slices/workspace-navigation/workspace-navigation-slice';
   import { workspaceClient } from '$store/renderer/slices/workspace/utils/workspace.client';
   import RichTextarea from '$lib/components/ui/RichTextarea.svelte';
   import { debugConfig } from '$lib/config/debug';
   import type { StarterPrompt } from '$lib/data/starter-prompts';
   import { setInitialAgentId } from '$store/renderer/slices/workspace-agents/workspace-agents-slice';
-  import {
-  setWorkspaceEntity,
-  updateWorkspaceEntity,
-} from '$store/renderer/slices/workspace/workspace-slice';
-
+  import { setWorkspaceEntity } from '$store/renderer/slices/workspace/workspace-slice';
+  import { openWorkspaceTab } from '$store/renderer/slices/tab-state/tab-state-slice';
+  import { bootstrapNewWorkspaceLayout } from '$store/renderer/slices/panel-layout/panel-layout-slice';
 
   import {
-  selectSpecialists,
-  selectEffectiveBehaviorPrompt,
-} from '$store/renderer/slices/specialists/specialists-selectors';
+    selectSpecialists,
+    selectEffectiveBehaviorPrompt,
+  } from '$store/renderer/slices/specialists/specialists-selectors';
   import { createLogger } from '$lib/utils/client-logger';
   import {
-  getGitErrorMessage,
-  parseGitHubUrl,
-  validateBranchName,
-  validateInitialPrompt,
-  validateRepoPath,
-} from '$lib/utils/workspace-validation';
+    getGitErrorMessage,
+    parseGitHubUrl,
+    validateBranchName,
+    validateInitialPrompt,
+    validateRepoPath,
+  } from '$lib/utils/workspace-validation';
   import { createAgentTypeId } from '$shared/types/agent.types';
   import {
-  faMagicWandSparkles,
-  faMicrophone,
-  faPaperclip,
-  faSpinner,
-  faStop,
-  faExclamationTriangle,
-  faCodeBranch,
-} from '@fortawesome/free-solid-svg-icons';
+    faMagicWandSparkles,
+    faMicrophone,
+    faPaperclip,
+    faSpinner,
+    faStop,
+    faExclamationTriangle,
+    faCodeBranch,
+  } from '@fortawesome/free-solid-svg-icons';
   import {
-  selectPttRecording,
-  selectVoiceTranscribing,
-} from '$store/renderer/slices/hardware-console/hardware-console-selectors';
+    selectPttRecording,
+    selectVoiceTranscribing,
+  } from '$store/renderer/slices/hardware-console/hardware-console-selectors';
   import { selectEffectiveVoiceEngine } from '$store/renderer/slices/voice-settings/voice-settings-selectors';
   import {
-  cancelPromptMicRecording,
-  isPromptMicRecording,
-  togglePromptMicRecording,
-} from '$features/hardware-console/voice/prompt-mic-controller';
+    cancelPromptMicRecording,
+    isPromptMicRecording,
+    togglePromptMicRecording,
+  } from '$features/hardware-console/voice/prompt-mic-controller';
   import { cancelActiveTranscription } from '$features/hardware-console/voice/transcription-cancellation';
   import type { PttContext } from '$features/hardware-console/voice/ptt-controller';
   import { showVoiceSetupToast } from '$features/hardware-console/voice/voice-setup-toast';
@@ -103,13 +104,9 @@
   import PullConflictDialog, { type PullErrorType } from '../modals/PullConflictDialog.svelte';
 
   import { toast } from 'svelte-sonner';
-  import {
-  fade,
-  slide,
-} from 'svelte/transition';
+  import { fade, slide } from 'svelte/transition';
   import Button from '../ui/button/button.svelte';
-  import { Checkbox } from '../ui/checkbox';
-  import Tooltip from '../ui/tooltip/Tooltip.svelte';
+  import CreateButtonProgress from './initializer/CreateButtonProgress.svelte';
   import InitialAgentPicker from './initializer/InitialAgentPicker.svelte';
   import IssueSuggestions, {
     preloadIssues,
@@ -126,18 +123,25 @@
   import { resolveSubmitProvider } from '$lib/utils/effective-model-resolution';
   import { store as appStore } from '$store/renderer/store';
   import { m } from '$shared/paraglide/messages.js';
-  import type { ContextItem } from '$lib/components/chat/input/context-api';
+  import { hasBlockingAttachments, type ContextItem } from '$lib/components/chat/input/context-api';
+  import {
+    hasStagedFileItems,
+    redeemStagedAttachments,
+    sendHeldFirstMessage,
+    type HeldFirstMessage,
+  } from './initializer/staged-attachments';
   import AttachmentPreview from '$lib/components/chat/AttachmentPreview.svelte';
   import {
-  clearNewWorkspaceDraft,
-  createNewWorkspaceDraftSaver,
-  restoreNewWorkspaceDraft,
-} from './initializer/new-workspace-draft';
+    clearNewWorkspaceDraft,
+    createNewWorkspaceDraftSaver,
+    restoreNewWorkspaceDraft,
+  } from './initializer/new-workspace-draft';
   import { resolveGitHubPrefillSelection } from './initializer/github-prefill';
+  import { createRepoCacheWarmer } from './initializer/warm-repo-cache';
   import {
-  matchGitHubPrefillRepo,
-  type GitHubPrefillRepoCandidate,
-} from './initializer/github-prefill-repo-match';
+    matchGitHubPrefillRepo,
+    type GitHubPrefillRepoCandidate,
+  } from './initializer/github-prefill-repo-match';
 
   const activeProviderId$ = selectActiveProviderId();
   const defaultProviderId$ = selectEffectiveDefaultProviderId();
@@ -299,20 +303,32 @@
         const data = JSON.parse(prefillData);
         logger.debug('Applying prefill data from sessionStorage', { data });
 
-        // Apply repo and branch settings (skip if onMount already set repoPath)
-        if (data.repoPath && !repoPath) {
+        // Apply repo and branch settings. An explicit prefill wins over form
+        // state restored from persistence, so no `!repoPath` guard here — the
+        // onMount reader applies the same data first, making this idempotent.
+        if (data.repoPath) {
           repoPath = data.repoPath;
+          repoType = 'local';
+          githubUrl = '';
+          isNewRepo = false;
           isValidPath = true;
           // Reset scope when changing repos - scope is repo-specific
           scope = '';
+          // Clear stale remote/branch state from a persisted prior selection:
+          // submission reads remoteSetup.workspacePath and branch regardless of
+          // repoType, so a leftover value would create against the wrong
+          // checkout or a branch that doesn't exist in the local repo. An
+          // explicit data.branch (applied below) still wins.
+          remoteSetup = null;
+          branch = '';
         } else if (data.githubUrl && !repoPath) {
           // repoPath wasn't resolved at deep-link time (knownRepos may not have loaded yet).
           // Try resolving now via IPC to the repo registry.
           try {
-            const result = await invoke<{ success: boolean; data?: Array<{ path: string; name: string; owner?: string }> }>(
-              'workspace:get-recent-repositories',
-              {},
-            );
+            const result = await invoke<{
+              success: boolean;
+              data?: Array<{ path: string; name: string; owner?: string }>;
+            }>('workspace:get-recent-repositories', {});
             if (result?.success && Array.isArray(result.data)) {
               const ghUrl = data.githubUrl.trim();
               const patterns = [
@@ -337,7 +353,10 @@
                   repoPath = matched.path;
                   isValidPath = true;
                   scope = '';
-                  logger.debug('Resolved githubUrl to local path via IPC', { githubUrl: data.githubUrl, repoPath });
+                  logger.debug('Resolved githubUrl to local path via IPC', {
+                    githubUrl: data.githubUrl,
+                    repoPath,
+                  });
                 }
               }
             }
@@ -370,7 +389,9 @@
             isTeamMode = data.specialist === 'spec-writer';
             logger.debug('Applied specialist from prefill', { specialistId: matchedSpecialist.id });
           } else {
-            logger.warn('Specialist from prefill not found, ignoring', { specialist: data.specialist });
+            logger.warn('Specialist from prefill not found, ignoring', {
+              specialist: data.specialist,
+            });
           }
         }
 
@@ -415,7 +436,6 @@
   const lastSubmittedAgent$ = selectWorkspaceInitializerLastSubmittedAgent();
   const recentRepos$ = selectWorkspaceInitializerRecentRepos();
   const pendingGitHubPrefill$ = selectWorkspaceInitializerPendingGitHubPrefill();
-  const defaultParentPath$ = selectWorkspaceInitializerDefaultParentPath();
 
   const savedState = $compactFormState$;
   const lastSubmittedAgent = $lastSubmittedAgent$;
@@ -424,7 +444,6 @@
   let repoPath = $state(savedState?.repoPath ?? '');
   let repoType: 'local' | 'github' | 'remote' = $state(savedState?.repoType ?? 'local');
   let githubUrl = $state(savedState?.githubUrl ?? '');
-  let clonePath = $state(savedState?.clonePath ?? ''); // User-selected folder for cloning GitHub repos
   let branch = $state(savedState?.branch ?? '');
   let isNewRepo = $state(savedState?.isNewRepo ?? false);
   let isValidPath = $state(savedState?.isValidPath ?? false);
@@ -436,7 +455,8 @@
   // Prompt text drafts live in the daemon (drafts.*, PROTOCOL §5.16) and are
   // restored asynchronously below so they survive full app restarts
   let initialPrompt = $state('');
-  // Context items for image attachments (images become attachment items, not inline nodes)
+  // Context items for attachments: images (thumbnail pills) and staged
+  // non-image files (path-only until placed at workspace.create redemption)
   let contextItems = $state<ContextItem[]>([]);
   // Use saved state first, then fall back to last submitted values, then defaults
   // NOTE: selectedSpecialist can be null (meaning "General / no specialist").
@@ -467,24 +487,34 @@
       ? (savedState?.modelWasOverridden ?? lastSubmittedAgent?.modelWasOverridden ?? false)
       : false,
   );
+  let selectedReasoningEffort = $state<string | undefined>(
+    isModelForCurrentProvider
+      ? (savedState?.selectedReasoningEffort ?? lastSubmittedAgent?.selectedReasoningEffort)
+      : undefined,
+  );
   // Track if team mode is selected (spec-writer orchestrates)
   let isTeamMode = $state<boolean>(
     savedState?.isTeamMode ?? lastSubmittedAgent?.isTeamMode ?? true,
   );
   // Track which provider the user selected for the initial agent
-  // Priority: active provider store takes precedence since it's the user's explicit choice
-  let selectedProvider = $state<string>($activeProviderId$ ?? 'auggie');
+  // Priority: active provider store takes precedence since it's the user's
+  // explicit choice, else the settings-derived effective default. '' when
+  // neither has resolved (honestly unselected — never a fabricated auggie);
+  // the $effect below adopts the provider once settings hydration lands.
+  let selectedProvider = $state<string>($activeProviderId$ || $defaultProviderId$);
   let prefillTitle = $state('');
 
   // Funnel tracking — fires at most once per form session, reset in clearForm()
   let hasFiredClick = $state(false);
   let hasFiredType = $state(false);
 
-  // Setup script state
-  let setupScript = $state(savedState?.setupScript ?? '');
+  // Setup script state — session-local: the default is restored per repo
+  // from the repo config / localStorage last-used, never from persisted
+  // form state.
+  let setupScript = $state('');
   let showSetupScript = $state(false); // Always collapsed on mount
-  let setupScriptName = $state(savedState?.setupScriptName ?? 'Custom');
-  let isCustomSetupScript = $state(savedState?.isCustomSetupScript ?? false);
+  let setupScriptName = $state('Custom');
+  let isCustomSetupScript = $state(false);
 
   // Repo-committed setup script from <repo>/.intent/config.json (local repos
   // read the file over IPC; GitHub repos use `github.repoConfig.get`).
@@ -498,9 +528,10 @@
   // Priority: repo-committed `.intent/config.json` setupScript > last used for
   // this repo > generic "Copy config files only" template.
   function restoreLastUsedSetupScript(repo: string) {
-    const lastUsed = repo
-      ? selectLastUsedScriptForRepo.select(appStore.state, repo)
-      : undefined;
+    // GitHub selections key last-used by path + source URL: the path is only
+    // the clone destination, which two different repos can share.
+    const ghUrl = repoType === 'github' ? githubUrl : undefined;
+    const lastUsed = repo ? getLastUsedSetupScript(repo, ghUrl) : undefined;
     const genericTemplate = SETUP_SCRIPT_TEMPLATES.find((t) => t.id === 'generic');
     const choice = chooseDefaultSetupScript({
       repoConfigScript: repo && repo === repoConfigScriptRepo ? repoConfigScript : null,
@@ -554,11 +585,9 @@
     }
   }
 
-  // Git availability state: null = checking, true = found, false = not found
-  let gitAvailable: boolean | null = $state(null);
-
-  // Stay on home page after creation
-  let stayOnHomePage = $state(savedState?.stayOnHomePage ?? false);
+  // Git availability state: null = checking, true = found, false = not found,
+  // 'unknown' = the probe couldn't run (transport failure / daemon unreachable)
+  let gitAvailable: boolean | 'unknown' | null = $state(null);
 
   // GitHub auth state - tracks if user needs to authenticate for private repos
   let githubAuthNeeded = $state<'none' | 'not-authenticated' | 'no-access'>('none');
@@ -578,37 +607,45 @@
   let didApplyHydratedLastSelectedRepo = $state(false);
   let hasInitialPrefillData = $state(hasWorkspacePrefillData());
 
+  // Whether the user explicitly picked a model in this form session. Late
+  // hydration (the applyAgentSettings re-application below) must not
+  // overwrite an in-session pick with restored state (intent-hq/monorepo#2678).
+  let modelPickedThisSession = $state(false);
+
   function applyAgentSettings(settings: CompactWorkspaceInitializerFormState | null | undefined) {
     if (!settings) return;
     if (settings.selectedSpecialist !== undefined) selectedSpecialist = settings.selectedSpecialist;
+    if (settings.isTeamMode !== undefined) isTeamMode = settings.isTeamMode;
+    if (modelPickedThisSession) return;
     const model = settings.selectedModel;
-    if (
-      model &&
+    const savedModelAccepted =
+      !!model &&
       parseCompoundModelId(model, $defaultProviderId$).providerId ===
-        ($activeProviderId$ || $defaultProviderId$)
-    ) {
+        ($activeProviderId$ || $defaultProviderId$);
+    if (savedModelAccepted) {
       selectedModel = model;
       modelWasOverridden = settings.modelWasOverridden ?? modelWasOverridden;
     }
-    if (settings.isTeamMode !== undefined) isTeamMode = settings.isTeamMode;
+    selectedReasoningEffort =
+      !model || savedModelAccepted ? settings.selectedReasoningEffort : undefined;
   }
 
   function applyCompactFormState(formState: CompactWorkspaceInitializerFormState) {
     repoPath = formState.repoPath ?? repoPath;
     repoType = formState.repoType ?? repoType;
     githubUrl = formState.githubUrl ?? githubUrl;
-    clonePath = formState.clonePath ?? clonePath;
     branch = formState.branch ?? branch;
     isNewRepo = formState.isNewRepo ?? isNewRepo;
     isValidPath = formState.isValidPath ?? isValidPath;
-    scope = formState.scope && formState.repoPath === formState.scopeRepoPath ? formState.scope : scope;
+    scope =
+      formState.scope && formState.repoPath === formState.scopeRepoPath ? formState.scope : scope;
     remoteSetup = formState.remoteSetup ?? remoteSetup;
-    selectedProvider = formState.selectedProvider ?? selectedProvider;
-    setupScript = formState.setupScript ?? setupScript;
-    setupScriptName = formState.setupScriptName ?? setupScriptName;
-    isCustomSetupScript = formState.isCustomSetupScript ?? isCustomSetupScript;
+    // Keep the provider paired with an in-session pick: restoring a different
+    // provider would trip the picker's provider-mismatch effect and clear it.
+    if (!modelPickedThisSession) {
+      selectedProvider = formState.selectedProvider ?? selectedProvider;
+    }
     skipIsolation = readSkipIsolation(formState) ?? skipIsolation;
-    stayOnHomePage = formState.stayOnHomePage ?? stayOnHomePage;
     applyAgentSettings(formState);
   }
 
@@ -616,7 +653,6 @@
     repoPath = data.path || '';
     repoType = data.type || 'local';
     githubUrl = data.githubUrl || '';
-    clonePath = data.clonePath || '';
     isNewRepo = data.isNewRepo || false;
     isValidPath = data.isValidPath ?? false;
     scope = data.scope || '';
@@ -652,12 +688,7 @@
       applyLastSelectedRepo(lastSelectedRepo);
     } else if (hydrationAction === 'restore-recent' && recentRepos.length > 0) {
       // Fall back to the most recently used repository
-      const mostRecentRepo = recentRepos[0];
-      applyLastSelectedRepo({
-        path: mostRecentRepo.path,
-        type: mostRecentRepo.type,
-        isValidPath: true,
-      });
+      applyLastSelectedRepo(mapRecentRepoToSelection(recentRepos[0]));
     }
   });
 
@@ -725,12 +756,11 @@
   $effect(() => {
     if (!$workspaceInitializerHydrated$) return;
     // Only save if there's meaningful state to preserve
-    if (repoPath || selectedSpecialist || selectedModel || setupScript) {
+    if (repoPath || selectedSpecialist || selectedModel) {
       const formState = {
         repoPath,
         repoType,
         githubUrl,
-        clonePath,
         branch,
         isNewRepo,
         isValidPath,
@@ -740,14 +770,10 @@
         selectedSpecialist,
         selectedModel,
         modelWasOverridden,
+        selectedReasoningEffort,
         isTeamMode,
         selectedProvider,
-        setupScript,
-        showSetupScript,
-        setupScriptName,
-        isCustomSetupScript,
         skipIsolation,
-        stayOnHomePage,
       };
       // Snapshot to strip $state proxies (e.g. remoteSetup) — Redux state must be
       // structured-cloneable for daemon persistence (src/store/renderer/AGENTS.md §2).
@@ -762,8 +788,6 @@
     const currentProvider = untrack(() => selectedProvider);
     if (newProviderId && newProviderId !== currentProvider) {
       selectedProvider = newProviderId;
-      selectedModel = undefined;
-      modelWasOverridden = false;
     }
   });
 
@@ -792,17 +816,20 @@
             : undefined;
         if (result?.success && result.data) {
           gitAvailable = result.data.available;
-          if (!result.data.available) {
-            logger.warn('Git is not available on this system');
-          } else {
+          if (result.data.available === true) {
             logger.debug('Git available', { version: result.data.version });
+          } else if (result.data.available === 'unknown') {
+            logger.warn('Git availability could not be verified (transport failure)');
+          } else {
+            logger.warn('Git is not available on this system');
           }
         } else {
-          gitAvailable = false;
+          // No probe answer at all — treat as unverifiable, not missing.
+          gitAvailable = 'unknown';
         }
       } catch (err) {
         logger.error('Failed to check git availability', err);
-        gitAvailable = false;
+        gitAvailable = 'unknown';
       }
     })();
 
@@ -817,12 +844,24 @@
         const data = JSON.parse(prefillData);
         logger.debug('Applying prefill data from sessionStorage', { data });
 
-        // Apply repo and branch settings
+        // Apply repo and branch settings — a repoPath prefill is always a
+        // local repo, so set the full selection (clearing any restored
+        // github state) so the picker opens on the Copy local repo tab
         if (data.repoPath) {
           repoPath = data.repoPath;
+          repoType = 'local';
+          githubUrl = '';
+          isNewRepo = false;
           isValidPath = true;
           // Reset scope when changing repos - scope is repo-specific
           scope = '';
+          // Clear stale remote/branch state from a persisted prior selection:
+          // submission reads remoteSetup.workspacePath and branch regardless of
+          // repoType, so a leftover value would create against the wrong
+          // checkout or a branch that doesn't exist in the local repo. An
+          // explicit data.branch (applied below) still wins.
+          remoteSetup = null;
+          branch = '';
         }
         if (data.branch) branch = data.branch;
 
@@ -842,14 +881,20 @@
         // Apply specialist if provided (match by specialist ID)
         if (data.specialist) {
           const specialists = selectSpecialists.select(appStore.state);
-          const matchedSpecialist = specialists.find((s: { id: string }) => s.id === data.specialist);
+          const matchedSpecialist = specialists.find(
+            (s: { id: string }) => s.id === data.specialist,
+          );
           if (matchedSpecialist) {
             selectedSpecialist = matchedSpecialist.id;
             // Switch team mode based on specialist - spec-writer uses team orchestration, everything else is single agent
             isTeamMode = data.specialist === 'spec-writer';
-            logger.debug('Applied specialist from prefill (onMount)', { specialistId: matchedSpecialist.id });
+            logger.debug('Applied specialist from prefill (onMount)', {
+              specialistId: matchedSpecialist.id,
+            });
           } else {
-            logger.warn('Specialist from prefill not found (onMount), ignoring', { specialist: data.specialist });
+            logger.warn('Specialist from prefill not found (onMount), ignoring', {
+              specialist: data.specialist,
+            });
           }
         }
 
@@ -950,7 +995,6 @@
       owner: target.owner,
       repo: target.repo,
       candidates,
-      defaultParentPath: $defaultParentPath$,
       probeRemote: async (path) => {
         if (typeof window === 'undefined' || !window.electronAPI) return null;
         const response = await invoke<{
@@ -970,11 +1014,12 @@
       const detail = { path: selection.path, type: 'local' as const, isValidPath: true };
       handleRepoChange({ detail } as CustomEvent<typeof detail>);
     } else {
+      // Picked-repo GitHub selection: `path` carries the owner/repo shorthand
+      // (mirroring RepoSelector's path-less GitHub picks), no local path.
       const detail = {
-        path: selection.clonePath,
+        path: selection.path,
         type: 'github' as const,
         githubUrl: selection.githubUrl,
-        clonePath: selection.clonePath,
         isValidPath: true,
       };
       handleRepoChange({ detail } as CustomEvent<typeof detail>);
@@ -1189,7 +1234,9 @@
     }, 200);
   });
 
-  // §5.31 gate — enhance is auggie-only; unset active provider defaults to auggie
+  // §5.31 gate — enhance is auggie-only; an unresolved effective provider
+  // ('') resolves the gate closed (mirrors the daemon: unset never defaults
+  // to auggie).
   const enhanceAvailable = $derived(isEnhancePromptAvailable($defaultProviderId$));
 
   // Enhance prompt state
@@ -1200,6 +1247,9 @@
   // UI state
   let isCreating = $state(false);
   let creationStage = $state(0); // 0-3 for progress stages
+  // progressId of the in-flight create — drives the live progress label/bar
+  // on the Create button; null when no create is running.
+  let activeCreateProgressId: string | null = $state(null);
   let error: string | null = $state(null);
   let controlsContainer: HTMLDivElement | null = $state(null);
   let richTextarea: RichTextarea | null = $state(null);
@@ -1257,8 +1307,8 @@
         const response =
           typeof window !== 'undefined' && window.electronAPI
             ? await invoke<any>('git-tracking:get-remote-url', {
-              repoPath: path,
-            })
+                repoPath: path,
+              })
             : undefined;
         // Drop stale responses: the repo changed while this probe was in flight
         if (generation !== remoteUrlProbeGeneration) {
@@ -1277,6 +1327,18 @@
         logger.debug('Failed to get remote URL for repo', { path, error: err });
       }
     })();
+  });
+
+  // Opportunistically warm the daemon's repo cache whenever a GitHub repo is
+  // selected (restored form state, prefill, or an explicit pick), so a
+  // subsequent create hydrates from an already-fresh cache. Fire-and-forget:
+  // dedupes per githubUrl within this form instance and swallows all errors.
+  const repoCacheWarmer = createRepoCacheWarmer();
+  $effect(() => {
+    const type = repoType;
+    // Only read githubUrl for GitHub selections so the effect doesn't track
+    // it (and re-run) while a local/remote repo is selected.
+    repoCacheWarmer.warm({ repoType: type, githubUrl: type === 'github' ? githubUrl : '' });
   });
 
   // Auto-restore last used setup script when the repo changes, and re-probe
@@ -1339,12 +1401,16 @@
 
   // Derived validation
   // For GitHub repos, also require successful branch fetch (no auth issues)
+  // `gitAvailable === 'unknown'` (probe couldn't run) does NOT block: only a
+  // daemon-confirmed missing git (false) or a still-pending probe (null) gates.
+  // A failed/placing attachment pill also blocks (retry or remove to proceed).
   const isValid = $derived(
-    gitAvailable === true &&
+    (gitAvailable === true || gitAvailable === 'unknown') &&
       !!repoPath &&
       isValidPath &&
       (isNewRepo || !!branch || repoType === 'remote') &&
-      (repoType !== 'github' || githubAuthNeeded === 'none'),
+      (repoType !== 'github' || githubAuthNeeded === 'none') &&
+      !hasBlockingAttachments(contextItems),
   );
 
   // Derived GitHub repo info for IssueSuggestions
@@ -1436,7 +1502,6 @@
       path: string;
       type: 'local' | 'github' | 'remote';
       githubUrl?: string;
-      clonePath?: string;
       isNewRepo?: boolean;
       isValidPath?: boolean;
       scope?: string;
@@ -1449,7 +1514,6 @@
     isValidPath = event.detail.isValidPath ?? false;
     scope = event.detail.scope || '';
     githubUrl = event.detail.githubUrl || '';
-    clonePath = event.detail.clonePath || '';
     branch = isNewRepo
       ? 'main'
       : event.detail.type === 'remote'
@@ -1558,9 +1622,27 @@
 
   async function handleSubmit() {
     if (!isValid || isCreating || isEnhancing) return;
+    // Attachments still placing or failed block the create: a failed pill
+    // must be retried or removed first (no silent drop, no base64 fallback).
+    if (hasBlockingAttachments(contextItems)) return;
+    // A previous submit already created the workspace but attachment
+    // placement failed — resume that flow instead of creating again.
+    if (pendingFirstMessage) {
+      await retryPendingFirstMessage();
+      return;
+    }
 
     isCreating = true;
     error = null;
+
+    // FE-minted correlation id for this create's provisioning progress: the
+    // daemon echoes it on git:clone:progress/done frames (PROTOCOL §5.1), and
+    // the bridge folds them into the workspaceCreateProgress slice. Registered
+    // BEFORE the request so mid-flight frames always find their entry; cleared
+    // in the finally below once the create settles.
+    const createProgressId = uuidv4();
+    appStore.dispatch(beginWorkspaceCreateProgress(createProgressId));
+    activeCreateProgressId = createProgressId;
 
     try {
       // Validate
@@ -1618,7 +1700,8 @@
             branch,
           });
         } catch (err) {
-          pullError = err instanceof Error ? err.message : m.workspace_compactInitializer_pullFailed_error();
+          pullError =
+            err instanceof Error ? err.message : m.workspace_compactInitializer_pullFailed_error();
           showPullConflictDialog = true;
           isPulling = false;
           isCreating = false;
@@ -1796,10 +1879,13 @@
               await import('$store/renderer/slices/scripts/scripts-selectors');
             const { scriptOutputToLines } = await import('$lib/utils/script-output-text');
             const scriptId = mention.id;
+            const wsId = (mention.meta?.workspaceId as string) || null;
             const state = appStore.state;
-            const outputLines = scriptOutputToLines(selectScriptOutput.select(state, scriptId));
-            const script = selectScriptById.select(state, scriptId);
-            const runtime = selectScriptRuntime.select(state, scriptId);
+            const outputLines = scriptOutputToLines(
+              selectScriptOutput.select(state, wsId, scriptId),
+            );
+            const script = selectScriptById.select(state, wsId, scriptId);
+            const runtime = selectScriptRuntime.select(state, wsId, scriptId);
 
             let content = `Script: ${script?.name || mention.label}\n`;
             content += `Command: ${script?.command || 'unknown'}\n`;
@@ -1890,8 +1976,7 @@
       // With no explicit pick the daemon applies its own resolved default at
       // creation time (the same value the picker previews via
       // `resolvedModel`), so no client-side tier/preference fallback runs.
-      const resolvedModel =
-        modelWasOverridden && selectedModel ? selectedModel : undefined;
+      const resolvedModel = modelWasOverridden && selectedModel ? selectedModel : undefined;
 
       // Derive the submitted provider from the explicit model (if any) so
       // intent and daemon spawn can never diverge: the daemon's
@@ -1904,6 +1989,14 @@
         $defaultProviderId$,
       );
 
+      // Staged non-image attachments cannot ride the create request: the
+      // daemon's attachment registry needs the workspace to exist before
+      // `file.placeAttachment` can run. When staged items exist, hold the
+      // whole first message (prompt + images + context) out of initialAgent
+      // and send it via `agent.sendMessage` with the attachment-reference
+      // fileBlocks after placement succeeds (create → place → send).
+      const hasStagedFiles = hasStagedFileItems(contextItems);
+
       // No client-minted agentId: the daemon assigns the initial agent's id
       // and returns it on the create result (supersedes the fresh-id-per-
       // attempt fix — with no client id there is nothing to poison retries).
@@ -1912,11 +2005,12 @@
         model: resolvedModel,
         specialist: specialistId, // Now accepts any specialist ID (not restricted to enum)
         behaviorPrompt: resolvedBehaviorPrompt, // Pass to IPC for workspace creation
-        prompt: initialPrompt.trim() || undefined,
+        prompt: hasStagedFiles ? undefined : initialPrompt.trim() || undefined,
         agentType: createAgentTypeId('workspace'),
         provider: submitProvider, // ACP provider ID (auggie, claude-code, codex)
-        contextReferences: contextReferences.length > 0 ? contextReferences : undefined,
-        imageBlocks: imageBlocks.length > 0 ? imageBlocks : undefined,
+        contextReferences:
+          !hasStagedFiles && contextReferences.length > 0 ? contextReferences : undefined,
+        imageBlocks: !hasStagedFiles && imageBlocks.length > 0 ? imageBlocks : undefined,
         metadata: {
           source: 'compact-initializer',
           isInitialAgent: true,
@@ -1934,21 +2028,37 @@
         logger.debug('Saved branch per repo', { repoPath, branch: baseBranch });
       }
 
-      // Picked repo (GitHub selection with no explicit clone destination):
-      // the daemon hydrates the checkout from its repo cache — send
-      // githubUrl + branch fields ONLY, no clonePath/repositoryPath
-      // (repoPath holds the owner/repo shorthand, not a local path).
-      const isGithubPick = repoType === 'github' && !!githubUrl && !clonePath;
+      // Picked repo (GitHub selection): the daemon hydrates the checkout
+      // from its repo cache — send githubUrl + branch fields ONLY, no
+      // repositoryPath (repoPath holds the owner/repo shorthand, not a
+      // local path).
+      const isGithubPick = repoType === 'github' && !!githubUrl;
+
+      // Await any in-flight repo-config probe (bounded, sub-second) so the
+      // setup-script decision below sees the committed `.intent/config.json`
+      // instead of racing the probe (monorepo#1862).
+      await setupScriptProbeScheduler.settled();
+
+      // The shown script is what runs: send it as-is, EXCEPT the unedited
+      // repo-config script — the daemon persists an explicit setupScript into
+      // the worktree's tracked .intent/config.json (PROTOCOL §5.1) and the
+      // committed file already holds it (it still executes when omitted).
+      const setupScriptParam = resolveSetupScriptParam({
+        setupScript,
+        setupScriptName,
+        repoPath,
+        repoConfigScript,
+        repoConfigScriptRepo,
+      });
 
       const result = await workspaceClient.create({
         title: prefillTitle || '', // Use deep-link title if provided, otherwise agent will set it
         repositoryPath: isGithubPick
           ? undefined
           : String(remoteSetupSnapshot?.workspacePath || repoPath),
-        githubUrl: repoType === 'github' && githubUrl ? githubUrl : undefined, // GitHub URL to clone
-        clonePath: repoType === 'github' && clonePath ? clonePath : undefined, // User-selected clone destination (legacy explicit-clone flow)
+        githubUrl: repoType === 'github' && githubUrl ? githubUrl : undefined, // GitHub URL of the picked repo
         baseRef: String(baseBranch),
-        setupScript: setupScript.trim() || undefined,
+        setupScript: setupScriptParam,
         environmentConfig,
         isNewRepo: Boolean(isNewRepo),
         skipIsolation: skipIsolation || undefined,
@@ -1958,6 +2068,7 @@
         executionEnvironment: selectedEnvironment ?? undefined,
         scope: scope || undefined, // Scope for subdirectories of git repos
         initialAgent,
+        progressId: createProgressId, // Echoed on git:clone:progress/done frames (PROTOCOL §5.1)
       });
 
       if (!result.ok) {
@@ -1982,6 +2093,85 @@
       // The daemon assigns the initial agent's id and returns it on the
       // create result; the FE no longer pre-mints one.
       const initialAgentId = result.data.initialAgent?.id;
+
+      // workspace.create does not accept reasoningEffort on initialAgent. Apply
+      // an explicit user pick to the daemon-minted session through agent.update;
+      // omitting this mutation preserves the daemon's normal resolution chain.
+      if (selectedReasoningEffort && initialAgentId) {
+        try {
+          const effortResult = await appClient.agents.setReasoningEffort({
+            agentId: initialAgentId,
+            workspaceId: workspace.id,
+            reasoningEffort: selectedReasoningEffort,
+          });
+          if (!effortResult.success) {
+            logger.warn('Failed to set reasoning effort on initial agent', {
+              error: effortResult.error,
+            });
+          }
+        } catch (effortError) {
+          logger.warn('Failed to set reasoning effort on initial agent', { error: effortError });
+        }
+      }
+
+      // Clear reused-ID state before installing the authoritative first-frame
+      // layout. The panel seed owns the initial agent identity; legacy
+      // navigation stays an empty shell so drawer migration cannot compete.
+      try {
+        const { getPanelLayoutManager } = await import('$features/layout/panel-layout-adapter');
+        getPanelLayoutManager(workspace.id).clearLayout();
+      } catch (error) {
+        logger.debug('Could not clear panel layout', { error });
+      }
+      try {
+        const { workspaceStorageManager } =
+          await import('$store/renderer/slices/workspace/utils/workspace-storage-manager');
+        workspaceStorageManager.clearState(workspace.id);
+      } catch (error) {
+        logger.debug('Could not clear workspace storage state', { error });
+      }
+
+      appStore.dispatch(setWorkspaceEntity(workspace));
+      if (initialAgentId) {
+        appStore.dispatch(setInitialAgentId(workspace.id, initialAgentId));
+      }
+      appStore.dispatch(
+        bootstrapNewWorkspaceLayout(
+          workspace.id,
+          initialAgentId ?? null,
+          agentName,
+          specialistId === 'spec-writer',
+        ),
+      );
+      const initialState: WorkspaceNavigationWorkspaceState = {
+        version: 2,
+        workspace: { id: workspace.id, status: 'loading' },
+        mainPanel: { type: 'empty' },
+        drawer: { open: false, type: null, itemId: null },
+        navigation: { history: [], currentIndex: -1 },
+        ui: { hasInitialized: false },
+      };
+      appStore.dispatch(hydrateWorkspaceNavigation(workspace.id, initialState));
+      appStore.dispatch(openWorkspaceTab(workspace.id));
+      // Redeem staged attachments now that the workspace exists: place each
+      // from its sourcePath, then send the held-back first message with the
+      // attachment-reference file blocks. A placement failure keeps the modal
+      // open with failed pills (retry/remove) and the create button resumes
+      // this flow — the created workspace itself is never rolled back.
+      if (hasStagedFiles) {
+        pendingFirstMessage = {
+          workspaceId: workspace.id,
+          agentId: initialAgentId,
+          content: initialPrompt.trim(),
+          imageBlocks,
+          contextReferences,
+        };
+        const sent = await placeAndSendFirstMessage();
+        if (!sent) {
+          isCreating = false;
+          return;
+        }
+      }
 
       // Register a picked repo as a path-less GitHub recent so re-picking it
       // prefills the tab (keyed by the owner/repo shorthand, no local path).
@@ -2013,135 +2203,69 @@
           });
       }
 
-      // Clear any stale panel layout data for this workspace ID.
-      // This is important when workspace IDs are reused (e.g., after deletion and recreation).
-      // Without this, the workspace page may load stale layout data with duplicate tabs.
-      try {
-        const { getPanelLayoutManager } = await import('$features/layout/panel-layout-adapter');
-        getPanelLayoutManager(workspace.id).clearLayout();
-      } catch (error) {
-        logger.debug('Could not clear panel layout', { error });
-      }
-
-      // Clear any stale workspace storage state (drawer state, main panel, etc.)
-      // for this workspace ID. When workspace IDs are reused, stale drawer state
-      // can cause the workspace page to open a non-existent agent from a previous
-      // workspace, leading to spurious agent creation.
-      try {
-        const { workspaceStorageManager } =
-          await import('$store/renderer/slices/workspace/utils/workspace-storage-manager');
-        workspaceStorageManager.clearState(workspace.id);
-      } catch (error) {
-        logger.debug('Could not clear workspace storage state', { error });
-      }
-
-      // Pre-populate Redux with the workspace entity so the workspace page
-      // has data on the very first render frame (before sagas/effects run).
-      appStore.dispatch(setWorkspaceEntity(workspace));
-
-      // Save the setup script to the store for future reuse.
+      // Record the script as this repo's last-used default (localStorage).
       // Skip the unedited repo-config script — the committed .intent/config.json
-      // is its source of truth, and saving a copy would both duplicate it in the
-      // saved list and shadow future repo-config changes as the last-used default.
+      // is its source of truth, and recording a copy would shadow future
+      // repo-config changes as the last-used default.
       const isUneditedRepoConfigScript =
         setupScriptName === REPO_CONFIG_SCRIPT_NAME &&
         repoConfigScriptRepo === repoPath &&
         setupScript.trim() === (repoConfigScript ?? '').trim();
       if (setupScript.trim() && !isUneditedRepoConfigScript) {
-        const now = new Date().toISOString();
-        const scriptToSave = {
-          id: uuidv4(),
-          name: setupScriptName || m.workspace_setupScriptEditor_customScript_name(),
-          content: setupScript.trim(),
+        recordLastUsedSetupScript(
           repoPath,
-          projectType: 'generic' as string,
-          lastUsedAt: now,
-          usageCount: 1,
-          createdAt: now,
-        };
-        appStore.dispatch(saveScript(scriptToSave));
-        logger.info('Saved setup script to store', {
-          name: setupScriptName,
-          repoPath,
-        });
-      }
-
-      // Initial-agent delivery (message + sends) is owned by the daemon; the
-      // FE only records which agent is the initial one so the UI can highlight
-      // and focus it. The id is daemon-assigned (from the create result); when
-      // it is somehow absent, skip the highlight/focus rather than invent one.
-      if (initialAgentId) {
-        appStore.dispatch(setInitialAgentId(workspace.id, initialAgentId));
-      }
-
-      // Pre-store the workspace state so the workspace page mounts on the
-      // initial-agent conversation as its only tab (full-width, no spec split).
-      // The spec note stays reachable manually from the sidebar; leaving the
-      // main panel empty here keeps the hydration payload consistent with the
-      // agent-only intent instead of asking the middleware to special-case it.
-      const initialState: WorkspaceNavigationWorkspaceState = {
-        version: 2,
-        workspace: { id: workspace.id, status: 'loading' },
-        mainPanel: { type: 'empty' },
-        drawer: initialAgentId
-          ? { open: true, type: 'agent' as const, itemId: initialAgentId }
-          : { open: false, type: null, itemId: null },
-        navigation: { history: [], currentIndex: -1 },
-        ui: { hasInitialized: false },
-      };
-      appStore.dispatch(hydrateWorkspaceNavigation(workspace.id, initialState));
-
-      if (stayOnHomePage) {
-        // Update the workspace in the store with agentSummary so the agent shows immediately
-        // This is needed because the workspace returned from create() doesn't include agentSummary
-        appStore.dispatch(
-          updateWorkspaceEntity(workspace.id, {
-            agentSummary: {
-              agentIds: initialAgentId ? [initialAgentId] : [],
-            },
-          }),
+          {
+            name: setupScriptName || m.workspace_setupScriptEditor_customScript_name(),
+            content: setupScript,
+          },
+          repoType === 'github' ? githubUrl : undefined,
         );
-      } else {
-        await goto(`/workspace/${workspace.id}`);
       }
+
+      await goto(`/workspace/${workspace.id}`);
 
       // Save last submitted agent settings before clearing form.
       // This allows the form to restore these values after submission.
-      appStore.dispatch(setWorkspaceInitializerLastSubmittedAgent({
-        selectedSpecialist,
-        selectedModel,
-        modelWasOverridden,
-        isTeamMode,
-      }));
+      appStore.dispatch(
+        setWorkspaceInitializerLastSubmittedAgent({
+          selectedSpecialist,
+          selectedModel,
+          modelWasOverridden,
+          selectedReasoningEffort,
+          isTeamMode,
+        }),
+      );
 
-      clearForm({ preserveRepo: stayOnHomePage });
-
-      // Notify parent (e.g. modal) that creation succeeded
-      // Skip if in rapid fire mode — the user wants to stay in the modal to create more workspaces
-      if (!stayOnHomePage) {
-        oncreate?.();
-      }
-
-      // Re-focus the text input if staying on the home page
-      if (stayOnHomePage) {
-        // Use setTimeout to ensure the form is fully cleared before focusing
-        setTimeout(() => {
-          richTextarea?.focus();
-        }, 100);
-      }
+      clearForm();
+      oncreate?.();
     } catch (err) {
-      error = err instanceof Error ? getGitErrorMessage(err.message) : m.workspace_compactInitializer_createFailed_error();
+      error =
+        err instanceof Error
+          ? getGitErrorMessage(err.message)
+          : m.workspace_compactInitializer_createFailed_error();
     } finally {
       isCreating = false;
+      // The create settled (success, failure, or early return) — drop the
+      // transient progress entry so the slice never accumulates stale ids.
+      activeCreateProgressId = null;
+      appStore.dispatch(clearWorkspaceCreateProgress(createProgressId));
     }
   }
 
-  function clearForm({ preserveRepo = false }: { preserveRepo?: boolean } = {}) {
-    if (!preserveRepo) {
+  function clearForm() {
+    // Note: NOT resetting the repo selection (repoPath, repoType, githubUrl,
+    // branch, isNewRepo, isValidPath, scope) — it is preserved so the next
+    // new-workspace form re-opens on the same repo (intent-hq/monorepo#2148).
+    // remoteSetup IS cleared: it is per-create connection state and stale
+    // values must not leak into the next create. Because a 'remote' selection
+    // is unusable without its remoteSetup (submission reads
+    // remoteSetup.workspacePath/environmentConfig, and isValid waives the
+    // branch requirement for remote), a remote selection cannot be preserved —
+    // reset it to defaults instead of leaving a valid-looking broken form.
+    if (repoType === 'remote') {
       repoPath = '';
       repoType = 'local';
       githubUrl = '';
-      clonePath = '';
       branch = '';
       isNewRepo = false;
       isValidPath = false;
@@ -2161,11 +2285,12 @@
     setupScriptName = 'Custom';
     isCustomSetupScript = false;
 
-    // When preserving repo (stayOnHomePage), restore the last used setup script
-    // so the next workspace creation uses the same script
-    if (preserveRepo && repoPath) {
+    // Restore the last used setup script for the preserved repo so the next
+    // workspace creation defaults to the same script
+    if (repoPath) {
       restoreLastUsedSetupScript(repoPath);
     }
+
     hasFiredClick = false;
     hasFiredType = false;
     error = null;
@@ -2173,39 +2298,32 @@
     branchBehind = 0;
     pullError = null;
     showPullConflictDialog = false;
-    // Note: intentionally not resetting stayOnHomePage or shouldPullBeforeCreate - user preferences should persist
+    // Note: intentionally not resetting shouldPullBeforeCreate — this preference should persist.
 
     // Immediately write the cleaned form state to Redux so that even if the
     // $effect doesn't fire before the component unmounts (e.g. navigation
-    // happens right after oncreate?.()), stale repo fields won't be restored.
+    // happens right after oncreate?.()), stale remoteSetup state won't be
+    // restored and the preserved repo selection is persisted.
     const cleanedState: CompactWorkspaceInitializerFormState = {
       // Agent prefs — always preserved
       selectedSpecialist,
       selectedModel,
       modelWasOverridden,
+      selectedReasoningEffort,
       isTeamMode,
       selectedProvider,
-      stayOnHomePage,
       skipIsolation,
       remoteSetup, // null at this point, but keeps parity with $effect's formState
-      // Setup script fields — already cleared above (or restored via restoreLastUsedSetupScript)
-      setupScript,
-      showSetupScript,
-      setupScriptName,
-      isCustomSetupScript,
+      // Repo selection — preserved so the next form re-opens on the same repo
+      repoPath,
+      repoType,
+      githubUrl,
+      branch,
+      isNewRepo,
+      isValidPath,
+      scope,
+      scopeRepoPath: scope ? repoPath : undefined,
     };
-    if (preserveRepo) {
-      // Keep repo fields in persisted form state when staying on the home page
-      cleanedState.repoPath = repoPath;
-      cleanedState.repoType = repoType;
-      cleanedState.githubUrl = githubUrl;
-      cleanedState.clonePath = clonePath;
-      cleanedState.branch = branch;
-      cleanedState.isNewRepo = isNewRepo;
-      cleanedState.isValidPath = isValidPath;
-      cleanedState.scope = scope;
-      cleanedState.scopeRepoPath = scope ? repoPath : undefined;
-    }
     // Snapshot to strip $state proxies before dispatching into Redux (see $effect above)
     appStore.dispatch(setCompactWorkspaceInitializerFormState($state.snapshot(cleanedState)));
   }
@@ -2337,7 +2455,10 @@
     }
 
     for (const file of files) {
-      if (file.size > MAX_FILE_SIZE) {
+      // The inline size cap only applies to images (they cross the wire as
+      // base64) — staged non-image files are placed daemon-side from their
+      // sourcePath, so any size is fine.
+      if (file.type.startsWith('image/') && file.size > MAX_FILE_SIZE) {
         oversizedFiles.push(file.name);
         continue;
       }
@@ -2368,28 +2489,36 @@
           }
         } catch (err) {
           logger.error('Failed to process image', { fileName: file.name, error: err });
-          toast.error(m.workspace_compactInitializer_processImageFailed_error({ fileName: file.name }));
+          toast.error(
+            m.workspace_compactInitializer_processImageFailed_error({ fileName: file.name }),
+          );
         }
       } else {
-        // Non-image files are inserted as mentions
-        // Use Electron's webUtils.getPathForFile (exposed via preload) to get the full filesystem path
-        // This works with contextIsolation: true, unlike the deprecated File.path property
-        const fullPath = (window as any).electronAPI?.getPathForFile?.(file) || '';
-        const displayName = file.name;
+        // Non-image files are STAGED as path-only context items: no workspace
+        // exists yet, so `file.placeAttachment` (PROTOCOL §5.9) runs at
+        // workspace.create redemption in handleSubmit, and the first message
+        // carries the resulting attachment-reference block. No bytes are ever
+        // read or kept — sourcePath only. A drop with no resolvable host path
+        // (e.g. clipboard bytes without a backing file) is a failed pill
+        // immediately: it blocks create until retried or removed.
+        const sourcePath = (window as any).electronAPI?.getPathForFile?.(file) || '';
+        const fileName = file.name || `pasted-file-${Date.now()}`;
 
-        richTextarea?.insertMention({
-          id: fullPath ? `file-${fullPath}` : `file-${displayName}-${Date.now()}`,
-          label: displayName,
+        const contextItem: ContextItem = {
+          id: `staged-file-${Date.now()}-${contextItems.length}`,
           type: 'file',
-          uri: fullPath ? `file:${fullPath}` : `devspace://file/${encodeURIComponent(displayName)}`,
-          meta: {
-            fullPath: fullPath || undefined,
-            path: displayName,
-            name: displayName,
-            size: file.size,
-            type: file.type,
-          },
-        });
+          label: fileName,
+          description: `${file.type || 'file'} • ${formatFileSize(file.size)}`,
+          path: fileName,
+          attachmentMimeType: file.type || undefined,
+          attachmentSize: file.size,
+          sourcePath,
+          placementStatus: sourcePath ? undefined : 'failed',
+        };
+        contextItems = [...contextItems, contextItem];
+        if (!sourcePath) {
+          toast.error(m.workspace_compactInitializer_attachmentNoPath_error({ fileName }));
+        }
         insertedFileCount.value++;
       }
     }
@@ -2399,11 +2528,13 @@
     }
 
     if (insertedFileCount.value > 0) {
-      logger.debug(`Attached ${insertedFileCount.value} file(s) as mentions`);
+      logger.debug(`Staged ${insertedFileCount.value} file(s) for placement at create`);
     }
 
     if (oversizedFiles.length > 0) {
-      toast.error(m.workspace_compactInitializer_filesTooLarge_error({ files: oversizedFiles.join(', ') }));
+      toast.error(
+        m.workspace_compactInitializer_filesTooLarge_error({ files: oversizedFiles.join(', ') }),
+      );
     }
   }
 
@@ -2419,6 +2550,120 @@
   // Remove a context item (for attachment removal)
   function removeContextItem(id: string) {
     contextItems = contextItems.filter((item) => item.id !== id);
+  }
+
+  // A context item the attachment strip should render: image attachments
+  // (thumbnails) plus staged/placed/failed non-image files (chips with
+  // placement state).
+  function isPreviewableAttachment(item: ContextItem): boolean {
+    if (item.type !== 'file') return false;
+    if (item.imageData && item.imageMimeType) return true;
+    if (item.file && item.file.type?.startsWith('image/')) return true;
+    return (
+      item.sourcePath !== undefined ||
+      item.placementStatus !== undefined ||
+      item.attachmentId !== undefined
+    );
+  }
+
+  function isImageAttachment(item: ContextItem): boolean {
+    return Boolean((item.imageData && item.imageMimeType) || item.file?.type?.startsWith('image/'));
+  }
+
+  // Set when workspace.create succeeded but staged-attachment placement (or
+  // the first-message send) failed: the workspace exists, the modal stays
+  // open with failed pills, and the create button resumes this flow instead
+  // of creating a second workspace.
+  let pendingFirstMessage = $state<HeldFirstMessage | null>(null);
+
+  /**
+   * Place all staged attachments into the created workspace (sourcePath-only,
+   * `file.placeAttachment` PROTOCOL §5.9) and send the held-back first
+   * message with the resulting attachment-reference file blocks. Returns
+   * false when any placement failed — the failed pills stay visible with
+   * retry/remove, `pendingFirstMessage` stays set, and the caller must NOT
+   * proceed with navigation/cleanup.
+   */
+  async function placeAndSendFirstMessage(): Promise<boolean> {
+    const pending = pendingFirstMessage;
+    if (!pending) return true;
+
+    const redemption = await redeemStagedAttachments(pending.workspaceId, contextItems);
+    contextItems = redemption.items;
+    if (redemption.failedCount > 0) {
+      error = m.workspace_compactInitializer_attachmentPlacementFailed_error();
+      return false;
+    }
+
+    // `sendHeldFirstMessage` rebuilds the wire params as plain JSON: this
+    // pending state is a Svelte $state deep-reactive Proxy tree, which
+    // Electron's structured clone rejects outright — passing it through
+    // verbatim made every staged-attachment first send fail before reaching
+    // the daemon (monorepo#2576).
+    const sendResult = await sendHeldFirstMessage($state.snapshot(pending), redemption.fileBlocks);
+    if (!sendResult.sent) {
+      logger.error('First-message send failed after attachment placement', {
+        error: sendResult.errorDetail,
+      });
+      error = sendResult.errorDetail
+        ? m.workspace_compactInitializer_firstMessageSendFailedDetail_error({
+            detail: sendResult.errorDetail,
+          })
+        : m.workspace_compactInitializer_firstMessageSendFailed_error();
+      return false;
+    }
+    pendingFirstMessage = null;
+    return true;
+  }
+
+  /**
+   * Resume a create whose staged-attachment placement failed: re-place the
+   * remaining failed items and send the held first message, then run the
+   * normal post-create navigation (the workspace already exists).
+   */
+  async function retryPendingFirstMessage(): Promise<void> {
+    const pending = pendingFirstMessage;
+    if (!pending) return;
+    isCreating = true;
+    error = null;
+    try {
+      const sent = await placeAndSendFirstMessage();
+      if (!sent) return;
+      await goto(`/workspace/${pending.workspaceId}`);
+      clearForm();
+      oncreate?.();
+    } finally {
+      isCreating = false;
+    }
+  }
+
+  /**
+   * Retry a single failed attachment pill. Before the workspace exists the
+   * failure means no resolvable sourcePath was captured — nothing to retry
+   * against, so the pill stays failed (remove is the way out). After a
+   * create whose placement failed (`pendingFirstMessage` set), retry
+   * re-runs the redemption + held first-message send.
+   */
+  async function retryStagedItem(id: string) {
+    const item = contextItems.find((i) => i.id === id);
+    if (!item) return;
+    if (pendingFirstMessage) {
+      // Workspace exists: reset this pill to staged and re-run the flow.
+      contextItems = contextItems.map((i) =>
+        i.id === id ? { ...i, placementStatus: undefined } : i,
+      );
+      await retryPendingFirstMessage();
+      return;
+    }
+    if (!item.sourcePath) {
+      toast.error(m.workspace_compactInitializer_attachmentNoPath_error({ fileName: item.label }));
+      return;
+    }
+    // Pre-create failure with a sourcePath (shouldn't normally happen):
+    // clear the failed state — the path is re-validated at create.
+    contextItems = contextItems.map((i) =>
+      i.id === id ? { ...i, placementStatus: undefined } : i,
+    );
   }
 
   // Track the last PR identifier we attempted to fetch branch info for
@@ -2561,7 +2806,9 @@
         error instanceof EnhancePromptUnavailableError
           ? m.workspace_compactInitializer_enhanceUnavailable_error()
           : error instanceof Error && error.message
-            ? m.workspace_compactInitializer_enhanceFailedWithMessage_error({ message: error.message })
+            ? m.workspace_compactInitializer_enhanceFailedWithMessage_error({
+                message: error.message,
+              })
             : m.workspace_compactInitializer_enhanceFailed_error(),
       );
     } finally {
@@ -2596,10 +2843,7 @@
     // fallback): surface the actionable setup toast instead of recording
     // audio that could never be transcribed. A live recording is never
     // gated — its stop-click must always land.
-    if (
-      !micRecording &&
-      selectEffectiveVoiceEngine.select(appStore.state) === 'unavailable'
-    ) {
+    if (!micRecording && selectEffectiveVoiceEngine.select(appStore.state) === 'unavailable') {
       showVoiceSetupToast();
       return;
     }
@@ -2650,7 +2894,7 @@
   <!-- Bordered container: Linear issues + Text area -->
   <!-- svelte-ignore a11y_no_static_element_interactions a11y_click_events_have_key_events a11y_no_noninteractive_element_interactions -->
   <div
-    class="relative -ml-4 w-[calc(100%+32px)] border rounded-xl transition-all duration-200 border-border bg-background"
+    class="relative w-full rounded-lg border border-border bg-background transition-all duration-200"
     class:drag-over={isDraggingOver}
     ondragover={handleDragOver}
     ondragleave={handleDragLeave}
@@ -2666,11 +2910,12 @@
     <!-- Drag overlay -->
     {#if isDraggingOver}
       <div
-        class="absolute inset-0 z-10 flex items-center justify-center bg-primary/5 rounded-xl pointer-events-none"
+        class="absolute inset-0 z-10 flex items-center justify-center rounded-lg bg-primary/5 pointer-events-none"
       >
         <div class="flex flex-col items-center gap-2 text-primary">
           <Fa icon={faPaperclip} class="w-6 h-6" />
-          <span class="text-sm font-medium">{m.workspace_compactInitializer_dropFiles_label()}</span>
+          <span class="text-sm font-medium">{m.workspace_compactInitializer_dropFiles_label()}</span
+          >
         </div>
       </div>
     {/if}
@@ -2719,20 +2964,24 @@
       {/if}
     </div>
 
-    <!-- Attachment previews (images only, Slack-style thumbnails) -->
-    {#if contextItems.some((item) => item.type === 'file' && ((item.imageData && item.imageMimeType) || (item.file && item.file.type?.startsWith('image/'))))}
-      <div class="px-2.5 pt-2 pb-1 flex flex-wrap gap-2">
-        {#each contextItems.filter((item) => item.type === 'file' && ((item.imageData && item.imageMimeType) || (item.file && item.file.type?.startsWith('image/')))) as item (item.id)}
+    <!-- Attachment previews: image thumbnails plus staged non-image file
+         chips (placed at workspace.create; failed pills show retry) -->
+    {#if contextItems.some(isPreviewableAttachment)}
+      <div class="px-2.5 pt-2 pb-1 flex flex-wrap gap-2 items-center">
+        {#each contextItems.filter(isPreviewableAttachment) as item (item.id)}
           <AttachmentPreview
             id={item.id}
             name={item.label}
-            type={item.file?.type || item.imageMimeType || ''}
-            size={item.file?.size}
+            type={item.file?.type || item.imageMimeType || item.attachmentMimeType || ''}
+            size={item.file?.size ?? item.attachmentSize}
             file={item.file}
             imageData={item.imageData}
             imageMimeType={item.imageMimeType}
             onRemove={removeContextItem}
-            variant="thumbnail"
+            variant={isImageAttachment(item) ? 'thumbnail' : 'chip'}
+            placementStatus={item.placementStatus}
+            placementError={item.placementError}
+            onRetry={retryStagedItem}
           />
         {/each}
       </div>
@@ -2779,7 +3028,7 @@
               tooltipSide="top"
               aria-label={m.chat_richInput_micStop_label()}
               aria-pressed="true"
-              class="text-destructive-foreground animate-pulse"
+              class="text-error-foreground animate-pulse"
               data-testid="initializer-mic-button"
             >
               <Fa icon={faMicrophone} size="xs" />
@@ -2810,11 +3059,13 @@
               size="icon-xs"
               variant="ghost-light"
               disabled={!initialPrompt.trim() && !isEnhancing}
-              tooltip={isEnhancing ? m.workspace_compactInitializer_stopEnhancing_tooltip() : m.workspace_compactInitializer_enhancePrompt_tooltip()}
+              tooltip={isEnhancing
+                ? m.workspace_compactInitializer_stopEnhancing_tooltip()
+                : m.workspace_compactInitializer_enhancePrompt_tooltip()}
               tooltipSide="top"
             >
               {#if isEnhancing}
-                <Fa icon={faStop} size="xs" class="text-destructive-foreground" />
+                <Fa icon={faStop} size="xs" class="text-error-foreground" />
               {:else}
                 <Fa icon={faMagicWandSparkles} size="xs" />
               {/if}
@@ -2846,7 +3097,7 @@
 
   <!-- Bottom: Agent picker, Setup script, Create button -->
   {#if isExpanded}
-    <div class="w-full min-w-0 mt-3.5 mb-3" transition:slide={{ axis: 'y', duration: 200 }}>
+    <div class="mt-4 mb-1 w-full min-w-0" transition:slide={{ axis: 'y', duration: 200 }}>
       <!-- Git not installed banner -->
       {#if gitAvailable === false}
         <div
@@ -2854,9 +3105,11 @@
           transition:slide={{ axis: 'y', duration: 200 }}
         >
           <div class="flex items-start gap-3">
-            <Fa icon={faExclamationTriangle} class="text-destructive-foreground mt-0.5 shrink-0" />
+            <Fa icon={faExclamationTriangle} class="text-error-foreground mt-0.5 shrink-0" />
             <div>
-              <p class="font-medium text-destructive-foreground">{m.workspace_compactInitializer_gitNotInstalled_label()}</p>
+              <p class="font-medium text-error-foreground">
+                {m.workspace_compactInitializer_gitNotInstalled_label()}
+              </p>
               <p class="text-subtle mt-1">
                 {m.workspace_compactInitializer_gitRequired_description()}
               </p>
@@ -2875,10 +3128,30 @@
             </div>
           </div>
         </div>
+      {:else if gitAvailable === 'unknown'}
+        <!-- Non-blocking notice: the git probe couldn't run (transport failure) -->
+        <div
+          class="mx-0 mb-3 px-4 py-3 bg-warning/10 border border-warning/30 rounded-md text-sm"
+          transition:slide={{ axis: 'y', duration: 200 }}
+        >
+          <div class="flex items-start gap-3">
+            <Fa icon={faExclamationTriangle} class="text-warning-foreground mt-0.5 shrink-0" />
+            <div>
+              <p class="font-medium text-warning-foreground">
+                {m.workspace_compactInitializer_gitCheckUnknown_label()}
+              </p>
+              <p class="text-subtle mt-1">
+                {m.workspace_compactInitializer_gitCheckUnknown_description()}
+              </p>
+            </div>
+          </div>
+        </div>
       {/if}
 
       <!-- Agent picker row -->
-      <div class="w-full min-w-0 flex flex-wrap items-center gap-2 pt-1 pb-4">
+      <div
+        class="flex w-full min-w-0 flex-wrap items-center gap-3 rounded-lg border border-border bg-card px-3 py-2.5 shadow-xs"
+      >
         <div class="flex-1 min-w-fit flex-col">
           <!-- Repo + Branch picker row (above border) -->
           {#if isExpanded}
@@ -2910,23 +3183,40 @@
 
         <!-- Create button -->
         <div class="shrink-0">
-          <Button class="text-white" onclick={handleSubmit} disabled={!isValid || isCreating || isEnhancing}>
+          <Button
+            onclick={handleSubmit}
+            disabled={!isValid || isCreating || isEnhancing}
+            class="bg-primary text-primary-foreground hover:bg-primary/90 hover:text-primary-foreground"
+          >
             {#if isCreating}
               <Fa icon={faSpinner} class="animate-spin" size="sm" />
               <span class="min-w-[160px] text-left">
                 {#if isPulling}
                   {m.workspace_compactInitializer_pullingLatest_label()}
+                {:else if activeCreateProgressId}
+                  <!-- Key on the progressId: the component binds its selector at
+                       init, so a new create must destroy/recreate it. -->
+                  {#key activeCreateProgressId}
+                    <CreateButtonProgress
+                      progressId={activeCreateProgressId}
+                      fallbackLabel={CREATION_STAGES[creationStage]}
+                    />
+                  {/key}
                 {:else}
                   {CREATION_STAGES[creationStage]}
                 {/if}
               </span>
             {:else}
-              {#if isValid}
-                <span class="opacity-50 ml-1" transition:slide={{ axis: 'x', duration: 200 }}>
-                  {navigator.userAgent?.includes('Mac') ? '⌘' : 'Ctrl'} + ↵
-                </span>
-              {/if}
               <span>{m.workspace_compactInitializer_createWorkspace_label()}</span>
+              <!-- Always rendered so the button never resizes when validity flips;
+                   `invisible` reserves the space while hiding it (incl. from AT). -->
+              <span
+                class="opacity-50 ml-1"
+                class:invisible={!isValid}
+                aria-hidden={!isValid ? 'true' : undefined}
+              >
+                {navigator.userAgent?.includes('Mac') ? '⌘' : 'Ctrl'} + ↵
+              </span>
             {/if}
           </Button>
         </div>
@@ -2942,7 +3232,7 @@
         </div>
       {/if}
       <!-- Validation hint -->
-      {#if isExpanded && !isValid && !isCreating && !error}
+      {#if isExpanded && !isValid && !isCreating && !error && (gitAvailable !== true || !repoPath || !isValidPath || (repoType === 'github' && githubAuthNeeded !== 'none'))}
         <div
           class="mt-2 px-4.5 text-sm text-subtle"
           transition:slide={{ axis: 'y', duration: 200 }}
@@ -2957,8 +3247,6 @@
             {m.workspace_compactInitializer_invalidPathHint_label()}
           {:else if repoType === 'github' && githubAuthNeeded !== 'none'}
             {m.workspace_compactInitializer_githubAuthRequired_label()}
-          {:else if !isNewRepo && !branch && repoType !== 'remote'}
-            {m.workspace_compactInitializer_waitingBranchSelection_label()}
           {/if}
         </div>
       {/if}
@@ -2979,63 +3267,69 @@
             }}
           >
             <Fa icon={faCodeBranch} size="sm" class="shrink-0" />
-            <span>{m.workspace_branchSelector_usePrBranch_label()} <strong>{selectedPRBranch}</strong></span>
+            <span
+              >{m.workspace_branchSelector_usePrBranch_label()}
+              <strong>{selectedPRBranch}</strong></span
+            >
           </button>
         </div>
       {/if}
 
-      <div class="w-full mt-3">
-        <div class="mb-6">
+      <div class="mt-4 w-full">
+        <div class="mb-4">
           <InitialAgentPicker
             bind:selectedSpecialist
             {selectedModel}
             onModelChange={(model) => {
               selectedModel = model;
+              // An explicit pick pins the model for this form session so late
+              // hydration cannot overwrite it (intent-hq/monorepo#2678).
+              if (model) modelPickedThisSession = true;
             }}
+            bind:selectedReasoningEffort
             bind:modelWasOverridden
             bind:isTeamMode
             bind:selectedProvider
           />
         </div>
-        <!-- Setup script + Rapid fire row -->
-        <div class="border-t border-border pt-4 space-y-2">
+        <!-- Setup script -->
+        <div class="space-y-2 border-t border-border pt-3">
           <div class="flex items-center justify-between flex-wrap gap-2 w-full">
-            <!-- Left: setup script sentence ("… with <script> script using <env> isolation") -->
-            <div class="flex items-center gap-1 flex-wrap">
-              <button
-                type="button"
-                class="flex items-center gap-1 whitespace-nowrap text-sm text-muted-foreground hover:text-foreground transition-colors cursor-pointer"
-                onclick={() => (showSetupScript = !showSetupScript)}
+            <!-- Left: setup script button -->
+            <button
+              type="button"
+              class="group flex min-h-9 w-full cursor-pointer items-center gap-1.5 rounded-md px-2.5 py-2 text-sm text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/40"
+              onclick={() => (showSetupScript = !showSetupScript)}
+            >
+              <span>{m.workspace_compactInitializer_setupDevEnvWith_before()}</span>
+              <!-- The pill and trailing suffix render in both states (spinner
+                   inside the pill while loading) so the row keeps the same
+                   structure and height when the probe resolves. -->
+              <span
+                class="rounded-md border border-border bg-background px-2 py-0.5 font-medium text-foreground"
               >
-                <span>{m.workspace_compactInitializer_setupDevEnvWith_before()}</span>
                 {#if isRepoConfigLoading}
-                  <Fa icon={faSpinner} class="animate-spin mx-1.5" size="sm" />
-                  <span class="sr-only">{m.workspace_compactInitializer_detectingSetupScript_label()}</span>
+                  <Fa icon={faSpinner} class="animate-spin" size="sm" />
+                  <span class="sr-only"
+                    >{m.workspace_compactInitializer_detectingSetupScript_label()}</span
+                  >
                 {:else}
-                  <div class="bg-background px-2 py-0.5 font-medium">{setupScriptName}</div>
-                  <p class="text-sm text-subtle">{m.workspace_compactInitializer_setupDevEnvWith_after()}</p>
+                  {setupScriptName}
                 {/if}
-              </button>
-              <ExecutionEnvironmentPicker
-                bind:value={selectedEnvironment}
-                onchange={handleEnvironmentChange}
-              />
-            </div>
-            <!-- Right: rapid fire -->
-            <Tooltip content={m.workspace_compactInitializer_rapidFire_tooltip()} side="top" size="sm">
-              <!-- svelte-ignore a11y_no_static_element_interactions a11y_click_events_have_key_events -->
-              <div
-                class="flex whitespace-nowrap items-center gap-2 text-sm text-muted-foreground hover:text-muted-foreground transition-colors cursor-pointer select-none ml-auto"
-                onclick={() => (stayOnHomePage = !stayOnHomePage)}
-              >
-                <Checkbox checked={stayOnHomePage} size="sm" />
-                <span>{m.workspace_compactInitializer_rapidFireMode_label()}</span>
-              </div>
-            </Tooltip>
+              </span>
+              <p class="text-sm text-subtle">
+                {m.workspace_compactInitializer_setupDevEnvWith_after()}
+              </p>
+            </button>
+            <ExecutionEnvironmentPicker
+              bind:value={selectedEnvironment}
+              onchange={handleEnvironmentChange}
+            />
           </div>
           <SetupScriptModal
             bind:open={showSetupScript}
             {repoPath}
+            githubUrl={repoType === 'github' ? githubUrl : null}
             repoConfigScript={repoConfigScriptRepo === repoPath ? repoConfigScript : null}
             bind:value={setupScript}
             bind:scriptName={setupScriptName}

@@ -32,6 +32,10 @@ export interface SystemStatusWirePayload {
   cpuPercent?: number;
   /** Daemon process resident memory (RSS) in bytes. May be missing on older daemons. */
   memoryBytes?: number;
+  /** Available bytes on the volume holding the workspaces root. May be missing on older daemons. */
+  workspacesDiskAvailableBytes?: number;
+  /** Total bytes on the volume holding the workspaces root. May be missing on older daemons. */
+  workspacesDiskTotalBytes?: number;
   fingerprint?: string | null;
   protocolVersion: string;
   host: {
@@ -87,6 +91,14 @@ export interface BackendTransportInfo {
   daemonVersion?: string;
   /** True when the adopted daemon's version differs from the bundled intentd.version pin (warn-only). */
   versionMismatch?: boolean;
+  /** The bundled intentd.version pin, reported in every transport mode. */
+  pinnedVersion?: string;
+  /**
+   * True when the adopted daemon is an orphaned sidecar — a leftover from a
+   * crashed/force-quit prior app session running from this app's own bundle
+   * (#2444). The renderer offers a kill-and-restart recovery for it.
+   */
+  isOrphanedSidecar?: boolean;
 }
 
 /**
@@ -106,6 +118,10 @@ export interface DaemonHealthStats {
   cpuPercent?: number;
   /** Daemon process resident memory (RSS) in bytes. Optional for older daemons. */
   memoryBytes?: number;
+  /** Available bytes on the volume holding the workspaces root. Optional for older daemons. */
+  workspacesDiskAvailableBytes?: number;
+  /** Total bytes on the volume holding the workspaces root. Optional for older daemons. */
+  workspacesDiskTotalBytes?: number;
   os: string;
   arch: string;
   /** FE connection mode (sidecar UDS vs external WebSocket). Optional for backward compatibility. */
@@ -130,6 +146,12 @@ export interface DaemonHealthState {
    * survives disconnects — the daemon-loss UI needs it while health is 'down'.
    */
   transport: BackendTransportInfo | null;
+  /**
+   * Reconnect attempts since the last successful connect, from the main
+   * process's backend:status broadcasts (#1750). 0 while connected / before
+   * the first retry; the daemon-loss overlay renders it as retry progress.
+   */
+  reconnectAttempts: number;
   /**
    * Daemon-reported connection locality from the last system.status poll
    * (`host.locality`, PROTOCOL §5.7/§5.14), or null before the first poll.

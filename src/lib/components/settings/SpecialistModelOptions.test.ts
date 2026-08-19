@@ -1,8 +1,7 @@
 /**
  * @vitest-environment jsdom
  *
- * Covers the per-row reasoning-effort dropdown in the model-options editor:
- * the levels come from the row model's catalog `effortLevels`, a picked level
+ * Covers controlled reasoning in the model-options editor: a picked level
  * is committed as `modelOptions[i].reasoningEffort` (PROTOCOL §5.11), draft
  * rows stay uncommitted until they gain a model, and a model switch to a
  * model lacking the current level resets the row to Default.
@@ -24,9 +23,8 @@ const mocks = vi.hoisted(() => ({
 }));
 
 vi.mock('$store/renderer/store', async () => {
-  const { createAppStoreMockModule } = await import(
-    '$store/renderer/utils/test-helpers/store-mock'
-  );
+  const { createAppStoreMockModule } =
+    await import('$store/renderer/utils/test-helpers/store-mock');
   return createAppStoreMockModule({ state: () => ({}) });
 });
 
@@ -39,9 +37,8 @@ vi.mock('$store/renderer/slices/model/model-selectors', () => ({
 }));
 
 vi.mock('$lib/components/chat/input/ModelPicker.svelte', async () => ({
-  default: (
-    await import('../workspace/initializer/__tests__/mocks/MockModelPicker.svelte')
-  ).default,
+  default: (await import('../workspace/initializer/__tests__/mocks/MockModelPicker.svelte'))
+    .default,
 }));
 
 vi.mock('svelte-fa', async () => ({
@@ -50,13 +47,13 @@ vi.mock('svelte-fa', async () => ({
 
 import SpecialistModelOptions from './SpecialistModelOptions.svelte';
 
-describe('SpecialistModelOptions effort dropdown', () => {
+describe('SpecialistModelOptions reasoning', () => {
   afterEach(() => {
     cleanup();
     mocks.effortLevels.value = {};
   });
 
-  it('shows the row model effort levels plus Default and commits a picked level', async () => {
+  it('enables controlled reasoning and commits a picked level', async () => {
     mocks.effortLevels.value = { [EFFORT_MODEL]: ['low', 'high'] };
     const onCommit = vi.fn();
     render(SpecialistModelOptions, {
@@ -64,26 +61,13 @@ describe('SpecialistModelOptions effort dropdown', () => {
       onCommit,
     });
 
-    const wrapper = screen.getByTestId('option-effort-0');
-    expect(wrapper.textContent).toContain('Default');
-
-    await fireEvent.click(wrapper.querySelector('button')!);
-    expect(screen.getByText('low')).toBeTruthy();
-    await fireEvent.click(screen.getByText('high'));
+    expect(screen.getByTestId('picker-show-reasoning').textContent).toBe('true');
+    expect(screen.getByTestId('picker-reasoning').textContent).toBe('');
+    await fireEvent.click(screen.getByTestId('pick-reasoning'));
 
     expect(onCommit).toHaveBeenCalledWith([
       { model: EFFORT_MODEL, hint: 'deep', reasoningEffort: 'high' },
     ]);
-  });
-
-  it('renders no dropdown for a row whose model advertises no levels', () => {
-    mocks.effortLevels.value = {};
-    render(SpecialistModelOptions, {
-      savedOptions: [{ model: 'claude-code:opus4.5', hint: '' }],
-      onCommit: vi.fn(),
-    });
-
-    expect(screen.queryByTestId('option-effort-0')).toBeNull();
   });
 
   it('does not commit an effort change on a draft row until it gains a model', async () => {
@@ -91,9 +75,9 @@ describe('SpecialistModelOptions effort dropdown', () => {
     const onCommit = vi.fn();
     render(SpecialistModelOptions, { savedOptions: [], onCommit });
 
-    // Draft row: no model yet, so no effort dropdown and no commit.
+    // Draft row: controlled reasoning is unset and no commit has fired.
     await fireEvent.click(screen.getByText('Add model option'));
-    expect(screen.queryByTestId('option-effort-0')).toBeNull();
+    expect(screen.getByTestId('picker-reasoning').textContent).toBe('');
     expect(onCommit).not.toHaveBeenCalled();
 
     // Picking a model commits the row.
@@ -109,12 +93,24 @@ describe('SpecialistModelOptions effort dropdown', () => {
       onCommit,
     });
 
-    expect(screen.getByTestId('option-effort-0').textContent).toContain('high');
+    expect(screen.getByTestId('picker-reasoning').textContent).toBe('high');
 
     // MockModelPicker picks PICKED_MODEL, which has no effortLevels.
     await fireEvent.click(screen.getByTestId('pick-model'));
 
     expect(onCommit).toHaveBeenCalledWith([{ model: PICKED_MODEL, hint: '' }]);
-    expect(screen.queryByTestId('option-effort-0')).toBeNull();
+    expect(screen.getByTestId('picker-reasoning').textContent).toBe('');
+  });
+
+  it('clears a committed row effort back to inherit', async () => {
+    const onCommit = vi.fn();
+    render(SpecialistModelOptions, {
+      savedOptions: [{ model: EFFORT_MODEL, hint: '', reasoningEffort: 'high' }],
+      onCommit,
+    });
+
+    await fireEvent.click(screen.getByTestId('clear-reasoning'));
+
+    expect(onCommit).toHaveBeenCalledWith([{ model: EFFORT_MODEL, hint: '' }]);
   });
 });

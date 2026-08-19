@@ -8,44 +8,43 @@
   import { slide } from 'svelte/transition';
   import Fa from 'svelte-fa';
   import {
-  faFile,
-  faFileCirclePlus,
-  faFileCircleMinus,
-  faFileEdit,
-  faArrowRightArrowLeft,
-  faCodeBranch,
-  faTerminal,
-  faPlay,
-  faCheck,
-  faXmark,
-  faWrench,
-  faCircle,
-  faMessage,
-  faEye,
-  faEyeSlash,
-  faBell,
-  faListCheck,
-  faVial,
-  faHammer,
-  faComment,
-  faPause,
-  faRotate,
-} from '@fortawesome/free-solid-svg-icons';
+    faFile,
+    faFileCirclePlus,
+    faFileCircleMinus,
+    faFileEdit,
+    faArrowRightArrowLeft,
+    faCodeBranch,
+    faTerminal,
+    faPlay,
+    faCheck,
+    faXmark,
+    faWrench,
+    faCircle,
+    faMessage,
+    faEye,
+    faEyeSlash,
+    faBell,
+    faListCheck,
+    faVial,
+    faHammer,
+    faComment,
+    faPause,
+    faRotate,
+  } from '@fortawesome/free-solid-svg-icons';
   import type { IconDefinition } from '@fortawesome/fontawesome-common-types';
   import type { WorkspaceEvent } from '$features/events/types';
+  import { shouldShowWorkspaceActivityEvent } from '$features/log/utils/activity-event-visibility';
   import {
-  selectWorkspaceEvents,
-  selectEventsLoading,
-} from '$store/renderer/slices/workspace-events/workspace-events-selectors';
+    selectWorkspaceEvents,
+    selectEventsLoading,
+  } from '$store/renderer/slices/workspace-events/workspace-events-selectors';
 
-  import {
-  getActivityLabelParts,
-  type StructuredLabel,
-} from '$features/events/activity-labels';
+  import { getActivityLabelParts, type StructuredLabel } from '$features/events/activity-labels';
+  import { getEventAgentId } from './utils';
   import { Skeleton } from '$lib/components/ui/skeleton';
   import RelativeTime from '$lib/components/ui/RelativeTime.svelte';
   import LineChangesBadge from '$lib/components/shared/LineChangesBadge.svelte';
-  import AuggieAvatar from '$lib/components/ui/auggie-avatar/AuggieAvatar.svelte';
+  import AgentAvatar from '$features/agent/components/agent-avatar/AgentAvatar.svelte';
   import { faNote } from '$lib/icons/faNote';
   import { selectAllWorkspaceAgents } from '$store/renderer/slices/workspace-agents/workspace-agents-selectors';
   import { m } from '$shared/paraglide/messages.js';
@@ -54,13 +53,14 @@
     workspaceId: string;
     /** Called when a file change event is clicked - receives the full event for showing changes */
     onOpenFileChanges?: (event: WorkspaceEvent) => void;
-    onShowAgent?: (agentId: string) => void;
+    onShowAgent?: (agentId: string, event: WorkspaceEvent) => void;
     onOpenNote?: (noteId: string) => void;
   }
 
   let { workspaceId, onOpenFileChanges, onShowAgent, onOpenNote }: Props = $props();
 
   // Wrap workspaceId prop in a writable store so selectors react to prop changes
+  // svelte-ignore state_referenced_locally - intentional initial capture; the $effect below syncs later changes
   const workspaceIdStore = writable(workspaceId);
   $effect(() => {
     workspaceIdStore.set(workspaceId);
@@ -118,6 +118,7 @@
    * is redundant with agent:started).
    */
   function shouldHideEvent(event: WorkspaceEvent): boolean {
+    if (!shouldShowWorkspaceActivityEvent(event)) return true;
     if (HIDDEN_EVENT_TYPES.has(event.type)) {
       return true;
     }
@@ -211,8 +212,6 @@
     return deduped;
   });
 
-
-
   // Comprehensive icon mapping for all event types
   function getEventIcon(type: string): IconDefinition {
     // File events
@@ -282,16 +281,16 @@
     if (type === 'test:completed') {
       const data = event.data as Record<string, unknown> | undefined;
       if (data?.status === 'passed') return 'text-emerald-500/70';
-      if (data?.status === 'failed') return 'text-red-400/70';
+      if (data?.status === 'failed') return 'text-error-foreground';
     }
     if (type === 'build:completed') {
       const data = event.data as Record<string, unknown> | undefined;
       if (data?.status === 'success') return 'text-emerald-500/70';
-      if (data?.status === 'failed') return 'text-red-400/70';
+      if (data?.status === 'failed') return 'text-error-foreground';
     }
 
     // Error states
-    if (type === 'agent:failed') return 'text-red-400/70';
+    if (type === 'agent:failed') return 'text-error-foreground';
     if (type === 'agent:deleted') return 'text-subtle';
 
     // Active/running states
@@ -338,10 +337,6 @@
     return null;
   }
 
-  function isAgentEvent(event: WorkspaceEvent): boolean {
-    return event.actor?.type === 'agent' || event.actor?.type === 'external';
-  }
-
   function isNoteEvent(event: WorkspaceEvent): boolean {
     return event.type.startsWith('note:');
   }
@@ -377,8 +372,9 @@
     }
 
     // For agent events (including messaging/subscription), show the agent
-    if (isAgentEvent(event) && event.actor?.id) {
-      onShowAgent?.(event.actor.id);
+    const eventAgentId = getEventAgentId(event);
+    if (eventAgentId) {
+      onShowAgent?.(eventAgentId, event);
       return;
     }
 
@@ -400,7 +396,7 @@
   // Check if event is clickable
   function isEventClickable(event: WorkspaceEvent): boolean {
     if (getFilePath(event)) return true;
-    if (isAgentEvent(event) && event.actor?.id) return true;
+    if (getEventAgentId(event)) return true;
     if (getNoteId(event)) return true;
     if (getTaskNoteId(event)) return true;
     return false;
@@ -439,7 +435,7 @@
           {@const labelParts = getEventLabelParts(event)}
           {@const statusColor = getStatusColor(event)}
           {@const changes = getChanges(event)}
-          {@const isAgent = isAgentEvent(event)}
+          {@const eventAgentId = getEventAgentId(event)}
           {@const prevEvent = index > 0 ? dedupedEvents[index - 1] : null}
           {@const showTimestamp =
             !prevEvent ||
@@ -450,7 +446,7 @@
 
           <button
             type="button"
-            class="relative group flex items-start gap-2 py-1 w-full text-left transition-colors z-10 {clickable
+            class="relative group flex items-start gap-2 py-1 w-full text-left transition-colors z-10 outline-none {clickable
               ? 'cursor-pointer'
               : 'cursor-default'}"
             onclick={() => handleEventClick(event)}
@@ -459,9 +455,9 @@
           >
             <!-- Icon or Agent Avatar - use h-[1.2rem] to match text line-height for vertical centering -->
             <div class="relative flex items-center justify-center w-3.5 h-[1.2rem] shrink-0">
-              {#if isAgent && event.actor?.id}
+              {#if eventAgentId}
                 <div class="flex items-center justify-center bg-sidebar">
-                  <AuggieAvatar size={14} agentId={event.actor.id} />
+                  <AgentAvatar size={14} agentId={eventAgentId} />
                 </div>
               {:else}
                 <div class="flex items-center justify-center w-3 rounded-sm bg-sidebar">

@@ -19,14 +19,16 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as net from 'node:net';
-import * as os from 'node:os';
 import * as path from 'node:path';
 
 import { Logger } from '$shared/logger';
 import { RestartPolicy } from './restart-policy';
-import { defaultWindowsSocketPath, isWindowsPipePath, windowsPipeName } from './intentd-pipe-name';
-import { setConnectionMode, setDaemonVersionInfo } from './connection-mode';
-import { compareToPinnedVersion, readPinnedVersion } from './intentd-version-pin';
+import { resolveIntentdSocketPath } from './intentd-data-dir';
+import { isWindowsPipePath, toLocalEndpoint } from './intentd-pipe-name';
+import { setConnectionMode, setDaemonVersionInfo, setOrphanedSidecarInfo } from './connection-mode';
+import { compareToPinnedVersion } from '$shared/intentd-version-compare';
+import { readPinnedVersion } from './intentd-version-pin';
+import { detectOrphanedSidecar } from './intentd-orphan';
 // Re-export from the policy module so existing importers keep working; consumers
 // that only need the decision (e.g. `backend-connection.ts`) import it from
 // `intentd-spawn-policy` directly to avoid pulling in the sidecar manager.
@@ -42,6 +44,33 @@ let restartTimer: NodeJS.Timeout | null = null;
 let killEscalationTimer: NodeJS.Timeout | null = null;
 let isShuttingDown = false;
 let consecutiveFailures = 0;
+
+/**
+ * The local daemon's `protocolVersion`, learned from the startup UDS version
+ * handshake probe (see [[probeDaemonVersion]] in {@link startIntentdSidecar}).
+ *
+ * Stored module-level here — on the sidecar manager, which outlives every
+ * renderer JsonRpcClient — so the multi-backend protocol-compat check has a
+ * STABLE local baseline that survives a client swap. Without it, the baseline
+ * lived only on the disposable local client's `client.hello`; a fast switch to
+ * a remote before that hello resolved disposed the client and left the baseline
+ * unrecorded, so a genuine protocol mismatch never warned (cloudlands-fe#823).
+ *
+ * Populated only when a live local daemon answers the startup probe (the
+ * adopt-external path). A freshly spawned daemon is not up yet at probe time, so
+ * this stays `null` there and backend.ipc.ts falls back to the local client's
+ * own `client.hello` value once it connects.
+ */
+let localDaemonProtocolVersion: string | null = null;
+
+/**
+ * The local daemon's `protocolVersion` from the startup handshake probe, or
+ * `null` if no live local daemon answered at startup. Consumed by backend.ipc.ts
+ * as the stable baseline for the multi-backend protocol-compatibility check.
+ */
+export function getLocalDaemonProtocolVersion(): string | null {
+  return localDaemonProtocolVersion;
+}
 
 /**
  * Startup readiness budget: total wall-clock time a freshly spawned daemon is
@@ -314,6 +343,16 @@ export function __resetIntentdSidecarForTesting(): void {
   currentRunRecord = null;
   sidecarStartupFailure = null;
   spawnOnDemandInFlight = null;
+  localDaemonProtocolVersion = null;
+}
+
+/**
+ * Test seam: set the local daemon protocolVersion baseline directly, standing
+ * in for a startup handshake probe against a live local daemon.
+ * @internal
+ */
+export function __setLocalDaemonProtocolVersionForTesting(version: string | null): void {
+  localDaemonProtocolVersion = version;
 }
 
 /**
@@ -405,29 +444,20 @@ export function resolveIntentdBinaryPath(
 /**
  * Resolve the local connect target for the daemon the sidecar manages.
  *
- * If `INTENTD_DATA_DIR` is set, the socket is `$INTENTD_DATA_DIR/intentd.sock`;
- * otherwise the platform default (macOS: `~/Library/Application Support/intentd/intentd.sock`,
- * Windows: `%APPDATA%\intentd\data\intentd.sock`) — both per intentd's
- * `Config::resolve` (crates/intent-core/src/config.rs). On win32 the daemon
- * serves a named pipe derived from that socket path, so this returns the pipe
- * name (see `intentd-pipe-name.ts` for the contract).
+ * The socket lives in the daemon's data dir — resolved by
+ * `intentd-data-dir.ts`, which honors `INTENTD_DATA_DIR` (socket =
+ * `$INTENTD_DATA_DIR/intentd.sock`) and otherwise mirrors intentd's
+ * `Config::resolve` platform defaults (crates/intent-core/src/config.rs):
+ * macOS `~/Library/Application Support/intentd`, Linux `$XDG_DATA_HOME/intentd`
+ * with a `~/.local/share/intentd` fallback, Windows `%APPDATA%\intentd\data`.
+ * On win32 the daemon serves a named pipe derived from that socket path, so
+ * this returns the pipe name (see `intentd-pipe-name.ts` for the contract).
  */
 export function resolveSocketPath(
   env: NodeJS.ProcessEnv,
   platform: NodeJS.Platform = process.platform,
 ): string {
-  const dataDir = env.INTENTD_DATA_DIR?.trim();
-  if (platform === 'win32') {
-    const socketPath = dataDir
-      ? path.win32.join(dataDir, 'intentd.sock')
-      : defaultWindowsSocketPath(env);
-    return windowsPipeName(socketPath);
-  }
-  if (dataDir) {
-    return path.join(dataDir, 'intentd.sock');
-  }
-  // i18n-ignore (filesystem path)
-  return path.join(os.homedir(), 'Library', 'Application Support', 'intentd', 'intentd.sock');
+  return toLocalEndpoint(resolveIntentdSocketPath(env, platform), platform);
 }
 
 /** Result of a version-aware daemon probe (see [[probeDaemonVersion]]). */
@@ -915,6 +945,12 @@ export async function startIntentdSidecar(
 
   const socketPath = resolveSocketPath(env);
   const probe = await probeDaemonVersion(socketPath);
+  // Record the local daemon's protocolVersion as the stable baseline for the
+  // multi-backend protocol-compat check (survives renderer client disposal;
+  // see [[localDaemonProtocolVersion]]). Only a live daemon reports a version —
+  // a not-yet-spawned daemon leaves this null and the local client.hello fills
+  // the baseline once it connects.
+  if (probe.protocolVersion) localDaemonProtocolVersion = probe.protocolVersion;
   if (probe.alive) {
     // A live daemon owns the socket (and the data dir behind it): ALWAYS
     // adopt it — never spawn a second daemon alongside. Version mismatch is
@@ -931,14 +967,29 @@ export async function startIntentdSidecar(
       pinnedVersion,
       versionMismatch,
     });
+    // Orphan classification (#2444): a live adopted daemon whose executable
+    // resolves inside OUR OWN bundle is not a genuinely external daemon — it
+    // is a leftover sidecar from a crashed/force-quit prior session. Recorded
+    // so the renderer can offer kill-and-restart recovery. Detection fails
+    // safe (any doubt → null), and only packaged builds have a meaningful
+    // resourcesPath to compare against.
+    const orphan = isPackaged ? detectOrphanedSidecar(env, resourcesPath) : null;
+    setOrphanedSidecarInfo(orphan);
     const details = {
       socketPath,
       daemonVersion: probe.version ?? null,
       protocolVersion: probe.protocolVersion ?? null,
       pinnedVersion,
       comparison,
+      orphanedSidecar: orphan !== null,
     };
-    if (versionMismatch) {
+    if (orphan) {
+      logger.warn(
+        // i18n-ignore (developer log message)
+        'Adopted daemon is an ORPHANED SIDECAR (executable inside our bundle)',
+        { ...details, orphanPid: orphan.pid, orphanExecutablePath: orphan.executablePath },
+      );
+    } else if (versionMismatch) {
       logger.warn(
         // i18n-ignore (developer log message)
         'Adopted external intentd whose version differs from the pinned version',

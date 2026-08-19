@@ -1,19 +1,9 @@
 /**
  * @vitest-environment jsdom
  */
-import {
-  fireEvent,
-  render,
-  screen,
-  waitFor,
-} from '@testing-library/svelte';
-import {
-  beforeEach,
-  describe,
-  expect,
-  it,
-  vi,
-} from 'vitest';
+import { fireEvent, render, screen, waitFor } from '@testing-library/svelte';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { WorkspaceStatus } from '$shared/types';
 
 const {
   gotoMock,
@@ -28,6 +18,8 @@ const {
   createSelectorReadable,
   paletteMruEntries,
   paletteFileMru,
+  workspaceViewMode,
+  toggleWorkspaceViewModeMock,
 } = vi.hoisted(() => {
   const createSelectorReadable = <TArg, TValue>(arg: TArg, resolver: (value: any) => TValue) => ({
     subscribe: (fn: (value: TValue) => void) => {
@@ -39,6 +31,20 @@ const {
       return () => {};
     },
   });
+
+  const workspaceViewMode = {
+    value: 'single' as 'single' | 'columns',
+    listeners: new Set<(value: 'single' | 'columns') => void>(),
+    subscribe(listener: (value: 'single' | 'columns') => void) {
+      this.listeners.add(listener);
+      listener(this.value);
+      return () => this.listeners.delete(listener);
+    },
+    set(value: 'single' | 'columns') {
+      this.value = value;
+      for (const listener of this.listeners) listener(value);
+    },
+  };
 
   return {
     gotoMock: vi.fn(),
@@ -53,6 +59,8 @@ const {
     createSelectorReadable,
     paletteMruEntries: { value: [] as any[] },
     paletteFileMru: { value: {} as Record<string, number> },
+    workspaceViewMode,
+    toggleWorkspaceViewModeMock: vi.fn(() => Promise.resolve()),
   };
 });
 
@@ -107,6 +115,17 @@ vi.mock('$store/renderer/slices/workspace/workspace-selectors', () => ({
     },
   }),
 }));
+vi.mock('$store/renderer/slices/tab-state/tab-state-selectors', () => ({
+  selectWorkspaceViewMode: Object.assign(
+    vi.fn(() => workspaceViewMode),
+    {
+      select: vi.fn(() => workspaceViewMode.value),
+    },
+  ),
+}));
+vi.mock('$features/workspace/workspace-view-mode-action', () => ({
+  toggleWorkspaceViewModeWithTransition: toggleWorkspaceViewModeMock,
+}));
 vi.mock('$features/agent/browser', () => ({}));
 
 vi.mock('$features/terminal/terminal-manager.svelte', () => ({
@@ -122,13 +141,13 @@ vi.mock('$lib/utils/client-logger', () => ({
   createLogger: () => ({ info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() }),
 }));
 vi.mock('$store/renderer/store', async () => {
-  const { createAppStoreMockModule } = await import('$store/renderer/utils/test-helpers/store-mock');
+  const { createAppStoreMockModule } =
+    await import('$store/renderer/utils/test-helpers/store-mock');
 
   return createAppStoreMockModule({
     state: () => ({
       workspaceNotes: { byWorkspaceId: {} },
       workspaceAgents: { byWorkspaceId: {} },
-      workspace: { activeWorkspaceId: 'ws-1' },
     }),
     dispatch: reduxDispatchMock,
   });
@@ -185,18 +204,6 @@ vi.mock('$store/renderer/slices/changes/changes-selectors', () => ({
     },
   }),
 }));
-vi.mock('$store/renderer/slices/user-preferences/user-preferences-selectors', () => ({
-  selectResolvedLocale: Object.assign(
-    () => ({
-      subscribe: (fn: (value: string) => void) => {
-        fn('en');
-        return () => {};
-      },
-    }),
-    { select: () => 'en' },
-  ),
-}));
-
 vi.mock('svelte-fa', async () => {
   const MockFa = (await import('./ui/__tests__/mocks/Fa.svelte')).default;
   return { default: MockFa };
@@ -208,7 +215,7 @@ vi.mock('./ui/skeleton', async () => {
   return { Skeleton: MockSimple };
 });
 
-vi.mock('$lib/components/ui/auggie-avatar/AuggieAvatar.svelte', async () => {
+vi.mock('$features/agent/components/agent-avatar/AgentAvatar.svelte', async () => {
   const MockSimple = (await import('./workspace/sidebar/__tests__/mocks/MockSimple.svelte'))
     .default;
   return { default: MockSimple };
@@ -228,6 +235,11 @@ vi.mock('@fortawesome/free-solid-svg-icons', () => ({
   faPlay: { iconName: 'play' },
   faRobot: { iconName: 'robot' },
   faUser: { iconName: 'user' },
+  faWandMagicSparkles: { iconName: 'wand-magic-sparkles' },
+  faAt: { iconName: 'at' },
+  faPaperclip: { iconName: 'paperclip' },
+  faChartLine: { iconName: 'chart-line' },
+  faThumbtack: { iconName: 'thumbtack' },
 }));
 
 import CommandPalette from './CommandPalette.svelte';
@@ -235,6 +247,8 @@ import { createAgentRequested } from '$store/renderer/slices/workspace-agents/wo
 import { createTerminalRequested } from '$store/renderer/slices/terminals/terminals-slice';
 import { createNoteRequested } from '$store/renderer/slices/note-read-tracking/note-read-tracking-slice';
 import { commandPaletteNewFileRequested } from '$store/renderer/slices/app-layout/app-layout-slice';
+import { setStatsOverlayOpen } from '$store/renderer/slices/sidebar-nav/sidebar-nav-slice';
+import { togglePanelOpenMode } from '$store/renderer/slices/user-preferences/user-preferences-slice';
 
 // Actions that dispatch Redux actions directly (no window event intermediary)
 const reduxActions = [
@@ -252,6 +266,7 @@ describe('CommandPalette new actions', () => {
     sessionSessions.value = [];
     paletteMruEntries.value = [];
     paletteFileMru.value = {};
+    workspaceViewMode.set('single');
   });
 
   it('dispatches Redux actions for agent, terminal, note, and file from keyboard', async () => {
@@ -289,6 +304,98 @@ describe('CommandPalette new actions', () => {
       await fireEvent.click(button);
       expect(reduxDispatchMock).toHaveBeenCalledWith(action.actionCreator('ws-1'));
     }
+  });
+
+  it('exposes composer commands with their keyboard hints', async () => {
+    render(CommandPalette, { props: { isOpen: true, workspaceId: 'ws-1', onClose: vi.fn() } });
+    const input = screen.getByRole('textbox');
+
+    await fireEvent.input(input, { target: { value: 'enhance prompt' } });
+    expect((await screen.findByRole('button', { name: /Enhance prompt/i })).textContent).toContain(
+      '⌘/',
+    );
+
+    await fireEvent.input(input, { target: { value: 'attach context' } });
+    expect((await screen.findByRole('button', { name: /Attach context/i })).textContent).toContain(
+      '@',
+    );
+
+    await fireEvent.input(input, { target: { value: 'attach files' } });
+    expect((await screen.findByRole('button', { name: /Attach files/i })).textContent).toContain(
+      '⇧⌘A',
+    );
+  });
+
+  it('toggles the global panel mode from a searched command', async () => {
+    render(CommandPalette, { props: { isOpen: true, workspaceId: 'ws-1', onClose: vi.fn() } });
+    const input = screen.getByRole('textbox');
+    await fireEvent.input(input, { target: { value: 'toggle panel open mode' } });
+
+    const button = await screen.findByRole('button', { name: /Toggle panel open mode/i });
+    expect(button.textContent).toContain('⌥⌘P');
+    await fireEvent.click(button);
+
+    expect(reduxDispatchMock).toHaveBeenCalledWith(togglePanelOpenMode());
+  });
+
+  it('opens HUD through the exact window IPC request and opens usage stats through Redux', async () => {
+    render(CommandPalette, { props: { isOpen: true, workspaceId: 'ws-1', onClose: vi.fn() } });
+    const input = screen.getByRole('textbox');
+
+    await fireEvent.input(input, { target: { value: 'HUD' } });
+    const hud = await screen.findByRole('button', { name: /HUD/i });
+    expect(hud.textContent).toContain('⇧⌘H');
+    await fireEvent.click(hud);
+    expect(invokeMock).toHaveBeenCalledWith('window:open-new', { route: '/hud' });
+
+    reduxDispatchMock.mockClear();
+    await fireEvent.input(input, { target: { value: 'usage stats' } });
+    const stats = await screen.findByRole('button', { name: /Usage stats/i });
+    expect(stats.textContent).toContain('⇧⌘U');
+    await fireEvent.click(stats);
+    expect(reduxDispatchMock).toHaveBeenCalledWith(setStatsOverlayOpen(true));
+  });
+
+  it('routes composer palette commands to the focused chat surface', async () => {
+    const events = ['chat:enhance-prompt', 'chat:attach-context', 'chat:attach-files'] as const;
+    const listeners = events.map(() => vi.fn());
+    events.forEach((event, index) => window.addEventListener(event, listeners[index]));
+    render(CommandPalette, { props: { isOpen: true, workspaceId: 'ws-1', onClose: vi.fn() } });
+    const input = screen.getByRole('textbox');
+
+    for (const [index, query] of ['enhance prompt', 'attach context', 'attach files'].entries()) {
+      await fireEvent.input(input, { target: { value: query } });
+      const action = await screen.findByRole('button', {
+        name: new RegExp(query, 'i'),
+      });
+      await fireEvent.click(action);
+      expect(listeners[index]).toHaveBeenCalledOnce();
+    }
+
+    events.forEach((event, index) => window.removeEventListener(event, listeners[index]));
+  });
+
+  it('shows and handles the dynamic workspace view command', async () => {
+    const onClose = vi.fn();
+    render(CommandPalette, { props: { isOpen: true, workspaceId: 'ws-1', onClose } });
+    const input = screen.getByRole('textbox');
+
+    await fireEvent.input(input, { target: { value: 'layout' } });
+    const horizontal = await screen.findByRole('button', {
+      name: /Switch to horizontal workspace view/i,
+    });
+    expect(horizontal.textContent).toContain('Show open workspaces side by side in columns.');
+    expect(horizontal.textContent).toMatch(/L/);
+    expect(horizontal.querySelector('[data-navigation-icon="spaces"]')).toBeTruthy();
+
+    await fireEvent.click(horizontal);
+    expect(toggleWorkspaceViewModeMock).toHaveBeenCalledOnce();
+    expect(onClose).toHaveBeenCalledOnce();
+
+    workspaceViewMode.set('columns');
+    const tabs = await screen.findByRole('button', { name: /Switch to tab workspace view/i });
+    expect(tabs.textContent).toContain('Show one workspace at a time with tabs.');
+    expect(tabs.querySelector('[data-navigation-icon="tabs"]')).toBeTruthy();
   });
 });
 
@@ -404,6 +511,7 @@ describe('CommandPalette chat message rows', () => {
         id: 'ws-noowner',
         title: 'Local space',
         repositoryName: 'tools',
+        status: WorkspaceStatus.Archived,
         createdAt: '2025-01-01T00:00:00.000Z',
         updatedAt: '2025-01-01T00:00:00.000Z',
       },
@@ -472,10 +580,14 @@ describe('CommandPalette chat message rows', () => {
     );
     expect(coordinator.textContent).toContain('hello from coordinator');
 
-    // No owner: Agent · Workspace · repo-name only
+    // Active workspace: no archived pill
+    expect(coordinator.textContent).not.toContain('Archived workspace');
+
+    // No owner: Agent · Workspace · repo-name only; archived workspace shows the pill
     const local = screen.getByRole('button', { name: /Local Agent/ });
     expect(local.textContent).toMatch(/Local Agent\s*·\s*Local space\s*·\s*tools/);
     expect(local.textContent).not.toContain('panghy');
+    expect(local.textContent).toContain('Archived workspace');
 
     // Unknown workspace: no segments, no dangling separators, no "undefined"
     const ghost = screen.getByRole('button', { name: /Ghost Agent/ });

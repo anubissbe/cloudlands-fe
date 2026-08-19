@@ -1,7 +1,7 @@
 import { store } from '../../store';
-import type { EnvironmentConfig, PullRequestInfo, Workspace } from '$shared/types';
-import { CHIEF_WORKSPACE_ID, type WorkspaceId } from '$shared/types/branded-ids';
-import { getItem, getItems } from '$lib/store-shim/utils/collections/collection-utils';
+import { type EnvironmentConfig, type PullRequestInfo, type Workspace } from '$shared/types';
+import { CHIEF_WORKSPACE_ID } from '$shared/types/branded-ids';
+import { getItem, getItems } from '@augmentcode/themis/utils/collections/collection-utils';
 import { type WorkspaceRecencyState } from './workspace-slice';
 import { selectIsNewlyCreatedWorkspace } from '../workspace-agents/workspace-agents-selectors';
 import {
@@ -10,18 +10,17 @@ import {
   selectFileTrackingCommits,
 } from '../changes/changes-selectors';
 import { selectGitStatus } from '../git/git-selectors';
+import { selectIsDaemonLocal } from '../daemon-health/daemon-health-selectors';
+import { selectActivePrMonitors } from '../pr-monitor/pr-monitor-selectors';
 import type {
   WorkflowStage,
+  WorkspaceActivePrSummary,
   WorkspaceProgressAction,
   WorkspaceProgressHeadline,
   WorkspaceProgressInput,
 } from './workspace-types';
 import { m } from '$shared/paraglide/messages.js';
 import { formatInteger, formatNumber } from '$lib/i18n/format';
-
-export const selectActiveWorkspaceId = store.createSelector((state) => {
-  return state.workspace.activeWorkspaceId as WorkspaceId | null;
-});
 
 export const selectWorkspaceLoading = store.createSelector((state) => {
   return state.workspace.loading;
@@ -86,28 +85,63 @@ export const selectWorkspaceEnvironmentConfig = store.createSelector<
   EnvironmentConfig | undefined
 >((state, wsId) => selectWorkspaceById.select(state, wsId)?.environmentConfig);
 
+/**
+ * True when a workspace's files live on THIS machine (monorepo#2171).
+ *
+ * Two distinct localities must both hold:
+ * - Daemon locality (`selectIsDaemonLocal`): the daemon host is the user's
+ *   machine.
+ * - Workspace locality: the workspace's checkout lives on the daemon host —
+ *   i.e. it is not a remote (SSH) environment
+ *   (`environmentConfig?.type !== 'remote'`, legacy `isRemote !== true`).
+ *
+ * Gates host-shell affordances that act on workspace file paths (reveal in
+ * file manager, download, editor opens): a remote workspace on a LOCAL daemon
+ * has no files on the local desktop, so those actions must be hidden.
+ *
+ * A missing workspace entity is treated as local, matching the optimistic
+ * daemon-locality default — remote workspaces always carry
+ * `environmentConfig`, so the entity resolves to remote as soon as it is
+ * hydrated.
+ */
+export const selectIsWorkspaceHostLocal = store.createSelector<[wsId: string], boolean>(
+  (state, wsId) => {
+    if (!selectIsDaemonLocal.select(state)) return false;
+    const workspace = selectWorkspaceById.select(state, wsId);
+    if (!workspace) return true;
+    return workspace.environmentConfig?.type !== 'remote' && workspace.isRemote !== true;
+  },
+);
+
+/**
+ * True when the daemon marked the workspace as waiting on external conditions
+ * (`workspace.waiting`, PROTOCOL §5.1 — active hooks / PR monitors / watched
+ * agents). Absent reads as false: older daemons never send the field.
+ */
+export const selectWorkspaceIsWaiting = store.createSelector<[wsId: string], boolean>(
+  (state, wsId) => selectWorkspaceById.select(state, wsId)?.waiting === true,
+);
+
 export const selectWorkspaceItems = store.createSelector<[], Workspace[]>((state) => {
   return getItems(state.workspace.workspaces).filter(
     (workspace) => workspace.id !== CHIEF_WORKSPACE_ID,
   );
 });
 
+const NO_EAGER_WORKSPACE_HYDRATION: Workspace[] = [];
+
+/**
+ * Legacy bootstrap seeders must not eagerly hydrate workspace domains.
+ * Workspace surfaces dispatch `workspaceMounted`, whose coalesced read services
+ * own files, git, notes, tasks, terminals, scripts, skills, and events hydration.
+ */
+export const selectHydratableWorkspaceItems = store.createSelector<[], Workspace[]>(
+  () => NO_EAGER_WORKSPACE_HYDRATION,
+);
+
 export const selectWorkspaceIsEmpty = store.createSelector((state) => {
   return state.workspace.workspaces.ids.length === 0;
 });
-
-/**
- * Select the active workspace entity from Redux.
- * Resolves `activeWorkspaceId` against the stored workspace collection.
- * Returns undefined if no active workspace or if it hasn't been hydrated yet.
- */
-export const selectActiveWorkspace = store.createSelector<[], Workspace | undefined>((state) => {
-  const wsId = state.workspace.activeWorkspaceId;
-  if (!wsId) return undefined;
-  return getItem(state.workspace.workspaces, wsId as Workspace['id']);
-});
-
-export const selectCurrentWorkspace = selectActiveWorkspace;
 
 // ---------------------------------------------------------------------------
 // Sidebar-specific selectors (stable references for template props)
@@ -136,8 +170,8 @@ export const selectIsNewWorkspaceSession = store.createSelector<
   boolean
 >((state, wsId, selectedNoteId) => {
   const isNewlyCreated = selectIsNewlyCreatedWorkspace.select(state, wsId);
-  const staged = selectCurrentStagedWorkingChanges.select(state);
-  const unstaged = selectCurrentUnstagedWorkingChanges.select(state);
+  const staged = selectCurrentStagedWorkingChanges.select(state, wsId);
+  const unstaged = selectCurrentUnstagedWorkingChanges.select(state, wsId);
   const commits = selectFileTrackingCommits.select(state, wsId) ?? [];
   const gitStatus = selectGitStatus.select(state, wsId);
   return !!(
@@ -175,6 +209,53 @@ function resolvePrIdentity(
     prUrl: activePR?.url ?? existingPR?.htmlUrl,
   };
 }
+
+/**
+ * One sidebar source for the View PR link and Changes-card PR action. The
+ * workspace-linked PR wins; active monitors are the fallback used by View PR.
+ */
+export const selectWorkspaceActivePrSummary = store.createSelector<
+  [wsId: string],
+  WorkspaceActivePrSummary | null
+>((state, wsId) => {
+  const workspace = getItem(state.workspace.workspaces, wsId as Workspace['id']);
+  const activePR = workspace?.activePullRequest;
+  const legacyNumber = workspace?.prNumber;
+  const legacyUrl = workspace?.prUrl;
+  const number = activePR?.number ?? legacyNumber;
+  const url = activePR?.url ?? legacyUrl;
+  if (number !== undefined && number !== null && url) {
+    return {
+      number,
+      url,
+      actionLabel: m.workspace_progress_viewPr_label(),
+      actionTooltip: m.workspace_progress_viewPr_tooltip(),
+    };
+  }
+
+  const monitor = selectActivePrMonitors.select(state, wsId)[0];
+  if (!monitor) return null;
+  const workspaceRepo =
+    workspace?.repositoryOwner && workspace?.repositoryName
+      ? `${workspace.repositoryOwner}/${workspace.repositoryName}`
+      : undefined;
+  const crossRepo = workspaceRepo !== undefined && monitor.repo !== workspaceRepo;
+  const formattedNumber = formatInteger(monitor.prNumber);
+  return {
+    number: monitor.prNumber,
+    url: monitor.url ?? `https://github.com/${monitor.repo}/pull/${monitor.prNumber}`,
+    repo: crossRepo ? monitor.repo : undefined,
+    actionLabel: crossRepo
+      ? m.workspace_progress_viewMonitoredPrCrossRepo_label({ repo: monitor.repo })
+      : m.workspace_progress_viewPr_label(),
+    actionTooltip: crossRepo
+      ? m.workspace_progress_viewMonitoredPrCrossRepo_tooltip({
+          repo: monitor.repo,
+          number: formattedNumber,
+        })
+      : m.workspace_progress_viewMonitoredPr_tooltip({ number: formattedNumber }),
+  };
+});
 
 export const selectWorkflowStage = store.createSelector<
   [wsId: string, input: WorkspaceProgressInput],
@@ -471,7 +552,9 @@ export const selectWorkspaceProgressActions = store.createSelector<
   const { taskStats } = input;
   const existingPR = input.gitStatus?.existingPR;
   const activePR = selectWorkspaceActivePullRequest.select(state, wsId) ?? undefined;
-  const { prUrl } = resolvePrIdentity(activePR, input);
+  const activePrSummary = selectWorkspaceActivePrSummary.select(state, wsId);
+  const { prUrl: fallbackPrUrl } = resolvePrIdentity(activePR, input);
+  const prUrl = activePrSummary?.url ?? fallbackPrUrl;
 
   // The approved stage retains its dedicated Merge PR action.
   if (stage === 'pr-approved') {
@@ -489,6 +572,18 @@ export const selectWorkspaceProgressActions = store.createSelector<
 
   // For every other stage, an openable PR takes priority over the
   // stage-based Review/Commit/Push actions.
+  if (activePrSummary) {
+    return [
+      {
+        id: 'view-pr',
+        label: activePrSummary.actionLabel,
+        iconKey: 'code-branch',
+        tooltip: activePrSummary.actionTooltip,
+        url: activePrSummary.url,
+      },
+    ];
+  }
+
   if (prUrl) {
     return [
       {

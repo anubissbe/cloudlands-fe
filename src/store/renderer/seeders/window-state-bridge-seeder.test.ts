@@ -11,10 +11,15 @@
  * `sendToWorkspaceWindows` (dropped `notification:show`), focus gating, and
  * the `window-workspace-state-changed`-driven NotificationService lifecycle.
  *
- * The bridge seeder forwards both channels to `window.electronAPI.invoke`
+ * The bridge seeder forwards these channels to `window.electronAPI.invoke`
  * when the preload bridge is present, and resolves undefined when it is
  * absent (browser dev build) — matching the former allowlist disposition for
  * these fire-and-forget callers.
+ *
+ * `window:set-theme` regression (intent-hq/monorepo#2746): theme-saga's
+ * `syncWindowTheme` invokes it saga-style, it was never bridged, so the
+ * main-process nativeTheme handler never ran and startup logged
+ * `UnbridgedMockIpcChannelError: window:set-theme`.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -24,11 +29,13 @@ import {
   registerWindowFullScreenBridge,
   registerWindowFullScreenEventRelay,
   registerWindowStateBridge,
+  registerWindowThemeBridge,
 } from './window-state-bridge-seeder';
 
 const INVOKE_CHANNELS = [
   IPC_CHANNELS.WINDOW.SET_IN_WORKSPACE,
   IPC_CHANNELS.WINDOW.SET_OPEN_WORKSPACE_TABS,
+  IPC_CHANNELS.WINDOW.SET_THEME,
 ];
 
 const originalElectronAPI = (window as any).electronAPI;
@@ -43,7 +50,7 @@ describe('window-state-bridge-seeder', () => {
     resetMockIpcRouter();
   });
 
-  it('forwards both window-state invoke channels to window.electronAPI.invoke when bridged', async () => {
+  it('forwards all window-state invoke channels to window.electronAPI.invoke when bridged', async () => {
     const invokeSpy = vi.fn(async (channel: string) => ({ success: true, forwarded: channel }));
     (window as any).electronAPI = { ...(originalElectronAPI || {}), invoke: invokeSpy };
     registerWindowStateBridge();
@@ -59,7 +66,7 @@ describe('window-state-bridge-seeder', () => {
     expect(invokeSpy).toHaveBeenCalledTimes(INVOKE_CHANNELS.length);
   });
 
-  it('forwards the exact +layout payload shapes for both channels', async () => {
+  it('forwards the exact caller payload shapes for each channel', async () => {
     const invokeSpy = vi.fn(async () => ({ success: true }));
     (window as any).electronAPI = { ...(originalElectronAPI || {}), invoke: invokeSpy };
     registerWindowStateBridge();
@@ -71,6 +78,7 @@ describe('window-state-bridge-seeder', () => {
     await mockInvoke(IPC_CHANNELS.WINDOW.SET_OPEN_WORKSPACE_TABS, {
       workspaceIds: ['ws-1', 'ws-2'],
     });
+    await mockInvoke(IPC_CHANNELS.WINDOW.SET_THEME, { theme: 'dark' });
 
     expect(invokeSpy).toHaveBeenNthCalledWith(1, IPC_CHANNELS.WINDOW.SET_IN_WORKSPACE, {
       inWorkspace: true,
@@ -78,6 +86,9 @@ describe('window-state-bridge-seeder', () => {
     });
     expect(invokeSpy).toHaveBeenNthCalledWith(2, IPC_CHANNELS.WINDOW.SET_OPEN_WORKSPACE_TABS, {
       workspaceIds: ['ws-1', 'ws-2'],
+    });
+    expect(invokeSpy).toHaveBeenNthCalledWith(3, IPC_CHANNELS.WINDOW.SET_THEME, {
+      theme: 'dark',
     });
   });
 
@@ -88,6 +99,17 @@ describe('window-state-bridge-seeder', () => {
     for (const channel of INVOKE_CHANNELS) {
       await expect(mockInvoke(channel, { probe: channel })).resolves.toBeUndefined();
     }
+  });
+
+  it('forwards only the window theme channel and its exact payload to preload', async () => {
+    const invokeSpy = vi.fn(async () => ({ success: true }));
+    (window as any).electronAPI = { ...(originalElectronAPI || {}), invoke: invokeSpy };
+    registerWindowThemeBridge();
+
+    await mockInvoke(IPC_CHANNELS.WINDOW.SET_THEME, { theme: 'dark' });
+
+    expect(invokeSpy).toHaveBeenCalledOnce();
+    expect(invokeSpy).toHaveBeenCalledWith(IPC_CHANNELS.WINDOW.SET_THEME, { theme: 'dark' });
   });
 });
 
@@ -102,7 +124,11 @@ describe('window full-screen bridge (HUD)', () => {
   });
 
   it('forwards set/get full-screen to window.electronAPI.invoke when bridged', async () => {
-    const invokeSpy = vi.fn(async (channel: string) => ({ success: true, fullScreen: true, forwarded: channel }));
+    const invokeSpy = vi.fn(async (channel: string) => ({
+      success: true,
+      fullScreen: true,
+      forwarded: channel,
+    }));
     (window as any).electronAPI = { ...(originalElectronAPI || {}), invoke: invokeSpy };
     registerWindowFullScreenBridge();
 

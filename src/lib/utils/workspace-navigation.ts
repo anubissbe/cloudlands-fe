@@ -24,8 +24,8 @@ import { get } from 'svelte/store';
 import { goto } from '$app/navigation';
 import { page } from '$app/stores';
 import { dispatchWindowEvent } from './window-events';
-import { closeWorkspaceTab } from '$store/renderer/slices/tab-state/tab-state-slice';
-import { selectCurrentWorkspaceTabId } from '$store/renderer/slices/tab-state/tab-state-selectors';
+import { selectWorkspaceItems } from '$store/renderer/slices/workspace/workspace-selectors';
+import { resolveEmptyWindowDestination } from '$features/workspace/utils/empty-window-destination';
 import {
   closeWorkspaceDrawer,
   openWorkspaceDrawer,
@@ -111,8 +111,12 @@ export async function navigateToTerminal(terminalId: string): Promise<void> {
 
 /** Options for opening content in panels */
 export interface OpenInPanelOptions {
+  /** Explicit owning workspace. Falls back to the route workspace for legacy callers. */
+  workspaceId?: string;
   /** If true, opens in an adjacent panel (or creates a split if needed). Used for cmd+click. */
   openInAdjacentPanel?: boolean;
+  /** If true, creates a new adjacent panel rather than reusing an existing neighbor. */
+  openInNewAdjacentPanel?: boolean;
   /** The ID of the panel where the navigation originated (used to open in the same panel). */
   sourcePanelId?: string;
 }
@@ -144,7 +148,7 @@ export async function navigateToNote(noteId: string, options?: OpenInPanelOption
   logger.info(`[navigateToNote] Navigating to note: ${noteId}`, options);
 
   const currentPage = get(page);
-  const workspaceId = currentPage.params.id;
+  const workspaceId = options?.workspaceId ?? currentPage.params.id;
 
   if (!workspaceId) {
     logger.error('[navigateToNote] No workspace ID found in current page params');
@@ -154,6 +158,7 @@ export async function navigateToNote(noteId: string, options?: OpenInPanelOption
   appStore.dispatch(
     openWorkspaceNote(workspaceId, noteId, {
       openInAdjacentPanel: options?.openInAdjacentPanel ?? false,
+      openInNewAdjacentPanel: options?.openInNewAdjacentPanel ?? false,
       sourcePanelId: options?.sourcePanelId,
     }),
   );
@@ -280,11 +285,7 @@ export async function navigateToTask(
 
   // Dispatch scroll-to-task event with retries to handle editor mount timing
   const dispatchScrollEvent = () => {
-    dispatchWindowEvent(
-      'scroll-to-task',
-      { noteId, taskPosition, taskText },
-      { bubbles: true },
-    );
+    dispatchWindowEvent('scroll-to-task', { noteId, taskPosition, taskText }, { bubbles: true });
     logger.debug('[navigateToTask] Dispatched scroll-to-task event', { noteId, taskPosition });
   };
 
@@ -316,6 +317,8 @@ export interface SettingsNavigationOptions {
   specialist?: string;
   /** View to open (e.g., 'create-specialist') */
   view?: string;
+  /** Workspace owner for project-scoped settings operations. */
+  workspaceId?: string;
 }
 
 /**
@@ -338,19 +341,24 @@ export async function navigateToSettings(options?: SettingsNavigationOptions): P
 
   // Build the target URL using the URL API for safe construction
   const targetUrl = new URL('/settings', window.location.origin);
+  const routeWorkspaceId = window.location.pathname.match(/^\/workspace\/([^/]+)/)?.[1];
+  const validRouteWorkspaceId = routeWorkspaceId === 'new' ? undefined : routeWorkspaceId;
+  const workspaceId = options?.workspaceId ?? validRouteWorkspaceId;
   if (options?.tab) targetUrl.searchParams.set('tab', options.tab);
   if (options?.specialist) targetUrl.searchParams.set('specialist', options.specialist);
   if (options?.view) targetUrl.searchParams.set('view', options.view);
+  if (workspaceId) targetUrl.searchParams.set('workspaceId', workspaceId);
   if (options?.hash) targetUrl.hash = options.hash;
 
   // If already on settings, update the URL in-place
   if (typeof window !== 'undefined' && window.location.pathname === '/settings') {
     // Update query params
-    if (options?.tab || options?.specialist || options?.view) {
+    if (options?.tab || options?.specialist || options?.view || options?.workspaceId) {
       const url = new URL(window.location.href);
       if (options?.tab) url.searchParams.set('tab', options.tab);
       if (options?.specialist) url.searchParams.set('specialist', options.specialist);
       if (options?.view) url.searchParams.set('view', options.view);
+      if (options?.workspaceId) url.searchParams.set('workspaceId', options.workspaceId);
       if (options?.hash) url.hash = options.hash;
       // Use goto to trigger SvelteKit reactivity for query param changes
       await goto(url.toString(), { replaceState: true });
@@ -380,11 +388,11 @@ export async function navigateToSettings(options?: SettingsNavigationOptions): P
  *
  * Used by the settings page to show a back button.
  *
- * @returns The previous path, or '/' if not set
+ * @returns The previous path, or the workspace creation route if not set
  */
 export function getSettingsPreviousPath(): string {
-  if (typeof sessionStorage === 'undefined') return '/';
-  return sessionStorage.getItem(SETTINGS_PREV_PATH_KEY) || '/';
+  if (typeof sessionStorage === 'undefined') return '/workspace/new';
+  return sessionStorage.getItem(SETTINGS_PREV_PATH_KEY) || '/workspace/new';
 }
 
 /**
@@ -393,34 +401,46 @@ export function getSettingsPreviousPath(): string {
 export async function navigateBackFromSettings(): Promise<void> {
   const prevPath = getSettingsPreviousPath();
   logger.info('[navigateBackFromSettings] Navigating back to:', prevPath);
+  if (prevPath === '/') {
+    await navigateToFirstWorkspace();
+    return;
+  }
   await goto(prevPath);
 }
 
 /**
- * Navigate after a workspace has been archived or deleted.
- *
- * Closes the tab for the removed workspace and navigates to:
- * - The next available workspace tab (if any exist)
- * - The home page (if no other tabs are open)
- *
- * Uses the tab manager's built-in "pick next or previous" logic.
- *
- * @param removedWorkspaceId - The ID of the workspace being archived/deleted
+ * Return the first non-archived workspace, excluding one being removed.
  */
+function getFirstAvailableWorkspace(excludedWorkspaceId?: string) {
+  return selectWorkspaceItems
+    .select(appStore.state)
+    .find(
+      (workspace) =>
+        workspace.id !== excludedWorkspaceId &&
+        workspace.status !== 'Archived' &&
+        workspace.status !== 'Deleted',
+    );
+}
+
+/** Navigate to an available workspace, or the shared empty-window destination when none exist. */
+export async function navigateToFirstWorkspace(): Promise<void> {
+  const workspace = getFirstAvailableWorkspace();
+  const target = workspace
+    ? `/workspace/${workspace.id}`
+    : resolveEmptyWindowDestination(selectWorkspaceItems.select(appStore.state));
+  logger.info('[navigateToFirstWorkspace] Navigating to:', target);
+  await goto(target);
+}
+
+/** Navigate away from a workspace after it has been archived or deleted. */
 export async function navigateAfterWorkspaceRemoval(removedWorkspaceId: string): Promise<void> {
-  logger.info('[navigateAfterWorkspaceRemoval] Navigating after workspace removal:', removedWorkspaceId);
-
-  // Close the tab - this automatically sets currentTabId to the next available tab
-  appStore.dispatch(closeWorkspaceTab(removedWorkspaceId));
-
-  // Get the next tab ID (already set by closeTab)
-  const nextTabId = selectCurrentWorkspaceTabId.select(appStore.state);
-
-  if (nextTabId && typeof nextTabId === 'string' && nextTabId.length > 0 && nextTabId !== 'undefined' && nextTabId !== 'null' && nextTabId !== removedWorkspaceId) {
-    logger.info('[navigateAfterWorkspaceRemoval] Navigating to next tab:', nextTabId);
-    await goto(`/workspace/${nextTabId}`);
-  } else {
-    logger.info('[navigateAfterWorkspaceRemoval] No other tabs, navigating to home');
-    await goto('/');
-  }
+  const workspace = getFirstAvailableWorkspace(removedWorkspaceId);
+  const target = workspace
+    ? `/workspace/${workspace.id}`
+    : resolveEmptyWindowDestination(
+        selectWorkspaceItems.select(appStore.state),
+        removedWorkspaceId,
+      );
+  logger.info('[navigateAfterWorkspaceRemoval] Navigating to:', target);
+  await goto(target);
 }

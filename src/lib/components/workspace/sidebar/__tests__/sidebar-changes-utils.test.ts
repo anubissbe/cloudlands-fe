@@ -8,8 +8,10 @@ import {
   type TrackedChange,
   type CommitInfo,
 } from '$features/file-tracking/types';
-import type { AgentChangeGroup } from '$lib/components/file-tracking/accept-changes/types';
+import type { AgentChangeGroup, PRInfo } from '$lib/components/file-tracking/accept-changes/types';
 import type { PullRequestInfo } from '$shared/types';
+import { PullRequestStatus } from '$shared/types';
+import type { PrMonitorRow, PrMonitorSnapshot } from '$features/pr-monitor/pr-monitor-service';
 import {
   getBranchNameValidationError,
   constructPrUrl,
@@ -30,9 +32,43 @@ import {
   aggregatePRFiles,
   computeTotalStats,
   mapWorkspacePRs,
+  mergeMonitoredPRs,
+  orderPRSectionsForSelection,
+  sortPRsByRecency,
+  sectionPRs,
+  type GitRootPRSource,
+  type SectionedPRs,
+  selectPrimaryPr,
+  getPRStatusTooltip,
+  countOtherMonitors,
+  monitorDisplayStatus,
+  monitorPillStatus,
+  toPullRequestStatus,
 } from '../sidebar-changes-utils';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
+
+function makeSnapshot(overrides: Partial<PrMonitorSnapshot> = {}): PrMonitorSnapshot {
+  return {
+    state: 'open',
+    isDraft: false,
+    hasConflicts: false,
+    isBehind: false,
+    checks: {
+      total: 0,
+      passed: 0,
+      failed: 0,
+      pending: 0,
+      failingRequired: 0,
+      pendingRequired: 0,
+      requiredKnown: false,
+    },
+    approvals: { decision: '', have: 0, changesRequested: 0 },
+    threads: { unresolved: 0 },
+    rulesKnown: false,
+    ...overrides,
+  };
+}
 
 function makeCommit(overrides: Partial<CommitInfo> = {}): CommitInfo {
   return {
@@ -689,5 +725,1162 @@ describe('mapWorkspacePRs', () => {
     const result = mapWorkspacePRs(prs, activePR, buildUrl, getTitle);
     expect(result).toHaveLength(1);
     expect(result[0].number).toBe(1);
+  });
+});
+
+// ─── mergeMonitoredPRs (PROTOCOL §6.9) ─────────────────────────────────────────
+
+describe('mergeMonitoredPRs', () => {
+  const workspaceRepo = 'acme/widgets';
+
+  function makeMonitor(overrides: Partial<PrMonitorRow> = {}): PrMonitorRow {
+    return {
+      monitorId: 'mon-1',
+      workspaceId: 'ws-1',
+      agentId: 'agent-1',
+      repo: 'acme/widgets',
+      prNumber: 42,
+      state: 'active',
+      pendingChanges: [],
+      hasPendingChanges: false,
+      createdAt: '2026-08-07T10:00:00Z',
+      updatedAt: '2026-08-07T10:05:00Z',
+      title: 'Monitored PR',
+      url: 'https://github.com/acme/widgets/pull/42',
+      ...overrides,
+    };
+  }
+
+  function makeBasePR(overrides: Partial<PRInfo> = {}): PRInfo {
+    return {
+      number: 42,
+      title: 'Branch PR',
+      url: 'https://github.com/acme/widgets/pull/42',
+      htmlUrl: 'https://github.com/acme/widgets/pull/42',
+      status: 'open',
+      ...overrides,
+    };
+  }
+
+  it('returns base list untouched when there are no monitors', () => {
+    const base = [makeBasePR()];
+    expect(mergeMonitoredPRs(base, [], workspaceRepo)).toBe(base);
+  });
+
+  it('annotates a same-repo duplicate with the owning agent instead of appending', () => {
+    const result = mergeMonitoredPRs([makeBasePR()], [makeMonitor()], workspaceRepo);
+    expect(result).toHaveLength(1);
+    expect(result[0].monitorAgentId).toBe('agent-1');
+    expect(result[0].title).toBe('Branch PR');
+  });
+
+  it('appends an unmatched same-repo monitor with agent attribution', () => {
+    const result = mergeMonitoredPRs(
+      [makeBasePR({ number: 7 })],
+      [makeMonitor()],
+      workspaceRepo,
+    );
+    expect(result).toHaveLength(2);
+    expect(result[1]).toMatchObject({
+      number: 42,
+      title: 'Monitored PR',
+      status: 'open',
+      monitorAgentId: 'agent-1',
+      crossRepo: undefined,
+      monitorOnly: true,
+    });
+    expect(result[0].monitorOnly).toBeUndefined();
+  });
+
+  it('appends a cross-repo monitor with repo context even when numbers collide', () => {
+    const result = mergeMonitoredPRs(
+      [makeBasePR({ number: 42 })],
+      [makeMonitor({ repo: 'other/repo', url: 'https://github.com/other/repo/pull/42' })],
+      workspaceRepo,
+    );
+    expect(result).toHaveLength(2);
+    expect(result[1].crossRepo).toBe('other/repo');
+    expect(result[1].monitorOnly).toBe(true);
+  });
+
+  it('drops the owner segment in crossRepoDisplay when the org matches the workspace repo', () => {
+    const result = mergeMonitoredPRs(
+      [],
+      [makeMonitor({ repo: 'acme/other', url: 'https://github.com/acme/other/pull/42' })],
+      workspaceRepo,
+    );
+    expect(result[0].crossRepo).toBe('acme/other');
+    expect(result[0].crossRepoDisplay).toBe('other');
+  });
+
+  it('shortens crossRepoDisplay case-insensitively on the owner segment', () => {
+    const result = mergeMonitoredPRs(
+      [],
+      [makeMonitor({ repo: 'Acme/other', url: 'https://github.com/Acme/other/pull/42' })],
+      workspaceRepo,
+    );
+    expect(result[0].crossRepo).toBe('Acme/other');
+    expect(result[0].crossRepoDisplay).toBe('other');
+  });
+
+  it('keeps the full owner/name in crossRepoDisplay when the org differs', () => {
+    const result = mergeMonitoredPRs(
+      [],
+      [makeMonitor({ repo: 'other/repo', url: 'https://github.com/other/repo/pull/42' })],
+      workspaceRepo,
+    );
+    expect(result[0].crossRepo).toBe('other/repo');
+    expect(result[0].crossRepoDisplay).toBe('other/repo');
+  });
+
+  it('leaves crossRepoDisplay unset for same-repo monitor rows', () => {
+    const result = mergeMonitoredPRs([makeBasePR({ number: 7 })], [makeMonitor()], workspaceRepo);
+    expect(result[1].crossRepo).toBeUndefined();
+    expect(result[1].crossRepoDisplay).toBeUndefined();
+  });
+
+  it('attaches the monitor last snapshot to both appended and annotated rows', () => {
+    const snapshot = makeSnapshot();
+    const appended = mergeMonitoredPRs([], [makeMonitor({ lastSnapshot: snapshot })], workspaceRepo);
+    expect(appended[0].monitorSnapshot).toBe(snapshot);
+
+    const annotated = mergeMonitoredPRs(
+      [makeBasePR()],
+      [makeMonitor({ lastSnapshot: snapshot })],
+      workspaceRepo,
+    );
+    expect(annotated[0].monitorSnapshot).toBe(snapshot);
+  });
+
+  it('does not let a snapshotless duplicate monitor clobber an earlier snapshot', () => {
+    const snapshot = makeSnapshot();
+    const result = mergeMonitoredPRs(
+      [makeBasePR()],
+      [
+        makeMonitor({ monitorId: 'mon-1', agentId: 'agent-1', lastSnapshot: snapshot }),
+        makeMonitor({ monitorId: 'mon-2', agentId: 'agent-2', lastSnapshot: undefined }),
+      ],
+      workspaceRepo,
+    );
+    expect(result[0].monitorSnapshot).toBe(snapshot);
+    expect(result[0].monitorAgentId).toBe('agent-2');
+  });
+
+  it('renders completed monitors without a snapshot verdict as closed (completion covers merged AND closed)', () => {
+    const result = mergeMonitoredPRs(
+      [],
+      [makeMonitor({ state: 'completed' })],
+      workspaceRepo,
+    );
+    expect(result).toHaveLength(1);
+    expect(result[0].status).toBe('closed');
+  });
+
+  it('prefers the last-snapshot state for completed monitors (closed stays closed)', () => {
+    const snapshot = {
+      state: 'closed',
+      isDraft: false,
+      hasConflicts: false,
+      isBehind: false,
+      checks: {
+        total: 0,
+        passed: 0,
+        failed: 0,
+        pending: 0,
+        failingRequired: 0,
+        pendingRequired: 0,
+        requiredKnown: false,
+      },
+      approvals: { decision: '', have: 0, changesRequested: 0 },
+      threads: { unresolved: 0 },
+      rulesKnown: false,
+    };
+    const result = mergeMonitoredPRs(
+      [],
+      [makeMonitor({ state: 'completed', lastSnapshot: snapshot })],
+      workspaceRepo,
+    );
+    expect(result[0].status).toBe('closed');
+  });
+
+  it('falls back to repo#number title and a constructed URL before the first poll', () => {
+    const result = mergeMonitoredPRs(
+      [],
+      [makeMonitor({ title: undefined, url: undefined })],
+      workspaceRepo,
+    );
+    expect(result[0].title).toBe('acme/widgets#42');
+    expect(result[0].url).toBe('https://github.com/acme/widgets/pull/42');
+  });
+
+  it('copies the monitor createdAt/updatedAt onto appended rows for selectPrimaryPr sorting', () => {
+    const result = mergeMonitoredPRs(
+      [],
+      [makeMonitor({ createdAt: '2026-08-01T00:00:00Z', updatedAt: '2026-08-02T00:00:00Z' })],
+      workspaceRepo,
+    );
+    expect(result[0].createdAt).toBe('2026-08-01T00:00:00Z');
+    expect(result[0].updatedAt).toBe('2026-08-02T00:00:00Z');
+  });
+
+  it('selectPrimaryPr picks the oldest-created of multiple open monitored PRs', () => {
+    const pool = mergeMonitoredPRs(
+      [],
+      [
+        makeMonitor({ monitorId: 'mon-1', prNumber: 50, createdAt: '2026-08-06T00:00:00Z' }),
+        makeMonitor({ monitorId: 'mon-2', prNumber: 43, createdAt: '2026-08-04T00:00:00Z' }),
+        makeMonitor({ monitorId: 'mon-3', prNumber: 47, createdAt: '2026-08-05T00:00:00Z' }),
+      ],
+      workspaceRepo,
+    );
+    expect(selectPrimaryPr(pool)?.number).toBe(43);
+  });
+
+  it('selectPrimaryPr picks the latest-updated of multiple merged monitored PRs', () => {
+    const pool = mergeMonitoredPRs(
+      [],
+      [
+        makeMonitor({
+          monitorId: 'mon-1',
+          prNumber: 50,
+          state: 'completed',
+          lastSnapshot: makeSnapshot({ state: 'merged' }),
+          updatedAt: '2026-08-06T00:00:00Z',
+        }),
+        makeMonitor({
+          monitorId: 'mon-2',
+          prNumber: 43,
+          state: 'completed',
+          lastSnapshot: makeSnapshot({ state: 'merged' }),
+          updatedAt: '2026-08-08T00:00:00Z',
+        }),
+      ],
+      workspaceRepo,
+    );
+    expect(selectPrimaryPr(pool)?.number).toBe(43);
+  });
+
+  it('treats all monitors as same-repo when the workspace repo is unknown', () => {
+    const result = mergeMonitoredPRs(
+      [makeBasePR({ number: 42 })],
+      [makeMonitor({ repo: 'other/repo' })],
+      undefined,
+    );
+    expect(result).toHaveLength(1);
+    expect(result[0].monitorAgentId).toBe('agent-1');
+  });
+
+  // ─── Regression: intent-hq/monorepo#1699 (each_key_duplicate crash) ────────
+
+  it('dedupes two monitors (different agentIds) on the same cross-repo PR into one row', () => {
+    const result = mergeMonitoredPRs(
+      [],
+      [
+        makeMonitor({ monitorId: 'mon-1', agentId: 'agent-1', repo: 'other/repo' }),
+        makeMonitor({ monitorId: 'mon-2', agentId: 'agent-2', repo: 'other/repo' }),
+      ],
+      workspaceRepo,
+    );
+    expect(result).toHaveLength(1);
+    expect(result[0].crossRepo).toBe('other/repo');
+    expect(result[0].number).toBe(42);
+    // Keys collide under prKey (crossRepo#number), so there must be exactly one row.
+    const keys = result.map((pr) => (pr.crossRepo ? `${pr.crossRepo}#${pr.number}` : String(pr.number)));
+    expect(new Set(keys).size).toBe(keys.length);
+  });
+
+  it('dedupes two monitors on the same same-repo PR absent from basePRs into one row', () => {
+    const result = mergeMonitoredPRs(
+      [],
+      [
+        makeMonitor({ monitorId: 'mon-1', agentId: 'agent-1' }),
+        makeMonitor({ monitorId: 'mon-2', agentId: 'agent-2' }),
+      ],
+      workspaceRepo,
+    );
+    expect(result).toHaveLength(1);
+    expect(result[0].crossRepo).toBeUndefined();
+    expect(result[0].number).toBe(42);
+  });
+
+  it('keeps a same-repo monitor and a cross-repo row with the same PR number as two distinct, correctly attributed rows', () => {
+    const result = mergeMonitoredPRs(
+      [],
+      [
+        makeMonitor({ monitorId: 'mon-1', agentId: 'agent-1', repo: 'other/repo' }),
+        makeMonitor({ monitorId: 'mon-2', agentId: 'agent-2' }),
+      ],
+      workspaceRepo,
+    );
+    expect(result).toHaveLength(2);
+    const crossRepoRow = result.find((pr) => pr.crossRepo === 'other/repo');
+    const bareRow = result.find((pr) => pr.crossRepo === undefined);
+    expect(crossRepoRow?.monitorAgentId).toBe('agent-1');
+    expect(bareRow?.monitorAgentId).toBe('agent-2');
+    const keys = result.map((pr) => (pr.crossRepo ? `${pr.crossRepo}#${pr.number}` : String(pr.number)));
+    expect(new Set(keys).size).toBe(keys.length);
+  });
+});
+
+// ─── sectionPRs (Changes tab sub-sections, monorepo#2053) ─────────────────────
+
+describe('sectionPRs', () => {
+  const workspaceRepo = 'acme/widgets';
+  const getTitle = (pr: PullRequestInfo) => pr.title;
+
+  function makeMonitor(overrides: Partial<PrMonitorRow> = {}): PrMonitorRow {
+    return {
+      monitorId: 'mon-1',
+      workspaceId: 'ws-1',
+      agentId: 'agent-1',
+      repo: 'acme/widgets',
+      prNumber: 42,
+      state: 'active',
+      pendingChanges: [],
+      hasPendingChanges: false,
+      createdAt: '2026-08-07T10:00:00Z',
+      updatedAt: '2026-08-07T10:05:00Z',
+      title: 'Monitored PR',
+      url: 'https://github.com/acme/widgets/pull/42',
+      ...overrides,
+    };
+  }
+
+  function makeBasePR(overrides: Partial<PRInfo> = {}): PRInfo {
+    return {
+      number: 42,
+      title: 'Branch PR',
+      url: 'https://github.com/acme/widgets/pull/42',
+      htmlUrl: 'https://github.com/acme/widgets/pull/42',
+      status: 'open',
+      ...overrides,
+    };
+  }
+
+  function makeRootPR(overrides: Partial<PullRequestInfo> = {}): PullRequestInfo {
+    return {
+      id: 'pr-1',
+      number: 7,
+      url: 'https://github.com/acme/intentd/pull/7',
+      title: 'Root PR',
+      status: PullRequestStatus.Open,
+      createdAt: '2026-08-01T00:00:00Z',
+      updatedAt: '2026-08-02T00:00:00Z',
+      ...overrides,
+    };
+  }
+
+  function makeRoot(overrides: Partial<GitRootPRSource> = {}): GitRootPRSource {
+    return {
+      repoOwner: 'acme',
+      repoName: 'intentd',
+      pullRequests: [makeRootPR()],
+      ...overrides,
+    };
+  }
+
+  it('matches mergeMonitoredPRs exactly in own when there are no roots or foreign monitors', () => {
+    const base = [makeBasePR()];
+    const monitors = [makeMonitor()];
+    const result = sectionPRs(base, monitors, workspaceRepo, [], getTitle);
+    expect(result.own).toEqual(mergeMonitoredPRs(base, monitors, workspaceRepo));
+    expect(result.otherRoots).toEqual([]);
+    expect(result.otherTracked).toEqual([]);
+  });
+
+  it('returns the base list untouched in own when everything else is empty', () => {
+    const base = [makeBasePR()];
+    const result = sectionPRs(base, [], workspaceRepo, [], getTitle);
+    expect(result.own).toBe(base);
+    expect(result.otherRoots).toEqual([]);
+    expect(result.otherTracked).toEqual([]);
+  });
+
+  it('maps secondary-root pullRequests into otherRoots with repo context', () => {
+    const result = sectionPRs([makeBasePR()], [], workspaceRepo, [makeRoot()], getTitle);
+    expect(result.otherRoots).toHaveLength(1);
+    expect(result.otherRoots[0]).toMatchObject({
+      number: 7,
+      title: 'Root PR',
+      url: 'https://github.com/acme/intentd/pull/7',
+      status: 'open',
+      crossRepo: 'acme/intentd',
+      crossRepoDisplay: 'intentd',
+    });
+  });
+
+  it('keeps the full owner/name in crossRepoDisplay when the root org differs', () => {
+    const root = makeRoot({
+      repoOwner: 'other',
+      repoName: 'repo',
+      pullRequests: [makeRootPR({ url: 'https://github.com/other/repo/pull/7' })],
+    });
+    const result = sectionPRs([], [], workspaceRepo, [root], getTitle);
+    expect(result.otherRoots[0].crossRepo).toBe('other/repo');
+    expect(result.otherRoots[0].crossRepoDisplay).toBe('other/repo');
+  });
+
+  it('constructs a GitHub URL when the root PR carries none', () => {
+    const root = makeRoot({ pullRequests: [makeRootPR({ url: '' })] });
+    const result = sectionPRs([], [], workspaceRepo, [root], getTitle);
+    expect(result.otherRoots[0].url).toBe('https://github.com/acme/intentd/pull/7');
+  });
+
+  it('attributes a monitor on a root repo to otherRoots, annotating the matching row', () => {
+    const monitor = makeMonitor({
+      repo: 'acme/intentd',
+      prNumber: 7,
+      url: 'https://github.com/acme/intentd/pull/7',
+    });
+    const result = sectionPRs([], [monitor], workspaceRepo, [makeRoot()], getTitle);
+    expect(result.own).toEqual([]);
+    expect(result.otherTracked).toEqual([]);
+    expect(result.otherRoots).toHaveLength(1);
+    expect(result.otherRoots[0].monitorAgentId).toBe('agent-1');
+    expect(result.otherRoots[0].monitorOnly).toBeUndefined();
+  });
+
+  it('appends an unmatched root-repo monitor to otherRoots as a monitor-only row', () => {
+    const monitor = makeMonitor({
+      repo: 'acme/intentd',
+      prNumber: 99,
+      url: 'https://github.com/acme/intentd/pull/99',
+    });
+    const result = sectionPRs([], [monitor], workspaceRepo, [makeRoot()], getTitle);
+    expect(result.otherRoots).toHaveLength(2);
+    expect(result.otherRoots[1]).toMatchObject({
+      number: 99,
+      monitorOnly: true,
+      crossRepo: 'acme/intentd',
+    });
+  });
+
+  it('routes monitors matching no root into otherTracked', () => {
+    const monitor = makeMonitor({
+      repo: 'stranger/repo',
+      prNumber: 5,
+      url: 'https://github.com/stranger/repo/pull/5',
+    });
+    const result = sectionPRs([], [monitor], workspaceRepo, [makeRoot()], getTitle);
+    expect(result.otherRoots).toHaveLength(1);
+    expect(result.otherTracked).toHaveLength(1);
+    expect(result.otherTracked[0]).toMatchObject({
+      number: 5,
+      monitorOnly: true,
+      crossRepo: 'stranger/repo',
+    });
+  });
+
+  it('keeps workspace-repo monitors in own even when a root points at the same repo', () => {
+    const root = makeRoot({
+      repoOwner: 'acme',
+      repoName: 'widgets',
+      pullRequests: [],
+    });
+    const result = sectionPRs([makeBasePR()], [makeMonitor()], workspaceRepo, [root], getTitle);
+    expect(result.own).toHaveLength(1);
+    expect(result.own[0].monitorAgentId).toBe('agent-1');
+    expect(result.otherRoots).toEqual([]);
+  });
+
+  it('treats every monitor as own when the workspace repo is unknown, mirroring mergeMonitoredPRs', () => {
+    const monitor = makeMonitor({ repo: 'other/repo' });
+    const result = sectionPRs([], [monitor], undefined, [makeRoot()], getTitle);
+    expect(result.own).toHaveLength(1);
+    expect(result.otherTracked).toEqual([]);
+  });
+
+  it('skips roots without a detected owner/name', () => {
+    const root = makeRoot({ repoOwner: undefined, repoName: undefined });
+    const result = sectionPRs([], [], workspaceRepo, [root], getTitle);
+    expect(result.otherRoots).toEqual([]);
+  });
+
+  it('drops a root PR duplicating an own row identity (same-repo subtree checkout)', () => {
+    const root = makeRoot({
+      repoOwner: 'acme',
+      repoName: 'widgets',
+      pullRequests: [makeRootPR({ number: 42 })],
+    });
+    const result = sectionPRs([makeBasePR({ number: 42 })], [], workspaceRepo, [root], getTitle);
+    expect(result.own).toHaveLength(1);
+    expect(result.otherRoots).toEqual([]);
+  });
+
+  it('leaves crossRepo unset for a root PR on the workspace repo itself', () => {
+    const root = makeRoot({
+      repoOwner: 'acme',
+      repoName: 'widgets',
+      pullRequests: [makeRootPR({ number: 8, url: 'https://github.com/acme/widgets/pull/8' })],
+    });
+    const result = sectionPRs([makeBasePR({ number: 42 })], [], workspaceRepo, [root], getTitle);
+    expect(result.otherRoots).toHaveLength(1);
+    expect(result.otherRoots[0].crossRepo).toBeUndefined();
+    expect(result.otherRoots[0].crossRepoDisplay).toBeUndefined();
+  });
+
+  it('dedupes the same PR appearing under two roots on the same repo', () => {
+    const result = sectionPRs(
+      [],
+      [],
+      workspaceRepo,
+      [makeRoot(), makeRoot()],
+      getTitle,
+    );
+    expect(result.otherRoots).toHaveLength(1);
+  });
+
+  it('attributes monitors case-insensitively (GitHub repo identities)', () => {
+    // A monitor registered as Acme/IntentD against a root detected as
+    // acme/intentd must not misclassify into otherTracked; likewise a
+    // differently-cased workspace-repo monitor stays in own.
+    const rootMonitor = makeMonitor({
+      monitorId: 'mon-root',
+      repo: 'Acme/IntentD',
+      prNumber: 99,
+      url: 'https://github.com/acme/intentd/pull/99',
+    });
+    const ownMonitor = makeMonitor({ monitorId: 'mon-own', repo: 'ACME/Widgets' });
+    const result = sectionPRs([], [ownMonitor, rootMonitor], workspaceRepo, [makeRoot()], getTitle);
+    expect(result.otherTracked).toEqual([]);
+    expect(result.own).toHaveLength(1);
+    expect(result.own[0].monitorAgentId).toBe('agent-1');
+    expect(result.otherRoots.map((pr) => pr.number)).toEqual([7, 99]);
+  });
+
+  it('drops the crossRepo context for a root PR on a differently-cased workspace repo', () => {
+    const root = makeRoot({
+      repoOwner: 'Acme',
+      repoName: 'Widgets',
+      pullRequests: [makeRootPR({ number: 8, url: 'https://github.com/Acme/Widgets/pull/8' })],
+    });
+    const result = sectionPRs([], [], workspaceRepo, [root], getTitle);
+    expect(result.otherRoots).toHaveLength(1);
+    expect(result.otherRoots[0].crossRepo).toBeUndefined();
+    expect(result.otherRoots[0].crossRepoDisplay).toBeUndefined();
+  });
+
+  it('keeps repo-qualified row keys unique across all three sections', () => {
+    const rootMonitor = makeMonitor({
+      monitorId: 'mon-root',
+      repo: 'acme/intentd',
+      prNumber: 7,
+    });
+    const trackedMonitor = makeMonitor({
+      monitorId: 'mon-tracked',
+      repo: 'stranger/repo',
+      prNumber: 42,
+    });
+    const result = sectionPRs(
+      [makeBasePR({ number: 42 })],
+      [makeMonitor(), rootMonitor, trackedMonitor],
+      workspaceRepo,
+      [makeRoot()],
+      getTitle,
+    );
+    const all = [...result.own, ...result.otherRoots, ...result.otherTracked];
+    const keys = all.map((pr) => (pr.crossRepo ? `${pr.crossRepo}#${pr.number}` : String(pr.number)));
+    expect(new Set(keys).size).toBe(keys.length);
+  });
+});
+
+// ─── orderPRSectionsForSelection (dropdown-follow ordering, monorepo#2053) ─────
+
+describe('orderPRSectionsForSelection', () => {
+  const workspaceRepo = 'acme/widgets';
+
+  function makePR(overrides: Partial<PRInfo> = {}): PRInfo {
+    return {
+      number: 42,
+      title: 'Branch PR',
+      url: 'https://github.com/acme/widgets/pull/42',
+      htmlUrl: 'https://github.com/acme/widgets/pull/42',
+      status: 'open',
+      ...overrides,
+    };
+  }
+
+  function makeSectioned(overrides: Partial<SectionedPRs> = {}): SectionedPRs {
+    return {
+      own: [makePR()],
+      otherRoots: [
+        makePR({ number: 7, crossRepo: 'acme/intentd', crossRepoDisplay: 'intentd' }),
+        makePR({ number: 9, crossRepo: 'acme/ios', crossRepoDisplay: 'ios' }),
+      ],
+      otherTracked: [makePR({ number: 5, crossRepo: 'stranger/repo', monitorOnly: true })],
+      ...overrides,
+    };
+  }
+
+  it('keeps the selection-unaware sectioning (as recency-sorted copies) when primary is selected', () => {
+    const sectioned = makeSectioned();
+    const result = orderPRSectionsForSelection(sectioned, workspaceRepo, null);
+    expect(result.selected.map((pr) => pr.number)).toEqual([42]);
+    // No updatedAt on these rows: PR number desc is the tiebreak.
+    expect(result.others.map((pr) => pr.number)).toEqual([9, 7]);
+    expect(result.otherTracked.map((pr) => pr.number)).toEqual([5]);
+    // Sorted copies, not the input arrays.
+    expect(result.selected).not.toBe(sectioned.own);
+    expect(result.others).not.toBe(sectioned.otherRoots);
+    expect(result.otherTracked).not.toBe(sectioned.otherTracked);
+  });
+
+  it('moves the selected root PRs on top and own PRs under others', () => {
+    const sectioned = makeSectioned();
+    const result = orderPRSectionsForSelection(sectioned, workspaceRepo, {
+      repoOwner: 'acme',
+      repoName: 'intentd',
+    });
+    expect(result.selected).toHaveLength(1);
+    expect(result.selected[0]).toMatchObject({ number: 7, crossRepo: 'acme/intentd' });
+    // Own PRs first, then the non-selected roots' rows
+    expect(result.others.map((pr) => pr.number)).toEqual([42, 9]);
+    expect(result.otherTracked).toEqual(sectioned.otherTracked);
+  });
+
+  it('attributes rows without crossRepo context to a selected root on the workspace repo', () => {
+    // A subtree-checkout root on the workspace repo produces bare rows
+    // (sectionPRs drops the repo context for sameRepo roots).
+    const sectioned = makeSectioned({
+      otherRoots: [makePR({ number: 8 })],
+    });
+    const result = orderPRSectionsForSelection(sectioned, workspaceRepo, {
+      repoOwner: 'acme',
+      repoName: 'widgets',
+    });
+    expect(result.selected.map((pr) => pr.number)).toEqual([8]);
+    expect(result.others.map((pr) => pr.number)).toEqual([42]);
+  });
+
+  it('owns no rows when the selected root has no detected owner/name', () => {
+    const sectioned = makeSectioned();
+    const result = orderPRSectionsForSelection(sectioned, workspaceRepo, {});
+    expect(result.selected).toEqual([]);
+    expect(result.others.map((pr) => pr.number)).toEqual([42, 9, 7]);
+    expect(result.otherTracked).toEqual(sectioned.otherTracked);
+  });
+
+  it('leaves otherTracked membership untouched by any selection', () => {
+    const sectioned = makeSectioned();
+    const secondary = orderPRSectionsForSelection(sectioned, workspaceRepo, {
+      repoOwner: 'acme',
+      repoName: 'intentd',
+    });
+    expect(secondary.otherTracked).toEqual(sectioned.otherTracked);
+  });
+
+  it('never moves own or tracked rows into selected', () => {
+    const sectioned = makeSectioned();
+    // Selecting a root that shadows the workspace repo: own rows stay
+    // functional-side (they were never in otherRoots).
+    const result = orderPRSectionsForSelection(sectioned, workspaceRepo, {
+      repoOwner: 'stranger',
+      repoName: 'repo',
+    });
+    expect(result.selected).toEqual([]);
+    expect(result.others.map((pr) => pr.number)).toEqual([42, 9, 7]);
+    expect(result.otherTracked).toEqual(sectioned.otherTracked);
+  });
+
+  it('sorts all three sections by updatedAt desc when primary is selected', () => {
+    const sectioned = makeSectioned({
+      own: [
+        makePR({ number: 1, updatedAt: '2026-01-01T00:00:00Z' }),
+        makePR({ number: 2, updatedAt: '2026-03-01T00:00:00Z' }),
+      ],
+      otherRoots: [
+        makePR({ number: 7, crossRepo: 'acme/intentd', updatedAt: '2026-02-01T00:00:00Z' }),
+        makePR({ number: 9, crossRepo: 'acme/ios', updatedAt: '2026-04-01T00:00:00Z' }),
+      ],
+      otherTracked: [
+        makePR({ number: 5, crossRepo: 'stranger/repo', updatedAt: '2026-01-01T00:00:00Z' }),
+        makePR({ number: 6, crossRepo: 'stranger/repo', updatedAt: '2026-05-01T00:00:00Z' }),
+      ],
+    });
+    const result = orderPRSectionsForSelection(sectioned, workspaceRepo, null);
+    expect(result.selected.map((pr) => pr.number)).toEqual([2, 1]);
+    expect(result.others.map((pr) => pr.number)).toEqual([9, 7]);
+    expect(result.otherTracked.map((pr) => pr.number)).toEqual([6, 5]);
+  });
+
+  it('sorts all three sections by updatedAt desc when a secondary root is selected', () => {
+    const sectioned = makeSectioned({
+      own: [makePR({ number: 1, updatedAt: '2026-01-01T00:00:00Z' })],
+      otherRoots: [
+        makePR({ number: 7, crossRepo: 'acme/intentd', updatedAt: '2026-02-01T00:00:00Z' }),
+        makePR({ number: 8, crossRepo: 'acme/intentd', updatedAt: '2026-04-01T00:00:00Z' }),
+        makePR({ number: 9, crossRepo: 'acme/ios', updatedAt: '2026-03-01T00:00:00Z' }),
+      ],
+      otherTracked: [
+        makePR({ number: 5, crossRepo: 'stranger/repo', updatedAt: '2026-01-01T00:00:00Z' }),
+        makePR({ number: 6, crossRepo: 'stranger/repo', updatedAt: '2026-05-01T00:00:00Z' }),
+      ],
+    });
+    const result = orderPRSectionsForSelection(sectioned, workspaceRepo, {
+      repoOwner: 'acme',
+      repoName: 'intentd',
+    });
+    expect(result.selected.map((pr) => pr.number)).toEqual([8, 7]);
+    // Recency wins over the own-first concatenation order.
+    expect(result.others.map((pr) => pr.number)).toEqual([9, 1]);
+    expect(result.otherTracked.map((pr) => pr.number)).toEqual([6, 5]);
+  });
+
+  it('does not mutate the input arrays', () => {
+    const sectioned = makeSectioned({
+      own: [
+        makePR({ number: 1, updatedAt: '2026-01-01T00:00:00Z' }),
+        makePR({ number: 2, updatedAt: '2026-03-01T00:00:00Z' }),
+      ],
+    });
+    orderPRSectionsForSelection(sectioned, workspaceRepo, null);
+    expect(sectioned.own.map((pr) => pr.number)).toEqual([1, 2]);
+    expect(sectioned.otherRoots.map((pr) => pr.number)).toEqual([7, 9]);
+  });
+});
+
+// ─── sortPRsByRecency (display-only Changes tab recency sort) ──────────────────
+
+describe('sortPRsByRecency', () => {
+  function makePR(overrides: Partial<PRInfo> = {}): PRInfo {
+    return {
+      number: 1,
+      title: 'PR',
+      url: 'https://github.com/acme/widgets/pull/1',
+      htmlUrl: 'https://github.com/acme/widgets/pull/1',
+      status: 'open',
+      updatedAt: '2026-01-01T00:00:00Z',
+      ...overrides,
+    };
+  }
+
+  it('sorts by updatedAt descending', () => {
+    const prs = [
+      makePR({ number: 1, updatedAt: '2026-01-01T00:00:00Z' }),
+      makePR({ number: 2, updatedAt: '2026-03-01T00:00:00Z' }),
+      makePR({ number: 3, updatedAt: '2026-02-01T00:00:00Z' }),
+    ];
+    expect(sortPRsByRecency(prs).map((pr) => pr.number)).toEqual([2, 3, 1]);
+  });
+
+  it('sorts rows missing updatedAt last', () => {
+    const prs = [
+      makePR({ number: 1, updatedAt: undefined }),
+      makePR({ number: 2, updatedAt: '2026-01-01T00:00:00Z' }),
+    ];
+    expect(sortPRsByRecency(prs).map((pr) => pr.number)).toEqual([2, 1]);
+  });
+
+  it('tiebreaks equal or missing updatedAt by descending PR number', () => {
+    const equal = [
+      makePR({ number: 4, updatedAt: '2026-01-01T00:00:00Z' }),
+      makePR({ number: 9, updatedAt: '2026-01-01T00:00:00Z' }),
+    ];
+    expect(sortPRsByRecency(equal).map((pr) => pr.number)).toEqual([9, 4]);
+
+    const missing = [
+      makePR({ number: 3, updatedAt: undefined }),
+      makePR({ number: 5, updatedAt: undefined }),
+    ];
+    expect(sortPRsByRecency(missing).map((pr) => pr.number)).toEqual([5, 3]);
+  });
+
+  it('returns a new array without mutating the input', () => {
+    const prs = [
+      makePR({ number: 1, updatedAt: '2026-01-01T00:00:00Z' }),
+      makePR({ number: 2, updatedAt: '2026-03-01T00:00:00Z' }),
+    ];
+    const sorted = sortPRsByRecency(prs);
+    expect(sorted).not.toBe(prs);
+    expect(prs.map((pr) => pr.number)).toEqual([1, 2]);
+  });
+});
+
+// ─── selectPrimaryPr (single-PR surface pill) ──────────────────────────────────
+
+describe('selectPrimaryPr', () => {
+  function makePR(overrides: Partial<PRInfo> = {}): PRInfo {
+    return {
+      number: 1,
+      title: 'PR',
+      url: 'https://github.com/acme/widgets/pull/1',
+      htmlUrl: 'https://github.com/acme/widgets/pull/1',
+      status: 'open',
+      createdAt: '2026-01-01T00:00:00Z',
+      updatedAt: '2026-01-02T00:00:00Z',
+      ...overrides,
+    };
+  }
+
+  it('returns undefined for an empty pool', () => {
+    expect(selectPrimaryPr([])).toBeUndefined();
+  });
+
+  it('picks the oldest open PR by createdAt', () => {
+    const prs = [
+      makePR({ number: 2, createdAt: '2026-02-01T00:00:00Z' }),
+      makePR({ number: 1, createdAt: '2026-01-01T00:00:00Z' }),
+      makePR({ number: 3, createdAt: '2026-03-01T00:00:00Z' }),
+    ];
+    expect(selectPrimaryPr(prs)?.number).toBe(1);
+  });
+
+  it('treats drafts as unmerged alongside open PRs', () => {
+    const prs = [
+      makePR({ number: 2, status: 'open', createdAt: '2026-02-01T00:00:00Z' }),
+      makePR({ number: 1, status: 'draft', createdAt: '2026-01-01T00:00:00Z' }),
+    ];
+    expect(selectPrimaryPr(prs)?.number).toBe(1);
+  });
+
+  it('prefers an unmerged PR over merged and closed ones regardless of age', () => {
+    const prs = [
+      makePR({ number: 1, status: 'merged', createdAt: '2026-01-01T00:00:00Z' }),
+      makePR({ number: 2, status: 'closed', createdAt: '2026-01-02T00:00:00Z' }),
+      makePR({ number: 3, status: 'open', createdAt: '2026-06-01T00:00:00Z' }),
+    ];
+    expect(selectPrimaryPr(prs)?.number).toBe(3);
+  });
+
+  it('tiebreaks equal createdAt by ascending PR number', () => {
+    const prs = [
+      makePR({ number: 9, createdAt: '2026-01-01T00:00:00Z' }),
+      makePR({ number: 4, createdAt: '2026-01-01T00:00:00Z' }),
+    ];
+    expect(selectPrimaryPr(prs)?.number).toBe(4);
+  });
+
+  it('falls back to the latest merged PR by updatedAt when nothing is unmerged', () => {
+    const prs = [
+      makePR({ number: 1, status: 'merged', updatedAt: '2026-01-05T00:00:00Z' }),
+      makePR({ number: 2, status: 'merged', updatedAt: '2026-03-05T00:00:00Z' }),
+      makePR({ number: 3, status: 'closed', updatedAt: '2026-06-05T00:00:00Z' }),
+    ];
+    expect(selectPrimaryPr(prs)?.number).toBe(2);
+  });
+
+  it('tiebreaks equal updatedAt among merged PRs by descending PR number', () => {
+    const prs = [
+      makePR({ number: 4, status: 'merged', updatedAt: '2026-01-05T00:00:00Z' }),
+      makePR({ number: 9, status: 'merged', updatedAt: '2026-01-05T00:00:00Z' }),
+    ];
+    expect(selectPrimaryPr(prs)?.number).toBe(9);
+  });
+
+  it('returns the first remaining row when the pool is closed-only', () => {
+    const prs = [
+      makePR({ number: 7, status: 'closed' }),
+      makePR({ number: 8, status: 'closed' }),
+    ];
+    expect(selectPrimaryPr(prs)?.number).toBe(7);
+  });
+
+  it('sorts unmerged PRs missing createdAt last within the bucket', () => {
+    const prs = [
+      makePR({ number: 1, createdAt: undefined }),
+      makePR({ number: 2, createdAt: '2026-05-01T00:00:00Z' }),
+    ];
+    expect(selectPrimaryPr(prs)?.number).toBe(2);
+  });
+
+  it('sorts merged PRs missing updatedAt last within the bucket', () => {
+    const prs = [
+      makePR({ number: 1, status: 'merged', updatedAt: undefined }),
+      makePR({ number: 2, status: 'merged', updatedAt: '2026-01-01T00:00:00Z' }),
+    ];
+    expect(selectPrimaryPr(prs)?.number).toBe(2);
+  });
+
+  it('tiebreaks by number when timestamps are missing on both sides', () => {
+    const prs = [
+      makePR({ number: 5, createdAt: undefined }),
+      makePR({ number: 3, createdAt: undefined }),
+    ];
+    expect(selectPrimaryPr(prs)?.number).toBe(3);
+  });
+
+  it('selects from a merged branch-linked + monitored pool (monitored-only rows included)', () => {
+    const monitor: PrMonitorRow = {
+      monitorId: 'mon-1',
+      workspaceId: 'ws-1',
+      agentId: 'agent-1',
+      repo: 'acme/widgets',
+      prNumber: 42,
+      state: 'active',
+      pendingChanges: [],
+      hasPendingChanges: false,
+      createdAt: '2026-01-01T00:00:00Z',
+      updatedAt: '2026-01-02T00:00:00Z',
+      title: 'Monitored PR',
+      url: 'https://github.com/acme/widgets/pull/42',
+    };
+    const pool = mergeMonitoredPRs([], [monitor], 'acme/widgets');
+    expect(selectPrimaryPr(pool)?.number).toBe(42);
+    expect(selectPrimaryPr(pool)?.monitorOnly).toBe(true);
+  });
+
+  it('does not mutate the input array', () => {
+    const prs = [
+      makePR({ number: 2, createdAt: '2026-02-01T00:00:00Z' }),
+      makePR({ number: 1, createdAt: '2026-01-01T00:00:00Z' }),
+    ];
+    selectPrimaryPr(prs);
+    expect(prs.map((pr) => pr.number)).toEqual([2, 1]);
+  });
+});
+
+// ─── getPRStatusTooltip (hover status, PROTOCOL §6.9) ──────────────────────────
+
+describe('getPRStatusTooltip', () => {
+  function makePR(overrides: Partial<PRInfo> = {}): PRInfo {
+    return {
+      number: 42,
+      title: 'PR',
+      url: 'https://github.com/acme/widgets/pull/42',
+      htmlUrl: 'https://github.com/acme/widgets/pull/42',
+      status: 'open',
+      ...overrides,
+    };
+  }
+
+  it('returns just the state line when there is no monitor snapshot', () => {
+    expect(getPRStatusTooltip(makePR({ status: 'open' }))).toBe('Open');
+    expect(getPRStatusTooltip(makePR({ status: 'draft' }))).toBe('Draft');
+    expect(getPRStatusTooltip(makePR({ status: 'merged' }))).toBe('Merged');
+    expect(getPRStatusTooltip(makePR({ status: 'closed' }))).toBe('Closed');
+  });
+
+  it('adds a checks line only when the snapshot has checks', () => {
+    const withChecks = getPRStatusTooltip(
+      makePR({
+        monitorSnapshot: makeSnapshot({
+          checks: {
+            total: 3,
+            passed: 2,
+            failed: 1,
+            pending: 0,
+            failingRequired: 0,
+            pendingRequired: 0,
+            requiredKnown: false,
+          },
+        }),
+      }),
+    );
+    expect(withChecks).toContain('Checks: 2 passed, 1 failed, 0 pending');
+
+    const noChecks = getPRStatusTooltip(makePR({ monitorSnapshot: makeSnapshot() }));
+    expect(noChecks).not.toContain('Checks:');
+  });
+
+  it('renders approvals with a needed count when the snapshot specifies one', () => {
+    const tooltip = getPRStatusTooltip(
+      makePR({
+        monitorSnapshot: makeSnapshot({
+          approvals: { decision: 'REVIEW_REQUIRED', have: 1, needed: 2, changesRequested: 0 },
+        }),
+      }),
+    );
+    expect(tooltip).toContain('Approvals: 1 of 2');
+  });
+
+  it('renders approvals without a needed count when none is specified', () => {
+    const tooltip = getPRStatusTooltip(
+      makePR({
+        monitorSnapshot: makeSnapshot({
+          approvals: { decision: 'APPROVED', have: 2, changesRequested: 0 },
+        }),
+      }),
+    );
+    expect(tooltip).toContain('Approvals: 2');
+    expect(tooltip).not.toContain('of');
+  });
+
+  it('includes changes-requested, unresolved threads, and the merge-blocked reason', () => {
+    const tooltip = getPRStatusTooltip(
+      makePR({
+        monitorSnapshot: makeSnapshot({
+          approvals: { decision: 'CHANGES_REQUESTED', have: 0, changesRequested: 2 },
+          threads: { unresolved: 3 },
+          mergeBlockedReason: 'Merge conflict must be resolved',
+        }),
+      }),
+    );
+    expect(tooltip).toContain('Changes requested: 2');
+    expect(tooltip).toContain('Unresolved threads: 3');
+    expect(tooltip).toContain('Merge conflict must be resolved');
+  });
+
+  it('capitalizes a lowercase merge-blocked reason', () => {
+    const tooltip = getPRStatusTooltip(
+      makePR({
+        monitorSnapshot: makeSnapshot({ mergeBlockedReason: 'branch behind base' }),
+      }),
+    );
+    expect(tooltip).toContain('Branch behind base');
+    expect(tooltip).not.toContain('branch behind base');
+  });
+
+  it('omits snapshot detail lines on merged and closed rows', () => {
+    const snapshot = makeSnapshot({
+      approvals: { decision: 'REVIEW_REQUIRED', have: 0, needed: 2, changesRequested: 0 },
+      mergeBlockedReason: 'blocked by required checks or reviews',
+    });
+    expect(getPRStatusTooltip(makePR({ status: 'merged', monitorSnapshot: snapshot }))).toBe(
+      'Merged',
+    );
+    expect(getPRStatusTooltip(makePR({ status: 'closed', monitorSnapshot: snapshot }))).toBe(
+      'Closed',
+    );
+  });
+});
+
+// ─── countOtherMonitors (PROTOCOL §6.9 "+N" indicator) ─────────────────────────
+
+describe('countOtherMonitors', () => {
+  function makeMonitor(overrides: Partial<PrMonitorRow> = {}): PrMonitorRow {
+    return {
+      monitorId: 'mon-1',
+      workspaceId: 'ws-1',
+      agentId: 'agent-1',
+      repo: 'acme/widgets',
+      prNumber: 42,
+      state: 'active',
+      pendingChanges: [],
+      hasPendingChanges: false,
+      createdAt: '2026-08-07T10:00:00Z',
+      updatedAt: '2026-08-07T10:05:00Z',
+      ...overrides,
+    };
+  }
+
+  it('excludes the monitor matching the primary PR in the workspace repo', () => {
+    const monitors = [makeMonitor(), makeMonitor({ monitorId: 'mon-2', prNumber: 7 })];
+    expect(countOtherMonitors(monitors, 42, 'acme', 'widgets')).toBe(1);
+  });
+
+  it('counts a same-number cross-repo monitor as "other"', () => {
+    const monitors = [makeMonitor({ repo: 'other/repo' })];
+    expect(countOtherMonitors(monitors, 42, 'acme', 'widgets')).toBe(1);
+  });
+
+  it('counts all monitors when there is no primary PR', () => {
+    const monitors = [makeMonitor(), makeMonitor({ monitorId: 'mon-2', prNumber: 7 })];
+    expect(countOtherMonitors(monitors, undefined, 'acme', 'widgets')).toBe(2);
+  });
+
+  it('matches by number alone when the workspace repo is unknown', () => {
+    const monitors = [makeMonitor({ repo: 'other/repo' })];
+    expect(countOtherMonitors(monitors, 42, undefined, undefined)).toBe(0);
+  });
+
+  it('returns 0 for no monitors', () => {
+    expect(countOtherMonitors([], 42, 'acme', 'widgets')).toBe(0);
+  });
+
+  it('counts other monitors in a merged-completed fallback pool', () => {
+    const merged = makeSnapshot({ state: 'merged' });
+    const monitors = [
+      makeMonitor({ state: 'completed', lastSnapshot: merged }),
+      makeMonitor({ monitorId: 'mon-2', prNumber: 7, state: 'completed', lastSnapshot: merged }),
+    ];
+    expect(countOtherMonitors(monitors, 42, 'acme', 'widgets')).toBe(1);
+  });
+
+  it('excludes the cross-repo monitor matching a cross-repo primary', () => {
+    const monitors = [
+      makeMonitor({ repo: 'other/repo' }),
+      makeMonitor({ monitorId: 'mon-2', prNumber: 7 }),
+    ];
+    expect(countOtherMonitors(monitors, 42, 'acme', 'widgets', 'other/repo')).toBe(1);
+  });
+
+  it('counts the workspace-repo monitor as "other" when the primary is cross-repo', () => {
+    const monitors = [makeMonitor()];
+    expect(countOtherMonitors(monitors, 42, 'acme', 'widgets', 'other/repo')).toBe(1);
+  });
+});
+
+// ─── toPullRequestStatus (display status → enum projection) ────────────────────
+
+describe('toPullRequestStatus', () => {
+  it('maps each display status to the matching enum value', () => {
+    expect(toPullRequestStatus('open')).toBe(PullRequestStatus.Open);
+    expect(toPullRequestStatus('merged')).toBe(PullRequestStatus.Merged);
+    expect(toPullRequestStatus('closed')).toBe(PullRequestStatus.Closed);
+    expect(toPullRequestStatus('draft')).toBe(PullRequestStatus.Draft);
+  });
+});
+
+// ─── monitorDisplayStatus / monitorPillStatus (pill status fallback) ───────────
+
+describe('monitorDisplayStatus', () => {
+  function makeMonitor(overrides: Partial<PrMonitorRow> = {}): PrMonitorRow {
+    return {
+      monitorId: 'mon-1',
+      workspaceId: 'ws-1',
+      agentId: 'agent-1',
+      repo: 'acme/widgets',
+      prNumber: 42,
+      state: 'active',
+      pendingChanges: [],
+      hasPendingChanges: false,
+      createdAt: '2026-08-07T10:00:00Z',
+      updatedAt: '2026-08-07T10:05:00Z',
+      ...overrides,
+    };
+  }
+
+  it('reads the last-snapshot state case-insensitively', () => {
+    expect(monitorDisplayStatus(makeMonitor({ lastSnapshot: makeSnapshot({ state: 'MERGED' }) })))
+      .toBe('merged');
+    expect(monitorDisplayStatus(makeMonitor({ lastSnapshot: makeSnapshot({ state: 'Closed' }) })))
+      .toBe('closed');
+  });
+
+  it('reports draft from the snapshot flag', () => {
+    expect(
+      monitorDisplayStatus(makeMonitor({ lastSnapshot: makeSnapshot({ isDraft: true }) })),
+    ).toBe('draft');
+  });
+
+  it('defaults active monitors to open and completed ones to closed without a verdict', () => {
+    expect(monitorDisplayStatus(makeMonitor())).toBe('open');
+    expect(monitorDisplayStatus(makeMonitor({ state: 'completed' }))).toBe('closed');
+  });
+});
+
+describe('monitorPillStatus', () => {
+  function makeMonitor(overrides: Partial<PrMonitorRow> = {}): PrMonitorRow {
+    return {
+      monitorId: 'mon-1',
+      workspaceId: 'ws-1',
+      agentId: 'agent-1',
+      repo: 'acme/widgets',
+      prNumber: 42,
+      state: 'active',
+      pendingChanges: [],
+      hasPendingChanges: false,
+      createdAt: '2026-08-07T10:00:00Z',
+      updatedAt: '2026-08-07T10:05:00Z',
+      ...overrides,
+    };
+  }
+
+  it('maps a merged completed monitor to PullRequestStatus.Merged', () => {
+    const monitor = makeMonitor({
+      state: 'completed',
+      lastSnapshot: makeSnapshot({ state: 'merged' }),
+    });
+    expect(monitorPillStatus(monitor)).toBe(PullRequestStatus.Merged);
+  });
+
+  it('maps closed, draft, and open display states to the matching enum values', () => {
+    expect(
+      monitorPillStatus(makeMonitor({ lastSnapshot: makeSnapshot({ state: 'closed' }) })),
+    ).toBe(PullRequestStatus.Closed);
+    expect(
+      monitorPillStatus(makeMonitor({ lastSnapshot: makeSnapshot({ isDraft: true }) })),
+    ).toBe(PullRequestStatus.Draft);
+    expect(monitorPillStatus(makeMonitor())).toBe(PullRequestStatus.Open);
   });
 });

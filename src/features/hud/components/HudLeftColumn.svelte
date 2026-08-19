@@ -52,6 +52,9 @@
   // WORKSPACE STATS — the SAME buckets the header counters use (IDLE,
   // PROGRESS, ATTENTION, PR OPEN, PR MERGED, FAILED, COMPLETED) so header,
   // left bars, and grid all agree — canonical HUD_STATE_COLORS tokens.
+  // WAITING is the orthogonal overlay row (`workspace.waiting`): its count
+  // double-counts with the state buckets, uses the grey/idle token, and
+  // never blinks — waiting is not a call to action.
   const workspaceBars = $derived([
     {
       label: m.hud_workspaceState_idle_label(),
@@ -68,6 +71,12 @@
       label: m.hud_workspaceState_progress_label(),
       count: $workspaceBars$.progress,
       color: HUD_STATE_COLORS.running,
+    },
+    {
+      label: m.hud_workspaceState_waiting_label(),
+      count: $workspaceBars$.waiting,
+      color: HUD_STATE_COLORS.idle,
+      testId: 'hud-workspace-bar-waiting',
     },
     // ATTENTION and FAILED blink on their OWN displayed counts (like the
     // footer's hud-stat-blink gating) — static at zero, so a failed fleet
@@ -108,9 +117,7 @@
   <HudPanel title={m.hud_system_title()}>
     {#snippet meta()}
       <span class="hud-system-meta">
-        {$workspaceBars$.attention > 0 ||
-        $workspaceBars$.failed > 0 ||
-        $agentCounts$.failed > 0
+        {$workspaceBars$.attention > 0 || $workspaceBars$.failed > 0 || $agentCounts$.failed > 0
           ? m.hud_system_fail_label()
           : m.hud_system_pass_label()}
       </span>
@@ -143,7 +150,7 @@
     font:
       500 9px 'JetBrains Mono',
       monospace;
-    color: hsl(var(--text-ghost));
+    color: hsl(var(--muted-foreground) / 0.65);
   }
   .hud-attention-slot {
     flex: 1;

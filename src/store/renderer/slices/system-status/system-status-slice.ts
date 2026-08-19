@@ -1,5 +1,4 @@
-import { createAction } from "$lib/store-shim/utils/store/create-action";
-import { createReducer } from "$lib/store-shim/utils/store/create-reducer";
+import { createReducer } from "@augmentcode/themis/utils/store/create-reducer";
 
 export type SystemStatusState = {
   nodeVersionOk: boolean | null;
@@ -15,14 +14,4 @@ export const initialState: SystemStatusState = {
   binaryInstallAvailable: false,
 };
 
-export const setSystemStatus = createAction<[status: SystemStatusState]>(
-  "systemStatus/setSystemStatus"
-);
-
-export const systemStatusReducer = createReducer<SystemStatusState>(initialState).with(
-  setSystemStatus,
-  (state, { payload: [status] }) => ({
-    ...state,
-    ...status,
-  })
-);
+export const systemStatusReducer = createReducer<SystemStatusState>(initialState);

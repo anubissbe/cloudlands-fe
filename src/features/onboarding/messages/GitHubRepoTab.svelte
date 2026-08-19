@@ -1,10 +1,12 @@
 <script lang="ts">
   /**
-   * GitHubRepoTab — GitHub repository clone for onboarding.
+   * GitHubRepoTab — GitHub repository picker for onboarding.
    *
-   * URL input + clone path picker, with a live list of the user's own
-   * repositories sourced from the `github-repos` Redux slice and a
-   * debounced global GitHub repo search powered by `github-repo-search`.
+   * URL input with a live list of the user's own repositories sourced from
+   * the `github-repos` Redux slice and a debounced global GitHub repo search
+   * powered by `github-repo-search`. There is no clone-destination control:
+   * the daemon owns the checkout location for picked repos (same picked-repo
+   * flow as CompactWorkspaceInitializer).
    *
    * The owner/repo input drives two things at once:
    *   1. A client-side filter over the cached list of the user's own repos
@@ -20,10 +22,8 @@
   import { cn } from '$lib/utils';
   import { createLogger } from '$lib/utils/client-logger';
   import { shell } from '$lib/electron-bridge';
-  import Input from '$lib/components/ui/input/input.svelte';
+  import { Input } from '$lib/components/ui/input';
   import GitHubAuthBanner from '$lib/components/GitHubAuthBanner.svelte';
-  import DirectoryPickerModal from './DirectoryPickerModal.svelte';
-  import { pickDirectory } from '$lib/directory-picker-service';
 
   import { initializeGitHubAuth } from '$store/renderer/slices/github-auth/github-auth-slice';
   import { selectGitHubAuthIsAuthenticated } from '$store/renderer/slices/github-auth/github-auth-selectors';
@@ -43,9 +43,8 @@
     selectGithubRepoSearchLoading,
     selectGithubRepoSearchResults,
   } from '$store/renderer/slices/github-repo-search/github-repo-search-selectors';
-  import { selectWorkspaceInitializerDefaultParentPath } from '$store/renderer/slices/workspace-initializer/workspace-initializer-selectors';
   import { faGithub } from '@fortawesome/free-brands-svg-icons';
-  import { faArrowUpRightFromSquare, faFolder, faSpinner } from '@fortawesome/free-solid-svg-icons';
+  import { faArrowUpRightFromSquare, faSpinner } from '@fortawesome/free-solid-svg-icons';
   import Fa from 'svelte-fa';
   import { store as appStore } from '$store/renderer/store';
 
@@ -53,25 +52,14 @@
 
   interface Props {
     githubUrl: string;
-    clonePath: string;
-    /** Pre-flight validation error for the computed clone target (owned by the parent) */
-    cloneDirError?: string;
     onGithubUrlChange: (url: string) => void;
-    onClonePathChange: (path: string) => void;
     /** Called when user presses Enter - should select AND advance to next step */
     onSelectAndAdvance?: (url: string) => void;
   }
 
   // Submit/continue is handled by the unified button at the bottom of the
   // onboarding flow (see `+page.svelte`). This tab only collects data.
-  let {
-    githubUrl,
-    clonePath,
-    cloneDirError,
-    onGithubUrlChange,
-    onClonePathChange,
-    onSelectAndAdvance,
-  }: Props = $props();
+  let { githubUrl, onGithubUrlChange, onSelectAndAdvance }: Props = $props();
 
   const isAuthenticated$ = selectGitHubAuthIsAuthenticated();
   const repos$ = selectGithubRepos();
@@ -81,8 +69,8 @@
   const searchResults$ = selectGithubRepoSearchResults();
   const searchLoading$ = selectGithubRepoSearchLoading();
   const searchLastQuery$ = selectGithubRepoSearchLastQuery();
-  const defaultParentPath$ = selectWorkspaceInitializerDefaultParentPath();
 
+  // svelte-ignore state_referenced_locally - intentional: seed the editable input from the prop at mount (component re-mounts per tab switch)
   let githubInput = $state(githubUrl.replace(/^https?:\/\/github\.com\//, ''));
 
   /**
@@ -194,51 +182,6 @@
     }
   });
 
-  /** Default base directory for cloned repos, hydrated through Redux persistence. */
-  const defaultCloneBase = $derived($defaultParentPath$ || '~/Developer');
-
-  /** Repo-name segment of a GitHub URL (mirrors ProjectPickerMessage.buildSelection). */
-  function repoNameFromUrl(url: string): string | undefined {
-    return url.match(/github\.com\/[^/]+\/([^/\s#?]+)/i)?.[1]?.replace(/\.git$/, '');
-  }
-
-  /** Strips a trailing `/repoName` segment so full clone paths hydrated from
-   *  persisted selections (base + repo name, see buildSelection) compare and
-   *  swap against their base directory rather than the full path. */
-  function stripRepoSegment(path: string, repoName: string | undefined): string {
-    return repoName && path.endsWith(`/${repoName}`) ? path.slice(0, -(repoName.length + 1)) : path;
-  }
-
-  /**
-   * Whether the user explicitly chose a clone destination (#823). Repo
-   * selection and owner/repo typing only auto-fill the default base while
-   * the path is untouched, so a user-picked parent directory survives
-   * selecting or switching repos. Initialized from the prop because this
-   * component remounts on tab switches ({#key activeTab} in the parent)
-   * while the clonePath state lives in ProjectPickerMessage; hydrated full
-   * clone paths (base + repo name) count as untouched when their base is the
-   * default. Capturing the initial values only is intentional, hence the
-   * svelte-ignore.
-   */
-  // svelte-ignore state_referenced_locally
-  let clonePathDirty = $state(
-    !!clonePath && stripRepoSegment(clonePath, repoNameFromUrl(githubUrl)) !== defaultCloneBase,
-  );
-
-  /** On repo selection/typing: fill the default base while untouched; for a
-   *  user-chosen path, only swap out a stale repo-name suffix (hydrated full
-   *  paths) so buildSelection appends the new repo name without nesting. */
-  function updateCloneBase(previousRepoName: string | undefined) {
-    if (!clonePathDirty) {
-      onClonePathChange(defaultCloneBase);
-    } else {
-      const base = stripRepoSegment(clonePath, previousRepoName);
-      if (base !== clonePath) {
-        onClonePathChange(base);
-      }
-    }
-  }
-
   function handleInputChange(value: string) {
     // Strip full URL prefix if user pastes a full URL
     let cleaned = value.replace(/^https?:\/\/github\.com\//, '');
@@ -247,17 +190,7 @@
     githubInput = cleaned;
 
     if (cleaned) {
-      const previousRepoName = repoNameFromUrl(githubUrl);
       onGithubUrlChange(`https://github.com/${cleaned}`);
-
-      // Auto-fill clone path when input looks like owner/repo
-      const parts = cleaned.split('/');
-      if (parts.length >= 2 && parts[0] && parts[1]) {
-        const repoName = parts[1].split(/[?#]/)[0]; // strip query/hash
-        if (repoName) {
-          updateCloneBase(previousRepoName);
-        }
-      }
     } else {
       onGithubUrlChange('');
     }
@@ -297,36 +230,11 @@
     }
   }
 
-  let pickerOpen = $state(false);
-
-  function handleSelectCloneFolder() {
-    void pickDirectory({
-      title: m.onboarding_githubRepoTab_selectCloneDest_title(),
-      defaultPath: clonePath || defaultCloneBase,
-      openModal: () => (pickerOpen = true),
-      onSelect: handlePickerSelect,
-    });
-  }
-
-  function handlePickerSelect(pickedPath: string) {
-    pickerOpen = false;
-    try {
-      onClonePathChange(pickedPath);
-      clonePathDirty = true;
-    } catch (err) {
-      logger.error('Failed to select clone folder', err);
-    }
-  }
-
   /** Click-to-select from the repo list. Notifies the parent of the
    *  selection without changing the search input so the user can keep
-   *  browsing. Also auto-fills the clone path with a sensible default —
-   *  unless the user already chose a destination (#823). */
+   *  browsing. */
   function handleSelectRepo(repo: GithubRepoItem) {
-    const previousRepoName = repoNameFromUrl(githubUrl);
-    const path = `${repo.owner}/${repo.name}`;
-    onGithubUrlChange(`https://github.com/${path}`);
-    updateCloneBase(previousRepoName);
+    onGithubUrlChange(`https://github.com/${repo.owner}/${repo.name}`);
   }
 
   /** User-initiated refresh (also drives the error "Try again" action). The
@@ -360,18 +268,14 @@
 
 <div class="space-y-3">
   <div class="w-full flex space-between items-center">
-    <p class="text-base text-muted-foreground pb-3 flex-1">{m.onboarding_githubRepoTab_clone_description()}</p>
+    <p class="text-base text-muted-foreground pb-3 flex-1">
+      {m.onboarding_githubRepoTab_clone_description()}
+    </p>
   </div>
-  <!--
-    Top row: GitHub URL input + clone destination picker, horizontally
-    stacked. The two controls share a single row so picking a repo and
-    picking where it goes feels like one decision rather than two
-    disconnected steps. `items-stretch` keeps both children the same
-    height regardless of which one has the taller content.
-  -->
+  <!-- GitHub URL input — the only control; the daemon owns the checkout location. -->
   <div class="flex items-stretch gap-2">
     <div
-      class="flex-1 flex items-center rounded-lg py-1 border border-border/50 bg-card/50 overflow-hidden"
+      class="flex-1 flex items-center rounded-lg py-1 border border-border bg-card/50 overflow-hidden focus-within:border-ring"
     >
       <Fa icon={faGithub} class="ml-3 text-muted-foreground" />
       <!-- i18n-ignore (domain name prefix) -->
@@ -407,7 +311,7 @@
     <GitHubAuthBanner message={m.onboarding_githubRepoTab_signIn_description()} />
   {:else if $reposError$}
     <div
-      class="rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2.5 text-xs text-destructive-foreground space-y-2"
+      class="rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2.5 text-xs text-error-foreground space-y-2"
     >
       <p>{m.onboarding_githubRepoTab_loadFailed_error({ error: $reposError$ })}</p>
       <button
@@ -428,7 +332,7 @@
       class="max-h-70 overflow-y-auto -mx-1 px-1"
     >
       {#if combinedRepos.length > 0}
-        <div class="divide-y divide-border/10">
+        <div class="divide-y divide-border">
           {#each combinedRepos as repo, index (repo.id)}
             {@const isFocused = index === focusedIndex}
             {@const isCommitted = githubUrl === `https://github.com/${repo.owner}/${repo.name}`}
@@ -479,8 +383,14 @@
                   if (e.key === 'Enter')
                     openInBrowser(`https://github.com/${repo.owner}/${repo.name}`, e);
                 }}
-                title={m.onboarding_githubRepoTab_openOnGithub_tooltip({ owner: repo.owner, name: repo.name })}
-                aria-label={m.onboarding_githubRepoTab_openOnGithub_tooltip({ owner: repo.owner, name: repo.name })}
+                title={m.onboarding_githubRepoTab_openOnGithub_tooltip({
+                  owner: repo.owner,
+                  name: repo.name,
+                })}
+                aria-label={m.onboarding_githubRepoTab_openOnGithub_tooltip({
+                  owner: repo.owner,
+                  name: repo.name,
+                })}
               >
                 <Fa icon={faArrowUpRightFromSquare} size="xs" />
               </span>
@@ -509,39 +419,3 @@
     </div>
   {/if}
 </div>
-
-<!--
-      Store location picker — horizontally stacked with the URL input.
-      Compact one-line layout so it fits in the row without dominating
-      the space. Clicking opens the picker appropriate for the daemon locality.
-    -->
-<button
-  type="button"
-  class="mt-6 flex items-center gap-2 px-3 rounded-lg transition-colors cursor-pointer text-left shrink-0"
-  onclick={handleSelectCloneFolder}
-  aria-label={m.onboarding_githubRepoTab_chooseCloneDest_ariaLabel()}
-  title={m.onboarding_githubRepoTab_whereToClone_tooltip()}
->
-  <Fa icon={faFolder} class="text-subtle/50 shrink-0 -mb-px" size={20} />
-  <span class="text-sm text-muted-foreground whitespace-nowrap">{m.onboarding_githubRepoTab_storeRepoIn_before()}</span>
-  <span
-    class="text-sm font-medium truncate max-w-40 {clonePath
-      ? 'text-foreground'
-      : 'text-muted-foreground'}"
-  >
-    {clonePath ? clonePath.replace(/^\/Users\/[^/]+/, '~') : m.onboarding_githubRepoTab_selectFolder_label()}
-  </span>
-</button>
-
-{#if cloneDirError}
-  <p class="text-sm text-red-500 px-1 mt-2">{cloneDirError}</p>
-{/if}
-
-<DirectoryPickerModal
-  open={pickerOpen}
-  title={m.onboarding_githubRepoTab_selectCloneDest_title()}
-  initialPath={clonePath || defaultCloneBase}
-  selectLabel={m.onboarding_githubRepoTab_selectFolder_label()}
-  onSelect={handlePickerSelect}
-  onClose={() => (pickerOpen = false)}
-/>

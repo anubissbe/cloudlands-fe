@@ -25,7 +25,7 @@
   import {
     faCheck,
     faChevronDown,
-    faChevronRight,
+    faChevronLeft,
     faCloud,
     faExclamationTriangle,
     faRotate,
@@ -132,6 +132,14 @@
   let searchValue = $state('');
   let debouncedSearchValue = $state('');
   let searchDebounceTimer: NodeJS.Timeout | null = null;
+  // Server-side prefix search (GitHub repos only): branches matching the
+  // typed prefix beyond the daemon's first page (`github.branches.list`
+  // `prefix` param, PROTOCOL §5.27). Merged into the displayed list; the
+  // unfiltered `branches` state stays untouched so clearing the search
+  // restores today's first-page view.
+  let githubSearchBranches: string[] = $state([]);
+  // Guards out-of-order prefix-search responses (only the latest wins).
+  let githubSearchRequestId = 0;
   // Using 'any' because this binds to a Svelte Input component, not a native HTMLInputElement
   // The Input component exports focus() and select() methods that we use
   let searchInputElement: any = $state(null);
@@ -339,6 +347,11 @@
       currentFetchAbortController = null;
     }
 
+    // Surface the loading state for the entire waiting window, including the
+    // debounce delay before the fetch actually starts.
+    isLoading = true;
+    error = null;
+
     fetchBranchesDebounceTimer = setTimeout(() => {
       fetchBranchesDebounceTimer = null;
       fetchBranches();
@@ -386,6 +399,8 @@
         showRemoteBranches = false;
         hasAttemptedRemoteFetch = false; // Reset so we can fetch for new repo
         githubAuthNeeded = 'none'; // Reset auth state for new repo
+        githubSearchRequestId++; // Discard in-flight prefix searches from the previous repo
+        githubSearchBranches = []; // Drop prefix-search results from the previous repo
         error = null;
         resetBranchStatus(); // Reset stale branch status from previous repo
 
@@ -395,6 +410,7 @@
         branches = [];
         internalSelectedBranch = '';
         defaultBranch = '';
+        isLoading = false;
       }
     }
   });
@@ -413,8 +429,47 @@
     }
   }
 
+  /**
+   * GitHub-path selection order: value prop, then the repo's saved branch,
+   * then the default branch, then the first available branch. Shared by the
+   * cached-first paint and the authoritative GitHub API path.
+   */
+  function applyGithubBranchSelection() {
+    // If value prop is provided, trust it (e.g., for remote branches like origin/...)
+    if (value) {
+      // Value prop is the source of truth - don't override it
+      setInternalBranch(value);
+      return;
+    }
+    // Look up saved branch for THIS repo from Redux (not from stale selectedBranch)
+    const savedBranchForRepo = getSavedBranchForRepo(repoPath);
+    if (
+      savedBranchForRepo &&
+      (branches.includes(savedBranchForRepo) || remoteBranches.includes(savedBranchForRepo))
+    ) {
+      // Saved branch exists (in local or remote branches), use it
+      setInternalBranch(savedBranchForRepo);
+    } else if (defaultBranch && branches.includes(defaultBranch)) {
+      // Fall back to default branch
+      setInternalBranch(defaultBranch);
+    } else {
+      // Last resort: use first available branch
+      setInternalBranch(branches[0]);
+    }
+  }
+
   async function fetchBranches() {
-    if (!repoPath) return;
+    if (!repoPath) {
+      isLoading = false;
+      return;
+    }
+
+    // Abort any in-flight fetch first (e.g. a refresh clicked while the
+    // authoritative request is still active after a cached-first paint) so a
+    // superseded request can never overwrite this fetch's results.
+    if (currentFetchAbortController) {
+      currentFetchAbortController.abort();
+    }
 
     // Create a new abort controller for this fetch
     const abortController = new AbortController();
@@ -459,6 +514,7 @@
           }
         }
         notifyBranchesLoaded();
+        isLoading = false;
         return;
       }
     }
@@ -497,6 +553,13 @@
     }
 
     let fetchSucceeded = false;
+    // Cached-first paint state for the GitHub path (`github.branches.listCached`).
+    let cachedListingApplied = false;
+    let cachedAutoSelectedBranch = '';
+    // Captured before the cached paint: its auto-selection persists via
+    // saveBranchForRepo, so the live saved value is clobbered by then.
+    let savedBranchBeforeCachedPaint = '';
+    let freshListingSettled = false;
 
     try {
       // Simulate network delay if enabled
@@ -553,6 +616,36 @@
         }
         const [, owner, repo] = match;
 
+        // Cached-first paint (`github.branches.listCached`, PROTOCOL §5.27):
+        // refs from the daemon's local repo cache — or its one-round-trip
+        // `git ls-remote` fallback on a cache miss (`source: "ls-remote"`) —
+        // render instantly while the authoritative GitHub API list loads in
+        // parallel. The seam folds failures to a cold-cache miss, so this
+        // never surfaces an error.
+        void appClient.integrations.githubBranchesCached(owner, repo).then((cachedListing) => {
+          // A superseded fetch must not clobber a newer repo's state, and the
+          // authoritative list wins once it has settled (either way).
+          if (abortController.signal.aborted || freshListingSettled) return;
+          // Paint whatever branches came back (warm cache OR ls-remote
+          // fallback); an empty listing keeps today's behavior (skeleton
+          // until the API responds).
+          if (cachedListing.branches.length === 0) return;
+          branches = cachedListing.branches;
+          defaultBranch = cachedListing.defaultBranch || '';
+          isLoading = false;
+          cachedListingApplied = true;
+          savedBranchBeforeCachedPaint = getSavedBranchForRepo(repoPath);
+          applyGithubBranchSelection();
+          cachedAutoSelectedBranch = internalSelectedBranch;
+          notifyBranchesLoaded();
+          logger.debug('Rendered cached branches via github.branches.listCached', {
+            owner,
+            repo,
+            count: cachedListing.branches.length,
+            source: cachedListing.source,
+          });
+        });
+
         // URL-only GitHub repo (no local clone to ask git): the daemon lists
         // remote branch names via `github.branches.list` and the default
         // branch via `github.repos.get` (PROTOCOL §5.27). There is no direct
@@ -565,6 +658,7 @@
             logger.debug('Branch fetch aborted after response');
             return;
           }
+          freshListingSettled = true;
           branches = listing.branches;
           defaultBranch = listing.defaultBranch || '';
           githubAuthNeeded = 'none';
@@ -575,6 +669,7 @@
             count: branches.length,
           });
         } catch (githubError) {
+          freshListingSettled = true;
           const message = githubError instanceof Error ? githubError.message : String(githubError);
           // The daemon reports a missing/failed GitHub token as
           // "GitHub is not configured." (§5.27 error conventions).
@@ -606,26 +701,33 @@
       // For GitHub repos, ensure a valid branch is selected
       // (Local repos already handle this above)
       if (effectiveRepoType === 'github' && branches.length > 0) {
-        // If value prop is provided, trust it (e.g., for remote branches like origin/...)
-        if (value) {
-          // Value prop is the source of truth - don't override it
-          setInternalBranch(value);
-        } else {
-          // Look up saved branch for THIS repo from Redux (not from stale selectedBranch)
-          const savedBranchForRepo = getSavedBranchForRepo(repoPath);
-          if (
-            savedBranchForRepo &&
-            (branches.includes(savedBranchForRepo) || remoteBranches.includes(savedBranchForRepo))
-          ) {
-            // Saved branch exists (in local or remote branches), use it
-            setInternalBranch(savedBranchForRepo);
-          } else if (defaultBranch && branches.includes(defaultBranch)) {
-            // Fall back to default branch
-            setInternalBranch(defaultBranch);
+        if (cachedListingApplied && !value) {
+          // Reconcile the cached-first selection against the authoritative
+          // list. A selection the user made after the cached paint is kept
+          // unless it vanished; an auto-selected one re-runs the documented
+          // saved → default → first order (a stale cache may have lacked the
+          // saved branch). setInternalBranch fires onchange and persists —
+          // never leave a vanished branch selected.
+          if (internalSelectedBranch && internalSelectedBranch !== cachedAutoSelectedBranch) {
+            if (!branches.includes(internalSelectedBranch)) {
+              setInternalBranch(
+                defaultBranch && branches.includes(defaultBranch) ? defaultBranch : branches[0],
+              );
+            }
           } else {
-            // Last resort: use first available branch
-            setInternalBranch(branches[0]);
+            // Use the saved value captured BEFORE the cached paint — the
+            // cached auto-selection persisted itself via saveBranchForRepo.
+            const saved = savedBranchBeforeCachedPaint;
+            const preferred =
+              saved && (branches.includes(saved) || remoteBranches.includes(saved))
+                ? saved
+                : defaultBranch && branches.includes(defaultBranch)
+                  ? defaultBranch
+                  : branches[0];
+            if (internalSelectedBranch !== preferred) setInternalBranch(preferred);
           }
+        } else {
+          applyGithubBranchSelection();
         }
       }
 
@@ -637,6 +739,13 @@
       if (err instanceof Error && err.name === 'AbortError') {
         logger.debug('Branch fetch aborted in outer catch (superseded by newer request)');
         return; // Exit silently - a newer fetch is in progress
+      }
+
+      // A superseded fetch must not overwrite the newer fetch's state with an
+      // error/empty list (e.g. a refresh started while this one was in flight).
+      if (abortController.signal.aborted) {
+        logger.debug('Branch fetch aborted; skipping error-state write');
+        return;
       }
 
       // Normalize error for logging - ensure we have an Error instance
@@ -704,10 +813,11 @@
       // the user can still type a branch name manually.
       branches = [];
     } finally {
-      isLoading = false;
       performanceMonitor.end(`fetchBranches-${repoPath}`);
-      // Clear the abort controller if this was the current fetch
+      // Only clear the loading state if this was the current fetch — a stale
+      // aborted fetch must not clear the loading state of a newer scheduled one
       if (currentFetchAbortController === abortController) {
+        isLoading = false;
         currentFetchAbortController = null;
       }
     }
@@ -858,7 +968,7 @@
    */
   function setInternalBranch(branchName: string) {
     internalSelectedBranch = branchName;
-    searchValue = '';
+    clearSearch();
     // Notify parent so form validation knows about the auto-selected default
     logger.debug('setInternalBranch called', {
       branchName,
@@ -888,7 +998,7 @@
    */
   function selectBranch(branch: string, keepSkipIsolation = false) {
     internalSelectedBranch = branch;
-    searchValue = '';
+    clearSearch();
     try {
       if (typeof onchange === 'function') {
         onchange(new CustomEvent('change', { detail: { branch } }));
@@ -928,6 +1038,20 @@
     searchDebounceTimer = setTimeout(() => {
       debouncedSearchValue = value;
     }, 100); // 100ms debounce for smoother experience
+  }
+
+  /**
+   * Reset the search box AND its debounced mirror — a pending debounce tick
+   * or a lingering debounced value would otherwise keep the filtered view
+   * (and the server-side prefix results) active behind a blank search field.
+   */
+  function clearSearch() {
+    searchValue = '';
+    if (searchDebounceTimer) {
+      clearTimeout(searchDebounceTimer);
+      searchDebounceTimer = null;
+    }
+    debouncedSearchValue = '';
   }
 
   async function handleRefresh() {
@@ -995,7 +1119,8 @@
     } catch (err) {
       logger.error('Failed to connect GitHub', err);
       isConnectingGitHub = false;
-      error = err instanceof Error ? err.message : m.workspace_branchSelector_githubConnectFailed_error();
+      error =
+        err instanceof Error ? err.message : m.workspace_branchSelector_githubConnectFailed_error();
     }
   }
 
@@ -1086,6 +1211,60 @@
     }
   });
 
+  /**
+   * Owner/repo for the prefix search — the same GitHub URL (or shorthand
+   * `owner/repo` repoPath) parsing fetchBranches applies.
+   */
+  function parseGithubOwnerRepo(): { owner: string; repo: string } | null {
+    // `||` (not `??`): fetchBranches treats an empty githubUrl as absent and
+    // reconstructs it from a shorthand repoPath (lines 541-546) — match that.
+    const url =
+      githubUrl ||
+      (repoPath && /^[a-zA-Z0-9_-]+\/[a-zA-Z0-9._-]+$/.test(repoPath)
+        ? `https://github.com/${repoPath}`
+        : undefined);
+    const match = url?.match(/github\.com\/([^\/]+)\/([^\/\.]+)/);
+    return match ? { owner: match[1], repo: match[2] } : null;
+  }
+
+  // Server-side prefix search: when the user types in a GitHub repo's search
+  // box, ask the daemon for branches matching the prefix
+  // (`github.branches.list` `prefix` param, PROTOCOL §5.27) so branches
+  // beyond the first page become findable. Clearing the search drops the
+  // results (no empty-prefix request) and resets to the first-page view.
+  // Failures are silent — the already-loaded first page still filters
+  // locally.
+  $effect(() => {
+    const prefix = debouncedSearchValue.trim();
+    if (repoType !== 'github' || !prefix) {
+      githubSearchRequestId++; // Discard any in-flight response
+      githubSearchBranches = [];
+      return;
+    }
+    const parsed = parseGithubOwnerRepo();
+    if (!parsed) {
+      // Same as the clear branch: without the bump, a still-in-flight request
+      // from a previous run could land later and repopulate the results.
+      githubSearchRequestId++;
+      githubSearchBranches = [];
+      return;
+    }
+    const requestId = ++githubSearchRequestId;
+    // Drop the previous prefix's results immediately: while the new request
+    // is in flight (or if it fails), only the loaded first page may match —
+    // stale beyond-page branches must not linger under a different prefix.
+    githubSearchBranches = [];
+    void appClient.integrations
+      .githubBranches(parsed.owner, parsed.repo, prefix)
+      .then((listing) => {
+        if (requestId !== githubSearchRequestId) return; // Superseded by a newer prefix
+        githubSearchBranches = listing.branches;
+      })
+      .catch(() => {
+        // Silent: the unfiltered first page keeps filtering locally.
+      });
+  });
+
   // Helper to identify Dependabot branches
   function isDependabotBranch(branch: string): boolean {
     return branch.startsWith('dependabot/');
@@ -1149,9 +1328,19 @@
     return false;
   }
 
+  // View source for the dropdown lists: the unfiltered first page merged
+  // with the server-side prefix-search results, deduped (first-page branches
+  // keep their listing order). The `branches` state stays untouched so
+  // clearing the search restores today's first-page view.
+  const displayBranches = $derived(
+    githubSearchBranches.length > 0
+      ? [...branches, ...githubSearchBranches.filter((b) => !branches.includes(b))]
+      : branches,
+  );
+
   // Separate regular, dependabot, and workspace branches
   const regularBranches = $derived(
-    branches
+    displayBranches
       .filter(
         (b) =>
           !isWorkspaceBranch(b) &&
@@ -1169,7 +1358,7 @@
   );
 
   const dependabotBranches = $derived(
-    branches
+    displayBranches
       .filter(
         (b) =>
           isDependabotBranch(b) && b.toLowerCase().includes(debouncedSearchValue.toLowerCase()),
@@ -1178,7 +1367,7 @@
   );
 
   const workspaceBranches = $derived(
-    branches
+    displayBranches
       .filter(
         (b) => isWorkspaceBranch(b) && b.toLowerCase().includes(debouncedSearchValue.toLowerCase()),
       )
@@ -1239,16 +1428,22 @@
           {/if}
           <span class="flex-1 text-left truncate min-w-0">
             {#if githubAuthNeeded === 'not-authenticated'}
-              <span class="text-orange-500">{m.workspace_branchSelector_connectGithub_label()}</span>
+              <span class="text-orange-500">{m.workspace_branchSelector_connectGithub_label()}</span
+              >
             {:else if skipIsolation && selectedBranch}
               <span>{selectedBranch}</span>
-              <span class="text-sm opacity-75 ml-1">{m.workspace_branchSelector_noIsolation_label({ isolationLabel })}</span>
+              <span class="text-sm opacity-75 ml-1"
+                >{m.workspace_branchSelector_noIsolation_label({ isolationLabel })}</span
+              >
             {:else if selectedBranch}
               <span>{selectedBranch}</span>
             {:else if !repoPath}
               <span>{m.workspace_branchSelector_selectRepoFirst_label()}</span>
             {:else if isLoading}
-              <span class="inline-block h-4 w-24 bg-muted rounded animate-pulse"></span>
+              <Fa icon={faSpinner} class="text-ghost animate-spin" size="sm" />
+              <span class="sr-only"
+                >{m.workspace_compactInitializer_waitingBranchSelection_label()}</span
+              >
             {:else}
               <span>{m.workspace_branchSelector_selectBranch_label()}</span>
             {/if}
@@ -1277,7 +1472,9 @@
       >
         <!-- Header -->
         <div class="px-4 pt-2 pb-3">
-          <h2 class="text-base font-semibold text-foreground">{m.workspace_branchSelector_whichBranch_label()}</h2>
+          <h2 class="text-base font-semibold text-foreground">
+            {m.workspace_branchSelector_whichBranch_label()}
+          </h2>
           <p class="text-sm text-subtle mt-1">
             {description || m.workspace_branchSelector_whichBranch_description()}
           </p>
@@ -1315,7 +1512,13 @@
               class="flex-1 border-0 bg-sidebar"
               noFocusStyle
             />
-            <Button onclick={handleRefresh} variant="ghost-light" size="icon" disabled={isLoading}>
+            <Button
+              onclick={handleRefresh}
+              variant="ghost-light"
+              size="icon"
+              disabled={isLoading}
+              aria-label={m.workspace_branchSelector_refreshBranches_ariaLabel()}
+            >
               <Fa icon={faRotate} class={isLoading ? 'animate-spin' : ''} />
             </Button>
           </div>
@@ -1354,8 +1557,12 @@
                 />
               </svg>
               <div class="flex-1 min-w-0">
-                <p class="text-sm font-medium text-foreground">{m.workspace_branchSelector_connectWithGithub_label()}</p>
-                <p class="text-sm text-subtle">{m.workspace_branchSelector_connectWithGithub_description()}</p>
+                <p class="text-sm font-medium text-foreground">
+                  {m.workspace_branchSelector_connectWithGithub_label()}
+                </p>
+                <p class="text-sm text-subtle">
+                  {m.workspace_branchSelector_connectWithGithub_description()}
+                </p>
               </div>
             </button>
           {:else if isConnectingGitHub}
@@ -1363,14 +1570,18 @@
             <div class="px-3 py-3 flex items-center gap-3 border-l-2 border-primary bg-primary/5">
               <Fa icon={faSpinner} class="w-5 h-5 text-ghost animate-spin" />
               <div class="flex-1 min-w-0">
-                <p class="text-sm font-medium text-foreground">{m.workspace_branchSelector_connectingGithub_label()}</p>
-                <p class="text-sm text-subtle">{m.workspace_branchSelector_completeAuth_description()}</p>
+                <p class="text-sm font-medium text-foreground">
+                  {m.workspace_branchSelector_connectingGithub_label()}
+                </p>
+                <p class="text-sm text-subtle">
+                  {m.workspace_branchSelector_completeAuth_description()}
+                </p>
               </div>
             </div>
           {:else if githubAuthNeeded === 'no-access'}
             <!-- User is authenticated but doesn't have access -->
             <div class="px-2 py-2 border-l-2 border-destructive bg-destructive/10">
-              <div class="text-sm text-destructive-foreground">
+              <div class="text-sm text-error-foreground">
                 {m.workspace_branchSelector_noAccess_error()}
               </div>
               <div class="text-sm text-subtle mt-1">
@@ -1379,7 +1590,7 @@
             </div>
           {:else if error}
             <div class="px-2 py-2 border-l-2 border-destructive bg-destructive/10">
-              <div class="text-sm text-destructive-foreground">{error}</div>
+              <div class="text-sm text-error-foreground">{error}</div>
               {#if repoType === 'github'}
                 <div class="text-sm text-subtle mt-1">
                   {m.workspace_branchSelector_typeManually_description()}
@@ -1420,10 +1631,14 @@
                     <span class="text-sm truncate flex-1">{branch}</span>
                     <div class="flex items-center gap-1 ml-2 shrink-0">
                       {#if branch === currentBranch && branch !== defaultBranch}
-                        <span class="text-sm text-subtle">{m.workspace_branchSelector_current_label()}</span>
+                        <span class="text-sm text-subtle"
+                          >{m.workspace_branchSelector_current_label()}</span
+                        >
                       {/if}
                       {#if branch === defaultBranch}
-                        <span class="text-sm text-subtle">{m.workspace_branchSelector_default_label()}</span>
+                        <span class="text-sm text-subtle"
+                          >{m.workspace_branchSelector_default_label()}</span
+                        >
                       {/if}
                       {#if branch === selectedBranch}
                         <Fa icon={faCheck} class="text-primary" size="sm" />
@@ -1442,11 +1657,13 @@
                     class="w-full justify-start text-left text-sm text-muted-foreground hover:text-foreground"
                   >
                     <Fa
-                      icon={dependabotBranchesCollapsed ? faChevronRight : faChevronDown}
+                      icon={dependabotBranchesCollapsed ? faChevronLeft : faChevronDown}
                       size="xs"
                       class="mr-1"
                     />
-                    {m.workspace_branchSelector_dependabotUpdates_label({ count: dependabotBranches.length })}
+                    {m.workspace_branchSelector_dependabotUpdates_label({
+                      count: dependabotBranches.length,
+                    })}
                   </Button>
 
                   {#if !dependabotBranchesCollapsed}
@@ -1483,7 +1700,7 @@
                       icon={faChevronDown}
                       size={10}
                       class="mr-1 opacity-50 transition-transform duration-200 {workspaceBranchesCollapsed
-                        ? '-rotate-90'
+                        ? 'rotate-90'
                         : ''}"
                     />
                     {m.workspace_branchSelector_workspaceBranches_label()}
@@ -1527,7 +1744,7 @@
                       size={10}
                       class="mr-1 opacity-50 transition-transform duration-200 {showRemoteBranches
                         ? ''
-                        : '-rotate-90'}"
+                        : 'rotate-90'}"
                     />
                     <Fa icon={faCloud} size={10} class="mr-1 opacity-50" />
                     {m.workspace_branchSelector_remoteBranches_label()}
@@ -1584,7 +1801,10 @@
                 class="w-full justify-start"
               >
                 <GitBranchIcon size={14} class="text-ghost" />
-                <span class="text-sm">{m.workspace_branchSelector_useBranch_label()} <strong>{searchValue}</strong></span>
+                <span class="text-sm"
+                  >{m.workspace_branchSelector_useBranch_label()}
+                  <strong>{searchValue}</strong></span
+                >
               </Button>
             </div>
           {:else if !isLoading && !error}

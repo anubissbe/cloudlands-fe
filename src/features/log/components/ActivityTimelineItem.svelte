@@ -13,13 +13,9 @@
   import { cn } from '$lib/utils';
   import Fa from 'svelte-fa';
   import type { IconDefinition } from '@fortawesome/fontawesome-common-types';
-  import {
-  faCheckCircle,
-  faXmarkCircle,
-  faSpinner,
-} from '@fortawesome/free-solid-svg-icons';
+  import { faCheckCircle, faXmarkCircle, faSpinner } from '@fortawesome/free-solid-svg-icons';
   import RelativeTime from '$lib/components/ui/RelativeTime.svelte';
-  import AuggieAvatar from '$lib/components/ui/auggie-avatar/AuggieAvatar.svelte';
+  import AgentAvatar from '$features/agent/components/agent-avatar/AgentAvatar.svelte';
   import { slide } from 'svelte/transition';
   import type { Snippet } from 'svelte';
 
@@ -68,7 +64,7 @@
 
   const statusColors: Record<Status, string> = {
     success: 'text-green-500',
-    error: 'text-red-500',
+    error: 'text-error-foreground',
     pending: 'text-amber-500 animate-spin',
     neutral: '',
   };
@@ -79,7 +75,7 @@
 <div class={cn('group relative flex items-start gap-3 py-1.5 px-2', className)}>
   <!-- Timeline connector line -->
   {#if showConnector && !isLast}
-    <div class="absolute left-[18px] top-8 bottom-0 w-px bg-border/40" aria-hidden="true"></div>
+    <div class="absolute left-[18px] top-8 bottom-0 w-px bg-border" aria-hidden="true"></div>
   {/if}
 
   <!-- Icon container -->
@@ -117,7 +113,7 @@
       class="shrink-0 opacity-70 hover:opacity-100 transition-opacity"
       onclick={onAgentClick}
     >
-      <AuggieAvatar size={20} {agentId} />
+      <AgentAvatar size={20} {agentId} />
     </button>
   {/if}
 </div>

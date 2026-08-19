@@ -4,8 +4,8 @@
  * Provides async alternatives to synchronous operations to prevent
  * blocking the main thread and causing UI freezes (beach balls).
  *
- * Execution helpers (`execAsync`, `execFileAsync`, `getNpmGlobalBinAsync`)
- * route through the daemon's streaming exec seam (`host.execStream`,
+ * Execution helpers (`execAsync`, `execFileAsync`) route through the
+ * daemon's streaming exec seam (`host.execStream`,
  * PROTOCOL.md §5.14), frame-accumulating stdout/stderr and throwing on
  * non-zero exit with `.stdout` / `.stderr` / numeric `.code` — the same
  * G1 fidelity contract git-env exposes. `findExecutableAsync` /
@@ -203,7 +203,6 @@ export async function findExecutableAsync(
   const { findBinary } = await import('./find-binary');
   const result = await findBinary(command, {
     commonPaths,
-    cache: false,
     timeout: 5000,
     useEnhancedPath: false,
     useLoginShell: false,
@@ -252,21 +251,6 @@ export async function findAuggieAsync(): Promise<string | null> {
     '../../features/auggie/main/auggie-path'
   );
   return findAuggiePathAsync();
-}
-
-/**
- * Get npm global bin directory asynchronously
- */
-export async function getNpmGlobalBinAsync(): Promise<string | null> {
-  try {
-    const { stdout } = await execAsync('npm bin -g', {
-      encoding: 'utf-8',
-      timeout: 5000,
-    });
-    return stdout.trim();
-  } catch {
-    return null;
-  }
 }
 
 /**

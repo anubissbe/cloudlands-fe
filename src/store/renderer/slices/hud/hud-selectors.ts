@@ -11,9 +11,9 @@
  */
 
 import { store } from '../../store';
-import { getItem, getItems } from '$lib/store-shim/utils/collections/collection-utils';
+import { getItem, getItems } from '@augmentcode/themis/utils/collections/collection-utils';
 import type { StoreState } from '../../types';
-import type { HudFeedEntry } from './hud-slice';
+import { sumHudUsageTotals, type HudFeedEntry } from './hud-slice';
 import {
   WORKSPACE_DISPLAY_STATUS_VALUES,
   WorkspaceStatus,
@@ -25,9 +25,16 @@ import {
   type WorkspaceId,
 } from '$shared/types';
 import type { TaskAgentAssociation } from '../task-agent-associations/task-agent-associations-types';
-import type { HudAgentStateBucket, HudCardStateKey } from './hud-types';
+import type {
+  HudAgentStateBucket,
+  HudCardStateKey,
+  WorkspaceTabStatus,
+  WorkspaceTabStatusCategory,
+} from './hud-types';
 import {
   HUD_AGENT_STATE_BUCKETS,
+  HUD_UNREAD_ATTENTION_VALUE,
+  WORKSPACE_TAB_STATUS_CATEGORY_ORDER,
   displayStatusCardStateKey,
   isHudAttentionValue,
   isHudTrackedAttentionValue,
@@ -39,8 +46,10 @@ import {
   selectAgentIsWaiting,
 } from '../agent-session/agent-session-selectors';
 import { getAgentAttentionRequest } from '$shared/utils/agent-attention';
+import { isAgentDeletionPending } from '$features/agent/utils/pending-agent-deletions';
 import { isQuestionMessageDismissed } from '$shared/utils/question-dismissal';
 import { deriveAgentPreviewLine } from '$lib/utils/text-utils';
+import { selectHardwareConsoleKeySlots } from '../hardware-console/hardware-console-selectors';
 
 export const selectHudActive = store.createSelector((state) => state.hud.active);
 
@@ -51,6 +60,22 @@ export const selectHudUsage = store.createSelector((state) => state.hud.usage);
 export const selectHudUsageError = store.createSelector((state) => state.hud.usageError);
 
 export const selectHudRateHistory = store.createSelector((state) => state.hud.rateHistory);
+
+/**
+ * 24h TOKEN BURN total — every `stats.getUsage` counter summed, `thoughtTokens`
+ * included when the daemon reported it (§5.23 omits it when zero). 0 before the
+ * first rollup lands.
+ */
+export const selectHudUsageTotalTokens = store.createSelector((state) => {
+  const totals = state.hud.usage?.totals;
+  return totals ? sumHudUsageTotals(totals) : 0;
+});
+
+/** Last-5-minute averaged per-minute burn (rounded) — the "…/min" readout. */
+export const selectHudBurnRatePerMin = store.createSelector((state) => state.hud.burnRatePerMin);
+
+/** Up/down/none trend of the averaged burn between polls (arrow glyph + color). */
+export const selectHudBurnTrend = store.createSelector((state) => state.hud.burnTrend);
 
 /** Daemon status view the HUD footer LEFT zone and SYSTEM panel render. */
 export interface HudSystemView {
@@ -90,6 +115,21 @@ export const selectHudGridFilter = store.createSelector((state) => state.hud.gri
 export const selectHudAttentionByWorkspaceId = store.createSelector(
   (state) => state.hud.attentionByWorkspaceId,
 );
+
+export const selectHudQuestionsByAgentId = store.createSelector(
+  (state) => state.hud?.questionsByAgentId ?? {},
+);
+
+/** Whether an agent has a captured, unanswered question. */
+export const selectHudAgentHasPendingQuestion = store.createSelector((state, agentId: string) => {
+  const question = state.hud?.questionsByAgentId?.[agentId];
+  if (!question) return false;
+  const metadata = (state.agentSessions?.byAgentId[agentId]?.metadata ?? {}) as Record<
+    string,
+    unknown
+  >;
+  return !isQuestionMessageDismissed(metadata, question.messageId);
+});
 
 /** Pending grid-card click for the takeover overlay; null when none. */
 export const selectHudTakeoverRequestWorkspaceId = store.createSelector(
@@ -143,13 +183,23 @@ export const selectHudWorkspaceStateCounts = store.createSelector(
  * on the FE `Workspace`, but the daemon emits the richer
  * `{ count, agents, agentIds }` form (PROTOCOL §5.1) and `normalizeWorkspace`
  * spreads it through verbatim. Read `agents` structurally when present.
+ *
+ * Rows whose wire `status` is `deleted` (PROTOCOL §5.5 AgentStatus) and rows
+ * inside the delete grace window (`isAgentDeletionPending`, the transient
+ * pending-deletions registry consulted by every rehydration path) are dropped
+ * here so no HUD surface — attention panel, card rows, AGENTS counters —
+ * renders a deleted or soft-hidden agent.
  */
 function agentInfosOf(workspace: Workspace): WorkspaceAgentInfo[] {
   const summary = workspace.agentSummary as { agents?: unknown; agentIds?: string[] } | undefined;
   if (!summary || !Array.isArray(summary.agents)) return [];
   return summary.agents.filter(
     (agent): agent is WorkspaceAgentInfo =>
-      !!agent && typeof agent === 'object' && typeof (agent as { id?: unknown }).id === 'string',
+      !!agent &&
+      typeof agent === 'object' &&
+      typeof (agent as { id?: unknown }).id === 'string' &&
+      (agent as { status?: unknown }).status !== 'deleted' &&
+      !isAgentDeletionPending((agent as { id: string }).id),
   );
 }
 
@@ -176,12 +226,23 @@ export const selectHudAgentStateCounts = store.createSelector(
 export interface HudWorkspaceStateBars {
   /** `not_started` / `idle` / no displayStatus. */
   idle: number;
-  /** Non-urgent `unread` (blue-dot flag on an otherwise idle card). */
+  /**
+   * Non-urgent unread — flag-driven (`attention === 'unread'`): counts every
+   * card carrying the unread flag, whatever its state. An overlay axis: an
+   * unread card ALSO counts in its state bucket.
+   */
   unread: number;
   /** `in_progress`. */
   progress: number;
   /** Attention states (`wait` / `blocked`). */
   attention: number;
+  /**
+   * Orthogonal waiting overlay — flag-driven (`workspace.waiting`, §5.1):
+   * counts every card carrying the flag REGARDLESS of its state bucket, so a
+   * Complete+waiting card counts in COMPLETED **and** WAITING (unlike the
+   * disjoint buckets below, which each count a card once).
+   */
+  waiting: number;
   /** `pr_open` + `pr_ready`. */
   prOpen: number;
   /** `pr_merged`. */
@@ -197,13 +258,19 @@ export interface HudWorkspaceStateBars {
 /**
  * WORKSPACE STATS: per-state workspace counts shared by the header counters
  * and the WORKSPACES panel bars — derived from the card `stateKey` (the
- * verbatim BE displayStatus plus the HUD attention overlays) so the rollups
- * always agree with the center grid: `wait`/`blocked` bucket as ATTENTION,
- * `failed` as FAILED, `in_progress` as PROGRESS, `complete` as COMPLETED,
- * PR states as PR OPEN / PR MERGED, `unread` as UNREAD, and everything else
- * (`idle`/`not_started`) as IDLE. An unread `complete`/`pr_merged` workspace
- * folds to UNREAD (its card `stateKey` does — see `cardStateKey`), so it
- * counts as UNREAD, not COMPLETED / PR MERGED.
+ * verbatim BE displayStatus) so the rollups always agree with the center
+ * grid: `wait`/`blocked` bucket as ATTENTION, `failed` as FAILED,
+ * `in_progress` as PROGRESS, `complete` as COMPLETED, PR states as
+ * PR OPEN / PR MERGED, and everything else (`idle`/`not_started`) as IDLE —
+ * every card counts toward its state bucket unconditionally. UNREAD is the
+ * one flag-driven bucket (intentd#1186 — unread is no longer a
+ * displayStatus): an OVERLAY axis over the state buckets, mirroring the
+ * card's unread border blink — every card with `isUnread` ALSO increments
+ * UNREAD, so an unread card counts twice (its state bucket + UNREAD).
+ * WAITING is the other overlay axis (`workspace.waiting`, §5.1): a waiting
+ * card counts in its state bucket AND in WAITING. `total` stays the
+ * workspace count (one per workspace — the bar denominator), so the state
+ * buckets alone sum to `total`.
  */
 export const selectHudWorkspaceStateBars = store.createSelector((state): HudWorkspaceStateBars => {
   const bars: HudWorkspaceStateBars = {
@@ -211,6 +278,7 @@ export const selectHudWorkspaceStateBars = store.createSelector((state): HudWork
     unread: 0,
     progress: 0,
     attention: 0,
+    waiting: 0,
     prOpen: 0,
     prMerged: 0,
     failed: 0,
@@ -219,13 +287,12 @@ export const selectHudWorkspaceStateBars = store.createSelector((state): HudWork
   };
   for (const card of selectHudWorkspaceCards.select(state)) {
     bars.total += 1;
+    if (card.isUnread) bars.unread += 1;
+    if (card.isWaiting) bars.waiting += 1;
     switch (card.stateKey) {
       case 'wait':
       case 'blocked':
         bars.attention += 1;
-        break;
-      case 'unread':
-        bars.unread += 1;
         break;
       case 'failed':
         bars.failed += 1;
@@ -282,17 +349,15 @@ export interface HudAttentionItem {
  * agentId → display name across all HUD workspaces' `agentSummary.agents`
  * (PROTOCOL §5.1). The join point for "never show raw agent UUIDs".
  */
-export const selectHudAgentNamesById = store.createSelector(
-  (state): Record<string, string> => {
-    const names: Record<string, string> = {};
-    for (const workspace of selectHudWorkspaces.select(state)) {
-      for (const agent of agentInfosOf(workspace)) {
-        if (typeof agent.name === 'string' && agent.name.length > 0) names[agent.id] = agent.name;
-      }
+export const selectHudAgentNamesById = store.createSelector((state): Record<string, string> => {
+  const names: Record<string, string> = {};
+  for (const workspace of selectHudWorkspaces.select(state)) {
+    for (const agent of agentInfosOf(workspace)) {
+      if (typeof agent.name === 'string' && agent.name.length > 0) names[agent.id] = agent.name;
     }
-    return names;
-  },
-);
+  }
+  return names;
+});
 
 function sinceMs(item: HudAttentionItem): number {
   if (!item.sinceTs) return 0;
@@ -392,8 +457,7 @@ export const selectHudFeedItems = store.createSelector((state): HudFeedItem[] =>
   return state.hud.feed.map((entry) => ({
     ...entry,
     workspaceTitle: getItem(state.workspace.workspaces, entry.source as WorkspaceId)?.title ?? null,
-    resolvedAgentName:
-      entry.agentName ?? (entry.agentId ? (names[entry.agentId] ?? null) : null),
+    resolvedAgentName: entry.agentName ?? (entry.agentId ? (names[entry.agentId] ?? null) : null),
   }));
 });
 
@@ -444,9 +508,11 @@ export interface HudCardAgent {
   hasQuestion: boolean;
   /**
    * The agent parents pending completion watches (session
-   * `isWaitingForOtherAgents` / non-empty `waitingForAgentIds`, §5.5 — folded
-   * in by the HUD's per-workspace `agent.list` hydration). A waiting
-   * coordinator stays VISIBLE on the card (idle bucket) between turns.
+   * `isWaitingForOtherAgents` / non-empty `waitingForAgentIds`, §5.5), OR
+   * owns active background hooks (`waitingOnHooks`, §3.1) OR active PR
+   * monitors (`waitingOnPrMonitors`, §5.42) — folded in by the HUD's
+   * per-workspace `agent.list` hydration. A waiting agent stays VISIBLE on
+   * the card (idle bucket) between turns.
    */
   isWaitingForAgents: boolean;
   /**
@@ -488,11 +554,27 @@ export interface HudWorkspaceCard {
   stateKey: HudCardStateKey;
   /** Raised live attention value, null when none. */
   attention: string | null;
+  /**
+   * Non-urgent unread overlay (`workspace.attention === 'unread'`, §5.1 —
+   * unread is a flag, not a displayStatus since intentd#1186): the card keeps
+   * its real state and adds the blue border blink; also increments the UNREAD
+   * state-bar bucket on top of the card's state bucket.
+   */
+  isUnread: boolean;
+  /**
+   * Orthogonal waiting overlay (`workspace.waiting`, §5.1 — BE-derived, set
+   * while the workspace's agents are purely waiting on external conditions):
+   * the card keeps its real state and adds the dimmed `/ WAITING` status
+   * suffix; also the WAITING state-bar row. Never feeds ATTENTION.
+   */
+  isWaiting: boolean;
   /** Workspace status message (agent content; i18n-exempt), null when empty. */
   statusMessage: string | null;
   /** Attention-reason strip content; null outside `wait`/`blocked`/`failed` or when no reason is known. */
   attentionSnippet: HudCardAttentionSnippet | null;
   prNumber: number | null;
+  /** Resolved 0-based hardware-console key slot, null when not slotted. */
+  keySlot: number | null;
   /** BE-owned task rollup (`task.list` stats; zeros until loaded). */
   tasks: { total: number; completed: number; inProgress: number };
   /** Sum of the four token counters from the workspace usage rollup. */
@@ -507,13 +589,14 @@ const ZERO_TASKS = { total: 0, completed: 0, inProgress: 0 };
  * Card state key: the BE-owned `workspace.displayStatus` rendered VERBATIM
  * (cloudlands-fe#578). The daemon owns the whole canonical precedence
  * (intentd#945 — `failed` > `blocked` > `needs_attention` > `in_progress` >
- * `unread` > the PR/task rollup, PROTOCOL §5.1), including the agent-running
- * promotion, the idle demotion (intentd#793), the blocker/failed axes and the
- * blue-dot `unread` promotion — so the HUD applies NO local promotion or
- * demotion over live sessions or attention flags. The only mapping left is
- * presentational: the wire `needs_attention` renders as `wait` (NEEDS
- * ATTENTION, yellow). Unknown or absent wire values default to `not_started`
- * so the card never vanishes (same convention as `AllWorkspacesCard`).
+ * the PR/task rollup, PROTOCOL §5.1), including the agent-running
+ * promotion, the idle demotion (intentd#793) and the blocker/failed axes —
+ * so the HUD applies NO local promotion or demotion over live sessions or
+ * attention flags (unread travels on the `attention` flag and overlays the
+ * card, intentd#1186). The only mapping left is presentational: the wire
+ * `needs_attention` renders as `wait` (NEEDS ATTENTION, yellow). Unknown or
+ * absent wire values default to `not_started` so the card never vanishes
+ * (same convention as `AllWorkspacesCard`).
  */
 function cardStateKey(workspace: Workspace): HudCardStateKey {
   const displayStatus = isWorkspaceDisplayStatus(workspace.displayStatus)
@@ -632,6 +715,7 @@ interface HudAgentBucketInfo {
   bucket: HudAgentStateBucket;
   attentionKind: 'discussion' | 'blocker' | null;
   hasQuestion: boolean;
+  isRunning: boolean;
 }
 
 /**
@@ -639,11 +723,14 @@ interface HudAgentBucketInfo {
  * tracks the agent (the daemon-events-bridge folds `agent:status-changed`
  * live, while the workspace entity's `agentSummary` only refreshes with the
  * next workspace snapshot), else the summary's wire status. Waiting on OTHER
- * AGENTS wins first (`isWaitingForOtherAgents`/`waitingForAgentIds`, §5.5): a
- * coordinator between turns holding completion watches buckets `idle` even
- * when its status/`isResponding` flags lag at active — it is not running
- * work, merely parked on children (visibility on the card is handled
- * separately by `keepLiveWithAncestors`, never by inflating the bucket).
+ * AGENTS wins first (`isWaitingForOtherAgents`/`waitingForAgentIds`, §5.5) —
+ * and identically, waiting on active background hooks (`waitingOnHooks`,
+ * §3.1) or active PR monitors (`waitingOnPrMonitors`, §5.42): a coordinator
+ * between turns holding completion watches (or hooks/monitors) buckets
+ * `idle` even when its status/`isResponding` flags lag at active — it is not
+ * running work, merely parked on children/hooks/monitors (visibility on the
+ * card is handled separately by `keepLiveWithAncestors`, never by inflating
+ * the bucket).
  * Genuine turn work still buckets running — a coordinator can take a turn
  * while its watches pend: the daemon's `turnInFlight` (§5.5 STAB-125, the
  * emit-time "a worker is draining a turn NOW" signal, refreshed by the
@@ -676,12 +763,18 @@ function agentBucketOf(state: StoreState, info: WorkspaceAgentInfo): HudAgentBuc
   const sessionStatusBucket = session
     ? toHudAgentStateBucket(typeof session.status === 'string' ? session.status : info.status)
     : null;
+  // Also parked on active background hooks (§3.1) or active PR monitors
+  // (§5.42): an idle-visibility signal treated identically to waiting on
+  // other agents — the agent will run again when a hook dispatches/expires
+  // or a monitor condition fires, so it is not genuinely idle either.
   const waitsOnOtherAgents =
     !!session &&
     sessionStatusBucket !== 'failed' &&
     sessionStatusBucket !== 'done' &&
     (session.isWaitingForOtherAgents === true ||
-      (Array.isArray(session.waitingForAgentIds) && session.waitingForAgentIds.length > 0));
+      (Array.isArray(session.waitingForAgentIds) && session.waitingForAgentIds.length > 0) ||
+      (Array.isArray(session.waitingOnHooks) && session.waitingOnHooks.length > 0) ||
+      (Array.isArray(session.waitingOnPrMonitors) && session.waitingOnPrMonitors.length > 0));
   // STAB-125 turn-liveness (§5.5, additive AgentLite field — structural read,
   // same convention as chat-read-service): `turnInFlight: true` is the
   // daemon's authoritative "an active worker is draining a turn NOW" signal,
@@ -727,26 +820,23 @@ function agentBucketOf(state: StoreState, info: WorkspaceAgentInfo): HudAgentBuc
   else {
     base = toHudAgentStateBucket(typeof session.status === 'string' ? session.status : info.status);
   }
-  // A captured §7.1 question pends while the agent is parked between turns
-  // (base `idle` — a genuine `ws.app.question.ask` ends the asking turn, so
-  // the daemon leaves the agent at lowercase `idle`, NOT `waiting`; gating on
-  // the waiting wire status alone missed every real coordinator question).
-  // It stops pending once the agent runs again (`hudQuestionSuperseded` also
-  // drops it from the slice on the next turn's running transition — §7.1:
-  // any later user message supersedes the questions) or finishes/fails, and
-  // a question the user dismissed (its message id ===
-  // metadata.dismissedQuestionsMessageId, §5.5) no longer pends — the same
-  // predicate the chat wizard gate uses.
+  // A captured §7.1 question pends PERSISTENTLY (spec §Decisions): a plain
+  // user message and the turn it starts no longer supersede it, so the
+  // capture survives the agent running again — it only stops pending when
+  // the daemon's `needs_attention` rollup drops
+  // (`hudQuestionsResolvedForWorkspace` clears the slice entry on answer /
+  // dismissal), when the agent fails, or when the user dismissed it (its
+  // message id === metadata.dismissedQuestionsMessageId, §5.5) — the same
+  // predicate the chat wizard gate uses. It raises `needs-attention` from
+  // any non-failed base — including `running`, exactly like an outstanding
+  // attention request does: the user still owes an answer while the agent
+  // works on an unrelated message.
   const question = state.hud.questionsByAgentId[info.id];
   const hasQuestion =
-    base === 'idle' && !!question && !isQuestionMessageDismissed(metadata, question.messageId);
+    base !== 'failed' && !!question && !isQuestionMessageDismissed(metadata, question.messageId);
   const bucket =
-    base === 'failed'
-      ? 'failed'
-      : attentionKind !== null || hasQuestion
-        ? 'needs-attention'
-        : base;
-  return { bucket, attentionKind, hasQuestion };
+    base === 'failed' ? 'failed' : attentionKind !== null || hasQuestion ? 'needs-attention' : base;
+  return { bucket, attentionKind, hasQuestion, isRunning: base === 'running' };
 }
 
 /**
@@ -757,10 +847,7 @@ function agentBucketOf(state: StoreState, info: WorkspaceAgentInfo): HudAgentBuc
  * child (delegated agents must not flip the workspace banner even when
  * their parent left the summary).
  */
-function isTopLevelAgent(
-  info: WorkspaceAgentInfo,
-  metadata: Record<string, unknown>,
-): boolean {
+function isTopLevelAgent(info: WorkspaceAgentInfo, metadata: Record<string, unknown>): boolean {
   if (typeof info.parentAgentId === 'string' && info.parentAgentId !== info.id) return false;
   const createdBy = metadata.createdByAgentId;
   return !(typeof createdBy === 'string' && createdBy.length > 0 && createdBy !== info.id);
@@ -791,6 +878,7 @@ function cardAgentsOf(workspace: Workspace, state: StoreState): HudCardAgent[] {
             isResponding: session.isResponding === true,
             completionReport:
               typeof metadata.completionReport === 'string' ? metadata.completionReport : null,
+            lastToolUse: session.lastToolUse,
           })
         : null,
       parentAgentId,
@@ -800,7 +888,11 @@ function cardAgentsOf(workspace: Workspace, state: StoreState): HudCardAgent[] {
       isBackground: session?.isBackground === true || metadata.isBackground === true,
       attentionKind,
       hasQuestion,
-      isWaitingForAgents: session?.isWaitingForOtherAgents === true || waitingForAgentIds.length > 0,
+      isWaitingForAgents:
+        session?.isWaitingForOtherAgents === true ||
+        waitingForAgentIds.length > 0 ||
+        (Array.isArray(session?.waitingOnHooks) && session.waitingOnHooks.length > 0) ||
+        (Array.isArray(session?.waitingOnPrMonitors) && session.waitingOnPrMonitors.length > 0),
       waitingForAgentIds,
     };
   });
@@ -866,12 +958,17 @@ function keepLiveWithAncestors(agents: HudCardAgent[]): HudCardAgent[] {
  * when one arrived, else the entity's daemon-served `attention` field
  * (`workspace.list`/`workspace.get` §5.1, kept fresh by the events bridge)
  * when it is a tracked value — so a workspace already unread at app start
- * renders UNREAD without waiting for a live event.
+ * renders its unread overlay without waiting for a live event. `isUnread`
+ * derives from the same resolved value (`=== 'unread'`).
  */
 export const selectHudWorkspaceCards = store.createSelector((state): HudWorkspaceCard[] => {
   const flags = state.hud.attentionByWorkspaceId;
+  // Resolved hardware-console key assignment, served verbatim from its
+  // owning slice (same resolution the sidebar badge uses — no re-derivation).
+  const keySlots = selectHardwareConsoleKeySlots.select(state);
   return selectHudWorkspaces.select(state).map((workspace) => {
     const workspaceId = String(workspace.id);
+    const keySlotIndex = keySlots.indexOf(workspaceId);
     const attention =
       flags[workspaceId]?.attention ??
       (typeof workspace.attention === 'string' && isHudTrackedAttentionValue(workspace.attention)
@@ -893,9 +990,12 @@ export const selectHudWorkspaceCards = store.createSelector((state): HudWorkspac
         : workspace.branch,
       stateKey,
       attention,
+      isUnread: attention === HUD_UNREAD_ATTENTION_VALUE,
+      isWaiting: workspace.waiting === true,
       statusMessage,
       attentionSnippet: cardAttentionSnippet(state, stateKey, agents),
       prNumber: typeof workspace.prNumber === 'number' ? workspace.prNumber : null,
+      keySlot: keySlotIndex === -1 ? null : keySlotIndex,
       tasks: stats
         ? { total: stats.total, completed: stats.completed, inProgress: stats.inProgress }
         : ZERO_TASKS,
@@ -909,6 +1009,96 @@ export const selectHudWorkspaceCards = store.createSelector((state): HudWorkspac
     };
   });
 });
+
+const WORKSPACE_TAB_STATUS_VISIBLE_LIMIT = 4;
+
+function isCurrentUserRelevantTabAgent(
+  state: StoreState,
+  workspaceId: string,
+  info: WorkspaceAgentInfo,
+): boolean {
+  const session = state.agentSessions?.byAgentId[info.id];
+  if (!session || String(session.workspaceId) !== workspaceId || session.pendingDeleteAt)
+    return false;
+  const metadata = (session.metadata ?? {}) as Record<string, unknown>;
+  if (!isTopLevelAgent(info, metadata)) return false;
+  return session.isBackground !== true && metadata.isBackground !== true;
+}
+
+/** Actionable tab axes derived from the same live inputs as the HUD. */
+export const selectWorkspaceTabStatuses = store.createSelector(
+  (state): Record<string, WorkspaceTabStatus> => {
+    const result: Record<string, WorkspaceTabStatus> = {};
+    const flags = state.hud.attentionByWorkspaceId;
+    for (const workspace of selectHudWorkspaces.select(state)) {
+      const workspaceId = String(workspace.id);
+      const namesByCategory = new Map<WorkspaceTabStatusCategory, string[]>();
+      const addAgent = (category: WorkspaceTabStatusCategory, name: string) => {
+        const names = namesByCategory.get(category) ?? [];
+        if (!names.includes(name)) names.push(name);
+        namesByCategory.set(category, names);
+      };
+      const infos = agentInfosOf(workspace);
+      const relevantInfos = infos.filter((info) =>
+        isCurrentUserRelevantTabAgent(state, workspaceId, info),
+      );
+      for (const info of relevantInfos) {
+        const signal = agentBucketOf(state, info);
+        if (signal.bucket === 'failed') addAgent('failed', info.name);
+        else if (signal.hasQuestion) addAgent('question', info.name);
+        else if (signal.attentionKind === 'blocker') addAgent('blocker', info.name);
+        else if (signal.attentionKind === 'discussion') addAgent('discussion', info.name);
+        if (signal.isRunning) addAgent('running', info.name);
+      }
+
+      const stateKey = cardStateKey(workspace);
+      if (stateKey === 'failed' && !namesByCategory.has('failed'))
+        namesByCategory.set('failed', []);
+      if (stateKey === 'blocked' && !namesByCategory.has('blocker'))
+        namesByCategory.set('blocker', []);
+      if (
+        stateKey === 'wait' &&
+        !namesByCategory.has('question') &&
+        !namesByCategory.has('blocker') &&
+        !namesByCategory.has('discussion')
+      ) {
+        namesByCategory.set('needs_input', []);
+      }
+      const attention =
+        flags[workspaceId]?.attention ??
+        (typeof workspace.attention === 'string' && isHudTrackedAttentionValue(workspace.attention)
+          ? workspace.attention
+          : null);
+      if (attention === 'review_required') namesByCategory.set('review', []);
+      if (attention === 'unread') namesByCategory.set('unread', []);
+      // BE activity is authoritative for the running axis (§5.1 "green
+      // dot"): unopened workspaces have no hydrated sessions and delegated
+      // children never pass the relevance gate, so trust the rollup whenever
+      // no tracked relevant agent already contributed a named running entry.
+      if (workspace.activity === 'agent_running' && !namesByCategory.has('running')) {
+        namesByCategory.set('running', []);
+      }
+
+      const categories = WORKSPACE_TAB_STATUS_CATEGORY_ORDER.flatMap((category) => {
+        const agentNames = namesByCategory.get(category);
+        return agentNames ? [{ category, count: Math.max(1, agentNames.length), agentNames }] : [];
+      });
+      if (categories.length === 0) continue;
+      const overflows = categories.length > WORKSPACE_TAB_STATUS_VISIBLE_LIMIT;
+      result[workspaceId] = {
+        agentCount: relevantInfos.length,
+        categories,
+        visibleCategories: overflows
+          ? categories.slice(0, WORKSPACE_TAB_STATUS_VISIBLE_LIMIT - 1)
+          : categories,
+        hiddenCategoryCount: overflows
+          ? categories.length - (WORKSPACE_TAB_STATUS_VISIBLE_LIMIT - 1)
+          : 0,
+      };
+    }
+    return result;
+  },
+);
 
 /**
  * Header ATTN counter (mock `stats.attn` — per-agent wait + fail): counts
@@ -978,6 +1168,21 @@ export interface HudTakeoverTask {
    * non-complete tasks and when neither source has text.
    */
   report: string | null;
+  /**
+   * Daemon-computed: true iff the spec note body links this task (§5.4,
+   * additive). Absent on older-daemon rows — the layout then keeps its
+   * legacy dep-free-spec-rooting behavior.
+   */
+  specLinked?: boolean;
+  /** Task-note ids this task depends on (hard ordering edges §5.4); omitted when empty. */
+  dependsOn?: string[];
+  /** Task-note ids this task may conflict with (advisory §5.4); omitted when empty. */
+  conflictsWith?: string[];
+  /**
+   * Daemon-computed `dependsOn` ids whose task is not yet `complete` (§5.4);
+   * served verbatim — never re-derived client-side. Omitted when empty.
+   */
+  unmetDependsOn?: string[];
 }
 
 /** View-model for the takeover overlay (one workspace, joined rollups). */
@@ -987,6 +1192,8 @@ export interface HudTakeoverView {
   repoRef: string;
   /** Status message (agent content; i18n-exempt), null when empty. */
   statusMessage: string | null;
+  /** Resolved 0-based hardware-console key slot (carried from the card). */
+  keySlot: number | null;
   /** BE-owned task rollup (`task.list` stats §5.4). */
   stats: { total: number; completed: number; inProgress: number };
   /** Display-ordered non-cancelled tasks for the map (wire order §5.4). */
@@ -1012,8 +1219,7 @@ function completeTaskReport(
   const newestFirst = links.slice().sort((a, b) => b.createdAt - a.createdAt);
   for (const link of newestFirst) {
     const metadata = state.agentSessions?.byAgentId[link.agentId]?.metadata as
-      | Record<string, unknown>
-      | undefined;
+      Record<string, unknown> | undefined;
     const report = metadata?.completionReport;
     if (typeof report === 'string' && report.trim().length > 0) return report;
   }
@@ -1056,6 +1262,10 @@ export const selectHudTakeoverView = store.createSelector(
                 task.status === 'complete'
                   ? completeTaskReport(state, workspaceId, task.id, links)
                   : null,
+              ...(task.specLinked !== undefined ? { specLinked: task.specLinked } : {}),
+              ...(task.dependsOn ? { dependsOn: task.dependsOn } : {}),
+              ...(task.conflictsWith ? { conflictsWith: task.conflictsWith } : {}),
+              ...(task.unmetDependsOn ? { unmetDependsOn: task.unmetDependsOn } : {}),
             };
           })
       : [];
@@ -1064,6 +1274,7 @@ export const selectHudTakeoverView = store.createSelector(
       title: card.title,
       repoRef: card.repoRef,
       statusMessage: card.statusMessage,
+      keySlot: card.keySlot,
       stats: card.tasks,
       tasks,
       // Both lists partition the SAME per-agent buckets (`agentBucketOf` via

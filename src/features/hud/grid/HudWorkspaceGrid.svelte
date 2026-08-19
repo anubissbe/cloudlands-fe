@@ -5,10 +5,11 @@
    * menus live in the header (mock lines 47-95, `HudHeaderFilters`); the
    * shared selection is read from the hud slice. Cards come from
    * `selectHudWorkspaceCards`; per-workspace task and token rollups are
-   * requested once per workspace id (the daemon-events bridge keeps them
-   * fresh afterwards). A 1s ticker drives the elapsed timers.
+   * requested once per workspace id, and only for cards the user can actually
+   * see (the daemon-events bridge keeps them fresh afterwards). A 1s ticker
+   * drives the elapsed timers.
    */
-  import { onMount } from 'svelte';
+  import { onDestroy, onMount } from 'svelte';
   import { flip } from 'svelte/animate';
   import { scale } from 'svelte/transition';
   import { cubicOut, quintOut } from 'svelte/easing';
@@ -22,7 +23,13 @@
   import { fetchWorkspaceTokenUsage } from '$store/renderer/slices/token-usage/token-usage-slice';
   import HudWorkspaceCard from './HudWorkspaceCard.svelte';
   import { applyHudGridFilter } from './hud-grid-filter';
+  import { createCardVisibilityGate } from './hud-card-visibility';
   import { watchReducedMotion } from '../right-column/hud-slide.svelte';
+  import { getWorkspaceRouteContext } from '$lib/utils/workspace-route-context';
+
+  let {
+    workspaceId = getWorkspaceRouteContext()?.workspaceId ?? undefined,
+  }: { workspaceId?: string } = $props();
 
   const cards$ = selectHudWorkspaceCards();
   const filter$ = selectHudGridFilter();
@@ -53,13 +60,28 @@
   // dispatch-safely idempotent (ensure* no-ops when loaded/loading, the
   // read-service coalesces in-flight token fetches).
   const requested = new Set<string>();
+  function requestRollups(workspaceId: string): void {
+    if (requested.has(workspaceId)) return;
+    requested.add(workspaceId);
+    appStore.dispatch(ensureWorkspaceTasksLoaded(workspaceId));
+    appStore.dispatch(fetchWorkspaceTokenUsage(workspaceId));
+  }
+
+  // A card only asks for its rollups once it is on screen: on a ~130-workspace
+  // profile the eager fan-out was ~260 reads in one tick, of which the user
+  // could see a dozen. The gate is rooted at the grid's scroll container (the
+  // element that actually clips the cards) — see `hud-card-visibility`.
+  let gridEl = $state<HTMLDivElement | undefined>();
+  const cardVisibility = createCardVisibilityGate(requestRollups);
+  const observeCard = cardVisibility.observe;
+  $effect(() => cardVisibility.setRoot(gridEl ?? null));
+  onDestroy(() => cardVisibility.destroy());
+
+  // The route workspace is exempt: its rollups feed the rest of the UI, so it
+  // is read whether or not its card is scrolled into view (or rendered at all
+  // under the current filter).
   $effect(() => {
-    for (const card of $cards$) {
-      if (requested.has(card.workspaceId)) continue;
-      requested.add(card.workspaceId);
-      appStore.dispatch(ensureWorkspaceTasksLoaded(card.workspaceId));
-      appStore.dispatch(fetchWorkspaceTokenUsage(card.workspaceId));
-    }
+    if (workspaceId) requestRollups(workspaceId);
   });
 </script>
 
@@ -68,10 +90,12 @@
     {#if visibleCards.length === 0}
       <div class="hud-ws-grid-empty">{m.hud_grid_empty_label()}</div>
     {:else}
-      <div class="hud-ws-grid">
+      <div class="hud-ws-grid" bind:this={gridEl}>
         {#each visibleCards as card (card.workspaceId)}
           <div
             class="hud-ws-grid-slot"
+            data-testid="hud-ws-grid-slot"
+            use:observeCard={card.workspaceId}
             animate:flip={{ duration: flipDuration, easing: quintOut }}
             in:scale={{ duration: enterDuration, start: 0.86, easing: quintOut }}
             out:scale={{ duration: leaveDuration, start: 0.88, easing: cubicOut }}
@@ -130,7 +154,7 @@
       system-ui,
       sans-serif;
     letter-spacing: 0.18em;
-    color: hsl(var(--text-ghost));
+    color: hsl(var(--muted-foreground) / 0.65);
   }
   .hud-ws-grid-fade {
     position: absolute;
@@ -138,7 +162,7 @@
     right: -4px;
     bottom: 0;
     height: 120px;
-    background: linear-gradient(180deg, transparent, hsl(var(--app-background)));
+    background: linear-gradient(180deg, transparent, hsl(var(--background)));
     pointer-events: none;
   }
 </style>

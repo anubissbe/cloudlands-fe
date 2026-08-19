@@ -286,9 +286,7 @@ describe('LiveAgentsClient mutations (fake transport)', () => {
     // PROTOCOL §5.5: agent.queueMessage accepts optional imageBlocks; the
     // daemon persists them on the QueuedMessage so queued attachments
     // survive queue-on-send. The seam forwards them verbatim.
-    const imageBlocks = [
-      { type: 'image' as const, data: 'aGVsbG8=', mimeType: 'image/png' },
-    ];
+    const imageBlocks = [{ type: 'image' as const, data: 'aGVsbG8=', mimeType: 'image/png' }];
     const queuedMessage = {
       id: 'qm-img-1',
       content: 'later with image',
@@ -885,6 +883,51 @@ describe('LiveAgentsClient mutations (fake transport)', () => {
     expect(result.error).toContain('unsupported reasoningEffort');
   });
 
+  it('updateSpecialist forwards the resolved specialist fields through agent.update', async () => {
+    backend.onRequest('agent.update', () => ({ success: true }));
+    const client = new LiveAgentsClient();
+
+    const result = await client.updateSpecialist({
+      agentId: 'agent-1',
+      workspaceId: 'ws-1',
+      specialist: 'spec-writer',
+      model: 'grok4.6',
+      systemPrompt: 'Coordinate the work.',
+    });
+
+    expect(result).toEqual({ success: true });
+    expect(backend.requests[0]).toEqual({
+      method: 'agent.update',
+      params: {
+        agentId: 'agent-1',
+        workspaceId: 'ws-1',
+        changes: {
+          specialist: 'spec-writer',
+          model: 'grok4.6',
+          systemPrompt: 'Coordinate the work.',
+        },
+      },
+    });
+  });
+
+  it('updateSpecialist forwards null to clear the specialist and system prompt', async () => {
+    backend.onRequest('agent.update', () => ({ success: true }));
+    const client = new LiveAgentsClient();
+
+    await client.updateSpecialist({
+      agentId: 'agent-1',
+      workspaceId: 'ws-1',
+      specialist: null,
+      systemPrompt: null,
+    });
+
+    expect(backend.requests[0]?.params).toEqual({
+      agentId: 'agent-1',
+      workspaceId: 'ws-1',
+      changes: { specialist: null, systemPrompt: null },
+    });
+  });
+
   it('rename forwards agent.rename with §5.5 params and folds the ack into success', async () => {
     // PROTOCOL §5.5: agent.rename takes `{ agentId, name }` (name non-empty)
     // and returns `{ success: true, name }`; an applied rename emits
@@ -962,6 +1005,61 @@ describe('LiveAgentsClient mutations (fake transport)', () => {
     expect(result.error).toContain('delete boom');
   });
 
+  it("delete forwards undoDelayMs and surfaces the daemon's { scheduled, deleteAt } (§5.5 delete grace window)", async () => {
+    backend.onRequest('agent.delete', () => ({
+      success: true,
+      scheduled: true,
+      deleteAt: '2026-08-11T00:00:15.000Z',
+    }));
+    const client = new LiveAgentsClient();
+
+    expect(await client.delete('agent-1', 'ws-1', { undoDelayMs: 15_000 })).toEqual({
+      success: true,
+      scheduled: true,
+      deleteAt: '2026-08-11T00:00:15.000Z',
+    });
+    expect(backend.requests[0]).toEqual({
+      method: 'agent.delete',
+      params: { agentId: 'agent-1', undoDelayMs: 15_000 },
+    });
+  });
+
+  it('delete keeps the pre-6.7 wire shape byte-identical when undoDelayMs is 0', async () => {
+    backend.onRequest('agent.delete', () => ({ success: true }));
+    const client = new LiveAgentsClient();
+
+    expect(await client.delete('agent-1', 'ws-1', { undoDelayMs: 0 })).toEqual({ success: true });
+    expect(backend.requests[0]).toEqual({
+      method: 'agent.delete',
+      params: { agentId: 'agent-1' },
+    });
+  });
+
+  it('cancelDelete forwards agent.cancelDelete and surfaces the race-safe { cancelled } outcomes', async () => {
+    const outcomes = [{ cancelled: true }, { cancelled: false }];
+    backend.onRequest('agent.cancelDelete', () => outcomes.shift()!);
+    const client = new LiveAgentsClient();
+
+    expect(await client.cancelDelete('agent-1')).toEqual({ success: true, cancelled: true });
+    expect(backend.requests[0]).toEqual({
+      method: 'agent.cancelDelete',
+      params: { agentId: 'agent-1' },
+    });
+    // Already committed / never scheduled — non-error, cancelled: false
+    expect(await client.cancelDelete('agent-1')).toEqual({ success: true, cancelled: false });
+  });
+
+  it('cancelDelete maps a transport error to a failed MutationResult without throwing', async () => {
+    backend.onRequest('agent.cancelDelete', () => {
+      throw new Error('daemon offline');
+    });
+    const client = new LiveAgentsClient();
+
+    const result = await client.cancelDelete('agent-1');
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('daemon offline');
+  });
+
   it('maps a daemon error to a failed MutationResult without throwing', async () => {
     // Use a fresh agentId so the module-level workspace cache is guaranteed to
     // miss; the resolver call resolves successfully, then agent.sendMessage
@@ -1035,6 +1133,26 @@ describe('LiveAgentsClient reads thread daemon activity flags (PROTOCOL §5.5)',
     });
   });
 
+  it('list and get preserve the AgentLite specialist metadata and model verbatim', async () => {
+    const coordinator = {
+      id: 'agent-coordinator',
+      workspaceId: 'ws-1',
+      name: 'Coordinator',
+      status: 'idle',
+      model: 'grok4.6',
+      metadata: { specialist: 'spec-writer' },
+    };
+    backend.onRequest('agent.list', () => ({ agents: [coordinator] }));
+    backend.onRequest('agent.get', () => ({ agent: coordinator }));
+    const client = new LiveAgentsClient();
+
+    const [listed] = await client.list('ws-1');
+    const fetched = await client.get('agent-coordinator');
+
+    expect(listed).toMatchObject({ model: 'grok4.6', metadata: { specialist: 'spec-writer' } });
+    expect(fetched).toMatchObject({ model: 'grok4.6', metadata: { specialist: 'spec-writer' } });
+  });
+
   it('does not synthesize activity flags the daemon omits (no healing)', async () => {
     backend.onRequest('agent.get', () => ({
       agent: { id: 'agent-1', workspaceId: 'ws-1', name: 'A1', status: 'completed' },
@@ -1080,6 +1198,124 @@ describe('LiveAgentsClient reads thread daemon activity flags (PROTOCOL §5.5)',
     expect(agent?.lastMessageRole).toBeUndefined();
   });
 
+  it('carries lastMessageId verbatim and derives hasUnread when the marker lags (monorepo#1597)', async () => {
+    backend.onRequest('agent.list', () => ({
+      agents: [
+        {
+          id: 'agent-1',
+          workspaceId: 'ws-1',
+          name: 'A1',
+          status: 'idle',
+          lastMessageRole: 'assistant',
+          lastMessageId: 'm-9',
+          metadata: { lastSeenMessageId: 'm-5' },
+        },
+      ],
+    }));
+    const client = new LiveAgentsClient();
+
+    const [agent] = await client.list('ws-1');
+    expect(agent).toMatchObject({ lastMessageId: 'm-9', hasUnread: true });
+  });
+
+  it('derives hasUnread: false when the seen marker converges (agent:updated re-ingest)', async () => {
+    backend.onRequest('agent.get', () => ({
+      agent: {
+        id: 'agent-1',
+        workspaceId: 'ws-1',
+        name: 'A1',
+        status: 'idle',
+        lastMessageRole: 'assistant',
+        lastMessageId: 'm-9',
+        metadata: { lastSeenMessageId: 'm-9' },
+      },
+    }));
+    const client = new LiveAgentsClient();
+
+    const agent = await client.get('agent-1');
+    expect(agent?.hasUnread).toBe(false);
+  });
+
+  it('derives hasUnread: true when the seen marker is absent (never marked seen)', async () => {
+    backend.onRequest('agent.get', () => ({
+      agent: {
+        id: 'agent-1',
+        workspaceId: 'ws-1',
+        name: 'A1',
+        status: 'idle',
+        lastMessageRole: 'assistant',
+        lastMessageId: 'm-1',
+      },
+    }));
+    const client = new LiveAgentsClient();
+
+    const agent = await client.get('agent-1');
+    expect(agent?.hasUnread).toBe(true);
+  });
+
+  it('derives hasUnread: false when the daemon omits lastMessageId (older daemon)', async () => {
+    backend.onRequest('agent.get', () => ({
+      agent: {
+        id: 'agent-1',
+        workspaceId: 'ws-1',
+        name: 'A1',
+        status: 'idle',
+        lastMessageRole: 'assistant',
+      },
+    }));
+    const client = new LiveAgentsClient();
+
+    const agent = await client.get('agent-1');
+    expect(agent?.lastMessageId).toBeUndefined();
+    expect(agent?.hasUnread).toBe(false);
+  });
+
+  it('list and get carry session-advertised effortLevels verbatim (§5.5 additive field)', async () => {
+    // The daemon serves the levels its `thought_level` discovery captured at
+    // the most recent session open (claude-code case) — pass-through, no
+    // healing/transforms.
+    const effortLevels = ['low', 'medium', 'high', 'max'];
+    backend.onRequest('agent.list', () => ({
+      agents: [
+        {
+          id: 'agent-1',
+          workspaceId: 'ws-1',
+          name: 'A1',
+          status: 'idle',
+          model: 'claude-code:opus',
+          effortLevels,
+        },
+      ],
+    }));
+    backend.onRequest('agent.get', () => ({
+      agent: {
+        id: 'agent-1',
+        workspaceId: 'ws-1',
+        name: 'A1',
+        status: 'idle',
+        model: 'claude-code:opus',
+        effortLevels,
+      },
+    }));
+    const client = new LiveAgentsClient();
+
+    const [listed] = await client.list('ws-1');
+    expect(listed.effortLevels).toEqual(effortLevels);
+
+    const fetched = await client.get('agent-1');
+    expect(fetched?.effortLevels).toEqual(effortLevels);
+  });
+
+  it('does not synthesize effortLevels when the daemon omits them (no thought_level support)', async () => {
+    backend.onRequest('agent.get', () => ({
+      agent: { id: 'agent-1', workspaceId: 'ws-1', name: 'A1', status: 'idle' },
+    }));
+    const client = new LiveAgentsClient();
+
+    const agent = await client.get('agent-1');
+    expect(agent?.effortLevels).toBeUndefined();
+  });
+
   // ---- §5.5 agent.getConversation pagination -----------------------------
 
   it('getConversation forwards limit only when no pageToken is given (first page)', async () => {
@@ -1095,7 +1331,7 @@ describe('LiveAgentsClient reads thread daemon activity flags (PROTOCOL §5.5)',
 
     expect(backend.requests[0]).toEqual({
       method: 'agent.getConversation',
-      params: { agentId: 'agent-1', limit: 200 },
+      params: { agentId: 'agent-1', limit: 50, projection: 'slim' },
     });
     expect(page.nextToken).toBe('tok-2');
     expect(page.truncated).toBe(true);
@@ -1116,7 +1352,7 @@ describe('LiveAgentsClient reads thread daemon activity flags (PROTOCOL §5.5)',
 
     expect(backend.requests[0]).toEqual({
       method: 'agent.getConversation',
-      params: { agentId: 'agent-1', limit: 100, nextToken: 'tok-2' },
+      params: { agentId: 'agent-1', limit: 100, nextToken: 'tok-2', projection: 'slim' },
     });
     expect(page.nextToken).toBeNull();
   });
@@ -1143,11 +1379,16 @@ describe('LiveAgentsClient reads thread daemon activity flags (PROTOCOL §5.5)',
     }));
     const client = new LiveAgentsClient();
 
-    const page = await client.getConversation('agent-1', 200, undefined, 'msg-target');
+    const page = await client.getConversation('agent-1', 50, undefined, 'msg-target');
 
     expect(backend.requests[0]).toEqual({
       method: 'agent.getConversation',
-      params: { agentId: 'agent-1', limit: 200, aroundMessageId: 'msg-target' },
+      params: {
+        agentId: 'agent-1',
+        limit: 50,
+        aroundMessageId: 'msg-target',
+        projection: 'slim',
+      },
     });
     expect(page.nextToken).toBe('older-tok');
     expect(page.prevToken).toBe('newer-tok');
@@ -1165,6 +1406,143 @@ describe('LiveAgentsClient reads thread daemon activity flags (PROTOCOL §5.5)',
 
     const page = await client.getConversation('agent-1');
     expect(page.prevToken).toBeNull();
+  });
+
+  it('getConversation forwards aroundIndex (§5.5 ordinal seek) and surfaces both cursors', async () => {
+    backend.onRequest('agent.getConversation', () => ({
+      messages: [{ id: 'msg-500' }],
+      truncated: true,
+      totalMessages: 2000,
+      nextToken: 'older-tok',
+      prevToken: 'newer-tok',
+    }));
+    const client = new LiveAgentsClient();
+
+    const page = await client.getConversation('agent-1', 200, undefined, undefined, 500);
+
+    expect(backend.requests[0]).toEqual({
+      method: 'agent.getConversation',
+      params: { agentId: 'agent-1', limit: 200, aroundIndex: 500, projection: 'slim' },
+    });
+    expect(page.nextToken).toBe('older-tok');
+    expect(page.prevToken).toBe('newer-tok');
+  });
+
+  it('getConversation omits the aroundIndex key entirely when undefined', async () => {
+    backend.onRequest('agent.getConversation', () => ({
+      messages: [],
+      truncated: false,
+      totalMessages: 0,
+      nextToken: null,
+    }));
+    const client = new LiveAgentsClient();
+
+    await client.getConversation('agent-1');
+    expect(backend.requests[0].params).not.toHaveProperty('aroundIndex');
+  });
+
+  it('retries an explicit oversized conversation response with progressively smaller limits', async () => {
+    let attempts = 0;
+    backend.onRequest('agent.getConversation', () => {
+      attempts += 1;
+      if (attempts < 3) {
+        throw new BackendError(
+          buildErrorPayload(
+            'OVERSIZED_RESPONSE',
+            `response for agent.getConversation exceeds maximum outbound frame size: ${attempts === 1 ? 62_571_863 : 47_361_902} bytes > 41943040 bytes`,
+          ),
+        );
+      }
+      return { messages: [{ id: 'm-fit' }], truncated: true, totalMessages: 420 };
+    });
+    const client = new LiveAgentsClient();
+    await expect(client.getConversation('agent-1', 200)).resolves.toMatchObject({
+      messages: [{ id: 'm-fit' }],
+    });
+    expect(backend.requests.map((request) => request.params.limit)).toEqual([200, 100, 50]);
+  });
+
+  it('does not retry unrelated or lookalike daemon failures', async () => {
+    backend.onRequest('agent.getConversation', () => {
+      throw new BackendError(buildErrorPayload('INTERNAL_ERROR', 'ordinary failure'));
+    });
+    const client = new LiveAgentsClient();
+    await expect(client.getConversation('agent-1')).rejects.toThrow('ordinary failure');
+    expect(backend.requests).toHaveLength(1);
+  });
+
+  it('stops reducing the frame-safe page size at one', async () => {
+    backend.onRequest('agent.getConversation', () => {
+      throw new BackendError(
+        buildErrorPayload(
+          'OVERSIZED_RESPONSE',
+          'response for agent.getConversation exceeds maximum outbound frame size: 62571863 bytes > 41943040 bytes',
+        ),
+      );
+    });
+    const client = new LiveAgentsClient();
+    await expect(client.getConversation('agent-1', 4, 'older')).rejects.toThrow(
+      'exceeds maximum outbound frame size',
+    );
+    expect(backend.requests.map((request) => request.params.limit)).toEqual([4, 2, 1]);
+  });
+
+  // ---- §5.5 agent.getMessageBlock (v7.2 slim-hydration counterpart) ------
+
+  it('getMessageBlock forwards agentId/messageId/blockId and returns the full block', async () => {
+    // PROTOCOL §5.5 v7.2: { block } — the full, unprojected body (no
+    // *Truncated/*Bytes flags on the returned block).
+    backend.onRequest('agent.getMessageBlock', () => ({
+      block: {
+        type: 'tool_result',
+        id: 'msg-1:3',
+        tool_use_id: 'call-9',
+        output: 'x'.repeat(5000),
+      },
+    }));
+    const client = new LiveAgentsClient();
+
+    const block = await client.getMessageBlock('agent-1', 'msg-1', 'msg-1:3');
+    expect(backend.requests[0]).toEqual({
+      method: 'agent.getMessageBlock',
+      params: { agentId: 'agent-1', messageId: 'msg-1', blockId: 'msg-1:3' },
+    });
+    expect(block.type).toBe('tool_result');
+    expect(block.id).toBe('msg-1:3');
+    expect(block.output).toHaveLength(5000);
+  });
+
+  it('getMessageBlock rejects on a missing block envelope', async () => {
+    backend.onRequest('agent.getMessageBlock', () => ({}));
+    const client = new LiveAgentsClient();
+    await expect(client.getMessageBlock('agent-1', 'msg-1', 'msg-1:0')).rejects.toThrow(
+      'returned no block',
+    );
+  });
+
+  it.each([
+    ['an array', []],
+    ['an empty object', {}],
+    ['an object with an unknown type', { type: 'bogus', id: 'msg-1:0' }],
+    ['a string', 'tool_result'],
+  ])('getMessageBlock rejects a malformed block envelope (%s)', async (_label, badBlock) => {
+    // Malformed { block } values must reject, never get cached and merged
+    // into message content as a ContentBlock.
+    backend.onRequest('agent.getMessageBlock', () => ({ block: badBlock }));
+    const client = new LiveAgentsClient();
+    await expect(client.getMessageBlock('agent-1', 'msg-1', 'msg-1:0')).rejects.toThrow(
+      'returned no block',
+    );
+  });
+
+  it('getMessageBlock propagates daemon -32602 rejections (unknown ids)', async () => {
+    backend.onRequest('agent.getMessageBlock', () => {
+      throw new BackendError(buildErrorPayload('INVALID_PARAMS', 'unknown block id: msg-1:99'));
+    });
+    const client = new LiveAgentsClient();
+    await expect(client.getMessageBlock('agent-1', 'msg-1', 'msg-1:99')).rejects.toThrow(
+      'unknown block id',
+    );
   });
 
   describe('retry', () => {
@@ -1234,6 +1612,65 @@ describe('LiveAgentsClient reads thread daemon activity flags (PROTOCOL §5.5)',
 
       const result = await client.retry('agent-fail', 'ws-1');
       expect(result).toEqual({ ok: false, error: 'Transport failure' });
+      expect(result).not.toHaveProperty('notFound');
+    });
+
+    it('classifies the daemon not-found rejection as notFound:true (#2806)', async () => {
+      // PROTOCOL §5.5: a deleted agent rejects with -32602 and the structured
+      // discriminator `data.code: "not-found"` (monorepo#1320). The client
+      // must preserve that classification instead of collapsing it into a
+      // generic { ok: false } so the failure toast can dismiss itself.
+      backend.onRequest('agent.retry', () => {
+        throw new BackendError(
+          buildErrorPayload('INVALID_PARAMS', 'Agent agent-gone not found', {
+            rpcCode: -32602,
+            data: { code: 'not-found' },
+          }),
+        );
+      });
+      const client = new LiveAgentsClient();
+
+      const result = await client.retry('agent-gone', 'ws-1');
+      expect(result).toEqual({
+        ok: false,
+        notFound: true,
+        error: 'Agent agent-gone not found',
+      });
+    });
+
+    it('classifies the legacy not-found shape (rpcCode + message, no data.code) as notFound:true', async () => {
+      // Older daemons / lossy re-wrapping lose the structured data.code; the
+      // classifier's rpcCode + message fallback must still mark notFound.
+      backend.onRequest('agent.retry', () => {
+        throw new BackendError(
+          buildErrorPayload('INVALID_PARAMS', 'Agent agent-old not found', {
+            rpcCode: -32602,
+          }),
+        );
+      });
+      const client = new LiveAgentsClient();
+
+      const result = await client.retry('agent-old', 'ws-1');
+      expect(result).toEqual({
+        ok: false,
+        notFound: true,
+        error: 'Agent agent-old not found',
+      });
+    });
+
+    it('does not mark lookalike -32602 errors without a not-found signal as notFound', async () => {
+      backend.onRequest('agent.retry', () => {
+        throw new BackendError(
+          buildErrorPayload('INVALID_PARAMS', 'workspaceId is required', {
+            rpcCode: -32602,
+          }),
+        );
+      });
+      const client = new LiveAgentsClient();
+
+      const result = await client.retry('agent-1', 'ws-1');
+      expect(result).toEqual({ ok: false, error: 'workspaceId is required' });
+      expect(result).not.toHaveProperty('notFound');
     });
   });
 
@@ -1316,16 +1753,15 @@ describe('LiveAgentsClient reads thread daemon activity flags (PROTOCOL §5.5)',
   });
 });
 
-// ---- Typed per-workspace agent channel (PROTOCOL §6.9, monorepo#775) -------
-// On liveState daemons `subscribe` registers ONE `agent.subscribe` per
-// workspace id — a bare `{ workspaceId }` frame, the params shape that routes
-// to the collection channel rather than the deprecated `eventTypes` service
-// alias (§6.9). The channel carries `AgentLite` entities; `agent:deleted`
-// (the soft-hide-then-commit deletion flow's convergence signal) arrives as a
-// `removedIds` delta. Snapshots/deltas reconcile per channel and merge;
-// workspace add/delete re-reconciles the channel set. The subscription is
-// live only while EVERY channel is push-confirmed — any gap keeps legacy
-// refetches serving.
+// ---- Typed per-workspace agent channel (PROTOCOL §6.9, monorepo#1697) ------
+// `subscribe` registers ONE `agent.subscribe` per workspace id — a bare
+// `{ workspaceId }` frame, the params shape that routes to the collection
+// channel rather than the deprecated `eventTypes` service alias (§6.9) — the
+// sole data path; there is no legacy `agent.list` refetch. The channel
+// carries `AgentLite` entities; `agent:deleted` (the soft-hide-then-commit
+// deletion flow's convergence signal) arrives as a `removedIds` delta.
+// Snapshots/deltas reconcile per channel and merge; workspace add/delete
+// re-reconciles the channel set, each channel emitting independently.
 describe('LiveAgentsClient.subscribe typed per-workspace agent channel (PROTOCOL §6.9)', () => {
   const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
   let backend: MockBackendHandle;
@@ -1351,20 +1787,16 @@ describe('LiveAgentsClient.subscribe typed per-workspace agent channel (PROTOCOL
     seq: number,
     delta: { added?: unknown[]; updated?: unknown[]; removedIds?: string[] },
   ) => backend.pushSubscriptionPush({ subscriptionId, kind: 'delta', seq, delta });
-  const fireLegacy = (type: string) => backend.pushEvent({ type });
 
-  // Mutable daemon fixture the mock serves: the workspace set and each
-  // workspace's `agent.list` rows (the legacy/bridging refetch source).
+  // Mutable daemon fixture the mock serves: the workspace set driving the
+  // dynamic channel-per-id scope.
   let workspaceIds: string[] = [];
-  let agentsByWorkspace: Record<string, unknown[]> = {};
   let chanSeq = 0;
 
   beforeEach(() => {
     backend = installMockBackend();
-    backend.setLiveStateCapability(true);
     chanSeq = 0;
     workspaceIds = ['ws-1', 'ws-2'];
-    agentsByWorkspace = {};
     backend.onRequest('workspace.list', () => ({
       workspaces: workspaceIds.map((id) => ({ id })),
     }));
@@ -1373,10 +1805,6 @@ describe('LiveAgentsClient.subscribe typed per-workspace agent channel (PROTOCOL
       return { subscriptionId: `chan-${chanSeq}` };
     });
     backend.onRequest('agent.unsubscribe', () => ({ success: true }));
-    backend.onRequest('agent.list', (params) => {
-      const wsId = (params as { workspaceId?: string })?.workspaceId ?? '';
-      return { agents: agentsByWorkspace[wsId] ?? [] };
-    });
   });
 
   afterEach(() => {
@@ -1401,44 +1829,19 @@ describe('LiveAgentsClient.subscribe typed per-workspace agent channel (PROTOCOL
     unsubscribe();
   });
 
-  it('does not register channels on a daemon without liveState — legacy refetches keep serving', async () => {
-    backend.setLiveStateCapability(false);
-    workspaceIds = ['ws-1'];
-    agentsByWorkspace = { 'ws-1': [wireAgent('agent-leg-1', 'ws-1', 'A')] };
-    const handler = vi.fn();
-    const client = new LiveAgentsClient();
-    const unsubscribe = client.subscribe(handler);
-
-    // Initial one-shot refetch aggregates across workspaces as before.
-    await vi.waitFor(() => expect(handler).toHaveBeenCalled());
-    expect((handler.mock.calls.at(-1)?.[0] as Array<{ id: string }>).map((a) => a.id)).toEqual([
-      'agent-leg-1',
-    ]);
-    expect(requestsFor('agent.subscribe')).toEqual([]);
-
-    // A legacy lifecycle event still refetches.
-    const listCallsBefore = requestsFor('agent.list').length;
-    fireLegacy('agent:status-changed');
-    await flush();
-    expect(requestsFor('agent.list').length).toBeGreaterThan(listCallsBefore);
-    unsubscribe();
-  });
-
-  it('goes live only when every workspace channel is snapshot-confirmed, merging their agents', async () => {
+  it('each channel emits independently, merging into the cross-workspace collection', async () => {
     const handler = vi.fn();
     const client = new LiveAgentsClient();
     const unsubscribe = client.subscribe(handler);
     await vi.waitFor(() => expect(requestsFor('agent.subscribe')).toHaveLength(2));
     await flush();
 
-    // Only chan-1 (ws-1) confirmed: not live yet — legacy events still refetch.
+    // chan-1 (ws-1) confirms: emits immediately with just its agents.
     pushSnapshot('chan-1', 0, [wireAgent('agent-a', 'ws-1', 'A')]);
-    const listCallsBefore = requestsFor('agent.list').length;
-    fireLegacy('agent:status-changed');
-    await flush();
-    expect(requestsFor('agent.list').length).toBeGreaterThan(listCallsBefore);
+    const afterFirst = handler.mock.calls.at(-1)?.[0] as Array<Record<string, unknown>>;
+    expect(afterFirst.map((a) => a.id)).toEqual(['agent-a']);
 
-    // chan-2 (ws-2) confirms: live — the merged cross-workspace collection emits.
+    // chan-2 (ws-2) confirms: merged cross-workspace collection.
     pushSnapshot('chan-2', 0, [wireAgent('agent-b', 'ws-2', 'B')]);
     const merged = handler.mock.calls.at(-1)?.[0] as Array<Record<string, unknown>>;
     expect(merged.map((a) => a.id).sort()).toEqual(['agent-a', 'agent-b']);
@@ -1447,16 +1850,10 @@ describe('LiveAgentsClient.subscribe typed per-workspace agent channel (PROTOCOL
       status: 'idle',
     });
 
-    // A lifecycle-driven `updated` delta reconciles the projection; legacy
-    // agent events no longer refetch.
+    // A lifecycle-driven `updated` delta reconciles the projection.
     pushDelta('chan-2', 1, { updated: [wireAgent('agent-b', 'ws-2', 'B', 'active')] });
     const afterDelta = handler.mock.calls.at(-1)?.[0] as Array<Record<string, unknown>>;
     expect(afterDelta.find((a) => a.id === 'agent-b')).toMatchObject({ status: 'active' });
-    const listCallsLive = requestsFor('agent.list').length;
-    fireLegacy('agent:status-changed');
-    fireLegacy('agent:idle');
-    await flush();
-    expect(requestsFor('agent.list')).toHaveLength(listCallsLive);
     unsubscribe();
   });
 
@@ -1487,7 +1884,7 @@ describe('LiveAgentsClient.subscribe typed per-workspace agent channel (PROTOCOL
   // Deletion-flow convergence (soft-hide-then-commit, agent-mutation-service):
   // after the committed `agent.delete` succeeds the daemon emits
   // `agent:deleted`, which the typed channel delivers as a `removedIds` delta
-  // — the hidden session reconciles away without a legacy refetch.
+  // — the hidden session reconciles away directly.
   it('converges the deletion flow: agent.delete then an agent:deleted removedIds delta drops the session', async () => {
     backend.onRequest('agent.delete', () => ({ success: true }));
     const handler = vi.fn();
@@ -1506,12 +1903,9 @@ describe('LiveAgentsClient.subscribe typed per-workspace agent channel (PROTOCOL
     expect(requestsFor('agent.delete')).toEqual([{ agentId: 'agent-del-1' }]);
 
     // …and the daemon's agent:deleted arrives as a typed removedIds delta.
-    const listCallsBefore = requestsFor('agent.list').length;
     pushDelta('chan-1', 1, { removedIds: ['agent-del-1'] });
     const afterDelete = handler.mock.calls.at(-1)?.[0] as Array<{ id: string }>;
     expect(afterDelete.map((a) => a.id)).toEqual(['agent-keep-1']);
-    // Convergence came from the delta — no legacy refetch fired.
-    expect(requestsFor('agent.list')).toHaveLength(listCallsBefore);
     unsubscribe();
   });
 
@@ -1527,7 +1921,7 @@ describe('LiveAgentsClient.subscribe typed per-workspace agent channel (PROTOCOL
     pushSnapshot('chan-1', 0, [wireAgent('agent-a', 'ws-1', 'A')]);
 
     workspaceIds = ['ws-1', 'ws-2'];
-    fireLegacy('workspace:created');
+    backend.pushEvent({ type: 'workspace:created' });
     await vi.waitFor(() => {
       expect(requestsFor('agent.subscribe')).toEqual([
         { workspaceId: 'ws-1' },
@@ -1552,7 +1946,7 @@ describe('LiveAgentsClient.subscribe typed per-workspace agent channel (PROTOCOL
     pushSnapshot('chan-2', 0, [wireAgent('agent-b', 'ws-2', 'B')]);
 
     workspaceIds = ['ws-1'];
-    fireLegacy('workspace:deleted');
+    backend.pushEvent({ type: 'workspace:deleted' });
     await vi.waitFor(() => {
       expect(requestsFor('agent.unsubscribe')).toEqual([{ subscriptionId: 'chan-2' }]);
     });
@@ -1561,33 +1955,38 @@ describe('LiveAgentsClient.subscribe typed per-workspace agent channel (PROTOCOL
     unsubscribe();
   });
 
-  it('stays legacy while any channel registration fails — refetches keep serving', async () => {
-    agentsByWorkspace = {
-      'ws-1': [wireAgent('agent-a', 'ws-1', 'A')],
-      'ws-2': [wireAgent('agent-b', 'ws-2', 'B')],
-    };
-    backend.onRequest('agent.subscribe', (params) => {
-      const wsId = (params as { workspaceId?: string })?.workspaceId;
-      if (wsId === 'ws-2') throw new Error('boom');
-      chanSeq += 1;
-      return { subscriptionId: `chan-${chanSeq}` };
-    });
-    const handler = vi.fn();
-    const client = new LiveAgentsClient();
-    const unsubscribe = client.subscribe(handler);
-    await vi.waitFor(() => expect(requestsFor('agent.subscribe')).toHaveLength(2));
-    await flush();
+  it('retries a failed channel registration with backoff until it succeeds', async () => {
+    vi.useFakeTimers();
+    try {
+      let ws2Attempts = 0;
+      backend.onRequest('agent.subscribe', (params) => {
+        const wsId = (params as { workspaceId?: string })?.workspaceId;
+        if (wsId === 'ws-2') {
+          ws2Attempts += 1;
+          if (ws2Attempts < 2) throw new Error('boom');
+        }
+        chanSeq += 1;
+        return { subscriptionId: `chan-${chanSeq}` };
+      });
+      const handler = vi.fn();
+      const client = new LiveAgentsClient();
+      const unsubscribe = client.subscribe(handler);
+      await vi.advanceTimersByTimeAsync(0);
+      // Both channels are attempted once; ws-2's attempt failed.
+      expect(requestsFor('agent.subscribe')).toEqual([
+        { workspaceId: 'ws-1' },
+        { workspaceId: 'ws-2' },
+      ]);
+      expect(ws2Attempts).toBe(1);
 
-    // chan-1 confirms but ws-2's registration failed: never live.
-    pushSnapshot('chan-1', 0, [wireAgent('agent-a', 'ws-1', 'A')]);
-    const listCallsBefore = requestsFor('agent.list').length;
-    fireLegacy('agent:status-changed');
-    await flush();
-    expect(requestsFor('agent.list').length).toBeGreaterThan(listCallsBefore);
-    // The refetch (not the lone snapshot) serves the full cross-workspace set.
-    const served = handler.mock.calls.at(-1)?.[0] as Array<{ id: string }>;
-    expect(served.map((a) => a.id).sort()).toEqual(['agent-a', 'agent-b']);
-    unsubscribe();
+      // Retry fires after the backoff delay and succeeds.
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(ws2Attempts).toBe(2);
+      expect(requestsFor('agent.subscribe')).toHaveLength(3);
+      unsubscribe();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('reconnect re-enumerates workspaces and re-registers only the surviving channels', async () => {
@@ -1602,8 +2001,7 @@ describe('LiveAgentsClient.subscribe typed per-workspace agent channel (PROTOCOL
     // ws-2 disappeared during the outage. The reconnect handler re-registers
     // both surviving channel states synchronously (ws-1 → chan-3, ws-2 →
     // chan-4); the id source's reconnect refresh then re-enumerates and
-    // reconciles ws-2 away — its dead channel is unsubscribed instead of
-    // pinning the subscription in legacy mode.
+    // reconciles ws-2 away — its dead channel is unsubscribed.
     workspaceIds = ['ws-1'];
     backend.triggerReconnect();
     await vi.waitFor(() => {
@@ -1614,8 +2012,8 @@ describe('LiveAgentsClient.subscribe typed per-workspace agent channel (PROTOCOL
       expect(requestsFor('agent.unsubscribe')).toEqual([{ subscriptionId: 'chan-4' }]);
     });
 
-    // The surviving ws-1 channel's recovery snapshot re-enters live mode with
-    // only ws-1's agents.
+    // The surviving ws-1 channel's recovery snapshot re-populates with only
+    // ws-1's agents.
     pushSnapshot('chan-3', 0, [wireAgent('agent-a', 'ws-1', 'A')]);
     await flush();
     const recovered = handler.mock.calls.at(-1)?.[0] as Array<{ id: string }>;

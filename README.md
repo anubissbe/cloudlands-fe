@@ -73,13 +73,29 @@ Use `pnpm` (not `npm`). The following scripts are defined in `package.json`:
 ```bash
 pnpm install            # Install dependencies
 pnpm run dev            # Start the app in development (Vite + Electron)
+pnpm run dev:web        # Start the plain-browser development profile
 pnpm run build          # Production build (renderer, main, preload)
+pnpm run build:web      # Build static plain-browser output in dist/web
 pnpm run check          # svelte-check (Svelte + TypeScript diagnostics)
 pnpm run lint           # ESLint
 pnpm run format         # Prettier (write)
 pnpm run test:unit      # Vitest unit suite
 pnpm run test:playwright # Playwright tests
 ```
+
+### Web runtime configuration
+
+`dev:web` accepts `VITE_INTENTD_WS_URL` as a local-development convenience.
+`build:web` deliberately does not compile that value into static JavaScript,
+because a full WebSocket URL can contain userinfo, query credentials, or a
+fragment. Production hosting should replace `/runtime-config.js` at response or
+deployment time and set `globalThis.__INTENT_RUNTIME_CONFIG__.intentdWsUrl` to a
+`wss://` URL. Serve that asset over authenticated HTTPS with `Cache-Control:
+no-store`, and use a short-lived, per-user credential rather than a shared
+secret. The URL is necessarily visible to that browser session; this separation
+prevents it from leaking through versioned bundles, source maps, and long-lived
+CDN caches. The committed empty runtime config preserves the standalone mock
+fallback when no live daemon is configured.
 
 ## intentd sidecar pin
 
@@ -105,6 +121,24 @@ The platform/arch → release-asset mapping lives in
 `scripts/fetch-sidecar-lib.test.ts`); update it there if the intentd release
 target list changes.
 
+## Release channels
+
+Desktop builds are distributed through three rolling releases (`alpha`, `beta`,
+`stable`) on
+[intent-hq/cloudlands-releases](https://github.com/intent-hq/cloudlands-releases),
+each pointing the auto-updater at the latest build for that channel:
+
+- **alpha** — every `vX.Y.Z` tag (cut by merging the release-please PR) builds
+  the app and publishes both an immutable versioned release and the rolling
+  `alpha` release (`.github/workflows/release-beta.yml`; the file name is
+  historical).
+- **beta** — a manual promotion of an existing versioned release (no new
+  build): dispatch `.github/workflows/promote-beta.yml` with the `version`
+  input to copy that release's assets and updater feeds into the rolling
+  `beta` release.
+- **stable** — same promotion model via `.github/workflows/release-stable.yml`;
+  it additionally marks the promoted version as Latest.
+
 ## Project layout
 
 ```text
@@ -128,19 +162,17 @@ See [`AGENTS.md`](./AGENTS.md) for the full conventions and routing guide.
 
 ## Documentation
 
-Key references under [`docs/`](./docs):
+Frontend documentation lives in the monorepo's [`docs/fe/`](../../docs/fe)
+(the relative links resolve in a monorepo checkout, where this repo mounts at
+`packages/cloudlands-fe/`). Key references:
 
-- [AGENT_ARCHITECTURE.md](./docs/AGENT_ARCHITECTURE.md) — agent system
-  architecture and design.
-- [STATE_MANAGEMENT.md](./docs/STATE_MANAGEMENT.md) — Redux + saga state policy
+- [STATE_MANAGEMENT.md](../../docs/fe/STATE_MANAGEMENT.md) — Redux + saga state policy
   and the Svelte-store migration.
-- [MODULE_BOUNDARY_GUIDE.md](./docs/MODULE_BOUNDARY_GUIDE.md) — renderer↔main
+- [MODULE_BOUNDARY_GUIDE.md](../../docs/fe/MODULE_BOUNDARY_GUIDE.md) — renderer↔main
   and feature boundaries.
-- [COMPONENT_RESPONSIBILITIES.md](./docs/COMPONENT_RESPONSIBILITIES.md) —
-  component structure and ownership.
-- [TYPE_SYSTEM_GUIDE.md](./docs/TYPE_SYSTEM_GUIDE.md) — TypeScript and type
+- [TYPE_SYSTEM_GUIDE.md](../../docs/fe/TYPE_SYSTEM_GUIDE.md) — TypeScript and type
   safety conventions.
-- [EVENT_SYSTEM.md](./docs/EVENT_SYSTEM.md) — the unified event system.
+- [EVENT_SYSTEM.md](../../docs/fe/EVENT_SYSTEM.md) — the unified event system.
 
 ## Reporting issues
 

@@ -1,16 +1,10 @@
 import { THEME_PRESET_IDS, THEME_PRESET_MANIFEST } from './theme-presets-manifest';
 import { locales } from './paraglide/runtime.js';
 import { SYSTEM_LANGUAGE_PREFERENCE } from './i18n/locale-matcher';
+import { GITHUB_LINK_DEFAULT_ACTIONS } from './utils/link-helpers';
 
 export type AppSettingValueType =
-  | 'string'
-  | 'boolean'
-  | 'number'
-  | 'object'
-  | 'array'
-  | 'enum'
-  | 'status'
-  | 'readonly';
+  'string' | 'boolean' | 'number' | 'object' | 'array' | 'enum' | 'status' | 'readonly';
 
 export type AppSettingSource =
   /**
@@ -99,14 +93,16 @@ export function formatSettingValue(definition: AppSettingDefinition, value: unkn
 
 export const APP_SETTING_DEFINITIONS: readonly AppSettingDefinition[] = [
   {
-    path: 'preferences.betaUpdatesEnabled',
-    label: 'Beta updates',
-    description: 'Whether beta update notifications are enabled.',
+    path: 'preferences.updateChannel',
+    label: 'Update channel',
+    description: 'Release channel for app updates: stable, beta, or alpha.',
     category: 'preferences',
-    type: 'boolean',
+    type: 'enum',
+    enumValues: ['stable', 'beta', 'alpha'],
+    enumLabels: { stable: 'Stable', beta: 'Beta', alpha: 'Alpha' },
     source: 'redux',
-    defaultValue: false,
-    apply: { kind: 'redux-action', action: 'userPreferences/setBetaUpdatesEnabled' },
+    defaultValue: 'stable',
+    apply: { kind: 'redux-action', action: 'userPreferences/setUpdateChannel' },
   },
   {
     path: 'preferences.spellcheckEnabled',
@@ -218,6 +214,18 @@ export const APP_SETTING_DEFINITIONS: readonly AppSettingDefinition[] = [
     storageKey: 'workspaces-provider-models',
     defaultValue: {},
     apply: { kind: 'read-only' },
+  },
+  {
+    path: 'model.defaultReasoningEffort',
+    label: 'Default reasoning effort',
+    description:
+      'Reasoning-effort level applied to new agents that resolve their model from the default-model setting. Empty means unset (the model default).',
+    category: 'agents',
+    type: 'string',
+    source: 'daemon-settings',
+    storageKey: 'model.defaultReasoningEffort',
+    defaultValue: '',
+    apply: { kind: 'daemon-settings-update', path: 'model.defaultReasoningEffort' },
   },
   {
     path: 'model.pickerCollapsedGroups',
@@ -435,9 +443,10 @@ export const APP_SETTING_DEFINITIONS: readonly AppSettingDefinition[] = [
     apply: { kind: 'user-mcp-settings', key: 'mcpServers' },
   },
   {
-    path: 'backgroundAgents.defaultModel',
+    path: 'quickActions.defaultModel',
     label: 'Default quick action model',
-    description: 'Default model for quick/background agents.',
+    description:
+      'Default model for single-shot quick actions (commit messages, PR descriptions, quick tasks). Never applied to agent sessions.',
     category: 'agents',
     type: 'string',
     source: 'local-storage',
@@ -447,7 +456,7 @@ export const APP_SETTING_DEFINITIONS: readonly AppSettingDefinition[] = [
     apply: { kind: 'redux-action', action: 'backgroundAgentSettings/setDefaultModel' },
   },
   {
-    path: 'backgroundAgents.typeOverrides',
+    path: 'quickActions.typeOverrides',
     label: 'Quick action model overrides',
     description: 'Per-quick-action model overrides.',
     category: 'agents',
@@ -459,9 +468,9 @@ export const APP_SETTING_DEFINITIONS: readonly AppSettingDefinition[] = [
     apply: { kind: 'redux-action', action: 'backgroundAgentSettings/setTypeOverride' },
   },
   {
-    path: 'backgroundAgents.providerSettings',
+    path: 'quickActions.providerSettings',
     label: 'Per-provider quick action settings',
-    description: 'Cached quick/background agent settings by provider ID.',
+    description: 'Cached quick action settings by provider ID.',
     category: 'agents',
     type: 'object',
     source: 'local-storage',
@@ -488,7 +497,7 @@ export const APP_SETTING_DEFINITIONS: readonly AppSettingDefinition[] = [
     description: 'Font style for notes.',
     category: 'fonts',
     type: 'enum',
-    enumValues: ['sans', 'monospace'],
+    enumValues: ['sans', 'serif', 'monospace'],
     source: 'local-storage',
     storageKey: 'note-font-settings',
     valuePath: 'fontStyle',
@@ -604,6 +613,25 @@ export const APP_SETTING_DEFINITIONS: readonly AppSettingDefinition[] = [
     storageKey: 'open-combo-button-last-action',
     defaultValue: 'vscode',
     apply: { kind: 'redux-action', action: 'externalEditors/setOpenAction' },
+  },
+  {
+    path: 'githubLinks.defaultAction',
+    label: 'GitHub link default action',
+    description: 'Default action for plain clicks on GitHub issue and pull request links.',
+    category: 'per-feature',
+    type: 'enum',
+    enumValues: GITHUB_LINK_DEFAULT_ACTIONS,
+    enumLabels: {
+      'show-choices': 'Show choices',
+      'open-in-browser': 'Open in browser',
+      'open-in-app': 'Open in app',
+      'copy-link': 'Copy link',
+      'start-workspace': 'Start workspace',
+    },
+    source: 'local-storage',
+    storageKey: 'github-links:defaultAction',
+    defaultValue: 'show-choices',
+    apply: { kind: 'redux-action', action: 'userPreferences/setGithubLinkDefaultAction' },
   },
   {
     path: 'openIn.hiddenEditors',

@@ -1,63 +1,56 @@
-import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
-// Fake the live backend transport so the seam routes settings.list /
-// settings.update through in-memory stubs (no Electron). `vi.hoisted` keeps
-// the spies visible to the hoisted vi.mock factory.
-const { listSpy, updateSpy } = vi.hoisted(() => ({ listSpy: vi.fn(), updateSpy: vi.fn() }));
-vi.mock("$lib/client/live/backend-transport", () => ({
+const { updateSpy, catalogSpy } = vi.hoisted(() => ({
+  updateSpy: vi.fn(),
+  catalogSpy: vi.fn(),
+}));
+vi.mock('$lib/client/live/backend-transport', () => ({
   backendRequest: (method: string, params?: unknown) => {
-    if (method === "settings.list") return listSpy(params);
-    if (method === "settings.update") return updateSpy(params);
+    if (method === 'settings.update') return updateSpy(params);
+    if (method === 'providers.catalog') return catalogSpy(params);
     return Promise.resolve(undefined);
   },
-  backendSubscribe: () => Promise.resolve({ subscriptionId: "sub-set-1" }),
+  backendSubscribe: () => Promise.resolve({ subscriptionId: 'sub-set-1' }),
   backendUnsubscribe: () => Promise.resolve(),
   onBackendNotification: () => () => {},
   onBackendReconnected: () => () => {},
 }));
 
-import { store as appStore } from "$store/renderer/store";
+import { store as appStore } from '$store/renderer/store';
+
+const testStore = appStore as typeof appStore & {
+  storeContext?: unknown;
+  getExistingStoreContext(): unknown;
+};
+testStore.getExistingStoreContext = function () {
+  return this.storeContext;
+};
+import { applySettingsChanges, BG_MODEL_MIGRATION_MARKER_KEY } from './settings-hydration-service';
 import {
-  __resetSettingsHydrationForTests,
-  applySettingsChanges,
-  createSettingsHydrationMiddleware,
-  BG_MODEL_MIGRATION_MARKER_KEY,
-} from "./settings-hydration-service";
-import { setAgentStreaming } from "$store/renderer/slices/agent-session/agent-session-slice";
+  hydrateActiveProvider,
+  loadEnabledProvidersFromStorage,
+} from '$store/renderer/slices/provider-settings/provider-settings-slice';
+import { loadProviderModelsFromStorage } from '$store/renderer/slices/model/model-slice';
 
-const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
-
-describe("settings-hydration-service (boot read + applySettingsChanges)", () => {
+describe('settings-hydration-service (boot read + applySettingsChanges)', () => {
   beforeAll(() => {
     appStore.init();
   });
 
   beforeEach(() => {
-    listSpy.mockReset();
     updateSpy.mockReset();
     updateSpy.mockResolvedValue({ applied: [] });
+    catalogSpy.mockReset();
+    catalogSpy.mockRejectedValue(new Error('no catalog in this test'));
     localStorage.removeItem(BG_MODEL_MIGRATION_MARKER_KEY);
-    __resetSettingsHydrationForTests();
   });
 
   afterEach(() => vi.clearAllMocks());
 
-  it("registers and lazily fires settings.list on the first dispatched action", async () => {
-    listSpy.mockResolvedValueOnce({ settings: [] });
-
-    // Calling the factory does NOT trigger I/O — only a dispatch does.
-    createSettingsHydrationMiddleware();
-    expect(listSpy).not.toHaveBeenCalled();
-
-    appStore.dispatch(setAgentStreaming("agent-x", false));
-    await flush();
-    expect(listSpy).toHaveBeenCalledTimes(1);
-  });
-
-  it("hydrates the provider-settings slice from providers.active / providers.enabled", async () => {
+  it('hydrates the provider-settings slice from providers.active / providers.enabled', async () => {
     applySettingsChanges([
-      { path: "providers.active", value: "auggie" },
-      { path: "providers.enabled", value: { auggie: true, codex: false } },
+      { path: 'providers.active', value: 'auggie' },
+      { path: 'providers.enabled', value: { auggie: true, codex: false } },
     ]);
     const state = appStore.state as {
       providerSettings: {
@@ -65,18 +58,16 @@ describe("settings-hydration-service (boot read + applySettingsChanges)", () => 
         enabledProviders: Record<string, boolean>;
       };
     };
-    expect(state.providerSettings.activeProviderId).toBe("auggie");
+    expect(state.providerSettings.activeProviderId).toBe('auggie');
     expect(state.providerSettings.enabledProviders).toEqual({ auggie: true, codex: false });
   });
 
-  it("hydrates the mcp-settings slice from mcp.servers + mcp.disabledServers + mcp.enableUserServers", async () => {
-    const servers = [
-      { name: "github", type: "http" as const, url: "https://mcp.github.com/mcp" },
-    ];
+  it('hydrates the mcp-settings slice from mcp.servers + mcp.disabledServers + mcp.enableUserServers', async () => {
+    const servers = [{ name: 'github', type: 'http' as const, url: 'https://mcp.github.com/mcp' }];
     applySettingsChanges([
-      { path: "mcp.servers", value: servers },
-      { path: "mcp.disabledServers", value: { filesystem: true } },
-      { path: "mcp.enableUserServers", value: true },
+      { path: 'mcp.servers', value: servers },
+      { path: 'mcp.disabledServers', value: { filesystem: true } },
+      { path: 'mcp.enableUserServers', value: true },
     ]);
     const state = appStore.state as {
       mcpSettings: {
@@ -90,10 +81,10 @@ describe("settings-hydration-service (boot read + applySettingsChanges)", () => 
     expect(state.mcpSettings.enabled).toBe(true);
   });
 
-  it("hydrates the background-agent-settings slice as a single bundle", async () => {
+  it('hydrates the background-agent-settings slice as a single bundle', async () => {
     applySettingsChanges([
-      { path: "backgroundAgents.defaultModel", value: "claude-sonnet" },
-      { path: "backgroundAgents.typeOverrides", value: { commit: "fast-1" } },
+      { path: 'quickActions.defaultModel', value: 'claude-sonnet' },
+      { path: 'quickActions.typeOverrides', value: { commit: 'fast-1' } },
     ]);
     const state = appStore.state as {
       backgroundAgentSettings: {
@@ -101,23 +92,50 @@ describe("settings-hydration-service (boot read + applySettingsChanges)", () => 
         typeOverrides: Record<string, string>;
       };
     };
-    expect(state.backgroundAgentSettings.defaultModel).toBe("claude-sonnet");
-    expect(state.backgroundAgentSettings.typeOverrides.commit).toBe("fast-1");
+    expect(state.backgroundAgentSettings.defaultModel).toBe('claude-sonnet');
+    expect(state.backgroundAgentSettings.typeOverrides.commit).toBe('fast-1');
     // Missing fields fall back to empty strings, matching the slice's initial state.
-    expect(state.backgroundAgentSettings.typeOverrides.pr).toBe("");
+    expect(state.backgroundAgentSettings.typeOverrides.pr).toBe('');
   });
 
-  it("silently skips unknown paths so BE-side schema additions never crash the FE", () => {
+  it('hydrates model.defaultReasoningEffort into the model slice', () => {
+    applySettingsChanges([{ path: 'model.defaultReasoningEffort', value: 'high' }]);
+    const state = appStore.state as { model: { defaultReasoningEffort: string } };
+    expect(state.model.defaultReasoningEffort).toBe('high');
+
+    // Clearing to Default persists (and rehydrates) an empty string.
+    applySettingsChanges([{ path: 'model.defaultReasoningEffort', value: '' }]);
+    expect(
+      (appStore.state as { model: { defaultReasoningEffort: string } }).model
+        .defaultReasoningEffort,
+    ).toBe('');
+  });
+
+  it('ignores non-string model.defaultReasoningEffort values', () => {
+    applySettingsChanges([{ path: 'model.defaultReasoningEffort', value: 'medium' }]);
+    applySettingsChanges([
+      { path: 'model.defaultReasoningEffort', value: 42 },
+      { path: 'model.defaultReasoningEffort', value: null },
+      { path: 'model.defaultReasoningEffort', value: { level: 'low' } },
+    ]);
+    const state = appStore.state as { model: { defaultReasoningEffort: string } };
+    expect(state.model.defaultReasoningEffort).toBe('medium');
+  });
+
+  it('silently skips unknown paths so BE-side schema additions never crash the FE', () => {
     expect(() =>
-      applySettingsChanges([{ path: "completely.unknown.path", value: 42 }]),
+      applySettingsChanges([{ path: 'completely.unknown.path', value: 42 }]),
     ).not.toThrow();
   });
 
-  it("preserves sibling backgroundAgents keys when partial delta contains only one", () => {
+  it('preserves sibling backgroundAgents keys when partial delta contains only one', () => {
     // First hydrate with both keys
     applySettingsChanges([
-      { path: "backgroundAgents.defaultModel", value: "claude-sonnet" },
-      { path: "backgroundAgents.typeOverrides", value: { commit: "fast-1", pr: "pr-model", review: "", fast: "" } },
+      { path: 'quickActions.defaultModel', value: 'claude-sonnet' },
+      {
+        path: 'quickActions.typeOverrides',
+        value: { commit: 'fast-1', pr: 'pr-model', review: '', fast: '' },
+      },
     ]);
 
     const stateBefore = appStore.state as {
@@ -126,13 +144,11 @@ describe("settings-hydration-service (boot read + applySettingsChanges)", () => 
         typeOverrides: Record<string, string>;
       };
     };
-    expect(stateBefore.backgroundAgentSettings.defaultModel).toBe("claude-sonnet");
-    expect(stateBefore.backgroundAgentSettings.typeOverrides.pr).toBe("pr-model");
+    expect(stateBefore.backgroundAgentSettings.defaultModel).toBe('claude-sonnet');
+    expect(stateBefore.backgroundAgentSettings.typeOverrides.pr).toBe('pr-model');
 
     // Now apply a partial delta with ONLY defaultModel (simulates daemon echo-back of a single-field update)
-    applySettingsChanges([
-      { path: "backgroundAgents.defaultModel", value: "new-model" },
-    ]);
+    applySettingsChanges([{ path: 'quickActions.defaultModel', value: 'new-model' }]);
 
     const stateAfter = appStore.state as {
       backgroundAgentSettings: {
@@ -142,12 +158,12 @@ describe("settings-hydration-service (boot read + applySettingsChanges)", () => 
     };
 
     // defaultModel should update
-    expect(stateAfter.backgroundAgentSettings.defaultModel).toBe("new-model");
+    expect(stateAfter.backgroundAgentSettings.defaultModel).toBe('new-model');
     // typeOverrides should NOT be dropped — it should fall back to the current slice state
-    expect(stateAfter.backgroundAgentSettings.typeOverrides.pr).toBe("pr-model");
+    expect(stateAfter.backgroundAgentSettings.typeOverrides.pr).toBe('pr-model');
   });
 
-  describe("legacy haiku4.5 background-model migration", () => {
+  describe('legacy haiku4.5 background-model migration', () => {
     type BgState = {
       backgroundAgentSettings: {
         defaultModel: string;
@@ -160,9 +176,7 @@ describe("settings-hydration-service (boot read + applySettingsChanges)", () => 
     const storage = new Map<string, string>();
     beforeEach(() => {
       storage.clear();
-      vi.mocked(localStorage.getItem).mockImplementation(
-        (key: string) => storage.get(key) ?? null,
-      );
+      vi.mocked(localStorage.getItem).mockImplementation((key: string) => storage.get(key) ?? null);
       vi.mocked(localStorage.setItem).mockImplementation((key: string, value: string) => {
         storage.set(key, String(value));
       });
@@ -173,67 +187,265 @@ describe("settings-hydration-service (boot read + applySettingsChanges)", () => 
 
     it("migrates legacy persisted haiku4.5 (default + overrides) to '' and persists the migration", () => {
       applySettingsChanges([
-        { path: "backgroundAgents.defaultModel", value: "haiku4.5" },
+        { path: 'quickActions.defaultModel', value: 'haiku4.5' },
         {
-          path: "backgroundAgents.typeOverrides",
-          value: { commit: "haiku4.5", pr: "pr-model", review: "", fast: "" },
+          path: 'quickActions.typeOverrides',
+          value: { commit: 'haiku4.5', pr: 'pr-model', review: '', fast: '' },
         },
       ]);
 
       const state = appStore.state as BgState;
-      expect(state.backgroundAgentSettings.defaultModel).toBe("");
-      expect(state.backgroundAgentSettings.typeOverrides.commit).toBe("");
+      expect(state.backgroundAgentSettings.defaultModel).toBe('');
+      expect(state.backgroundAgentSettings.typeOverrides.commit).toBe('');
       // Non-legacy overrides pass through untouched.
-      expect(state.backgroundAgentSettings.typeOverrides.pr).toBe("pr-model");
+      expect(state.backgroundAgentSettings.typeOverrides.pr).toBe('pr-model');
 
       // The normalized values are written back to the daemon settings catalog.
       expect(updateSpy).toHaveBeenCalledTimes(1);
       expect(updateSpy).toHaveBeenCalledWith({
         changes: [
-          { path: "backgroundAgents.defaultModel", value: "" },
+          { path: 'quickActions.defaultModel', value: '' },
           {
-            path: "backgroundAgents.typeOverrides",
-            value: { commit: "", pr: "pr-model", review: "", fast: "" },
+            path: 'quickActions.typeOverrides',
+            value: { commit: '', pr: 'pr-model', review: '', fast: '' },
           },
         ],
       });
-      expect(localStorage.getItem(BG_MODEL_MIGRATION_MARKER_KEY)).toBe("1");
+      expect(localStorage.getItem(BG_MODEL_MIGRATION_MARKER_KEY)).toBe('1');
     });
 
-    it("passes any other persisted model id through untouched (and never writes back)", () => {
+    it('passes any other persisted model id through untouched (and never writes back)', () => {
       applySettingsChanges([
-        { path: "backgroundAgents.defaultModel", value: "claude-sonnet" },
+        { path: 'quickActions.defaultModel', value: 'claude-sonnet' },
         {
-          path: "backgroundAgents.typeOverrides",
-          value: { commit: "fast-1", pr: "", review: "", fast: "" },
+          path: 'quickActions.typeOverrides',
+          value: { commit: 'fast-1', pr: '', review: '', fast: '' },
         },
       ]);
 
       const state = appStore.state as BgState;
-      expect(state.backgroundAgentSettings.defaultModel).toBe("claude-sonnet");
-      expect(state.backgroundAgentSettings.typeOverrides.commit).toBe("fast-1");
+      expect(state.backgroundAgentSettings.defaultModel).toBe('claude-sonnet');
+      expect(state.backgroundAgentSettings.typeOverrides.commit).toBe('fast-1');
       expect(updateSpy).not.toHaveBeenCalled();
       // The marker is still set so later hydrations skip the migration check.
-      expect(localStorage.getItem(BG_MODEL_MIGRATION_MARKER_KEY)).toBe("1");
+      expect(localStorage.getItem(BG_MODEL_MIGRATION_MARKER_KEY)).toBe('1');
     });
 
-    it("does not re-run: a deliberate post-migration re-pick of haiku4.5 hydrates verbatim", () => {
+    it('does not re-run: a deliberate post-migration re-pick of haiku4.5 hydrates verbatim', () => {
       // First hydration runs (and completes) the migration.
       applySettingsChanges([
-        { path: "backgroundAgents.defaultModel", value: "haiku4.5" },
-        { path: "backgroundAgents.typeOverrides", value: { commit: "", pr: "", review: "", fast: "" } },
+        { path: 'quickActions.defaultModel', value: 'haiku4.5' },
+        { path: 'quickActions.typeOverrides', value: { commit: '', pr: '', review: '', fast: '' } },
       ]);
-      expect((appStore.state as BgState).backgroundAgentSettings.defaultModel).toBe("");
+      expect((appStore.state as BgState).backgroundAgentSettings.defaultModel).toBe('');
       updateSpy.mockClear();
 
       // The user re-picks haiku4.5; the daemon echoes it back via settings:changed.
-      applySettingsChanges([
-        { path: "backgroundAgents.defaultModel", value: "haiku4.5" },
-      ]);
+      applySettingsChanges([{ path: 'quickActions.defaultModel', value: 'haiku4.5' }]);
 
       const state = appStore.state as BgState;
-      expect(state.backgroundAgentSettings.defaultModel).toBe("haiku4.5");
+      expect(state.backgroundAgentSettings.defaultModel).toBe('haiku4.5');
       expect(updateSpy).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('default-provider enablement seeding (monorepo#1947)', () => {
+    type ProviderState = {
+      providerSettings: { enabledProviders: Record<string, boolean> };
+    };
+
+    /** §5.38-shaped catalog: auggie disableable, claude-code not. */
+    const CATALOG = {
+      providers: [
+        {
+          id: 'auggie',
+          displayName: 'Augment Auggie',
+          shortName: 'Auggie',
+          command: 'auggie',
+          canBeDisabled: true,
+          visible: true,
+        },
+        {
+          id: 'claude-code',
+          displayName: 'Claude Code',
+          shortName: 'Claude',
+          command: 'claude',
+          canBeDisabled: false,
+          visible: true,
+        },
+      ],
+    };
+
+    const enabledProviders = () =>
+      (appStore.state as ProviderState).providerSettings.enabledProviders;
+
+    /** Let the fire-and-forget seed promise (if any) settle. */
+    const flushAsync = async () => {
+      for (let i = 0; i < 5; i++) await Promise.resolve();
+    };
+
+    beforeEach(() => {
+      catalogSpy.mockResolvedValue(CATALOG);
+      // Reset the slice map so no enablement state bleeds between tests (the
+      // app store is a module singleton).
+      appStore.dispatch(hydrateActiveProvider(''));
+      appStore.dispatch(loadEnabledProvidersFromStorage({}));
+      appStore.dispatch(loadProviderModelsFromStorage({}));
+    });
+
+    it('seeds an unset default provider to true and persists the map back (pre-2.17 upgrade)', async () => {
+      // Existing-machine simulation: active provider auggie, enabled map
+      // without an auggie entry (the pre-fe#759 unset⇒enabled special case
+      // meant it was never written).
+      applySettingsChanges([
+        { path: 'providers.active', value: 'auggie' },
+        { path: 'providers.enabled', value: { codex: true } },
+      ]);
+
+      await vi.waitFor(() => expect(updateSpy).toHaveBeenCalledTimes(1));
+      expect(enabledProviders()).toEqual({ codex: true, auggie: true });
+      expect(updateSpy).toHaveBeenCalledWith({
+        changes: [{ path: 'providers.enabled', value: { codex: true, auggie: true } }],
+      });
+    });
+
+    it('seeds when providers.enabled hydrates as null (never-persisted install)', async () => {
+      // The daemon returns null for the enabled map on installs that never
+      // persisted one — the most common pre-2.17 upgrade shape. The seed gate
+      // is path-keyed, so a null value still triggers it against the slice's
+      // (empty) map even though applyOne skips the null dispatch.
+      applySettingsChanges([
+        { path: 'providers.active', value: 'auggie' },
+        { path: 'providers.enabled', value: null },
+      ]);
+
+      await vi.waitFor(() => expect(updateSpy).toHaveBeenCalledTimes(1));
+      expect(enabledProviders()).toEqual({ auggie: true });
+      expect(updateSpy).toHaveBeenCalledWith({
+        changes: [{ path: 'providers.enabled', value: { auggie: true } }],
+      });
+    });
+
+    it('seeds the sole persisted model provider when providers.active is unset', async () => {
+      applySettingsChanges([
+        { path: 'providers.active', value: null },
+        { path: 'model.providerDefaults', value: { auggie: 'gpt5.6-sol' } },
+        { path: 'providers.enabled', value: null },
+      ]);
+
+      await vi.waitFor(() => expect(updateSpy).toHaveBeenCalledTimes(1));
+      expect(enabledProviders()).toEqual({ auggie: true });
+      expect(updateSpy).toHaveBeenCalledWith({
+        changes: [{ path: 'providers.enabled', value: { auggie: true } }],
+      });
+    });
+
+    it('leaves an unset active provider unresolved when persisted model providers are ambiguous', async () => {
+      applySettingsChanges([
+        { path: 'providers.active', value: null },
+        {
+          path: 'model.providerDefaults',
+          value: { auggie: 'gpt5.6-sol', codex: 'gpt-5.3-codex/high' },
+        },
+        { path: 'providers.enabled', value: null },
+      ]);
+
+      await flushAsync();
+      expect(enabledProviders()).toEqual({});
+      expect(catalogSpy).not.toHaveBeenCalled();
+      expect(updateSpy).not.toHaveBeenCalled();
+    });
+
+    it('preserves an explicit persisted false (deliberate disable) without touching the wire', async () => {
+      applySettingsChanges([
+        { path: 'providers.active', value: 'auggie' },
+        { path: 'providers.enabled', value: { auggie: false } },
+      ]);
+
+      await flushAsync();
+      expect(enabledProviders()).toEqual({ auggie: false });
+      expect(catalogSpy).not.toHaveBeenCalled();
+      expect(updateSpy).not.toHaveBeenCalled();
+    });
+
+    it('is idempotent: the seeded entry short-circuits every later hydration', async () => {
+      applySettingsChanges([
+        { path: 'providers.active', value: 'auggie' },
+        { path: 'providers.enabled', value: {} },
+      ]);
+      await vi.waitFor(() => expect(updateSpy).toHaveBeenCalledTimes(1));
+      expect(enabledProviders()).toEqual({ auggie: true });
+      updateSpy.mockClear();
+      catalogSpy.mockClear();
+
+      // The daemon echoes the persisted map back (and later boots re-hydrate it).
+      applySettingsChanges([{ path: 'providers.enabled', value: { auggie: true } }]);
+
+      await flushAsync();
+      expect(catalogSpy).not.toHaveBeenCalled();
+      expect(updateSpy).not.toHaveBeenCalled();
+    });
+
+    it('never seeds a non-disableable provider (always enabled, needs no entry)', async () => {
+      applySettingsChanges([
+        { path: 'providers.active', value: 'claude-code' },
+        { path: 'providers.enabled', value: {} },
+      ]);
+
+      await vi.waitFor(() => expect(catalogSpy).toHaveBeenCalledTimes(1));
+      await flushAsync();
+      expect(enabledProviders()).toEqual({});
+      expect(updateSpy).not.toHaveBeenCalled();
+    });
+
+    it('never seeds a provider unknown to the catalog', async () => {
+      applySettingsChanges([
+        { path: 'providers.active', value: 'removed-provider' },
+        { path: 'providers.enabled', value: {} },
+      ]);
+
+      await vi.waitFor(() => expect(catalogSpy).toHaveBeenCalledTimes(1));
+      await flushAsync();
+      expect(enabledProviders()).toEqual({});
+      expect(updateSpy).not.toHaveBeenCalled();
+    });
+
+    it('skips the seed (and retries next hydration) when the catalog read fails', async () => {
+      catalogSpy.mockRejectedValue(new Error('daemon unavailable'));
+      applySettingsChanges([
+        { path: 'providers.active', value: 'auggie' },
+        { path: 'providers.enabled', value: {} },
+      ]);
+
+      await vi.waitFor(() => expect(catalogSpy).toHaveBeenCalledTimes(1));
+      await flushAsync();
+      expect(enabledProviders()).toEqual({});
+      expect(updateSpy).not.toHaveBeenCalled();
+
+      // The next hydration (e.g. next boot) retries and seeds.
+      catalogSpy.mockResolvedValue(CATALOG);
+      applySettingsChanges([{ path: 'providers.enabled', value: {} }]);
+      await vi.waitFor(() => expect(updateSpy).toHaveBeenCalledTimes(1));
+      expect(enabledProviders()).toEqual({ auggie: true });
+    });
+
+    it('does not mutate renderer state when the daemon write fails (persist-first)', async () => {
+      updateSpy.mockRejectedValue(new Error('write failed'));
+      applySettingsChanges([
+        { path: 'providers.active', value: 'auggie' },
+        { path: 'providers.enabled', value: {} },
+      ]);
+
+      await vi.waitFor(() => expect(updateSpy).toHaveBeenCalledTimes(1));
+      await flushAsync();
+      // Renderer stays faithful to the daemon (no entry ⇒ resolves disabled);
+      // the seed retries on the next hydration.
+      expect(enabledProviders()).toEqual({});
+
+      updateSpy.mockResolvedValue({ applied: [] });
+      applySettingsChanges([{ path: 'providers.enabled', value: {} }]);
+      await vi.waitFor(() => expect(updateSpy).toHaveBeenCalledTimes(2));
+      expect(enabledProviders()).toEqual({ auggie: true });
     });
   });
 });

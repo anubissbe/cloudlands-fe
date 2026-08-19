@@ -2,15 +2,16 @@
   /**
    * ProviderPathConfig
    *
-   * A compact folder icon button that opens a dropdown portal for configuring
-   * a provider's CLI executable path. Designed for the Integrations > Providers section.
+   * A dropdown panel for configuring a provider's CLI executable path. It can
+   * render its default folder trigger or be controlled by a parent menu.
    */
   import { appClient } from '$lib/client';
   import { faFolder, faCheck } from '@fortawesome/free-solid-svg-icons';
   import Fa from 'svelte-fa';
   import { toast } from 'svelte-sonner';
   import { m } from '$shared/paraglide/messages.js';
-  import DropdownMenu from '$lib/components/ui/dropdown-menu.svelte';
+  import * as Menu from '$lib/components/ui/menu';
+  import { Button } from '$lib/components/ui/button';
   import PathSettingField from './PathSettingField.svelte';
   import { createLogger } from '$lib/utils/client-logger';
 
@@ -55,6 +56,10 @@
     isInstalled?: boolean;
     /** Callback when path changes */
     onPathChange?: (path: string) => void;
+    /** Whether the path dropdown is open */
+    open?: boolean;
+    /** Whether to render the default folder trigger */
+    showTrigger?: boolean;
   }
 
   let {
@@ -67,9 +72,9 @@
     runtimeResolvedPath,
     isInstalled = false,
     onPathChange,
+    open = $bindable(false),
+    showTrigger = true,
   }: Props = $props();
-
-  let dropdownOpen = $state(false);
 
   async function savePath(path: string) {
     try {
@@ -99,21 +104,53 @@
   const placeholderText = $derived(
     resolvedPath ? resolvedPath : m.settings_providerPath_placeholder({ command: cliCommand }),
   );
+
+  // Remote daemons route browsing to the in-app DirectoryPickerModal, which
+  // portals outside this menu; while it is open the menu must neither close
+  // on outside interaction/Escape/focus loss nor unmount the subtree that
+  // renders the modal.
+  let pickerOpen = $state(false);
 </script>
 
-<DropdownMenu bind:open={dropdownOpen} align="end" side="bottom" portal={true}>
-  {#snippet trigger({ toggle }: { toggle: () => void })}
-    <button
-      type="button"
-      onclick={toggle}
-      class="p-1.5 text-muted-foreground hover:text-foreground hover:bg-muted/50 rounded transition-colors cursor-pointer"
-      title={m.settings_providerPath_configureTitle({ name: providerName })}
-    >
-      <Fa icon={faFolder} size={11} />
-    </button>
-  {/snippet}
-
-  {#snippet content()}
+<Menu.Root
+  bind:open={
+    () => open,
+    (next) => {
+      // The remote picker modal lives inside this menu's subtree; refuse to
+      // close (and unmount it) while the modal is open.
+      if (!next && pickerOpen) return;
+      open = next;
+    }
+  }
+>
+  {#if showTrigger}
+    <Menu.Trigger>
+      {#snippet child({ props })}
+        <span class="contents" {...props}>
+          <Button
+            variant="ghost-light"
+            size="icon-xs"
+            tooltip={m.settings_providerPath_configureTitle({ name: providerName })}
+            title={m.settings_providerPath_configureTitle({ name: providerName })}
+            aria-label={m.settings_providerPath_configureTitle({ name: providerName })}
+          >
+            <Fa icon={faFolder} size={11} />
+          </Button>
+        </span>
+      {/snippet}
+    </Menu.Trigger>
+  {/if}
+  <Menu.Content
+    align="end"
+    side="bottom"
+    portal={true}
+    interactOutsideBehavior={pickerOpen ? 'ignore' : 'close'}
+    escapeKeydownBehavior={pickerOpen ? 'ignore' : 'close'}
+    onFocusOutside={(event) => {
+      if (pickerOpen) event.preventDefault();
+    }}
+    aria-label={m.ui_dropdownMenu_ariaLabel()}
+  >
     <div class="w-80 p-3 space-y-3 overflow-hidden">
       <!-- Header with helpful copy -->
       <div class="space-y-1">
@@ -141,6 +178,7 @@
         ariaLabel={m.settings_providerPath_header({ name: providerName })}
         pickerTitle={m.settings_providerPath_pickerTitle({ command: cliCommand })}
         onchange={savePath}
+        bind:pickerOpen
       />
 
       <!-- Status indicator: full (wrapped) auto-detected paths; the primary
@@ -210,5 +248,5 @@
         </div>
       {/if}
     </div>
-  {/snippet}
-</DropdownMenu>
+  </Menu.Content>
+</Menu.Root>

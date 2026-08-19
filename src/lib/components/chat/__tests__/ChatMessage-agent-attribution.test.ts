@@ -4,14 +4,64 @@
 import { render, screen, fireEvent } from '@testing-library/svelte';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { AgentMessage } from '$shared/types';
+import { WorkspaceId } from '$shared/types/branded-ids';
+import {
+  configuredVisualStates,
+  exerciseVisualStates,
+} from '$lib/components/__tests__/helpers/visual-state-characterization';
+import {
+  SUBSCRIPTION_CARD_CONTAINMENT_CLASS,
+  SUBSCRIPTION_CARD_SURFACE_CLASS,
+  SUBSCRIPTION_DISCLOSURE_ROW_CLASS,
+  SUBSCRIPTION_IN_THREAD_CARD_SPACING_CLASS,
+} from '../subscription-disclosure';
+import { USER_MESSAGE_SURFACE_CLASS } from '../user-message-surface';
 
-const { dispatchMock } = vi.hoisted(() => ({ dispatchMock: vi.fn() }));
+const { dispatchMock, handleLinkMock, agentSelectorHarness } = vi.hoisted(() => {
+  type Snapshot = {
+    session: Record<string, unknown>;
+    responding: boolean;
+    waiting: boolean;
+    permissionCount: number;
+    provider: string | undefined;
+  };
+  const initialSnapshot: Snapshot = {
+    session: { status: 'idle', metadata: { specialist: 'spec-writer' } },
+    responding: false,
+    waiting: false,
+    permissionCount: 0,
+    provider: 'augment',
+  };
+  let snapshot = initialSnapshot;
+  const listeners = new Set<() => void>();
+  return {
+    dispatchMock: vi.fn(),
+    handleLinkMock: vi.fn(),
+    agentSelectorHarness: {
+      readable: <T>(select: (value: Snapshot) => T) => ({
+        subscribe: (run: (value: T) => void) => {
+          const notify = () => run(select(snapshot));
+          notify();
+          listeners.add(notify);
+          return () => listeners.delete(notify);
+        },
+      }),
+      set: (updates: Partial<Snapshot>) => {
+        snapshot = { ...snapshot, ...updates };
+        for (const notify of [...listeners]) notify();
+      },
+      reset: () => {
+        snapshot = initialSnapshot;
+        for (const notify of [...listeners]) notify();
+      },
+    },
+  };
+});
 
 // Mock Redux store and selectors
 vi.mock('$store/renderer/store', async () => {
-  const { createAppStoreMockModule } = await import(
-    '$store/renderer/utils/test-helpers/store-mock'
-  );
+  const { createAppStoreMockModule } =
+    await import('$store/renderer/utils/test-helpers/store-mock');
   return createAppStoreMockModule({
     state: () => ({}),
     dispatch: dispatchMock,
@@ -19,15 +69,19 @@ vi.mock('$store/renderer/store', async () => {
 });
 
 vi.mock('$store/renderer/slices/workspace/workspace-selectors', () => ({
-  selectActiveWorkspaceId: Object.assign(
+  selectWorkspaceById: Object.assign(
     () => ({
-      subscribe: (run: (value: string | null) => void) => {
-        run('ws-1');
+      subscribe: (run: (value: unknown) => void) => {
+        run(undefined);
         return () => {};
       },
     }),
-    { select: () => 'ws-1' },
+    { select: () => ({ repositoryOwner: 'intent-hq', repositoryName: 'monorepo' }) },
   ),
+}));
+
+vi.mock('$features/navigation/link-handler', () => ({
+  handleLink: handleLinkMock,
 }));
 
 vi.mock('$store/renderer/slices/workspace-notes/workspace-notes-selectors', () => ({
@@ -52,10 +106,20 @@ vi.mock('$store/renderer/slices/agent-session/agent-session-selectors', () => ({
     }),
     { select: () => undefined },
   ),
+  selectAgentSession: Object.assign(() => agentSelectorHarness.readable((value) => value.session), {
+    select: () => ({ metadata: { specialist: 'spec-writer' } }),
+  }),
+  selectAgentIsResponding: () => agentSelectorHarness.readable((value) => value.responding),
+  selectAgentIsWaiting: () => agentSelectorHarness.readable((value) => value.waiting),
+  selectAgentProvider: () => agentSelectorHarness.readable((value) => value.provider),
 }));
 
-vi.mock('$lib/components/ui/auggie-avatar/AuggieAvatar.svelte', async () => ({
-  default: (await import('./mocks/AuggieAvatar.svelte')).default,
+vi.mock('$store/renderer/slices/permission/permission-selectors', () => ({
+  selectPendingCount: () => agentSelectorHarness.readable((value) => value.permissionCount),
+}));
+
+vi.mock('$features/agent/components/agent-avatar/AgentAvatarWithState.svelte', async () => ({
+  default: (await import('./mocks/AgentMessageAttributionAvatar.svelte')).default,
 }));
 
 // Stub the edit-mode input; its real dependency tree (ModelPicker → useAgentSession)
@@ -65,12 +129,23 @@ vi.mock('../input/SimpleRichInput.svelte', async () => ({
 }));
 
 import ChatMessage from '../ChatMessage.svelte';
+import ChatMessageRouteContextHarness from './ChatMessageRouteContextHarness.test.svelte';
 
-function userMessage(metadata?: Record<string, unknown>): AgentMessage {
+async function expandAutomatedWake() {
+  const toggle = screen.getByTestId('automated-wake-toggle');
+  expect(toggle.getAttribute('aria-expanded')).toBe('false');
+  await fireEvent.click(toggle);
+  expect(toggle.getAttribute('aria-expanded')).toBe('true');
+}
+
+function userMessage(
+  metadata?: Record<string, unknown>,
+  text = 'hello from another agent',
+): AgentMessage {
   return {
     id: 'msg-1',
     role: 'user',
-    contentBlocks: [{ type: 'text', text: 'hello from another agent' }],
+    contentBlocks: [{ type: 'text', text }],
     timestamp: new Date('2026-01-01T12:00:00Z'),
     ...(metadata ? { metadata } : {}),
   };
@@ -85,6 +160,77 @@ function userTextMessage(text: string): AgentMessage {
   };
 }
 
+function installGeometryUtilities(): HTMLStyleElement {
+  const style = document.createElement('style');
+  style.textContent = `
+    .px-1\\.5 { padding-left: 6px; padding-right: 6px; }
+    .py-1 { padding-top: 4px; padding-bottom: 4px; }
+    .px-3 { padding-left: 12px; padding-right: 12px; }
+    .py-2 { padding-top: 8px; padding-bottom: 8px; }
+    .min-h-9 { min-height: 36px; }
+    .h-9\\! { height: 36px; }
+    .h-5 { height: 20px; }
+    .w-5 { width: 20px; }
+    .h-6 { height: 24px; }
+    .w-6 { width: 24px; }
+    [data-geometry-card] { box-sizing: border-box; border: 1px solid; }
+  `;
+  document.head.append(style);
+  return style;
+}
+
+function px(value: string): number {
+  return Number.parseFloat(value) || 0;
+}
+
+function measureCollapsedCard(
+  card: HTMLElement,
+  row: HTMLElement,
+  chevron: HTMLElement,
+  width: number,
+  zoom: number,
+) {
+  const cardStyle = getComputedStyle(card);
+  const rowStyle = getComputedStyle(row);
+  const chevronStyle = getComputedStyle(chevron);
+  const contentHeight = px(chevronStyle.height);
+  const rowHeight =
+    px(rowStyle.height) ||
+    Math.max(
+      px(rowStyle.minHeight),
+      px(rowStyle.paddingTop) + contentHeight + px(rowStyle.paddingBottom),
+    );
+  const height =
+    px(cardStyle.borderTopWidth) +
+    px(cardStyle.paddingTop) +
+    rowHeight +
+    px(cardStyle.paddingBottom) +
+    px(cardStyle.borderBottomWidth);
+  card.getBoundingClientRect = () => ({ width: width * zoom, height: height * zoom }) as DOMRect;
+  return {
+    rect: {
+      width: card.getBoundingClientRect().width,
+      height: card.getBoundingClientRect().height,
+    },
+    insets: {
+      top:
+        (px(cardStyle.borderTopWidth) + px(cardStyle.paddingTop) + px(rowStyle.paddingTop)) * zoom,
+      right:
+        (px(cardStyle.borderRightWidth) + px(cardStyle.paddingRight) + px(rowStyle.paddingRight)) *
+        zoom,
+      bottom:
+        (px(cardStyle.borderBottomWidth) +
+          px(cardStyle.paddingBottom) +
+          px(rowStyle.paddingBottom)) *
+        zoom,
+      left:
+        (px(cardStyle.borderLeftWidth) + px(cardStyle.paddingLeft) + px(rowStyle.paddingLeft)) *
+        zoom,
+    },
+    chevron: { width: px(chevronStyle.width) * zoom, height: contentHeight * zoom },
+  };
+}
+
 describe('ChatMessage user message text rendering', () => {
   it('renders multi-line text with no leading whitespace before the first character', () => {
     const { container } = render(ChatMessage, {
@@ -93,8 +239,8 @@ describe('ChatMessage user message text rendering', () => {
 
     // The element(s) applying whitespace-pre-wrap must contain exactly the
     // message text — no template whitespace text nodes rendered under pre-wrap.
-    const preWrapEls = Array.from(container.querySelectorAll('.whitespace-pre-wrap')).filter(
-      (el) => el.textContent?.includes('Q: q1'),
+    const preWrapEls = Array.from(container.querySelectorAll('.whitespace-pre-wrap')).filter((el) =>
+      el.textContent?.includes('Q: q1'),
     );
     expect(preWrapEls.length).toBeGreaterThan(0);
     for (const el of preWrapEls) {
@@ -135,6 +281,32 @@ describe('ChatMessage user message text rendering', () => {
 describe('ChatMessage agent-to-agent sender attribution', () => {
   beforeEach(() => {
     dispatchMock.mockClear();
+    agentSelectorHarness.reset();
+  });
+
+  it('affirms attributed message hierarchy and density in every required visual state', async () => {
+    const observed = await exerciseVisualStates(() => {
+      const attributed = render(ChatMessage, {
+        props: {
+          message: userMessage({
+            type: 'agent_message',
+            fromAgentId: 'agent-sender-visual',
+            fromAgentName: 'Builder',
+          }),
+        },
+      });
+      const target = attributed.getByTestId('agent-message-attribution');
+      return {
+        container: attributed.container,
+        target,
+        unmount: attributed.unmount,
+        assertCapability: () => {
+          expect(attributed.getByTestId('agent-message-attribution')).toBeTruthy();
+          expect(attributed.getByTestId('user-message-surface').className).toContain('min-w-0');
+        },
+      };
+    });
+    expect(observed).toEqual(configuredVisualStates);
   });
 
   it('renders the attribution header for an agent_message user row', () => {
@@ -152,15 +324,191 @@ describe('ChatMessage agent-to-agent sender attribution', () => {
     expect(header).toBeTruthy();
     expect(screen.getByText('Builder')).toBeTruthy();
     expect(screen.getByText('sent a message')).toBeTruthy();
-    const avatar = screen.getByTestId('auggie-avatar');
+    const avatar = screen.getByTestId('agent-avatar');
     expect(avatar.getAttribute('data-agent-id')).toBe('agent-sender-1');
-    // Message body still renders
-    expect(screen.getByText('hello from another agent')).toBeTruthy();
+    expect(avatar.getAttribute('data-specialist')).toBe('spec-writer');
+    expect(avatar.getAttribute('data-provider')).toBe('augment');
+    expect(avatar.getAttribute('data-avatar-state')).toBe('idle');
+    expect(avatar.getAttribute('data-avatar-variant')).toBe('standard');
+    const preview = screen.getByTestId('agent-message-preview');
+    expect(preview.textContent).toContain('hello from another agent');
+    expect(screen.queryByTestId('agent-message-expanded-body')).toBeNull();
+    const surface = screen.getByTestId('user-message-surface');
+    for (const token of [
+      ...SUBSCRIPTION_CARD_CONTAINMENT_CLASS.split(' '),
+      ...SUBSCRIPTION_CARD_SURFACE_CLASS.split(' '),
+    ]) {
+      expect(surface.classList.contains(token)).toBe(true);
+    }
+    const disclosureHeader = screen.getByTestId('agent-message-disclosure-header');
+    for (const token of SUBSCRIPTION_DISCLOSURE_ROW_CLASS.split(' ')) {
+      expect(disclosureHeader.classList.contains(token)).toBe(true);
+    }
+    for (const token of ['h-9!', 'px-3!', 'py-2!', 'type-body', 'font-normal']) {
+      expect(disclosureHeader.classList.contains(token)).toBe(true);
+    }
+    expect(disclosureHeader.classList.contains('gap-2')).toBe(true);
+    expect(disclosureHeader.classList.contains('justify-start!')).toBe(true);
+    expect(surface.querySelector('button button')).toBeNull();
+  });
+
+  it('updates live semantic state and identity inputs without remounting', async () => {
+    render(ChatMessage, {
+      props: {
+        message: userMessage({
+          type: 'agent_message',
+          fromAgentId: 'agent-sender-live',
+          fromAgentName: 'Live Builder',
+        }),
+      },
+    });
+    const mountedAvatar = screen.getByTestId('agent-avatar');
+    expect(mountedAvatar.getAttribute('data-avatar-state')).toBe('idle');
+
+    const transitions = [
+      {
+        updates: {
+          responding: true,
+          session: { status: 'Processing', metadata: { specialist: 'implementor' } },
+          provider: 'codex',
+        },
+        state: 'running',
+      },
+      {
+        updates: { responding: false, waiting: true, session: { status: 'Waiting' } },
+        state: 'waiting',
+      },
+      {
+        updates: { waiting: false, session: { status: 'error' } },
+        state: 'failed',
+      },
+      {
+        updates: { session: { status: 'Waiting' }, permissionCount: 1 },
+        state: 'needs-permission',
+      },
+      {
+        updates: {
+          permissionCount: 0,
+          session: { status: 'Waiting', attentionRequestKind: 'discussion' },
+        },
+        state: 'attention-discussion',
+      },
+    ] as const;
+
+    for (const transition of transitions) {
+      agentSelectorHarness.set(transition.updates);
+      await Promise.resolve();
+      const avatar = screen.getByTestId('agent-avatar');
+      expect(avatar).toBe(mountedAvatar);
+      expect(avatar.getAttribute('data-avatar-state')).toBe(transition.state);
+    }
+    expect(mountedAvatar.getAttribute('data-specialist')).toBeNull();
+    expect(mountedAvatar.getAttribute('data-provider')).toBe('codex');
+  });
+
+  it.each([
+    { width: 450, zoom: 1 },
+    { width: 220, zoom: 1 },
+    { width: 450, zoom: 2 },
+    { width: 220, zoom: 2 },
+  ])('matches finished event geometry at $width px and $zoom× zoom', ({ width, zoom }) => {
+    const style = installGeometryUtilities();
+    const view = render(ChatMessage, {
+      props: {
+        message: userMessage({
+          type: 'agent_message',
+          fromAgentId: 'agent-sender-geometry',
+          fromAgentName: 'Coordinator with a deliberately long sender name',
+        }),
+      },
+    });
+    const agentCard = screen.getByTestId('user-message-surface');
+    const agentRow = screen.getByTestId('agent-message-disclosure-header');
+    const agentChevron = screen.getByTestId('agent-message-chevron-column');
+    agentCard.setAttribute('data-geometry-card', '');
+    const eventCard = document.createElement('div');
+    eventCard.setAttribute('data-geometry-card', '');
+    eventCard.className = SUBSCRIPTION_CARD_SURFACE_CLASS;
+    const eventRow = document.createElement('div');
+    eventRow.className = SUBSCRIPTION_DISCLOSURE_ROW_CLASS;
+    const eventChevron = document.createElement('span');
+    eventChevron.className = 'h-6 w-6';
+    eventRow.append(eventChevron);
+    eventCard.append(eventRow);
+    view.container.append(eventCard);
+    expect(measureCollapsedCard(agentCard, agentRow, agentChevron, width, zoom)).toEqual(
+      measureCollapsedCard(eventCard, eventRow, eventChevron, width, zoom),
+    );
+    expect(measureCollapsedCard(agentCard, agentRow, agentChevron, width, zoom).rect.height).toBe(
+      38 * zoom,
+    );
+    style.remove();
+  });
+
+  it('uses a single-line attributed preview without changing plain user messages', () => {
+    const { unmount } = render(ChatMessage, {
+      props: {
+        message: userMessage({
+          type: 'agent_message',
+          fromAgentId: 'agent-sender-1',
+          fromAgentName: 'Builder',
+        }),
+      },
+    });
+
+    const preview = screen.getByTestId('agent-message-preview');
+    expect(preview.className).toContain('truncate');
+    expect(preview.className).toContain('whitespace-nowrap');
+    expect(screen.queryByTestId('agent-message-expanded-body')).toBeNull();
+
+    unmount();
+    render(ChatMessage, { props: { message: userMessage() } });
+
+    const plainBody = screen.getByText('hello from another agent').closest('.type-body');
+    expect(plainBody?.className).toContain('line-clamp-6');
+    expect(plainBody?.className).not.toContain('line-clamp-2');
+  });
+
+  it('expands and collapses the full attributed message inside the same card', async () => {
+    const longMessage = 'Long coordinator message '.repeat(12).trim();
+    render(ChatMessage, {
+      props: {
+        message: userMessage(
+          {
+            type: 'agent_message',
+            fromAgentId: 'agent-sender-1',
+            fromAgentName: 'Builder',
+          },
+          longMessage,
+        ),
+      },
+    });
+
+    const surface = screen.getByTestId('user-message-surface');
+    const toggle = screen.getByTestId('agent-message-disclosure-toggle');
+    expect(toggle.getAttribute('aria-expanded')).toBe('false');
+    expect(screen.queryByTestId('agent-message-expanded-body')).toBeNull();
+
+    await fireEvent.click(toggle);
+    const expanded = screen.getByTestId('agent-message-expanded-body');
+    const body = screen.getByText(longMessage).closest('.type-body');
+    expect(surface.contains(expanded)).toBe(true);
+    expect(expanded.className).toContain('border-t');
+    expect(expanded.className).toContain('px-3');
+    expect(expanded.className).toContain('py-2');
+    expect(body?.className).not.toContain('line-clamp-2');
+    expect(body?.getAttribute('data-expanded')).toBe('true');
+    expect(toggle.getAttribute('aria-expanded')).toBe('true');
+
+    await fireEvent.click(toggle);
+    expect(screen.queryByTestId('agent-message-expanded-body')).toBeNull();
+    expect(toggle.getAttribute('aria-expanded')).toBe('false');
   });
 
   it('dispatches openAgentTabRequested with the sender agent id on click', async () => {
-    render(ChatMessage, {
+    render(ChatMessageRouteContextHarness, {
       props: {
+        workspaceId: WorkspaceId('ws-1'),
         message: userMessage({
           type: 'agent_message',
           fromAgentId: 'agent-sender-1',
@@ -226,6 +574,7 @@ describe('ChatMessage agent-to-agent sender attribution', () => {
       },
     });
 
+    await fireEvent.click(screen.getByTestId('agent-message-disclosure-toggle'));
     await fireEvent.click(screen.getByText('hello from another agent'));
 
     // Still rendering the message (no edit input swapped in)
@@ -244,6 +593,49 @@ describe('ChatMessage agent-to-agent sender attribution', () => {
     // Edit mode replaces the message body view
     expect(screen.queryByText('hello from another agent')).toBeNull();
   });
+
+  it('compacts a sticky user message and scrolls it instead of editing', async () => {
+    const onEditSubmit = vi.fn();
+    const onStickyClick = vi.fn();
+    const { rerender } = render(ChatMessage, {
+      props: {
+        message: userMessage(),
+        isSticky: false,
+        onStickyClick,
+        onEditSubmit,
+      },
+    });
+
+    const text = screen.getByText('hello from another agent');
+    const body = text.closest('.type-body');
+    const surface = screen.getByTestId('user-message-surface');
+    expect(body).not.toBeNull();
+    expect(body.className).toContain('line-clamp-6');
+    expect(body.className).not.toContain('line-clamp-2');
+    for (const token of USER_MESSAGE_SURFACE_CLASS.split(' ')) {
+      expect(surface.classList.contains(token)).toBe(true);
+    }
+    expect(surface.className).not.toContain(SUBSCRIPTION_CARD_SURFACE_CLASS);
+
+    await rerender({
+      message: userMessage(),
+      isSticky: true,
+      onStickyClick,
+      onEditSubmit,
+    });
+
+    expect(body.className).toContain('line-clamp-2');
+    expect(body.className).not.toContain('line-clamp-6');
+    for (const token of USER_MESSAGE_SURFACE_CLASS.split(' ')) {
+      expect(surface.classList.contains(token)).toBe(true);
+    }
+
+    await fireEvent.click(text);
+
+    expect(onStickyClick).toHaveBeenCalledOnce();
+    expect(screen.queryByTestId('mock-rich-input')).toBeNull();
+    expect(screen.getByText('hello from another agent')).toBeTruthy();
+  });
 });
 
 describe('ChatMessage hook wake attribution', () => {
@@ -254,48 +646,93 @@ describe('ChatMessage hook wake attribution', () => {
     reason: 'dispatched',
   };
 
-  function hookWakeMessage(opts: { rowMetadata?: boolean; blockMetadata?: boolean }): AgentMessage {
+  function hookWakeMessage(opts: {
+    rowMetadata?: boolean;
+    blockMetadata?: boolean;
+    metadata?: Record<string, unknown>;
+    text?: string;
+  }): AgentMessage {
+    const metadata = opts.metadata ?? hookWakeMetadata;
     return {
       id: 'msg-1',
       role: 'user',
       contentBlocks: [
         {
           type: 'text',
-          text: '[Background hook "ci-watch"] CI is red',
-          ...(opts.blockMetadata ? { messageMetadata: hookWakeMetadata } : {}),
+          text: opts.text ?? '[Background hook "ci-watch"] CI is red',
+          ...(opts.blockMetadata ? { messageMetadata: metadata } : {}),
         },
       ],
       timestamp: new Date('2026-01-01T12:00:00Z'),
-      ...(opts.rowMetadata ? { metadata: hookWakeMetadata } : {}),
+      ...(opts.rowMetadata ? { metadata } : {}),
     };
   }
 
-  it('renders the hook wake header and strips the prefix (row-level metadata)', () => {
+  it('affirms wake disclosure containment in every required visual state', async () => {
+    const observed = await exerciseVisualStates(() => {
+      const view = render(ChatMessage, {
+        props: { message: hookWakeMessage({ rowMetadata: true }) },
+      });
+      const target = view.getByTestId('automated-wake-toggle');
+      return {
+        ...view,
+        target,
+        assertCapability: () => {
+          expect(
+            view.getByTestId('user-message-surface').hasAttribute('data-automated-wake-card'),
+          ).toBe(true);
+          expect(view.getByTestId('automated-wake-header')).toBeTruthy();
+        },
+      };
+    });
+    expect(observed).toEqual(configuredVisualStates);
+  });
+
+  it('renders a collapsed hook wake card and strips the prefix when expanded', async () => {
     render(ChatMessage, { props: { message: hookWakeMessage({ rowMetadata: true }) } });
 
-    const header = screen.getByTestId('hook-wake-attribution');
+    const header = screen.getByTestId('automated-wake-header');
     expect(header).toBeTruthy();
+    const surface = screen.getByTestId('user-message-surface');
+    for (const token of [
+      ...SUBSCRIPTION_CARD_CONTAINMENT_CLASS.split(' '),
+      ...SUBSCRIPTION_CARD_SURFACE_CLASS.split(' '),
+    ]) {
+      expect(surface.classList.contains(token)).toBe(true);
+    }
+    for (const token of SUBSCRIPTION_DISCLOSURE_ROW_CLASS.split(' ')) {
+      expect(header.classList.contains(token)).toBe(true);
+    }
+    for (const token of SUBSCRIPTION_IN_THREAD_CARD_SPACING_CLASS.split(' ')) {
+      expect(surface.classList.contains(token)).toBe(true);
+    }
+    expect(surface.getAttribute('data-external-spacing-owner')).toBe('automated-wake-card');
     expect(screen.getByText('ci-watch')).toBeTruthy();
     expect(screen.getByText('woke the agent')).toBeTruthy();
+    expect(screen.queryByTestId('automated-wake-details')).toBeNull();
+    await expandAutomatedWake();
     expect(screen.getByText('CI is red')).toBeTruthy();
     expect(screen.queryByText(/\[Background hook/)).toBeNull();
   });
 
-  it('detects hook wake from block-level messageMetadata', () => {
+  it('detects hook wake from block-level messageMetadata', async () => {
     render(ChatMessage, { props: { message: hookWakeMessage({ blockMetadata: true }) } });
 
-    expect(screen.getByTestId('hook-wake-attribution')).toBeTruthy();
+    expect(screen.getByTestId('automated-wake-header')).toBeTruthy();
+    await expandAutomatedWake();
     expect(screen.getByText('CI is red')).toBeTruthy();
     expect(screen.queryByText(/\[Background hook/)).toBeNull();
   });
 
-  it('renders untagged prefixed text unchanged (no metadata, no strip)', () => {
+  it('uses the protocol legacy hook prefix when metadata is absent', async () => {
     render(ChatMessage, {
       props: { message: hookWakeMessage({}) },
     });
 
-    expect(screen.queryByTestId('hook-wake-attribution')).toBeNull();
-    expect(screen.getByText('[Background hook "ci-watch"] CI is red')).toBeTruthy();
+    expect(screen.getByTestId('automated-wake-header')).toBeTruthy();
+    await expandAutomatedWake();
+    expect(screen.getByText('CI is red')).toBeTruthy();
+    expect(screen.queryByText(/\[Background hook/)).toBeNull();
   });
 
   it('does not enter edit mode when clicking a hook wake message body', async () => {
@@ -304,9 +741,309 @@ describe('ChatMessage hook wake attribution', () => {
       props: { message: hookWakeMessage({ rowMetadata: true }), onEditSubmit },
     });
 
+    await expandAutomatedWake();
     await fireEvent.click(screen.getByText('CI is red'));
 
     expect(screen.getByText('CI is red')).toBeTruthy();
-    expect(screen.getByTestId('hook-wake-attribution')).toBeTruthy();
+    expect(screen.getByTestId('automated-wake-header')).toBeTruthy();
+  });
+
+  it('hides the trailing state note (old wording) from the rendered body', async () => {
+    render(ChatMessage, {
+      props: {
+        message: hookWakeMessage({
+          rowMetadata: true,
+          text:
+            '[Background hook "ci-watch"] CI is red\n\n' +
+            '[This hook has now fired and is retired — it will not run again. ' +
+            'Schedule a new hook via ws.hook.schedule if you still need to watch this condition.]',
+        }),
+      },
+    });
+
+    await expandAutomatedWake();
+    expect(screen.getByText('CI is red')).toBeTruthy();
+    expect(screen.queryByText(/\[This hook/)).toBeNull();
+  });
+
+  it('hides the trailing state note (new wording) from the rendered body', async () => {
+    render(ChatMessage, {
+      props: {
+        message: hookWakeMessage({
+          rowMetadata: true,
+          text:
+            '[Background hook "ci-watch"] CI is red\n\n' +
+            '[This hook is now retired and will not run again — ' +
+            'reschedule via ws.hook.schedule if still needed.]',
+        }),
+      },
+    });
+
+    await expandAutomatedWake();
+    expect(screen.getByText('CI is red')).toBeTruthy();
+    expect(screen.queryByText(/\[This hook/)).toBeNull();
+  });
+
+  it('shows queued timing only when expanded and suppresses the raw delivery note', async () => {
+    render(ChatMessage, {
+      props: {
+        message: hookWakeMessage({
+          rowMetadata: true,
+          metadata: {
+            ...hookWakeMetadata,
+            queueInfo: { queuedAt: '2026-01-01T11:59:57Z', waitedMs: 3000 },
+          },
+          text:
+            '[Background hook "ci-watch"] CI is red\n\n' +
+            '[SYSTEM NOTE] This message was queued at 2026-01-01T11:59:57Z and waited 3s before delivery.',
+        }),
+      },
+    });
+
+    expect(screen.queryByTestId('queued-message-notice')).toBeNull();
+    await expandAutomatedWake();
+    const timing = screen.getByTestId('queued-message-notice');
+    expect(screen.getByTestId('automated-wake-details').contains(timing)).toBe(true);
+    // Automated-wake cards render on the subscription-card surface → muted tone.
+    expect(timing.className).toContain('text-subtle');
+    expect(timing.className).not.toContain('text-primary-foreground/80');
+    expect(screen.getByTestId('queued-message-notice-text').textContent).toBe(
+      'Waited in queue for 3s',
+    );
+    expect(screen.getByText('CI is red')).toBeTruthy();
+    expect(screen.queryByText(/SYSTEM NOTE/)).toBeNull();
+  });
+
+  it('contains long wake details for narrow and zoomed transcript layouts', async () => {
+    const longBody = `Failure ${'unbroken-result'.repeat(40)} 你好世界`;
+    const view = render(ChatMessage, {
+      props: {
+        message: hookWakeMessage({
+          rowMetadata: true,
+          text: `[Background hook "ci-watch"] ${longBody}`,
+        }),
+      },
+    });
+    view.container.style.width = '200px';
+    view.container.style.zoom = '2';
+    await expandAutomatedWake();
+
+    const details = screen.getByTestId('automated-wake-details');
+    expect(details.className).toContain('min-w-0');
+    expect(details.className).toContain('max-w-full');
+    expect(screen.getByText(longBody).parentElement?.className).toContain(
+      '[overflow-wrap:anywhere]',
+    );
+  });
+
+  it('says "and is now retired" when hookStillActive is false', () => {
+    render(ChatMessage, {
+      props: {
+        message: hookWakeMessage({
+          rowMetadata: true,
+          metadata: { ...hookWakeMetadata, hookStillActive: false },
+        }),
+      },
+    });
+
+    expect(screen.getByText('woke the agent and is now retired')).toBeTruthy();
+  });
+
+  it('says "and will continue to run" when hookStillActive is true', () => {
+    render(ChatMessage, {
+      props: {
+        message: hookWakeMessage({
+          rowMetadata: true,
+          metadata: { ...hookWakeMetadata, hookStillActive: true },
+        }),
+      },
+    });
+
+    expect(screen.getByText('woke the agent and will continue to run')).toBeTruthy();
+  });
+
+  it('falls back to the plain "woke the agent" chip when hookStillActive is absent', () => {
+    render(ChatMessage, {
+      props: { message: hookWakeMessage({ rowMetadata: true }) },
+    });
+
+    expect(screen.getByText('woke the agent')).toBeTruthy();
+  });
+
+  it('shows the retired suffix for evicted wakes without needing hookStillActive', async () => {
+    render(ChatMessage, {
+      props: {
+        message: hookWakeMessage({
+          rowMetadata: true,
+          metadata: { ...hookWakeMetadata, reason: 'evicted' },
+          text:
+            '[Background hook "ci-watch"] Hook failed\n\n' +
+            '[This hook will not run again. Schedule a new hook via ' +
+            'ws.hook.schedule if the condition is still worth watching.]',
+        }),
+      },
+    });
+
+    expect(screen.getByText('woke the agent and is now retired')).toBeTruthy();
+    await expandAutomatedWake();
+    expect(screen.queryByText(/\[This hook/)).toBeNull();
+  });
+});
+
+describe('ChatMessage PR-monitor wake attribution', () => {
+  beforeEach(() => {
+    handleLinkMock.mockClear();
+  });
+
+  const prMonitorWakeMetadata = {
+    type: 'pr_monitor_wake',
+    monitorId: 'mon-1',
+    repo: 'intent-hq/monorepo',
+    prNumber: 42,
+    reason: 'checks_failed',
+  };
+
+  function prMonitorWakeMessage(opts: {
+    rowMetadata?: boolean;
+    blockMetadata?: boolean;
+    metadata?: Record<string, unknown>;
+  }): AgentMessage {
+    const metadata = opts.metadata ?? prMonitorWakeMetadata;
+    return {
+      id: 'msg-1',
+      role: 'user',
+      contentBlocks: [
+        {
+          type: 'text',
+          text: '[PR monitor intent-hq/monorepo#42] Checks failed',
+          ...(opts.blockMetadata ? { messageMetadata: metadata } : {}),
+        },
+      ],
+      timestamp: new Date('2026-01-01T12:00:00Z'),
+      ...(opts.rowMetadata ? { metadata } : {}),
+    };
+  }
+
+  it('renders the PR wake card with the chip and strips the prefix when expanded', async () => {
+    render(ChatMessage, { props: { message: prMonitorWakeMessage({ rowMetadata: true }) } });
+
+    const header = screen.getByTestId('automated-wake-header');
+    expect(header).toBeTruthy();
+    // Workspace repo unknown → owner/repo #N chip
+    const chip = screen.getByTestId('pr-monitor-wake-chip');
+    expect(chip.textContent?.trim()).toBe('intent-hq/monorepo #42');
+    // Label sits flush left next to the PR icon (overrides the Button base justify-center)
+    expect(chip.className).toContain('justify-start');
+    expect(screen.getByText('woke the agent')).toBeTruthy();
+    await expandAutomatedWake();
+    expect(screen.getByText('Checks failed')).toBeTruthy();
+    expect(screen.queryByText(/\[PR monitor/)).toBeNull();
+  });
+
+  it('detects PR wake from block-level messageMetadata', async () => {
+    render(ChatMessage, { props: { message: prMonitorWakeMessage({ blockMetadata: true }) } });
+
+    expect(screen.getByTestId('automated-wake-header')).toBeTruthy();
+    await expandAutomatedWake();
+    expect(screen.getByText('Checks failed')).toBeTruthy();
+    expect(screen.queryByText(/\[PR monitor/)).toBeNull();
+  });
+
+  it('labels a same-owner, different-repo PR with the repo name only', () => {
+    render(ChatMessageRouteContextHarness, {
+      props: {
+        workspaceId: WorkspaceId('ws-1'),
+        message: prMonitorWakeMessage({
+          rowMetadata: true,
+          metadata: { ...prMonitorWakeMetadata, repo: 'intent-hq/intentd' },
+        }),
+        workspace: {
+          id: 'ws-1',
+          repositoryOwner: 'intent-hq',
+          repositoryName: 'monorepo',
+        } as any,
+      },
+    });
+
+    expect(screen.getByTestId('pr-monitor-wake-chip').textContent?.trim()).toBe('intentd #42');
+  });
+
+  it('labels a different-owner PR with owner/repo', () => {
+    render(ChatMessage, {
+      props: {
+        message: prMonitorWakeMessage({
+          rowMetadata: true,
+          metadata: { ...prMonitorWakeMetadata, repo: 'other/lib' },
+        }),
+        workspace: {
+          id: 'ws-1',
+          repositoryOwner: 'intent-hq',
+          repositoryName: 'monorepo',
+        } as any,
+      },
+    });
+
+    expect(screen.getByTestId('pr-monitor-wake-chip').textContent?.trim()).toBe('other/lib #42');
+  });
+
+  it('opens the PR externally on chip click (metadata url preferred)', async () => {
+    render(ChatMessage, {
+      props: {
+        message: prMonitorWakeMessage({
+          rowMetadata: true,
+          metadata: { ...prMonitorWakeMetadata, url: 'https://github.example/pr/42' },
+        }),
+      },
+    });
+
+    await fireEvent.click(screen.getByTestId('pr-monitor-wake-chip'));
+
+    expect(handleLinkMock).toHaveBeenCalledTimes(1);
+    expect(handleLinkMock.mock.calls[0][0]).toBe('https://github.example/pr/42');
+    expect(handleLinkMock.mock.calls[0][1]).toMatchObject({ forceExternal: true });
+  });
+
+  it('falls back to the GitHub PR URL when metadata has no url', async () => {
+    render(ChatMessage, { props: { message: prMonitorWakeMessage({ rowMetadata: true }) } });
+
+    await fireEvent.click(screen.getByTestId('pr-monitor-wake-chip'));
+
+    expect(handleLinkMock).toHaveBeenCalledTimes(1);
+    expect(handleLinkMock.mock.calls[0][0]).toBe('https://github.com/intent-hq/monorepo/pull/42');
+  });
+
+  it('uses the protocol legacy PR prefix when metadata is absent', async () => {
+    render(ChatMessage, { props: { message: prMonitorWakeMessage({}) } });
+
+    expect(screen.getByTestId('automated-wake-header')).toBeTruthy();
+    await expandAutomatedWake();
+    expect(screen.getByText('Checks failed')).toBeTruthy();
+    expect(screen.queryByText(/\[PR monitor/)).toBeNull();
+  });
+
+  it('falls back to the protocol prefix when row metadata is malformed', () => {
+    render(ChatMessage, {
+      props: {
+        message: prMonitorWakeMessage({
+          rowMetadata: true,
+          metadata: { type: 'pr_monitor_wake', monitorId: 'mon-1', repo: 'intent-hq/monorepo' },
+        }),
+      },
+    });
+
+    expect(screen.getByTestId('automated-wake-header')).toBeTruthy();
+  });
+
+  it('does not enter edit mode when clicking a PR wake message body', async () => {
+    const onEditSubmit = vi.fn();
+    render(ChatMessage, {
+      props: { message: prMonitorWakeMessage({ rowMetadata: true }), onEditSubmit },
+    });
+
+    await expandAutomatedWake();
+    await fireEvent.click(screen.getByText('Checks failed'));
+
+    expect(screen.getByText('Checks failed')).toBeTruthy();
+    expect(screen.getByTestId('automated-wake-header')).toBeTruthy();
   });
 });

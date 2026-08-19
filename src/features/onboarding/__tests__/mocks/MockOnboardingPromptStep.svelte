@@ -55,6 +55,12 @@
       setSetupScript: (value: string) => {
         setupScript = value;
       },
+      // Simulate the SetupScriptModal's Done: commit an edited script the way
+      // the real modal does (isCustomScript binding).
+      commitSetupScript: (value: string, isCustom = true) => {
+        setupScript = value;
+        isCustomSetupScript = isCustom;
+      },
     };
   });
 </script>

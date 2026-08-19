@@ -13,6 +13,7 @@
 import type {
   AgentMessage,
   AgentSession,
+  ContentBlock,
   CreateNoteRequest,
   CreateWorkspaceRequest,
   DiffChunk,
@@ -46,12 +47,11 @@ import type {
   WorkspaceScript,
 } from "$store/renderer/slices/scripts/scripts-types";
 import type { ScriptCategory, ScriptMode } from "$features/scripts/types";
-import type { SetupScript } from "$store/renderer/slices/setup-scripts/setup-scripts-types";
 import type { SkillInfo } from "$store/renderer/slices/skills/skills-types";
 import type { AuggieModel } from "$features/auggie/auggie-models.client";
 import type { ProviderCatalogResult } from "$shared/provider-catalog";
 import type { RecentUrl } from "$store/renderer/slices/browser/browser-types";
-import type { McpServerConfig } from "$store/renderer/slices/mcp-settings/mcp-settings-types";
+import type { McpServerConfig, McpServerRuntimeStatus } from "$store/renderer/slices/mcp-settings/mcp-settings-types";
 import type { UserPreferencesState } from "$store/renderer/slices/user-preferences/user-preferences-slice";
 import type { ProviderSettingsState } from "$store/renderer/slices/provider-settings/provider-settings-slice";
 
@@ -309,6 +309,29 @@ export interface WorkspaceDiskUsageResult {
   refreshing: boolean;
 }
 
+/**
+ * `workspace.delete` outcome (§5.1). When the request carried
+ * `undoDelayMs > 0` the daemon registers an in-memory pending deletion
+ * (protocol 6.7+ delete grace window) and returns
+ * `{ success: true, scheduled: true, deleteAt }` — `deleteAt` is the ISO
+ * commit deadline. An immediate delete (no `undoDelayMs`) keeps the plain
+ * `{ success: true }` shape, so both fields are additive and optional.
+ */
+export interface WorkspaceDeleteResult extends MutationResult {
+  scheduled?: boolean;
+  deleteAt?: string;
+}
+
+/**
+ * `workspace.cancelDelete` outcome (§5.1, delete grace window). The daemon
+ * returns `{ cancelled: bool }` — `false` when nothing is pending (already
+ * committed, or never scheduled): a non-error, race-safe outcome. Folded onto
+ * MutationResult so transport failures surface uniformly via `success`.
+ */
+export interface WorkspaceCancelDeleteResult extends MutationResult {
+  cancelled?: boolean;
+}
+
 export interface WorkspacesClient {
   list(options?: { includeArchived?: boolean }): Promise<Workspace[]>;
   get(id: string): Promise<Workspace | null>;
@@ -333,7 +356,20 @@ export interface WorkspacesClient {
    * without a follow-up `workspace.get`.
    */
   update(request: UpdateWorkspaceRequest): Promise<WorkspaceUpdateResult>;
-  delete(id: string): Promise<MutationResult>;
+  /**
+   * Delete a workspace (`workspace.delete`, §5.1). Optional
+   * `options.undoDelayMs > 0` requests the daemon-owned delete grace window
+   * (protocol 6.7+): the daemon schedules the commit at `now + undoDelayMs`
+   * and returns `{ success: true, scheduled: true, deleteAt }`; the FE cancels
+   * it via `cancelDelete`. Omitted/0 keeps the immediate-delete behavior.
+   */
+  delete(id: string, options?: { undoDelayMs?: number }): Promise<WorkspaceDeleteResult>;
+  /**
+   * Cancel a pending grace-window deletion (`workspace.cancelDelete`, §5.1).
+   * `{ cancelled: false }` means nothing was pending (already committed, or
+   * never scheduled) — a non-error, race-safe outcome.
+   */
+  cancelDelete(id: string): Promise<WorkspaceCancelDeleteResult>;
   /** Archive a workspace (`workspace.archive`, §5.1). */
   archive(id: string): Promise<MutationResult>;
   /** Unarchive a workspace (`workspace.unarchive`, §5.1) — the archive-undo path. */
@@ -392,6 +428,43 @@ export interface ImageBlock {
   mimeType: string;
 }
 
+/**
+ * Attachment-reference file block attached to a message (PROTOCOL §5.5:
+ * `{ type: "file", attachmentId, fileName, mimeType?, size? }`). Carries the
+ * attachment-registry UUID plus chip-rendering metadata — never bytes or
+ * paths. Shared shape for the optional `fileBlocks` param on `agents.queue`.
+ */
+export interface FileBlock {
+  type: "file";
+  attachmentId: string;
+  fileName: string;
+  mimeType?: string;
+  size?: number;
+}
+
+/**
+ * `agent.delete` outcome (§5.5). When the request carried `undoDelayMs > 0`
+ * the daemon registers an in-memory pending deletion (protocol 6.7+ delete
+ * grace window) and returns `{ success: true, scheduled: true, deleteAt }` —
+ * `deleteAt` is the ISO commit deadline. An immediate delete (no
+ * `undoDelayMs`) keeps the plain `{ success: true }` shape, so both fields
+ * are additive and optional.
+ */
+export interface AgentDeleteResult extends MutationResult {
+  scheduled?: boolean;
+  deleteAt?: string;
+}
+
+/**
+ * `agent.cancelDelete` outcome (§5.5, delete grace window). The daemon
+ * returns `{ cancelled: bool }` — `false` when nothing is pending (already
+ * committed, or never scheduled): a non-error, race-safe outcome. Folded onto
+ * MutationResult so transport failures surface uniformly via `success`.
+ */
+export interface AgentCancelDeleteResult extends MutationResult {
+  cancelled?: boolean;
+}
+
 export interface AgentsClient {
   list(workspaceId: string): Promise<AgentSession[]>;
   get(agentId: string): Promise<AgentSession | null>;
@@ -410,12 +483,21 @@ export interface AgentsClient {
    * carry `prevToken` — an opaque FORWARD cursor toward the live tail (pass
    * it back as the `pageToken` input to fetch the next newer page); it is
    * normalized to `null` on legacy backward pages, which never carry the key.
+   *
+   * Ordinal seek (§5.5 `aroundIndex`, additive): the page containing the
+   * 0-based ordinal from the OLDEST message. Out-of-range values clamp
+   * daemon-side into `[0, totalMessages - 1]` (client estimates are
+   * approximate); negatives and supplying both seek params are rejected
+   * with -32602. Same dual-cursor page shape as `aroundMessageId`. Daemons
+   * predating the param reject it with -32602 (`INVALID_PARAMS`) — callers
+   * needing old-daemon compatibility must handle that rejection.
    */
   getConversation(
     agentId: string,
     limit?: number,
     pageToken?: string,
     aroundMessageId?: string,
+    aroundIndex?: number,
   ): Promise<{
     messages: AgentMessage[];
     truncated: boolean;
@@ -423,6 +505,18 @@ export interface AgentsClient {
     nextToken: string | null;
     prevToken: string | null;
   }>;
+  /**
+   * One FULL content block of one persisted message, by block id
+   * (`agent.getMessageBlock`, §5.5, v7.2) — the on-demand counterpart of the
+   * slim conversation projection: a client holding a `*Truncated` slim block
+   * fetches the complete body here. Block identity matches the served
+   * conversation byte-for-byte (persisted assistant ids and serve-time
+   * synthetic `{messageId}:{index}` ids both resolve), and the returned block
+   * is the full, unprojected body — no `*Truncated`/`*Bytes` flags, images
+   * carry the original `data`, never the thumbnail. Unknown message/block ids
+   * reject with `-32602`; errors propagate as rejections.
+   */
+  getMessageBlock(agentId: string, messageId: string, blockId: string): Promise<ContentBlock>;
   /**
    * Create an agent session (`agent.create`, §5.5). The daemon returns the
    * full `AgentLite` projection of the newly persisted session (widened in
@@ -450,11 +544,13 @@ export interface AgentsClient {
     messageId: string;
     content: string;
     model?: string;
+    imageBlocks?: ImageBlock[];
+    fileBlocks?: FileBlock[];
   }): Promise<MutationResult>;
   /**
    * Queue a message behind the agent's in-flight turn (`agent.queueMessage`,
-   * §5.5). Optional `imageBlocks` are only forwarded when supplied so queued
-   * attachments survive queue-on-send. The daemon returns
+   * §5.5). Optional `imageBlocks` / `fileBlocks` are only forwarded when
+   * supplied so queued attachments survive queue-on-send. The daemon returns
    * `{ success, queuedMessage, turnId }`, surfaced as `queuedMessage` /
    * `turnId` on the MutationResult (the entry's turn-correlation id,
    * monorepo#1057 — falls back to `queuedMessage.turnId` when the top-level
@@ -466,6 +562,7 @@ export interface AgentsClient {
     message: string,
     options?: {
       imageBlocks?: ImageBlock[];
+      fileBlocks?: FileBlock[];
     },
   ): Promise<MutationResult>;
   /**
@@ -590,6 +687,14 @@ export interface AgentsClient {
     workspaceId: string;
     reasoningEffort: string | null;
   }): Promise<MutationResult>;
+  /** Persist a specialist picker change through the `agent.update` partial writer. */
+  updateSpecialist(params: {
+    agentId: string;
+    workspaceId: string;
+    specialist: string | null;
+    model?: string | null;
+    systemPrompt?: string | null;
+  }): Promise<MutationResult>;
   /**
    * Rename an agent session (`agent.rename`, §5.5). The daemon persists the
    * new name and an applied rename emits `agent:renamed` (in
@@ -613,8 +718,24 @@ export interface AgentsClient {
    * already gone — and emits `agent:deleted` (in `AGENT_LIFECYCLE_EVENTS`), so
    * the reactive `subscribe` refetch reconciles the list. `workspaceId` is
    * optional per the contract; the daemon resolves the workspace itself.
+   * Optional `options.undoDelayMs > 0` requests the daemon-owned delete grace
+   * window (protocol 6.7+): the daemon schedules the commit at
+   * `now + undoDelayMs` and returns `{ success: true, scheduled: true,
+   * deleteAt }`; the FE cancels it via `cancelDelete`. Omitted/0 keeps the
+   * immediate-delete behavior. Scheduling does NOT stop the agent — the
+   * deadline commit runs the ordinary teardown, which does.
    */
-  delete(agentId: string, workspaceId?: string): Promise<MutationResult>;
+  delete(
+    agentId: string,
+    workspaceId?: string,
+    options?: { undoDelayMs?: number },
+  ): Promise<AgentDeleteResult>;
+  /**
+   * Cancel a pending grace-window deletion (`agent.cancelDelete`, §5.5).
+   * `{ cancelled: false }` means nothing was pending (already committed, or
+   * never scheduled) — a non-error, race-safe outcome.
+   */
+  cancelDelete(agentId: string, workspaceId?: string): Promise<AgentCancelDeleteResult>;
   /**
    * Retry a failed agent spawn (`agent.retry`). Only valid when the agent
    * status is `error` (after spawn exhaustion); returns `{ ok: false, error }`
@@ -628,12 +749,19 @@ export interface AgentsClient {
    * `redriven: true`: the redriven head entry's turn-correlation id — the
    * SAME id the original send/enqueue RPC returned (preserved across the
    * terminal-failure requeue), so the redrive's lifecycle events correlate
-   * with the record the client already keyed.
+   * with the record the client already keyed. `notFound: true` on an
+   * `ok: false` result marks the daemon's not-found rejection (-32602,
+   * data.code "not-found", §5.5) — the agent was deleted, so callers should
+   * drop stale failure state instead of keeping a Retry affordance
+   * (monorepo#2806).
    */
   retry(
     agentId: string,
     workspaceId: string,
-  ): Promise<{ ok: true; redriven?: boolean; turnId?: string } | { ok: false; error: string }>;
+  ): Promise<
+    | { ok: true; redriven?: boolean; turnId?: string }
+    | { ok: false; notFound?: boolean; error: string }
+  >;
   /**
    * Resolve an outstanding interactive permission prompt
    * (`agent.respondPermission`, PROTOCOL §8). The daemon forwards the chosen
@@ -679,6 +807,25 @@ export interface ChatTranscript {
   truncated: boolean;
   totalMessages: number;
   isStreaming: boolean;
+  /**
+   * Resume disposition (PROTOCOL §7.1 `sinceMessageId`), stamped ONLY on the
+   * emit produced by the seq-0 snapshot of a registration that requested a
+   * resume: `true` — the snapshot was a delta from the requested anchor,
+   * merged onto the retained baseline; `false` — the daemon did not honor
+   * the resume (unknown/pruned id) and replied with the standard newest-page
+   * snapshot, so the subscriber must fully rehydrate older history. Absent
+   * on every other emit (delta emits, non-resume snapshots).
+   */
+  resumed?: boolean;
+  /**
+   * Stamped `true` ONLY on the emit produced by applying a seq-0 snapshot
+   * push (fresh registration, gap resnapshot, reconnect re-registration) —
+   * absent on delta emits. Consumers use it to tell "the daemon just served
+   * the authoritative newest page (with the in-flight assistant merged)"
+   * apart from incremental delta reconciliation, e.g. the chat-subscribe
+   * saga signals transcript hydration from it.
+   */
+  fromSnapshot?: boolean;
 }
 
 /**
@@ -699,18 +846,6 @@ export type ChatLiveStreamPhase =
 
 export interface ChatClient {
   /**
-   * One-shot seq-0 snapshot from the `chat.subscribe` channel (PROTOCOL §7.1).
-   * The daemon's snapshot merges the newest `agent.getConversation` page with
-   * the synthetic in-flight assistant message (`isStreaming: true`) when a turn
-   * is currently streaming, so a client (re)opening the chat mid-turn rehydrates
-   * the interim response instead of clobbering it with persisted-only history.
-   * Subscribes, awaits the initial snapshot push, and unsubscribes — the live
-   * delta stream is still served by the `agent:stream:*` firehose.
-   */
-  subscribeSnapshot(
-    agentId: string,
-  ): Promise<{ messages: AgentMessage[]; truncated: boolean; totalMessages: number }>;
-  /**
    * Standing per-agent `chat.subscribe` subscription (PROTOCOL §7.1). Keeps
    * the registration open and invokes `handler` with the reconciled
    * transcript on the seq-0 snapshot and after every applied block delta.
@@ -719,12 +854,27 @@ export interface ChatClient {
    * are buffered pre-ack. Returns the disposer (sends `chat.unsubscribe`).
    * Optional `onPhase` observes the stream's lifecycle phase transitions
    * (deduped; purely observational — it never alters subscription behavior).
+   * Optional `options.sinceMessageId` requests a resume (§7.1): the seq-0
+   * snapshot then carries only messages after that id with `resumed: true`,
+   * or falls back to the standard newest-page snapshot with `resumed: false`
+   * when the daemon no longer knows the id (see `ChatTranscript.resumed`).
    */
   subscribe(
     agentId: string,
     handler: (transcript: ChatTranscript) => void,
     onPhase?: (phase: ChatLiveStreamPhase) => void,
+    options?: ChatSubscribeOptions,
   ): Unsubscribe;
+}
+
+/** Options for `ChatClient.subscribe` (PROTOCOL §7.1 resume). */
+export interface ChatSubscribeOptions {
+  /**
+   * Resume anchor: the last known (fully persisted) message id. The daemon
+   * replies with a delta snapshot (`resumed: true`) when it knows the id,
+   * or the full newest page (`resumed: false`) when it does not.
+   */
+  sinceMessageId?: string;
 }
 
 /** Parameters for `terminal.create` (PROTOCOL §5.13). `command` omitted ⇒ default shell. */
@@ -870,6 +1020,12 @@ export interface SettingsClient {
   setProviderSettings(settings: Partial<PersistedProviderSettings>): Promise<MutationResult>;
   getMcpServers(): Promise<McpServerConfig[]>;
   setMcpServers(servers: McpServerConfig[]): Promise<MutationResult>;
+  /**
+   * `mcp.servers.getStatus` (§5.22) fanned out per server id. Returns the
+   * daemon-reported runtime statuses keyed by `serverId`; ids whose point read
+   * fails are omitted (live updates arrive via `mcp.servers:status-changed`).
+   */
+  getMcpServerStatuses(serverIds: string[]): Promise<McpServerRuntimeStatus[]>;
   getWorkspaceSettings(workspaceId: string): Promise<SingleWorkspaceSettings | null>;
   setWorkspaceSettings(
     workspaceId: string,
@@ -895,7 +1051,6 @@ export interface FilesClient {
   listDirectory(workspaceId: string, path: string): Promise<FileNode[]>;
   /** Per-file git status keyed by workspace-relative path, for the explorer overlay. */
   gitStatusMap(workspaceId: string): Promise<Record<string, FileGitStatus>>;
-  subscribe(handler: SubscriptionHandler<FileContentEntry[]>): Unsubscribe;
   /** Write file content (`file.write`); create-ish, so the live client attaches an idempotencyKey (§5.6). */
   write(workspaceId: string, path: string, content: string): Promise<MutationResult>;
   /** Delete a file (`file.delete`). */
@@ -953,6 +1108,11 @@ export interface GitDiffsOptions {
   staged?: boolean;
   /** When set, returns the per-file hunks for `<commitHash>^..<commitHash>`. */
   commitHash?: string;
+  /**
+   * Scopes the read to a registered secondary git root (v6.15). Omitted →
+   * primary-worktree behavior, byte-identical to the pre-6.15 request.
+   */
+  gitRootId?: string;
 }
 
 export interface GitClient {
@@ -964,7 +1124,8 @@ export interface GitClient {
    * commit's own changes against its first parent (`<commitHash>^..<commitHash>`).
    */
   diffs(workspaceId: string, options?: GitDiffsOptions): Promise<DiffChunk[]>;
-  trackedChanges(workspaceId: string): Promise<TrackedChange[]>;
+  /** Returns `null` when the tracked-change read fails; an empty array is a successful empty result. */
+  trackedChanges(workspaceId: string): Promise<TrackedChange[] | null>;
   /**
    * `file-tracking.loadCommits` — workspace commits with agent attribution.
    * When `includeOlder` is true, fetches commits before and including the workspace boundary.
@@ -982,8 +1143,14 @@ export interface GitClient {
   /**
    * `git.commitDetails` — metadata + per-file `(additions, deletions)` for one
    * commit. Returns `null` on transport failure so callers degrade gracefully.
+   * `opts.gitRootId` scopes the read to a registered secondary git root;
+   * omitted → primary-worktree behavior (byte-identical request).
    */
-  commitDetails(workspaceId: string, commitHash: string): Promise<CommitDetailsResult | null>;
+  commitDetails(
+    workspaceId: string,
+    commitHash: string,
+    opts?: { gitRootId?: string }
+  ): Promise<CommitDetailsResult | null>;
   prStatus(workspaceId: string): Promise<PrStatusSummary | null>;
   /**
    * `pr.refresh` (§5.7) — forces the daemon's PR discovery/refresh (link,
@@ -1216,6 +1383,19 @@ export interface TaskUpdatePatch {
 export interface MarkAsTaskOptions {
   acceptanceCriteria?: string[] | string;
   effort?: string;
+  /** Seed/replace the task's `dependsOn` relation list (v6.8); omitted keeps existing. */
+  dependsOn?: string[];
+  /** Seed/replace the task's `conflictsWith` relation list (v6.8); omitted keeps existing. */
+  conflictsWith?: string[];
+}
+
+/**
+ * Per-list replace params for `task.setRelations` (PROTOCOL §5.4, v6.8):
+ * an omitted list keeps the existing one, `[]` clears it.
+ */
+export interface SetRelationsParams {
+  dependsOn?: string[];
+  conflictsWith?: string[];
 }
 
 /** Options for creating a prerequisite task dependency (`task.createPrerequisite`). */
@@ -1261,6 +1441,13 @@ export interface TasksClient {
     options?: MarkAsTaskOptions,
     expectedVersion?: number,
   ): Promise<MutationResult>;
+  /**
+   * Replace a task note's relation lists (`task.setRelations`, PROTOCOL §5.4,
+   * v6.8). Replace semantics per list: an omitted param keeps the existing
+   * list, `[]` clears it. The daemon validates ids (same-workspace task notes,
+   * no self-edges) and rejects `dependsOn` cycles naming the cycle path.
+   */
+  setRelations(noteId: string, relations: SetRelationsParams): Promise<MutationResult>;
   /** Assign an existing agent to a task note (`task.assignAgent`). `expectedVersion` is optional (§11.4-D). */
   assignAgent(noteId: string, agentId: string, expectedVersion?: number): Promise<MutationResult>;
   /** Create a prerequisite task dependency (`task.createPrerequisite`); carries an idempotencyKey. */
@@ -1430,8 +1617,6 @@ export interface WorkspaceSetupScript {
 }
 
 export interface SetupScriptsClient {
-  list(): Promise<SetupScript[]>;
-  subscribe(handler: SubscriptionHandler<SetupScript[]>): Unsubscribe;
   /** `workspace.getSetupScript` (§5.25). */
   get(workspaceId: string): Promise<WorkspaceSetupScript | null>;
   /** `workspace.saveSetupScript` (§5.25) — persists the body; returns the stored record. */
@@ -1539,12 +1724,17 @@ export interface ProvidersClient {
 /** Wire `period` mode for `stats.getUsage`. */
 export type UsageStatsPeriod = "24h" | "month" | "year";
 
-/** The 4 separate token counters for one `stats.getUsage` aggregation cell. */
+/** The separate token counters for one `stats.getUsage` aggregation cell. */
 export interface UsageTokenTotals {
   inputTokens: number;
   outputTokens: number;
   cacheReadTokens: number;
   cacheCreationTokens: number;
+  /**
+   * Reasoning ("thought") tokens — **omitted when zero or unreported** (§5.23),
+   * so an absent field means no provider broke reasoning out of `outputTokens`.
+   */
+  thoughtTokens?: number;
 }
 
 /** Per-model rollup row (sorted desc by total tokens by the daemon). */
@@ -1664,6 +1854,22 @@ export interface GitHubBranchListing {
 }
 
 /**
+ * Cached-refs branch listing (`github.branches.listCached`, §5.27): branch
+ * names read from the daemon's local repo cache (`source: "cache"`) — or,
+ * on a cache miss, from the daemon's one-round-trip `git ls-remote`
+ * fallback (`source: "ls-remote"` with `cached: false`). A failed fallback
+ * folds to the plain miss — `{ cached: false, branches: [] }` with `source`
+ * omitted — the same shape pre-fallback daemons always return (`source` is
+ * absent on older daemons).
+ */
+export interface GitHubCachedBranchListing {
+  cached: boolean;
+  branches: string[];
+  defaultBranch?: string;
+  source?: 'cache' | 'ls-remote';
+}
+
+/**
  * Remote repo-config read (`github.repoConfig.get`, §5.27 v2.4) for a GitHub
  * repo with no local checkout: the committed `.intent/config.json` fetched
  * via the contents API. `config` is null when the file (or repo/ref) is
@@ -1681,9 +1887,19 @@ export interface IntegrationsClient {
    * with the default branch from `github.repos.get` (best-effort). Unlike the
    * issue reads this THROWS on transport/daemon errors (e.g. "GitHub is not
    * configured.") so the workspace-initializer BranchSelector can render an
-   * explicit error/auth state — never a fabricated branch list.
+   * explicit error/auth state — never a fabricated branch list. An optional
+   * `prefix` narrows the listing server-side (GitHub's `refs/heads/{prefix}`
+   * matching-refs semantics) so branches beyond the first page are findable.
    */
-  githubBranches(owner: string, repo: string): Promise<GitHubBranchListing>;
+  githubBranches(owner: string, repo: string, prefix?: string): Promise<GitHubBranchListing>;
+  /**
+   * Branch names from the daemon's local repo cache — or its `git ls-remote`
+   * fallback on a cache miss (`github.branches.listCached`, §5.27) — purely
+   * a fast first paint for the BranchSelector. NEVER throws: failures fold
+   * to a cold-cache miss (`{ cached: false, branches: [] }`) so
+   * `githubBranches` stays the only error authority.
+   */
+  githubBranchesCached(owner: string, repo: string): Promise<GitHubCachedBranchListing>;
   /**
    * The repo's committed `.intent/config.json` (`github.repoConfig.get`,
    * §5.27 v2.4) for a GitHub repo without a local checkout. `ref` defaults to
@@ -1752,8 +1968,10 @@ export interface EventsClient {
 
 /**
  * Serialized draft attachment (opaque to the daemon; stored verbatim per
- * PROTOCOL §5.16 `drafts.*`). FE-authored projection of an image `ContextItem`
- * — the non-serializable `File` handle is dropped.
+ * PROTOCOL §5.16 `drafts.*`). FE-authored projection of an image or
+ * placed-attachment `ContextItem` — the non-serializable `File` handle is
+ * dropped. Image items persist their base64 bytes; placed attachments
+ * persist only the registry UUID + metadata.
  */
 export interface DraftAttachment {
   id: string;
@@ -1763,6 +1981,21 @@ export interface DraftAttachment {
   path?: string;
   imageData?: string;
   imageMimeType?: string;
+  attachmentId?: string;
+  attachmentMimeType?: string;
+  attachmentSize?: number;
+  /** Absolute host path of a staged (not-yet-placed) non-image file. The
+   * draft persists the path only — no bytes — and placement copies from it
+   * at redemption; a path gone stale by then fails into a failed pill. */
+  sourcePath?: string;
+  /**
+   * Only ever `'failed'`: a chat-input item persisted while its placement
+   * was in flight or failed. The restore renders it as a blocking failed
+   * pill whose retry re-places from `sourcePath` — never a silent drop.
+   * Absent on pre-workspace staged items (placed at create redemption)
+   * and on placed/image attachments.
+   */
+  placementStatus?: 'failed';
 }
 
 /** Drafts client for persistent chat input drafts (PROTOCOL §5.16). */

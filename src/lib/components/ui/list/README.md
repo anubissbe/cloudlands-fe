@@ -24,7 +24,7 @@ A flexible list item component with consistent height and spacing.
 - `variant`: "default" | "ghost" | "subtle" - Visual style variant
 - `size`: "sm" | "md" - Size of the item (affects padding, font size, min height)
 - `icon`: FontAwesome icon
-- `iconComponent`: Custom icon component (e.g., AuggieAvatar)
+- `iconComponent`: Custom icon component (e.g., AgentAvatar)
 - `iconProps`: Props to pass to the icon component
 - `title`: Main text content
 - `subtitle`: Secondary text content
@@ -69,20 +69,12 @@ An empty state component for when there are no items.
 
 ```svelte
 <ListContainer spacing="compact">
-  <ListItem
-    icon={faStickyNote}
-    title="Note 1"
-    onclick={() => console.log('clicked')}
-  />
-  <ListItem
-    icon={faStickyNote}
-    title="Note 2"
-    selected={true}
-  />
+  <ListItem icon={faStickyNote} title="Note 1" onclick={() => console.log('clicked')} />
+  <ListItem icon={faStickyNote} title="Note 2" selected={true} />
   <ListItem
     icon={faStickyNote}
     title="Note 3"
-    active={true}  // Currently open/active note
+    active={true} // Currently open/active note
   />
 </ListContainer>
 ```
@@ -91,7 +83,7 @@ An empty state component for when there are no items.
 
 ```svelte
 <ListItem
-  iconComponent={AuggieAvatar}
+  iconComponent={AgentAvatar}
   iconProps={{ agentId: '123', size: 16 }}
   title="Agent Name"
   subtitle="Last message..."
@@ -120,7 +112,7 @@ An empty state component for when there are no items.
 
 ```svelte
 {#if items.length === 0}
-  <ListEmpty message="No notes yet" icon={faStickyNote} />
+  <ListEmpty message="No notes yet" />
 {:else}
   <ListContainer>
     <!-- items -->

@@ -2,8 +2,10 @@ import type { AppSettingApplyPlan, AppSettingDefinition } from '$shared/app-sett
 import { findAppSettingDefinition } from '$shared/app-settings-schema';
 import { m } from '$shared/paraglide/messages.js';
 import type { ProposalActionDetail, SettingsChangeProposal } from '$shared/types/proposal';
+import { isGithubLinkDefaultAction } from '$shared/utils/link-helpers';
+import { isUpdateChannel } from '$features/auto-update/types';
 import { appClient } from '$lib/client';
-import { store as appStore } from "$store/renderer/store";
+import { store as appStore } from '$store/renderer/store';
 import type { ThemePreference } from '$store/renderer/slices/theme/theme-types';
 import { selectProposalAppliedState } from '$store/renderer/slices/settings-proposal-history/settings-proposal-history-selectors';
 import type {
@@ -30,9 +32,9 @@ import {
 } from '$store/renderer/slices/mcp-settings/mcp-settings-selectors';
 import {
   selectAgentFontStyle,
-  selectBetaUpdatesEnabled,
   selectCodeFontFamily,
   selectGroupByRepo,
+  selectGithubLinkDefaultAction,
   selectHasCompletedProviderSetup,
   selectLanguagePreference,
   selectNotificationEnabled,
@@ -42,6 +44,7 @@ import {
   selectSoundEnabled,
   selectSoundOnlyWhenUnfocused,
   selectSpellcheckEnabled,
+  selectUpdateChannel,
 } from '$store/renderer/slices/user-preferences/user-preferences-selectors';
 import {
   selectBgDefaultModel,
@@ -71,12 +74,15 @@ import {
   setActiveProvider,
   setProviderEnabled,
 } from '$store/renderer/slices/provider-settings/provider-settings-slice';
-import { setEnabled, setDisabledServers } from '$store/renderer/slices/mcp-settings/mcp-settings-slice';
+import {
+  setEnabled,
+  setDisabledServers,
+} from '$store/renderer/slices/mcp-settings/mcp-settings-slice';
 import {
   setAgentFontStyle,
-  setBetaUpdatesEnabled,
   setCodeFontFamily,
   setGroupByRepo,
+  setGithubLinkDefaultAction,
   setHasCompletedProviderSetup,
   setLanguagePreference,
   setNotificationEnabled,
@@ -85,10 +91,11 @@ import {
   setSoundEnabled,
   setSoundOnlyWhenUnfocused,
   setSpellcheckEnabled,
+  setUpdateChannel,
   setVolume,
   type FontStyle,
+  type NoteFontStyle,
 } from '$store/renderer/slices/user-preferences/user-preferences-slice';
-import { autoUpdateClient } from '$features/auto-update/auto-update.client';
 import {
   setDefaultModel,
   setTypeOverride,
@@ -242,8 +249,8 @@ function writeLocalStorageValue(key: string, value: unknown): void {
 async function readCurrentSettingValue(definition: AppSettingDefinition): Promise<unknown> {
   const state = appStore.state;
   switch (definition.path) {
-    case 'preferences.betaUpdatesEnabled':
-      return selectBetaUpdatesEnabled.select(state);
+    case 'preferences.updateChannel':
+      return selectUpdateChannel.select(state);
     case 'preferences.spellcheckEnabled':
       return selectSpellcheckEnabled.select(state);
     case 'workspaceList.showArchived':
@@ -272,9 +279,9 @@ async function readCurrentSettingValue(definition: AppSettingDefinition): Promis
       return selectSoundOnlyWhenUnfocused.select(state);
     case 'notifications.volume':
       return selectNotificationVolume.select(state);
-    case 'backgroundAgents.defaultModel':
+    case 'quickActions.defaultModel':
       return selectBgDefaultModel.select(state);
-    case 'backgroundAgents.typeOverrides':
+    case 'quickActions.typeOverrides':
       return selectBgTypeOverrides.select(state);
     case 'fonts.agent':
       return selectAgentFontStyle.select(state);
@@ -300,6 +307,8 @@ async function readCurrentSettingValue(definition: AppSettingDefinition): Promis
       return selectIsCollapsed.select(state);
     case 'openIn.defaultAction':
       return selectOpenAction.select(state);
+    case 'githubLinks.defaultAction':
+      return selectGithubLinkDefaultAction.select(state);
     case 'openIn.hiddenEditors':
       return selectHiddenEditorIds.select(state);
     case 'mcp.enableUserServers':
@@ -321,15 +330,18 @@ function isFontStyle(value: unknown): value is FontStyle {
   return value === 'sans' || value === 'monospace';
 }
 
+function isNoteFontStyle(value: unknown): value is NoteFontStyle {
+  return value === 'sans' || value === 'serif' || value === 'monospace';
+}
+
 function dispatchReduxAction(path: string, value: unknown): boolean {
   switch (path) {
-    case 'preferences.betaUpdatesEnabled': {
-      const enabled = Boolean(value);
-      appStore.dispatch(setBetaUpdatesEnabled(enabled));
-      // Also call SET_CHANNEL IPC to persist and switch feed immediately
-      autoUpdateClient.setChannel(enabled ? 'beta' : 'stable').catch((error) => {
-        console.error('Failed to set update channel via IPC', error);
-      });
+    case 'preferences.updateChannel': {
+      // Dispatch only: the update-channel persistence saga owns the
+      // SET_CHANNEL write (persist + feed switch) — a direct setChannel here
+      // would duplicate it.
+      if (!isUpdateChannel(value)) return false;
+      appStore.dispatch(setUpdateChannel(value));
       return true;
     }
     case 'preferences.spellcheckEnabled':
@@ -388,10 +400,10 @@ function dispatchReduxAction(path: string, value: unknown): boolean {
       appStore.dispatch(setVolume(parsed));
       return true;
     }
-    case 'backgroundAgents.defaultModel':
+    case 'quickActions.defaultModel':
       appStore.dispatch(setDefaultModel(String(value ?? '')));
       return true;
-    case 'backgroundAgents.typeOverrides':
+    case 'quickActions.typeOverrides':
       for (const [type, model] of Object.entries(objectValue(value))) {
         appStore.dispatch(
           setTypeOverride({ type: type as BackgroundAgentType, model: String(model ?? '') }),
@@ -403,7 +415,7 @@ function dispatchReduxAction(path: string, value: unknown): boolean {
       appStore.dispatch(setAgentFontStyle(value));
       return true;
     case 'fonts.notes':
-      if (!isFontStyle(value)) return false;
+      if (!isNoteFontStyle(value)) return false;
       appStore.dispatch(setNoteFontStyle(value));
       return true;
     case 'fonts.code':
@@ -442,6 +454,10 @@ function dispatchReduxAction(path: string, value: unknown): boolean {
     case 'openIn.defaultAction':
       appStore.dispatch(setOpenAction(String(value ?? '')));
       return true;
+    case 'githubLinks.defaultAction':
+      if (!isGithubLinkDefaultAction(value)) return false;
+      appStore.dispatch(setGithubLinkDefaultAction(value));
+      return true;
     default:
       return false;
   }
@@ -454,6 +470,12 @@ async function applyPersistedSetting(
 ): Promise<void> {
   if (!apply || apply.kind === 'read-only') return;
   if (dispatchReduxAction(path, value)) return;
+  if (apply.kind === 'redux-action') {
+    // A redux-action plan has no fallback below: reaching here means the
+    // value failed validation (or the path has no dispatch case), so fail the
+    // transaction instead of recording the proposal as applied.
+    throw new Error(`Invalid value for setting "${path}": ${JSON.stringify(value)}`);
+  }
   if (apply.kind === 'daemon-settings-update') {
     await writeDaemonSetting(apply.path, apply.valuePath, value);
     if (path === 'mcp.enableUserServers') appStore.dispatch(setEnabled(Boolean(value)));

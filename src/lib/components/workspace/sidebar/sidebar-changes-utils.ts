@@ -5,6 +5,8 @@
 
 import type { TrackedChange, CommitInfo } from '$features/file-tracking/types';
 import type { PullRequestInfo } from '$shared/types';
+import { PullRequestStatus } from '$shared/types';
+import type { PrMonitorRow } from '$features/pr-monitor/pr-monitor-service';
 import type {
   AgentChangeGroup,
   PRInfo,
@@ -12,6 +14,7 @@ import type {
 } from '$lib/components/file-tracking/accept-changes/types';
 import { m } from '$shared/paraglide/messages.js';
 import { formatInteger } from '$lib/i18n/format';
+import { capitalize } from '$shared/utils-client';
 
 /**
  * Validate a git branch name according to git-check-ref-format rules.
@@ -325,6 +328,403 @@ export function mapWorkspacePRs(
     }];
   }
   return [];
+}
+
+/** Display status for a monitored PR row (PROTOCOL §6.9): active monitors
+ * read the live snapshot state; completed ones ended merged or closed. */
+export function monitorDisplayStatus(
+  monitor: PrMonitorRow,
+): 'open' | 'merged' | 'closed' | 'draft' {
+  const snapshotState = monitor.lastSnapshot?.state?.toLowerCase();
+  if (snapshotState === 'merged') return 'merged';
+  if (snapshotState === 'closed') return 'closed';
+  if (monitor.lastSnapshot?.isDraft) return 'draft';
+  // Completed without a snapshot verdict (rare — the terminal sweep persists
+  // the final snapshot first): completion covers both merged and closed, so
+  // default to the non-celebratory 'closed' rather than falsely claim merged.
+  return monitor.state === 'completed' ? 'closed' : 'open';
+}
+
+/**
+ * Merge agent-monitored PRs (PROTOCOL §6.9) into the workspace PR list.
+ * A monitor that duplicates an existing row's repo-qualified identity
+ * (`crossRepo ? "repo#number" : "number"`, mirroring PRSection's `prKey`)
+ * only annotates it with the owning agent; same-repo lookups only match
+ * bare (non-`crossRepo`) rows, so a same-repo monitor never annotates a
+ * cross-repo row sharing a PR number. Unmatched monitors append as new
+ * rows carrying agent attribution (and the `<owner>/<name>` repo context
+ * when it differs from the workspace repo).
+ */
+export function mergeMonitoredPRs(
+  basePRs: PRInfo[],
+  monitors: PrMonitorRow[],
+  workspaceRepo: string | undefined,
+): PRInfo[] {
+  if (monitors.length === 0) return basePRs;
+
+  const workspaceOwner = workspaceRepo?.split('/')[0];
+  const merged = basePRs.map((pr) => ({ ...pr }));
+  for (const monitor of monitors) {
+    const sameRepo = !workspaceRepo || monitor.repo === workspaceRepo;
+    const existing = merged.find((pr) =>
+      sameRepo
+        ? !pr.crossRepo && pr.number === monitor.prNumber
+        : pr.crossRepo === monitor.repo && pr.number === monitor.prNumber,
+    );
+    if (existing) {
+      existing.monitorAgentId = monitor.agentId;
+      // `lastSnapshot` is absent until a monitor's first successful poll —
+      // don't let a snapshotless duplicate monitor clobber a present one.
+      existing.monitorSnapshot = monitor.lastSnapshot ?? existing.monitorSnapshot;
+      continue;
+    }
+    const url = monitor.url ?? `https://github.com/${monitor.repo}/pull/${monitor.prNumber}`;
+    merged.push({
+      number: monitor.prNumber,
+      title: monitor.title ?? `${monitor.repo}#${monitor.prNumber}`,
+      url,
+      htmlUrl: url,
+      status: monitorDisplayStatus(monitor),
+      // Monitor-row timestamps stand in for the PR's own (the snapshot does
+      // not carry them) so selectPrimaryPr's oldest-created / latest-updated
+      // ordering works when multiple monitored PRs compete.
+      createdAt: monitor.createdAt,
+      updatedAt: monitor.updatedAt,
+      monitorAgentId: monitor.agentId,
+      crossRepo: sameRepo ? undefined : monitor.repo,
+      crossRepoDisplay: sameRepo ? undefined : shortRepoDisplay(monitor.repo, workspaceOwner),
+      monitorSnapshot: monitor.lastSnapshot,
+      monitorOnly: true,
+    });
+  }
+  return merged;
+}
+
+/** Same-org repos carry no information in the owner segment — show only the
+ * repo name; the full form is kept when the org differs. GitHub owner names
+ * are case-insensitive, so compare lowercased. */
+function shortRepoDisplay(repo: string, workspaceOwner: string | undefined): string {
+  return workspaceOwner && repo.toLowerCase().startsWith(`${workspaceOwner.toLowerCase()}/`)
+    ? repo.slice(workspaceOwner.length + 1)
+    : repo;
+}
+
+/** PR-bearing subset of a secondary git-root row (monorepo#2053) — structural
+ * so both `GitRootRow` and `WorkspaceGitRootEntry` satisfy it. */
+export interface GitRootPRSource {
+  repoOwner?: string;
+  repoName?: string;
+  pullRequests?: PullRequestInfo[];
+}
+
+/** The Changes tab's three PR sub-sections (monorepo#2053). */
+export interface SectionedPRs {
+  /** The workspace's own PRs, exactly as {@link mergeMonitoredPRs} produced
+   * them before sectioning existed (same-repo monitors only). */
+  own: PRInfo[];
+  /** PRs attributed to secondary git roots by repo `owner/name` — the
+   * "Other PRs" section. */
+  otherRoots: PRInfo[];
+  /** Monitor entries attributable to no known root — the "Other Tracked
+   * PRs" section. */
+  otherTracked: PRInfo[];
+}
+
+/**
+ * Section the Changes tab PR pool (monorepo#2053): the workspace's own PRs
+ * first (with monitors on the workspace repo merged in — byte-identical to
+ * the pre-sectioning `mergeMonitoredPRs` output when the other sections are
+ * empty), then secondary-root PRs, then unattributable monitors. Monitors
+ * are attributed by exact repo `owner/name` match — workspace repo first
+ * (a monitor on the workspace repo always groups under the primary root,
+ * even when a secondary root points at the same repo), then registered
+ * roots; when the workspace repo is unknown every monitor stays in `own`,
+ * mirroring `mergeMonitoredPRs`. Roots without a detected `owner/name`
+ * contribute no rows (the PR sweep cannot discover PRs for them). Root rows
+ * duplicating an `own` row's repo-qualified identity (or an earlier root's)
+ * are dropped; root-attributed monitors annotate their matching root row or
+ * append as monitor-only rows, exactly like `mergeMonitoredPRs`.
+ */
+export function sectionPRs(
+  basePRs: PRInfo[],
+  monitors: PrMonitorRow[],
+  workspaceRepo: string | undefined,
+  secondaryRoots: GitRootPRSource[],
+  getDisplayTitle: (pr: PullRequestInfo) => string,
+): SectionedPRs {
+  // GitHub repo identities are case-insensitive (see shortRepoDisplay), so
+  // all attribution comparisons here normalize to lowercase.
+  const workspaceRepoLower = workspaceRepo?.toLowerCase();
+  const rootRepos = new Set<string>();
+  for (const root of secondaryRoots) {
+    if (root.repoOwner && root.repoName)
+      rootRepos.add(`${root.repoOwner}/${root.repoName}`.toLowerCase());
+  }
+
+  const primaryMonitors: PrMonitorRow[] = [];
+  const rootMonitors: PrMonitorRow[] = [];
+  const trackedMonitors: PrMonitorRow[] = [];
+  for (const monitor of monitors) {
+    const monitorRepoLower = monitor.repo.toLowerCase();
+    if (!workspaceRepoLower || monitorRepoLower === workspaceRepoLower)
+      primaryMonitors.push(monitor);
+    else if (rootRepos.has(monitorRepoLower)) rootMonitors.push(monitor);
+    else trackedMonitors.push(monitor);
+  }
+
+  const own = mergeMonitoredPRs(basePRs, primaryMonitors, workspaceRepo);
+
+  const workspaceOwner = workspaceRepo?.split('/')[0];
+  const seen = new Set(own.map((pr) => `${pr.crossRepo ?? workspaceRepo ?? ''}#${pr.number}`));
+  const rootRows: PRInfo[] = [];
+  for (const root of secondaryRoots) {
+    if (!root.repoOwner || !root.repoName) continue;
+    const repo = `${root.repoOwner}/${root.repoName}`;
+    for (const pr of root.pullRequests ?? []) {
+      const identity = `${repo}#${pr.number}`;
+      if (seen.has(identity)) continue;
+      seen.add(identity);
+      const url = pr.url || `https://github.com/${repo}/pull/${pr.number}`;
+      // A root on the workspace repo (e.g. a subtree checkout) needs no repo
+      // context; otherwise keep the full identity for row keys, as
+      // mergeMonitoredPRs does for cross-repo monitors.
+      const sameRepo = workspaceRepoLower !== undefined && repo.toLowerCase() === workspaceRepoLower;
+      rootRows.push({
+        number: pr.number,
+        title: getDisplayTitle(pr),
+        url,
+        htmlUrl: url,
+        status: toPRDisplayStatus(pr.status),
+        createdAt: pr.createdAt,
+        updatedAt: pr.updatedAt,
+        crossRepo: sameRepo ? undefined : repo,
+        crossRepoDisplay: sameRepo ? undefined : shortRepoDisplay(repo, workspaceOwner),
+      });
+    }
+  }
+
+  return {
+    own,
+    otherRoots: mergeMonitoredPRs(rootRows, rootMonitors, workspaceRepo),
+    otherTracked: mergeMonitoredPRs([], trackedMonitors, workspaceRepo),
+  };
+}
+
+/** The Changes tab's PR sections reordered to follow the git-root dropdown
+ * selection (monorepo#2053). */
+export interface SelectionOrderedPRSections {
+  /** Rows of the dropdown-selected root — the top, undivided section. */
+  selected: PRInfo[];
+  /** Rows of every non-selected root — the "Other PRs" section. Includes
+   * the workspace's own PRs when a secondary root is selected. */
+  others: PRInfo[];
+  /** Monitor rows attributable to no known root — the "Other Tracked PRs"
+   * section; unaffected by selection. */
+  otherTracked: PRInfo[];
+}
+
+/**
+ * Reorder {@link sectionPRs} output to follow the git-root dropdown selection
+ * (monorepo#2053). With the primary root selected (`selectedRoot` null) the
+ * three sections keep the selection-unaware sectioning, returned as
+ * recency-sorted copies (see {@link sortPRsByRecency}). With a secondary root
+ * selected, its rows (attributed by repo `owner/name`, resolving rows
+ * without `crossRepo` context against the workspace repo) move to the top
+ * section while the workspace's own PRs join the remaining roots' rows under
+ * "Other PRs". A selected root without a detected `owner/name` owns no rows.
+ * Every returned section is sorted newest-updated first. Purely visual:
+ * functional consumers keep keying off `SectionedPRs.own`.
+ */
+export function orderPRSectionsForSelection(
+  sectioned: SectionedPRs,
+  workspaceRepo: string | undefined,
+  selectedRoot: GitRootPRSource | null,
+): SelectionOrderedPRSections {
+  if (!selectedRoot) {
+    return {
+      selected: sortPRsByRecency(sectioned.own),
+      others: sortPRsByRecency(sectioned.otherRoots),
+      otherTracked: sortPRsByRecency(sectioned.otherTracked),
+    };
+  }
+  const selectedRepo =
+    selectedRoot.repoOwner && selectedRoot.repoName
+      ? `${selectedRoot.repoOwner}/${selectedRoot.repoName}`
+      : undefined;
+  const selected: PRInfo[] = [];
+  const rest: PRInfo[] = [];
+  for (const pr of sectioned.otherRoots) {
+    if (selectedRepo !== undefined && (pr.crossRepo ?? workspaceRepo) === selectedRepo) {
+      selected.push(pr);
+    } else {
+      rest.push(pr);
+    }
+  }
+  return {
+    selected: sortPRsByRecency(selected),
+    others: sortPRsByRecency([...sectioned.own, ...rest]),
+    otherTracked: sortPRsByRecency(sectioned.otherTracked),
+  };
+}
+
+/**
+ * Display-only recency sort for the Changes tab PR sections: `updatedAt`
+ * descending, rows missing `updatedAt` last, PR number descending as
+ * tiebreak. Returns a new array; the input is not mutated.
+ */
+export function sortPRsByRecency(prs: PRInfo[]): PRInfo[] {
+  return [...prs].sort(
+    (a, b) =>
+      compareMissingLast(a.updatedAt, b.updatedAt, (x, y) => y.localeCompare(x)) ||
+      b.number - a.number,
+  );
+}
+
+/** Comparator fragment: rows with a timestamp sort before rows without one;
+ * two present timestamps compare via `cmp`. */
+function compareMissingLast(
+  a: string | undefined,
+  b: string | undefined,
+  cmp: (x: string, y: string) => number,
+): number {
+  if (a && b) return cmp(a, b);
+  if (a) return -1;
+  if (b) return 1;
+  return 0;
+}
+
+/**
+ * Pick the primary PR for single-PR surfaces (workspace card/row pill, the
+ * summarized Changes card) from the combined branch-linked + monitored pool
+ * (see {@link mergeMonitoredPRs}): the oldest unmerged (open/draft) PR
+ * (`createdAt` asc, PR number asc as tiebreak); otherwise the latest merged
+ * PR (`updatedAt` desc, PR number desc); otherwise the first remaining
+ * (closed) row. Missing timestamps sort last within their bucket.
+ */
+export function selectPrimaryPr(prs: PRInfo[]): PRInfo | undefined {
+  const unmerged = prs.filter((pr) => pr.status === 'open' || pr.status === 'draft');
+  if (unmerged.length > 0) {
+    return [...unmerged].sort(
+      (a, b) =>
+        compareMissingLast(a.createdAt, b.createdAt, (x, y) => x.localeCompare(y)) ||
+        a.number - b.number,
+    )[0];
+  }
+  const merged = prs.filter((pr) => pr.status === 'merged');
+  if (merged.length > 0) {
+    return [...merged].sort(
+      (a, b) =>
+        compareMissingLast(a.updatedAt, b.updatedAt, (x, y) => y.localeCompare(x)) ||
+        b.number - a.number,
+    )[0];
+  }
+  return prs[0];
+}
+
+/**
+ * Hover tooltip for a sidebar PR row: the PR state, plus the monitor's
+ * last-snapshot merge-requirements summary (checks, approvals, unresolved
+ * threads, merge-blocked reason) when the row carries one (PROTOCOL §6.9).
+ */
+export function getPRStatusTooltip(pr: PRInfo): string {
+  const stateLine =
+    pr.status === 'merged'
+      ? m.workspace_prSection_merged_label()
+      : pr.status === 'closed'
+        ? m.workspace_prSection_closed_label()
+        : pr.status === 'draft'
+          ? m.workspace_prSection_statusDraft_label()
+          : m.workspace_prSection_statusOpen_label();
+  const lines: string[] = [stateLine];
+  // Merged/closed rows no longer have merge requirements — the snapshot
+  // detail lines would just be stale noise on a settled PR.
+  const snapshot =
+    pr.status === 'merged' || pr.status === 'closed' ? undefined : pr.monitorSnapshot;
+  if (snapshot) {
+    if (snapshot.checks.total > 0) {
+      lines.push(
+        m.workspace_prSection_statusChecks_tooltip({
+          passed: formatInteger(snapshot.checks.passed),
+          failed: formatInteger(snapshot.checks.failed),
+          pending: formatInteger(snapshot.checks.pending),
+        }),
+      );
+    }
+    lines.push(
+      snapshot.approvals.needed != null
+        ? m.workspace_prSection_statusApprovalsOfNeeded_tooltip({
+            count: formatInteger(snapshot.approvals.have),
+            needed: formatInteger(snapshot.approvals.needed),
+          })
+        : m.workspace_prSection_statusApprovals_tooltip({
+            count: formatInteger(snapshot.approvals.have),
+          }),
+    );
+    if (snapshot.approvals.changesRequested > 0) {
+      lines.push(
+        m.workspace_prSection_statusChangesRequested_tooltip({
+          count: formatInteger(snapshot.approvals.changesRequested),
+        }),
+      );
+    }
+    if (snapshot.threads.unresolved > 0) {
+      lines.push(
+        m.workspace_prSection_statusUnresolvedThreads_tooltip({
+          count: formatInteger(snapshot.threads.unresolved),
+        }),
+      );
+    }
+    if (snapshot.mergeBlockedReason) {
+      // i18n-ignore (BE-provided human-readable reason)
+      lines.push(capitalize(snapshot.mergeBlockedReason));
+    }
+  }
+  return lines.join('\n');
+}
+
+/** Inverse of {@link toPRDisplayStatus}: `PullRequestStatus` enum value for
+ * a display status — used by the workspace card/row pills. */
+export function toPullRequestStatus(
+  status: 'open' | 'merged' | 'closed' | 'draft',
+): PullRequestStatus {
+  if (status === 'merged') return PullRequestStatus.Merged;
+  if (status === 'closed') return PullRequestStatus.Closed;
+  if (status === 'draft') return PullRequestStatus.Draft;
+  return PullRequestStatus.Open;
+}
+
+/** `PullRequestStatus` pill value for a monitor-backed PR pill (the
+ * WorkspaceCard/WorkspaceTableRow fallback) — the enum projection of
+ * {@link monitorDisplayStatus}. */
+export function monitorPillStatus(monitor: PrMonitorRow): PullRequestStatus {
+  return toPullRequestStatus(monitorDisplayStatus(monitor));
+}
+
+/**
+ * Count monitored PRs (PROTOCOL §6.9) beyond the primary PR pill/badge —
+ * the "+N" indicator on the workspace card surfaces. A monitor is excluded
+ * only when it matches the primary PR by number in the primary PR's repo —
+ * `primaryCrossRepo` when the primary is a cross-repo monitored row, else
+ * the workspace repo (an unknown repo matches by number alone).
+ */
+export function countOtherMonitors(
+  monitors: PrMonitorRow[],
+  primaryPrNumber: number | undefined,
+  repositoryOwner: string | undefined,
+  repositoryName: string | undefined,
+  primaryCrossRepo?: string,
+): number {
+  const workspaceRepo =
+    repositoryOwner && repositoryName ? `${repositoryOwner}/${repositoryName}` : undefined;
+  const primaryRepo = primaryCrossRepo ?? workspaceRepo;
+  return monitors.filter(
+    (mon) =>
+      !(
+        primaryPrNumber !== undefined &&
+        mon.prNumber === primaryPrNumber &&
+        (!primaryRepo || mon.repo === primaryRepo)
+      ),
+  ).length;
 }
 
 /** Check if an agent group is collapsed. */

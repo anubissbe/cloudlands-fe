@@ -10,7 +10,11 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { mockInvoke, resetMockIpcRouter, UnbridgedMockIpcChannelError } from '$shared/ipc-mock-router';
+import {
+  mockInvoke,
+  resetMockIpcRouter,
+  UnbridgedMockIpcChannelError,
+} from '$shared/ipc-mock-router';
 
 /** Import a fresh copy of browser-mock so its auto-install side effect re-runs. */
 async function importBrowserMock() {
@@ -83,6 +87,84 @@ describe('browser-mock DEV gate', () => {
 
     expect(installBrowserMock()).toBe(false);
     expect((window as any).electronAPI).toBe(realBridge);
+  });
+
+  it('serves protocol-shaped backend lists to the live AppClient in browser mode', async () => {
+    vi.stubEnv('DEV', true);
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    await importBrowserMock();
+    const api = (window as any).electronAPI;
+    const invokeSpy = vi.spyOn(api, 'invoke');
+    const { LiveAppClient } = await import('./client');
+    const { backendRequest } = await import('./client/live/backend-transport');
+    const { rememberNoteWorkspace } = await import('./client/live/live-support');
+    const client = new LiveAppClient();
+
+    const workspaces = await client.workspaces.list({ includeArchived: true });
+    const agents = await client.agents.list(String(workspaces[0].id));
+    const interrupted = await client.agents.listInterrupted();
+    const files = await backendRequest<{ files?: string[] }>('search.fileNames', {
+      workspaceId: String(workspaces[0].id),
+      pattern: '',
+      limit: 50,
+    });
+    rememberNoteWorkspace('mock-note', 'mock-ws-1');
+    const comments = await client.comments.list('mock-note');
+    const tasks = await client.tasks.list('mock-ws-1');
+    const gitStatus = await client.git.status('mock-ws-1');
+
+    expect(workspaces.map(({ id }) => String(id))).toEqual(['mock-ws-1', 'mock-ws-2']);
+    expect(agents).toEqual([]);
+    expect(interrupted).toEqual([]);
+    expect(files).toEqual({ files: [] });
+    expect(comments).toEqual([]);
+    expect(tasks).toEqual({ tasks: [], stats: { total: 0, completed: 0, inProgress: 0 } });
+    expect(gitStatus).toEqual({
+      branch: '',
+      ahead: 0,
+      behind: 0,
+      diverged: false,
+      files: [],
+      hasUncommittedChanges: false,
+      hasUntrackedFiles: false,
+    });
+    expect(invokeSpy).toHaveBeenNthCalledWith(1, 'backend:request', {
+      method: 'workspace.list',
+      params: { includeArchived: true },
+    });
+    expect(invokeSpy).toHaveBeenNthCalledWith(2, 'backend:request', {
+      method: 'agent.list',
+      params: { workspaceId: 'mock-ws-1' },
+    });
+    expect(invokeSpy).toHaveBeenNthCalledWith(3, 'backend:request', {
+      method: 'agent.listInterrupted',
+      params: {},
+    });
+    expect(invokeSpy).toHaveBeenNthCalledWith(4, 'backend:request', {
+      method: 'search.fileNames',
+      params: { workspaceId: 'mock-ws-1', pattern: '', limit: 50 },
+    });
+    expect(invokeSpy).toHaveBeenNthCalledWith(5, 'backend:request', {
+      method: 'comment.list',
+      params: { workspaceId: 'mock-ws-1', noteId: 'mock-note', includeComments: true },
+    });
+    await expect(invokeSpy.mock.results[4].value).resolves.toEqual({
+      ok: true,
+      result: { threads: [] },
+    });
+    expect(invokeSpy).toHaveBeenNthCalledWith(6, 'backend:request', {
+      method: 'task.list',
+      params: { workspaceId: 'mock-ws-1' },
+    });
+    await expect(invokeSpy.mock.results[5].value).resolves.toEqual({
+      ok: true,
+      result: { tasks: [], stats: { total: 0, completed: 0, inProgress: 0 } },
+    });
+    expect(invokeSpy).toHaveBeenNthCalledWith(7, 'backend:request', {
+      method: 'git.status',
+      params: { workspaceId: 'mock-ws-1' },
+    });
   });
 
   it('logs a [BrowserMock]-prefixed warning naming the channel for every served response', async () => {
@@ -166,6 +248,131 @@ describe('browser-mock backend:* transport envelope', () => {
     expect(typeof sub.result?.subscriptionId).toBe('string');
   });
 
+  it('backend:request workspace.get resolves the workspace by id as { ok: true, result: { workspace } } (monorepo#2605)', async () => {
+    const res = await api.invoke('backend:request', {
+      method: 'workspace.get',
+      params: { workspaceId: 'mock-ws-1' },
+    });
+    expect(res.ok).toBe(true);
+    expect(res.result?.workspace?.id).toBe('mock-ws-1');
+    expect(res.result.workspace.title).toBe('Example Project');
+  });
+
+  it('backend:request workspace.get for an unknown id returns a structured error envelope (PROTOCOL §5.1)', async () => {
+    const res = await api.invoke('backend:request', {
+      method: 'workspace.get',
+      params: { workspaceId: 'no-such-ws' },
+    });
+    expect(res.ok).toBe(false);
+    expect(res.error?.code).toBe('INVALID_PARAMS');
+    expect(res.error?.message).toContain('no-such-ws');
+    // Mirrors JsonRpcError.toErrorPayload(): data.code + numeric rpcCode
+    // (isDaemonErrorResponse duck-types daemon rejections on rpcCode).
+    expect(res.error?.data).toEqual({ code: 'INVALID_PARAMS' });
+    expect(res.error?.rpcCode).toBe(-32602);
+  });
+
+  it('backend:request task.listAgentLinks returns the empty links + linksByNoteId shape (monorepo#2605, PROTOCOL §5.4)', async () => {
+    const res = await api.invoke('backend:request', {
+      method: 'task.listAgentLinks',
+      params: { workspaceId: 'mock-ws-1' },
+    });
+    expect(res.ok).toBe(true);
+    expect(res.result).toEqual({ links: [], linksByNoteId: {} });
+  });
+
+  it('backend:request serves the remaining workspace-open lifecycle reads as ok envelopes', async () => {
+    // These are hit by the lifecycle read saga right after workspace.get /
+    // task.listAgentLinks when a workspace opens in dev:web.
+    const tokenUsage = await api.invoke('backend:request', {
+      method: 'workspace.getTokenUsage',
+      params: { workspaceId: 'mock-ws-1' },
+    });
+    expect(tokenUsage.ok).toBe(true);
+    expect(tokenUsage.result?.tokenUsage?.totals).toEqual({
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
+    });
+    expect(tokenUsage.result?.tokenUsage?.lastScanAt).toBeNull();
+
+    const context = await api.invoke('backend:request', {
+      method: 'workspace.getContext',
+      params: { workspaceId: 'mock-ws-1' },
+    });
+    expect(context.ok).toBe(true);
+    expect(Array.isArray(context.result?.items)).toBe(true);
+
+    const scripts = await api.invoke('backend:request', {
+      method: 'script.list',
+      params: { workspaceId: 'mock-ws-1' },
+    });
+    expect(scripts.ok).toBe(true);
+    expect(Array.isArray(scripts.result?.scripts)).toBe(true);
+
+    // v4.0 envelope: { terminals, daemonBootId } — never the bare array.
+    const terminals = await api.invoke('backend:request', {
+      method: 'terminal.list',
+      params: { workspaceId: 'mock-ws-1' },
+    });
+    expect(terminals.ok).toBe(true);
+    expect(Array.isArray(terminals.result?.terminals)).toBe(true);
+    expect(typeof terminals.result?.daemonBootId).toBe('string');
+
+    const active = await api.invoke('backend:request', {
+      method: 'agent.listActive',
+      params: {},
+    });
+    expect(active.ok).toBe(true);
+    expect(active.result).toEqual({ streams: [] });
+
+    const monitors = await api.invoke('backend:request', {
+      method: 'prMonitor.list',
+      params: { workspaceId: 'mock-ws-1' },
+    });
+    expect(monitors.ok).toBe(true);
+    expect(monitors.result).toEqual({ monitors: [] });
+
+    const gitRoots = await api.invoke('backend:request', {
+      method: 'gitRoot.list',
+      params: { workspaceId: 'mock-ws-1' },
+    });
+    expect(gitRoots.ok).toBe(true);
+    expect(gitRoots.result).toEqual({ gitRoots: [] });
+
+    // §5.9 file.tree returns a bare array.
+    const tree = await api.invoke('backend:request', {
+      method: 'file.tree',
+      params: { workspaceId: 'mock-ws-1', path: '.' },
+    });
+    expect(tree.ok).toBe(true);
+    expect(tree.result).toEqual([]);
+
+    // §5.19 file-tracking reads (refreshChanges in the lifecycle saga).
+    const changes = await api.invoke('backend:request', {
+      method: 'file-tracking.getChanges',
+      params: { workspaceId: 'mock-ws-1' },
+    });
+    expect(changes.ok).toBe(true);
+    expect(changes.result).toEqual({ changes: [], truncated: false, totalCount: 0 });
+
+    const commits = await api.invoke('backend:request', {
+      method: 'file-tracking.loadCommits',
+      params: { workspaceId: 'mock-ws-1' },
+    });
+    expect(commits.ok).toBe(true);
+    expect(commits.result).toEqual({ commits: [], boundarySha: null, nextToken: null });
+  });
+
+  it('resolves workspaces.get through the live client (workspace open path)', async () => {
+    const { LiveAppClient } = await import('./client');
+    const client = new LiveAppClient();
+    const workspace = await client.workspaces.get('mock-ws-1');
+    expect(workspace).not.toBeNull();
+    expect(String(workspace?.id)).toBe('mock-ws-1');
+  });
+
   it('backend:request for an unimplemented method returns a structured error envelope', async () => {
     const res = await api.invoke('backend:request', { method: 'no.suchMethod' });
     expect(res.ok).toBe(false);
@@ -198,9 +405,8 @@ describe('browser-mock backend:* transport envelope', () => {
   });
 
   it('unwraps cleanly through the real electron-ipc transport (no BackendError on boot reads)', async () => {
-    const { createElectronIpcBackendTransport } = await import(
-      './client/live/electron-ipc-transport'
-    );
+    const { createElectronIpcBackendTransport } =
+      await import('./client/live/electron-ipc-transport');
     const transport = createElectronIpcBackendTransport();
     const result = await transport.request<{ workspaces?: unknown[] }>('workspace.list');
     expect(Array.isArray(result.workspaces)).toBe(true);

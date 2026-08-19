@@ -15,6 +15,7 @@ import { StringDecoder } from 'node:string_decoder';
 import { Logger } from '$shared/logger';
 import { JsonRpcError, type JsonRpcErrorShape } from './json-rpc-errors';
 import {
+  AuthRejectedError,
   type BackendConnectionConfig,
   createBackendSocket,
   describeBackendConfig,
@@ -69,6 +70,8 @@ export interface JsonRpcClientOptions {
   heartbeatIntervalMs?: number;
   /** Optional async liveness probe invoked on each heartbeat tick. */
   healthCheck?: () => Promise<void>;
+  /** Consecutive failed liveness probes required before reconnecting. Defaults to 1. */
+  healthCheckFailureThreshold?: number;
   /**
    * §5.17 stable client identity. When set, the client performs a
    * `client.hello` handshake with these params (the persisted clientId) on
@@ -119,6 +122,7 @@ export class JsonRpcClient extends EventEmitter {
   private readonly maxReconnectDelayMs: number;
   private readonly heartbeatIntervalMs: number;
   private readonly healthCheck?: () => Promise<void>;
+  private readonly healthCheckFailureThreshold: number;
   private readonly helloParams?: () => Promise<Record<string, unknown>> | Record<string, unknown>;
   private readonly onHelloResult?: (result: unknown) => void;
 
@@ -134,10 +138,14 @@ export class JsonRpcClient extends EventEmitter {
   private currentReconnectDelay: number;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  private heartbeatInFlight = false;
+  private consecutiveHealthCheckFailures = 0;
   private connectWaiters: Array<{ resolve: () => void; reject: (e: Error) => void }> = [];
   private readonly pending = new Map<number, PendingRequest>();
   /** Sticky flag so `reconnected` only fires on the 2nd (or later) successful connect. */
   private hasBeenConnected = false;
+  /** Consecutive reconnect attempts since the last successful connect (#1750). */
+  private reconnectAttempts = 0;
   /** Handlers for daemon-initiated (reverse) requests, keyed by method name. */
   private readonly reverseHandlers = new Map<string, ReverseRequestHandler>();
 
@@ -150,6 +158,13 @@ export class JsonRpcClient extends EventEmitter {
     this.maxReconnectDelayMs = options.maxReconnectDelayMs ?? DEFAULT_MAX_RECONNECT_MS;
     this.heartbeatIntervalMs = options.heartbeatIntervalMs ?? 0;
     this.healthCheck = options.healthCheck;
+    const healthCheckFailureThreshold = options.healthCheckFailureThreshold;
+    this.healthCheckFailureThreshold =
+      typeof healthCheckFailureThreshold === 'number' &&
+      Number.isFinite(healthCheckFailureThreshold) &&
+      healthCheckFailureThreshold >= 1
+        ? Math.floor(healthCheckFailureThreshold)
+        : 1;
     this.helloParams = options.helloParams;
     this.onHelloResult = options.onHelloResult;
     this.currentReconnectDelay = this.reconnectDelayMs;
@@ -158,6 +173,16 @@ export class JsonRpcClient extends EventEmitter {
   /** Current connection status. */
   getStatus(): ConnectionStatus {
     return this.status;
+  }
+
+  /**
+   * Number of reconnect attempts made since the last successful connect
+   * (0 while connected / before the first retry). Surfaced to the renderer via
+   * the backend:status broadcast so the daemon-loss UI can show retry progress
+   * (#1750).
+   */
+  getReconnectAttempts(): number {
+    return this.reconnectAttempts;
   }
 
   /** Connection config (transport type and target). */
@@ -362,6 +387,7 @@ export class JsonRpcClient extends EventEmitter {
 
   private finishConnect(): void {
     this.currentReconnectDelay = this.reconnectDelayMs;
+    this.reconnectAttempts = 0;
     const wasReconnect = this.hasBeenConnected;
     this.hasBeenConnected = true;
     this.setStatus('connected');
@@ -387,6 +413,18 @@ export class JsonRpcClient extends EventEmitter {
     // instead of hanging across reconnect attempts.
     this.failWaiters(error);
     this.setStatus('disconnected');
+    // A 401/403 auth rejection (PROTOCOL §2.1) is not transient: every retry
+    // would re-present the same stale credential and fail identically, so the
+    // automatic reconnect loop stops here. Recovery paths (re-pair, backend
+    // switch) build a fresh client; a later request() still triggers a single
+    // on-demand connect via ensureConnected().
+    if (error instanceof AuthRejectedError) {
+      logger.warn('Backend rejected authentication; automatic reconnect halted', {
+        target: describeBackendConfig(this.config),
+        statusCode: error.statusCode,
+      });
+      return;
+    }
     this.scheduleReconnect();
   }
 
@@ -503,7 +541,12 @@ export class JsonRpcClient extends EventEmitter {
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
       this.currentReconnectDelay = Math.min(delay * 2, this.maxReconnectDelayMs);
-      if (!this.disposed) this.connect();
+      if (!this.disposed) {
+        // Count the retry BEFORE connecting so the 'connecting' status
+        // broadcast carries the up-to-date attempt number (#1750).
+        this.reconnectAttempts += 1;
+        this.connect();
+      }
     }, delay);
   }
 
@@ -517,12 +560,36 @@ export class JsonRpcClient extends EventEmitter {
   private startHeartbeat(): void {
     if (this.heartbeatIntervalMs <= 0) return;
     this.stopHeartbeat();
+    this.heartbeatInFlight = false;
+    this.consecutiveHealthCheckFailures = 0;
     this.heartbeatTimer = setInterval(() => {
       this.emit('heartbeat');
-      if (!this.healthCheck) return;
-      this.healthCheck().catch((error) =>
-        this.onConnectionFailure(error instanceof Error ? error : new Error(String(error))),
-      );
+      if (!this.healthCheck || this.heartbeatInFlight) return;
+
+      const socket = this.socket;
+      this.heartbeatInFlight = true;
+      this.healthCheck()
+        .then(() => {
+          if (this.disposed || this.socket !== socket) return;
+          this.consecutiveHealthCheckFailures = 0;
+        })
+        .catch((error) => {
+          if (this.disposed || this.socket !== socket) return;
+          this.consecutiveHealthCheckFailures += 1;
+          const connectionError = error instanceof Error ? error : new Error(String(error));
+          if (this.consecutiveHealthCheckFailures >= this.healthCheckFailureThreshold) {
+            this.onConnectionFailure(connectionError);
+            return;
+          }
+          logger.warn('Backend health check failed; waiting for confirmation before reconnecting', {
+            failures: this.consecutiveHealthCheckFailures,
+            threshold: this.healthCheckFailureThreshold,
+            error: connectionError.message,
+          });
+        })
+        .finally(() => {
+          if (this.socket === socket) this.heartbeatInFlight = false;
+        });
     }, this.heartbeatIntervalMs);
   }
 

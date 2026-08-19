@@ -9,12 +9,12 @@
   onMount,
   onDestroy,
 } from 'svelte';
-  import { slide } from 'svelte/transition';
+  import { safeSlide } from '$lib/utils/animations';
   import Fa from 'svelte-fa';
   import {
   faInfoCircle,
   faChevronDown,
-  faChevronUp,
+  faChevronLeft,
 } from '@fortawesome/free-solid-svg-icons';
   import { cn } from '$lib/utils/cn';
   import { m } from '$shared/paraglide/messages.js';
@@ -86,7 +86,7 @@
       'rounded-md border border-amber-500/30 bg-amber-500/10 text-amber-600 dark:text-amber-400',
       className,
     )}
-    transition:slide={{ duration: 200 }}
+    transition:safeSlide={{ duration: 200 }}
   >
     <!-- Header - always visible -->
     <button
@@ -99,14 +99,14 @@
         {m.chat_longRunningDebug_processingFor_before()}
         <strong>{formattedTime}</strong>
       </span>
-      <Fa icon={isExpanded ? faChevronUp : faChevronDown} class="shrink-0 opacity-60" />
+      <Fa icon={isExpanded ? faChevronDown : faChevronLeft} class="shrink-0 opacity-60" />
     </button>
 
     <!-- Expanded debug details -->
     {#if isExpanded}
       <div
         class="border-t border-amber-500/20 px-3 py-2 text-ui space-y-1.5"
-        transition:slide={{ duration: 150 }}
+        transition:safeSlide={{ duration: 150 }}
       >
         <p class="text-amber-600/80 dark:text-amber-400/80">
           {m.chat_longRunningDebug_intro_label()}

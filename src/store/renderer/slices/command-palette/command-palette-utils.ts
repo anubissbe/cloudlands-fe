@@ -3,7 +3,7 @@
  * Extracted from the component so they are testable outside Svelte.
  */
 
-import type { Note } from "$shared/types";
+import { WorkspaceStatus, type Note } from "$shared/types";
 import { formatRelativeTime as formatRelative, formatShortDate } from "$lib/i18n/format";
 import type { PaletteMruEntry, PaletteMruEntryType } from "../palette/palette-types";
 
@@ -74,6 +74,15 @@ export function fuzzyScore(haystackRaw: string, needleRaw: string): number {
   if (haystack === needle) return 1000;
   if (haystack.startsWith(needle)) return 200 + Math.max(0, 20 - needle.length);
 
+  let best = -Infinity;
+  for (let subIdx = haystack.indexOf(needle); subIdx !== -1; subIdx = haystack.indexOf(needle, subIdx + 1)) {
+    const prev = haystack[subIdx - 1];
+    const atBoundary = prev === " " || prev === "/" || prev === "-" || prev === "_" || prev === ".";
+    const occScore = (atBoundary ? 100 : 50) + Math.max(0, 20 - needle.length) + Math.max(0, 10 - subIdx);
+    if (occScore > best) best = occScore;
+  }
+  if (best !== -Infinity) return best;
+
   let i = 0;
   let score = 0;
   let streak = 0;
@@ -87,14 +96,17 @@ export function fuzzyScore(haystackRaw: string, needleRaw: string): number {
     score += Math.max(0, 3 - idx);
     i = idx + 1;
   }
-  return score;
+  // Compress the walk into [0, 49) so a contiguous substring (>= 50) always outranks
+  // any pure subsequence match; the transform is monotonic, preserving walk-internal order.
+  return (49 * score) / (score + 49);
 }
 
 /**
  * Format a date string as a compact relative time label in the active locale;
- * dates older than a week show a short date instead.
+ * dates older than a week show a short date instead. Falsy inputs — including
+ * the epoch-0 placeholder used for unattributed changes — format as "".
  */
-export function formatRelativeTime(dateStr: Date | string | undefined): string {
+export function formatRelativeTime(dateStr: Date | string | number | undefined): string {
   if (!dateStr) return "";
   const date = new Date(dateStr);
   if (Number.isNaN(date.getTime())) return "";
@@ -124,15 +136,21 @@ export function parseQueryFilter(query: string): {
 
 /**
  * Resolve the secondary title-line segments for a chat-message palette row:
- * the owning workspace's title and its "owner/repo" label. An unknown
- * workspace yields no segments; a repository without an owner yields just the
- * repo name.
+ * the owning workspace's title, its "owner/repo" label, and whether the
+ * workspace is archived. An unknown workspace yields no segments; a
+ * repository without an owner yields just the repo name.
  */
 export function buildMessageTitleSegments(
   workspace:
-    | { id: string; title?: string; repositoryOwner?: string; repositoryName?: string }
+    | {
+        id: string;
+        title?: string;
+        repositoryOwner?: string;
+        repositoryName?: string;
+        status?: WorkspaceStatus;
+      }
     | undefined,
-): { workspaceName?: string; repoLabel?: string } {
+): { workspaceName?: string; repoLabel?: string; isArchivedWorkspace?: boolean } {
   if (!workspace) return {};
   return {
     workspaceName: workspace.title || workspace.id,
@@ -141,6 +159,7 @@ export function buildMessageTitleSegments(
         ? `${workspace.repositoryOwner}/${workspace.repositoryName}`
         : workspace.repositoryName
       : undefined,
+    isArchivedWorkspace: workspace.status === WorkspaceStatus.Archived ? true : undefined,
   };
 }
 

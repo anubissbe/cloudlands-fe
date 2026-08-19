@@ -9,7 +9,7 @@ import { promises as fs } from 'fs';
 import path from 'path';
 import { Logger } from '../../../shared/logger';
 import { createZipFromPaths } from './zip-utils';
-import { collectDebugFiles } from './debug-files-collector';
+import { collectDebugFiles, copyDebugFile } from './debug-files-collector';
 import { generateSystemInfo } from './system-info.service';
 
 const logger = new Logger('DebugBundleService');
@@ -27,8 +27,12 @@ export async function createDebugBundle(workspaceId?: string): Promise<string> {
     await fs.mkdir(tempDir, { recursive: true });
 
     // Collect all debug files (including workspace-specific if provided)
-    const debugFiles = await collectDebugFiles(workspaceId);
-    logger.info('Collected debug files', { count: debugFiles.length, workspaceId });
+    const { files: debugFiles, omissions, memorySnapshot } = await collectDebugFiles(workspaceId);
+    logger.info('Collected debug files', {
+      count: debugFiles.length,
+      omissions: omissions.length,
+      workspaceId,
+    });
 
     // Copy files to temp directory
     for (const file of debugFiles) {
@@ -39,7 +43,8 @@ export async function createDebugBundle(workspaceId?: string): Promise<string> {
       await fs.mkdir(destDir, { recursive: true });
 
       try {
-        await fs.copyFile(file.sourcePath, destPath);
+        // Handles literal-content entries and tail-capped copies too
+        await copyDebugFile(file, destPath);
       } catch (error) {
         logger.warn('Failed to copy debug file', {
           file: file.relativePath,
@@ -49,10 +54,17 @@ export async function createDebugBundle(workspaceId?: string): Promise<string> {
       }
     }
 
-    // Generate and add system info
-    const systemInfo = generateSystemInfo();
+    // Generate and add system info, describing the same processes the memory
+    // collector already sampled rather than reading the process table twice
+    const systemInfo = generateSystemInfo(memorySnapshot);
     const systemInfoPath = path.join(tempDir, 'system-info.json');
     await fs.writeFile(systemInfoPath, JSON.stringify(systemInfo, null, 2));
+
+    // Record skipped sections so an incomplete bundle is explainable
+    if (omissions.length > 0) {
+      const manifestPath = path.join(tempDir, 'export-manifest.json');
+      await fs.writeFile(manifestPath, JSON.stringify({ omissions }, null, 2));
+    }
 
     // Create zip file
     const zipPath = path.join(app.getPath('temp'), `intent-debug-${Date.now()}.zip`);

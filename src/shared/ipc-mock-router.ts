@@ -48,8 +48,8 @@ export const UNBRIDGED_INVOKE_ALLOWLIST: ReadonlyMap<string, unknown> = new Map<
   // flush. There is no daemon-side log sink yet (P3-1.5 retirement candidate);
   // resolving undefined keeps the logger's in-memory behavior harmless.
   ['log:persist-renderer-logs', undefined],
-  // Legacy notes-on-disk workspace root (`WorkspaceConfig.paths.workspace(id)`,
-  // used to build `.workspace/notes/<id>.md` paths). The daemon owns notes in
+  // Legacy notes-on-disk workspace root (formerly resolved from assumed local
+  // roots, used to build `.workspace/notes/<id>.md` paths). The daemon owns notes in
   // SQLite (PROTOCOL §5.2) — this build has no on-disk notes mirror, so there
   // is no root to return. All production callers tolerate undefined:
   // NoteTabType's noteFilePath → OpenComboButton guards `if (rootPath)` and
@@ -129,11 +129,29 @@ export const UNBRIDGED_INVOKE_ALLOWLIST: ReadonlyMap<string, unknown> = new Map<
     'system:write-clipboard',
     { success: false, error: 'Clipboard IPC is not available in this build' },
   ],
+  // Note-primitive actions against the legacy main process: patch blocks
+  // (PatchBlock apply/revert) and code-reference resolution (ReferenceBlock).
+  // No daemon patch/reference surface; the callers check `.ok` and surface
+  // the error in the block UI / a toast on the triggering interaction.
+  ['patch:apply', { ok: false, error: 'Applying patches is not available in this build' }],
+  ['patch:revert', { ok: false, error: 'Reverting patches is not available in this build' }],
+  [
+    'reference:resolve',
+    { ok: false, error: 'Code-reference resolution is not bridged to the daemon' },
+  ],
+  // FilesPanel's remote-file existence probe (only reached for
+  // environmentConfig.type === 'remote' workspaces). The legacy SSH
+  // connection pool is Electron-main-only; the caller folds `success:false`
+  // to "file not present remotely".
+  [
+    'remote-fs:exists',
+    { success: false, error: 'Remote SSH file access is not available in this build' },
+  ],
   // Electron-main CDP plumbing: EmbeddedBrowser's webContents registration
-  // (caller `.catch`es and logs) and PanelLayout's response arm for the
-  // browser:list-tabs-request event — which never fires in this build (see
-  // UNEMITTED_LISTENER_ALLOWLIST), so the invoke is statically present but
-  // unreachable.
+  // (caller `.catch`es and logs) and the browser IPC saga's response arm for
+  // the browser:list-tabs-request event. The saga only subscribes in Electron
+  // (isElectron() gate) and the request never fires in this build, so the
+  // invoke is statically present but unreachable.
   ['browser:register-tab', undefined],
   ['browser:list-tabs-response', undefined],
   // Chat-input context enrichment (context-api getWorkspaceInfo). The caller
@@ -194,12 +212,6 @@ export const UNEMITTED_LISTENER_ALLOWLIST: ReadonlyMap<string, string> = new Map
   ['git:auto-commit-started', 'no daemon auto-commit events (PROTOCOL §6.5 git:* reserved)'],
   ['git:auto-commit-succeeded', 'no daemon auto-commit events (PROTOCOL §6.5 git:* reserved)'],
   ['git:auto-commit-hook-failure', 'no daemon auto-commit events (PROTOCOL §6.5 git:* reserved)'],
-  // PanelLayout ↔ Electron-main CDP agent plumbing (focus a browser tab / list
-  // open tabs). The CDP agent lives in the unported Electron main process;
-  // nothing in the daemon build issues these requests. The paired
-  // browser:list-tabs-response invoke is an allowlisted absent surface above.
-  ['browser:focus-tab', 'Electron-main CDP agent request — no emitter in the daemon build'],
-  ['browser:list-tabs-request', 'Electron-main CDP agent request — no emitter in the daemon build'],
   // Tiptap editor agent-suggestion marks (editor-listeners.ts). The legacy
   // agent note-suggestion flow was never ported — no producer exists on the
   // daemon; the editor simply never renders suggestion marks.

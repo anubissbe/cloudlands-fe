@@ -28,6 +28,7 @@ const mocks = vi.hoisted(() => {
     fetchGitHubRepoConfig:
       vi.fn<(owner: string, repo: string, ref?: string) => Promise<string | null>>(),
     lastUsedSelect: vi.fn(),
+    create: vi.fn<(params: Record<string, unknown>) => Promise<unknown>>(),
   };
 });
 
@@ -38,7 +39,10 @@ vi.mock('$store/renderer/store', async () => {
     '$store/renderer/utils/test-helpers/store-mock'
   );
   return createAppStoreMockModule({
-    state: () => ({ hardwareConsole: { pttRecording: false, voiceTranscribing: false } }),
+    state: () => ({
+      hardwareConsole: { pttRecording: false, voiceTranscribing: false },
+      workspaceCreateProgress: { byProgressId: {} },
+    }),
     dispatch: mocks.dispatch,
   });
 });
@@ -72,8 +76,9 @@ vi.mock('$store/renderer/slices/specialists/specialists-selectors', () => ({
   selectUserOverrides: { select: vi.fn(() => ({ modelOverrides: {} })) },
 }));
 
-vi.mock('$store/renderer/slices/setup-scripts/setup-scripts-selectors', () => ({
-  selectLastUsedScriptForRepo: { select: mocks.lastUsedSelect },
+vi.mock('$features/setup-scripts/last-used', () => ({
+  getLastUsedSetupScript: mocks.lastUsedSelect,
+  recordLastUsedSetupScript: vi.fn(),
 }));
 
 // Keep the real priority logic and the shared probe helper; only the
@@ -111,7 +116,7 @@ vi.mock('$shared/generated/ipc-client', () => ({
 }));
 
 vi.mock('$store/renderer/slices/workspace/utils/workspace.client', () => ({
-  workspaceClient: { create: vi.fn(), update: vi.fn() },
+  workspaceClient: { create: mocks.create, update: vi.fn() },
 }));
 
 vi.mock('$lib/components/workspace/initializer/new-workspace-draft', () => ({
@@ -272,7 +277,9 @@ describe('CompactWorkspaceInitializer repo-config setup script detection', () =>
     expect(mocks.fetchRepoConfig).toHaveBeenCalledWith('/repo/a');
   });
 
-  it('never clobbers a restored setup script from saved form state', async () => {
+  it('ignores legacy setup-script fields in saved form state (repo config wins)', async () => {
+    // The setup script is session-local now: legacy persisted script fields
+    // must not rehydrate, so the repo-config default applies as usual.
     mocks.fetchRepoConfig.mockResolvedValue('echo repo-config');
     mocks.savedFormState = {
       repoPath: '/repo/a',
@@ -284,12 +291,11 @@ describe('CompactWorkspaceInitializer repo-config setup script detection', () =>
 
     const result = renderInitializer();
     await waitFor(() => expect(mocks.fetchRepoConfig).toHaveBeenCalledWith('/repo/a'));
-    // Probe settles (spinner gone) without overwriting the restored name.
     await waitFor(() => {
       expect(result.queryByText(SPINNER_LABEL)).toBeNull();
     });
-    expect(result.getByText('Restored')).toBeTruthy();
-    expect(result.queryByText(REPO_CONFIG_SCRIPT_NAME)).toBeNull();
+    expect(result.getByText(REPO_CONFIG_SCRIPT_NAME)).toBeTruthy();
+    expect(result.queryByText('Restored')).toBeNull();
   });
 
   it('degrades silently to the last-used script when the repo has no config', async () => {
@@ -362,5 +368,162 @@ describe('CompactWorkspaceInitializer repo-config setup script detection', () =>
     await waitFor(() => {
       expect(result.getByText(REPO_CONFIG_SCRIPT_NAME)).toBeTruthy();
     });
+  });
+});
+
+// The modal must keep a constant height across loading transitions: the
+// setup-script pill and its trailing "script" suffix render in both loading
+// and loaded states (spinner inside the pill), and the Create button's
+// shortcut hint is always mounted with only its visibility toggled by form
+// validity.
+describe('CompactWorkspaceInitializer modal height stability', () => {
+  const PILL_CLASSES = ['rounded-md', 'border', 'border-border', 'bg-background', 'px-2', 'py-0.5'];
+  const SUFFIX_LABEL = 'script';
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    sessionStorage.clear();
+    mocks.savedFormState = null;
+    mocks.lastUsedSelect.mockReturnValue(undefined);
+    mocks.fetchRepoConfig.mockResolvedValue(null);
+    mocks.fetchGitHubRepoConfig.mockResolvedValue(null);
+  });
+
+  afterEach(() => {
+    cleanup();
+    sessionStorage.clear();
+  });
+
+  it('keeps the setup-script pill and suffix rendered with the spinner inside the pill while the probe is in flight', async () => {
+    const probe = deferred<string | null>();
+    mocks.fetchRepoConfig.mockReturnValue(probe.promise);
+    mocks.savedFormState = { repoPath: '/repo/a', repoType: 'local', isValidPath: true };
+
+    const result = renderInitializer();
+    await waitFor(() => {
+      expect(result.getByText(SPINNER_LABEL)).toBeTruthy();
+    });
+    // The sr-only loading label (next to the spinner) sits inside the same
+    // bordered pill that later shows the script name, and the trailing
+    // "script" suffix stays mounted so the row structure never changes.
+    const loadingPill = result.getByText(SPINNER_LABEL).parentElement;
+    expect(loadingPill).toBeTruthy();
+    for (const cls of PILL_CLASSES) {
+      expect(loadingPill!.classList.contains(cls)).toBe(true);
+    }
+    const loadingSuffix = result.getByText(SUFFIX_LABEL);
+
+    probe.resolve('echo repo-config');
+    await waitFor(() => {
+      expect(result.getByText(REPO_CONFIG_SCRIPT_NAME)).toBeTruthy();
+    });
+    const loadedPill = result.getByText(REPO_CONFIG_SCRIPT_NAME);
+    for (const cls of PILL_CLASSES) {
+      expect(loadedPill.classList.contains(cls)).toBe(true);
+    }
+    // Same suffix node across the transition — it is never unmounted.
+    expect(result.getByText(SUFFIX_LABEL)).toBe(loadingSuffix);
+  });
+
+  it('never remounts the shortcut hint span on a validity flip — visibility only', async () => {
+    // Single render: start invalid (no repo selected) with the hint mounted
+    // but invisible, reserving its space so the button never resizes.
+    const result = renderInitializer();
+    const hint = result.getByText(/↵/);
+    expect(hint.classList.contains('invisible')).toBe(true);
+    expect(hint.getAttribute('aria-hidden')).toBe('true');
+
+    // Flip the form to valid by driving the picker callbacks.
+    await waitFor(() => expect(pickerCallbacks()).toBeTruthy());
+    pickerCallbacks().onRepoChange({
+      detail: { path: '/repo/a', type: 'local', isValidPath: true },
+    });
+    pickerCallbacks().onBranchChange({ detail: { branch: 'main' } });
+
+    await waitFor(() => {
+      expect(result.getByText(/↵/).classList.contains('invisible')).toBe(false);
+    });
+    // Element identity preserved: the span was toggled, not remounted.
+    const visibleHint = result.getByText(/↵/);
+    expect(visibleHint).toBe(hint);
+    expect(visibleHint.getAttribute('aria-hidden')).toBeNull();
+  });
+});
+
+describe('CompactWorkspaceInitializer setupScript on workspace.create (monorepo#1862)', () => {
+  const PREFILL_KEY = 'workspace-prefill';
+
+  /** Seed the auto-create prefill so the reactive $effect submits the form. */
+  function seedAutoCreatePrefill() {
+    sessionStorage.setItem(
+      PREFILL_KEY,
+      JSON.stringify({
+        repoPath: '/repo/a',
+        branch: 'main',
+        prompt: 'Build the thing',
+        autoCreate: true,
+      }),
+    );
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    sessionStorage.clear();
+    mocks.savedFormState = null;
+    mocks.lastUsedSelect.mockReturnValue(undefined);
+    mocks.fetchRepoConfig.mockResolvedValue(null);
+    mocks.fetchGitHubRepoConfig.mockResolvedValue(null);
+    mocks.create.mockResolvedValue({ ok: false, error: 'stop after payload capture' });
+  });
+
+  afterEach(() => {
+    cleanup();
+    sessionStorage.clear();
+  });
+
+  it('sends the auto-restored last-used default (the shown script is what runs)', async () => {
+    // Last-used script restored synchronously on repo selection — it is
+    // shown in the form, so it is sent.
+    mocks.lastUsedSelect.mockReturnValue({ name: 'My saved script', content: 'echo saved' });
+
+    seedAutoCreatePrefill();
+    const { component } = renderInitializer();
+    await component.applyPrefill();
+
+    await waitFor(() => expect(mocks.create).toHaveBeenCalledTimes(1));
+    const request = mocks.create.mock.calls[0][0] as Record<string, unknown>;
+    expect(request.setupScript).toBe('echo saved');
+  });
+
+  it('omits setupScript for the unedited repo-config script', async () => {
+    mocks.fetchRepoConfig.mockResolvedValue('echo repo-config');
+
+    seedAutoCreatePrefill();
+    const { component, getByText } = renderInitializer();
+    await component.applyPrefill();
+    await waitFor(() => expect(getByText(REPO_CONFIG_SCRIPT_NAME)).toBeTruthy());
+
+    await waitFor(() => expect(mocks.create).toHaveBeenCalledTimes(1));
+    const request = mocks.create.mock.calls[0][0] as Record<string, unknown>;
+    expect(request.setupScript).toBeUndefined();
+  });
+
+  it('awaits an in-flight probe at submit instead of racing it', async () => {
+    const probe = deferred<string | null>();
+    mocks.fetchRepoConfig.mockReturnValue(probe.promise);
+
+    seedAutoCreatePrefill();
+    const { component } = renderInitializer();
+    await component.applyPrefill();
+    await waitFor(() => expect(mocks.fetchRepoConfig).toHaveBeenCalledWith('/repo/a'));
+
+    // Create is gated on the probe settling.
+    await new Promise((r) => setTimeout(r, 50));
+    expect(mocks.create).not.toHaveBeenCalled();
+
+    probe.resolve('echo repo-config');
+    await waitFor(() => expect(mocks.create).toHaveBeenCalledTimes(1));
+    const request = mocks.create.mock.calls[0][0] as Record<string, unknown>;
+    expect(request.setupScript).toBeUndefined();
   });
 });

@@ -1,31 +1,29 @@
 <script lang="ts">
-import { selectAgentSession } from '$store/renderer/slices/agent-session/agent-session-selectors';
-  import type { Note,
-  AgentMessage,
-  AgentSession } from '$shared/types';
-  import type { WorkspaceId,
-  AgentId } from '$shared/types/branded-ids';
+  import { selectAgentSession } from '$store/renderer/slices/agent-session/agent-session-selectors';
+  import type { Note, AgentMessage, AgentSession } from '$shared/types';
+  import type { WorkspaceId, AgentId } from '$shared/types/branded-ids';
   import { createLogger } from '$lib/utils/client-logger';
-  import AuggieAvatar from '$lib/components/ui/auggie-avatar/AuggieAvatar.svelte';
+  import AgentAvatar from '$features/agent/components/agent-avatar/AgentAvatar.svelte';
   import TaskStatusIndicator from './TaskStatusIndicator.svelte';
+  import TaskRelationLink from './TaskRelationLink.svelte';
   import Fa from 'svelte-fa';
   import { faPlay } from '@fortawesome/free-solid-svg-icons';
   import {
-  getFileChangesFromMessages,
-  type ChatFileChange,
-} from '$lib/utils/get-file-changes-from-messages';
+    getFileChangesFromMessages,
+    type ChatFileChange,
+  } from '$lib/utils/get-file-changes-from-messages';
   import { SPEC_NOTE_ID } from '$shared/constants/notes';
 
-  import { selectActiveWorkspace } from '$store/renderer/slices/workspace/workspace-selectors';
+  import { selectWorkspaceById } from '$store/renderer/slices/workspace/workspace-selectors';
   import { selectAllNotes } from '$store/renderer/slices/workspace-notes/workspace-notes-selectors';
   import { selectAllWorkspaceAgents } from '$store/renderer/slices/workspace-agents/workspace-agents-selectors';
   import { openAgentTabRequested } from '$store/renderer/slices/app-layout/app-layout-slice';
   import { openWorkspaceChatChanges } from '$store/renderer/slices/workspace-navigation/workspace-navigation-slice';
   import {
-  ensureAgentSessionLoaded,
-  restoreAgentSessionRequested,
-  runAgentForNoteRequested,
-} from '$store/renderer/slices/workspace-agents/workspace-agents-slice';
+    ensureAgentSessionLoaded,
+    restoreAgentSessionRequested,
+    runAgentForNoteRequested,
+  } from '$store/renderer/slices/workspace-agents/workspace-agents-slice';
   import { toStore } from 'svelte/store';
   import { store as appStore } from '$store/renderer/store';
   import { m } from '$shared/paraglide/messages.js';
@@ -42,6 +40,7 @@ import { selectAgentSession } from '$store/renderer/slices/agent-session/agent-s
   } = $props();
 
   const workspaceId$ = toStore(() => workspaceId as string);
+  const workspace$ = selectWorkspaceById(workspaceId$);
 
   // Reactive list of workspace agents. selectAllWorkspaceAgents already
   // scopes to the current workspace, so no manual filtering is needed.
@@ -52,7 +51,6 @@ import { selectAgentSession } from '$store/renderer/slices/agent-session/agent-s
   const taskMetadata = $derived(note.metadata?.task);
   const assignedAgentIds = $derived(taskMetadata?.assignedAgentIds || []);
   const isSpec = $derived(note.id === SPEC_NOTE_ID);
-  const activeWorkspace = selectActiveWorkspace();
 
   // Get child tasks (notes that have this note as parent)
   const allNotes$ = selectAllNotes(workspaceId$);
@@ -62,7 +60,25 @@ import { selectAgentSession } from '$store/renderer/slices/agent-session/agent-s
     return allNotes.filter((n) => n.parentId === note.id && n.metadata?.task);
   });
 
+  // Task relations (PROTOCOL §5.2/§5.4). `unmetDependsOn` is the
+  // daemon-computed projection carried on note-shaped payloads; unmet
+  // highlighting is suppressed once the task itself is complete, matching
+  // the task-row chip semantics.
+  const dependsOn = $derived(taskMetadata?.dependsOn ?? []);
+  const conflictsWith = $derived(taskMetadata?.conflictsWith ?? []);
+  const unmetDependsOn = $derived(new Set<string>(taskMetadata?.unmetDependsOn ?? []));
+  const isComplete = $derived(taskMetadata?.status === 'complete');
 
+  // Reverse dependency edges computed client-side from the notes slice:
+  // task notes whose dependsOn includes this note. Sorted by id so the
+  // rendered order is stable regardless of notes-slice iteration order.
+  const dependedOnBy = $derived.by(() => {
+    const allNotes = $allNotes$;
+    return allNotes
+      .filter((n) => n.id !== note.id && n.metadata?.task?.dependsOn?.includes(note.id))
+      .map((n) => n.id)
+      .sort();
+  });
   // Sort assigned agents by creation date (oldest first)
   const assignedAgents = $derived.by(() => {
     // Keep this derived value reactive to agent session loads while resolving
@@ -92,12 +108,13 @@ import { selectAgentSession } from '$store/renderer/slices/agent-session/agent-s
 
   // Effect to load missing agents from disk
   $effect(() => {
-    const workspace = $activeWorkspace;
+    const workspace = $workspace$;
     if (!workspace) return;
 
     const missingAgentIds = assignedAgentIds.filter(
       (agentId) =>
-        !$workspaceAgents$.some((agent) => agent.id === agentId) && !loadAttemptedAgents.has(agentId),
+        !$workspaceAgents$.some((agent) => agent.id === agentId) &&
+        !loadAttemptedAgents.has(agentId),
     );
 
     if (missingAgentIds.length > 0) {
@@ -126,13 +143,17 @@ import { selectAgentSession } from '$store/renderer/slices/agent-session/agent-s
   // Handle running an agent for this note (creates agent and sends initial message)
   function handleRunAgent() {
     appStore.dispatch(
-      runAgentForNoteRequested(workspaceId, note.id, note.title || m.workspace_noteCodeChanges_task_label()),
+      runAgentForNoteRequested(
+        workspaceId,
+        note.id,
+        note.title || m.workspace_noteCodeChanges_task_label(),
+      ),
     );
   }
 
   async function getAggregateChanges(): Promise<ChatFileChange[]> {
     const allMessages: AgentMessage[] = [];
-    const workspace = selectActiveWorkspace.select(appStore.state);
+    const workspace = selectWorkspaceById.select(appStore.state, workspaceId);
 
     for (const agentId of assignedAgents) {
       try {
@@ -170,7 +191,7 @@ import { selectAgentSession } from '$store/renderer/slices/agent-session/agent-s
           m.workspace_noteMetadataBar_changesFromTask_label({
             title: note.title || m.workspace_noteCodeChanges_task_label(),
           }),
-          { isAggregate: true },
+          { isAggregate: true, scopeId: note.id },
         ),
       );
     } catch (error) {
@@ -182,7 +203,9 @@ import { selectAgentSession } from '$store/renderer/slices/agent-session/agent-s
 {#if !isSpec && isTask && taskMetadata}
   <!-- Task note metadata (template is in header) -->
   <div class="w-full flex justify-center">
-    <div class="w-full max-w-[var(--content-max-width,60rem)] px-[var(--content-gutter-left)] pt-12 mb-6 flex flex-col">
+    <div
+      class="w-full max-w-[var(--content-max-width,60rem)] px-[var(--content-gutter-left)] pt-12 mb-6 flex flex-col"
+    >
       <!-- Status row -->
       <div class="grid grid-cols-[120px_1fr] items-start min-h-7 py-0.5 min-w-0">
         <div class="text-subtle pt-0.5">{m.workspace_noteMetadataBar_status_label()}</div>
@@ -215,7 +238,7 @@ import { selectAgentSession } from '$store/renderer/slices/agent-session/agent-s
                   onclick={(e) => handleAgentClick(e, agentId)}
                   class="inline-flex items-center gap-1 min-w-0 py-0.5 pl-0.5 pr-2 rounded bg-muted/30 px-2 cursor-pointer"
                 >
-                  <AuggieAvatar size={22} {agentId} />
+                  <AgentAvatar size={22} {agentId} />
                   <span class="truncate font-medium text-subtle -mt-0.5"
                     >{getAgentName(agentId)}</span
                   >
@@ -238,6 +261,42 @@ import { selectAgentSession } from '$store/renderer/slices/agent-session/agent-s
           {/if}
         </div>
       </div>
+
+      <!-- Relations rows (hidden when the task has no relations) -->
+      {#if dependsOn.length > 0}
+        <div class="grid grid-cols-[120px_1fr] items-start min-h-7 py-0.5 min-w-0">
+          <div class="text-subtle pt-0.5">{m.workspace_noteMetadataBar_dependsOn_label()}</div>
+          <div class="flex flex-wrap items-center gap-1.5 min-h-6 min-w-0">
+            {#each dependsOn as depId (depId)}
+              <TaskRelationLink
+                {workspaceId}
+                noteId={depId}
+                unmet={!isComplete && unmetDependsOn.has(depId)}
+              />
+            {/each}
+          </div>
+        </div>
+      {/if}
+      {#if dependedOnBy.length > 0}
+        <div class="grid grid-cols-[120px_1fr] items-start min-h-7 py-0.5 min-w-0">
+          <div class="text-subtle pt-0.5">{m.workspace_noteMetadataBar_dependedOnBy_label()}</div>
+          <div class="flex flex-wrap items-center gap-1.5 min-h-6 min-w-0">
+            {#each dependedOnBy as dependentId (dependentId)}
+              <TaskRelationLink {workspaceId} noteId={dependentId} />
+            {/each}
+          </div>
+        </div>
+      {/if}
+      {#if conflictsWith.length > 0}
+        <div class="grid grid-cols-[120px_1fr] items-start min-h-7 py-0.5 min-w-0">
+          <div class="text-subtle pt-0.5">{m.workspace_noteMetadataBar_conflictsWith_label()}</div>
+          <div class="flex flex-wrap items-center gap-1.5 min-h-6 min-w-0">
+            {#each conflictsWith as conflictId (conflictId)}
+              <TaskRelationLink {workspaceId} noteId={conflictId} variant="conflict" />
+            {/each}
+          </div>
+        </div>
+      {/if}
     </div>
   </div>
 {/if}

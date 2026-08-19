@@ -1,19 +1,12 @@
 /**
- * Mock store bootstrap.
- *
- * On store init the layout calls `seedMockStore()`, which runs every registered
- * domain seeder. Each seeder reads fixtures from the `AppClient` seam and
- * dispatches existing slice actions to populate the in-memory store — replacing
- * the work sagas used to do against the real backend.
- *
- * The registry starts empty. Per-domain seeders are added in later waves by
- * calling `registerMockSeeder()` from their own modules, so this file never has
- * to grow into one giant bootstrap.
+ * Generic test fixture for registering and executing mock store seed functions
+ * in insertion order. Production renderer hydration is saga-owned; this module
+ * remains for focused tests that need an explicit seeding harness.
  */
-import type { Store } from "$lib/store-shim/svelte-store";
+import type { Store } from '@augmentcode/themis/svelte-store';
 
-import type { AppClient } from "$lib/client";
-import { appClient } from "$lib/client";
+import type { AppClient } from '$lib/client';
+import { appClient } from '$lib/client';
 
 /** Everything a seeder needs to populate one domain's state. */
 export interface MockSeederContext {
@@ -21,6 +14,10 @@ export interface MockSeederContext {
   store: Store<any, any>;
   /** The mock-backed client fixtures are pulled from. */
   client: AppClient;
+  /** Explicit workspace ID for seeders that need the current workspace selection. */
+  workspaceId: string | null;
+  /** Optional live workspace-ID provider for seeders that await mock RPCs. */
+  getWorkspaceId?: () => string | null;
 }
 
 /** Seeds one domain's slice state from the `AppClient`. May be async. */
@@ -64,8 +61,14 @@ export function clearMockSeeders(): void {
 export async function seedMockStore(
   store: Store<any, any>,
   client: AppClient = appClient,
+  workspaceId: string | null | (() => string | null) = null,
 ): Promise<void> {
+  const getWorkspaceId = typeof workspaceId === 'function' ? workspaceId : undefined;
+  const initialWorkspaceId = typeof workspaceId === 'function' ? workspaceId() : workspaceId;
   for (const { seed } of [...seeders]) {
-    await seed({ store, client });
+    const context: MockSeederContext = getWorkspaceId
+      ? { store, client, workspaceId: initialWorkspaceId, getWorkspaceId }
+      : { store, client, workspaceId: initialWorkspaceId };
+    await seed(context);
   }
 }

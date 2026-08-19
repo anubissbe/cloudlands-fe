@@ -5,20 +5,20 @@
   import { Tooltip } from '$lib/components/ui/tooltip';
   import Fa from 'svelte-fa';
   import {
-  faXmark,
-  faTerminal,
-  faCode,
-  faCodeBranch,
-  faExclamationTriangle,
-  faChevronDown,
-  faArrowUpRightFromSquare,
-  faFolder,
-} from '@fortawesome/free-solid-svg-icons';
+    faXmark,
+    faTerminal,
+    faCode,
+    faCodeBranch,
+    faExclamationTriangle,
+    faChevronDown,
+    faArrowUpRightFromSquare,
+    faFolder,
+  } from '@fortawesome/free-solid-svg-icons';
   import { onMount } from 'svelte';
   import {
-  fetchEditors,
-  type InstalledEditor,
-} from '$store/renderer/slices/external-editors/external-editors-slice';
+    fetchEditors,
+    type InstalledEditor,
+  } from '$store/renderer/slices/external-editors/external-editors-slice';
   import { selectInstalledEditorsFiltered } from '$store/renderer/slices/external-editors/external-editors-selectors';
 
   import { invoke } from '$lib/electron-bridge';
@@ -157,7 +157,7 @@
       toast.error(
         err instanceof Error
           ? err.message
-          : m.modals_pullConflict_openFailed_error({ appName: editor.appName })
+          : m.modals_pullConflict_openFailed_error({ appName: editor.appName }),
       );
     }
   }
@@ -207,17 +207,24 @@
         <!-- Header -->
         <div class="px-6 py-4 border-b border-border flex items-center justify-between">
           <div class="flex items-center gap-3">
-            <div class="text-destructive-foreground">
+            <div class="text-error-foreground">
               <Fa icon={faExclamationTriangle} size="lg" />
             </div>
             <div>
               <h2 class="text-lg font-semibold">{m.modals_pullConflict_title()}</h2>
               {#if branchName}
-                <p class="text-sm text-subtle mt-0.5">{m.modals_pullConflict_branch_label({ branchName })}</p>
+                <p class="text-sm text-subtle mt-0.5">
+                  {m.modals_pullConflict_branch_label({ branchName })}
+                </p>
               {/if}
             </div>
           </div>
-          <Button variant="ghost" size="icon" onclick={close}>
+          <Button
+            variant="ghost"
+            size="icon"
+            onclick={close}
+            aria-label={m.modals_pullConflict_close_ariaLabel()}
+          >
             <Fa icon={faXmark} />
           </Button>
         </div>
@@ -229,7 +236,7 @@
           </p>
           {#if error}
             <div
-              class="bg-destructive/10 py-2.5 px-3.5 text-sm text-destructive-foreground whitespace-pre-wrap break-words max-h-32 overflow-auto"
+              class="bg-destructive/10 py-2.5 px-3.5 text-sm text-error-foreground whitespace-pre-wrap break-words max-h-32 overflow-auto"
             >
               {error}
             </div>
@@ -243,8 +250,8 @@
             <!-- Open in dropdown (combined IDEs and terminals) -->
             {#if $installedEditors$.length > 0}
               <DropdownMenu bind:open={dropdownOpen} align="start" portal={true}>
-                {#snippet trigger({ toggle }: { toggle: () => void })}
-                  <Button variant="outline" onclick={toggle} class="w-full justify-between gap-2">
+                {#snippet trigger({ props })}
+                  <Button {...props} variant="outline" class="w-full justify-between gap-2">
                     <span class="flex items-center gap-2">
                       <Fa icon={faArrowUpRightFromSquare} size="sm" />
                       <span>{m.modals_pullConflict_openIn_label()}</span>
@@ -289,10 +296,10 @@
             {/if}
           </div>
           <div class="grid grid-cols-2 gap-2 items-center">
-            <Tooltip
-              content={m.modals_pullConflict_createWorkspace_tooltip()}
-            >
-              <span class="text-xs inline-block">{m.modals_pullConflict_letIntentHandle_label()}</span>
+            <Tooltip content={m.modals_pullConflict_createWorkspace_tooltip()}>
+              <span class="text-xs inline-block"
+                >{m.modals_pullConflict_letIntentHandle_label()}</span
+              >
             </Tooltip>
             <!-- Create workspace action -->
             <Button

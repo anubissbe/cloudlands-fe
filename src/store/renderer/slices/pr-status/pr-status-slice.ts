@@ -6,8 +6,8 @@
  * tracks refresh metadata (loading, rate-limiting, errors).
  */
 
-import { createAction } from "$lib/store-shim/utils/store/create-action";
-import { createReducer } from "$lib/store-shim/utils/store/create-reducer";
+import { createAction } from "@augmentcode/themis/utils/store/create-action";
+import { createReducer } from "@augmentcode/themis/utils/store/create-reducer";
 import { createWorkspaceScopedHelpers } from "../../utils/workspace-scoped";
 import type { PRStatusWorkspaceState, PRStatusState } from "./pr-status-types";
 
@@ -17,7 +17,7 @@ const emptyWorkspaceState: PRStatusWorkspaceState = {
   lastError: null,
 };
 
-const { getWorkspaceState, setWorkspaceState, clearWorkspaceState } =
+const { getWorkspaceState, setWorkspaceState } =
   createWorkspaceScopedHelpers(emptyWorkspaceState);
 
 export { getWorkspaceState as getPRStatusWorkspaceState };
@@ -44,33 +44,18 @@ export const prStatusRefreshCompleted = createAction(
   (wsId: string, success: boolean, error?: string) => ({ wsId, success, error, timestamp: Date.now() })
 );
 
-/** Clean up all PR status tracking for a workspace */
-export const cleanupPRStatusWorkspace = createAction<[wsId: string]>(
-  "prStatus/cleanupWorkspace"
-);
-
-/** Start PR polling for a workspace (saga-only trigger) */
-export const startPRPolling = createAction<[wsId: string]>(
-  "prStatus/startPolling"
-);
-
-/** Stop PR polling for a workspace (saga-only trigger) */
-export const stopPRPolling = createAction<[wsId: string]>(
-  "prStatus/stopPolling"
-);
-
 // ── Reducer ──
 
-export const prStatusReducer = createReducer<PRStatusState>(initialState)
-  .with(prStatusRefreshStarted, (state, { payload: [wsId] }) => {
+export const prStatusReducer = createReducer<PRStatusState>(initialState);
+prStatusReducer.with(prStatusRefreshStarted, (state, { payload: [wsId] }) => {
     const ws = getWorkspaceState(state, wsId);
     return setWorkspaceState(state, wsId, {
       ...ws,
       isRefreshing: true,
       lastError: null,
     });
-  })
-  .with(prStatusRefreshCompleted, (state, action) => {
+  });
+prStatusReducer.with(prStatusRefreshCompleted, (state, action) => {
     const { wsId, success, error } = action.payload;
     const ws = getWorkspaceState(state, wsId);
     return setWorkspaceState(state, wsId, {
@@ -79,8 +64,5 @@ export const prStatusReducer = createReducer<PRStatusState>(initialState)
       lastRefreshTime: success ? action.payload.timestamp : ws.lastRefreshTime,
       lastError: error ?? null,
     });
-  })
-  .with(cleanupPRStatusWorkspace, (state, { payload: [wsId] }) =>
-    clearWorkspaceState(state, wsId)
-  );
+  });
 

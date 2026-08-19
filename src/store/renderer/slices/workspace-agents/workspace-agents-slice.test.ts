@@ -18,6 +18,8 @@ import {
   selectIsInitialSpecWriteInProgress,
   selectIsLoadingAgents,
   selectRecentlyCreatedAgents,
+  resolveEmptyLayoutAgent,
+  selectEmptyLayoutAgent,
   selectWorkspaceAgentIsSoftDeleted,
   selectWorkspaceAgentIsStreaming,
   selectWorkspaceAgentSession,
@@ -217,10 +219,10 @@ describe('workspaceAgentsReducer', () => {
     state = workspaceAgentsReducer(state, setWaitingForFirstMessage(WS_1, 'agent-1', true));
     state = workspaceAgentsReducer(state, setWaitingForFirstMessage(WS_1, 'agent-2', true));
 
-    // Disk only has agent-2, but agent-1 was added via IPC and should be preserved
+    // Disk only has agent-2; daemon IDs are authoritative, optimistic agent-1 appended
     const nextState = workspaceAgentsReducer(state, setAgents(WS_1, [mockAgent('agent-2')]));
 
-    expect(nextState.byWorkspaceId[WS_1].agentIds).toEqual(['agent-1', 'agent-2']);
+    expect(nextState.byWorkspaceId[WS_1].agentIds).toEqual(['agent-2', 'agent-1']);
     expect(nextState.byWorkspaceId[WS_1].recentlyCreatedAgents).toEqual(['agent-1', 'agent-2']);
     expect(nextState.byWorkspaceId[WS_1].isWaitingForFirstMessage).toEqual({
       'agent-1': true,
@@ -249,18 +251,18 @@ describe('workspaceAgentsReducer', () => {
     expect(state.byWorkspaceId[WS_1].foregroundAgentIds).toEqual(['agent-1', 'agent-3']);
   });
 
-  it("preserves IPC-added agents when setAgents loads disk agents that don't include them", () => {
+  it('daemon snapshot IDs are authoritative; non-optimistic IPC agents are removed', () => {
     // 1. Coordinator created and added to state
     let state = workspaceAgentsReducer(initialState, addAgent(WS_1, mockAgent('coordinator')));
-    // 2. Subagent arrives via IPC (upsertSession)
+    // 2. Subagent arrives via IPC (upsertSession) but is NOT marked optimistic
     state = workspaceAgentsReducer(state, upsertSession(mockAgent('subagent', WS_1)));
     expect(state.byWorkspaceId[WS_1].agentIds).toEqual(['coordinator', 'subagent']);
 
     // 3. loadAgentsFromDiskSaga finishes — disk only has coordinator
     state = workspaceAgentsReducer(state, setAgents(WS_1, [mockAgent('coordinator')]));
 
-    // subagent must NOT be wiped
-    expect(state.byWorkspaceId[WS_1].agentIds).toEqual(['coordinator', 'subagent']);
+    // Daemon snapshot is authoritative; non-optimistic subagent is removed
+    expect(state.byWorkspaceId[WS_1].agentIds).toEqual(['coordinator']);
   });
 
   it('adds new disk-loaded agents not already in agentIds', () => {
@@ -274,7 +276,6 @@ describe('workspaceAgentsReducer', () => {
 
     expect(state.byWorkspaceId[WS_1].agentIds).toEqual(['agent-1', 'agent-2']);
   });
-
 });
 
 describe('workspace-agents actions', () => {
@@ -312,6 +313,110 @@ describe('workspace-agents selectors', () => {
     expect(selectIsLoadingAgents.select(state, WS_1)).toBe(false);
     expect(selectInitialAgentId.select(state, WS_1)).toBeNull();
     expect(selectRecentlyCreatedAgents.select(state, WS_1)).toEqual([]);
+    expect(selectEmptyLayoutAgent.select(state, WS_1)).toBeNull();
+  });
+
+  it('resolves the primary agent with the newest valid user-message timestamp', () => {
+    const older = {
+      ...mockAgent('agent-older'),
+      messages: [{ id: 'message-1', role: 'user', timestamp: '2026-03-19T01:00:00.000Z' }],
+    } as AgentSession;
+    const newer = {
+      ...mockAgent('agent-newer'),
+      messages: [{ id: 'message-2', role: 'user', timestamp: '2026-03-19T02:00:00.000Z' }],
+    } as AgentSession;
+    const workspaceAgents = workspaceAgentsReducer(initialState, setAgents(WS_1, [older, newer]));
+
+    expect(selectEmptyLayoutAgent.select(mockState(workspaceAgents, [older, newer]), WS_1)).toBe(
+      newer,
+    );
+  });
+
+  it('orders transcript-free restored AgentLite sessions by durable activity timestamp', () => {
+    const older = {
+      ...mockAgent('agent-older'),
+      lastUserMessage: 'Older message',
+      lastActivity: '2026-03-19T01:00:00.000Z',
+    } as AgentSession;
+    const newer = {
+      ...mockAgent('agent-newer'),
+      lastUserMessage: 'Newer message',
+      lastActivity: '2026-03-19T02:00:00.000Z',
+    } as AgentSession;
+
+    expect(resolveEmptyLayoutAgent([newer, older], WS_1)).toBe(newer);
+  });
+
+  it('excludes background and delegated agents from recent-message selection', () => {
+    const primary = {
+      ...mockAgent('agent-primary'),
+      messages: [{ id: 'primary', role: 'user', timestamp: '2026-03-19T01:00:00.000Z' }],
+    } as AgentSession;
+    const background = {
+      ...mockBackgroundAgent('agent-background'),
+      messages: [{ id: 'background', role: 'user', timestamp: '2026-03-19T04:00:00.000Z' }],
+    } as AgentSession;
+    const metadataBackground = {
+      ...mockMetadataBackgroundAgent('agent-metadata-background'),
+      messages: [
+        { id: 'metadata-background', role: 'user', timestamp: '2026-03-19T05:00:00.000Z' },
+      ],
+    } as AgentSession;
+    const delegated = {
+      ...mockAgent('agent-delegated'),
+      metadata: { createdByAgentId: 'agent-primary' } as AgentSession['metadata'],
+      messages: [{ id: 'delegated', role: 'user', timestamp: '2026-03-19T03:00:00.000Z' }],
+    } as AgentSession;
+    const child = {
+      ...mockAgent('agent-child'),
+      parentSessionId: 'agent-primary' as AgentSession['parentSessionId'],
+      messages: [{ id: 'child', role: 'user', timestamp: '2026-03-19T02:00:00.000Z' }],
+    } as AgentSession;
+
+    expect(
+      resolveEmptyLayoutAgent([background, metadataBackground, delegated, child, primary], WS_1),
+    ).toBe(primary);
+  });
+
+  it('breaks equal user-message timestamp ties by canonical creation order', () => {
+    const laterCreated = {
+      ...mockAgent('agent-later'),
+      createdAt: '2026-03-19T01:00:00.000Z',
+      messages: [{ id: 'later', role: 'user', timestamp: '2026-03-19T02:00:00.000Z' }],
+    } as AgentSession;
+    const earlierCreated = {
+      ...mockAgent('agent-earlier'),
+      createdAt: '2026-03-19T00:00:00.000Z',
+      messages: [{ id: 'earlier', role: 'user', timestamp: '2026-03-19T02:00:00.000Z' }],
+    } as AgentSession;
+
+    expect(resolveEmptyLayoutAgent([laterCreated, earlierCreated], WS_1)).toBe(earlierCreated);
+  });
+
+  it('returns null when no eligible agent has a valid ordering timestamp', () => {
+    const invalidRecent = {
+      ...mockAgent('agent-invalid'),
+      messages: [{ id: 'invalid', role: 'user', timestamp: undefined }],
+    } as unknown as AgentSession;
+
+    expect(resolveEmptyLayoutAgent([invalidRecent], WS_1)).toBeNull();
+  });
+
+  it.each([
+    ['top-level initial marker', { isInitialAgent: true }],
+    ['metadata initial marker', { metadata: { isInitialAgent: true } }],
+    ['alternate metadata initial marker', { agentMetadata: { isInitialAgent: true } }],
+    ['wrong workspace', { workspaceId: WS_2 }],
+    ['deleted status', { status: 'deleted' }],
+    ['pending deletion', { pendingDeleteAt: '2026-03-19T03:00:00.000Z' }],
+  ])('excludes an agent with %s', (_name, overrides) => {
+    const excluded = {
+      ...mockAgent('agent-excluded'),
+      messages: [{ id: 'excluded', role: 'user', timestamp: '2026-03-19T02:00:00.000Z' }],
+      ...overrides,
+    } as AgentSession;
+
+    expect(resolveEmptyLayoutAgent([excluded], WS_1)).toBeNull();
   });
 
   it('returns per-workspace agent values (sessions from agent-session slice)', () => {
@@ -404,6 +509,82 @@ describe('workspace-agents selectors', () => {
       foregroundAgent,
       flagOnlyAgent,
     ]);
+  });
+
+  describe('selectInitialAgentId metadata fallback', () => {
+    const initialFlaggedAgent = (id: string): AgentSession => ({
+      ...mockAgent(id),
+      metadata: { isInitialAgent: true } as AgentSession['metadata'],
+    });
+
+    it('falls back to the agent flagged metadata.isInitialAgent when the in-memory id is unset', () => {
+      const plainAgent = mockAgent('agent-1');
+      const flaggedAgent = initialFlaggedAgent('agent-2');
+      const workspaceAgents = workspaceAgentsReducer(
+        initialState,
+        setAgents(WS_1, [plainAgent, flaggedAgent]),
+      );
+      const state = mockState(workspaceAgents, [plainAgent, flaggedAgent]);
+
+      expect(selectInitialAgentId.select(state, WS_1)).toBe('agent-2');
+    });
+
+    it('prefers the explicitly set in-memory initialAgentId over the metadata flag', () => {
+      const plainAgent = mockAgent('agent-1');
+      const flaggedAgent = initialFlaggedAgent('agent-2');
+      let workspaceAgents = workspaceAgentsReducer(
+        initialState,
+        setAgents(WS_1, [plainAgent, flaggedAgent]),
+      );
+      workspaceAgents = workspaceAgentsReducer(workspaceAgents, setInitialAgentId(WS_1, 'agent-1'));
+      const state = mockState(workspaceAgents, [plainAgent, flaggedAgent]);
+
+      expect(selectInitialAgentId.select(state, WS_1)).toBe('agent-1');
+    });
+
+    it('stays null when no agent carries the metadata flag (older daemons)', () => {
+      const plainAgent = mockAgent('agent-1');
+      const otherAgent = mockAgent('agent-2');
+      const workspaceAgents = workspaceAgentsReducer(
+        initialState,
+        setAgents(WS_1, [plainAgent, otherAgent]),
+      );
+      const state = mockState(workspaceAgents, [plainAgent, otherAgent]);
+
+      expect(selectInitialAgentId.select(state, WS_1)).toBeNull();
+    });
+
+    it('ignores non-true metadata values and agents from other workspaces', () => {
+      const falseFlagged = {
+        ...mockAgent('agent-1'),
+        metadata: { isInitialAgent: false } as AgentSession['metadata'],
+      } satisfies AgentSession;
+      const otherWorkspaceFlagged = {
+        ...initialFlaggedAgent('agent-2'),
+        workspaceId: WS_2,
+      } satisfies AgentSession;
+      let workspaceAgents = workspaceAgentsReducer(initialState, setAgents(WS_1, [falseFlagged]));
+      workspaceAgents = workspaceAgentsReducer(
+        workspaceAgents,
+        setAgents(WS_2, [otherWorkspaceFlagged]),
+      );
+      const state = mockState(workspaceAgents, [falseFlagged, otherWorkspaceFlagged]);
+
+      expect(selectInitialAgentId.select(state, WS_1)).toBeNull();
+      expect(selectInitialAgentId.select(state, WS_2)).toBe('agent-2');
+    });
+
+    it('resolves the first flagged agent in agentIds order when multiple carry the flag', () => {
+      const firstFlagged = initialFlaggedAgent('agent-1');
+      const secondFlagged = initialFlaggedAgent('agent-2');
+      const workspaceAgents = workspaceAgentsReducer(
+        initialState,
+        setAgents(WS_1, [firstFlagged, secondFlagged]),
+      );
+      const state = mockState(workspaceAgents, [firstFlagged, secondFlagged]);
+
+      expect(selectInitialAgentId.select(state, WS_1)).toBe('agent-1');
+    });
   });
 
   // -----------------------------------------------------------------------

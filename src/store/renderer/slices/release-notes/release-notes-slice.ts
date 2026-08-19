@@ -4,8 +4,8 @@
  * Manages state for fetching and displaying release notes after an app update.
  */
 
-import { createAction } from "$lib/store-shim/utils/store/create-action";
-import { createReducer } from "$lib/store-shim/utils/store/create-reducer";
+import { createAction } from '@augmentcode/themis/utils/store/create-action';
+import { createReducer } from '@augmentcode/themis/utils/store/create-reducer';
 import type { ReleaseNotes, ReleaseNotesState } from "./release-notes-types";
 
 // ---------------------------------------------------------------------------
@@ -14,12 +14,6 @@ import type { ReleaseNotes, ReleaseNotesState } from "./release-notes-types";
 
 /** Trigger initialization: subscribe to the main-process "show" push */
 export const initializeReleaseNotes = createAction("releaseNotes/initialize");
-
-/** Set loading state */
-export const setLoading = createAction<[loading: boolean]>("releaseNotes/setLoading");
-
-/** Set error state */
-export const setError = createAction<[error: string | null]>("releaseNotes/setError");
 
 /** Mark as initialized */
 export const setInitialized = createAction("releaseNotes/setInitialized");
@@ -56,38 +50,30 @@ export const initialState: ReleaseNotesState = {
 // Reducer
 // ---------------------------------------------------------------------------
 
-export const releaseNotesReducer = createReducer<ReleaseNotesState>(initialState)
-  .with(setLoading, (state, { payload: [loading] }) => ({
-    ...state,
-    loading,
-  }))
-  .with(setError, (state, { payload: [error] }) => ({
-    ...state,
-    error,
-  }))
-  .with(setInitialized, (state) => ({
+export const releaseNotesReducer = createReducer<ReleaseNotesState>(initialState);
+releaseNotesReducer.with(setInitialized, (state) => ({
     ...state,
     initialized: true,
-  }))
-  .with(closeReleaseNotesModal, (state) => ({
+  }));
+releaseNotesReducer.with(closeReleaseNotesModal, (state) => ({
     ...state,
     showModal: false,
-  }))
-  .with(showReleaseNotes, (state) => ({
+  }));
+releaseNotesReducer.with(showReleaseNotes, (state) => ({
     ...state,
     releaseNotes: null,
     showModal: true,
     loading: true,
     error: null,
-  }))
-  .with(showReleaseNotesSuccess, (state, { payload: [notes] }) => ({
+  }));
+releaseNotesReducer.with(showReleaseNotesSuccess, (state, { payload: [notes] }) => ({
     ...state,
     releaseNotes: notes,
     showModal: true,
     loading: false,
     error: null,
-  }))
-  .with(showReleaseNotesUnavailable, (state) => ({
+  }));
+releaseNotesReducer.with(showReleaseNotesUnavailable, (state) => ({
     ...state,
     releaseNotes: null,
     showModal: true,

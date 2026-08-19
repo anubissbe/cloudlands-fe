@@ -5,7 +5,7 @@
  * Escape closes the picker, EXCEPT while the path input is focused — the
  * layer declines so the input's own handler cancels the edit instead.
  */
-import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/svelte';
 
 vi.mock('$lib/client/live/backend-transport', () => ({
@@ -13,13 +13,6 @@ vi.mock('$lib/client/live/backend-transport', () => ({
   onBackendNotification: vi.fn(() => () => {}),
   onBackendReconnected: vi.fn(() => () => {}),
 }));
-
-vi.mock('$lib/components/ui/Portal.svelte', async () => {
-  const MockPortal = (
-    await import('../../../../lib/components/modals/__tests__/mocks/MockPortal.svelte')
-  ).default;
-  return { default: MockPortal };
-});
 
 vi.mock('svelte-fa', async () => {
   const MockFa = (await import('../../../../lib/components/ui/__tests__/mocks/Fa.svelte')).default;
@@ -32,10 +25,12 @@ import {
   resetDirectoryPicker,
   type DirectoryPickerListing,
 } from '$store/renderer/slices/directory-picker/directory-picker-slice';
+import { directoryPickerSaga } from '$store/renderer/slices/directory-picker/sagas/directory-picker-saga';
 
 import DirectoryPickerModal from '../DirectoryPickerModal.svelte';
 
 const backendRequestMock = vi.mocked(backendRequest);
+let stopDirectoryPickerSaga: (() => void) | undefined;
 
 const homeListing = (): DirectoryPickerListing => ({
   path: '/Users/me',
@@ -76,6 +71,12 @@ describe('DirectoryPickerModal Escape handling (escape-layer stack)', () => {
       });
     }
     appStore.init();
+    stopDirectoryPickerSaga = appStore.runSaga(directoryPickerSaga);
+  });
+
+  afterAll(() => {
+    stopDirectoryPickerSaga?.();
+    stopDirectoryPickerSaga = undefined;
   });
 
   afterEach(() => {
@@ -123,10 +124,20 @@ describe('DirectoryPickerModal Escape handling (escape-layer stack)', () => {
     const searchInput = screen.getByRole('searchbox', {
       name: 'Filter folder contents',
     }) as HTMLInputElement;
-    await fireEvent.input(searchInput, { target: { value: 'code' } });
+    await fireEvent.input(searchInput, { target: { value: 'no-such-entry' } });
+    // The filter is live: the lone entry is hidden while the search matches nothing.
+    await waitFor(() => {
+      expect(screen.queryByRole('option', { name: /code/ })).toBeNull();
+    });
+
     await fireEvent.keyDown(searchInput, { key: 'Escape' });
 
     expect(searchInput.value).toBe('');
+    // The layer's synthetic input event must sync searchDraft, un-filtering the
+    // list — clearing input.value alone would leave the entries hidden.
+    await waitFor(() => {
+      expect(screen.getByRole('option', { name: /code/ })).toBeTruthy();
+    });
     expect(onClose).not.toHaveBeenCalled();
   });
 

@@ -13,6 +13,12 @@
  * (reviewer finding on cloudlands-fe#443): switching repos clears the
  * detected GitHub owner/repo immediately, and late responses for a previous
  * path never apply.
+ *
+ * Also covers the onboarding `workspace.create` wire request shape: the
+ * picked-repo payloads (githubUrl vs repositoryPath) and the live clone
+ * progress correlation — a minted `progressId` registered in the
+ * workspaceCreateProgress slice before the create goes out, echoed on the
+ * request (PROTOCOL §5.1), and cleared once the create settles.
  */
 import { cleanup, render, waitFor } from '@testing-library/svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -60,6 +66,10 @@ vi.mock('$store/renderer/store', async () => {
 vi.mock('$store/renderer/slices/onboarding/onboarding-selectors', () => ({
   selectOnboardingStep: () => mocks.readable(() => 'configuring'),
   selectOnboardingState: () => mocks.readable(() => ({ step: 'configuring' })),
+  selectOnboardingFullFlowRequested: Object.assign(
+    () => mocks.readable(() => false),
+    { select: () => false },
+  ),
 }));
 
 vi.mock('$store/renderer/slices/workspace-initializer/workspace-initializer-selectors', () => ({
@@ -73,8 +83,9 @@ vi.mock('$store/renderer/slices/github-auth/github-auth-selectors', () => ({
   selectGitHubAuthIsAuthenticating: { select: vi.fn(() => false) },
 }));
 
-vi.mock('$store/renderer/slices/setup-scripts/setup-scripts-selectors', () => ({
-  selectLastUsedScriptForRepo: { select: mocks.lastUsedSelect },
+vi.mock('$features/setup-scripts/last-used', () => ({
+  getLastUsedSetupScript: mocks.lastUsedSelect,
+  recordLastUsedSetupScript: vi.fn(),
 }));
 
 // Keep the real priority logic (chooseDefaultSetupScript, templates, name
@@ -206,7 +217,7 @@ function selectLocalRepo(repoPath: string) {
   });
 }
 
-/** Drive a GitHub-type selection (URL, no local checkout). */
+/** Drive a GitHub-type selection (picked repo: owner/repo shorthand, no local checkout). */
 function selectGitHubRepo(overrides: Record<string, unknown> = {}) {
   const captured = (
     window as unknown as {
@@ -215,7 +226,7 @@ function selectGitHubRepo(overrides: Record<string, unknown> = {}) {
   ).__mockOnboardingPromptStep;
   captured.onProjectChange({
     type: 'github',
-    repoPath: '/clones/repo',
+    repoPath: 'owner/repo',
     githubUrl: 'https://github.com/owner/repo',
     branch: 'main',
     isValid: true,
@@ -361,7 +372,10 @@ describe('onboarding repo-config setup script detection', () => {
     });
   });
 
-  it('sends the silently-applied repo-config script as setupScript on workspace.create', async () => {
+  it('omits setupScript on workspace.create for the unedited repo-config script (monorepo#1862)', async () => {
+    // The committed .intent/config.json is the source of truth: re-sending it
+    // would make the daemon rewrite the tracked file; omitting it still
+    // executes the committed script via the worktree-first read (§5.1).
     mocks.fetchRepoConfig.mockResolvedValue('echo repo-config');
     mocks.workspaceCreate.mockResolvedValue({ ok: false, error: 'stop after payload capture' });
 
@@ -384,9 +398,178 @@ describe('onboarding repo-config setup script detection', () => {
     captured.onSubmit();
 
     await waitFor(() => expect(mocks.workspaceCreate).toHaveBeenCalled());
+    const request = mocks.workspaceCreate.mock.calls[0][0];
+    expect(request.setupScript).toBeUndefined();
+  });
+
+  it('sends the auto-restored default (the shown script is what runs)', async () => {
+    // No repo config — the form falls back to the generic template. The
+    // shown script is what runs, so it is sent as-is.
+    mocks.fetchRepoConfig.mockResolvedValue(null);
+    mocks.workspaceCreate.mockResolvedValue({ ok: false, error: 'stop after payload capture' });
+    const generic = SETUP_SCRIPT_TEMPLATES.find((t) => t.id === 'generic')!;
+
+    const result = renderPage();
+    selectLocalRepo('/repo/a');
+    await waitFor(() => {
+      expect(textOf(result, 'setup-script-name')).toBe(generic.name);
+    });
+    const shownScript = textOf(result, 'setup-script');
+    expect(shownScript).not.toBe('');
+
+    const captured = (
+      window as unknown as {
+        __mockOnboardingPromptStep: {
+          onSubmit: () => void;
+          setInputValue: (value: string) => void;
+        };
+      }
+    ).__mockOnboardingPromptStep;
+    captured.setInputValue('build the thing');
+    captured.onSubmit();
+
+    await waitFor(() => expect(mocks.workspaceCreate).toHaveBeenCalled());
+    const request = mocks.workspaceCreate.mock.calls[0][0];
+    expect(request.setupScript).toBe(shownScript?.trim());
+  });
+
+  it('sends setupScript when the user committed an edited script via the modal', async () => {
+    mocks.fetchRepoConfig.mockResolvedValue('echo repo-config');
+    mocks.workspaceCreate.mockResolvedValue({ ok: false, error: 'stop after payload capture' });
+
+    const result = renderPage();
+    selectLocalRepo('/repo/a');
+    await waitFor(() => {
+      expect(textOf(result, 'setup-script')).toBe('echo repo-config');
+    });
+
+    const captured = (
+      window as unknown as {
+        __mockOnboardingPromptStep: {
+          onSubmit: () => void;
+          setInputValue: (value: string) => void;
+          commitSetupScript: (value: string, isCustom?: boolean) => void;
+        };
+      }
+    ).__mockOnboardingPromptStep;
+    captured.commitSetupScript('echo repo-config && echo edited');
+    captured.setInputValue('build the thing');
+    captured.onSubmit();
+
+    await waitFor(() => expect(mocks.workspaceCreate).toHaveBeenCalled());
     expect(mocks.workspaceCreate).toHaveBeenCalledWith(
-      expect.objectContaining({ setupScript: 'echo repo-config' }),
+      expect.objectContaining({ setupScript: 'echo repo-config && echo edited' }),
     );
+  });
+
+  it('mints a progressId, registers it before create, sends it on the wire, and clears it on settle', async () => {
+    // Live clone progress: the FE mints a correlation id, registers the slice
+    // entry BEFORE workspace.create (so mid-flight git:clone:progress frames
+    // find it), echoes it as `progressId` on the create request (PROTOCOL
+    // §5.1), and drops the entry once the create settles.
+    mocks.workspaceCreate.mockResolvedValue({ ok: false, error: 'stop after payload capture' });
+
+    renderPage();
+    selectLocalRepo('/repo/a');
+
+    const captured = (
+      window as unknown as {
+        __mockOnboardingPromptStep: {
+          onSubmit: () => void;
+          setInputValue: (value: string) => void;
+        };
+      }
+    ).__mockOnboardingPromptStep;
+    captured.setInputValue('build the thing');
+    captured.onSubmit();
+
+    await waitFor(() => expect(mocks.workspaceCreate).toHaveBeenCalled());
+    const request = mocks.workspaceCreate.mock.calls[0][0] as { progressId?: string };
+    expect(typeof request.progressId).toBe('string');
+    expect(request.progressId).not.toBe('');
+
+    const actions = mocks.dispatch.mock.calls.map(
+      ([action]) => action as { type: string; payload?: unknown[] },
+    );
+    const begin = actions.find((a) => a.type === 'workspaceCreateProgress/begin');
+    expect(begin?.payload).toEqual([request.progressId]);
+    // begin must be dispatched before the create request goes out.
+    const beginIndex = mocks.dispatch.mock.calls.findIndex(
+      ([action]) => (action as { type: string }).type === 'workspaceCreateProgress/begin',
+    );
+    expect(beginIndex).toBeGreaterThanOrEqual(0);
+    expect(mocks.workspaceCreate.mock.invocationCallOrder[0]).toBeGreaterThan(
+      mocks.dispatch.mock.invocationCallOrder[beginIndex],
+    );
+    // The create settled (failure here) — the entry is dropped.
+    await waitFor(() => {
+      const clear = mocks.dispatch.mock.calls
+        .map(([action]) => action as { type: string; payload?: unknown[] })
+        .find((a) => a.type === 'workspaceCreateProgress/clear');
+      expect(clear?.payload).toEqual([request.progressId]);
+    });
+  });
+
+  it('submits a picked-repo create for GitHub selections: githubUrl only, no repositoryPath/clonePath', async () => {
+    // Picked-repo flow: the daemon hydrates the checkout from its repo
+    // cache. The create request must carry the GitHub URL and MUST NOT
+    // carry a local repositoryPath or any clonePath (the selection's
+    // repoPath is the owner/repo shorthand, not a local path).
+    mocks.workspaceCreate.mockResolvedValue({ ok: false, error: 'stop after payload capture' });
+
+    renderPage();
+    selectGitHubRepo();
+
+    const captured = (
+      window as unknown as {
+        __mockOnboardingPromptStep: {
+          onSubmit: () => void;
+          setInputValue: (value: string) => void;
+        };
+      }
+    ).__mockOnboardingPromptStep;
+    captured.setInputValue('build the thing');
+    captured.onSubmit();
+
+    await waitFor(() => expect(mocks.workspaceCreate).toHaveBeenCalled());
+    const request = mocks.workspaceCreate.mock.calls[0][0];
+    expect(request.githubUrl).toBe('https://github.com/owner/repo');
+    expect(request.repositoryPath).toBeUndefined();
+    expect(request).not.toHaveProperty('clonePath');
+    expect(request.baseRef).toBe('main');
+  });
+
+  it('awaits an in-flight probe at submit and never sends the racing generic template (monorepo#1862)', async () => {
+    // Probe still in flight when the user submits: create must wait for it,
+    // see the repo-config script applied, and omit setupScript — not send the
+    // synchronously-restored generic template.
+    const probe = deferred<string | null>();
+    mocks.fetchRepoConfig.mockReturnValue(probe.promise);
+    mocks.workspaceCreate.mockResolvedValue({ ok: false, error: 'stop after payload capture' });
+
+    renderPage();
+    selectLocalRepo('/repo/a');
+    await waitFor(() => expect(mocks.fetchRepoConfig).toHaveBeenCalledWith('/repo/a'));
+
+    const captured = (
+      window as unknown as {
+        __mockOnboardingPromptStep: {
+          onSubmit: () => void;
+          setInputValue: (value: string) => void;
+        };
+      }
+    ).__mockOnboardingPromptStep;
+    captured.setInputValue('build the thing');
+    captured.onSubmit();
+
+    // Create is gated on the probe.
+    await new Promise((r) => setTimeout(r, 50));
+    expect(mocks.workspaceCreate).not.toHaveBeenCalled();
+
+    probe.resolve('echo repo-config');
+    await waitFor(() => expect(mocks.workspaceCreate).toHaveBeenCalled());
+    const request = mocks.workspaceCreate.mock.calls[0][0];
+    expect(request.setupScript).toBeUndefined();
   });
 
   it('does not probe remote selections', async () => {
@@ -411,7 +594,7 @@ describe('onboarding repo-config setup script detection', () => {
   });
 
   it('discards a stale probe result after the user switches repos', async () => {
-    mocks.lastUsedSelect.mockImplementation((_state: unknown, repo: string) =>
+    mocks.lastUsedSelect.mockImplementation((repo: string) =>
       repo === '/repo/b' ? { name: 'B saved script', content: 'echo b-saved' } : undefined,
     );
     const probeA = deferred<string | null>();
@@ -448,7 +631,7 @@ describe('onboarding repo-config setup script detection', () => {
   });
 
   it('discards a stale GitHub probe result after switching to a local repo', async () => {
-    mocks.lastUsedSelect.mockImplementation((_state: unknown, repo: string) =>
+    mocks.lastUsedSelect.mockImplementation((repo: string) =>
       repo === '/repo/local' ? { name: 'Local saved', content: 'echo local-saved' } : undefined,
     );
     const ghProbe = deferred<string | null>();

@@ -37,9 +37,13 @@
     status,
   }: Props = $props();
 
+  // svelte-ignore state_referenced_locally - intentional initial capture; the $effect below syncs later changes
   let hasError = $state(initialError ? true : false);
+  // svelte-ignore state_referenced_locally - intentional initial capture; the $effect below syncs later changes
   let errorMessage = $state(initialError?.message || '');
+  // svelte-ignore state_referenced_locally - intentional initial capture; the $effect below syncs later changes
   let errorDetails = $state<Error | null>(initialError || null);
+  // svelte-ignore state_referenced_locally - intentional initial capture; the $effect below syncs later changes
   let errorInfo = $state(initialError?.stack || '');
   let showDetails = $state(false);
   let copyFeedback = $state(false);
@@ -384,7 +388,7 @@
             <div class="relative w-full pt-3" transition:slide={{ axis: 'y' }}>
 
 
-              <div class="p-4 border border-border/50">
+              <div class="p-4 border border-border">
                 <pre class="text-xs font-mono text-subtle leading-relaxed overflow-x-auto max-h-64 text-left whitespace-pre-wrap break-all">{errStack}</pre>
               </div>
             </div>

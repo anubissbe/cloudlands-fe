@@ -1,21 +1,20 @@
-import type { FileNode, FileGitStatus } from "$shared/types";
-import { shallowEqual } from "fast-equals";
+import type { FileNode, FileGitStatus } from '$shared/types';
+import { shallowEqual } from 'fast-equals';
 import {
   createCollection,
   getItem,
   getItems,
   type Collection,
-} from "$lib/store-shim/utils/collections/collection-utils";
-import { createAction } from "$lib/store-shim/utils/store/create-action";
-import { createReducer } from "$lib/store-shim/utils/store/create-reducer";
-import { createWorkspaceScopedHelpers } from "../../utils/workspace-scoped";
+} from '@augmentcode/themis/utils/collections/collection-utils';
+import { createAction } from '@augmentcode/themis/utils/store/create-action';
+import { createReducer } from '@augmentcode/themis/utils/store/create-reducer';
+import { createWorkspaceScopedHelpers } from '../../utils/workspace-scoped';
 import type {
   FileExplorerWorkspaceState,
   FileExplorerState,
   FileExplorerTreeNode,
-} from "./file-explorer-types";
-import { sortNodesRecursive } from "./file-explorer-utils";
-import type { StoreAction } from "$lib/store-shim/types";
+} from './file-explorer-types';
+import { sortNodesRecursive } from './file-explorer-utils';
 
 export type { FileExplorerWorkspaceState, FileExplorerState };
 
@@ -24,9 +23,9 @@ export type { FileExplorerWorkspaceState, FileExplorerState };
 // ---------------------------------------------------------------------------
 
 export const emptyFileExplorerWorkspaceState: FileExplorerWorkspaceState = {
-  workspacePath: "",
+  workspacePath: '',
   rootPath: null,
-  nodes: createCollection<FileExplorerTreeNode, "path">("path"),
+  nodes: createCollection<FileExplorerTreeNode, 'path'>('path'),
   isLoading: false,
   isInitialized: false,
   error: null,
@@ -47,8 +46,9 @@ export const initialState: FileExplorerState = {
   byWorkspaceId: {},
 };
 
-const { getWorkspaceState, setWorkspaceState, clearWorkspaceState } =
-  createWorkspaceScopedHelpers(emptyFileExplorerWorkspaceState);
+const { getWorkspaceState, setWorkspaceState } = createWorkspaceScopedHelpers(
+  emptyFileExplorerWorkspaceState,
+);
 
 // ---------------------------------------------------------------------------
 // Saga-trigger actions
@@ -56,39 +56,33 @@ const { getWorkspaceState, setWorkspaceState, clearWorkspaceState } =
 
 export const initializeFileExplorer = createAction<
   [wsId: string, options: { workspacePath: string; workspaceId?: string }]
->("fileExplorer/initializeFileExplorer");
-
-export const setWorkspacePathRequested = createAction<[wsId: string, path: string]>(
-  "fileExplorer/setWorkspacePathRequested",
-);
+>('fileExplorer/initializeFileExplorer');
 
 export const toggleDirectoryRequested = createAction<[wsId: string, nodePath: string]>(
-  "fileExplorer/toggleDirectoryRequested",
+  'fileExplorer/toggleDirectoryRequested',
 );
 
 export const expandToPathRequested = createAction<[wsId: string, targetPath: string]>(
-  "fileExplorer/expandToPathRequested",
+  'fileExplorer/expandToPathRequested',
 );
 
 export const expandAllRequested = createAction<[wsId: string, maxDepth?: number]>(
-  "fileExplorer/expandAllRequested",
+  'fileExplorer/expandAllRequested',
 );
 
-export const refreshFileExplorer = createAction<[wsId: string]>(
-  "fileExplorer/refreshFileExplorer",
-);
+export const refreshFileExplorer = createAction<[wsId: string]>('fileExplorer/refreshFileExplorer');
 
 /**
  * Fan-out trigger dispatched by the workspaceMounted fan-out
  * (`lifecycle-ipc-read-service`) so a workspace first-opened after boot
  * hydrates its file tree via `appClient.files.explorerTree` — mirroring the
- * boot `files-git-seeder` file-explorer section. Saga-only trigger with no
+ * file-explorer read saga. Saga-only trigger with no
  * reducer entry (see AGENTS.md §8); the handler lives in
  * `file-explorer-read-service` and is guarded by the per-workspace
  * `isInitialized` flag so boot-seeded workspaces are unaffected.
  */
 export const hydrateFileExplorerRequested = createAction<[wsId: string]>(
-  "fileExplorer/hydrateFileExplorerRequested",
+  'fileExplorer/hydrateFileExplorerRequested',
 );
 
 /**
@@ -101,85 +95,38 @@ export const hydrateFileExplorerRequested = createAction<[wsId: string]>(
  * object identity.
  */
 export const refreshDirectoryRequested = createAction<[wsId: string, filePath: string]>(
-  "fileExplorer/refreshDirectoryRequested",
-);
-
-export const refreshGitStatusRequested = createAction<[wsId: string]>(
-  "fileExplorer/refreshGitStatusRequested",
-);
-
-export const refreshAgentFileEditsRequested = createAction<[wsId: string]>(
-  "fileExplorer/refreshAgentFileEditsRequested",
+  'fileExplorer/refreshDirectoryRequested',
 );
 
 export const syncGitStatusFromStoresRequested = createAction<[wsId: string]>(
-  "fileExplorer/syncGitStatusFromStoresRequested",
-);
-
-/**
- * Wrapper action used by the file-explorer saga to debounce rapid
- * file-tracking IPC events. Dispatch as
- * `debouncedFileTrackingSync(syncGitStatusFromStoresRequested(wsId))` — the
- * inner action is fired after the debounce window elapses.
- */
-export const debouncedFileTrackingSync = createAction<[inner: StoreAction<any>]>(
-  "fileExplorer/debouncedFileTrackingSync",
-);
-
-export const debouncedDirectoryRefresh = createAction<[inner: StoreAction<any>]>(
-  "fileExplorer/debouncedDirectoryRefresh",
-);
-
-export const debouncedAgentFileEditsRefresh = createAction<[inner: StoreAction<any>]>(
-  "fileExplorer/debouncedAgentFileEditsRefresh",
+  'fileExplorer/syncGitStatusFromStoresRequested',
 );
 
 // ---------------------------------------------------------------------------
 // Reducer actions
 // ---------------------------------------------------------------------------
 
-export const setFileExplorerLoading = createAction<[wsId: string, isLoading: boolean]>(
-  "fileExplorer/setLoading",
-);
+export const setFileExplorerLoading =
+  createAction<[wsId: string, isLoading: boolean]>('fileExplorer/setLoading');
+
+export const setFileExplorerError =
+  createAction<[wsId: string, error: string | null]>('fileExplorer/setError');
 
 export const setFileExplorerInitialized = createAction<[wsId: string, isInitialized: boolean]>(
-  "fileExplorer/setInitialized",
+  'fileExplorer/setInitialized',
 );
 
 export const setRootNode = createAction<[wsId: string, rootNode: FileNode | null]>(
-  "fileExplorer/setRootNode",
+  'fileExplorer/setRootNode',
 );
 
 export const setChildrenAtPathAction = createAction<
   [wsId: string, parentPath: string, children: FileNode[]]
->("fileExplorer/setChildrenAtPath");
+>('fileExplorer/setChildrenAtPath');
 
-export const setGitignorePatterns = createAction<[wsId: string, patterns: string[]]>(
-  "fileExplorer/setGitignorePatterns",
-);
-
-export const setGitStatusMap = createAction<[wsId: string, gitStatus: Record<string, FileGitStatus>]>(
-  "fileExplorer/setGitStatusMap",
-);
-
-/**
- * Shallow-merge per-entry git-status updates into ws.gitStatus.
- * - No-op (returns identical state ref) when every provided key's value deep-equals existing.
- * - Does NOT increment treeVersion — selectors recompute off the gitStatus reference.
- * - Keys absent from `entries` are NOT deleted; use removeGitStatusEntries for that.
- */
-export const updateGitStatusEntries = createAction<
-  [wsId: string, entries: Record<string, FileGitStatus>]
->("fileExplorer/updateGitStatusEntries");
-
-/**
- * Remove the listed paths from ws.gitStatus.
- * No-op (returns identical state ref) when none of the paths exist.
- * Does NOT increment treeVersion.
- */
-export const removeGitStatusEntries = createAction<[wsId: string, paths: string[]]>(
-  "fileExplorer/removeGitStatusEntries",
-);
+export const setGitStatusMap = createAction<
+  [wsId: string, gitStatus: Record<string, FileGitStatus>]
+>('fileExplorer/setGitStatusMap');
 
 /**
  * Shallow-merge per-entry agent-file-edits updates into ws.agentFileEdits.
@@ -187,68 +134,50 @@ export const removeGitStatusEntries = createAction<[wsId: string, paths: string[
  */
 export const updateAgentFileEditsEntries = createAction<
   [wsId: string, entries: Record<string, string[]>]
->("fileExplorer/updateAgentFileEditsEntries");
+>('fileExplorer/updateAgentFileEditsEntries');
 
 /**
  * Remove the listed paths from ws.agentFileEdits.
  * Same no-op semantics as removeGitStatusEntries.
  */
 export const removeAgentFileEditsEntries = createAction<[wsId: string, paths: string[]]>(
-  "fileExplorer/removeAgentFileEditsEntries",
+  'fileExplorer/removeAgentFileEditsEntries',
 );
 
 export const addExpandedPath = createAction<[wsId: string, path: string]>(
-  "fileExplorer/addExpandedPath",
+  'fileExplorer/addExpandedPath',
 );
 
 export const removeExpandedPath = createAction<[wsId: string, path: string]>(
-  "fileExplorer/removeExpandedPath",
+  'fileExplorer/removeExpandedPath',
 );
 
 export const clearExpandedPathsExceptRoot = createAction<[wsId: string]>(
-  "fileExplorer/clearExpandedPathsExceptRoot",
+  'fileExplorer/clearExpandedPathsExceptRoot',
 );
 
 export const addLoadingPath = createAction<[wsId: string, path: string]>(
-  "fileExplorer/addLoadingPath",
+  'fileExplorer/addLoadingPath',
 );
 
 export const removeLoadingPath = createAction<[wsId: string, path: string]>(
-  "fileExplorer/removeLoadingPath",
+  'fileExplorer/removeLoadingPath',
 );
 
 export const setBulkOperation = createAction<[wsId: string, isBulk: boolean]>(
-  "fileExplorer/setBulkOperation",
+  'fileExplorer/setBulkOperation',
 );
 
 export const incrementTreeVersion = createAction<[wsId: string]>(
-  "fileExplorer/incrementTreeVersion",
+  'fileExplorer/incrementTreeVersion',
 );
 
-
-
 export const setFileExplorerWorkspacePath = createAction<[wsId: string, path: string]>(
-  "fileExplorer/setWorkspacePath",
+  'fileExplorer/setWorkspacePath',
 );
 
 export const setFileExplorerFileCount = createAction<[wsId: string, count: number]>(
-  "fileExplorer/setFileCount",
-);
-
-export const setRemoteConnectionIdAction = createAction<[wsId: string, id: string | null]>(
-  "fileExplorer/setRemoteConnectionId",
-);
-
-export const setIsRemoteInitializedAction = createAction<[wsId: string, value: boolean]>(
-  "fileExplorer/setIsRemoteInitialized",
-);
-
-export const setIsStoreActive = createAction<[wsId: string, value: boolean]>(
-  "fileExplorer/setIsStoreActive",
-);
-
-export const clearFileExplorerForWorkspace = createAction<[wsId: string]>(
-  "fileExplorer/clearForWorkspace",
+  'fileExplorer/setFileCount',
 );
 
 // ---------------------------------------------------------------------------
@@ -290,8 +219,8 @@ function removeRecordKeys<V>(
   return draft ?? record;
 }
 
-function createEmptyNodesCollection(): Collection<FileExplorerTreeNode, "path"> {
-  return createCollection<FileExplorerTreeNode, "path">("path");
+function createEmptyNodesCollection(): Collection<FileExplorerTreeNode, 'path'> {
+  return createCollection<FileExplorerTreeNode, 'path'>('path');
 }
 
 function toTreeNode(node: FileNode): FileExplorerTreeNode {
@@ -302,7 +231,10 @@ function toTreeNode(node: FileNode): FileExplorerTreeNode {
   };
 }
 
-function collectNormalizedNodes(node: FileNode, result: FileExplorerTreeNode[] = []): FileExplorerTreeNode[] {
+function collectNormalizedNodes(
+  node: FileNode,
+  result: FileExplorerTreeNode[] = [],
+): FileExplorerTreeNode[] {
   result.push(toTreeNode(node));
   for (const child of node.children ?? []) {
     collectNormalizedNodes(child, result);
@@ -318,15 +250,15 @@ function sortedRoot(rootNode: FileNode): FileNode {
 
 function normalizeTree(rootNode: FileNode | null): {
   rootPath: string | null;
-  nodes: Collection<FileExplorerTreeNode, "path">;
+  nodes: Collection<FileExplorerTreeNode, 'path'>;
 } {
   if (!rootNode) {
     return { rootPath: null, nodes: createEmptyNodesCollection() };
   }
   return {
     rootPath: rootNode.path,
-    nodes: createCollection<FileExplorerTreeNode, "path">(
-      "path",
+    nodes: createCollection<FileExplorerTreeNode, 'path'>(
+      'path',
       collectNormalizedNodes(sortedRoot(rootNode)),
     ),
   };
@@ -344,7 +276,7 @@ function treeNodesEqual(left: FileExplorerTreeNode, right: FileExplorerTreeNode)
 }
 
 function collectSubtreePaths(
-  nodes: Collection<FileExplorerTreeNode, "path">,
+  nodes: Collection<FileExplorerTreeNode, 'path'>,
   paths: readonly string[],
   result: string[] = [],
 ): string[] {
@@ -358,10 +290,10 @@ function collectSubtreePaths(
 }
 
 function replaceChildrenInCollection(
-  nodes: Collection<FileExplorerTreeNode, "path">,
+  nodes: Collection<FileExplorerTreeNode, 'path'>,
   parentPath: string,
   children: FileNode[],
-): Collection<FileExplorerTreeNode, "path"> {
+): Collection<FileExplorerTreeNode, 'path'> {
   const parent = getItem(nodes, parentPath);
   if (!parent) return nodes;
 
@@ -399,43 +331,50 @@ function replaceChildrenInCollection(
   }
   finalItems.push(...incomingNodes);
 
-  return createCollection<FileExplorerTreeNode, "path">("path", finalItems);
+  return createCollection<FileExplorerTreeNode, 'path'>('path', finalItems);
 }
 
 // ---------------------------------------------------------------------------
 // Reducer
 // ---------------------------------------------------------------------------
 
-export const fileExplorerReducer = createReducer<FileExplorerState>(initialState)
-  .with(clearFileExplorerForWorkspace, (state, { payload: [wsId] }) =>
-    clearWorkspaceState(state, wsId),
-  )
-  .with(setFileExplorerLoading, (state, { payload: [wsId, isLoading] }) => {
-    const ws = getWorkspaceState(state, wsId);
-    if (ws.isLoading === isLoading) return state;
-    return setWorkspaceState(state, wsId, {
-      ...ws,
-      isLoading,
-      ...(isLoading ? { error: null } : {}),
-    });
-  })
-  .with(setFileExplorerInitialized, (state, { payload: [wsId, isInitialized] }) => {
+export const fileExplorerReducer = createReducer<FileExplorerState>(initialState);
+fileExplorerReducer.with(setFileExplorerLoading, (state, { payload: [wsId, isLoading] }) => {
+  const ws = getWorkspaceState(state, wsId);
+  if (ws.isLoading === isLoading) return state;
+  return setWorkspaceState(state, wsId, {
+    ...ws,
+    isLoading,
+    ...(isLoading ? { error: null } : {}),
+  });
+});
+fileExplorerReducer.with(setFileExplorerError, (state, { payload: [wsId, error] }) => {
+  const ws = getWorkspaceState(state, wsId);
+  if (ws.error === error) return state;
+  return setWorkspaceState(state, wsId, { ...ws, error });
+});
+fileExplorerReducer.with(
+  setFileExplorerInitialized,
+  (state, { payload: [wsId, isInitialized] }) => {
     const ws = getWorkspaceState(state, wsId);
     return setWorkspaceState(state, wsId, { ...ws, isInitialized });
-  })
-  .with(setRootNode, (state, { payload: [wsId, rootNode] }) => {
-    const ws = getWorkspaceState(state, wsId);
-    const normalizedTree = normalizeTree(rootNode);
-    if (normalizedTree.rootPath === null && ws.rootPath === null && ws.nodes.ids.length === 0) {
-      return state;
-    }
-    return setWorkspaceState(state, wsId, {
-      ...ws,
-      ...normalizedTree,
-      treeVersion: ws.treeVersion + 1,
-    });
-  })
-  .with(setChildrenAtPathAction, (state, { payload: [wsId, parentPath, children] }) => {
+  },
+);
+fileExplorerReducer.with(setRootNode, (state, { payload: [wsId, rootNode] }) => {
+  const ws = getWorkspaceState(state, wsId);
+  const normalizedTree = normalizeTree(rootNode);
+  if (normalizedTree.rootPath === null && ws.rootPath === null && ws.nodes.ids.length === 0) {
+    return state;
+  }
+  return setWorkspaceState(state, wsId, {
+    ...ws,
+    ...normalizedTree,
+    treeVersion: ws.treeVersion + 1,
+  });
+});
+fileExplorerReducer.with(
+  setChildrenAtPathAction,
+  (state, { payload: [wsId, parentPath, children] }) => {
     const ws = getWorkspaceState(state, wsId);
     if (!ws.rootPath) return state;
     const nodes = replaceChildrenInCollection(ws.nodes, parentPath, children);
@@ -445,120 +384,91 @@ export const fileExplorerReducer = createReducer<FileExplorerState>(initialState
       nodes,
       treeVersion: ws.treeVersion + 1,
     });
-  })
-  .with(setGitignorePatterns, (state, { payload: [wsId, patterns] }) => {
-    const ws = getWorkspaceState(state, wsId);
-    return setWorkspaceState(state, wsId, { ...ws, gitignorePatterns: patterns });
-  })
-  .with(setGitStatusMap, (state, { payload: [wsId, gitStatus] }) => {
-    const ws = getWorkspaceState(state, wsId);
-    return setWorkspaceState(state, wsId, { ...ws, gitStatus });
-  })
-  .with(updateGitStatusEntries, (state, { payload: [wsId, entries] }) => {
-    const ws = getWorkspaceState(state, wsId);
-    const gitStatus = mergeRecordEntries(ws.gitStatus, entries, shallowEqual);
-    if (gitStatus === ws.gitStatus) return state;
-    return setWorkspaceState(state, wsId, { ...ws, gitStatus });
-  })
-  .with(removeGitStatusEntries, (state, { payload: [wsId, paths] }) => {
-    const ws = getWorkspaceState(state, wsId);
-    const gitStatus = removeRecordKeys(ws.gitStatus, paths);
-    if (gitStatus === ws.gitStatus) return state;
-    return setWorkspaceState(state, wsId, { ...ws, gitStatus });
-  })
-  .with(updateAgentFileEditsEntries, (state, { payload: [wsId, entries] }) => {
-    const ws = getWorkspaceState(state, wsId);
-    const agentFileEdits = mergeRecordEntries(ws.agentFileEdits, entries, shallowEqual);
-    if (agentFileEdits === ws.agentFileEdits) return state;
-    return setWorkspaceState(state, wsId, { ...ws, agentFileEdits });
-  })
-  .with(removeAgentFileEditsEntries, (state, { payload: [wsId, paths] }) => {
-    const ws = getWorkspaceState(state, wsId);
-    const agentFileEdits = removeRecordKeys(ws.agentFileEdits, paths);
-    if (agentFileEdits === ws.agentFileEdits) return state;
-    return setWorkspaceState(state, wsId, { ...ws, agentFileEdits });
-  })
-  .with(addExpandedPath, (state, { payload: [wsId, path] }) => {
-    const ws = getWorkspaceState(state, wsId);
-    if (ws.expandedPaths.includes(path)) return state;
-    return setWorkspaceState(state, wsId, {
-      ...ws,
-      expandedPaths: [...ws.expandedPaths, path],
-      treeVersion: ws.treeVersion + 1,
-    });
-  })
-  .with(removeExpandedPath, (state, { payload: [wsId, path] }) => {
-    const ws = getWorkspaceState(state, wsId);
-    if (!ws.expandedPaths.includes(path)) return state;
-    return setWorkspaceState(state, wsId, {
-      ...ws,
-      expandedPaths: ws.expandedPaths.filter((p) => p !== path),
-      treeVersion: ws.treeVersion + 1,
-    });
-  })
-  .with(clearExpandedPathsExceptRoot, (state, { payload: [wsId] }) => {
-    const ws = getWorkspaceState(state, wsId);
-    const rootPath = ws.workspacePath;
-    return setWorkspaceState(state, wsId, {
-      ...ws,
-      expandedPaths: rootPath ? [rootPath] : [],
-      treeVersion: ws.treeVersion + 1,
-    });
-  })
-  .with(addLoadingPath, (state, { payload: [wsId, path] }) => {
-    const ws = getWorkspaceState(state, wsId);
-    if (ws.loadingPaths.includes(path)) return state;
-    return setWorkspaceState(state, wsId, {
-      ...ws,
-      loadingPaths: [...ws.loadingPaths, path],
-      treeVersion: ws.treeVersion + 1,
-    });
-  })
-  .with(removeLoadingPath, (state, { payload: [wsId, path] }) => {
-    const ws = getWorkspaceState(state, wsId);
-    return setWorkspaceState(state, wsId, {
-      ...ws,
-      loadingPaths: ws.loadingPaths.filter((p) => p !== path),
-      treeVersion: ws.treeVersion + 1,
-    });
-  })
-  .with(setBulkOperation, (state, { payload: [wsId, isBulk] }) => {
-    const ws = getWorkspaceState(state, wsId);
-    return setWorkspaceState(state, wsId, { ...ws, isBulkOperation: isBulk });
-  })
-  .with(incrementTreeVersion, (state, { payload: [wsId] }) => {
-    const ws = getWorkspaceState(state, wsId);
-    return setWorkspaceState(state, wsId, { ...ws, treeVersion: ws.treeVersion + 1 });
-  })
-  .with(setFileExplorerWorkspacePath, (state, { payload: [wsId, path] }) => {
-    const ws = getWorkspaceState(state, wsId);
-    if (ws.workspacePath === path) return state;
-    return setWorkspaceState(state, wsId, {
-      ...ws,
-      workspacePath: path,
-      rootPath: null,
-      nodes: createEmptyNodesCollection(),
-      expandedPaths: [],
-      loadingPaths: [],
-      error: null,
-      treeVersion: ws.treeVersion + 1,
-    });
-  })
-  .with(setFileExplorerFileCount, (state, { payload: [wsId, count] }) => {
-    const ws = getWorkspaceState(state, wsId);
-    return setWorkspaceState(state, wsId, { ...ws, fileCount: count });
-  })
-  .with(setRemoteConnectionIdAction, (state, { payload: [wsId, id] }) => {
-    const ws = getWorkspaceState(state, wsId);
-    if (ws.remoteConnectionId === id) return state;
-    return setWorkspaceState(state, wsId, { ...ws, remoteConnectionId: id });
-  })
-  .with(setIsRemoteInitializedAction, (state, { payload: [wsId, value] }) => {
-    const ws = getWorkspaceState(state, wsId);
-    if (ws.isRemoteInitialized === value) return state;
-    return setWorkspaceState(state, wsId, { ...ws, isRemoteInitialized: value });
-  })
-  .with(setIsStoreActive, (state, { payload: [wsId, value] }) => {
-    const ws = getWorkspaceState(state, wsId);
-    return setWorkspaceState(state, wsId, { ...ws, isStoreActive: value });
+  },
+);
+fileExplorerReducer.with(setGitStatusMap, (state, { payload: [wsId, gitStatus] }) => {
+  const ws = getWorkspaceState(state, wsId);
+  return setWorkspaceState(state, wsId, { ...ws, gitStatus });
+});
+fileExplorerReducer.with(updateAgentFileEditsEntries, (state, { payload: [wsId, entries] }) => {
+  const ws = getWorkspaceState(state, wsId);
+  const agentFileEdits = mergeRecordEntries(ws.agentFileEdits, entries, shallowEqual);
+  if (agentFileEdits === ws.agentFileEdits) return state;
+  return setWorkspaceState(state, wsId, { ...ws, agentFileEdits });
+});
+fileExplorerReducer.with(removeAgentFileEditsEntries, (state, { payload: [wsId, paths] }) => {
+  const ws = getWorkspaceState(state, wsId);
+  const agentFileEdits = removeRecordKeys(ws.agentFileEdits, paths);
+  if (agentFileEdits === ws.agentFileEdits) return state;
+  return setWorkspaceState(state, wsId, { ...ws, agentFileEdits });
+});
+fileExplorerReducer.with(addExpandedPath, (state, { payload: [wsId, path] }) => {
+  const ws = getWorkspaceState(state, wsId);
+  if (ws.expandedPaths.includes(path)) return state;
+  return setWorkspaceState(state, wsId, {
+    ...ws,
+    expandedPaths: [...ws.expandedPaths, path],
+    treeVersion: ws.treeVersion + 1,
   });
+});
+fileExplorerReducer.with(removeExpandedPath, (state, { payload: [wsId, path] }) => {
+  const ws = getWorkspaceState(state, wsId);
+  if (!ws.expandedPaths.includes(path)) return state;
+  return setWorkspaceState(state, wsId, {
+    ...ws,
+    expandedPaths: ws.expandedPaths.filter((p) => p !== path),
+    treeVersion: ws.treeVersion + 1,
+  });
+});
+fileExplorerReducer.with(clearExpandedPathsExceptRoot, (state, { payload: [wsId] }) => {
+  const ws = getWorkspaceState(state, wsId);
+  const rootPath = ws.workspacePath;
+  return setWorkspaceState(state, wsId, {
+    ...ws,
+    expandedPaths: rootPath ? [rootPath] : [],
+    treeVersion: ws.treeVersion + 1,
+  });
+});
+fileExplorerReducer.with(addLoadingPath, (state, { payload: [wsId, path] }) => {
+  const ws = getWorkspaceState(state, wsId);
+  if (ws.loadingPaths.includes(path)) return state;
+  return setWorkspaceState(state, wsId, {
+    ...ws,
+    loadingPaths: [...ws.loadingPaths, path],
+    treeVersion: ws.treeVersion + 1,
+  });
+});
+fileExplorerReducer.with(removeLoadingPath, (state, { payload: [wsId, path] }) => {
+  const ws = getWorkspaceState(state, wsId);
+  return setWorkspaceState(state, wsId, {
+    ...ws,
+    loadingPaths: ws.loadingPaths.filter((p) => p !== path),
+    treeVersion: ws.treeVersion + 1,
+  });
+});
+fileExplorerReducer.with(setBulkOperation, (state, { payload: [wsId, isBulk] }) => {
+  const ws = getWorkspaceState(state, wsId);
+  return setWorkspaceState(state, wsId, { ...ws, isBulkOperation: isBulk });
+});
+fileExplorerReducer.with(incrementTreeVersion, (state, { payload: [wsId] }) => {
+  const ws = getWorkspaceState(state, wsId);
+  return setWorkspaceState(state, wsId, { ...ws, treeVersion: ws.treeVersion + 1 });
+});
+fileExplorerReducer.with(setFileExplorerWorkspacePath, (state, { payload: [wsId, path] }) => {
+  const ws = getWorkspaceState(state, wsId);
+  if (ws.workspacePath === path) return state;
+  return setWorkspaceState(state, wsId, {
+    ...ws,
+    workspacePath: path,
+    rootPath: null,
+    nodes: createEmptyNodesCollection(),
+    expandedPaths: [],
+    loadingPaths: [],
+    error: null,
+    treeVersion: ws.treeVersion + 1,
+  });
+});
+fileExplorerReducer.with(setFileExplorerFileCount, (state, { payload: [wsId, count] }) => {
+  const ws = getWorkspaceState(state, wsId);
+  return setWorkspaceState(state, wsId, { ...ws, fileCount: count });
+});

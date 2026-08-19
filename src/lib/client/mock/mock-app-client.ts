@@ -54,9 +54,14 @@ export class MockAppClient implements Omit<AppClient, MigratedDomain> {
   readonly chat: AppClient["chat"] = {
     // Mock parity with the §7.1 seq-0 snapshot: an empty transcript is the
     // safe default since fixtures don't model turn-granular AgentMessage lists.
-    subscribeSnapshot: async () => ({ messages: [], truncated: false, totalMessages: 0 }),
     subscribe: (_agentId, handler) =>
-      emitOnce(handler, { messages: [], truncated: false, totalMessages: 0, isStreaming: false }),
+      emitOnce(handler, {
+        messages: [],
+        truncated: false,
+        totalMessages: 0,
+        isStreaming: false,
+        fromSnapshot: true,
+      }),
   };
 
   readonly terminals: AppClient["terminals"] = {
@@ -87,6 +92,7 @@ export class MockAppClient implements Omit<AppClient, MigratedDomain> {
     setProviderSettings: async () => OK,
     getMcpServers: async () => fx.mockMcpServers,
     setMcpServers: async () => OK,
+    getMcpServerStatuses: async () => [],
     getWorkspaceSettings: async () => fx.mockWorkspaceSettings,
     setWorkspaceSettings: async () => OK,
     getBackgroundAgentSettings: async () => fx.mockBackgroundAgentSettings,
@@ -109,8 +115,6 @@ export class MockAppClient implements Omit<AppClient, MigratedDomain> {
   };
 
   readonly setupScripts: AppClient["setupScripts"] = {
-    list: async () => fx.mockSetupScripts,
-    subscribe: (handler) => emitOnce(handler, fx.mockSetupScripts),
     get: async () => null,
     save: async () => null,
     detectProjectType: async () => null,
@@ -162,6 +166,7 @@ export class MockAppClient implements Omit<AppClient, MigratedDomain> {
   readonly integrations: AppClient["integrations"] = {
     githubUser: async () => fx.mockGitHubUser,
     githubBranches: async () => ({ branches: [] }),
+    githubBranchesCached: async () => ({ cached: false, branches: [] }),
     githubRepoConfig: async () => ({ config: null, exists: false }),
     linearIssues: async () => fx.mockLinearIssues,
     sentryIssues: async () => fx.mockSentryIssues,

@@ -1,23 +1,19 @@
 import path from 'path';
-import {
-  app,
-  screen,
-  nativeTheme,
-  nativeImage,
-  BrowserWindow,
-} from 'electron';
+import { app, screen, nativeTheme, nativeImage, BrowserWindow } from 'electron';
 import type { BrowserWindow as BrowserWindowType } from 'electron';
 import fs from 'fs';
 import fsAsync from 'fs/promises';
 import { Logger } from '../shared/logger';
 import { resolveAppTitle } from './utils/resolve-app-title';
 import { DeepLinkHandler } from '../features/deeplink/deep-link-handler';
-import {
-  getMainWindow,
-  setMainWindow,
-} from './state';
+import { getMainWindow, setMainWindow } from './state';
+import { LOCAL_CONNECTION_ID } from '../shared/types/connections';
 import { fileURLToPath } from 'url';
 import { dirname } from 'path';
+import {
+  getWindowAppearanceOptions,
+  getWindowTitleBarOptions,
+} from '../shared/main/window-appearance';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -110,14 +106,9 @@ function buildWindowOptions(opts: {
       nodeIntegration: false,
       webviewTag: true,
     },
-    titleBarStyle: process.platform === 'darwin' ? 'hiddenInset' : 'default',
-    frame: process.platform !== 'darwin',
-    ...(process.platform === 'darwin' && {
-      trafficLightPosition: { x: 9, y: 11 },
-      tabbingIdentifier: 'intent',
-    }),
+    ...getWindowTitleBarOptions(),
     title: opts.title,
-    backgroundColor: isDarkMode ? '#0a0a0a' : '#ffffff',
+    ...getWindowAppearanceOptions(isDarkMode),
     ...(opts.iconPath && { icon: opts.iconPath }),
   };
 }
@@ -128,26 +119,58 @@ function buildWindowOptions(opts: {
 const RENDERER_CONSOLE_MAX_MESSAGE_CHARS = 4096;
 
 /**
+ * Renderer INFO breadcrumbs that are forwarded despite the info-level filter.
+ *
+ * Info is dropped by default to keep the log bounded, but a diagnostic whose
+ * entire purpose is to populate a debug bundle is useless if it never reaches
+ * the file. Entries here must be low-rate and periodic — `[RetentionFingerprint]`
+ * emits one line per five minutes. Anything chatty belongs at debug instead.
+ */
+const FORWARDED_RENDERER_INFO_MARKERS = ['[RetentionFingerprint]'] as const;
+
+function isForwardedInfoMessage(level: string, message: string): boolean {
+  return level === 'info' && FORWARDED_RENDERER_INFO_MARKERS.some((m) => message.includes(m));
+}
+
+/**
+ * Logger for forwarded renderer breadcrumbs.
+ *
+ * A separate category from `Main` because it is pinned to INFO in
+ * logging-config: the production defaultLevel is WARN, so routing the
+ * allowlisted info lines through `Main` would silently drop them in packaged
+ * builds — the exact machines debug bundles come from. Note that `Logger`
+ * re-reads the level from config on every call and ignores its constructor
+ * `level` option, so registering the category is the only thing that works.
+ */
+const rendererConsoleLogger = new Logger('RendererConsole');
+
+/**
  * Forward renderer console warnings/errors into the main-process log so they
  * land in {userData}/logs/console-output.log (via setupConsoleLogCapture) and
  * debug exports. Closes the diagnosability gap where renderer-only breadcrumbs
  * (e.g. failed comment.add evidence) were invisible in persistent logs.
- * Info/debug/verbose messages are intentionally not forwarded, messages are
- * truncated to a few KB, and consecutive duplicates are counted instead of
- * re-written, to keep the log file bounded.
+ * Debug/verbose messages are never forwarded, info only for the explicit
+ * allowlist above, messages are truncated to a few KB, and consecutive
+ * duplicates are counted instead of re-written, to keep the log file bounded.
  */
 export function forwardRendererConsoleToMainLog(window: BrowserWindowType): void {
   let lastLine = '';
   let suppressed = 0;
   window.webContents.on('console-message', (details) => {
     const { level, message, sourceId, lineNumber } = details;
-    if (level !== 'warning' && level !== 'error') return;
+    const forwardedInfo = isForwardedInfoMessage(level, message);
+    if (level !== 'warning' && level !== 'error' && !forwardedInfo) return;
     const origin = `${sourceId || 'renderer'}:${lineNumber}`;
     const bounded =
       message.length > RENDERER_CONSOLE_MAX_MESSAGE_CHARS
         ? `${message.slice(0, RENDERER_CONSOLE_MAX_MESSAGE_CHARS)}… [truncated ${message.length - RENDERER_CONSOLE_MAX_MESSAGE_CHARS} chars]`
         : message;
-    const line = `[RendererConsole] ${bounded} (${origin})`;
+    // Warn/error keep the literal tag because they log under the `Main`
+    // category; the info path already carries `RendererConsole` as its logger
+    // context, so repeating it would stutter in the file.
+    const line = forwardedInfo
+      ? `${bounded} (${origin})`
+      : `[RendererConsole] ${bounded} (${origin})`;
     if (line === lastLine) {
       suppressed += 1;
       return;
@@ -159,6 +182,8 @@ export function forwardRendererConsoleToMainLog(window: BrowserWindowType): void
     lastLine = line;
     if (level === 'error') {
       logger.error(line);
+    } else if (forwardedInfo) {
+      rendererConsoleLogger.info(line);
     } else {
       logger.warn(line);
     }
@@ -168,7 +193,9 @@ export function forwardRendererConsoleToMainLog(window: BrowserWindowType): void
 /**
  * Build the URL to load in a window (dev server or production app:// protocol).
  */
-function buildLoadUrl(route: string = '/'): string {
+const DEFAULT_WINDOW_ROUTE = '/workspace/new';
+
+function buildLoadUrl(route: string = DEFAULT_WINDOW_ROUTE): string {
   if (process.env.NODE_ENV === 'development') {
     const devPort = process.env.DEV_PORT || '5190';
     return `http://127.0.0.1:${devPort}${route}`;
@@ -176,17 +203,61 @@ function buildLoadUrl(route: string = '/'): string {
   return `app://workspaces${route}`;
 }
 
-
 // ---- Window Session Persistence ----
-// Saves and restores window sessions so the app reopens with the same workspaces/windows.
+// Saves and restores window sessions so the app reopens with the same
+// workspaces/windows. Sessions are keyed by the active backend id (T2's
+// connections store), so each backend restores its own window layout on switch.
 
 export interface WindowSession {
   route: string;
   bounds: { x: number; y: number; width: number; height: number };
 }
 
+/**
+ * On-disk shape of window-sessions.json: a map from backend id (see T2's
+ * connections store) to that backend's saved window layout. Legacy files hold
+ * a bare `WindowSession[]` — that shape is migrated into the `local` bucket on
+ * read (see `readSessionsMap`).
+ */
+export type WindowSessionsMap = Record<string, WindowSession[]>;
+
+/** Max windows restored per backend, guarding against a corrupted sessions file. */
+const MAX_SESSIONS_PER_BACKEND = 20;
+
 export function getWindowSessionsPath(): string {
   return path.join(app.getPath('userData'), 'window-sessions.json');
+}
+
+/**
+ * Read the raw sessions file and normalize it into a backend-keyed map.
+ *
+ * Migration: a legacy top-level array (the pre-multi-backend global sessions
+ * list) is folded into the `local` backend id so existing single-backend users
+ * keep their layout on first run after upgrade. A malformed/absent file yields
+ * an empty map.
+ */
+function readSessionsMap(): WindowSessionsMap {
+  try {
+    const sessionsPath = getWindowSessionsPath();
+    if (!fs.existsSync(sessionsPath)) return {};
+    const data = JSON.parse(fs.readFileSync(sessionsPath, 'utf-8'));
+    if (Array.isArray(data)) {
+      // Legacy global sessions → migrate under the local backend id.
+      return { [LOCAL_CONNECTION_ID]: data.filter(isValidWindowSession) };
+    }
+    if (data && typeof data === 'object') {
+      const map: WindowSessionsMap = {};
+      for (const [backendId, sessions] of Object.entries(data)) {
+        if (Array.isArray(sessions)) {
+          map[backendId] = sessions.filter(isValidWindowSession);
+        }
+      }
+      return map;
+    }
+  } catch (err) {
+    logger.warn('Failed to read window sessions map:', err);
+  }
+  return {};
 }
 
 // In-memory snapshot of the most recent non-empty sessions list. Used as a
@@ -207,19 +278,19 @@ function buildSessionsFromOpenWindows(): WindowSession[] {
     .map((w: BrowserWindowType) => {
       const bounds = w.getBounds();
       const url = w.webContents.getURL();
-      let route = '/';
+      let route = DEFAULT_WINDOW_ROUTE;
       try {
         const parsed = new URL(url);
         if (parsed.protocol === 'file:') {
           // Windows created via WINDOW_CHANNELS.CREATE use file:// with ?initialRoute=
           const initialRoute = parsed.searchParams.get('initialRoute');
-          route = initialRoute || '/';
+          route = initialRoute || DEFAULT_WINDOW_ROUTE;
         } else {
           // For dev (http:) and production (app:): pathname is the route
           route = parsed.pathname;
         }
       } catch {
-        // Fall back to home
+        // Fall back to the workspace bootstrap route.
       }
       return { route, bounds };
     });
@@ -244,7 +315,7 @@ export function captureWindowSessionsSnapshot(): void {
   }
 }
 
-export async function saveWindowSessions(): Promise<void> {
+export async function saveWindowSessions(backendId: string): Promise<void> {
   try {
     let sessions = buildSessionsFromOpenWindows();
 
@@ -260,10 +331,14 @@ export async function saveWindowSessions(): Promise<void> {
       });
     }
 
-    const sessionsPath = getWindowSessionsPath();
     if (sessions.length > 0) {
-      await fsAsync.writeFile(sessionsPath, JSON.stringify(sessions), 'utf-8');
+      // Read-modify-write the backend-keyed map so saving one backend's layout
+      // never clobbers another backend's saved sessions.
+      const map = readSessionsMap();
+      map[backendId] = sessions;
+      await fsAsync.writeFile(getWindowSessionsPath(), JSON.stringify(map), 'utf-8');
       logger.debug('Saved window sessions', {
+        backendId,
         count: sessions.length,
         routes: sessions.map((s) => s.route),
       });
@@ -309,20 +384,18 @@ export function isValidWindowSession(s: unknown): s is WindowSession {
   );
 }
 
-export function loadWindowSessions(): WindowSession[] | null {
+export function loadWindowSessions(backendId: string): WindowSession[] | null {
   try {
-    const sessionsPath = getWindowSessionsPath();
-    if (fs.existsSync(sessionsPath)) {
-      const data = JSON.parse(fs.readFileSync(sessionsPath, 'utf-8'));
-      if (Array.isArray(data) && data.length > 0) {
-        const valid = data.filter(isValidWindowSession);
-        if (valid.length > 0) {
-          // Cap at 20 windows to guard against corrupted sessions file
-          const capped = valid.slice(0, 20);
-          logger.info('Loaded window sessions', { count: capped.length, total: valid.length });
-          return capped;
-        }
-      }
+    const valid = readSessionsMap()[backendId];
+    if (valid && valid.length > 0) {
+      // Cap per backend to guard against a corrupted sessions file.
+      const capped = valid.slice(0, MAX_SESSIONS_PER_BACKEND);
+      logger.info('Loaded window sessions', {
+        backendId,
+        count: capped.length,
+        total: valid.length,
+      });
+      return capped;
     }
   } catch (err) {
     logger.warn('Failed to load window sessions:', err);
@@ -346,9 +419,6 @@ export function createWindowForSession(session: WindowSession, setAsMain: boolea
 
   if (setAsMain) {
     setMainWindow(window);
-    import('../features/auto-update/main/auto-update.ipc')
-      .then(({ updateAutoUpdaterWindow }) => updateAutoUpdaterWindow(window))
-      .catch(() => {});
   }
 
   // Clear cache in production to ensure fresh file references after rebuilds
@@ -361,7 +431,8 @@ export function createWindowForSession(session: WindowSession, setAsMain: boolea
       );
   }
 
-  window.loadURL(buildLoadUrl(session.route));
+  const route = session.route === '/' ? DEFAULT_WINDOW_ROUTE : session.route;
+  window.loadURL(buildLoadUrl(route));
 
   // Save bounds on resize/move (updates the main window bounds file for backward compat)
   let saveBoundsTimeout: NodeJS.Timeout | null = null;
@@ -393,6 +464,61 @@ export function createWindowForSession(session: WindowSession, setAsMain: boolea
   logger.info('Restored session window', { route: session.route, isMain: setAsMain });
 }
 
+/**
+ * Backend-switch window hook — capture + teardown half (consumed by T3's
+ * switch orchestration).
+ *
+ * Persists the currently-open workspace/HUD windows under `fromBackendId` (so
+ * switching back restores them), then tears them all down. Split from
+ * `restoreWindowsForBackend` so the orchestrator can dispose the old client,
+ * connect the new one, and flip the active id in between — the windows it later
+ * restores then hit the NEW daemon.
+ *
+ * Windows are `destroy()`ed, not `close()`d, so the graceful close-snapshot /
+ * debounced-save handlers can't race a stale layout back into the wrong
+ * backend's bucket.
+ */
+export async function captureAndCloseWindowsForBackendSwitch(fromBackendId: string): Promise<void> {
+  // Persist the outgoing backend's layout while its windows are still live.
+  await saveWindowSessions(fromBackendId);
+  // That capture belongs to fromBackendId; wipe the id-agnostic snapshot cache
+  // so a later save for the incoming backend can't resurrect it.
+  clearWindowSessionsSnapshot();
+
+  // Tear down every workspace/HUD window.
+  for (const w of BrowserWindow.getAllWindows()) {
+    if (!w.isDestroyed()) w.destroy();
+  }
+  setMainWindow(null);
+}
+
+/**
+ * Backend-switch window hook — restore half (consumed by T3's switch
+ * orchestration).
+ *
+ * Restores `toBackendId`'s saved window layout, or opens one fresh default
+ * window when that backend has no saved sessions. Call AFTER the new client is
+ * connected and the active id has been flipped, so restored windows load
+ * against the incoming daemon.
+ */
+export function restoreWindowsForBackend(toBackendId: string): void {
+  const savedSessions = loadWindowSessions(toBackendId);
+  if (savedSessions && savedSessions.length > 0) {
+    logger.info('Restoring window sessions for backend switch', {
+      backendId: toBackendId,
+      count: savedSessions.length,
+    });
+    for (let i = 0; i < savedSessions.length; i++) {
+      createWindowForSession(savedSessions[i], i === 0);
+    }
+  } else {
+    logger.info('No saved sessions for backend; opening a fresh window', {
+      backendId: toBackendId,
+    });
+    createWindow();
+  }
+}
+
 export function createWindow() {
   const iconPath = resolveIcon(true);
   const { workArea } = screen.getPrimaryDisplay();
@@ -405,7 +531,12 @@ export function createWindow() {
     height?: number;
   }
 
-  let windowBounds = { x: workArea.x, y: workArea.y, width: workArea.width, height: workArea.height };
+  let windowBounds = {
+    x: workArea.x,
+    y: workArea.y,
+    width: workArea.width,
+    height: workArea.height,
+  };
 
   const savedBoundsPath = path.join(app.getPath('userData'), 'window-bounds.json');
   try {
@@ -440,11 +571,6 @@ export function createWindow() {
   forwardRendererConsoleToMainLog(window);
 
   setMainWindow(window);
-
-  // Update auto-updater's window reference so status events go to the current window
-  import('../features/auto-update/main/auto-update.ipc')
-    .then(({ updateAutoUpdaterWindow }) => updateAutoUpdaterWindow(window))
-    .catch(() => {});
 
   // Save window bounds when resized or moved (debounced)
   let saveBoundsTimeout: NodeJS.Timeout | null = null;
@@ -506,7 +632,10 @@ export function createWindow() {
  * Create deep links are sent to the existing window unless newWindow=true.
  * All other deep link types create a new window.
  */
-export async function createWindowForDeepLink(deepLinkUrl: string, deepLinkHandler: DeepLinkHandler) {
+export async function createWindowForDeepLink(
+  deepLinkUrl: string,
+  deepLinkHandler: DeepLinkHandler,
+) {
   logger.info('Creating window for deep link:', { url: deepLinkUrl });
 
   // Parse the deep link to extract action and params
@@ -543,13 +672,11 @@ export async function createWindowForDeepLink(deepLinkUrl: string, deepLinkHandl
   const { workArea } = screen.getPrimaryDisplay();
   const bounds = { x: workArea.x, y: workArea.y, width: workArea.width, height: workArea.height };
 
-  const newWindow = new BrowserWindow(
-    buildWindowOptions({ bounds, title: resolveAppTitle() }),
-  );
+  const newWindow = new BrowserWindow(buildWindowOptions({ bounds, title: resolveAppTitle() }));
   forwardRendererConsoleToMainLog(newWindow);
 
   const encodedAction = encodeURIComponent(JSON.stringify(action));
-  newWindow.loadURL(buildLoadUrl(`/?deepLink=${encodedAction}`));
+  newWindow.loadURL(buildLoadUrl(`${DEFAULT_WINDOW_ROUTE}?deepLink=${encodedAction}`));
   newWindow.focus();
 
   logger.info('New window created for deep link:', { action: action.type });

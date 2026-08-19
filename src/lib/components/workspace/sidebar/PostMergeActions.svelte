@@ -7,36 +7,31 @@
   import { workspaceClient } from '$store/renderer/slices/workspace/utils/workspace.client';
 
   import {
-  setPostMergeState,
-  setGitOperationFlag,
-  loadGitStatus,
-} from '$store/renderer/slices/git/git-slice';
+    loadGitStatus,
+    setPostMergeState,
+    setGitOperationFlag,
+  } from '$store/renderer/slices/git/git-slice';
   import {
-  refreshAcceptChangesStatus,
-  clearOlderCommits as ftClearOlderCommits,
-  refreshRequested,
-} from '$store/renderer/slices/changes/changes-slice';
+    refreshAcceptChangesStatus,
+    clearOlderCommits as ftClearOlderCommits,
+    refreshRequested,
+  } from '$store/renderer/slices/changes/changes-slice';
   import {
-  selectPostMergeState,
-  selectGitOperationFlags,
-} from '$store/renderer/slices/git/git-selectors';
+    selectPostMergeState,
+    selectGitOperationFlags,
+  } from '$store/renderer/slices/git/git-selectors';
   import { selectWorkspaceById } from '$store/renderer/slices/workspace/workspace-selectors';
   import {
-  loadWorkspacesRequested,
-  setWorkspaceEntity,
-} from '$store/renderer/slices/workspace/workspace-slice';
-
-
+    loadWorkspacesRequested,
+    setWorkspaceEntity,
+  } from '$store/renderer/slices/workspace/workspace-slice';
 
   import { Button } from '$lib/components/ui/button';
   import { toast } from '$lib/components/ui/toast';
+  import { isDaemonManagedRepoPath } from '$lib/components/workspace/initializer/recent-repo-display';
   import type { WorkspaceId } from '$shared/types/branded-ids';
   import type { PostMergeState } from '$store/renderer/slices/git/git-types';
-  import {
-  faRotateLeft,
-  faRocket,
-  faSpinner,
-} from '@fortawesome/free-solid-svg-icons';
+  import { faRotateLeft, faRocket, faSpinner } from '@fortawesome/free-solid-svg-icons';
   import Fa from 'svelte-fa';
   import { writable } from 'svelte/store';
   import { store as appStore } from '$store/renderer/store';
@@ -49,7 +44,6 @@
   }
 
   let { workspaceId, hasNoLocalChanges, trunkBranch }: Props = $props();
-
 
   const workspaceIdStore = writable('');
   $effect(() => {
@@ -77,6 +71,7 @@
   // Start new workspace with same repo after merge, archiving the current one
   async function handleStartNewSpace() {
     const repo = $workspace?.repositoryPath;
+    const worktree = $workspace?.worktreePath;
     const currentWorkspaceId = $workspace?.id;
 
     // Archive the current workspace first
@@ -89,13 +84,19 @@
       appStore.dispatch(loadWorkspacesRequested());
     }
 
-    // Pre-fill the create form with the current repo info via sessionStorage
-    if (repo) {
+    // Pre-fill the create form with the current repo info via sessionStorage.
+    // Only local-source repos are prefilled (mirrors NewWorkspaceCard):
+    // workspace-owned standalone checkouts (GitHub picks, where
+    // repositoryPath === worktreePath) and daemon-managed paths are not
+    // copyable local sources, so prefilling them would open the Copy-local
+    // tab against a daemon-owned directory.
+    if (repo && repo !== worktree && !isDaemonManagedRepoPath(repo)) {
       sessionStorage.setItem('workspace-prefill', JSON.stringify({ repoPath: repo }));
     }
 
     // Open the create workspace modal
-    const { setShowCreateModal } = await import('$store/renderer/slices/sidebar-nav/sidebar-nav-slice');
+    const { setShowCreateModal } =
+      await import('$store/renderer/slices/sidebar-nav/sidebar-nav-slice');
     appStore.dispatch(setShowCreateModal(true));
   }
 
@@ -120,7 +121,7 @@
           // Clear older commits pagination cache which may reference commits from old history
           appStore.dispatch(ftClearOlderCommits(workspaceId));
 
-          // Refresh all stores in parallel
+          // Git and Changes have separate canonical read owners; preserve dispatch order.
           await Promise.all([
             Promise.resolve(appStore.dispatch(loadGitStatus(workspaceId, true))),
             appStore.dispatch(refreshRequested(workspaceId, true)),
@@ -171,7 +172,7 @@
   }
 </script>
 
-<div class="mt-4 pt-4 border-t border-border/50 ml-4 space-y-3">
+<div class="mt-4 pt-4 border-t border-border ml-4 space-y-3">
   <!-- Reset and continue button - hidden when there are uncommitted changes or unpushed commits -->
   {#if hasNoLocalChanges}
     <div>
@@ -198,12 +199,7 @@
   {#if hasNoLocalChanges && !$workspace?.archived}
     <!-- Archive and start new space button -->
     <div>
-      <Button
-        variant="outline"
-        size="sm"
-        class="w-full gap-2"
-        onclick={handleStartNewSpace}
-      >
+      <Button variant="outline" size="sm" class="w-full gap-2" onclick={handleStartNewSpace}>
         <Fa icon={faRocket} size="sm" class="text-primary" />
         <span>{m.workspace_postMerge_archiveStartNew_label()}</span>
       </Button>

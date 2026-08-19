@@ -5,16 +5,17 @@
  * `WorkspaceTask[]` projection AND the workspace-wide `taskStats` aggregate the
  * BE owns. The FE renders `stats` verbatim — it never re-derives task progress
  * from the task list (or from `note.list`). `subscribe` aggregates tasks
- * across workspaces — converging via one typed per-workspace `task.subscribe`
- * channel per workspace (PROTOCOL §6.9) on liveState daemons, and refetching
- * on legacy `task:*`/`note:*` events otherwise (task status lives in note
- * metadata).
+ * across workspaces, converging via one typed per-workspace `task.subscribe`
+ * channel per workspace (PROTOCOL §6.9) — the sole data path
+ * (intent-hq/monorepo#1697); there is no legacy `task:*`/`note:*`
+ * events-driven refetch.
  */
-import type { TaskStatus, WorkspaceTask, WorkspaceTaskStats } from "$shared/types";
+import type { NoteId, TaskStatus, WorkspaceTask, WorkspaceTaskStats } from "$shared/types";
 import type {
   CreatePrerequisiteOptions,
   MarkAsTaskOptions,
   MutationResult,
+  SetRelationsParams,
   SubscriptionHandler,
   TaskCheckboxStatus,
   TaskUpdatePatch,
@@ -28,14 +29,62 @@ import type {
 import { backendRequest } from "./backend-transport";
 import { createDeltaSubscription } from "./delta-subscription";
 import {
-  isEventInFamily,
-  listWorkspaceIds,
   newIdempotencyKey,
   rememberNoteWorkspace,
   resolveNoteWorkspaceId,
   runMutationWithId,
   subscribeWorkspaceIds,
 } from "./live-support";
+import { createLogger } from "$lib/utils/client-logger";
+
+const logger = createLogger("LiveTasksClient");
+
+/**
+ * Carry a wire string-array field through only when it is a non-empty string
+ * array. A non-empty array with a non-string member is a contract divergence
+ * (PROTOCOL §5.4 lists are task-note id strings) — it is discarded with a warn
+ * so a BE-side break surfaces instead of vanishing silently.
+ */
+function stringArray(field: string, value: unknown): string[] | undefined {
+  if (!Array.isArray(value) || value.length === 0) return undefined;
+  if (!value.every((v) => typeof v === "string")) {
+    logger.warn(`discarding malformed ${field}: expected string[], got non-string member`, {
+      value,
+    });
+    return undefined;
+  }
+  return value as string[];
+}
+
+/**
+ * Relation fields (v6.8, presence-detected): `dependsOn` / `conflictsWith`
+ * plus the daemon-computed `unmetDependsOn`, all read from the source shape —
+ * top-level on `task.list` rows, `metadata.task` on note-shaped entities
+ * (monorepo#1979).
+ */
+function relationFields(
+  source: Record<string, unknown>,
+): Pick<WorkspaceTask, "dependsOn" | "conflictsWith" | "unmetDependsOn"> {
+  const dependsOn = stringArray("dependsOn", source.dependsOn) as NoteId[] | undefined;
+  const conflictsWith = stringArray("conflictsWith", source.conflictsWith) as NoteId[] | undefined;
+  const unmetDependsOn = stringArray("unmetDependsOn", source.unmetDependsOn) as
+    | NoteId[]
+    | undefined;
+  return {
+    ...(dependsOn ? { dependsOn } : {}),
+    ...(conflictsWith ? { conflictsWith } : {}),
+    ...(unmetDependsOn ? { unmetDependsOn } : {}),
+  };
+}
+
+/**
+ * `specLinked` (additive, PROTOCOL §5.4): carried through only when the wire
+ * row has the boolean — an older daemon omits it and consumers keep their
+ * legacy behavior on `undefined` (presence-detected like the relation fields).
+ */
+function specLinkedField(source: Record<string, unknown>): Pick<WorkspaceTask, "specLinked"> {
+  return typeof source.specLinked === "boolean" ? { specLinked: source.specLinked } : {};
+}
 
 /** Map a raw daemon note to a `WorkspaceTask` when it carries task metadata. */
 function noteToTask(raw: Record<string, unknown>): WorkspaceTask | null {
@@ -55,6 +104,8 @@ function noteToTask(raw: Record<string, unknown>): WorkspaceTask | null {
     // Optimistic-concurrency revision (§11.4-D): carried through when the daemon
     // returns it, left undefined otherwise (no behavior change → last-writer-wins).
     ...(typeof raw.rev === "number" ? { rev: raw.rev } : {}),
+    ...relationFields(task as Record<string, unknown>),
+    ...specLinkedField(task as Record<string, unknown>),
   };
 }
 
@@ -79,6 +130,8 @@ function normalizeTaskEntity(raw: Record<string, unknown>): WorkspaceTask | null
           ? raw.updated_at
           : undefined,
     ...(typeof raw.rev === "number" ? { rev: raw.rev } : {}),
+    ...relationFields(raw),
+    ...specLinkedField(raw),
   };
 }
 
@@ -250,9 +303,27 @@ export class LiveTasksClient implements TasksClient {
           ? { acceptanceCriteria: options.acceptanceCriteria }
           : {}),
         ...(options?.effort !== undefined ? { effort: options.effort } : {}),
+        ...(options?.dependsOn !== undefined ? { dependsOn: options.dependsOn } : {}),
+        ...(options?.conflictsWith !== undefined
+          ? { conflictsWith: options.conflictsWith }
+          : {}),
       },
       expectedVersion,
     );
+  }
+
+  /**
+   * `task.setRelations` (PROTOCOL §5.4, v6.8): replace the task's relation
+   * lists. Omitted params are NOT sent — the daemon keeps the existing list;
+   * `[]` is sent and clears it.
+   */
+  async setRelations(noteId: string, relations: SetRelationsParams): Promise<MutationResult> {
+    return this.runTaskMutation(noteId, "task.setRelations", {
+      ...(relations.dependsOn !== undefined ? { dependsOn: relations.dependsOn } : {}),
+      ...(relations.conflictsWith !== undefined
+        ? { conflictsWith: relations.conflictsWith }
+        : {}),
+    });
   }
 
   async assignAgent(
@@ -388,20 +459,17 @@ export class LiveTasksClient implements TasksClient {
   /**
    * Subscribe to tasks across every workspace.
    *
-   * Typed §6.9 channel: on liveState daemons one per-workspace
-   * `task.subscribe` (`{ workspaceId }`) is registered per id yielded by
-   * `subscribeWorkspaceIds` — the same enumeration `fetchAll` flattens over.
+   * Typed §6.9 channel: one per-workspace `task.subscribe`
+   * (`{ workspaceId }`) is registered per id yielded by
+   * `subscribeWorkspaceIds` — the sole data path (intent-hq/monorepo#1697).
    * The channel carries task notes; the BE emits `removedIds` when a note is
    * deleted OR demoted (its task metadata removed), which the reconciler
    * drops. Workspace add → a new channel registers and its snapshot merges
    * in; workspace delete → the channel unsubscribes and its tasks are
-   * evicted. While ANY workspace channel lacks a push-confirmed registration
-   * the subscription stays legacy and refetches keep serving (the #775
-   * safety net); daemons without liveState never register channels at all.
+   * evicted.
    */
   subscribe(handler: SubscriptionHandler<WorkspaceTask[]>): Unsubscribe {
     return createDeltaSubscription<WorkspaceTask>({
-      eventTypes: ["task:status-changed", "task:ready-tasks-changed", "note:updated"],
       channel: {
         subscribeMethod: "task.subscribe",
         unsubscribeMethod: "task.unsubscribe",
@@ -409,13 +477,6 @@ export class LiveTasksClient implements TasksClient {
           subscribeIds: subscribeWorkspaceIds,
           paramsForId: (id) => ({ workspaceId: id }),
         },
-      },
-      matchLegacyEvent: (method, params) =>
-        isEventInFamily(method, params, "task") || isEventInFamily(method, params, "note"),
-      fetchAll: async () => {
-        const ids = await listWorkspaceIds();
-        const perWorkspace = await Promise.all(ids.map((id) => this.list(id)));
-        return perWorkspace.flatMap((entry) => entry.tasks);
       },
       getId: (raw) => String(raw.id ?? ""),
       // Push-path entities are the daemon's task-filtered wire `Note` (§6.9),

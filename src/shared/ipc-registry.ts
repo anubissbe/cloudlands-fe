@@ -162,8 +162,6 @@ export const IPC_CHANNELS = {
   },
 
   // Events System
-  // NOTE: Advanced queries (recent files, agent activity, workspace summary) are handled
-  // via AgentEventTools on the main process side, not via IPC.
   EVENTS: {
     QUERY: 'events:query',
     SUBSCRIBE: 'events:subscribe',
@@ -177,8 +175,6 @@ export const IPC_CHANNELS = {
 
   // Auggie Integration
   AUGGIE: {
-    CHECK_AVAILABILITY: 'auggie:check-availability',
-    STATUS: 'auggie:status',
     INSTALL: 'auggie:install',
     AUTHENTICATE: 'auggie:authenticate',
     GET_MODELS: 'auggie:get-models',
@@ -211,8 +207,6 @@ export const IPC_CHANNELS = {
   CODEX: {
     CHECK_AVAILABILITY: 'codex:check-availability',
     GET_MODELS: 'codex:get-models',
-    MANAGED_INSTALL_STATUS: 'codex/managed-install/status',
-    MANAGED_INSTALL_PROGRESS: 'codex/managed-install/progress',
   },
 
   // Cortex Integration
@@ -254,6 +248,8 @@ export const IPC_CHANNELS = {
   // File Management
   FILE: {
     READ: 'file:read',
+    READ_CHUNK: 'file:read-chunk',
+    HASH: 'file:hash',
     WRITE: 'file:write',
     DELETE: 'file:delete',
     EXISTS: 'file:exists',
@@ -268,6 +264,8 @@ export const IPC_CHANNELS = {
     GET_GIT_STATUS: 'file:getGitStatus',
     GET_TREE_WITH_SIZES: 'file:getTreeWithSizes',
     GET_DIRECTORY_STATUS: 'file:getDirectoryStatus',
+    DOWNLOAD: 'file:download',
+    DOWNLOAD_ATTACHMENT: 'file:download-attachment',
   },
 
   // Notes Primitives (ws-block rendering)
@@ -288,7 +286,6 @@ export const IPC_CHANNELS = {
     WRITE_CLIPBOARD: 'system:write-clipboard',
     BEEP: 'system:beep',
     HOME_DIRECTORY: 'system:home-directory',
-    WORKSPACE_ROOT: 'system:workspace-root',
     EXECUTE_COMMAND: 'system:execute-command',
     EXECUTE_COMMAND_STREAMING: 'system:execute-command-streaming',
     CHECK_GIT: 'system:check-git',
@@ -481,6 +478,8 @@ export const IPC_CHANNELS = {
     UNREGISTER_TAB: 'browser:unregister-tab',
     /** Execute code with access to browser CDP API */
     EXEC: 'browser:exec',
+    /** Resolve a URL through the loopback rewrite → probe → tunnel pipeline */
+    RESOLVE_URL: 'browser:resolve-url',
     /** Focus a browser tab (bring to front) - main->renderer event */
     FOCUS_TAB: 'browser:focus-tab',
     /** Request browser tab list from renderer (main->renderer event) */
@@ -489,6 +488,12 @@ export const IPC_CHANNELS = {
     LIST_TABS_RESPONSE: 'browser:list-tabs-response',
     /** Open a browser tab in a panel - main->renderer event */
     OPEN_TAB: 'browser:open-tab',
+    /** Close a browser tab in a panel - main->renderer event */
+    CLOSE_TAB: 'browser:close-tab',
+    /** Main navigated an existing tab (agent navigate/reuse) - main->renderer event */
+    TAB_NAVIGATED: 'browser:tab-navigated',
+    /** A tab's owner agent changed (claim/agent open) - main->renderer event */
+    TAB_OWNER_CHANGED: 'browser:tab-owner-changed',
   },
 
   // File Tracking
@@ -518,9 +523,6 @@ export const IPC_CHANNELS = {
     TRACK_FILE_CHANGE: 'log:track-file-change',
     TRACK_AGENT_EVENT: 'log:track-agent-event',
     TRACK_MCP_CALL: 'log:track-mcp-call',
-    GET_EVENTS: 'log:get-events',
-    CLEAR_EVENTS: 'log:clear-events',
-    EVENTS_UPDATED: 'log:events-updated',
     PATHS: 'log:paths',
     READ: 'log:read',
     CLEAR: 'log:clear',
@@ -528,8 +530,6 @@ export const IPC_CHANNELS = {
     EXPORT_DEBUG_BUNDLE: 'log:export-debug-bundle',
     PERSIST_RENDERER_LOGS: 'log:persist-renderer-logs',
   },
-
-
 
   // User Rules
   USER_RULES: {
@@ -610,16 +610,6 @@ export const IPC_CHANNELS = {
     MARK_NOTE_READ: 'user-activity:mark-note-read',
     GET_NOTE_READ_STATUS: 'user-activity:get-note-read-status',
     GET_UNREAD_NOTE_IDS: 'user-activity:get-unread-note-ids',
-  },
-
-
-
-  // Diffs
-  DIFFS: {
-    LIST: 'diffs:list',
-    CREATE: 'diffs:create',
-    UPDATE: 'diffs:update',
-    GET: 'diffs:get',
   },
 
   // Line Attribution
@@ -772,8 +762,6 @@ export const IPC_CHANNELS = {
     DELETE: 'storage:delete',
   },
 
-
-
   // Auto-Update
   AUTO_UPDATE: {
     CHECK_MANUAL: 'auto-update:check-manual',
@@ -812,19 +800,6 @@ export const IPC_CHANNELS = {
     SET_DISCOVERY: 'websocket-api:set-discovery',
   },
 
-  // Workspace Scripts
-  SCRIPTS: {
-    LIST: 'scripts:list',
-    CREATE: 'scripts:create',
-    UPDATE: 'scripts:update',
-    REMOVE: 'scripts:remove',
-    START: 'scripts:start',
-    STOP: 'scripts:stop',
-    RESTART: 'scripts:restart',
-    GET_STATUS: 'scripts:get-status',
-    GET_OUTPUT: 'scripts:get-output',
-  },
-
   // Workspace Token Usage (aggregated agent token consumption)
   TOKEN_USAGE: {
     GET: 'token-usage:get',
@@ -851,7 +826,58 @@ export const IPC_CHANNELS = {
     NOTIFICATION: 'backend:notification',
     STATUS: 'backend:status',
     SPAWN_SIDECAR: 'backend:spawn-sidecar',
+    // Atomic recovery from external/remote mode: switch the active backend to
+    // local AND spawn the app-managed sidecar in ONE main-process action. The
+    // switch destroys every window (captureAndClose) before the switch IPC
+    // returns, so a renderer that switched then dispatched the spawn separately
+    // could be torn down before the second step runs — this single handler keeps
+    // both steps in main so recovery survives the window teardown.
+    SWITCH_LOCAL_AND_SPAWN: 'backend:switch-local-and-spawn',
     GET_SIDECAR_RUN_LOG: 'backend:get-sidecar-run-log',
+    // Kill-and-restart recovery for an orphaned sidecar (#2444): the adopted
+    // daemon's executable lives inside our own bundle (leftover from a
+    // crashed/force-quit session). The handler re-verifies the classification,
+    // confirms with the user when agents are responding, stops the orphan
+    // (SIGTERM→SIGKILL) and spawns the bundled sidecar.
+    RESTART_ORPHANED_SIDECAR: 'backend:restart-orphaned-sidecar',
+  },
+
+  // Multi-backend connect: the "Connect to another intentd" registry.
+  // Request/response channels for the connections list + TOFU pairing +
+  // switch. Handlers land in T3; the renderer-facing contract types live in
+  // `shared/types/connections.ts`. CHANGED / CERT_MISMATCH are main→renderer
+  // push events (also listed in EVENT_CHANNELS for the preload allow-list).
+  CONNECTIONS: {
+    LIST: 'connections:list',
+    CAPTURE_FINGERPRINT: 'connections:capture-fingerprint',
+    ADD: 'connections:add',
+    FORGET: 'connections:forget',
+    SWITCH: 'connections:switch',
+    CHANGED: 'connections:changed',
+    CERT_MISMATCH: 'connections:cert-mismatch',
+    PROTOCOL_MISMATCH: 'connections:protocol-mismatch',
+    AUTH_REJECTED: 'connections:auth-rejected',
+    // Pull the one-shot boot-restore fallback notice latched in main (T19),
+    // consume-once. The renderer fetches this once on mount and surfaces a
+    // non-blocking toast; the notice never becomes connections-slice state.
+    GET_BOOT_FALLBACK: 'connections:get-boot-fallback',
+  },
+
+  // Workspace transfer relay (main-process, wizard steps 3–4). The renderer
+  // starts/finalizes/cancels the relay; archive bytes never cross IPC —
+  // progress counters arrive on the `transfer:progress` push channel
+  // (EVENT_CHANNELS).
+  TRANSFER: {
+    START: 'transfer:start',
+    FINALIZE: 'transfer:finalize',
+    CANCEL: 'transfer:cancel',
+    PROGRESS: 'transfer:progress',
+    // Import-from-file (File menu): main reads a transfer zip from disk and
+    // streams it into the CURRENT backend. Bytes never cross renderer IPC —
+    // counters arrive on the `transfer:import-progress` push channel.
+    IMPORT_START: 'transfer:import-start',
+    IMPORT_CANCEL: 'transfer:import-cancel',
+    IMPORT_PROGRESS: 'transfer:import-progress',
   },
 
   // Hardware console (Codex Micro / Creator Micro 2)
@@ -862,6 +888,12 @@ export const IPC_CHANNELS = {
     // Renderer → main one-way ack once lighting is cleared (or there was
     // nothing to do).
     CLEAR_LIGHTING_DONE: 'hardware-console:clear-lighting-done',
+    // Renderer → main invoke: does the calling window own the console
+    // (i.e. is it the last-focused non-HUD window)? → { isOwner: boolean }
+    GET_OWNER_STATUS: 'hardware-console:get-owner-status',
+    // Main → renderer push on every ownership change, per-webContents
+    // { isOwner: boolean } payload (also in EVENT_CHANNELS).
+    OWNER_CHANGED: 'hardware-console:owner-changed',
   },
 } as const;
 
@@ -948,15 +980,12 @@ export const EVENT_CHANNELS = [
   'terminal:professional:command:finished',
   'terminal:professional:command:executed',
   'terminal:professional:cwd:changed',
-  'codex/managed-install/status',
-  'codex/managed-install/progress',
   'terminal:disposed', // Terminal disposed event (from workspace cleanup)
   'events:new',
-  'events:cleared',
   'app:ready',
   'app:ui:navigate',
   'app:ui:highlight',
-  'app:history-navigate', // Windows app-command X buttons → renderer history back/forward
+  'app:history-navigate', // Windows app-command X buttons / macOS swipe gestures → renderer history back/forward
   'window:ready',
   'window:focus',
   'window:blur',
@@ -1024,12 +1053,14 @@ export const EVENT_CHANNELS = [
   'browser:list-tabs-request',
   // Browser tab open request from main process (agent wants to open a browser tab)
   'browser:open-tab',
-  // Script events (main → renderer)
-  'script:started',
-  'script:stopped',
-  'script:output',
-  'script:error',
-  'script:url-detected',
+  // Browser tab close request from main process (agent wants to close a browser tab)
+  'browser:close-tab',
+  // Main navigated an existing browser tab (agent navigate/reuse) so the
+  // renderer can persist the new URL + requested URL (monorepo#2789)
+  'browser:tab-navigated',
+  // A tab's owner agent changed (claim/agent open) so the renderer can
+  // persist ownership with the tab (monorepo#2857)
+  'browser:tab-owner-changed',
   // WebSocket API events (main → renderer)
   'websocket-api:discovery-auto-disabled',
   // Workspace token usage changed (main → renderer)
@@ -1040,6 +1071,25 @@ export const EVENT_CHANNELS = [
   'backend:status',
   // Hardware console shutdown handshake (main → renderer)
   'hardware-console:clear-lighting',
+  // Hardware console ownership push (main → renderer, per-window { isOwner })
+  'hardware-console:owner-changed',
+  // Multi-backend connect (main → renderer): connections list/active changed,
+  // a pinned-cert mismatch that must block with a failure modal, and a
+  // protocol-version mismatch that warns non-blockingly (connect still proceeds).
+  'connections:changed',
+  'connections:cert-mismatch',
+  'connections:protocol-mismatch',
+  // A 401/403 WebSocket-upgrade rejection (bad token / WS API disabled)
+  // surfaced as a distinct auth failure instead of a generic transport error.
+  'connections:auth-rejected',
+  // Workspace transfer relay progress (main → renderer): byte/chunk counters
+  // for the wizard's step-3 progress UI. Never carries archive bytes.
+  'transfer:progress',
+  // Import-from-file progress (main → renderer): byte/chunk counters for the
+  // import wizard. Never carries archive bytes.
+  'transfer:import-progress',
+  // File menu → renderer: open the import-workspace wizard.
+  'menu:import-workspace',
 ] as const;
 
 // Dynamic channel patterns that use runtime IDs

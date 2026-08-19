@@ -11,22 +11,31 @@
   import { NodeViewWrapper, NodeViewContent } from '$lib/utils/tiptap/svelte-node-view';
   import TaskAgentStatus from './TaskAgentStatus.svelte';
   import TaskNotePreview from './TaskNotePreview.svelte';
+  import TaskRelationLink from '$lib/components/workspace/TaskRelationLink.svelte';
   import { createLogger } from '$lib/utils/client-logger';
   import { navigateToNote } from '$lib/utils/workspace-navigation';
   import Fa from 'svelte-fa';
-  import { faPlay, faLinkSlash, faListCheck } from '@fortawesome/free-solid-svg-icons';
+  import {
+    faPlay,
+    faLinkSlash,
+    faListCheck,
+    faHourglassHalf,
+    faTriangleExclamation,
+  } from '@fortawesome/free-solid-svg-icons';
   import Button from '../ui/button/button.svelte';
   import { Tooltip } from '$lib/components/ui/tooltip';
   import { slide } from 'svelte/transition';
   import { taskNoteUrl } from '$shared/constants/intent-links';
-  import { selectActiveWorkspaceId } from '$store/renderer/slices/workspace/workspace-selectors';
   import {
     selectSelectedNoteId,
     selectNoteById,
-    selectNotesVersion,
+    selectWorkspaceNotesState,
   } from '$store/renderer/slices/workspace-notes/workspace-notes-selectors';
 
-  import { updateTaskNoteStatus, createPrerequisiteTask } from '$features/tasks/tasks-write-service';
+  import {
+    updateTaskNoteStatus,
+    createPrerequisiteTask,
+  } from '$features/tasks/tasks-write-service';
   import { delegateExistingTaskRequested } from '$store/renderer/slices/workspace-agents/workspace-agents-slice';
   import { writable } from 'svelte/store';
   import type { NoteId, TaskStatus } from '$shared/types';
@@ -35,19 +44,22 @@
   import Checkbox from '../ui/checkbox/checkbox.svelte';
   import { store as appStore } from '$store/renderer/store';
   import { m } from '$shared/paraglide/messages.js';
+  import { getWorkspaceRouteContext } from '$lib/utils/workspace-route-context';
 
   const logger = createLogger('TaskItemNodeView');
   const TASK_LINK_REGEX = /^intent:\/\/local\/task\/(.+)$/;
 
-  // Redux state access - called at component init time for reactive subscriptions
-  const activeWorkspaceId = selectActiveWorkspaceId();
+  let { node, selected, updateAttributes, getPos, editor, extension }: NodeViewProps = $props();
+
+  // Note editors configure an immutable owner on their task-item extension. Route
+  // context is the explicit fallback for non-note editor callers.
+  let owningWorkspaceId = $derived(extension?.options?.workspaceId as string | undefined);
+  const routeWorkspaceId = getWorkspaceRouteContext()?.workspaceId;
   const wsIdStore = writable<string>('');
   $effect(() => {
-    wsIdStore.set($activeWorkspaceId ?? '');
+    wsIdStore.set(owningWorkspaceId ?? routeWorkspaceId ?? '');
   });
-  const notesVersion = selectNotesVersion(wsIdStore);
-
-  let { node, selected, updateAttributes, getPos, editor }: NodeViewProps = $props();
+  let workspaceId = $derived(owningWorkspaceId ?? routeWorkspaceId ?? '');
 
   // Core derived state
   let checked = $derived(node.attrs.checked ?? false);
@@ -78,25 +90,26 @@
   });
 
   let isLinkedTask = $derived(!!linkedTaskNoteId);
-
-  let linkedTaskNote = $derived.by(() => {
-    if (!linkedTaskNoteId) return null;
-    // Access notesVersion to trigger reactivity when notes map changes
-    void $notesVersion;
-    const wsId = $activeWorkspaceId;
-    if (!wsId) return null;
-    const state = appStore.state;
-    return selectNoteById.select(state, wsId, linkedTaskNoteId) ?? null;
+  const linkedTaskNoteIdStore = writable<NoteId | null>(null);
+  $effect(() => {
+    linkedTaskNoteIdStore.set(linkedTaskNoteId);
   });
+  const linkedTaskNoteStore = selectNoteById(wsIdStore, linkedTaskNoteIdStore);
+  const workspaceNotesStateStore = selectWorkspaceNotesState(wsIdStore);
+  let linkedTaskNote = $derived($linkedTaskNoteStore ?? null);
 
   let linkedTaskTitle = $derived(
     linkedTaskNote?.title ??
-      m.tiptap_taskItem_taskNotFound_label({
-        id: linkedTaskNoteId ?? m.tiptap_taskItem_unknownId_label(),
-      }),
+      (!$workspaceNotesStateStore.initialized
+        ? m.tiptap_taskNotePreview_loading_label()
+        : m.tiptap_taskItem_taskNotFound_label({
+            id: linkedTaskNoteId ?? m.tiptap_taskItem_unknownId_label(),
+          })),
   );
   let linkedTaskStatus = $derived(linkedTaskNote?.metadata?.task?.status ?? null);
-  let linkedTaskNotFound = $derived(isLinkedTask && !linkedTaskNote);
+  let linkedTaskNotFound = $derived(
+    isLinkedTask && $workspaceNotesStateStore.initialized && !linkedTaskNote,
+  );
   let linkedTaskChecked = $derived(linkedTaskStatus === 'complete');
 
   let linkedTaskAgentId = $derived.by(() => {
@@ -104,6 +117,15 @@
     if (!agentIds || agentIds.length === 0) return null;
     return agentIds[agentIds.length - 1];
   });
+
+  // Task relations (PROTOCOL §5.2/§5.4, v6.8). `unmetDependsOn` is the
+  // daemon-computed projection carried on note-shaped read/push payloads
+  // (monorepo#1979) — a dep is unmet unless its task note is `complete`
+  // (missing and cancelled deps count as unmet). A dependency status change
+  // re-announces each dependent note via `note:updated`, so the refreshed
+  // projection lands in the notes slice without any client-side derivation.
+  let linkedTaskConflictsWith = $derived(linkedTaskNote?.metadata?.task?.conflictsWith ?? []);
+  let unmetDependsOn = $derived(linkedTaskNote?.metadata?.task?.unmetDependsOn ?? []);
 
   // Computed display values
   let effectiveAgentId = $derived(isLinkedTask ? linkedTaskAgentId : delegatedAgentId);
@@ -145,7 +167,6 @@
     }
 
     try {
-      const workspaceId = linkedTaskNote?.workspaceId;
       if (!workspaceId) return;
       void updateTaskNoteStatus(workspaceId, linkedTaskNoteId, newStatus);
     } catch (error) {
@@ -163,7 +184,7 @@
 
   async function handleOpenLinkedNote(event?: MouseEvent) {
     if (linkedTaskNoteId) {
-      const openInAdjacentPanel = event?.metaKey || event?.ctrlKey || false;
+      const openInAdjacentPanel = true;
       // Find the panel ID by looking up the DOM for the data-panel-id attribute
       const target = event?.target as HTMLElement | null;
       const panelElement = target?.closest('[data-panel-id]');
@@ -175,7 +196,12 @@
         event.stopPropagation();
       }
 
-      await navigateToNote(linkedTaskNoteId, { openInAdjacentPanel, sourcePanelId });
+      await navigateToNote(linkedTaskNoteId, {
+        workspaceId: (linkedTaskNote?.workspaceId as string | undefined) ?? workspaceId,
+        openInAdjacentPanel,
+        openInNewAdjacentPanel: true,
+        sourcePanelId,
+      });
     }
   }
 
@@ -266,9 +292,10 @@
 
   function emitLinkedTaskDelegateEvent() {
     if (!linkedTaskNoteId) return;
-    // Prefer the linked note's own workspaceId (it may differ from the active workspace
-    // if the task lives in a different workspace), fall back to the active workspace.
-    const wsId = (linkedTaskNote?.workspaceId as string | undefined) ?? $activeWorkspaceId;
+    // Prefer the linked note's own workspaceId (it may differ from the route
+    // workspace if the task lives in a different workspace), then use the
+    // immutable route context.
+    const wsId = (linkedTaskNote?.workspaceId as string | undefined) ?? workspaceId;
     if (!wsId) return;
     // TODO(redux-remove): delegation creates an agent and assigns it atomically, which
     // the tasks seam (`task.assignAgent` assigns an EXISTING agent only) cannot express.
@@ -315,7 +342,7 @@
     const taskText = getTaskText();
     if (!taskText) return;
 
-    const wsId = $activeWorkspaceId;
+    const wsId = workspaceId;
     if (!wsId) return;
     const reduxState = appStore.state;
     const currentNoteId = selectSelectedNoteId.select(reduxState, wsId);
@@ -374,7 +401,7 @@
         role="group"
         contenteditable="false"
       >
-        <div class="flex items-center gap-1.5 w-full pl-2.5 pr-2 pt-1.5 pb-1.5">
+        <div class="flex items-center gap-1.5 w-full pl-2.5 pr-2 pt-1.5 pb-2">
           <span class="shrink-0" onclick={(e) => e.stopPropagation()} role="presentation">
             {#key status}
               <TaskStatusIcon
@@ -385,7 +412,7 @@
             {/key}
           </span>
           <span
-            class="flex-1 min-w-0 pb-0.5 font-medium overflow-hidden text-ellipsis whitespace-nowrap [&_p]:m-0"
+            class="flex-1 min-w-0 font-medium overflow-hidden text-ellipsis whitespace-nowrap [&_p]:m-0"
           >
             <NodeViewContent />
           </span>
@@ -411,7 +438,7 @@
       >
         {#snippet content()}
           {#if linkedTaskNoteId && !linkedTaskNotFound}
-            <TaskNotePreview noteId={linkedTaskNoteId} />
+            <TaskNotePreview {workspaceId} noteId={linkedTaskNoteId} />
           {/if}
         {/snippet}
         <button
@@ -422,7 +449,7 @@
           onclick={(e) => handleOpenLinkedNote(e)}
           contenteditable="false"
         >
-          <div class="flex items-center gap-2 w-full pl-2.5 pr-2 pt-2">
+          <div class="flex items-center gap-2 w-full pl-2.5 pr-2 pt-2 pb-1.5">
             <span class="shrink-0" onclick={(e) => e.stopPropagation()} role="presentation">
               {#key linkedTaskStatus}
                 <TaskStatusIcon
@@ -433,12 +460,68 @@
               {/key}
             </span>
             <span
-              class="flex-1 min-w-0 pb-1.5 font-medium overflow-hidden text-ellipsis whitespace-nowrap {linkedTaskNotFound
+              class="flex-1 min-w-0 font-medium overflow-hidden text-ellipsis whitespace-nowrap {linkedTaskNotFound
                 ? 'text-muted-foreground italic'
                 : ''}"
             >
               {linkedTaskTitle}
             </span>
+            {#if unmetDependsOn.length > 0 && !effectiveChecked}
+              <Tooltip
+                side="bottom"
+                align="end"
+                delayDuration={300}
+                disableHoverableContent={false}
+                class="shrink-0"
+                contentClass="p-1.5"
+              >
+                {#snippet content()}
+                  <div class="flex flex-col items-stretch gap-1 min-w-0">
+                    <div class="px-0.5 text-xs text-muted-foreground">
+                      {m.tiptap_taskItem_waitsOnList_label()}
+                    </div>
+                    {#each unmetDependsOn as depId (depId)}
+                      <TaskRelationLink {workspaceId} noteId={depId} unmet />
+                    {/each}
+                  </div>
+                {/snippet}
+                <span
+                  class="inline-flex items-center gap-1 rounded-full bg-muted px-1.5 py-0.5 text-xs font-medium text-subtle"
+                  contenteditable="false"
+                >
+                  <Fa icon={faHourglassHalf} size="xs" />
+                  {m.tiptap_taskItem_waitsOn_label({ count: unmetDependsOn.length })}
+                </span>
+              </Tooltip>
+            {/if}
+            {#if linkedTaskConflictsWith.length > 0 && !effectiveChecked}
+              <Tooltip
+                side="bottom"
+                align="end"
+                delayDuration={300}
+                disableHoverableContent={false}
+                class="shrink-0"
+                contentClass="p-1.5"
+              >
+                {#snippet content()}
+                  <div class="flex flex-col items-stretch gap-1 min-w-0">
+                    <div class="px-0.5 text-xs text-muted-foreground">
+                      {m.tiptap_taskItem_conflictsList_label()}
+                    </div>
+                    {#each linkedTaskConflictsWith as conflictId (conflictId)}
+                      <TaskRelationLink {workspaceId} noteId={conflictId} variant="conflict" />
+                    {/each}
+                  </div>
+                {/snippet}
+                <span
+                  class="inline-flex items-center gap-1 rounded-full bg-warning/10 px-1.5 py-0.5 text-xs font-medium text-warning"
+                  contenteditable="false"
+                >
+                  <Fa icon={faTriangleExclamation} size="xs" />
+                  {m.tiptap_taskItem_conflicts_label({ count: linkedTaskConflictsWith.length })}
+                </span>
+              </Tooltip>
+            {/if}
             {#if linkedTaskNotFound}
               <Button
                 variant="ghost-light"
@@ -457,7 +540,7 @@
               <Button
                 variant="ghost-light"
                 size="icon-xs"
-                class="shrink-0 opacity-30 hover:opacity-100 transition-opacity pb-2"
+                class="shrink-0 opacity-30 hover:opacity-100 transition-opacity"
                 title={m.tiptap_taskItem_assignToAgent_tooltip()}
                 onclick={(e) => {
                   e.stopPropagation();
@@ -496,6 +579,7 @@
             <Button
               variant="ghost-light"
               size="icon-xs"
+              aria-label={m.tiptap_taskItem_convertToTaskNote_tooltip()}
               class="opacity-20 hover:opacity-100 transition-opacity"
               onclick={(e) => {
                 e.stopPropagation();

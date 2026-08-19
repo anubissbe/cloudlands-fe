@@ -20,33 +20,27 @@
  * A fresh decoder is created per connection so the Mic-coalescing device
  * model always matches the connected device.
  *
- * Dependency-light middleware module: AppClient-free, no selector imports —
+ * Dependency-light device service: AppClient-free, no selector imports —
  * slot resolution and tab/attention lookups read `appStore.state` directly
  * via pure helpers.
  */
-import type { StoreMiddleware } from '$lib/store-shim/types';
 import { store as appStore } from '$store/renderer/store';
 import { createLogger } from '$lib/utils/client-logger';
 import { navigateToRoute } from '$lib/utils/navigation.client';
 import type { HardwareConsoleManager } from '../device/device-manager';
-import { getHardwareConsoleManager } from '../instance';
 import { HardwareInputDecoder } from '../input/input-decoder';
 import type { LogicalKeyId } from '../input/types';
-import {
-  agentKeyToSlot,
-  isKeyAssignableWorkspace,
-  resolveKeySlots,
-} from './key-assignment';
-import { getItems } from '$lib/store-shim/utils/collections/collection-utils';
+import { agentKeyToSlot, isKeyAssignableWorkspace, resolveKeySlots } from './key-assignment';
+import { isConsoleOwner } from '../owner-gate';
+import { getItems } from '@augmentcode/themis/utils/collections/collection-utils';
 import { CHIEF_WORKSPACE_ID } from '$shared/types/branded-ids';
-import {
-  focusPanel,
-  setActiveTab,
-} from '$store/renderer/slices/panel-layout/panel-layout-slice';
+import { focusPanel, setActiveTab } from '$store/renderer/slices/panel-layout/panel-layout-slice';
+import { openWorkspaceTab } from '$store/renderer/slices/tab-state/tab-state-slice';
 import { openAgentTabRequested } from '$store/renderer/slices/app-layout/app-layout-slice';
 import { setActiveAgentId } from '$store/renderer/slices/workspace-agents/workspace-agents-slice';
 import { sessionNeedsAttention } from '../actions/agent-cycle';
 import { focusAgentComposer } from '../actions/action-key-service';
+import { selectCurrentWorkspaceTabId } from '$store/renderer/slices/tab-state/tab-state-selectors';
 
 const logger = createLogger('HardwareConsoleKeySwitch');
 
@@ -55,6 +49,10 @@ export interface KeySwitchDeps {
   navigate?: (route: string) => Promise<void>;
   /** Focus an agent tab's chat composer. Defaults to `focusAgentComposer`. */
   focusComposer?: (agentId: string) => void;
+  /** Console-owner gate (#1928). Defaults to the store-backed `isConsoleOwner`. */
+  isOwner?: () => boolean;
+  /** Current workspace-tab seam. */
+  getCurrentWorkspaceId?: () => string | null;
 }
 
 function resolveSlotWorkspaceId(slot: number): string | null {
@@ -147,7 +145,13 @@ export function focusWorkspaceSlot(workspaceId: string, deps: KeySwitchDeps = {}
   const focusedPanelId = layout?.focusedPanelId ?? null;
   const activeTabId = focusedPanelId ? (layout?.panels[focusedPanelId]?.activeTabId ?? null) : null;
 
-  if (appStore.state.workspace.activeWorkspaceId !== workspaceId) {
+  const activeWorkspaceId = (
+    deps.getCurrentWorkspaceId ?? (() => selectCurrentWorkspaceTabId.select(appStore.state))
+  )();
+  if (activeWorkspaceId !== workspaceId) {
+    // Mirror the workspace-list click (AllWorkspacesCard.handleClick): open the
+    // workspace tab in tab-state so the columns view scrolls it into view.
+    appStore.dispatch(openWorkspaceTab(workspaceId));
     const navigate = deps.navigate ?? navigateToRoute;
     void navigate(`/workspace/${workspaceId}`).catch((error: unknown) => {
       logger.warn('Failed to switch workspace from agent key', { workspaceId, error });
@@ -180,10 +184,7 @@ export function focusWorkspaceSlot(workspaceId: string, deps: KeySwitchDeps = {}
  * Handle one agent-key press. Exported for tests. Returns the workspace id
  * that was targeted, or null when the key had no assignment.
  */
-export function handleAgentKeyEvent(
-  key: LogicalKeyId,
-  deps: KeySwitchDeps = {},
-): string | null {
+export function handleAgentKeyEvent(key: LogicalKeyId, deps: KeySwitchDeps = {}): string | null {
   const slot = agentKeyToSlot(key);
   if (slot === null) return null;
   const workspaceId = resolveSlotWorkspaceId(slot);
@@ -194,7 +195,7 @@ export function handleAgentKeyEvent(
 
 /**
  * Wire agent-key switching to a manager. Returns the teardown function.
- * Exported for tests; production installs via the middleware below.
+ * Exported for tests; production installation is owned by the device saga.
  */
 export function installHardwareConsoleKeySwitching(
   manager: HardwareConsoleManager,
@@ -207,12 +208,15 @@ export function installHardwareConsoleKeySwitching(
     detachDecoder = null;
   };
 
+  const isOwner = deps.isOwner ?? isConsoleOwner;
+
   const setupDecoder = (): void => {
     teardownDecoder();
     const decoder = new HardwareInputDecoder({
       deviceModel: manager.connectedDevice?.model ?? 'creator-micro-2',
     });
     const offKeydown = decoder.on('keydown', ({ key }) => {
+      if (!isOwner()) return;
       handleAgentKeyEvent(key, deps);
     });
     const offRaw = manager.onRawMessage((message) => decoder.handleMessage(message));
@@ -231,23 +235,5 @@ export function installHardwareConsoleKeySwitching(
   return () => {
     offStatus();
     teardownDecoder();
-  };
-}
-
-let installed = false;
-
-/**
- * Lazily install on the first dispatched action (same pattern as the
- * connection-toast middleware): wires agent-key switching to the shared
- * manager. The manager itself is started by the integration-toggle
- * middleware once the persisted enabled flag hydrates on.
- */
-export function createHardwareConsoleKeySwitchMiddleware(): StoreMiddleware {
-  return () => (next) => (action) => {
-    if (!installed) {
-      installed = true;
-      installHardwareConsoleKeySwitching(getHardwareConsoleManager());
-    }
-    return next(action);
   };
 }

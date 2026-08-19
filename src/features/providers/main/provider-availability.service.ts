@@ -11,7 +11,6 @@ import { PROVIDERS_CHANNELS } from '../../../shared/ipc/channels';
 import {
   fetchProviderCatalog,
   getCachedProviderCatalog,
-  getCachedProviderCatalogEntry,
 } from '../../../main/utils/provider-catalog-accessor';
 import { Logger } from '../../../shared/logger';
 import {
@@ -20,14 +19,9 @@ import {
 } from '../../../shared/main/provider-auth-status';
 import { featureCodesService } from '../../feature-codes/main/feature-codes.service';
 import { getBackendClient } from '../../backend/main/backend.ipc';
-import { findBinary } from '../../../shared/main/find-binary';
-import { findAuggiePathAsync } from '../../auggie/main/auggie.ipc';
-import {
-  CLAUDE_CODE_NPX_MISSING_WARNING,
-  clearClaudeCodeCache,
-  isClaudeCodeInstalled,
-  isNpxAvailableForClaudeCode,
-} from '../../claude-code/main/claude-code-resolver';
+import { findBinaryStrict, getCommonNpmPaths } from '../../../shared/main/find-binary';
+import { findAuggiePathStrict } from '../../auggie/main/auggie-path';
+import { CLAUDE_CODE_NPX_MISSING_WARNING } from '../../../shared/constants/claude-code';
 import { clearCodexCache, isCodexInstalled } from '../../codex/main/codex-resolver';
 import { clearCortexCache, isCortexInstalled } from '../../cortex/main/cortex-resolver';
 import { clearOpenCodeCache, isOpenCodeInstalled } from '../../opencode/main/opencode-resolver';
@@ -45,36 +39,57 @@ export type { NpxStatus, ProviderAvailabilityResult, ProviderStatus };
 const logger = new Logger('ProviderAvailability');
 
 /**
+ * All check*Availability probes below use the STRICT lookups
+ * (`findBinaryStrict` / `findAuggiePathStrict` / the throwing
+ * `is*Installed` resolvers) and let probe failures REJECT: a daemon RPC
+ * failure/timeout proves nothing about availability, so it must never fold
+ * into `available:false`. The IPC handlers catch the rejection and return an
+ * explicit failure envelope, which the renderer saga maps to
+ * `checkSingleProviderFailure` — preserving the last-known status.
+ */
+
+/**
  * Check if auggie is available by asking the daemon (`host.checkAuggie` via
- * `findAuggiePathAsync`). The BE owns the settings precedence and binary
+ * `findAuggiePathStrict`). The BE owns the settings precedence and binary
  * discovery — no local file probing or install-path scans here.
  */
 async function checkAuggieAvailability(): Promise<ProviderStatus> {
-  try {
-    const auggiePath = await findAuggiePathAsync();
-    return { available: auggiePath !== null };
-  } catch (error) {
-    return { available: false, error: (error as Error).message };
-  }
+  const auggiePath = await findAuggiePathStrict();
+  return { available: auggiePath !== null };
+}
+
+/**
+ * Check whether the claude CLI resolves on the daemon host
+ * (`host.findBinary`) — the prerequisite for the claude-code provider.
+ * Rejects when the probe itself fails.
+ */
+async function isClaudeCliInstalled(): Promise<boolean> {
+  return (
+    (await findBinaryStrict('claude', {
+      commonPaths: getCommonNpmPaths('claude'),
+    })) !== null
+  );
 }
 
 /**
  * Check if claude-code is available by checking if the claude CLI is installed.
- * The ACP adapter itself always runs via npx (pinned version); when the CLI is
- * installed but npx is missing, the status carries an explicit warning so the
- * UI can tell the user the adapter cannot run.
+ * The ACP adapter itself always runs via npx (intentd pins the package); when
+ * the CLI is installed but npx is authoritatively missing, the status carries
+ * an explicit warning so the UI can tell the user the adapter cannot run. A
+ * FAILED npx probe rejects instead — it must not fabricate the warning.
  */
 async function checkClaudeCodeAvailability(): Promise<ProviderStatus> {
-  try {
-    const installed = await isClaudeCodeInstalled();
-    const status: ProviderStatus = { available: installed };
-    if (installed && !(await isNpxAvailableForClaudeCode())) {
-      status.warning = CLAUDE_CODE_NPX_MISSING_WARNING;
-    }
-    return status;
-  } catch (error) {
-    return { available: false, error: (error as Error).message };
+  const installed = await isClaudeCliInstalled();
+  const status: ProviderStatus = { available: installed };
+  const npxPath = installed
+    ? await findBinaryStrict('npx', {
+        commonPaths: getCommonNpmPaths('npx'),
+      })
+    : null;
+  if (installed && npxPath === null) {
+    status.warning = CLAUDE_CODE_NPX_MISSING_WARNING;
   }
+  return status;
 }
 
 /**
@@ -82,12 +97,8 @@ async function checkClaudeCodeAvailability(): Promise<ProviderStatus> {
  * Does not fall back to npx - we want accurate "is installed" status.
  */
 async function checkCodexAvailability(): Promise<ProviderStatus> {
-  try {
-    const installed = await isCodexInstalled();
-    return { available: installed };
-  } catch (error) {
-    return { available: false, error: (error as Error).message };
-  }
+  const installed = await isCodexInstalled();
+  return { available: installed };
 }
 
 /**
@@ -95,12 +106,8 @@ async function checkCodexAvailability(): Promise<ProviderStatus> {
  * Does not fall back to npx - we want accurate "is installed" status.
  */
 async function checkCortexAvailability(): Promise<ProviderStatus> {
-  try {
-    const installed = await isCortexInstalled();
-    return { available: installed };
-  } catch (error) {
-    return { available: false, error: (error as Error).message };
-  }
+  const installed = await isCortexInstalled();
+  return { available: installed };
 }
 
 /**
@@ -108,12 +115,8 @@ async function checkCortexAvailability(): Promise<ProviderStatus> {
  * Does not fall back to npx - we want accurate "is installed" status.
  */
 async function checkOpenCodeAvailability(): Promise<ProviderStatus> {
-  try {
-    const installed = await isOpenCodeInstalled();
-    return { available: installed };
-  } catch (error) {
-    return { available: false, error: (error as Error).message };
-  }
+  const installed = await isOpenCodeInstalled();
+  return { available: installed };
 }
 
 /**
@@ -121,12 +124,8 @@ async function checkOpenCodeAvailability(): Promise<ProviderStatus> {
  * Does not fall back to npx - we want accurate "is installed" status.
  */
 async function checkPiAvailability(): Promise<ProviderStatus> {
-  try {
-    const installed = await isPiInstalled();
-    return { available: installed };
-  } catch (error) {
-    return { available: false, error: (error as Error).message };
-  }
+  const installed = await isPiInstalled();
+  return { available: installed };
 }
 
 /**
@@ -134,12 +133,8 @@ async function checkPiAvailability(): Promise<ProviderStatus> {
  * Does not fall back to npx - we want accurate "is installed" status.
  */
 async function checkDroidAvailability(): Promise<ProviderStatus> {
-  try {
-    const installed = await isDroidInstalled();
-    return { available: installed };
-  } catch (error) {
-    return { available: false, error: (error as Error).message };
-  }
+  const installed = await isDroidInstalled();
+  return { available: installed };
 }
 
 /**
@@ -150,9 +145,8 @@ async function checkDroidAvailability(): Promise<ProviderStatus> {
  * by the callers.
  */
 async function checkGrokAvailability(): Promise<ProviderStatus> {
-  // findBinary never throws (it folds RPC errors to null), so no try/catch;
-  // skip its local cache so a fresh install is picked up on recheck.
-  const grokPath = await findBinary('grok', { cache: false });
+  // Every call hits the daemon so a fresh install is picked up on recheck.
+  const grokPath = await findBinaryStrict('grok');
   return { available: grokPath !== null };
 }
 
@@ -164,12 +158,12 @@ async function checkGrokAvailability(): Promise<ProviderStatus> {
  * opencode`) — so availability requires BOTH binaries to resolve on the
  * daemon host. Like grok, there is no FE-side resolver module — the
  * aggregate path uses the daemon's provider discovery and this fallback
- * covers the RPC-degraded / single-recheck path.
+ * covers the single-recheck path.
  */
 async function checkUnslothAvailability(): Promise<ProviderStatus> {
   const [opencodePath, unslothPath] = await Promise.all([
-    findBinary('opencode', { cache: false }),
-    findBinary('unsloth', { cache: false }),
+    findBinaryStrict('opencode'),
+    findBinaryStrict('unsloth'),
   ]);
   return { available: opencodePath !== null && unslothPath !== null };
 }
@@ -224,21 +218,14 @@ interface ProviderDiscoveryResponse {
 
 /**
  * Call intentd's host.providerDiscovery to get base availability + npx status.
- * Returns null on RPC failure (the caller degrades to empty/unavailable state).
+ * Rejects on RPC failure — the daemon could not answer, so callers must not
+ * fabricate an "all unavailable" result from it. `getProviderAvailability`
+ * lets the rejection propagate as an explicit failure; `getProviderPaths`
+ * (a settings-only path lookup, not an install/not-installed verdict)
+ * degrades to empty maps.
  */
-async function callProviderDiscovery(): Promise<ProviderDiscoveryResponse | null> {
-  try {
-    const result = await getBackendClient().request<ProviderDiscoveryResponse>(
-      'host.providerDiscovery',
-      {},
-    );
-    return result;
-  } catch (error) {
-    logger.warn('host.providerDiscovery RPC failed; degrading to empty availability', {
-      error: error instanceof Error ? error.message : String(error),
-    });
-    return null;
-  }
+async function callProviderDiscovery(): Promise<ProviderDiscoveryResponse> {
+  return getBackendClient().request<ProviderDiscoveryResponse>('host.providerDiscovery', {});
 }
 
 /**
@@ -256,9 +243,10 @@ export async function getProviderAvailability(): Promise<ProviderAvailabilityRes
   } catch (error) {
     // Fail closed on the gating decision: fall back to the last cached
     // registry when the fetch fails. When there is no cache either, the
-    // daemon has never answered on this connection — provider discovery
-    // below will fail the same way and report nothing available, so no
-    // gated provider can surface through this path.
+    // gating verdict is UNKNOWN — `hiddenProviders` is omitted from the
+    // result (never an empty array, which would read as an authoritative
+    // "nothing hidden" verdict) so consumers fall back to the catalog's
+    // `visible` flag and gated providers (e.g. mock) cannot flash.
     catalog = getCachedProviderCatalog();
     logger.warn('Provider catalog fetch failed; using cached registry for gating', {
       error,
@@ -285,7 +273,6 @@ export async function getProviderAvailability(): Promise<ProviderAvailabilityRes
   }
 
   // Clear caches to ensure fresh detection (important for refresh button)
-  clearClaudeCodeCache();
   clearCodexCache();
   clearCortexCache();
   clearOpenCodeCache();
@@ -320,9 +307,14 @@ export async function getProviderAvailability(): Promise<ProviderAvailabilityRes
     });
   };
 
-  // Check all providers in parallel; for hidden providers skip the check entirely
-  const isCortexHidden = hiddenProviders.includes('cortex');
-  const isMockHidden = hiddenProviders.includes('mock');
+  // Check all providers in parallel; for hidden providers skip the check
+  // entirely. When the gating verdict is unknown (no catalog), fail closed on
+  // the registry-gated providers (mock: env var) — the same pre-hydration
+  // default-deny the single-provider recheck path applies — so
+  // availability-only consumers (e.g. onboarding auto-selection) cannot
+  // pick a gated provider on the degraded path.
+  const gatingVerdictUnknown = catalog === undefined;
+  const isMockHidden = gatingVerdictUnknown || hiddenProviders.includes('mock');
   const [
     auggieResult,
     claudeCodeResult,
@@ -339,9 +331,7 @@ export async function getProviderAvailability(): Promise<ProviderAvailabilityRes
     makeProviderStatus('auggie', checkAuggieAvailability),
     makeProviderStatus('claude-code', checkClaudeCodeAvailability),
     makeProviderStatus('codex', checkCodexAvailability),
-    isCortexHidden
-      ? Promise.resolve({ available: false } as ProviderStatus)
-      : makeProviderStatus('cortex', checkCortexAvailability),
+    makeProviderStatus('cortex', checkCortexAvailability),
     isMockHidden
       ? Promise.resolve({ available: false } as ProviderStatus)
       : checkMockAvailability(), // mock stays local
@@ -361,14 +351,14 @@ export async function getProviderAvailability(): Promise<ProviderAvailabilityRes
     getProviderAuthVerdicts(),
   ]);
 
-  // claude-code runs its ACP adapter exclusively via npx (pinned version).
-  // On the discovery path the daemon reports "installed" from npx presence
-  // alone (npx-only provider), so re-gate availability on the claude CLI
-  // prerequisite: without the CLI the provider is unavailable regardless of
-  // npx, and with the CLI but no npx surface an explicit warning instead of
-  // a silently broken provider. The local fallback already handles both.
+  // claude-code runs its ACP adapter exclusively via npx (intentd pins the
+  // package). On the discovery path the daemon reports "installed" from npx
+  // presence alone (npx-only provider), so re-gate availability on the claude
+  // CLI prerequisite: without the CLI the provider is unavailable regardless
+  // of npx, and with the CLI but no npx surface an explicit warning instead
+  // of a silently broken provider. The fallback path already handles both.
   if (discoveryById.has('claude-code')) {
-    if (!(await isClaudeCodeInstalled())) {
+    if (!(await isClaudeCliInstalled())) {
       claudeCodeResult.available = false;
     } else if (!claudeCodeResult.warning && npxStatus?.resolvedPath === null) {
       claudeCodeResult.warning = CLAUDE_CODE_NPX_MISSING_WARNING;
@@ -412,7 +402,9 @@ export async function getProviderAvailability(): Promise<ProviderAvailabilityRes
       grok: grokResult,
       unsloth: unslothResult,
     },
-    hiddenProviders,
+    // Absent catalog = unknown gating verdict; only a consulted catalog
+    // yields an authoritative hidden list (empty = nothing hidden).
+    ...(catalog !== undefined ? { hiddenProviders } : {}),
     npx: npxStatus,
   };
 
@@ -466,7 +458,14 @@ export interface ProviderPathsResult {
  * avoid the aggregated GET_AVAILABILITY round-trip.
  */
 export async function getProviderPaths(): Promise<ProviderPathsResult> {
-  const discovery = await callProviderDiscovery();
+  let discovery: ProviderDiscoveryResponse | undefined;
+  try {
+    discovery = await callProviderDiscovery();
+  } catch (error) {
+    logger.warn('host.providerDiscovery RPC failed; degrading to empty paths', {
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
   const paths: Record<string, string | null> = {};
   const secondaryPaths: Record<string, string | null> = {};
   for (const provider of discovery?.providers ?? []) {
@@ -526,7 +525,6 @@ export function setupProviderAvailabilityIPC(): void {
             }
             break;
           case 'claude-code':
-            clearClaudeCodeCache();
             status = await checkClaudeCodeAvailability();
             if (status.available) {
               authenticated = await checkAuth();
@@ -544,22 +542,10 @@ export function setupProviderAvailabilityIPC(): void {
               authenticated = await checkAuth();
             }
             break;
-          case 'cortex': {
-            // Fail closed pre-hydration: cortex is feature-gated in the
-            // registry, so an unhydrated catalog means "hidden", not "open".
-            const cortexEntry = getCachedProviderCatalogEntry('cortex');
-            const cortexFeatureCode = cortexEntry?.requiresFeatureCode;
-            const isHidden =
-              cortexEntry === undefined ||
-              (cortexFeatureCode && !featureCodesService.isFeatureEnabled(cortexFeatureCode));
-            if (isHidden) {
-              status = { available: false };
-            } else {
-              clearCortexCache();
-              status = await checkCortexAvailability();
-            }
+          case 'cortex':
+            clearCortexCache();
+            status = await checkCortexAvailability();
             break;
-          }
           case 'opencode':
             clearOpenCodeCache();
             status = await checkOpenCodeAvailability();

@@ -59,6 +59,23 @@ export interface SendMessageOptions {
    * them with the message (#965). Plain base64 data — serializable/redux-safe.
    */
   imageBlocks?: Array<{ type: 'image'; data: string; mimeType: string }>;
+  /**
+   * Attachment-reference file blocks the original send carried, recorded so
+   * "Try again" resends them. UUID + metadata only — no bytes.
+   */
+  fileBlocks?: Array<{
+    type: 'file';
+    attachmentId: string;
+    fileName: string;
+    mimeType?: string;
+    size?: number;
+  }>;
+  /**
+   * Opaque per-message tag the original send carried (PROTOCOL §5.5), recorded
+   * so "Try again" resends it: an untagged retry of a wizard answer would leave
+   * the daemon's question hold pending and re-surface the answered wizard.
+   */
+  messageMetadata?: Record<string, unknown>;
 }
 
 /**
@@ -68,10 +85,31 @@ export interface SendMessageOptions {
 export type SerializableContextItem = Omit<ChatInputContextItem, 'file'>;
 
 /**
- * Transcript hydration status: 'loading' when a transcript fetch is in flight,
- * 'settled' when it completes (success or error). Defaults to undefined (not yet started).
+ * Transcript hydration status: 'loading' while the newest window is unresolved,
+ * 'settled' after a successful source paints, and 'error' when all bounded
+ * first-window sources fail. Defaults to undefined (not yet started).
  */
-export type TranscriptHydrationStatus = 'loading' | 'settled';
+export type TranscriptHydrationStatus = 'loading' | 'settled' | 'error';
+
+/**
+ * Metadata of the LAST seq-0 snapshot the standing `chat.subscribe`
+ * subscription applied to the store (single-transfer hydration). Written by
+ * the chat-subscribe saga on every `fromSnapshot` transcript emit; consumed
+ * by the chat-read saga to settle hydration and anchor the background
+ * older-history fetch without a second conversation transfer.
+ */
+export interface TranscriptSnapshotMeta {
+  /** Daemon `truncated` flag: older history exists beyond the snapshot page. */
+  truncated: boolean;
+  /** Daemon `totalMessages` count at snapshot time. */
+  totalMessages: number;
+  /** Id of the oldest message in the snapshot page (undefined when empty). */
+  oldestMessageId?: string;
+  /** §7.1 resume disposition when the registration requested one. */
+  resumed?: boolean;
+  /** Monotonic per-agent counter so waiters can detect a NEW snapshot. */
+  seq: number;
+}
 
 /**
  * Lifecycle phase of the agent's standing `chat.subscribe` stream, mirrored
@@ -79,12 +117,20 @@ export type TranscriptHydrationStatus = 'loading' | 'settled';
  * in app-client.ts). Drives the pre-live hydration indicator in ChatPanel.
  * `null`/absent means no standing subscription is open for the agent.
  */
-export type LiveStreamPhase =
-  | 'connecting'
-  | 'awaiting-snapshot'
-  | 'live'
-  | 'resyncing'
-  | 'delayed';
+export type LiveStreamPhase = 'connecting' | 'awaiting-snapshot' | 'live' | 'resyncing' | 'delayed';
+
+/**
+ * One lazily hydrated content block (PROTOCOL §5.5 slim projection + v7.2
+ * `agent.getMessageBlock`): the FULL body fetched on demand when the user
+ * expands a truncated tool row or views a truncated image. Keyed in
+ * `ChatAgentState.hydratedBlocks` by `{messageId}|{blockId}`. `seq` is a
+ * per-agent monotonic counter used ONLY for cap eviction (Record key order
+ * is not insertion order for integer-like keys).
+ */
+export type HydratedBlockEntry =
+  | { status: 'loading'; seq: number }
+  | { status: 'loaded'; seq: number; block: ContentBlock }
+  | { status: 'error'; seq: number; error: string };
 
 /**
  * Serializable per-agent chat state stored in Redux.
@@ -123,17 +169,94 @@ export interface ChatAgentState {
   lastChunkReceivedAt: number;
   /**
    * Transcript hydration status for this agent. Undefined means hydration has not
-   * started; 'loading' means a fetch is in flight; 'settled' means the fetch completed
-   * (success or error). Gates the welcome page: skeleton shows while loading, welcome
-   * shows only when settled with zero messages.
+   * started; 'loading' means the newest window is unresolved, 'settled' means a source
+   * succeeded, and 'error' exposes a retry instead of a false new-chat welcome.
    */
   transcriptHydration?: TranscriptHydrationStatus;
   /**
+   * True once transcript hydration has settled at least once for this agent.
+   * Distinguishes the FIRST hydration (ChatPanel keeps the indeterminate
+   * skeleton up even if partial messages have already landed, e.g. the
+   * standing subscription's newest page arriving ahead of the paged history
+   * read) from a refresh re-hydration (messages keep rendering). Never reset
+   * except by chatReset.
+   */
+  transcriptHydratedOnce?: boolean;
+  /**
    * Current standing `chat.subscribe` lifecycle phase for this agent, or
    * null when no subscription is open (teardown resets it). Written by
-   * chat-subscribe-service from the live client's onPhase reports.
+   * chat-subscribe saga from the live client's onPhase reports.
    */
   liveStreamPhase: LiveStreamPhase | null;
+  /**
+   * Metadata of the last applied seq-0 snapshot from the standing
+   * subscription, or undefined when none has arrived yet. See
+   * TranscriptSnapshotMeta.
+   */
+  transcriptSnapshot?: TranscriptSnapshotMeta;
+  /** True while an on-demand older-history scrollback page fetch is in flight. */
+  fetchingOlderHistory: boolean;
+  /** True while an on-demand gap-refill scrollback page fetch is in flight. */
+  fetchingGapFill: boolean;
+  /**
+   * Opaque §5.5 backward cursor continuing the older-history walk from where
+   * the last fetched page stopped, or null when the next request must re-seek
+   * (`aroundMessageId`) at the history segment's oldest row. Only honored
+   * while the history segment it was minted against still has rows; dropped
+   * when a gap-refill append lands (the append may have cap-pruned history's
+   * oldest side, and continuing backward would skip the pruned rows).
+   */
+  scrollbackOlderToken: string | null;
+  /**
+   * Opaque §5.5 forward cursor continuing the gap-refill walk toward the live
+   * tail, or null when the next request must re-seek at the history segment's
+   * newest row. Dropped when an older prepend lands (the prepend may have
+   * cap-pruned history's newest side, and continuing forward would skip the
+   * pruned rows).
+   */
+  scrollbackGapToken: string | null;
+  /** True while an `aroundIndex` far-flick seek fetch is in flight. */
+  fetchingHistorySeek: boolean;
+  /**
+   * True once the daemon rejected `aroundIndex` with INVALID_PARAMS —
+   * a daemon predating the param. Seeks are disabled for this agent for the
+   * rest of the session (the serial walk covers deep scrolls instead).
+   */
+  historySeekUnsupported: boolean;
+  /**
+   * Switch-back transcript reveal gate: true while the VIEWED conversation is
+   * awaiting a fresh seq-0 snapshot from its (re)opening standing
+   * subscription. Armed synchronously by the `markAgentAsViewed` reducer case
+   * (only when the transcript hydrated at least once and no snapshot from the
+   * current subscription exists) so no frame can paint the retained stale
+   * transcript; cleared when a snapshot applies, when the subscription
+   * closes (the retained transcript is then the right thing to show), or by
+   * the subscribe saga's bounded fallback timeout.
+   */
+  awaitingSwitchBackSnapshot?: boolean;
+  /**
+   * Utility-footer reveal gate: true while the transcript reveal is holding
+   * for the footer data sources (agent subscriptions, background hooks,
+   * monitored PRs) to settle their initial snapshots, so transcript and
+   * footer flip in the SAME paint. Armed by the first
+   * `transcriptHydrationSettled` (first open) and alongside
+   * `awaitingSwitchBackSnapshot` on `markAgentAsViewed` (switch-back);
+   * cleared by `chatUtilityFooterReady` (the subscribe saga observed
+   * `isUtilityFooterReady` flip true), by the subscription teardown
+   * (phase null), or by the saga's bounded fallback timeout — footer
+   * readiness must NEVER wedge the transcript reveal.
+   */
+  awaitingUtilityFooter?: boolean;
+  /**
+   * Lazily hydrated full content blocks, keyed `{messageId}|{blockId}`
+   * (§5.5 slim projection → v7.2 `agent.getMessageBlock`). Read-through
+   * cache of daemon responses: `loading` de-dupes concurrent expand clicks
+   * (single-flight per block), `loaded` renders instead of the slim preview,
+   * `error` re-enables the fetch on the next expand. Bounded at
+   * MAX_HYDRATED_BLOCKS (oldest-seq evicted first) since each entry can
+   * carry an MB-scale body.
+   */
+  hydratedBlocks?: Record<string, HydratedBlockEntry>;
 }
 
 /**
@@ -142,12 +265,22 @@ export interface ChatAgentState {
  */
 export interface SendMessagePayload {
   text: string;
+  /** Stable identity shared by the optimistic row and its composer transition. */
+  userAppMessageId?: string;
   contextItems?: ChatInputContextItem[];
   serializedContextItems?: SerializableContextItem[];
   workspaceContextStr?: string;
   noteIds?: string[];
   /** Image blocks extracted from serialized context items */
   imageBlocks?: Array<{ type: 'image'; data: string; mimeType: string }>;
+  /** Attachment-reference file blocks extracted from context items */
+  fileBlocks?: Array<{
+    type: 'file';
+    attachmentId: string;
+    fileName: string;
+    mimeType?: string;
+    size?: number;
+  }>;
   /**
    * Queued entry id for the atomic "Send now" path
    * (`agent.sendQueuedMessageNow`): when present, the send middleware makes
@@ -162,6 +295,12 @@ export interface SendMessagePayload {
   agentModel?: string;
   /** Whether this is the initial workspace agent */
   isInitialWorkspaceAgent?: boolean;
+  /**
+   * Opaque per-message payload forwarded verbatim as `agent.sendMessage`'s
+   * `messageMetadata` (PROTOCOL §5.5) — the Q&A wizard tags its flattened
+   * answer message with `{ type: "question_answers", answeredQuestionsMessageId }`.
+   */
+  messageMetadata?: Record<string, unknown>;
 }
 
 /**
@@ -177,6 +316,7 @@ export interface InitializeChatOptions {
 
 import type { ContextItem as ChatInputContextItem } from '$lib/components/chat/input/context-api';
 import type { ContextReference } from '$features/agent/agent-context';
+import type { ContentBlock } from '$shared/types';
 
 // ============================================================================
 // Top-level slice state (flat, agent-keyed)
@@ -204,3 +344,18 @@ export const MIN_MESSAGE_SEND_INTERVAL = 100;
  * comfortably exceeds any realistic queue depth.
  */
 export const MAX_QUEUED_RETRY_RECORDS = 20;
+
+/**
+ * Cap on cached `hydratedBlocks` per agent (memory bound): each entry can
+ * carry an MB-scale full tool body or original image. Hydrating beyond the
+ * cap evicts the oldest (lowest-seq) settled entries first; in-flight
+ * `loading` entries are never evicted (the single-flight guard depends on
+ * them). 30 comfortably exceeds the number of expanded rows a user works
+ * with at once while bounding worst-case retention.
+ */
+export const MAX_HYDRATED_BLOCKS = 30;
+
+/** Key for one hydrated block in `ChatAgentState.hydratedBlocks`. */
+export function hydratedBlockKey(messageId: string, blockId: string): string {
+  return `${messageId}|${blockId}`;
+}

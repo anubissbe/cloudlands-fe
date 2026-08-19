@@ -4,10 +4,11 @@
    *
    * Faint row above the chat input surfacing the active agent's background
    * hooks (PROTOCOL §5.40): one small chip per scheduled/running hook with a
-   * shrinking time-to-next-run bar (pure CSS animation derived from
-   * `nextRunAt` — no polling timers) and a spinner while a run is in flight.
+   * live time-to-next-run countdown (a component-local 1s interval ticks a
+   * reactive "now" while any rendered hook carries a `nextRunAt`/`expiresAt`)
+   * and a spinner while a run is in flight.
    * Clicking a chip opens a popover offering "Run now" (`hook.runNow`),
-   * "View script" (opens `HookScriptModal`), and "Cancel" (`hook.cancel`);
+   * "View script" (opens a workspace panel tab), and "Cancel" (`hook.cancel`);
    * the hover card offers the same "View script" affordance. Hidden entirely
    * when the agent has no active hooks.
    *
@@ -18,16 +19,22 @@
    */
 
   import Fa from 'svelte-fa';
-  import { faBolt, faCode, faPlay, faSpinner, faXmark } from '@fortawesome/free-solid-svg-icons';
-  import { slide } from 'svelte/transition';
+  import {
+    faBolt,
+    faChevronDown,
+    faCode,
+    faPlay,
+    faSpinner,
+    faXmark,
+  } from '@fortawesome/free-solid-svg-icons';
+  import { safeSlide } from '$lib/utils/animations';
   import { untrack } from 'svelte';
   import { writable } from 'svelte/store';
   import DropdownMenu from '$lib/components/ui/dropdown-menu.svelte';
-  import Button from '$lib/components/ui/button/button.svelte';
-  import Tooltip from '$lib/components/ui/tooltip/Tooltip.svelte';
-  import HookScriptModal from '$lib/components/chat/HookScriptModal.svelte';
+  import { Button } from '$lib/components/ui/button';
+  import { getPanelLayoutManager } from '$features/layout/panel-layout-adapter';
   import { m } from '$shared/paraglide/messages.js';
-  import { formatInteger, formatTime } from '$lib/i18n/format';
+  import { formatCompactDuration, formatInteger } from '$lib/i18n/format';
   import type { BackgroundHook } from '$features/hooks/background-hooks-service';
   import { selectBackgroundHooks } from '$store/renderer/slices/background-hooks/background-hooks-selectors';
   import {
@@ -37,16 +44,37 @@
     runBackgroundHookRequested,
   } from '$store/renderer/slices/background-hooks/background-hooks-slice';
   import { store as appStore } from '$store/renderer/store';
+  import KebabIcon from '$lib/components/icons/KebabIcon.svelte';
+  import {
+    safeSubscriptionRowTransition,
+    safeSubscriptionSlide,
+    SUBSCRIPTION_ACTION_ICON_CLASS,
+    SUBSCRIPTION_CHEVRON_CLASS,
+    SUBSCRIPTION_CHEVRON_SIZE_CLASS,
+    SUBSCRIPTION_ICON_CLASS,
+    SUBSCRIPTION_ICON_BUTTON_CLASS,
+    SUBSCRIPTION_INSET_ROW_DIVIDER_CLASS,
+    SUBSCRIPTION_ROW_TYPOGRAPHY_CLASS,
+  } from './subscription-disclosure';
 
   interface Props {
     workspaceId: string;
     agentId: string;
+    embedded?: boolean;
+    visible?: boolean;
+    count?: number;
   }
 
-  let { workspaceId, agentId }: Props = $props();
+  let {
+    workspaceId,
+    agentId,
+    embedded: _embedded = false,
+    visible = $bindable(false),
+    count = $bindable(0),
+  }: Props = $props();
 
-  // Writable store mirrors the prop so the Redux selector re-evaluates when
-  // workspaceId changes (selector readables are init-time only).
+  // Capture the initial prop in a store; the effect below keeps later changes in sync.
+  // svelte-ignore state_referenced_locally -- intentional initial snapshot for store construction.
   const workspaceIdStore = writable(workspaceId);
   $effect(() => {
     workspaceIdStore.set(workspaceId);
@@ -73,19 +101,10 @@
     ),
   );
 
-  /**
-   * Inline animation style for the shrinking time bar: one linear pass over
-   * the full `delayMs` cycle, offset by a negative delay so the bar picks up
-   * at the fraction of the cycle already elapsed. Computed once per
-   * `nextRunAt` value ({#key} restarts the animation on a new cycle).
-   */
-  function timeBarStyle(hook: BackgroundHook): string {
-    const total = hook.delayMs;
-    if (!hook.nextRunAt || !Number.isFinite(total) || total <= 0) return 'display: none;';
-    const remaining = new Date(hook.nextRunAt).getTime() - Date.now();
-    const elapsed = Math.min(total, Math.max(0, total - remaining));
-    return `animation-duration: ${total}ms; animation-delay: -${elapsed}ms;`;
-  }
+  $effect(() => {
+    visible = agentHooks.length > 0;
+    count = agentHooks.length;
+  });
 
   function handleRunNow(hook: BackgroundHook, close: () => void) {
     close();
@@ -97,12 +116,32 @@
     appStore.dispatch(cancelBackgroundHookRequested(hook.workspaceId, hook.hookId));
   }
 
-  // Hook whose script/logs modal is open; null when closed.
-  let viewingHookId = $state<string | null>(null);
+  let expandedHookId = $state<string | null>(null);
 
   function handleViewScript(hook: BackgroundHook, close?: () => void) {
     close?.();
-    viewingHookId = hook.hookId;
+    const panelLayoutManager = getPanelLayoutManager(hook.workspaceId);
+    const sourcePanelId = panelLayoutManager
+      .getPanelIds()
+      .find((panelId) =>
+        panelLayoutManager
+          .getPanel(panelId)
+          ?.tabs.some((tab) => tab.type === 'agent' && tab.agentId === agentId),
+      );
+    panelLayoutManager.openTabInAdjacentOrSplit(
+      {
+        type: 'hook-script',
+        title: m.chat_backgroundHooks_modal_title({ name: hook.name }),
+        workspaceId: hook.workspaceId,
+        hookId: hook.hookId,
+        closable: true,
+      },
+      sourcePanelId,
+    );
+  }
+
+  function toggleHookDetails(hookId: string) {
+    expandedHookId = expandedHookId === hookId ? null : hookId;
   }
 
   function stateLabel(hook: BackgroundHook): string {
@@ -111,181 +150,194 @@
       : m.chat_backgroundHooks_state_scheduled_label();
   }
 
+  // Reactive clock driving the countdown readouts: ticks once per second, but
+  // only while a rendered hook has a timed target. Ephemeral UI state — the
+  // actual row removal/state change still comes from `hook:*` events.
+  let now = $state(Date.now());
+  const hasTimedHook = $derived(agentHooks.some((h) => h.nextRunAt || h.expiresAt));
+  $effect(() => {
+    if (!hasTimedHook) return;
+    now = Date.now();
+    const interval = setInterval(() => {
+      now = Date.now();
+    }, 1000);
+    return () => clearInterval(interval);
+  });
+
   /**
-   * Compact TTL duration (`expiresAt − createdAt`): "60m" / "12m 30s" / "45s"
-   * — the seconds part is omitted when zero.
+   * Relative timing shown beside localized absolute timestamps in the inline
+   * details. `formatCompactDuration` clamps negative durations to "0s".
    */
-  function ttlDuration(hook: BackgroundHook): string {
-    const totalSeconds = Math.max(
-      0,
-      Math.round((new Date(hook.expiresAt!).getTime() - new Date(hook.createdAt).getTime()) / 1000),
-    );
-    const minutes = Math.floor(totalSeconds / 60);
-    const seconds = totalSeconds % 60;
-    if (minutes === 0) {
-      return m.chat_backgroundHooks_hover_ttlDurationSeconds_label({
-        seconds: formatInteger(seconds),
-      });
-    }
-    if (seconds === 0) {
-      return m.chat_backgroundHooks_hover_ttlDurationMinutes_label({
-        minutes: formatInteger(minutes),
-      });
-    }
-    return m.chat_backgroundHooks_hover_ttlDurationMinutesSeconds_label({
-      minutes: formatInteger(minutes),
-      seconds: formatInteger(seconds),
-    });
+  function nextRunIn(hook: BackgroundHook): string {
+    return formatCompactDuration(new Date(hook.nextRunAt!).getTime() - now);
+  }
+
+  function expiresIn(hook: BackgroundHook): string {
+    return formatCompactDuration(new Date(hook.expiresAt!).getTime() - now);
   }
 </script>
 
 {#if agentHooks.length > 0}
   <div
-    class="flex flex-wrap items-center gap-1.5 px-2.5 py-1 opacity-70"
+    class="w-full min-w-0 max-w-full"
     role="group"
     aria-label={m.chat_backgroundHooks_row_ariaLabel()}
     data-testid="background-hooks-row"
-    transition:slide={{ axis: 'y', duration: 200 }}
+    transition:safeSlide={{ axis: 'y', duration: 200 }}
   >
-    <Fa icon={faBolt} class="w-2.5 h-2.5 text-ghost shrink-0" />
-    <span class="text-xs leading-tight text-ghost shrink-0"
-      >{m.chat_backgroundHooks_runningHooks_label()}</span
-    >
     {#each agentHooks as hook (hook.hookId)}
-      <DropdownMenu side="top" align="start">
-        {#snippet trigger({ toggle }: { toggle: () => void })}
-          <Tooltip
-            side="top"
-            align="start"
-            delayDuration={300}
-            disableHoverableContent={false}
-            contentClass="max-w-sm"
+      {@const detailsId = `background-hook-details-${hook.hookId}`}
+      <div
+        class="overflow-hidden {SUBSCRIPTION_INSET_ROW_DIVIDER_CLASS}"
+        data-hook-state={hook.state}
+        data-subscription-motion-row="hook"
+        transition:safeSubscriptionRowTransition
+      >
+        <div
+          class="flex min-h-9 min-w-0 max-w-full items-center gap-2 px-3 py-2 text-muted-foreground"
+        >
+          <Button
+            variant="plain"
+            type="button"
+            class="h-auto min-h-0 w-auto min-w-0 max-w-full flex-1 shrink overflow-hidden whitespace-normal rounded border-0 text-left {SUBSCRIPTION_ROW_TYPOGRAPHY_CLASS} {SUBSCRIPTION_ICON_BUTTON_CLASS} focus-visible:ring-1"
+            data-testid="background-hook-summary"
+            data-subscription-row="event-subscription"
+            aria-expanded={expandedHookId === hook.hookId}
+            aria-controls={detailsId}
+            onclick={() => toggleHookDetails(hook.hookId)}
           >
-            {#snippet content()}
-              <div class="flex flex-col gap-1 text-xs" data-testid="background-hook-hover-card">
-                <div class="flex items-center gap-1.5 font-medium">
-                  <Fa icon={faBolt} class="w-2.5 h-2.5 text-ghost shrink-0" />
-                  <span class="truncate">{hook.name}</span>
-                  <span class="text-subtle font-normal">{stateLabel(hook)}</span>
-                </div>
-                <div class="text-subtle">
-                  <span
-                    >{m.chat_backgroundHooks_hover_delay_label({
-                      seconds: formatInteger(Math.round(hook.delayMs / 1000)),
-                    })}</span
-                  >
-                  {#if hook.nextRunAt}
-                    <span class="mx-1" aria-hidden="true">·</span>
-                    <span
-                      >{m.chat_backgroundHooks_hover_nextRun_label({
-                        time: formatTime(hook.nextRunAt, { seconds: true }),
-                      })}</span
-                    >
-                  {/if}
-                  {#if hook.expiresAt}
-                    <span class="mx-1" aria-hidden="true">·</span>
-                    <span
-                      >{m.chat_backgroundHooks_hover_ttl_label({
-                        duration: ttlDuration(hook),
-                        time: formatTime(hook.expiresAt, { seconds: true }),
-                      })}</span
-                    >
-                  {/if}
-                </div>
-                <button
-                  type="button"
-                  class="mt-0.5 self-start cursor-pointer text-primary underline hover:text-primary/80"
-                  data-testid="background-hook-view-script-link"
-                  onclick={() => handleViewScript(hook)}
+            <Fa
+              icon={hook.state === 'running' ? faSpinner : faBolt}
+              class="h-3.5 w-3.5 shrink-0 {SUBSCRIPTION_ICON_CLASS} {hook.state === 'running'
+                ? 'animate-spin'
+                : ''}"
+            />
+            <span class="min-w-0 flex-1 truncate">{hook.name}</span>
+            <span class="shrink-0 text-muted-foreground">{stateLabel(hook)}</span>
+            {#if hook.nextRunAt}
+              <span class="shrink-0 text-muted-foreground">{nextRunIn(hook)}</span>
+            {/if}
+            <span class="shrink-0" data-testid="background-hook-chevron">
+              <Fa
+                icon={faChevronDown}
+                size={16}
+                class="{SUBSCRIPTION_CHEVRON_SIZE_CLASS} {SUBSCRIPTION_CHEVRON_CLASS} {expandedHookId ===
+                hook.hookId
+                  ? ''
+                  : 'rotate-90'}"
+              />
+            </span>
+          </Button>
+          <DropdownMenu side="top" align="end">
+            {#snippet trigger({ props })}
+              <Button
+                {...props}
+                variant="plain"
+                size="icon-xs"
+                type="button"
+                class="h-6 w-6 border-0 {SUBSCRIPTION_ACTION_ICON_CLASS} {SUBSCRIPTION_ICON_BUTTON_CLASS} focus-visible:ring-1"
+                data-testid="background-hook-chip"
+                aria-label={m.chat_backgroundHooks_row_ariaLabel()}
+              >
+                <KebabIcon class="h-3 w-3" />
+              </Button>
+            {/snippet}
+            {#snippet content({ close }: { close: () => void })}
+              <div class="flex w-36 flex-col p-1">
+                <Button
+                  variant="ghost-light"
+                  size="xs"
+                  class="justify-start"
+                  disabled={hook.state === 'running'}
+                  onclick={() => handleRunNow(hook, close)}
                 >
+                  <Fa icon={faPlay} class="h-2.5 w-2.5" />
+                  {m.chat_backgroundHooks_runNow_label()}
+                </Button>
+                <Button
+                  variant="ghost-light"
+                  size="xs"
+                  class="justify-start"
+                  data-testid="background-hook-view-script-item"
+                  onclick={() => handleViewScript(hook, close)}
+                >
+                  <Fa icon={faCode} class="h-2.5 w-2.5" />
                   {m.chat_backgroundHooks_viewScript_label()}
-                </button>
+                </Button>
+                <Button
+                  variant="ghost-light"
+                  size="xs"
+                  class="justify-start"
+                  onclick={() => handleCancel(hook, close)}
+                >
+                  <Fa icon={faXmark} class="h-2.5 w-2.5" />
+                  {m.chat_backgroundHooks_cancel_label()}
+                </Button>
               </div>
             {/snippet}
-            <button
+          </DropdownMenu>
+        </div>
+        {#if expandedHookId === hook.hookId}
+          <div
+            id={detailsId}
+            class="grid gap-1.5 overflow-hidden px-9 pb-2 text-xs text-subtle"
+            data-testid="background-hook-details"
+            transition:safeSubscriptionSlide
+          >
+            <span
+              >{m.chat_backgroundHooks_hover_delay_label({
+                seconds: formatInteger(Math.round(hook.delayMs / 1000)),
+              })}</span
+            >
+            {#if hook.nextRunAt}
+              <span
+                >{m.chat_backgroundHooks_hover_nextRunIn_label({ duration: nextRunIn(hook) })}</span
+              >
+            {/if}
+            {#if hook.expiresAt}
+              <span
+                >{m.chat_backgroundHooks_hover_ttlExpiresIn_label({
+                  duration: expiresIn(hook),
+                })}</span
+              >
+            {/if}
+            <span
+              >{hook.runCount === 1
+                ? m.chat_backgroundHooks_details_runCount_one({
+                    count: formatInteger(hook.runCount),
+                  })
+                : m.chat_backgroundHooks_details_runCount_many({
+                    count: formatInteger(hook.runCount),
+                  })}</span
+            >
+            {#if hook.lastError}<span class="break-words text-destructive">{hook.lastError}</span
+              >{/if}
+            {#if hook.lastLogs}
+              <div class="grid gap-1">
+                <span class="font-medium text-muted-foreground"
+                  >{m.chat_backgroundHooks_modal_logsTab_label()}</span
+                >
+                <pre
+                  class="background-hook-logs max-h-24 overflow-auto whitespace-pre-wrap break-words font-mono leading-snug">{hook.lastLogs}</pre>
+              </div>
+            {/if}
+            <Button
+              variant="plain"
               type="button"
-              onclick={toggle}
-              class="group/chip relative flex flex-col rounded border border-border/40 bg-muted/20 px-1.5 py-0.5 text-xs leading-tight text-subtle hover:text-foreground hover:bg-muted/40 transition-colors overflow-hidden cursor-pointer"
-              data-testid="background-hook-chip"
-              data-hook-state={hook.state}
+              class="h-auto min-h-0 w-fit shrink border-0 font-normal text-primary underline focus-visible:ring-1"
+              data-testid="background-hook-view-script-link"
+              onclick={() => handleViewScript(hook)}
+              >{m.chat_backgroundHooks_viewScript_label()}</Button
             >
-              <span class="flex items-center gap-1 max-w-32">
-                <span class="truncate">{hook.name}</span>
-                {#if hook.state === 'running'}
-                  <Fa icon={faSpinner} class="w-2 h-2 animate-spin shrink-0" />
-                  <span class="sr-only">{m.chat_backgroundHooks_running_label()}</span>
-                {/if}
-              </span>
-              {#if hook.state === 'scheduled' && hook.nextRunAt}
-                {#key hook.nextRunAt}
-                  <span
-                    class="hook-time-bar mt-0.5 block h-px w-full bg-muted-foreground/50"
-                    style={timeBarStyle(hook)}
-                  ></span>
-                {/key}
-              {:else}
-                <span class="mt-0.5 block h-px w-full bg-transparent"></span>
-              {/if}
-            </button>
-          </Tooltip>
-        {/snippet}
-
-        {#snippet content({ close }: { close: () => void })}
-          <div class="flex w-36 flex-col p-1">
-            <Button
-              variant="ghost-light"
-              size="xs"
-              class="justify-start"
-              disabled={hook.state === 'running'}
-              onclick={() => handleRunNow(hook, close)}
-            >
-              <Fa icon={faPlay} class="w-2.5 h-2.5" />
-              {m.chat_backgroundHooks_runNow_label()}
-            </Button>
-            <Button
-              variant="ghost-light"
-              size="xs"
-              class="justify-start"
-              data-testid="background-hook-view-script-item"
-              onclick={() => handleViewScript(hook, close)}
-            >
-              <Fa icon={faCode} class="w-2.5 h-2.5" />
-              {m.chat_backgroundHooks_viewScript_label()}
-            </Button>
-            <Button
-              variant="ghost-light"
-              size="xs"
-              class="justify-start"
-              onclick={() => handleCancel(hook, close)}
-            >
-              <Fa icon={faXmark} class="w-2.5 h-2.5" />
-              {m.chat_backgroundHooks_cancel_label()}
-            </Button>
           </div>
-        {/snippet}
-      </DropdownMenu>
+        {/if}
+      </div>
     {/each}
   </div>
 {/if}
 
-{#if viewingHookId !== null}
-  <HookScriptModal {workspaceId} hookId={viewingHookId} onClose={() => (viewingHookId = null)} />
-{/if}
-
 <style>
-  @keyframes hook-time-bar-shrink {
-    from {
-      transform: scaleX(1);
-    }
-    to {
-      transform: scaleX(0);
-    }
-  }
-
-  .hook-time-bar {
-    transform-origin: left;
-    animation-name: hook-time-bar-shrink;
-    animation-timing-function: linear;
-    animation-fill-mode: forwards;
+  .background-hook-logs {
+    font-size: 11px;
   }
 </style>

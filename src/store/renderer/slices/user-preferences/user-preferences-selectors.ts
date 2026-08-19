@@ -22,8 +22,8 @@ export const selectIsAgentMonospace = store.createSelector((state) => {
   return state.userPreferences.agentFontStyle === 'monospace';
 });
 
-export const selectBetaUpdatesEnabled = store.createSelector((state) => {
-  return state.userPreferences.betaUpdatesEnabled;
+export const selectUpdateChannel = store.createSelector((state) => {
+  return state.userPreferences.updateChannel;
 });
 
 export const selectSpellcheckEnabled = store.createSelector((state) => {
@@ -46,6 +46,10 @@ export const selectHasCompletedProviderSetup = store.createSelector((state) => {
   return state.userPreferences.hasCompletedProviderSetup;
 });
 
+export const selectShowReasoningBlocks = store.createSelector((state) => {
+  return state.userPreferences?.showReasoningBlocks ?? false;
+});
+
 export const selectCounterScale = store.createSelector((state) => {
   return 1 / state.userPreferences.zoomFactor;
 });
@@ -58,6 +62,8 @@ export const selectNoteFontStyleLabel = store.createSelector((state) => {
   switch (state.userPreferences.noteFontStyle) {
     case 'sans':
       return 'Sans-serif';
+    case 'serif':
+      return 'Serif';
     case 'monospace':
       return 'Monospace';
     default:
@@ -134,6 +140,18 @@ export const selectActivityLogPresets = store.createSelector((state) => {
 
 export const selectLanguagePreference = store.createSelector((state) => {
   return state.userPreferences.languagePreference;
+});
+
+export const selectGithubLinkDefaultAction = store.createSelector((state) => {
+  return state.userPreferences?.githubLinkDefaultAction ?? 'show-choices';
+});
+
+export const selectPanelOpenMode = store.createSelector((state) => {
+  return state.userPreferences?.panelOpenMode ?? 'normal';
+});
+
+export const selectPanelStackDirection = store.createSelector((state) => {
+  return state.userPreferences?.panelStackDirection ?? 'right';
 });
 
 /** The concrete catalog locale the preference resolves to (explicit → system → en). */

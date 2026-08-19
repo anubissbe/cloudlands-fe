@@ -26,12 +26,10 @@
 
 <script lang="ts">
   import { shell } from '$lib/electron-bridge';
-  import {
-  faCircleNotch,
-  faTriangleExclamation,
-} from '@fortawesome/free-solid-svg-icons';
+  import { faCircleNotch, faTriangleExclamation } from '@fortawesome/free-solid-svg-icons';
   import Fa from 'svelte-fa';
   import { m } from '$shared/paraglide/messages.js';
+  import { cn } from '$lib/utils';
 
   interface Props {
     warning?: string;
@@ -41,6 +39,8 @@
     description?: string;
     linkText?: string;
     variant?: 'warning' | 'progress';
+    /** Extra classes on the notice root (e.g. to break out of a flex row). */
+    class?: string;
   }
 
   let {
@@ -51,6 +51,7 @@
     description = m.chat_modelPicker_installCodex_description(),
     linkText = m.chat_modelPicker_setupDocs_label(),
     variant = 'warning',
+    class: className,
   }: Props = $props();
 
   const shouldRender = $derived(show && (Boolean(warning) || variant === 'progress'));
@@ -66,12 +67,18 @@
 
 {#if shouldRender}
   <div
-    class="max-w-[360px] rounded-md border border-warning/30 bg-warning/10 px-3 py-2 text-xs text-foreground"
+    class={cn(
+      'type-caption max-w-[360px] rounded-md border border-warning/30 bg-warning/10 px-3 py-2 text-foreground',
+      className,
+    )}
     role="status"
   >
     <div class="flex items-start gap-2">
       {#if variant === 'progress'}
-        <Fa icon={faCircleNotch} class="h-3.5 w-3.5 text-warning-foreground mt-0.5 shrink-0 animate-spin" />
+        <Fa
+          icon={faCircleNotch}
+          class="h-3.5 w-3.5 text-warning-foreground mt-0.5 shrink-0 animate-spin"
+        />
       {:else}
         <Fa
           icon={faTriangleExclamation}

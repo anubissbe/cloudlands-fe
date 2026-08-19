@@ -7,22 +7,27 @@
 
   import type { TabTypeComponentProps } from './registry';
   import { getPanelHeaderContext } from '$lib/components/layout/panel-system/panel-header-context.svelte';
-  import { closeTab } from '$store/renderer/slices/panel-layout/panel-layout-slice';
+  import {
+    closeTab,
+    updateFileTabPath,
+  } from '$store/renderer/slices/panel-layout/panel-layout-slice';
 
   import {
-  selectFileContent,
-  selectFileError,
-  selectFileIsBinary,
-  selectFileIsDirty,
-  selectFileLastUpdated,
-  selectFileLoading,
-  selectFileSaving,
-} from '$store/renderer/slices/files/files-selectors';
-  import { loadFileContentRequested } from '$store/renderer/slices/files/files-slice';
+    selectFileContent,
+    selectFileError,
+    selectFileIsBinary,
+    selectFileIsDirty,
+    selectFileLastUpdated,
+    selectFileLoading,
+    selectFileNotFoundCandidates,
+    selectFileSaving,
+  } from '$store/renderer/slices/files/files-selectors';
   import {
-  writeFileContent,
-  flushFileContent,
-} from '$features/files/files-write-service';
+    loadFileContentRequested,
+    removeFileContentEntry,
+    saveFileContentRequested,
+    updateFileContent,
+  } from '$store/renderer/slices/files/files-slice';
   import { selectFileTrackingChanges } from '$store/renderer/slices/changes/changes-selectors';
   import type { TrackedChange } from '$features/file-tracking/types';
   import { selectWorkspaceById } from '$store/renderer/slices/workspace/workspace-selectors';
@@ -31,38 +36,27 @@
   import { LineType } from '$shared/types';
   import { getLanguageFromPath } from '$lib/utils/file-utils';
   import { isAbsolutePath, isAbsolutePathOutsideRoot, isTildePath } from '$lib/utils/path-utils';
-  import {
-  parseHunksToLineChanges,
-  type LineChange,
-} from '$lib/utils/line-change-decorations';
+  import { parseHunksToLineChanges, type LineChange } from '$lib/utils/line-change-decorations';
   import CodeEditor from '$lib/components/editor/CodeEditor.svelte';
   import MarkdownFileEditor from '$lib/components/editor/MarkdownFileEditor.svelte';
   import FileViewer from '$lib/components/editor/FileViewer.svelte';
   import { Skeleton } from '$lib/components/ui/skeleton';
-  import { Button } from '$lib/components/ui/button';
-  import OpenComboButton from '$lib/components/ui/OpenComboButton.svelte';
-  import SaveIndicator from '$lib/components/ui/SaveIndicator.svelte';
+  import * as Menu from '$lib/components/ui/menu';
+  import ViewSettingsDropdown from '../components/ViewSettingsDropdown.svelte';
+  import OpenComboButton from '$features/external-editors/components/OpenComboButton.svelte';
   import {
-  selectLineWrapping,
-  selectDiffIndicators,
-} from '$store/renderer/slices/ui-layout/ui-layout-selectors';
+    selectLineWrapping,
+    selectDiffIndicators,
+  } from '$store/renderer/slices/ui-layout/ui-layout-selectors';
   import {
-  toggleLineWrapping,
-  toggleDiffIndicators,
-} from '$store/renderer/slices/ui-layout/ui-layout-slice';
+    toggleLineWrapping,
+    toggleDiffIndicators,
+  } from '$store/renderer/slices/ui-layout/ui-layout-slice';
 
   import { dispatchWindowEvent } from '$lib/utils/window-events';
   import { openWorkspaceDiff } from '$store/renderer/slices/workspace-navigation/workspace-navigation-slice';
   import { untrack } from 'svelte';
-  import Fa from 'svelte-fa';
-  import {
-  faPaintbrush,
-  faTextWidth,
-  faPencil,
-  faTrash,
-  faEye,
-  faCode,
-} from '@fortawesome/free-solid-svg-icons';
+  import { faFloppyDisk, faPencil, faTrash } from '@fortawesome/free-solid-svg-icons';
   import { deleteWithUndo } from '$lib/utils/reversible-actions';
   import { m } from '$shared/paraglide/messages.js';
   import { writable } from 'svelte/store';
@@ -70,38 +64,61 @@
 
   const lineWrapping = selectLineWrapping();
   const diffIndicators = selectDiffIndicators();
-  const headerToggleActiveClass =
-    'text-foreground bg-sidebar hover:text-foreground hover:bg-sidebar';
-  const headerToggleInactiveClass = 'text-subtle';
-
   let { tab, workspaceId, isActive, isPanelFocused }: TabTypeComponentProps = $props();
 
+  // svelte-ignore state_referenced_locally
   const filePathStore = writable<string | null | undefined>(tab.filePath);
   $effect(() => {
     filePathStore.set(tab.filePath);
   });
 
+  // svelte-ignore state_referenced_locally
   const fileContentStore = selectFileContent(workspaceId, filePathStore);
+  // svelte-ignore state_referenced_locally
   const fileLoadingStore = selectFileLoading(workspaceId, filePathStore);
+  // svelte-ignore state_referenced_locally
   const fileSavingStore = selectFileSaving(workspaceId, filePathStore);
+  // svelte-ignore state_referenced_locally
   const fileErrorStore = selectFileError(workspaceId, filePathStore);
+  // svelte-ignore state_referenced_locally
+  const fileNotFoundCandidatesStore = selectFileNotFoundCandidates(workspaceId, filePathStore);
+  // svelte-ignore state_referenced_locally
   const isFileBinaryStore = selectFileIsBinary(workspaceId, filePathStore);
+  // svelte-ignore state_referenced_locally
   const isFileDirtyStore = selectFileIsDirty(workspaceId, filePathStore);
+  // svelte-ignore state_referenced_locally
   const fileLastUpdatedStore = selectFileLastUpdated(workspaceId, filePathStore);
 
+  // svelte-ignore state_referenced_locally
   const ftChanges$ = selectFileTrackingChanges(workspaceId);
   const headerContext = getPanelHeaderContext();
 
+  // svelte-ignore state_referenced_locally
   const workspace = selectWorkspaceById(workspaceId);
-  const repoPath = $derived($workspace?.worktreePath || $workspace?.repositoryPath || null);
+  const repoPath = $derived(
+    $workspace?.worktreePath || $workspace?.repositoryPath || $workspace?.path || null,
+  );
 
   const fileContent = $derived($fileContentStore);
   const fileLoading = $derived($fileLoadingStore);
   const fileSaving = $derived($fileSavingStore);
   const fileError = $derived($fileErrorStore);
+  // Suffix-resolution candidates recorded by the read saga on a not-found
+  // error (see files-read-saga); capped for display in the error panel.
+  const MAX_NOT_FOUND_CANDIDATES = 5;
+  const fileNotFoundCandidates = $derived(
+    ($fileNotFoundCandidatesStore ?? []).slice(0, MAX_NOT_FOUND_CANDIDATES),
+  );
   const isFileBinary = $derived($isFileBinaryStore);
   const isFileDirty = $derived($isFileDirtyStore);
   const fileLastUpdated = $derived($fileLastUpdatedStore);
+  const saveStatusLabel = $derived(
+    fileSaving
+      ? m.ui_saveIndicator_saving_tooltip()
+      : isFileDirty
+        ? m.ui_saveIndicator_autoSaving_tooltip()
+        : m.ui_saveIndicator_saved_tooltip(),
+  );
 
   let codeEditorRef = $state<{ focus: () => boolean } | null>(null);
   let isMounted = $state(true);
@@ -141,8 +158,7 @@
   const isOutsideWorkspace = $derived(
     !!(
       tab.filePath &&
-      (isTildePath(tab.filePath) ||
-        (repoPath && isAbsolutePathOutsideRoot(tab.filePath, repoPath)))
+      (isTildePath(tab.filePath) || (repoPath && isAbsolutePathOutsideRoot(tab.filePath, repoPath)))
     ),
   );
   const fileAbsolutePath = $derived(
@@ -172,14 +188,24 @@
   });
   const fileHasChanges = $derived(!!fileChange);
 
-  // Auto-save is debounced inside the files-write-service (keyed by ws::path).
+  // Auto-save is debounced inside filesWriteSaga (keyed by ws::path).
   // Flush any pending save when the file/workspace changes or the tab unmounts
   // so an in-flight edit is never lost.
   $effect(() => {
     const wsId = workspaceId;
     const filePath = tab.filePath;
     return () => {
-      if (wsId && filePath) flushFileContent(wsId, filePath);
+      if (!wsId || !filePath) return;
+      const content = selectFileContent.select(appStore.state, wsId, filePath);
+      const dirty = selectFileIsDirty.select(appStore.state, wsId, filePath);
+      const absolutePath = isAbsolutePath(filePath)
+        ? filePath
+        : repoPath
+          ? `${repoPath}/${filePath}`
+          : null;
+      if (dirty && content !== null && absolutePath) {
+        appStore.dispatch(saveFileContentRequested(wsId, filePath, absolutePath, content));
+      }
     };
   });
 
@@ -190,8 +216,12 @@
     const absolutePath = fileAbsolutePath;
     const wsId = workspaceId;
 
-    if (filePath && absolutePath && wsId && !isOutsideWorkspace) {
-      appStore.dispatch(loadFileContentRequested(wsId, filePath, absolutePath));
+    // `file.read` is scoped by workspaceId and accepts a repository-relative
+    // path. Do not block the read while the workspace entity/root hydrates —
+    // doing so leaves activity-opened tabs stuck at "Preparing to load file".
+    // The effect runs again with the resolved absolute path once hydration lands.
+    if (filePath && wsId && !isOutsideWorkspace) {
+      appStore.dispatch(loadFileContentRequested(wsId, filePath, absolutePath ?? filePath));
     }
   });
 
@@ -202,12 +232,25 @@
   function setFileContentFromEditor(content: string) {
     if (!tab.filePath || !workspaceId || !fileAbsolutePath) return;
     // Optimistic local update + debounced file.write through the seam.
-    writeFileContent(workspaceId, tab.filePath, fileAbsolutePath, content);
+    appStore.dispatch(updateFileContent(workspaceId, tab.filePath, content));
   }
 
   function saveFileContent() {
     if (!tab.filePath || !fileAbsolutePath || fileContent === null || fileSaving) return;
-    writeFileContent(workspaceId, tab.filePath, fileAbsolutePath, fileContent, { immediate: true });
+    appStore.dispatch(
+      saveFileContentRequested(workspaceId, tab.filePath, fileAbsolutePath, fileContent),
+    );
+  }
+
+  // Retarget this tab to a suffix-resolution candidate (mirrors the read
+  // saga's unique-match flow): drop the stale not-found entry, then update
+  // the tab path — the load effect re-issues the read against it. Scoped to
+  // this tab's id so other tabs open on the same path resolve independently.
+  function openNotFoundCandidate(candidate: string) {
+    const currentPath = tab.filePath;
+    if (!currentPath || !workspaceId) return;
+    appStore.dispatch(removeFileContentEntry(workspaceId, currentPath));
+    appStore.dispatch(updateFileTabPath(workspaceId, currentPath, candidate, tab.id));
   }
 
   // Fetch line changes for diff indicators
@@ -278,8 +321,7 @@
     const filePath = tab.filePath;
     const fileName = filePath.split('/').pop() || m.layout_fileTab_file_fallback();
     // Capture current content so we can restore on undo
-    const savedContent =
-      selectFileContent.select(appStore.state, workspaceId, filePath) ?? '';
+    const savedContent = selectFileContent.select(appStore.state, workspaceId, filePath) ?? '';
 
     await deleteWithUndo(
       `"${fileName}"`,
@@ -298,7 +340,9 @@
       },
       async () => {
         // Undo action — re-create the file with saved content (immediate write).
-        writeFileContent(workspaceId, filePath, absolutePath, savedContent, { immediate: true });
+        appStore.dispatch(
+          saveFileContentRequested(workspaceId, filePath, absolutePath, savedContent),
+        );
       },
     );
   }
@@ -306,96 +350,59 @@
   // Register header state and actions
   $effect(() => {
     if (!headerContext || !isActive) return;
+    const headerState = { isDirty: isFileDirty, isSaving: fileSaving };
     untrack(() => {
-      headerContext.registerActions(fileActions);
-      headerContext.registerState({ isDirty: isFileDirty, isSaving: fileSaving });
+      headerContext.registerActions({ display: fileDisplayActions, actions: fileActions });
+      headerContext.registerState(headerState);
     });
   });
 </script>
 
 <svelte:window onkeydown={handleKeyDown} />
 
-{#snippet fileActions()}
+{#snippet fileDisplayActions()}
   <!-- Save/edit affordances are hidden for out-of-workspace paths -->
   {#if !isOutsideWorkspace}
-    <SaveIndicator
-      isDirty={isFileDirty}
-      isSaving={fileSaving}
-      isAutoSaving={isFileDirty && !fileSaving}
-      onSave={saveFileContent}
-      size="sm"
-    />
+    <Menu.CommandItem icon={faFloppyDisk} label={saveStatusLabel} disabled />
   {/if}
   {#if tab.filePath && !isOutsideWorkspace}
-    <div class="w-px h-4 bg-border mx-1"></div>
-    {#if isMarkdownFile}
-      <Button
-        variant="ghost-light"
-        size="icon-xs"
-        onclick={() => (markdownPreview = !markdownPreview)}
-        tooltip={markdownPreview
-          ? m.layout_fileTab_switchToCode_tooltip()
-          : m.layout_fileTab_switchToPreview_tooltip()}
-        tooltipSide="bottom"
-        aria-pressed={markdownPreview}
-        class={markdownPreview ? headerToggleActiveClass : headerToggleInactiveClass}
-      >
-        <Fa icon={markdownPreview ? faCode : faEye} size="xs" />
-      </Button>
-    {/if}
+    <ViewSettingsDropdown
+      embedded
+      showFold={false}
+      showSplit={false}
+      showPreview={isMarkdownFile}
+      previewEnabled={markdownPreview}
+      onTogglePreview={() => (markdownPreview = !markdownPreview)}
+      showWrap={!isMarkdownFile || !markdownPreview}
+      wrapEnabled={$lineWrapping}
+      onToggleWrap={() => appStore.dispatch(toggleLineWrapping())}
+      showDiff={!isMarkdownFile || !markdownPreview}
+      diffEnabled={$diffIndicators}
+      onToggleDiff={() => appStore.dispatch(toggleDiffIndicators())}
+    />
+  {/if}
+{/snippet}
+
+{#snippet fileActions()}
+  {#if tab.filePath && !isOutsideWorkspace}
     {#if fileHasChanges}
-      <Button
-        variant="ghost-light"
-        size="icon-xs"
+      <Menu.CommandItem
+        icon={faPencil}
+        label={m.layout_fileTab_goToChanges_tooltip()}
         onclick={handleGoToChanges}
-        tooltip={m.layout_fileTab_goToChanges_tooltip()}
-        tooltipSide="bottom"
-      >
-        <Fa icon={faPencil} size="xs" />
-      </Button>
+      />
     {/if}
-    {#if !isMarkdownFile || !markdownPreview}
-      <Button
-        variant="ghost-light"
-        size="icon-xs"
-        onclick={() => appStore.dispatch(toggleDiffIndicators())}
-        tooltip={$diffIndicators
-          ? m.layout_fileTab_hideDiffIndicators_tooltip()
-          : m.layout_fileTab_showDiffIndicators_tooltip()}
-        tooltipSide="bottom"
-        aria-pressed={$diffIndicators}
-        class={$diffIndicators ? headerToggleActiveClass : headerToggleInactiveClass}
-      >
-        <Fa icon={faPaintbrush} size="xs" />
-      </Button>
-      <Button
-        variant="ghost-light"
-        size="icon-xs"
-        onclick={() => appStore.dispatch(toggleLineWrapping())}
-        tooltip={$lineWrapping
-          ? m.layout_diffHeader_wrappingOn_tooltip()
-          : m.layout_diffHeader_wrapLines_tooltip()}
-        tooltipSide="bottom"
-        aria-pressed={$lineWrapping}
-        class={$lineWrapping ? headerToggleActiveClass : headerToggleInactiveClass}
-      >
-        <Fa icon={faTextWidth} size="xs" />
-      </Button>
-    {/if}
-    <Button
-      variant="ghost-light"
-      size="icon-xs"
+    <Menu.CommandItem
+      icon={faTrash}
+      label={m.layout_fileTab_deleteFile_tooltip()}
       onclick={handleDeleteFile}
-      tooltip={m.layout_fileTab_deleteFile_tooltip()}
-      tooltipSide="bottom"
-      class="text-muted-foreground hover:text-destructive-foreground"
-    >
-      <Fa icon={faTrash} size="xs" />
-    </Button>
+      destructive
+    />
     <OpenComboButton
       filePath={tab.filePath}
+      {workspaceId}
       isDirectory={false}
-      compact
+      embedded
       workspaceFolderPath={repoPath ?? undefined}
     />
   {/if}
@@ -421,8 +428,25 @@
       </div>
     {:else if fileError}
       <div class="flex flex-col items-center justify-center h-full text-subtle gap-2">
-        <p class="text-destructive-foreground">{m.layout_fileTab_errorLoading_label()}</p>
+        <p class="text-error-foreground">{m.layout_fileTab_errorLoading_label()}</p>
         <p class="text-xs">{fileError}</p>
+        <p class="text-xs font-mono">{tab.filePath}</p>
+        {#if fileNotFoundCandidates.length > 0}
+          <p class="text-xs mt-2">{m.layout_fileTab_didYouMean_label()}</p>
+          <ul class="flex flex-col items-center gap-1">
+            {#each fileNotFoundCandidates as candidate (candidate)}
+              <li>
+                <button
+                  type="button"
+                  class="text-xs font-mono text-primary cursor-pointer hover:underline"
+                  onclick={() => openNotFoundCandidate(candidate)}
+                >
+                  {candidate}
+                </button>
+              </li>
+            {/each}
+          </ul>
+        {/if}
       </div>
     {:else if fileContent !== null}
       {@const isSvgFile = tab.filePath?.toLowerCase().endsWith('.svg')}

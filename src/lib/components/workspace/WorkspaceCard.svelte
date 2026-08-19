@@ -5,6 +5,7 @@
     faBoxArchive,
     faCheck,
     faKeyboard,
+    faRightLeft,
     faThumbtack,
     faTrash,
   } from '@fortawesome/free-solid-svg-icons';
@@ -13,15 +14,19 @@
   import { onDestroy } from 'svelte';
   import { Tooltip } from '$lib/components/ui/tooltip';
   import HoverCard from '$lib/components/ui/HoverCard.svelte';
-  import AugieAvatarWithState from '$lib/components/ui/auggie-avatar/AugieAvatarWithState.svelte';
   import WorkspaceHoverCard from '$lib/components/workspace/WorkspaceHoverCard.svelte';
+  import WorkspaceStatusIcon from '$lib/components/workspace/WorkspaceStatusIcon.svelte';
   import WorkspacePhaseIndicator from '$lib/components/workspace/WorkspacePhaseIndicator.svelte';
-  import { deriveWorkspacePhase } from '$lib/components/workspace/workspace-phase';
   import type { WorkspacePhaseInfo, WorkspacePhaseStats, WorkspacePhase } from './workspace-phase';
+  import {
+    getWorkspaceStatusPresentation,
+    resolveWorkspaceStatusState,
+  } from './utils/workspace-status-presentation';
   import TaskProgressBar from './TaskProgressBar.svelte';
   import RelativeTime from '$lib/components/ui/RelativeTime.svelte';
-  import Button from '$lib/components/ui/button/button.svelte';
+  import { Button } from '$lib/components/ui/button';
   import SidebarContextMenu from '$lib/components/ui/sidebar-context-menu/SidebarContextMenu.svelte';
+  import SidebarOverflowMenu from '$lib/components/ui/sidebar-context-menu/SidebarOverflowMenu.svelte';
   import type {
     SidebarMenuEntry,
     SidebarMenuItem,
@@ -32,23 +37,14 @@
   } from '$store/renderer/slices/sidebar-nav/sidebar-nav-slice';
   import type { Workspace } from '$shared/types';
   import { PullRequestStatus } from '$shared/types';
-  import {
-    getWorkspaceAgentDisplayInfos,
-    type WorkspaceAgentDisplayInfo,
-  } from './utils/workspace-agent-display';
   import { writable } from 'svelte/store';
-  import { store as appStore } from "$store/renderer/store";
-  import {
-    selectAgentIsResponding,
-    selectAgentIsWaiting,
-    selectAgentSession,
-  } from '$store/renderer/slices/agent-session/agent-session-selectors';
-  import { selectWorkspaceTaskProgress } from '$store/renderer/slices/workspace-tasks/workspace-tasks-selectors';
+  import { store as appStore } from '$store/renderer/store';
   import { ensureWorkspaceTasksLoaded } from '$store/renderer/slices/workspace-tasks/workspace-tasks-slice';
   import {
     requestArchiveWorkspace,
     requestDeleteWorkspace,
   } from '$store/renderer/slices/workspace-operations/workspace-operations-slice';
+  import { openTransferModal } from '$store/renderer/slices/workspace-transfer/workspace-transfer-slice';
   import {
     markKeySlotUnassigned,
     pinWorkspaceToKey,
@@ -61,6 +57,16 @@
   import { microConnectedReadable } from '$features/hardware-console/device/connection-status';
   import MicroKeySlotBadge from '$lib/components/workspace/MicroKeySlotBadge.svelte';
   import { selectWorkspaceActivePullRequest } from '$store/renderer/slices/workspace/workspace-selectors';
+  import { selectPrMonitors } from '$store/renderer/slices/pr-monitor/pr-monitor-selectors';
+  import {
+    constructPrUrl,
+    countOtherMonitors,
+    getPRStatusTooltip,
+    mapWorkspacePRs,
+    mergeMonitoredPRs,
+    selectPrimaryPr,
+    toPullRequestStatus,
+  } from '$lib/components/workspace/sidebar/sidebar-changes-utils';
   import { cn } from '$lib/utils';
   import { isPRMergeable as checkPRMergeable, getPRTooltipContent } from '$lib/utils/pr-status';
   import { getWorkspaceActivityDisplayTime } from '$shared/utils/workspace-activity-time';
@@ -78,20 +84,26 @@
     phase?: WorkspacePhaseInfo;
     stats?: WorkspacePhaseStats;
     variant?: 'compact' | 'expanded' | 'header' | 'row';
+    /** @deprecated Status visuals resolve from the workspace status contract. */
     isRunning?: boolean;
     isUnread?: boolean;
+    /**
+     * Daemon-flagged waiting workspace (grey dot; loses to running/unread).
+     * Defaults to the workspace's own BE-sent `waiting` flag (PROTOCOL §5.1)
+     * when not explicitly passed; an explicit value overrides the flag.
+     */
+    /** @deprecated Status visuals resolve from the workspace status contract. */
+    isWaiting?: boolean;
     isPinned?: boolean;
     streamingAgentIds?: string[];
-    /** Unread agent IDs for this workspace (used to filter which agents to show) */
-    unreadAgentIds?: string[];
-    /** Whether to hide the repo avatar (e.g. when already grouped by repo) */
-    hideRepoAvatar?: boolean;
     /** Whether the spec note has content */
     hasSpec?: boolean;
     /** Whether the coordinator/initial agent is actively running */
     isAgentRunning?: boolean;
     /** Short digest of what the agent is doing */
     agentDigest?: string;
+    /** Optional localized label shown beside the workspace title. */
+    trailingLabel?: string;
     title?: string;
     repoName?: string;
     branch?: string;
@@ -122,15 +134,15 @@
     phase,
     stats,
     variant = 'compact',
-    isRunning = false,
+    isRunning: _isRunning = false,
     isUnread = false,
+    isWaiting: _isWaiting,
     isPinned = false,
     streamingAgentIds = [],
-    unreadAgentIds = [],
-    hideRepoAvatar = false,
     hasSpec = false,
     isAgentRunning = false,
     agentDigest,
+    trailingLabel,
     title: _title,
     repoName: _repoName,
     branch: _branch,
@@ -152,18 +164,15 @@
   $effect(() => {
     workspaceIdStore.set(workspace?.id ?? '');
   });
-  const workspaceTaskProgress$ = selectWorkspaceTaskProgress(workspaceIdStore);
+  // Agent PR monitors (PROTOCOL §6.9): all monitors (active + completed) feed
+  // the primary-PR pool and the "+N" other-monitored-PRs indicator — the same
+  // pool every primary-PR surface uses, so pill and Overview never disagree.
+  const prMonitors$ = selectPrMonitors(workspaceIdStore);
 
   // Micro-key slot badge/menus: only while a micro is connected (manager
   // status connected — not mere presence).
   const microConnected$ = microConnectedReadable();
   const workspaceKeySlot$ = selectWorkspaceResolvedKeySlot(workspaceIdStore);
-
-  // Whether the second (repo) row renders its owner/repo text; when it
-  // doesn't, the micro-key badge moves inline into the title row.
-  const showRepoLine = $derived(
-    !hideRepoAvatar && Boolean(workspace?.repositoryOwner && workspace?.repositoryName),
-  );
 
   // Load canonical tasks for progress display (no-op once initialized).
   $effect(() => {
@@ -172,83 +181,81 @@
     appStore.dispatch(ensureWorkspaceTasksLoaded(String(workspaceId)));
   });
 
-  const workspacePhaseInfo = $derived(
-    workspace
-      ? deriveWorkspacePhase(workspace, {
-          hasActiveAgents: isRunning,
-          taskProgress: $workspaceTaskProgress$,
-        })
-      : undefined,
+  const workspaceStatusState = $derived(resolveWorkspaceStatusState(workspace ?? {}));
+  const workspaceStatusPresentation = $derived(
+    getWorkspaceStatusPresentation(workspaceStatusState),
   );
-  const workspaceBuildProgress = $derived.by(() => {
-    const { total, completed } = $workspaceTaskProgress$;
-    if (total === 0) return 0;
-    return completed / total;
-  });
   let isCurrent = $derived(workspace ? page.url.pathname === `/workspace/${workspace.id}` : false);
   let hoverCardVisible = $state(false);
   let rowElement: HTMLDivElement | null = $state(null);
 
+  const activePullRequest = $derived.by(() => {
+    if (!workspace) return null;
+    return selectWorkspaceActivePullRequest.select(appStore.state, workspace.id);
+  });
+  // Primary PR for the pill: the shared oldest-unmerged / latest-merged rule
+  // (selectPrimaryPr) over the combined branch-linked + agent-monitored pool
+  // (PROTOCOL §6.9).
+  const primaryPr = $derived.by(() => {
+    if (!workspace) return undefined;
+    const ws = workspace;
+    const workspaceRepo =
+      ws.repositoryOwner && ws.repositoryName
+        ? `${ws.repositoryOwner}/${ws.repositoryName}`
+        : undefined;
+    return selectPrimaryPr(
+      mergeMonitoredPRs(
+        mapWorkspacePRs(
+          ws.pullRequests,
+          activePullRequest,
+          (prNum, fallbackUrl) =>
+            constructPrUrl(prNum, ws.repositoryOwner, ws.repositoryName, fallbackUrl),
+          (pr) => pr.title,
+        ),
+        $prMonitors$,
+        workspaceRepo,
+      ),
+    );
+  });
+  // The branch-linked active PR keeps its tooltip/mergeability treatment only
+  // when it is the chosen primary.
+  const primaryIsActivePr = $derived(
+    primaryPr !== undefined &&
+      activePullRequest !== null &&
+      !primaryPr.crossRepo &&
+      !primaryPr.monitorOnly &&
+      primaryPr.number === activePullRequest.number,
+  );
   const prStatus = $derived.by(() => {
     if (!workspace) return null;
-    const activePR = selectWorkspaceActivePullRequest.select(
-      appStore.state,
-      workspace.id,
-    );
-    if (activePR) return activePR.status;
-    if (workspace.prStatus) return workspace.prStatus;
-    const prs = workspace.pullRequests ?? [];
-    if (prs.length > 0) return prs[0].status;
-    return null;
+    if (primaryPr) return toPullRequestStatus(primaryPr.status);
+    return workspace.prStatus ?? null;
   });
   const prNumber = $derived.by(() => {
     if (!workspace) return undefined;
-    const activePR = selectWorkspaceActivePullRequest.select(
-      appStore.state,
-      workspace.id,
-    );
-    return activePR?.number ?? workspace.prNumber ?? workspace.pullRequests?.[0]?.number;
+    return primaryPr?.number ?? workspace.prNumber ?? undefined;
   });
-  const isPRMergeable = $derived.by(() => {
-    if (!workspace) return false;
-    const activePR = selectWorkspaceActivePullRequest.select(
-      appStore.state,
-      workspace.id,
-    );
-    return checkPRMergeable(activePR ?? undefined);
-  });
+  const isPRMergeable = $derived(
+    primaryIsActivePr && checkPRMergeable(activePullRequest ?? undefined),
+  );
   const prTooltipContent = $derived.by(() => {
-    if (!workspace) return '';
-    const activePR = selectWorkspaceActivePullRequest.select(
-      appStore.state,
-      workspace.id,
+    if (!primaryPr) return '';
+    return primaryIsActivePr
+      ? getPRTooltipContent(activePullRequest ?? undefined)
+      : getPRStatusTooltip(primaryPr);
+  });
+
+  // "+N" indicator: other monitored PRs in the pool beyond the primary badge.
+  const otherMonitoredPrCount = $derived.by(() => {
+    if (!workspace) return 0;
+    return countOtherMonitors(
+      $prMonitors$,
+      prNumber,
+      workspace.repositoryOwner,
+      workspace.repositoryName,
+      primaryPr?.crossRepo,
     );
-    return getPRTooltipContent(activePR ?? undefined);
   });
-
-  const agentInfos = $derived.by(() => {
-    const reduxState = appStore.state;
-    return getWorkspaceAgentDisplayInfos({
-      memberAgentIds: workspace?.agentSummary?.agentIds ?? [],
-      unreadAgentIds,
-      workspaceActivity: workspace?.activity,
-      getAgentSnapshot: (agentId) => {
-        const loadedSession = selectAgentSession.select(reduxState, agentId);
-        return {
-          hasLoadedSession: !!loadedSession,
-          isWaiting: loadedSession ? selectAgentIsWaiting.select(reduxState, agentId) : false,
-          isResponding: loadedSession
-            ? selectAgentIsResponding.select(reduxState, agentId)
-            : false,
-          isStreamingFallback: loadedSession ? false : streamingAgentIds.includes(agentId),
-          sessionStatus: loadedSession?.status as string | undefined,
-          specialist: (loadedSession?.metadata?.specialist ??
-            null) as WorkspaceAgentDisplayInfo['specialist'],
-        };
-      },
-    });
-  });
-
   function handleKeydown(e: KeyboardEvent) {
     if (e.key === 'Enter') onClick?.(e);
   }
@@ -267,21 +274,25 @@
   });
 
   let contextMenu: { x: number; y: number } | null = $state(null);
+  let overflowMenuOpen = $state(false);
   let hadContextMenu = false;
 
   function handleContextMenu(e: MouseEvent) {
     if (!workspace) return;
     e.preventDefault();
     e.stopPropagation();
+    overflowMenuOpen = false;
     contextMenu = { x: e.clientX, y: e.clientY };
   }
 
   function closeContextMenu() {
     contextMenu = null;
+    overflowMenuOpen = false;
   }
 
   $effect(() => {
-    const isOpen = contextMenu !== null;
+    if (overflowMenuOpen) contextMenu = null;
+    const isOpen = contextMenu !== null || overflowMenuOpen;
 
     if (isOpen && !hadContextMenu) {
       appStore.dispatch(incrementContextMenuOpen());
@@ -344,6 +355,18 @@
         submenu: assignSubmenu,
       });
     }
+
+    items.push({
+      id: 'transfer',
+      label: m.workspace_card_transfer_label(),
+      icon: faRightLeft,
+      onClick: () => {
+        appStore.dispatch(
+          openTransferModal({ workspaceId: workspace.id, workspaceTitle: workspace.title }),
+        );
+        closeContextMenu();
+      },
+    });
 
     items.push({
       id: 'archive',
@@ -432,187 +455,226 @@
   });
 
   const phasePillStyles: Record<WorkspacePhase, string> = {
-    planning: 'bg-muted/20 text-subtle',
-    building: 'bg-sky-500/15 text-sky-600 dark:text-sky-400',
-    reviewing: 'bg-indigo-500/15 text-indigo-600 dark:text-indigo-400',
+    planning: 'bg-muted/20 text-muted-foreground',
+    building: 'bg-info/15 text-info',
+    reviewing: 'bg-primary/15 text-primary',
     shipped: 'bg-foreground/10 text-foreground',
   };
 </script>
 
 {#if workspace}
-  <!-- svelte-ignore a11y_no_static_element_interactions -->
+  <!-- The sibling Button owns keyboard activation; the wrapper delegates pointer hover/context behavior. -->
+  <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
   <div
     bind:this={rowElement}
     class={cn(
-      'wc-root group relative flex w-full cursor-pointer items-start gap-2 px-3 py-2 text-left',
+      'wc-root group relative mx-1 flex w-auto cursor-pointer items-center gap-2.5 rounded-md px-2.5 py-2 text-left font-normal transition-colors',
       isCurrent
-        ? 'bg-background'
+        ? 'bg-background/60'
         : highlighted
-          ? 'bg-sidebar'
-          : !suppressHover && 'hover:bg-sidebar',
+          ? 'bg-background/50'
+          : !suppressHover && 'hover:bg-background/40',
       selected && 'bg-primary/5 ring-1 ring-primary/30',
       className,
     )}
-    role="button"
-    tabindex="0"
+    role="group"
+    data-pinned={isPinned}
     data-highlight-id={highlightId}
     use:highlightTarget={{ id: highlightId }}
     onclick={(e) => onClick?.(e)}
-    onkeydown={handleKeydown}
+    onkeydown={(event) => {
+      if (event.target === event.currentTarget) handleKeydown(event);
+    }}
     oncontextmenu={handleContextMenu}
     onmouseenter={handleMouseEnter}
     onmouseleave={handleMouseLeave}
     style:anchor-name="--workspace-list-{workspace.id}"
+    data-workspace-card-row
   >
-    <div class="flex items-center gap-1.5 shrink-0 mt-[3px]">
-      <div class="shrink-0 relative">
-        <WorkspacePhaseIndicator
-          phase={workspacePhaseInfo?.phase ?? 'planning'}
-          progress={workspaceBuildProgress}
-          size={14}
-        />
-        {#if isRunning}
-          <div
-            class="absolute -top-0.5 -right-0.5 size-1.5 rounded-full bg-green-500 animate-pulse"
-          ></div>
-        {:else if isUnread}
-          <div class="absolute -top-0.5 -right-0.5 size-1.5 rounded-full bg-blue-500"></div>
-        {/if}
-      </div>
+    <Button
+      variant="plain"
+      class="absolute inset-0 z-0 h-auto w-auto rounded-md focus-visible:border-transparent focus-visible:bg-background/50 focus-visible:ring-0"
+      aria-label={workspace.title || m.workspace_links_untitled_label()}
+      aria-describedby={`workspace-status-state-${workspace.id}${isPinned ? ` workspace-pinned-state-${workspace.id}` : ''}`}
+      aria-current={isCurrent ? 'page' : undefined}
+      data-workspace-card-trigger
+      onclick={(event) => {
+        event.stopPropagation();
+        onClick?.(event);
+      }}
+    ></Button>
+
+    <div class="relative z-10 flex shrink-0 items-center gap-1.5">
+      {#if $microConnected$ && $workspaceKeySlot$ !== null}
+        <MicroKeySlotBadge workspaceId={workspace.id} slot={$workspaceKeySlot$} />
+      {/if}
+      <Tooltip content={workspaceStatusPresentation.tooltip} side="bottom" sideOffset={4}>
+        <WorkspaceStatusIcon status={workspaceStatusState} size={14} decorative />
+      </Tooltip>
+      <span id="workspace-status-state-{workspace.id}" class="sr-only">
+        {workspaceStatusPresentation.accessibleName}
+      </span>
     </div>
 
-    <div class="flex-1 min-w-0 flex flex-col gap-0.5">
-      <div class="flex items-center gap-1.5">
+    <div class="relative z-10 flex min-w-0 flex-1 items-center gap-2">
+      <span class="flex min-w-0 flex-1 items-center gap-1" data-workspace-card-title-group>
         <span
-          class="wc-title truncate text-[13px] flex-1 min-w-0
+          class="wc-title type-body min-w-0 truncate font-normal!
           {isCurrent
-            ? 'font-medium text-foreground'
+            ? 'text-foreground'
             : workspace.title
               ? 'text-foreground'
-              : 'text-subtle'}"
+              : 'text-muted-foreground'}"
+          data-workspace-card-title
         >
           {workspace.title || m.workspace_links_untitled_label()}
         </span>
-
-        {#if isRunning && streamingAgentIds.length > 0 && workspace?.activity !== 'idle'}
-          <div class="wc-secondary flex items-center -space-x-1.5 shrink-0">
-            {#each streamingAgentIds.slice(0, 3) as agentId (agentId)}
-              <AugieAvatarWithState {agentId} size={14} state="running" />
-            {/each}
-            {#if streamingAgentIds.length > 3}
-              <div class="ml-1 text-ui text-subtle font-medium">
-                +{streamingAgentIds.length - 3}
-              </div>
-            {/if}
-          </div>
-        {:else if agentInfos.length > 0}
-          <div class="wc-secondary flex items-center -space-x-1.5 shrink-0">
-            {#each agentInfos.slice(0, 3) as agent (agent.id)}
-              <AugieAvatarWithState
-                agentId={agent.id}
-                size={14}
-                state={agent.state}
-                specialist={agent.specialist}
-              />
-            {/each}
-            {#if agentInfos.length > 3}
-              <div class="ml-1 text-ui text-subtle font-medium">+{agentInfos.length - 3}</div>
-            {/if}
-          </div>
-        {/if}
-
-        {#if $microConnected$ && $workspaceKeySlot$ !== null && !showRepoLine}
-          <span class="wc-secondary shrink-0 flex items-center">
-            <MicroKeySlotBadge workspaceId={workspace.id} slot={$workspaceKeySlot$} />
-          </span>
-        {/if}
-
-        {#if prStatus}
-          {@const statusColor =
-            prStatus === PullRequestStatus.Merged
-              ? 'bg-purple-500/10 text-purple-500'
-              : prStatus === PullRequestStatus.Open
-                ? isPRMergeable
-                  ? 'bg-emerald-500/10 text-emerald-500'
-                  : 'bg-yellow-500/10 text-yellow-600 dark:text-yellow-400'
-                : prStatus === PullRequestStatus.Draft
-                  ? 'bg-muted-foreground/10 text-muted-foreground'
-                  : 'bg-red-500/10 text-red-500'}
-          <Tooltip
-            content={prTooltipContent}
-            side="bottom"
-            sideOffset={4}
-            disabled={!prTooltipContent}
+        {#if isPinned}
+          <span
+            class="wc-pin-indicator inline-flex shrink-0 items-center text-muted-foreground transition-opacity
+              {onTogglePin
+              ? highlighted
+                ? 'opacity-0'
+                : suppressHover
+                  ? ''
+                  : 'group-hover:opacity-0 group-focus-within:opacity-0'
+              : ''}"
+            data-workspace-card-pin-indicator
+            aria-hidden="true"
           >
-            <span
-              class="wc-secondary text-ui font-medium px-1.5 py-0 rounded-full shrink-0 {statusColor}"
-            >
-              {m.workspace_card_prBadge_label({ number: prNumber ? ` #${prNumber}` : '' })}
-            </span>
-          </Tooltip>
-        {/if}
-
-        <span
-          class="wc-secondary shrink-0 {actions || onTogglePin || (isUnread && onMarkAsRead)
-            ? highlighted
-              ? 'opacity-0'
-              : suppressHover
-                ? ''
-                : 'group-hover:opacity-0 group-hover/message:opacity-0'
-            : ''}"
-        >
-          {#if getWorkspaceActivityDisplayTime(workspace) > 0}
-            <RelativeTime
-              date={getWorkspaceActivityDisplayTime(workspace)}
-              class="text-ui text-subtle whitespace-nowrap"
-              compact
-            />
-          {/if}
-        </span>
-      </div>
-
-      {#if showRepoLine}
-        <div class="wc-repo flex items-center gap-1.5 min-w-0">
-          {#if $microConnected$ && $workspaceKeySlot$ !== null}
-            <MicroKeySlotBadge workspaceId={workspace.id} slot={$workspaceKeySlot$} />
-          {/if}
-          <span class="min-w-0 truncate text-ui text-subtle">
-            {workspace.repositoryOwner}/{workspace.repositoryName}
+            <Fa icon={faThumbtack} size="xs" />
           </span>
-        </div>
+          <span id="workspace-pinned-state-{workspace.id}" class="sr-only">
+            {m.layout_activeCard_pinned_header()}
+          </span>
+        {/if}
+      </span>
+
+      {#if trailingLabel}
+        <span
+          class="type-caption shrink-0 rounded-sm bg-muted-foreground/10 px-1.5 font-normal text-muted-foreground"
+          data-workspace-card-trailing-label
+        >
+          {trailingLabel}
+        </span>
       {/if}
+
+      {#if prStatus}
+        {@const statusColor =
+          prStatus === PullRequestStatus.Merged
+            ? 'bg-success/10 text-success'
+            : prStatus === PullRequestStatus.Open
+              ? isPRMergeable
+                ? 'bg-success/10 text-success'
+                : 'bg-warning/10 text-warning'
+              : prStatus === PullRequestStatus.Draft
+                ? 'bg-muted text-muted-foreground'
+                : 'bg-destructive/10 text-error-foreground'}
+        <Tooltip
+          content={prTooltipContent}
+          side="bottom"
+          sideOffset={4}
+          disabled={!prTooltipContent}
+        >
+          <span
+            class="wc-secondary type-caption shrink-0 rounded-sm px-1.5 font-normal tabular-nums {statusColor}"
+          >
+            {m.workspace_card_prBadge_label({ number: prNumber ? ` #${prNumber}` : '' })}
+          </span>
+        </Tooltip>
+      {/if}
+
+      {#if otherMonitoredPrCount > 0}
+        <Tooltip
+          content={otherMonitoredPrCount === 1
+            ? m.workspace_card_morePrs_tooltip_one()
+            : m.workspace_card_morePrs_tooltip_many({
+                count: formatInteger(otherMonitoredPrCount),
+              })}
+          side="bottom"
+          sideOffset={4}
+        >
+          <span
+            class="wc-secondary type-caption shrink-0 rounded-sm bg-muted-foreground/10 px-1.5 font-normal text-muted-foreground tabular-nums"
+            data-testid="workspace-card-more-prs"
+          >
+            {m.workspace_card_morePrs_label({ count: formatInteger(otherMonitoredPrCount) })}
+          </span>
+        </Tooltip>
+      {/if}
+
+      <span
+        class="wc-secondary shrink-0 {actions || onTogglePin || (isUnread && onMarkAsRead)
+          ? highlighted
+            ? 'opacity-0'
+            : suppressHover
+              ? ''
+              : 'group-hover:opacity-0 group-hover/message:opacity-0'
+          : ''}"
+        data-workspace-card-time
+      >
+        {#if getWorkspaceActivityDisplayTime(workspace) > 0}
+          <RelativeTime
+            date={getWorkspaceActivityDisplayTime(workspace)}
+            class="type-caption whitespace-nowrap tabular-nums text-muted-foreground"
+            compact
+          />
+        {/if}
+      </span>
     </div>
 
-    {#if actions || onTogglePin || (isUnread && onMarkAsRead)}
+    {#if actions || onOpenInNewWindow || onTogglePin || (isUnread && onMarkAsRead)}
       <div
-        class="wc-actions absolute right-0 top-1.5 px-2 flex items-center gap-0.5
+        class="wc-actions absolute right-1 top-1/2 z-20 flex -translate-y-1/2 items-center gap-0.5 rounded-md bg-accent/95 px-0.5 focus-within:opacity-100 group-focus-within:opacity-100
           {highlighted
           ? 'opacity-100'
           : suppressHover
             ? 'opacity-0'
             : 'opacity-0 group-hover:opacity-100'}"
       >
+        {#if onOpenInNewWindow}
+          <SidebarOverflowMenu
+            bind:open={overflowMenuOpen}
+            items={getContextMenuItems()}
+            ariaLabel={m.workspace_progressCard_actions_ariaLabel()}
+            class="flex size-5 cursor-pointer items-center justify-center rounded text-muted-foreground transition-colors hover:bg-muted/50 hover:text-foreground focus-visible:bg-muted/50 focus-visible:text-foreground focus-visible:outline-none"
+          />
+        {/if}
         {@render actions?.()}
         {#if isUnread && onMarkAsRead}
-          <button
-            class="flex h-5 w-5 cursor-pointer items-center justify-center rounded text-ghost transition-all hover:bg-muted/50 hover:text-foreground"
-            onclick={onMarkAsRead}
+          <Button
+            variant="plain"
+            size="icon-xs"
+            iconOnly
+            class="text-muted-foreground hover:bg-muted/50 hover:text-foreground focus-visible:border-transparent focus-visible:bg-muted/50 focus-visible:text-foreground focus-visible:ring-0"
+            onclick={(event) => {
+              event.stopPropagation();
+              onMarkAsRead?.(event);
+            }}
             aria-label={m.workspace_card_markAsRead_label()}
             title={m.workspace_card_markAsRead_label()}
           >
             <Fa icon={faCheck} size="xs" />
-          </button>
+          </Button>
         {/if}
         {#if onTogglePin}
-          <button
-            class="flex h-5 w-5 -my-1 cursor-pointer items-center justify-center rounded transition-all hover:bg-muted/50 hover:text-foreground
-              {isPinned ? 'text-primary/60' : 'text-ghost'}"
-            onclick={onTogglePin}
-            aria-label={isPinned ? m.workspace_card_unpin_ariaLabel() : m.workspace_card_pin_ariaLabel()}
+          <Button
+            variant="plain"
+            size="icon-xs"
+            iconOnly
+            class="transition-all hover:bg-muted/50 hover:text-foreground focus-visible:border-transparent focus-visible:bg-muted/50 focus-visible:text-foreground focus-visible:ring-0
+              {isPinned ? 'text-primary' : 'text-muted-foreground'}"
+            onclick={(event) => {
+              event.stopPropagation();
+              onTogglePin?.(event);
+            }}
+            aria-label={isPinned
+              ? m.workspace_card_unpin_ariaLabel()
+              : m.workspace_card_pin_ariaLabel()}
             title={isPinned ? m.workspace_card_unpin_tooltip() : m.workspace_card_pin_tooltip()}
           >
-            <Fa icon={faThumbtack} size="xs" />
-          </button>
+            <span aria-hidden="true"><Fa icon={faThumbtack} size="xs" /></span>
+          </Button>
         {/if}
       </div>
     {/if}
@@ -623,7 +685,7 @@
       anchor="--workspace-list-{workspace.id}"
       position="right"
       anchorElement={rowElement}
-      class="w-auto border-0 bg-transparent shadow-xl"
+      class="w-auto border-0 bg-transparent"
     >
       <WorkspaceHoverCard {workspace} activeAgentIds={streamingAgentIds} />
     </HoverCard>
@@ -660,8 +722,8 @@
       class="shrink-0"
     />
     <span class="font-medium truncate">{phase.label}</span>
-    <span class="text-ghost shrink-0">·</span>
-    <span class="text-subtle truncate text-xs">{statusSubtitle}</span>
+    <span class="shrink-0 text-muted-foreground">·</span>
+    <span class="truncate text-xs text-muted-foreground">{statusSubtitle}</span>
     {@render actions?.()}
   </button>
 {:else if phase && stats && variant === 'header'}
@@ -679,9 +741,9 @@
       <div class="text-sm font-semibold truncate">{_title}</div>
     {/if}
     {#if _repoName || _branch}
-      <div class="flex items-center gap-1 text-xs text-subtle truncate">
+      <div class="flex items-center gap-1 truncate text-xs text-muted-foreground">
         {#if _repoName}<span class="truncate">{_repoName}</span>{/if}
-        {#if _repoName && _branch}<span class="text-ghost">·</span>{/if}
+        {#if _repoName && _branch}<span class="text-muted-foreground">·</span>{/if}
         {#if _branch}<span class="truncate">{_branch}</span>{/if}
       </div>
     {/if}
@@ -692,7 +754,7 @@
         size={12}
         class="shrink-0"
       />
-      <span class="text-subtle truncate">{statusSubtitle}</span>
+      <span class="truncate text-muted-foreground">{statusSubtitle}</span>
       <span
         class={cn(
           'inline-flex items-center px-1.5 py-px rounded-full text-ui font-medium shrink-0 ml-auto',
@@ -706,8 +768,8 @@
   <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions a11y_no_noninteractive_tabindex -->
   <div
     class={cn(
-      'rounded-lg border border-border/50 bg-background text-left w-full',
-      onClick && 'cursor-pointer hover:bg-background/80 transition-colors',
+      'rounded-lg border border-border bg-sidebar text-left w-full',
+      onClick && 'cursor-pointer hover:bg-sidebar/80 transition-colors',
       highlighted && 'ring-1 ring-primary/40',
       selected && 'bg-primary/5 ring-1 ring-primary/30',
       className,
@@ -728,7 +790,9 @@
       />
       <div class="flex-1 min-w-0">
         <div class="text-sm font-medium">{phase.label}</div>
-        <div class="text-xs text-subtle mt-0.5 leading-snug line-clamp-2">{statusSubtitle}</div>
+        <div class="mt-0.5 line-clamp-2 text-xs leading-snug text-muted-foreground">
+          {statusSubtitle}
+        </div>
       </div>
     </div>
 
@@ -737,25 +801,25 @@
         {#if stats.tasks.total > 0}
           <div class="flex items-center gap-2">
             <TaskProgressBar stats={stats.tasks} barWidth="3px" barHeight="14px" class="flex-1" />
-            <span class="text-ui text-subtle shrink-0 tabular-nums">
+            <span class="text-ui shrink-0 tabular-nums text-muted-foreground">
               {stats.tasks.completed}/{stats.tasks.total}
             </span>
           </div>
         {/if}
         {#if stats.files.changed > 0}
           <div class="flex items-center justify-between text-ui">
-            <span class="text-subtle"
+            <span class="text-muted-foreground"
               >{m.workspace_card_files_label({ count: formatInteger(stats.files.changed) })}</span
             >
             <span class="tabular-nums">
-              <span class="text-green-500/70">+{stats.files.additions}</span>
-              <span class="text-red-500/70 ml-1">-{stats.files.deletions}</span>
+              <span class="text-success">+{stats.files.additions}</span>
+              <span class="ml-1 text-error-foreground">-{stats.files.deletions}</span>
             </span>
           </div>
         {/if}
         {#if stats.commits.total > 0}
           <div class="flex items-center justify-between text-ui">
-            <span class="text-subtle"
+            <span class="text-muted-foreground"
               >{m.workspace_card_commits_label({ count: formatInteger(stats.commits.total) })}</span
             >
           </div>
@@ -765,7 +829,7 @@
             <span
               class={cn(
                 'inline-flex items-center gap-1',
-                stats.pr.hasMerged ? 'text-purple-500/70' : 'text-green-500/70',
+                stats.pr.hasMerged ? 'text-primary' : 'text-success',
               )}>{statusPrLabel}</span
             >
           </div>
@@ -789,7 +853,7 @@
           }}>{statusActions.primary.label}</Button
         >
         <Button
-          class="h-7 text-xs text-subtle"
+          class="h-7 text-xs text-muted-foreground"
           variant="ghost"
           size="sm"
           onclick={(e) => {
@@ -807,9 +871,6 @@
     .wc-secondary {
       display: none;
     }
-    .wc-repo {
-      display: none;
-    }
   }
 
   @container (max-width: 160px) {
@@ -825,6 +886,9 @@
     }
     .wc-actions {
       display: none;
+    }
+    .wc-pin-indicator {
+      opacity: 1 !important;
     }
   }
 </style>

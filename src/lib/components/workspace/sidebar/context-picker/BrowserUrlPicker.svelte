@@ -6,30 +6,30 @@
    */
   import { Input } from '$lib/components/ui/input';
   import { Button } from '$lib/components/ui/button';
-  import {
-  faGlobe,
-  faPlus,
-  faHistory,
-} from '@fortawesome/free-solid-svg-icons';
+  import { faGlobe, faPlus, faHistory } from '@fortawesome/free-solid-svg-icons';
   import Fa from 'svelte-fa';
   import { onMount } from 'svelte';
 
   import { selectBrowserRecentUrls } from '$store/renderer/slices/browser/browser-selectors';
-  import {
-  addRecentUrl,
-  initBrowserWorkspace,
-} from '$store/renderer/slices/browser/browser-slice';
+  import { addRecentUrl, initBrowserWorkspace } from '$store/renderer/slices/browser/browser-slice';
   import { store as appStore } from '$store/renderer/store';
   import { m } from '$shared/paraglide/messages.js';
 
   interface Props {
     workspaceId: string;
-    onSelect: (item: { type: string; title: string; url: string; identifier: string; metadata?: Record<string, unknown> }) => void;
+    onSelect: (item: {
+      type: string;
+      title: string;
+      url: string;
+      identifier: string;
+      metadata?: Record<string, unknown>;
+    }) => void;
     onClose: () => void;
   }
 
   let { workspaceId, onSelect, onClose }: Props = $props();
 
+  // svelte-ignore state_referenced_locally - intentional initial capture; the picker is modal-scoped so workspaceId never changes during its lifetime
   const recentUrls$ = selectBrowserRecentUrls(workspaceId);
 
   let urlInput = $state('');
@@ -79,7 +79,9 @@
     urlError = '';
 
     // Add to browser store for history
-    appStore.dispatch(addRecentUrl(workspaceId, normalized, undefined, undefined, new Date().toISOString()));
+    appStore.dispatch(
+      addRecentUrl(workspaceId, normalized, undefined, undefined, new Date().toISOString()),
+    );
 
     onSelect({
       type: 'browser-url',
@@ -118,7 +120,9 @@
 <div class="p-4">
   <!-- URL Input -->
   <div class="space-y-2">
-    <label for="url-input" class="text-sm font-medium">{m.workspace_browserUrlPicker_enterUrl_label()}</label>
+    <label for="url-input" class="text-sm font-medium"
+      >{m.workspace_browserUrlPicker_enterUrl_label()}</label
+    >
     <div class="flex gap-2">
       <div class="flex-1 relative">
         <Fa icon={faGlobe} class="absolute left-3 top-1/2 -translate-y-1/2 text-ghost" size="sm" />
@@ -137,7 +141,7 @@
       </Button>
     </div>
     {#if urlError}
-      <p class="text-xs text-destructive-foreground">{urlError}</p>
+      <p class="text-xs text-error-foreground">{urlError}</p>
     {/if}
   </div>
 

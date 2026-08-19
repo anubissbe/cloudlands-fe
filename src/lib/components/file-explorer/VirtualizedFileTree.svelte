@@ -1,10 +1,6 @@
 <script lang="ts">
-/* eslint-disable max-lines */
-  import {
-  onMount,
-  tick,
-  untrack,
-} from 'svelte';
+  /* eslint-disable max-lines */
+  import { onMount, tick, untrack } from 'svelte';
   import { writable } from 'svelte/store';
   import type {
     FileExplorerDisplayNode as FileNode,
@@ -12,16 +8,18 @@
   } from '$store/renderer/slices/file-explorer/file-explorer-types';
   import { ListItem } from '$lib/components/ui/list';
   import {
-  faChevronDown,
-  faPlus,
-  faArrowUpRightFromSquare,
-  faPencil,
-  faFolderOpen,
-  faTrash,
-} from '@fortawesome/free-solid-svg-icons';
+    faChevronDown,
+    faPlus,
+    faArrowUpRightFromSquare,
+    faDownload,
+    faPencil,
+    faFolderOpen,
+    faTrash,
+  } from '@fortawesome/free-solid-svg-icons';
+  import { toast } from 'svelte-sonner';
   import { getFileTypeIconSvg } from '$lib/utils/file-type-icons';
   import LineChangesBadge from '../shared/LineChangesBadge.svelte';
-  import AuggieAvatar from '$lib/components/ui/auggie-avatar/AuggieAvatar.svelte';
+  import AgentAvatar from '$features/agent/components/agent-avatar/AgentAvatar.svelte';
   import Fa from 'svelte-fa';
   import SidebarContextMenu from '$lib/components/ui/sidebar-context-menu/SidebarContextMenu.svelte';
   import type { SidebarMenuEntry } from '$lib/components/ui/sidebar-context-menu/types';
@@ -29,14 +27,17 @@
   import { pathsMatch as filePathsMatch } from '$lib/utils/file-utils';
   import { deleteWithUndo } from '$lib/utils/reversible-actions';
   import {
-  getPanelLayoutManager,
-  hasPanelLayoutManager,
-} from '$features/layout/panel-layout-adapter';
+    getPanelLayoutManager,
+    hasPanelLayoutManager,
+  } from '$features/layout/panel-layout-adapter';
   import { dispatchWindowEvent } from '$lib/utils/window-events';
   import { selectEffectiveFileExplorerWorkspacePath } from '$store/renderer/slices/file-explorer/file-explorer-selectors';
-  import { selectIsDaemonLocal } from '$store/renderer/slices/daemon-health/daemon-health-selectors';
+  import { selectIsWorkspaceHostLocal } from '$store/renderer/slices/workspace/workspace-selectors';
   import { store as appStore } from '$store/renderer/store';
   import { m } from '$shared/paraglide/messages.js';
+  import type { PanelTab } from '$store/renderer/slices/panel-layout/panel-layout-types';
+  import { getPanelTabOpenState } from '$store/renderer/slices/panel-layout/panel-layout-selectors';
+  import OpenPanelIndicator from '$lib/components/workspace/sidebar/OpenPanelIndicator.svelte';
 
   // Sentinel path for inline creation node
   const CREATING_SENTINEL_PATH = '__creating_new_file__';
@@ -70,6 +71,8 @@
     overscan?: number;
     /** Callback when external files are dropped onto the tree */
     onExternalFilesDrop?: (files: File[], targetPath: string | null) => void;
+    openPanelTabs?: PanelTab[];
+    activePanelTab?: PanelTab | null;
   }
 
   let {
@@ -86,8 +89,11 @@
     itemHeight = 25, // Match ListItem sm size
     overscan = 5,
     onExternalFilesDrop,
+    openPanelTabs = [],
+    activePanelTab,
   }: Props = $props();
 
+  // svelte-ignore state_referenced_locally - intentional initial capture; the $effect below syncs later changes
   const workspaceIdStore = writable(workspaceId);
   const fileExplorerWorkspacePath = selectEffectiveFileExplorerWorkspacePath(workspaceIdStore);
 
@@ -271,10 +277,7 @@
 
     // Walk backwards to find the first directory with lower depth
     for (let i = currentIndex - 1; i >= 0; i--) {
-      if (
-        flattenedNodes[i].depth < currentDepth &&
-        flattenedNodes[i].node.type === 'directory'
-      ) {
+      if (flattenedNodes[i].depth < currentDepth && flattenedNodes[i].node.type === 'directory') {
         return i;
       }
     }
@@ -654,10 +657,7 @@
           targetDir =
             focusedFlatNode.node.type === 'directory'
               ? focusedFlatNode.node.path
-              : focusedFlatNode.node.path.substring(
-                  0,
-                  focusedFlatNode.node.path.lastIndexOf('/'),
-                );
+              : focusedFlatNode.node.path.substring(0, focusedFlatNode.node.path.lastIndexOf('/'));
         }
       }
       if (!targetDir) {
@@ -769,6 +769,28 @@
     );
   }
 
+  // Save a copy of a file (or a zip of a folder) via the main process's native
+  // save dialog. Workspace-host-local only — the local main process reads the path.
+  async function handleDownload(node: FileNode) {
+    try {
+      const result = await invoke<{
+        success: boolean;
+        canceled?: boolean;
+        data?: { filePath: string };
+        error?: { code: string; message: string };
+      }>('file:download', { path: node.path });
+      if (result?.success && result.data?.filePath) {
+        toast.success(
+          m.fileExplorer_tree_downloadSuccess_toast({ filePath: result.data.filePath }),
+        );
+      } else if (!result?.canceled) {
+        toast.error(result?.error?.message || m.fileExplorer_tree_downloadFailed_error());
+      }
+    } catch {
+      toast.error(m.fileExplorer_tree_downloadFailed_error());
+    }
+  }
+
   function getBackgroundContextMenuItems(): SidebarMenuEntry[] {
     const items: SidebarMenuEntry[] = [];
     if (onCreateFile) {
@@ -799,7 +821,8 @@
         },
       });
       if (onCreateFile) {
-        const parentDir = node.path.substring(0, node.path.lastIndexOf('/')) || $fileExplorerWorkspacePath;
+        const parentDir =
+          node.path.substring(0, node.path.lastIndexOf('/')) || $fileExplorerWorkspacePath;
         items.push({
           id: 'new-file',
           label: m.fileExplorer_tree_newFile_label(),
@@ -860,10 +883,24 @@
       });
     }
 
-    // Add reveal-in-file-manager option — daemon-host desktop action, only
-    // offered when the daemon runs on this machine (PROTOCOL §5.14 locality).
-    if (selectIsDaemonLocal.select(appStore.state)) {
+    // Add download and reveal-in-file-manager options — desktop actions on
+    // workspace file paths, only offered when the daemon runs on this machine
+    // (PROTOCOL §5.14 locality) AND the workspace checkout lives on the daemon
+    // host, i.e. not a remote (SSH) workspace (monorepo#2171).
+    if (selectIsWorkspaceHostLocal.select(appStore.state, workspaceId)) {
       items.push({ type: 'separator' });
+      items.push({
+        id: 'download',
+        label:
+          node.type === 'file'
+            ? m.fileExplorer_tree_download_label()
+            : m.fileExplorer_tree_downloadZip_label(),
+        icon: faDownload,
+        onClick: () => {
+          closeContextMenu();
+          void handleDownload(node);
+        },
+      });
       items.push({
         id: 'reveal',
         label: m.layout_panelTabBar_revealIn_label({ fileManager: fileManagerName }),
@@ -957,6 +994,14 @@
       return nodePath.endsWith(`/${selectedFile}`);
     }
     return false;
+  }
+
+  function getFilePanelState(filePath: string) {
+    return getPanelTabOpenState(openPanelTabs, activePanelTab, workspaceId, {
+      type: 'file',
+      filePath,
+      workspaceId,
+    });
   }
 
   // Scroll state
@@ -1096,7 +1141,9 @@
                 class="relative min-w-0 flex items-center gap-2.5 py-1 rounded-md border border-border shadow-xs bg-background text-foreground"
                 style="margin-left: 0.5px; padding-left: 9px; padding-right: 0.5px; width: calc(100% - 0.5px);"
               >
-                <span class="shrink-0 flex items-center justify-center w-4 h-4 [&>svg]:w-full [&>svg]:h-full">
+                <span
+                  class="shrink-0 flex items-center justify-center w-4 h-4 [&>svg]:w-full [&>svg]:h-full"
+                >
                   {@html getFileTypeIconSvg(creatingValue || '')}
                 </span>
                 <input
@@ -1122,9 +1169,10 @@
                   : ''
                 : getGitStatusColor(flatNode.gitStatus?.status)}
             {@const hasChanges =
-              (flatNode.gitStatus?.additions ?? 0) > 0 ||
-              (flatNode.gitStatus?.deletions ?? 0) > 0}
+              (flatNode.gitStatus?.additions ?? 0) > 0 || (flatNode.gitStatus?.deletions ?? 0) > 0}
             {@const isModified = isFileModified(node.path) && node.type === 'file'}
+            {@const panelState =
+              node.type === 'file' ? getFilePanelState(node.path) : { count: 0, isActive: false }}
             {@const isDropTarget =
               isExternalFileDragOver &&
               dropTargetPath !== null &&
@@ -1138,7 +1186,9 @@
 
             <!-- svelte-ignore a11y_no_static_element_interactions -->
             <div
-              class="flex items-center transition-colors duration-150 {isIgnored ? 'opacity-50' : ''}"
+              class="flex items-center transition-colors duration-150 {isIgnored
+                ? 'opacity-50'
+                : ''}"
               class:folder-drop-target={isDropTarget}
               class:inside-drop-target={isInsideDropTarget}
               style="height: {itemHeight}px; padding-left: {depth * 16}px;"
@@ -1152,7 +1202,9 @@
                   class="relative min-w-0 flex items-center gap-2.5 py-1 rounded-md border border-border shadow-xs bg-background text-foreground"
                   style="margin-left: 0.5px; padding-left: 9px; padding-right: 0.5px; width: calc(100% - 0.5px);"
                 >
-                  <span class={`shrink-0 flex items-center justify-center ${node.type === 'directory' ? `opacity-50 ${gitColor}` : `w-4 h-4 [&>svg]:w-full [&>svg]:h-full`}`}>
+                  <span
+                    class={`shrink-0 flex items-center justify-center ${node.type === 'directory' ? `opacity-50 ${gitColor}` : `w-4 h-4 [&>svg]:w-full [&>svg]:h-full`}`}
+                  >
                     {#if node.type === 'directory'}
                       <Fa icon={faChevronDown} size="12" />
                     {:else}
@@ -1175,7 +1227,7 @@
                   selected={isFocused}
                   tabindex={-1}
                   icon={faChevronDown}
-                  iconClass={`opacity-50 [&>svg]:w-2! [&>svg]:mr-1! ${gitColor} transition-transform duration-150 ${flatNode.isExpanded ? '' : '-rotate-90'}`}
+                  iconClass={`opacity-50 [&>svg]:w-2! [&>svg]:mr-1! ${gitColor} transition-transform duration-150 ${flatNode.isExpanded ? '' : 'rotate-90'}`}
                   title={displayName}
                   titleClass={gitColor}
                   onclick={() => handleItemClick(flatNode, absoluteIndex)}
@@ -1215,6 +1267,7 @@
                       {@html getFileTypeIconSvg(node.name)}
                     </span>
                   {/snippet}
+                  <OpenPanelIndicator count={panelState.count} active={panelState.isActive} />
                 </ListItem>
               {/if}
               {#if hasChanges}
@@ -1237,7 +1290,7 @@
                         onSelectAgent?.(agentId);
                       }}
                     >
-                      <AuggieAvatar {agentId} size={16} />
+                      <AgentAvatar {agentId} size={16} />
                     </button>
                   {/each}
                 </div>
@@ -1254,7 +1307,9 @@
   <SidebarContextMenu
     x={contextMenu.x}
     y={contextMenu.y}
-    items={contextMenu.node ? getContextMenuItems(contextMenu.node) : getBackgroundContextMenuItems()}
+    items={contextMenu.node
+      ? getContextMenuItems(contextMenu.node)
+      : getBackgroundContextMenuItems()}
     onClickOutside={closeContextMenu}
   />
 {/if}

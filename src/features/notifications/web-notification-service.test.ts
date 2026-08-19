@@ -2,8 +2,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { goto } from '$app/navigation';
 
 // Use vi.hoisted to ensure mocks are available before module resolution
-const { mockAppStore, mockState, mockGetPlatform, mockPlayNotificationSound, mockBackendRequest } =
-  vi.hoisted(() => {
+const { mockAppStore, mockState, mockPlayNotificationSound, mockBackendRequest } = vi.hoisted(
+  () => {
     const mockState = {
       userPreferences: {
         enabled: true,
@@ -11,23 +11,25 @@ const { mockAppStore, mockState, mockGetPlatform, mockPlayNotificationSound, moc
         soundOnlyWhenUnfocused: false,
         volume: 0.5,
       },
-      workspace: { activeWorkspaceId: null as string | null },
+      tabState: { currentTabId: null as string | null },
     };
     return {
       mockState,
-      mockAppStore: { state: mockState, dispatch: vi.fn() },
-      mockGetPlatform: vi.fn(() => 'web'),
+      mockAppStore: {
+        state: mockState,
+        dispatch: vi.fn(),
+        createSelector: (selector: (state: typeof mockState) => unknown) => ({
+          select: (state: typeof mockState) => selector(state),
+        }),
+      },
       mockPlayNotificationSound: vi.fn(() => Promise.resolve()),
       mockBackendRequest: vi.fn(),
     };
-  });
+  },
+);
 
 vi.mock('$store/renderer/store', () => ({
   store: mockAppStore,
-}));
-
-vi.mock('$lib/utils/platform-capabilities', () => ({
-  getPlatform: mockGetPlatform,
 }));
 
 vi.mock('$lib/utils/notification-sound', () => ({
@@ -40,14 +42,12 @@ vi.mock('$lib/client/live/backend-transport', () => ({
 
 // Import after mocking
 import {
-  createWebNotificationMiddleware,
   handleWebAgentIdle,
   showTestWebNotification,
   requestWebNotificationPermission,
   __resetWebNotificationServiceForTesting,
   __getActiveWebNotificationCountForTesting,
 } from './web-notification-service';
-import { emitMockIpcEvent, resetMockIpcRouter } from '$shared/ipc-mock-router';
 import { CHIEF_WORKSPACE_ID } from '$shared/types/branded-ids';
 import {
   openPanel,
@@ -192,13 +192,11 @@ describe('web-notification-service', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     __resetWebNotificationServiceForTesting();
-    resetMockIpcRouter();
-    mockGetPlatform.mockReturnValue('web');
     mockState.userPreferences.enabled = true;
     mockState.userPreferences.soundEnabled = true;
     mockState.userPreferences.soundOnlyWhenUnfocused = false;
     mockState.userPreferences.volume = 0.5;
-    mockState.workspace.activeWorkspaceId = null;
+    mockState.tabState.currentTabId = null;
     MockNotification.permission = 'granted';
     MockNotification.instances = [];
     MockNotification.requestPermission = vi.fn(async () => MockNotification.permission);
@@ -210,51 +208,6 @@ describe('web-notification-service', () => {
   afterEach(() => {
     hasFocusSpy.mockRestore();
     vi.unstubAllGlobals();
-    resetMockIpcRouter();
-  });
-
-  describe('middleware installation', () => {
-    it('listens on the relayed agent:idle channel on web', async () => {
-      const middleware = createWebNotificationMiddleware();
-      const next = vi.fn((action) => action);
-      middleware({} as never)(next)({ type: 'boot' });
-
-      emitMockIpcEvent('agent:idle', makeIdleEvent());
-      await flushAsync();
-
-      expect(MockNotification.instances).toHaveLength(1);
-      expect(mockBackendRequest.mock.calls).toEqual(idleWireCalls());
-    });
-
-    it('registers nothing on electron (native pipeline unchanged)', async () => {
-      mockGetPlatform.mockReturnValue('electron');
-      const middleware = createWebNotificationMiddleware();
-      const next = vi.fn((action) => action);
-      middleware({} as never)(next)({ type: 'boot' });
-
-      emitMockIpcEvent('agent:idle', makeIdleEvent());
-      await flushAsync();
-
-      expect(MockNotification.instances).toHaveLength(0);
-      expect(mockBackendRequest).not.toHaveBeenCalled();
-    });
-
-    it('does not request permission at boot (lazy request only)', () => {
-      MockNotification.permission = 'default';
-      const middleware = createWebNotificationMiddleware();
-      const next = vi.fn((action) => action);
-      middleware({} as never)(next)({ type: 'boot' });
-
-      expect(MockNotification.requestPermission).not.toHaveBeenCalled();
-    });
-
-    it('passes through all actions', () => {
-      const middleware = createWebNotificationMiddleware();
-      const next = vi.fn((action) => action);
-      const action = { type: 'test/action' };
-      expect(middleware({} as never)(next)(action)).toBe(action);
-      expect(next).toHaveBeenCalledWith(action);
-    });
   });
 
   describe('trigger conditions (Electron NotificationService parity)', () => {
@@ -397,6 +350,81 @@ describe('web-notification-service', () => {
       expect(mockBackendRequest.mock.calls).toEqual(idleWireCalls());
     });
 
+    it('skips when the agent is waiting on active hooks (event fast path, no agent.list read)', async () => {
+      await handleWebAgentIdle(
+        makeIdleEvent({ waitingOnHooks: [{ hookId: 'hook-1', name: 'Watch CI' }] }),
+      );
+
+      expect(MockNotification.instances).toHaveLength(0);
+      expect(mockBackendRequest.mock.calls).toEqual(
+        idleWireCalls('ws-1', { agentList: false, workspaceGet: false }),
+      );
+    });
+
+    it('does not skip when waitingOnHooks is empty', async () => {
+      await handleWebAgentIdle(makeIdleEvent({ waitingOnHooks: [] }));
+
+      expect(MockNotification.instances).toHaveLength(1);
+      expect(mockBackendRequest.mock.calls).toEqual(idleWireCalls());
+    });
+
+    it('does not skip when waitingOnHooks is absent (older daemons)', async () => {
+      await handleWebAgentIdle(makeIdleEvent());
+
+      expect(MockNotification.instances).toHaveLength(1);
+      expect(mockBackendRequest.mock.calls).toEqual(idleWireCalls());
+    });
+
+    it('skips when the agent is waiting on active PR monitors (event fast path, no agent.list read)', async () => {
+      await handleWebAgentIdle(
+        makeIdleEvent({
+          waitingOnPrMonitors: [{ monitorId: 'mon-1', repo: 'intent-hq/intentd', prNumber: 42 }],
+        }),
+      );
+
+      expect(MockNotification.instances).toHaveLength(0);
+      expect(mockBackendRequest.mock.calls).toEqual(
+        idleWireCalls('ws-1', { agentList: false, workspaceGet: false }),
+      );
+    });
+
+    it('does not skip when waitingOnPrMonitors is empty', async () => {
+      await handleWebAgentIdle(makeIdleEvent({ waitingOnPrMonitors: [] }));
+
+      expect(MockNotification.instances).toHaveLength(1);
+      expect(mockBackendRequest.mock.calls).toEqual(idleWireCalls());
+    });
+
+    it('does not skip when waitingOnPrMonitors is absent (older daemons)', async () => {
+      await handleWebAgentIdle(makeIdleEvent());
+
+      expect(MockNotification.instances).toHaveLength(1);
+      expect(mockBackendRequest.mock.calls).toEqual(idleWireCalls());
+    });
+
+    it('skips when the workspace is archived (event fast path, no agent.list read)', async () => {
+      await handleWebAgentIdle(makeIdleEvent({ workspaceArchived: true }));
+
+      expect(MockNotification.instances).toHaveLength(0);
+      expect(mockBackendRequest.mock.calls).toEqual(
+        idleWireCalls('ws-1', { agentList: false, workspaceGet: false }),
+      );
+    });
+
+    it('does not skip when workspaceArchived is false', async () => {
+      await handleWebAgentIdle(makeIdleEvent({ workspaceArchived: false }));
+
+      expect(MockNotification.instances).toHaveLength(1);
+      expect(mockBackendRequest.mock.calls).toEqual(idleWireCalls());
+    });
+
+    it('does not skip when workspaceArchived is absent (older daemons)', async () => {
+      await handleWebAgentIdle(makeIdleEvent());
+
+      expect(MockNotification.instances).toHaveLength(1);
+      expect(mockBackendRequest.mock.calls).toEqual(idleWireCalls());
+    });
+
     it('skips when other agents are still active in the workspace', async () => {
       stubBackendWire({
         agentListResult: {
@@ -455,7 +483,7 @@ describe('web-notification-service', () => {
 
     it('suppresses the banner when focused viewing the workspace with soundOnlyWhenUnfocused (sound gate still runs and declines while focused)', async () => {
       mockState.userPreferences.soundOnlyWhenUnfocused = true;
-      mockState.workspace.activeWorkspaceId = 'ws-1';
+      mockState.tabState.currentTabId = 'ws-1';
       hasFocusSpy.mockReturnValue(true);
 
       await handleWebAgentIdle(makeIdleEvent());
@@ -471,7 +499,7 @@ describe('web-notification-service', () => {
 
     it('shows the banner when focused on a DIFFERENT workspace with soundOnlyWhenUnfocused', async () => {
       mockState.userPreferences.soundOnlyWhenUnfocused = true;
-      mockState.workspace.activeWorkspaceId = 'ws-other';
+      mockState.tabState.currentTabId = 'ws-other';
       hasFocusSpy.mockReturnValue(true);
 
       await handleWebAgentIdle(makeIdleEvent());
@@ -480,7 +508,7 @@ describe('web-notification-service', () => {
     });
 
     it('shows the banner when focused viewing the workspace with soundOnlyWhenUnfocused OFF', async () => {
-      mockState.workspace.activeWorkspaceId = 'ws-1';
+      mockState.tabState.currentTabId = 'ws-1';
       hasFocusSpy.mockReturnValue(true);
 
       await handleWebAgentIdle(makeIdleEvent());

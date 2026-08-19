@@ -1,40 +1,41 @@
 <script lang="ts">
   import { goto } from '$app/navigation';
+  import { scrollFade } from '$lib/actions/scroll-fade';
   import { m } from '$shared/paraglide/messages.js';
   import { openWorkspaceInNewWindow } from '../utils/openWorkspaceInNewWindow';
   import { activeStreamsTracker } from '$features/agent/services/active-streams-tracker';
   import {
-  selectWorkspaceItems,
-  selectWorkspaceHasLoaded,
-} from '$store/renderer/slices/workspace/workspace-selectors';
+    selectWorkspaceItems,
+    selectWorkspaceHasLoaded,
+  } from '$store/renderer/slices/workspace/workspace-selectors';
   import { WorkspaceStatusEnum, isWorkspaceDisplayStatus } from '$shared/types';
   import type { Workspace, WorkspaceDisplayStatus } from '$shared/types';
   import {
-  buildRepoPathLookup,
-  getGroupKey,
-} from '$lib/components/workspace/utils/workspace-grouping';
+    buildRepoPathLookup,
+    getGroupKey,
+  } from '$lib/components/workspace/utils/workspace-grouping';
   import { onMount } from 'svelte';
   import Header from '$lib/components/ui/Header.svelte';
 
   import {
-  selectPinnedWorkspaceIds,
-  selectAllSpacesViewMode,
-} from '$store/renderer/slices/sidebar-nav/sidebar-nav-selectors';
+    selectPinnedWorkspaceIds,
+    selectAllSpacesViewMode,
+    selectShowArchivedWorkspaces,
+  } from '$store/renderer/slices/sidebar-nav/sidebar-nav-selectors';
   import { markWorkspaceSeen } from '$features/workspace/mark-workspace-seen';
 
+  import { togglePinWorkspace } from '$store/renderer/slices/sidebar-nav/sidebar-nav-slice';
   import {
-  closeAll,
-  togglePinWorkspace,
-  setAllSpacesViewMode,
-} from '$store/renderer/slices/sidebar-nav/sidebar-nav-slice';
-  import type { AllSpacesViewMode } from '$store/renderer/slices/sidebar-nav/sidebar-nav-types';
-  import {
-  compareWorkspaceActivityDisplayTimeDesc,
-  getWorkspaceActivityDisplayTime,
-} from '$shared/utils/workspace-activity-time';
+    compareWorkspaceActivityDisplayTimeDesc,
+    getWorkspaceActivityDisplayTime,
+  } from '$shared/utils/workspace-activity-time';
   import { store as appStore } from '$store/renderer/store';
   import WorkspaceCard from '$lib/components/workspace/WorkspaceCard.svelte';
   import WorkspaceCardSkeleton from '../WorkspaceCardSkeleton.svelte';
+  import { openWorkspaceTab } from '$store/renderer/slices/tab-state/tab-state-slice';
+  import { Button } from '$lib/components/ui/button';
+
+  const REPOSITORY_WORKSPACE_LIMIT = 3;
 
   function getGitHubAvatarUrl(owner: string, size: number = 24): string {
     return `https://github.com/${owner}.png?size=${size}`;
@@ -44,29 +45,62 @@
   const hasLoaded$ = selectWorkspaceHasLoaded();
   const pinnedIds$ = selectPinnedWorkspaceIds();
   const viewMode$ = selectAllSpacesViewMode();
+  const showArchivedWorkspaces$ = selectShowArchivedWorkspaces();
 
   interface Props {
     expanded?: boolean;
+    /** Whether the search input is shown (the host may hide it behind a toggle). */
+    searchVisible?: boolean;
+    /** Plain, activity-ordered rows for the compact hover dropdown. */
+    recentsOnly?: boolean;
+    /** Number of recent rows shown before expansion. */
+    recentLimit?: number;
+    /** Whether compact recents can search across every active workspace. */
+    searchRecents?: boolean;
+    /** Whether compact recents render a show-more/show-less toggle. */
+    expandableRecents?: boolean;
+    /** Workspace IDs omitted from default, expanded, and searched results. */
+    excludedWorkspaceIds?: readonly string[];
+    /** Whether compact recents announce loading with visible text. */
+    showLoadingText?: boolean;
   }
 
-  let { expanded = false }: Props = $props();
-
+  let {
+    expanded = false,
+    searchVisible = true,
+    recentsOnly = false,
+    recentLimit = 10,
+    searchRecents = false,
+    expandableRecents = false,
+    excludedWorkspaceIds = [],
+    showLoadingText = true,
+  }: Props = $props();
 
   let searchQuery = $state('');
   let searchInputEl = $state<HTMLInputElement | null>(null);
   let highlightedIndex = $state(-1);
+  let showAllRecents = $state(false);
+  let expandedRepositoryKeys = $state(new Set<string>());
+  const searchInputClasses =
+    'box-border w-full min-w-0 rounded-md border border-border bg-background/30 px-2.5 py-1.5 text-sm text-foreground outline-none placeholder:text-muted-foreground/40 focus-visible:border-ring focus-visible:outline-none focus-visible:ring-0';
+  const excludedWorkspaceIdSet = $derived(new Set(excludedWorkspaceIds));
 
   // Reset highlight when search query or view mode changes
   $effect(() => {
     void searchQuery;
     void $viewMode$;
-    highlightedIndex = filteredWorkspaces.length > 0 ? 0 : -1;
+    void recentsOnly;
+    void $showArchivedWorkspaces$;
+    highlightedIndex = allVisibleIds.length > 0 ? 0 : -1;
   });
 
-  // Auto-focus search when expanded
+  // Auto-focus search when shown; clear any stale filter when hidden so the
+  // list isn't invisibly filtered.
   $effect(() => {
-    if (expanded && searchInputEl) {
+    if (expanded && searchVisible && searchInputEl) {
       searchInputEl.focus();
+    } else if (!searchVisible) {
+      searchQuery = '';
     }
   });
 
@@ -81,13 +115,52 @@
     return activeStreamsTracker.subscribe(() => activeStreamsVersion++);
   });
 
+  const recentWorkspaces = $derived.by(() =>
+    $workspaceItems
+      .filter(
+        (workspace) =>
+          !excludedWorkspaceIdSet.has(workspace.id) &&
+          workspace.status !== WorkspaceStatusEnum.Archived &&
+          workspace.status !== WorkspaceStatusEnum.Deleted,
+      )
+      .sort(compareWorkspaceActivityDisplayTimeDesc),
+  );
+
+  const filteredRecentWorkspaces = $derived.by(() => {
+    const query = searchQuery.toLowerCase().trim();
+    if (!query) return recentWorkspaces;
+    return recentWorkspaces.filter(
+      (workspace) =>
+        (workspace.title || '').toLowerCase().includes(query) ||
+        (workspace.repositoryName || '').toLowerCase().includes(query),
+    );
+  });
+
+  const visibleRecentWorkspaces = $derived.by(() => {
+    if (searchQuery.trim() || showAllRecents) return filteredRecentWorkspaces;
+    return filteredRecentWorkspaces.slice(0, recentLimit);
+  });
+
+  const discoverableWorkspaces = $derived.by(() =>
+    $workspaceItems.filter(
+      (workspace) =>
+        !excludedWorkspaceIdSet.has(workspace.id) &&
+        workspace.status !== WorkspaceStatusEnum.Deleted,
+    ),
+  );
+
+  const archivedWorkspaceCount = $derived(
+    discoverableWorkspaces.filter((workspace) => workspace.status === WorkspaceStatusEnum.Archived)
+      .length,
+  );
+
   const allWorkspaces = $derived.by(() => {
     void $pinnedIds$;
 
-    return $workspaceItems
+    return discoverableWorkspaces
       .filter(
-        (w) =>
-          w.status !== WorkspaceStatusEnum.Archived && w.status !== WorkspaceStatusEnum.Deleted,
+        (workspace) =>
+          $showArchivedWorkspaces$ || workspace.status !== WorkspaceStatusEnum.Archived,
       )
       .sort((a, b) => {
         const aPinned = $pinnedIds$.includes(a.id);
@@ -136,7 +209,11 @@
   const groupedByRepo = $derived.by(() => {
     const groups = new Map<string, { workspaces: Workspace[]; owner?: string; label: string }>();
     for (const ws of filteredWorkspaces) {
-      const { key, label, owner } = getGroupKey(ws, sidebarRepoPathLookup, m.layout_allCard_noRepository_label());
+      const { key, label, owner } = getGroupKey(
+        ws,
+        sidebarRepoPathLookup,
+        m.layout_allCard_noRepository_label(),
+      );
 
       if (!groups.has(key)) groups.set(key, { workspaces: [], owner, label });
       groups.get(key)!.workspaces.push(ws);
@@ -148,6 +225,41 @@
     });
   });
 
+  const discoverableRepositoryKeys = $derived.by(
+    () =>
+      new Set(
+        discoverableWorkspaces.map(
+          (workspace) =>
+            getGroupKey(workspace, sidebarRepoPathLookup, m.layout_allCard_noRepository_label())
+              .key,
+        ),
+      ),
+  );
+
+  $effect(() => {
+    const validKeys = discoverableRepositoryKeys;
+    const retainedKeys = [...expandedRepositoryKeys].filter((key) => validKeys.has(key));
+    if (retainedKeys.length !== expandedRepositoryKeys.size) {
+      expandedRepositoryKeys = new Set(retainedKeys);
+    }
+  });
+
+  const visibleGroupedByRepo = $derived.by(() => {
+    const searchActive = searchQuery.trim().length > 0;
+    return groupedByRepo.map(([key, group]) => {
+      const isExpanded = expandedRepositoryKeys.has(key);
+      return {
+        key,
+        group,
+        isExpanded,
+        visibleWorkspaces:
+          searchActive || isExpanded
+            ? group.workspaces
+            : group.workspaces.slice(0, REPOSITORY_WORKSPACE_LIMIT),
+      };
+    });
+  });
+
   const statusLabels: Record<WorkspaceDisplayStatus, () => string> = {
     failed: () => m.layout_allCard_statusFailed_label(),
     blocked: () => m.layout_allCard_statusBlocked_label(),
@@ -155,7 +267,6 @@
     idle: () => m.layout_allCard_statusIdle_label(),
     not_started: () => m.layout_allCard_statusNoChanges_label(),
     in_progress: () => m.layout_allCard_statusInProgress_label(),
-    unread: () => m.layout_allCard_statusUnread_label(),
     complete: () => m.layout_allCard_statusComplete_label(),
     pr_ready: () => m.layout_allCard_statusPrReady_label(),
     pr_open: () => m.layout_allCard_statusPrOpen_label(),
@@ -168,7 +279,6 @@
     'needs_attention',
     'idle',
     'in_progress',
-    'unread',
     'pr_ready',
     'pr_open',
     'not_started',
@@ -178,33 +288,27 @@
 
   const groupedByStatus = $derived.by(() => {
     const groups = new Map<WorkspaceDisplayStatus, Workspace[]>();
+    const archived: Workspace[] = [];
     for (const ws of filteredWorkspaces) {
+      if (ws.status === WorkspaceStatusEnum.Archived) {
+        archived.push(ws);
+        continue;
+      }
       const status = getDisplayStatus(ws);
       if (!groups.has(status)) groups.set(status, []);
       groups.get(status)!.push(ws);
     }
-    return statusOrder
+    const liveGroups = statusOrder
       .filter((s) => groups.has(s))
       .map((s) => [statusLabels[s](), groups.get(s)!] as [string, Workspace[]]);
+    return archived.length > 0
+      ? [...liveGroups, [m.layout_allCard_archived_label(), archived] as [string, Workspace[]]]
+      : liveGroups;
   });
-
-  function _isRunning(ws: Workspace): boolean {
-    // Streaming-based UI affordance only (the running dot on the card); the
-    // status grouping above renders the BE displayStatus verbatim and is never
-    // influenced by this signal.
-    void activeStreamsVersion;
-    const streamingAgentIds = activeStreamsTracker.getStreamingAgentIdsForWorkspace(ws.id);
-    return ws.activity === 'agent_running' || streamingAgentIds.length > 0;
-  }
 
   function _getStreamingIds(ws: Workspace): string[] {
     void activeStreamsVersion;
     return activeStreamsTracker.getStreamingAgentIdsForWorkspace(ws.id);
-  }
-
-  function getUnreadAgentIds(ws: Workspace): string[] {
-    // Attention is workspace-level (BE-owned); show member agents as the unread set.
-    return ws.attention === 'unread' ? (ws.agentSummary?.agentIds ?? []) : [];
   }
 
   function _isUnread(ws: Workspace): boolean {
@@ -225,8 +329,8 @@
 
     keyboardNavActive = false;
     highlightedIndex = -1;
-    appStore.dispatch(closeAll(false));
-    goto(route);
+    appStore.dispatch(openWorkspaceTab(workspaceId));
+    await goto(route);
   }
 
   function handleTogglePin(e: MouseEvent, workspaceId: string) {
@@ -241,10 +345,20 @@
     markWorkspaceSeen(workspaceId);
   }
 
+  function toggleRepositoryGroup(key: string) {
+    const nextExpandedKeys = new Set(expandedRepositoryKeys);
+    if (nextExpandedKeys.has(key)) nextExpandedKeys.delete(key);
+    else nextExpandedKeys.add(key);
+    expandedRepositoryKeys = nextExpandedKeys;
+  }
+
   // Flat ordered list of workspace IDs matching the current view mode's display order
   const allVisibleIds = $derived.by(() => {
+    if (recentsOnly) return visibleRecentWorkspaces.map((workspace) => workspace.id);
     if ($viewMode$ === 'repo') {
-      return groupedByRepo.flatMap(([, group]) => group.workspaces.map((w) => w.id));
+      return visibleGroupedByRepo.flatMap(({ visibleWorkspaces }) =>
+        visibleWorkspaces.map((workspace) => workspace.id),
+      );
     } else if ($viewMode$ === 'status') {
       return groupedByStatus.flatMap(([, workspaces]) => workspaces.map((w) => w.id));
     }
@@ -299,162 +413,244 @@
 </script>
 
 <div
-  class="flex flex-col h-full outline-none"
+  class="flex flex-col h-full outline-none focus-visible:bg-muted/10"
   onkeydown={handleSearchKeydown}
   onmousemove={handleMouseMove}
   role="listbox"
   tabindex="0"
 >
-  <div class="flex flex-col gap-1 px-3 pt-1 pb-1 shrink-0 w-full">
-    <div class="view-mode-tabs gap-0.5 bg-slate-500/10 rounded-lg p-0.5 mb-2 w-full">
-      {#each [['recent', m.layout_allCard_recent_label()], ['repo', m.layout_allCard_repo_label()], ['status', m.layout_allCard_status_label()]] as [mode, label]}
-        <button
-          class="view-mode-tab px-1.5 py-1 text-xs rounded-md transition-all duration-150 cursor-pointer text-center truncate
-            {$viewMode$ === mode
-            ? 'bg-background text-foreground font-medium shadow-sm'
-            : 'text-muted-foreground hover:text-foreground'}"
-          title={label}
-          onclick={() => appStore.dispatch(setAllSpacesViewMode(mode as AllSpacesViewMode))}
-        >
-          {label}
-        </button>
-      {/each}
-    </div>
-  </div>
+  {#if recentsOnly}
+    {#if $hasLoaded$ && searchRecents && searchVisible && recentWorkspaces.length > recentLimit}
+      <div class="px-2 pb-2">
+        <input
+          bind:this={searchInputEl}
+          type="text"
+          placeholder={m.layout_activeCard_search_placeholder()}
+          bind:value={searchQuery}
+          class={searchInputClasses}
+          data-workspace-search-input
+        />
+      </div>
+    {/if}
 
-  {#if $hasLoaded$ && expanded && allWorkspaces.length > 3}
-    <div class="px-3 pb-2">
-      <input
-        bind:this={searchInputEl}
-        type="text"
-        placeholder={m.layout_activeCard_search_placeholder()}
-        bind:value={searchQuery}
-        class="w-full px-2.5 py-1.5 text-sm bg-background/30 rounded-md text-foreground placeholder:text-muted-foreground/40 focus:outline-none"
-      />
-    </div>
-  {/if}
-
-  {#if !$hasLoaded$}
-    <!-- Show skeleton placeholders while loading -->
-    <div class="pb-2">
-      {#each Array(5) as _, i (i)}
-        <WorkspaceCardSkeleton />
-      {/each}
-    </div>
-  {:else if allWorkspaces.length === 0}
-    <div class="px-3 pb-3 text-xs text-subtle">{m.layout_allCard_noWorkspaces_label()}</div>
-  {:else}
-    <div class="overflow-y-auto flex-1 min-h-0 pb-2">
-      {#if $viewMode$ === 'recent'}
-        {#each filteredWorkspaces as workspace, i (workspace.id)}
-          {#if i > 0 && !$pinnedIds$.includes(workspace.id) && $pinnedIds$.includes(filteredWorkspaces[i - 1].id)}
-            <div class="border-t border-border my-1 mx-2"></div>
-          {/if}
-          <WorkspaceCard
-            {workspace}
-            variant="compact"
-            isRunning={_isRunning(workspace)}
-            isUnread={_isUnread(workspace)}
-            isPinned={$pinnedIds$.includes(workspace.id)}
-            streamingAgentIds={_getStreamingIds(workspace)}
-            unreadAgentIds={getUnreadAgentIds(workspace)}
-            highlighted={keyboardNavActive && highlightedIndex === (_visibleIdIndex.get(workspace.id) ?? -1)}
-            suppressHover={keyboardNavActive}
-            onClick={(e) => handleClick(workspace.id, e)}
-            onTogglePin={(e) => handleTogglePin(e, workspace.id)}
-            onMarkAsRead={_isUnread(workspace)
-              ? (e) => handleMarkAsRead(e, workspace.id)
-              : undefined}
-            onOpenInNewWindow={() => openWorkspaceInNewWindow(workspace.id)}
-            onHover={() => { hoveredIndex = _visibleIdIndex.get(workspace.id) ?? -1; }}
-          />
-        {/each}
-      {:else if $viewMode$ === 'repo'}
-        {#each groupedByRepo as [, group]}
-          <div class="section-header flex items-center gap-1.5 px-3 pt-2.5 pb-1 mt-3 min-w-0">
-            {#if group.owner}
-              <img
-                src={getGitHubAvatarUrl(group.owner)}
-                alt={group.owner}
-                class="size-3.5 rounded-full shrink-0"
-                loading="lazy"
-                onerror={(e) => ((e.currentTarget as HTMLImageElement).style.display = 'none')}
-              />
-            {/if}
-            <Header size={3} class="truncate">{group.label}</Header>
-          </div>
-          {#each group.workspaces as workspace, _i (workspace.id)}
-            <WorkspaceCard
-              {workspace}
-              variant="compact"
-              isRunning={_isRunning(workspace)}
-              isUnread={_isUnread(workspace)}
-              isPinned={$pinnedIds$.includes(workspace.id)}
-              streamingAgentIds={_getStreamingIds(workspace)}
-              unreadAgentIds={getUnreadAgentIds(workspace)}
-              hideRepoAvatar={true}
-              highlighted={keyboardNavActive && highlightedIndex === (_visibleIdIndex.get(workspace.id) ?? -1)}
-              suppressHover={keyboardNavActive}
-              onClick={(e) => handleClick(workspace.id, e)}
-              onTogglePin={(e) => handleTogglePin(e, workspace.id)}
-              onMarkAsRead={_isUnread(workspace)
-                ? (e) => handleMarkAsRead(e, workspace.id)
-                : undefined}
-              onOpenInNewWindow={() => openWorkspaceInNewWindow(workspace.id)}
-              onHover={() => { hoveredIndex = _visibleIdIndex.get(workspace.id) ?? -1; }}
-            />
-          {/each}
-        {/each}
-      {:else if $viewMode$ === 'status'}
-        {#each groupedByStatus as [statusLabel, workspaces]}
-          <div class="section-header px-3 pt-2 pb-1 mt-3 min-w-0">
-            <Header size={3} class="truncate">{statusLabel}</Header>
-          </div>
-          {#each workspaces as workspace, _i (workspace.id)}
-            <WorkspaceCard
-              {workspace}
-              variant="compact"
-              isRunning={_isRunning(workspace)}
-              isUnread={_isUnread(workspace)}
-              isPinned={$pinnedIds$.includes(workspace.id)}
-              streamingAgentIds={_getStreamingIds(workspace)}
-              unreadAgentIds={getUnreadAgentIds(workspace)}
-              highlighted={keyboardNavActive && highlightedIndex === (_visibleIdIndex.get(workspace.id) ?? -1)}
-              suppressHover={keyboardNavActive}
-              onClick={(e) => handleClick(workspace.id, e)}
-              onTogglePin={(e) => handleTogglePin(e, workspace.id)}
-              onMarkAsRead={_isUnread(workspace)
-                ? (e) => handleMarkAsRead(e, workspace.id)
-                : undefined}
-              onOpenInNewWindow={() => openWorkspaceInNewWindow(workspace.id)}
-              onHover={() => { hoveredIndex = _visibleIdIndex.get(workspace.id) ?? -1; }}
-            />
-          {/each}
-        {/each}
+    {#if !$hasLoaded$}
+      {#if showLoadingText}
+        <div class="px-3 py-3 text-sm text-subtle">{m.ui_spinner_loading_ariaLabel()}</div>
       {/if}
-    </div>
+    {:else if recentWorkspaces.length === 0}
+      <div class="px-3 py-3 text-sm text-subtle">{m.layout_allCard_noWorkspaces_label()}</div>
+    {:else if visibleRecentWorkspaces.length === 0}
+      <div class="px-3 py-3 text-sm text-subtle">{m.ui_dropdown_noResults_label()}</div>
+    {:else}
+      <div class="min-h-0 flex-1 overflow-y-auto py-1">
+        {#each visibleRecentWorkspaces as workspace, index (workspace.id)}
+          <div data-recent-space-row data-workspace-id={workspace.id}>
+            <WorkspaceCard
+              {workspace}
+              variant="compact"
+              isUnread={_isUnread(workspace)}
+              isPinned={$pinnedIds$.includes(workspace.id)}
+              streamingAgentIds={_getStreamingIds(workspace)}
+              highlighted={keyboardNavActive && highlightedIndex === index}
+              suppressHover={keyboardNavActive}
+              onClick={(event) => handleClick(workspace.id, event)}
+              onTogglePin={(event) => handleTogglePin(event, workspace.id)}
+              onMarkAsRead={_isUnread(workspace)
+                ? (event) => handleMarkAsRead(event, workspace.id)
+                : undefined}
+              onOpenInNewWindow={() => openWorkspaceInNewWindow(workspace.id)}
+              onHover={() => {
+                hoveredIndex = index;
+              }}
+            />
+          </div>
+        {/each}
+      </div>
+    {/if}
+
+    {#if expandableRecents && !searchQuery.trim() && recentWorkspaces.length > recentLimit}
+      <div class="px-2 pb-2">
+        <Button
+          variant="ghost-light"
+          size="xs"
+          class="w-full"
+          aria-expanded={showAllRecents}
+          data-recent-spaces-toggle
+          onclick={() => (showAllRecents = !showAllRecents)}
+        >
+          {showAllRecents ? m.layout_allCard_showLess_label() : m.layout_allCard_showMore_label()}
+        </Button>
+      </div>
+    {/if}
+  {:else}
+    {#if $hasLoaded$ && expanded && searchVisible && (discoverableWorkspaces.length > 3 || archivedWorkspaceCount > 0)}
+      <div class="min-w-0 overflow-visible px-2 pb-2 pt-0.5" data-workspace-search-controls>
+        <input
+          bind:this={searchInputEl}
+          type="text"
+          placeholder={m.layout_activeCard_search_placeholder()}
+          bind:value={searchQuery}
+          class={searchInputClasses}
+          data-workspace-search-input
+        />
+      </div>
+    {/if}
+
+    {#if !$hasLoaded$}
+      <!-- Show skeleton placeholders while loading -->
+      <div class="pb-2">
+        {#each Array(5) as _, index (index)}
+          <WorkspaceCardSkeleton {index} />
+        {/each}
+      </div>
+    {:else if allWorkspaces.length === 0}
+      <div class="px-2 pb-3 text-xs text-subtle">
+        {archivedWorkspaceCount > 0 && !$showArchivedWorkspaces$
+          ? m.layout_activeCard_noActive_label()
+          : m.layout_allCard_noWorkspaces_label()}
+      </div>
+    {:else if filteredWorkspaces.length === 0}
+      <div class="px-2 pb-3 text-xs text-subtle">{m.ui_dropdown_noResults_label()}</div>
+    {:else}
+      <div
+        class="overflow-y-auto flex-1 min-h-0 pt-1 pb-2"
+        data-workspace-list-scroll
+        use:scrollFade
+      >
+        {#if $viewMode$ === 'recent'}
+          {#each filteredWorkspaces as workspace, i (workspace.id)}
+            {#if i > 0 && !$pinnedIds$.includes(workspace.id) && $pinnedIds$.includes(filteredWorkspaces[i - 1].id)}
+              <div class="border-t border-border my-1 mx-2"></div>
+            {/if}
+            <WorkspaceCard
+              {workspace}
+              variant="compact"
+              isUnread={_isUnread(workspace)}
+              isPinned={$pinnedIds$.includes(workspace.id)}
+              trailingLabel={workspace.status === WorkspaceStatusEnum.Archived
+                ? m.lib_commandPalette_archivedWorkspace_pill()
+                : undefined}
+              streamingAgentIds={_getStreamingIds(workspace)}
+              highlighted={keyboardNavActive &&
+                highlightedIndex === (_visibleIdIndex.get(workspace.id) ?? -1)}
+              suppressHover={keyboardNavActive}
+              onClick={(e) => handleClick(workspace.id, e)}
+              onTogglePin={(e) => handleTogglePin(e, workspace.id)}
+              onMarkAsRead={_isUnread(workspace)
+                ? (e) => handleMarkAsRead(e, workspace.id)
+                : undefined}
+              onOpenInNewWindow={() => openWorkspaceInNewWindow(workspace.id)}
+              onHover={() => {
+                hoveredIndex = _visibleIdIndex.get(workspace.id) ?? -1;
+              }}
+            />
+          {/each}
+        {:else if $viewMode$ === 'repo'}
+          {#each visibleGroupedByRepo as repositoryGroup (repositoryGroup.key)}
+            <div data-repository-group data-repository-key={repositoryGroup.key}>
+              <div class="section-header flex items-center gap-1.5 px-2 pt-2 pb-1 mt-2 min-w-0">
+                {#if repositoryGroup.group.owner}
+                  <img
+                    src={getGitHubAvatarUrl(repositoryGroup.group.owner)}
+                    alt={repositoryGroup.group.owner}
+                    class="size-3.5 rounded-full shrink-0"
+                    loading="lazy"
+                    onerror={(e) => ((e.currentTarget as HTMLImageElement).style.display = 'none')}
+                  />
+                {/if}
+                <Header size={4} class="truncate">{repositoryGroup.group.label}</Header>
+              </div>
+              {#each repositoryGroup.visibleWorkspaces as workspace, _i (workspace.id)}
+                <div data-repository-space-row data-workspace-id={workspace.id}>
+                  <WorkspaceCard
+                    {workspace}
+                    variant="compact"
+                    isUnread={_isUnread(workspace)}
+                    isPinned={$pinnedIds$.includes(workspace.id)}
+                    trailingLabel={workspace.status === WorkspaceStatusEnum.Archived
+                      ? m.lib_commandPalette_archivedWorkspace_pill()
+                      : undefined}
+                    streamingAgentIds={_getStreamingIds(workspace)}
+                    highlighted={keyboardNavActive &&
+                      highlightedIndex === (_visibleIdIndex.get(workspace.id) ?? -1)}
+                    suppressHover={keyboardNavActive}
+                    onClick={(e) => handleClick(workspace.id, e)}
+                    onTogglePin={(e) => handleTogglePin(e, workspace.id)}
+                    onMarkAsRead={_isUnread(workspace)
+                      ? (e) => handleMarkAsRead(e, workspace.id)
+                      : undefined}
+                    onOpenInNewWindow={() => openWorkspaceInNewWindow(workspace.id)}
+                    onHover={() => {
+                      hoveredIndex = _visibleIdIndex.get(workspace.id) ?? -1;
+                    }}
+                  />
+                </div>
+              {/each}
+              {#if !searchQuery.trim() && repositoryGroup.group.workspaces.length > REPOSITORY_WORKSPACE_LIMIT}
+                <div class="min-w-0 px-2 pb-1">
+                  <Button
+                    variant="plain"
+                    type="button"
+                    class="repository-group-toggle type-caption -mx-1 h-auto min-h-7 w-fit max-w-full shrink appearance-none justify-start overflow-hidden border-0 bg-transparent px-1! py-1! text-left font-normal text-muted-foreground shadow-none hover:bg-transparent hover:text-muted-foreground active:bg-transparent focus-visible:bg-transparent focus-visible:text-foreground focus-visible:underline focus-visible:outline-none focus-visible:ring-0!"
+                    aria-expanded={repositoryGroup.isExpanded}
+                    data-repository-group-toggle
+                    onclick={() => toggleRepositoryGroup(repositoryGroup.key)}
+                    onkeydown={(event) => event.stopPropagation()}
+                  >
+                    <span class="truncate" data-repository-group-toggle-label>
+                      {repositoryGroup.isExpanded
+                        ? m.layout_allCard_showLess_label()
+                        : m.layout_allCard_showMore_label()}
+                    </span>
+                  </Button>
+                </div>
+              {/if}
+            </div>
+          {/each}
+        {:else if $viewMode$ === 'status'}
+          {#each groupedByStatus as [statusLabel, workspaces]}
+            <div class="section-header px-2 pt-2 pb-1 mt-2 min-w-0">
+              <Header size={4} class="truncate">{statusLabel}</Header>
+            </div>
+            {#each workspaces as workspace, _i (workspace.id)}
+              <WorkspaceCard
+                {workspace}
+                variant="compact"
+                isUnread={_isUnread(workspace)}
+                isPinned={$pinnedIds$.includes(workspace.id)}
+                trailingLabel={workspace.status === WorkspaceStatusEnum.Archived
+                  ? m.lib_commandPalette_archivedWorkspace_pill()
+                  : undefined}
+                streamingAgentIds={_getStreamingIds(workspace)}
+                highlighted={keyboardNavActive &&
+                  highlightedIndex === (_visibleIdIndex.get(workspace.id) ?? -1)}
+                suppressHover={keyboardNavActive}
+                onClick={(e) => handleClick(workspace.id, e)}
+                onTogglePin={(e) => handleTogglePin(e, workspace.id)}
+                onMarkAsRead={_isUnread(workspace)
+                  ? (e) => handleMarkAsRead(e, workspace.id)
+                  : undefined}
+                onOpenInNewWindow={() => openWorkspaceInNewWindow(workspace.id)}
+                onHover={() => {
+                  hoveredIndex = _visibleIdIndex.get(workspace.id) ?? -1;
+                }}
+              />
+            {/each}
+          {/each}
+        {/if}
+      </div>
+    {/if}
   {/if}
 </div>
 
 <style>
-  /* Default: horizontal tabs */
-  .view-mode-tabs {
-    display: flex;
-    flex-direction: row;
-  }
-  .view-mode-tab {
-    flex: 1;
+  @media (forced-colors: active) {
+    :global(.repository-group-toggle:focus-visible) {
+      color: Highlight;
+    }
   }
 
-  /* Narrow: stack tabs vertically, tighten spacing */
   @container (max-width: 180px) {
-    .view-mode-tabs {
-      flex-direction: column;
-    }
-    .view-mode-tab {
-      flex: none;
-      width: 100%;
-    }
     .section-header {
       padding-left: 0.5rem;
       padding-right: 0.5rem;

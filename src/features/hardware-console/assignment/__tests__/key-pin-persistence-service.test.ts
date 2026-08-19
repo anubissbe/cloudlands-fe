@@ -1,5 +1,7 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { createCollection } from '$lib/store-shim/utils/collections/collection-utils';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { runSaga, stdChannel, type Task } from 'redux-saga';
+import { select } from 'typed-redux-saga';
+import { createCollection } from '@augmentcode/themis/utils/collections/collection-utils';
 import { UNASSIGNED_KEY_PIN } from '../key-assignment';
 
 interface MockWorkspace {
@@ -27,6 +29,12 @@ const dispatched: { type: string; payload?: unknown[] }[] = [];
 
 vi.mock('$store/renderer/store', () => ({
   store: {
+    createSelector: (selector: (state: typeof mockState, ...args: never[]) => unknown) => {
+      const readable = (...args: never[]) => selector(mockState, ...args);
+      readable.select = (state: typeof mockState, ...args: never[]) => selector(state, ...args);
+      readable.effect = (...args: never[]) => select(selector, ...args);
+      return readable;
+    },
     get state() {
       return mockState;
     },
@@ -45,6 +53,14 @@ vi.mock('$store/renderer/store', () => ({
       if (action.type === 'hardwareConsole/keyPinsReconciled') {
         mockState.hardwareConsole.keyPins = (action.payload?.[0] as (string | null)[]).slice();
       }
+      if (action.type === 'hardwareConsole/pinWorkspaceToKey' && Array.isArray(action.payload)) {
+        const [slot, workspaceId] = action.payload as [number, string];
+        const next = mockState.hardwareConsole.keyPins.map((pin) =>
+          pin === workspaceId ? null : pin,
+        );
+        next[slot] = workspaceId;
+        mockState.hardwareConsole.keyPins = next;
+      }
       return action;
     }),
   },
@@ -60,7 +76,9 @@ vi.mock('$lib/client', () => ({
 }));
 
 import { appClient } from '$lib/client';
-import { createHardwareConsoleKeyPinPersistenceMiddleware } from '../key-pin-persistence-service';
+import { store as appStore } from '$store/renderer/store';
+import { persistHardwareConsoleKeyPins } from '../key-pin-persistence-service';
+import { keyPinPersistenceSaga } from '$store/renderer/slices/hardware-console/sagas/key-pin-persistence-saga';
 
 function ws(id: string, lastActivity: string): MockWorkspace {
   return { id, lastActivity, createdAt: '2026-01-01T00:00:00Z', updatedAt: lastActivity };
@@ -93,13 +111,37 @@ beforeEach(() => {
   vi.clearAllMocks();
 });
 
+const runningTasks: Task[] = [];
+
+afterEach(() => {
+  for (const task of runningTasks.splice(0)) task.cancel();
+});
+
 function invokeChain() {
-  const middleware = createHardwareConsoleKeyPinPersistenceMiddleware();
-  const next = vi.fn((action) => action);
-  return middleware({} as never)(next);
+  const channel = stdChannel();
+  runningTasks.push(
+    runSaga(
+      {
+        channel,
+        // Loop saga puts back into the channel so watchers see re-dispatched
+        // actions, mirroring the real saga middleware.
+        dispatch: (action) => {
+          appStore.dispatch(action as never);
+          channel.put(action as never);
+        },
+        getState: () => mockState,
+      },
+      keyPinPersistenceSaga,
+    ),
+  );
+  return (action: { type: string; payload?: unknown }) => {
+    appStore.dispatch(action as never);
+    channel.put(action);
+    return action;
+  };
 }
 
-describe('createHardwareConsoleKeyPinPersistenceMiddleware (sticky assignments)', () => {
+describe('keyPinPersistenceSaga (sticky assignments)', () => {
   it('hydrates pins and the exclusion list from the bag', async () => {
     seedBag({ keyPins: ['ws-1'], excludedWorkspaceIds: ['ws-x'] });
     const invoke = invokeChain();
@@ -148,9 +190,9 @@ describe('createHardwareConsoleKeyPinPersistenceMiddleware (sticky assignments)'
     seedWorkspaces([ws('ws-a', '2026-07-01T00:00:00Z'), ws('ws-b', '2026-08-03T00:00:00Z')]);
     invoke({ type: 'workspace/updateWorkspaceEntity' });
 
-    expect(
-      dispatched.filter((a) => a.type === 'hardwareConsole/keyPinsReconciled'),
-    ).toHaveLength(0);
+    expect(dispatched.filter((a) => a.type === 'hardwareConsole/keyPinsReconciled')).toHaveLength(
+      0,
+    );
     expect(mockState.hardwareConsole.keyPins).toEqual(['ws-a', 'ws-b', null, null, null, null]);
   });
 
@@ -166,14 +208,7 @@ describe('createHardwareConsoleKeyPinPersistenceMiddleware (sticky assignments)'
     invoke({ type: 'any/action' });
     await vi.waitFor(() => expect(mockState.hardwareConsole.hydrated).toBe(true));
     await vi.waitFor(() =>
-      expect(mockState.hardwareConsole.keyPins).toEqual([
-        'ws-a',
-        'ws-b',
-        'ws-c',
-        null,
-        null,
-        null,
-      ]),
+      expect(mockState.hardwareConsole.keyPins).toEqual(['ws-a', 'ws-b', 'ws-c', null, null, null]),
     );
     (appClient.settings.update as ReturnType<typeof vi.fn>).mockClear();
 
@@ -230,9 +265,9 @@ describe('createHardwareConsoleKeyPinPersistenceMiddleware (sticky assignments)'
     await vi.waitFor(() => expect(mockState.hardwareConsole.hydrated).toBe(true));
     invoke({ type: 'workspace/setWorkspaceLoading' });
 
-    expect(
-      dispatched.filter((a) => a.type === 'hardwareConsole/keyPinsReconciled'),
-    ).toHaveLength(0);
+    expect(dispatched.filter((a) => a.type === 'hardwareConsole/keyPinsReconciled')).toHaveLength(
+      0,
+    );
     expect(mockState.hardwareConsole.keyPins).toEqual(['ws-a', null, null, null, null, null]);
   });
 
@@ -245,9 +280,9 @@ describe('createHardwareConsoleKeyPinPersistenceMiddleware (sticky assignments)'
     await vi.waitFor(() => expect(mockState.hardwareConsole.hydrated).toBe(true));
     invoke({ type: 'workspace/updateWorkspaceEntity' });
 
-    expect(
-      dispatched.filter((a) => a.type === 'hardwareConsole/keyPinsReconciled'),
-    ).toHaveLength(0);
+    expect(dispatched.filter((a) => a.type === 'hardwareConsole/keyPinsReconciled')).toHaveLength(
+      0,
+    );
     expect(appClient.settings.update).not.toHaveBeenCalled();
   });
 
@@ -267,5 +302,89 @@ describe('createHardwareConsoleKeyPinPersistenceMiddleware (sticky assignments)'
         null,
       ]),
     );
+  });
+
+  it('skips the persist instead of wiping the bag when the pre-write read fails', async () => {
+    seedBag({ keyPins: ['ws-1'], sibling: 'kept' });
+    seedWorkspaces([ws('ws-1', '2026-07-01T00:00:00Z')]);
+    const invoke = invokeChain();
+
+    invoke({ type: 'any/action' });
+    await vi.waitFor(() => expect(mockState.hardwareConsole.hydrated).toBe(true));
+    (appClient.settings.update as ReturnType<typeof vi.fn>).mockClear();
+    const getMock = appClient.settings.get as ReturnType<typeof vi.fn>;
+    const readsBefore = getMock.mock.calls.length;
+
+    seedBag(null); // transient daemon read failure
+    invoke({ type: 'hardwareConsole/pinWorkspaceToKey' });
+
+    await vi.waitFor(() => expect(getMock.mock.calls.length).toBeGreaterThan(readsBefore));
+    expect(appClient.settings.update).not.toHaveBeenCalled();
+  });
+
+  it('does not persist a pin mutation while hydration keeps failing', async () => {
+    seedBag(null); // boot hydration fails and the retry fails too
+    seedWorkspaces([ws('ws-1', '2026-07-01T00:00:00Z')]);
+    const invoke = invokeChain();
+
+    invoke({ type: 'any/action' });
+    await vi.waitFor(() => expect(mockState.hardwareConsole.hydrated).toBe(true));
+    const getMock = appClient.settings.get as ReturnType<typeof vi.fn>;
+    const readsBefore = getMock.mock.calls.length;
+
+    invoke({ type: 'hardwareConsole/pinWorkspaceToKey', payload: [0, 'ws-1'] });
+
+    await vi.waitFor(() => expect(getMock.mock.calls.length).toBeGreaterThan(readsBefore));
+    expect(appClient.settings.update).not.toHaveBeenCalled();
+  });
+
+  it('re-hydrates and re-applies the mutation when a failed boot hydration recovers', async () => {
+    seedBag(null); // boot hydration fails
+    seedWorkspaces([
+      ws('ws-a', '2026-07-01T00:00:00Z'),
+      ws('ws-b', '2026-07-02T00:00:00Z'),
+      ws('ws-c', '2026-07-03T00:00:00Z'),
+    ]);
+    const invoke = invokeChain();
+
+    invoke({ type: 'any/action' });
+    await vi.waitFor(() => expect(mockState.hardwareConsole.hydrated).toBe(true));
+    expect(appClient.settings.update).not.toHaveBeenCalled();
+
+    seedBag({ keyPins: ['ws-a', 'ws-b'], sibling: 'kept' }); // daemon reachable again
+    invoke({ type: 'hardwareConsole/pinWorkspaceToKey', payload: [2, 'ws-c'] });
+
+    await vi.waitFor(() => {
+      expect(lastPersistedValue()).toMatchObject({
+        sibling: 'kept',
+        keyPins: ['ws-a', 'ws-b', 'ws-c', null, null, null],
+      });
+    });
+  });
+});
+
+describe('persistHardwareConsoleKeyPins', () => {
+  it('rejects and does not write when the bag read fails', async () => {
+    seedBag(null);
+    await expect(
+      persistHardwareConsoleKeyPins(['ws-1', null, null, null, null, null], []),
+    ).rejects.toThrow('hardwareConsole.state');
+    expect(appClient.settings.update).not.toHaveBeenCalled();
+  });
+
+  it('writes the merged bag preserving sibling fields on a successful read', async () => {
+    seedBag({ promptUsage: ['p'], enabled: false });
+    await persistHardwareConsoleKeyPins(['ws-1', null, null, null, null, null], ['ws-x']);
+    expect(appClient.settings.update).toHaveBeenCalledWith([
+      {
+        path: 'hardwareConsole.state',
+        value: {
+          promptUsage: ['p'],
+          enabled: false,
+          keyPins: ['ws-1', null, null, null, null, null],
+          excludedWorkspaceIds: ['ws-x'],
+        },
+      },
+    ]);
   });
 });

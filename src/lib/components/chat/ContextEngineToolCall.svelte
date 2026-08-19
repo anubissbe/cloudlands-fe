@@ -6,68 +6,51 @@
    * Augment branding to highlight they use Augment's proprietary context engine.
    */
   import type { ToolUseBlock } from '$shared/types';
-  import {
-  faFile,
-  faExclamationTriangle,
-  faCodeCommit,
-} from '@fortawesome/free-solid-svg-icons';
+  import { faEye } from '@fortawesome/free-solid-svg-icons';
   import Fa from 'svelte-fa';
-  import {
-  fly,
-  slide,
-} from 'svelte/transition';
   import { parseToolResult } from './tool-result-parser';
   import CodeBlock from '$lib/components/editor/CodeBlock.svelte';
-  import { TooltipRich } from '$lib/components/ui/tooltip';
-  import { cn } from '$lib/utils';
   import { m } from '$shared/paraglide/messages.js';
   import { formatInteger } from '$lib/i18n/format';
+  import {
+    CHAT_OPERATIONAL_ICON_CLASS,
+    OPERATIONAL_INLINE_DETAILS_CLASS,
+  } from './operational-disclosure-row';
+  import { buildToolDisplayModel } from './tool-display-model';
+  import ToolStatusIcon from './ToolStatusIcon.svelte';
+  import ChatOperationalRow from './ChatOperationalRow.svelte';
 
   interface Props {
     toolUse: ToolUseBlock;
     toolState?: 'running' | 'completed' | 'error';
     result?: any;
+    adjacentOperationalRow?: boolean;
+    /** Called on expand — the parent dispatches lazy block hydration (§5.5). */
+    onExpand?: () => void;
   }
 
-  let { toolUse, toolState = 'completed', result = null }: Props = $props();
+  let {
+    toolUse,
+    toolState = 'completed',
+    result = null,
+    adjacentOperationalRow = false,
+    onExpand,
+  }: Props = $props();
 
   const parsedResult = $derived(
-    result ? parseToolResult(toolUse.name, toolUse.input, result) : null,
+    result !== null && result !== undefined
+      ? parseToolResult(toolUse.name, toolUse.input || {}, result)
+      : null,
   );
 
   let expanded = $state(false);
-  // Only allow expanding if there are actual results to show
-  const hasResults = $derived(
-    (parsedResult?.snippets?.length ?? 0) > 0 || !!parsedResult?.content,
-  );
-  let hoveredIndex = $state<number | null>(null);
-  let hoverTimeout: ReturnType<typeof setTimeout> | null = null;
-
-  function handleMouseEnter(index: number) {
-    if (hoverTimeout) {
-      clearTimeout(hoverTimeout);
-      hoverTimeout = null;
-    }
-    hoveredIndex = index;
-  }
-
-  function handleMouseLeave() {
-    hoverTimeout = setTimeout(() => {
-      hoveredIndex = null;
-    }, 50);
-  }
-
-  function expand(node: Element) {
-    return slide(node, { duration: 150 });
-  }
+  const detailsId = $derived(`context-engine-details-${toolUse.id}`);
 
   // Determine the source type (codebase vs commit history)
   const isCommitRetrieval = $derived(
     toolUse.name.toLowerCase().includes('git') || toolUse.name.toLowerCase().includes('commit'),
   );
-  const isConversationRetrieval = $derived(
-    toolUse.name.toLowerCase().includes('conversation'),
-  );
+  const isConversationRetrieval = $derived(toolUse.name.toLowerCase().includes('conversation'));
 
   const sourceLabel = $derived(
     isCommitRetrieval
@@ -79,10 +62,51 @@
 
   // Get the query/information request (cast to String to handle non-string values safely)
   const query = $derived(String(toolUse.input?.information_request || toolUse.input?.query || ''));
+  const displayModel = $derived(
+    buildToolDisplayModel({
+      toolName: toolUse.name,
+      display: {
+        category: 'context-engine',
+        icon: faEye,
+        verb: '',
+        subject: sourceLabel,
+        path: null,
+      },
+      input: toolUse.input || {},
+      result,
+      parsedResult,
+      toolState,
+    }),
+  );
 
   // Get snippets from parsed result
   const snippets = $derived(parsedResult?.snippets || []);
   const snippetCount = $derived(snippets.length);
+
+  const plainContentPreview = $derived.by(() => {
+    const content = parsedResult?.content;
+    if (!content) return '';
+    if (content === `Search: ${query}` || content === `Find: ${query}`) return '';
+    return getPreviewContent(content, 3);
+  });
+
+  // Only allow expanding if there are actual results to show.
+  const hasResults = $derived(snippetCount > 0 || plainContentPreview.length > 0);
+  const isExpandable = $derived(hasResults || toolState === 'error');
+
+  function toggleExpanded() {
+    if (!isExpandable) return;
+    expanded = !expanded;
+    // Expanding a slim-truncated row triggers the on-demand full-block fetch
+    // (no-op for under-budget rows: the parent's truncated id list is empty).
+    if (expanded) onExpand?.();
+  }
+
+  function handleDisclosureKeydown(event: KeyboardEvent) {
+    if (event.key !== 'Enter' && event.key !== ' ') return;
+    event.preventDefault();
+    toggleExpanded();
+  }
 
   // Normalize content with line numbers to have consistent formatting
   // Input format: "    42\tcode here" (varying leading spaces + digits + tab + content)
@@ -204,210 +228,143 @@
   }
 </script>
 
-<div
-  class="group relative w-full text-base transition-all duration-150 overflow-hidden block my-1 bg-primary/5 text-primary px-3.5 pb-2"
->
-  <div class="flex flex-col w-full min-w-0 pt-2 relative min-h-8">
-    <button
-      class={cn('flex flex-col text-left items-start gap-1.5', hasResults ? 'cursor-pointer' : 'cursor-default')}
-      onclick={() => {
-        if (hasResults) expanded = !expanded;
-      }}
+{#snippet leading()}
+  <Fa icon={faEye} size={16} class={CHAT_OPERATIONAL_ICON_CLASS} />
+{/snippet}
+
+{#snippet summary()}
+  {#each displayModel.sentenceSegments as segment}
+    <span
+      class="font-normal"
+      data-tool-primary={segment.kind === 'primary' ? '' : undefined}
+      data-tool-secondary={segment.kind !== 'primary' ? '' : undefined}>{segment.text}</span
     >
-      <!-- Context Engine label -->
-      <div class="w-full flex mb-1">
-        <!-- Augment Logo -->
-        <!-- <div class="shrink-0 pt-1.25 pr-1.5 text-subtle">
-          <Fa icon={faMagnifyingGlass} size={12} />
-        </div> -->
-        <span class="shrink-0 text-primary/80 {toolState === 'running' ? 'animate-pulse' : ''}">
-          {m.chat_contextEngine_search_label({ source: sourceLabel })}
-        </span>
+  {/each}
+{/snippet}
 
-        <div class="ml-auto flex items-center gap-1.5">
-          <div
-            class="flex items-center justify-center leading-none font-medium whitespace-nowrap text-primary/70 px-3d py-1.25 rounded-full text-[0.66rem] uppercase tracking-widest"
-          >
-            <!-- i18n-ignore (brand name) -->
-            Augment Context Engine
-          </div>
+{#snippet trailing()}
+  <ToolStatusIcon status={toolState} />
+{/snippet}
 
-          <!-- Status indicator -->
-          {#if toolState === 'error'}
-            <div class="flex items-center gap-2 shrink-0">
-              <Fa icon={faExclamationTriangle} size="xs" class="text-red-500" />
-            </div>
+{#snippet details()}
+  <div class="type-caption px-3 py-1 text-muted-foreground" data-testid="context-engine-brand">
+    <!-- i18n-ignore (brand name) -->
+    Augment Context Engine
+  </div>
+  <!-- Error display -->
+  {#if toolState === 'error'}
+    <div class="border-b border-destructive/20 bg-destructive/10 px-4 py-3">
+      <div class="flex items-start gap-2">
+        <div class="type-caption text-destructive">
+          {#if result}
+            {typeof result === 'string' ? result : JSON.stringify(result, null, 2)}
+          {:else}
+            {m.chat_contextEngine_toolCallFailed_label()}
           {/if}
         </div>
       </div>
-    </button>
+    </div>
+  {/if}
 
-    <!-- Query preview (truncated) -->
-    {#if query}
-      <button
-        class={cn('flex-1 flex items-center gap-2 min-w-0 text-left bg-transparent border-0 p-0 my-0.5', hasResults ? 'cursor-pointer' : 'cursor-default')}
-        onclick={() => {
-          if (hasResults) expanded = !expanded;
-        }}
-      >
-        <span class="text-subtle text-sm line-clamp-2 block leading-tight">
-          {query.slice(0, 600)}
-        </span>
-      </button>
-
-      {#if !expanded}
-        <div class="w-full flex -ml-1 shrink" role="list" onmouseleave={handleMouseLeave}>
-          {#each snippets.slice(0, 20) as snippet, i (`snippet-${i}-${snippet.path}`)}
-            {@const fileName = snippet.path.split('/').pop() || snippet.path}
-            {@const lineInfo = snippet.lineStart ? `:${snippet.lineStart}` : ''}
-            {@const dirPath = snippet.path.split('/').slice(0, -1).join('/')}
-            {@const previewLines = getPreviewContent(snippet.content, 6)}
-            <div class="shrink-0" transition:fly={{ x: 6, duration: 200 }}>
-              <TooltipRich
-                side="top"
-                sideOffset={4}
-                delayDuration={0}
-                maxWidth="28rem"
-                variant="custom"
-                contentClass="bg-popover border border-border"
-                showArrow={false}
-                disableHoverableContent
-                disableAnimation
-                open={hoveredIndex === i}
-              >
-                {#snippet trigger()}
-                  <!-- svelte-ignore a11y_no_static_element_interactions -->
-                  <span class="p-1 pb-0" onmouseenter={() => handleMouseEnter(i)}>
-                    <Fa
-                      icon={isCommitRetrieval ? faCodeCommit : faFile}
-                      size="xs"
-                      class="text-ghost"
-                    />
-                  </span>
-                {/snippet}
-                {#snippet content()}
-                  <div class="flex items-baseline gap-1.5 mb-1 whitespace-nowrap">
-                    <span class="text-sm text-foreground">{fileName}{lineInfo}</span>
-                    {#if dirPath}
-                      <span class="text-xs text-subtle truncate">{dirPath}</span>
-                    {/if}
-                  </div>
-                  {#if previewLines}
-                    <div class="snippet-hover-code">
-                      <CodeBlock
-                        className="overflow-hidden"
-                        doScroll={false}
-                        code={previewLines}
-                        language={getLanguageFromPath(snippet.path)}
-                        maxHeight={120}
-                      />
-                    </div>
-                  {/if}
-                {/snippet}
-              </TooltipRich>
-            </div>
-          {/each}
-        </div>
-      {/if}
-    {:else}
-      <div class="flex-1"></div>
-    {/if}
-  </div>
-
-  {#if expanded}
-    <div class="-mt-2" transition:expand>
-      <!-- Error display -->
-      {#if toolState === 'error'}
-        <div class="px-4 py-3 bg-red-500/10 border-b border-red-500/20">
-          <div class="flex items-start gap-2">
-            <Fa icon={faExclamationTriangle} size="sm" class="text-red-500 mt-0.5 shrink-0" />
-            <div class="text-sm text-red-600 dark:text-red-400">
-              {#if result}
-                {typeof result === 'string' ? result : JSON.stringify(result, null, 2)}
-              {:else}
-                {m.chat_contextEngine_toolCallFailed_label()}
-              {/if}
-            </div>
-          </div>
-        </div>
-      {/if}
-
-      <!-- Results section -->
-      {#if toolState !== 'error' && snippetCount > 0}
-        <div class="py-2">
-          <!-- <div class="flex items-center gap-2 mb-2">
+  <!-- Results section -->
+  {#if toolState !== 'error' && snippetCount > 0}
+    <div class="py-2">
+      <!-- <div class="flex items-center gap-2 mb-2">
           <span class="text-xs text-muted-foreground uppercase tracking-wide">Retrieved</span>
           <span class="text-xs px-1.5 py-0.5 rounded-full bg-primary/10 text-primary font-medium">
             {snippetCount} {snippetCount === 1 ? 'file' : 'files'}
           </span>
         </div> -->
 
-          <div class="flex flex-col gap-1.5">
-            {#each snippets.slice(0, 6) as snippet, i (`snippet-${i}-${snippet.path}`)}
-              {@const fileName = snippet.path.split('/').pop() || snippet.path}
-              {@const dirPath = snippet.path.split('/').slice(0, -1).join('/')}
-              <div class="transition-colors">
-                <!-- File header -->
-                <div class="flex items-center gap-1.5 py-1">
-                  <!-- <Fa icon={faFile} size="xs" class="text-primary/60" /> -->
-                  <span class="text-sm text-subtle">{fileName}</span>
-                  {#if snippet.lineStart}
-                    <span class="text-sm text-subtle">:{snippet.lineStart}</span>
-                  {/if}
-                  {#if dirPath}
-                    <span class="text-sm text-subtle truncate" title={snippet.path}
-                      >{dirPath}</span
-                    >
-                  {/if}
-                </div>
-                <!-- Code preview with syntax highlighting -->
-                <div class="code-snippet-wrapper">
-                  <CodeBlock
-                    code={getPreviewContent(snippet.content, 6)}
-                    language={getLanguageFromPath(snippet.path)}
-                    maxHeight={120}
-                  />
-                </div>
-              </div>
-            {/each}
+      <div class="flex flex-col gap-1.5">
+        {#each snippets.slice(0, 6) as snippet, i (`snippet-${i}-${snippet.path}`)}
+          {@const fileName = snippet.path.split('/').pop() || snippet.path}
+          {@const dirPath = snippet.path.split('/').slice(0, -1).join('/')}
+          <div class="transition-colors">
+            <!-- File header -->
+            <div class="flex items-center gap-1.5 py-1">
+              <!-- <Fa icon={faFile} size="xs" class="text-primary/60" /> -->
+              <span class="type-caption text-subtle">{fileName}</span>
+              {#if snippet.lineStart}
+                <span class="type-caption text-subtle">:{snippet.lineStart}</span>
+              {/if}
+              {#if dirPath}
+                <span class="type-caption truncate text-subtle" title={snippet.path}>{dirPath}</span
+                >
+              {/if}
+            </div>
+            <!-- Code preview with syntax highlighting -->
+            <div class="code-snippet-wrapper">
+              <CodeBlock
+                code={getPreviewContent(snippet.content, 6)}
+                language={getLanguageFromPath(snippet.path)}
+                maxHeight={120}
+              />
+            </div>
+          </div>
+        {/each}
 
-            {#if snippetCount > 6}
-              <div
-                class="text-center text-xs text-subtle py-1.5 border-t border-border/20 mt-1"
-              >
-                {snippetCount - 6 === 1
-                  ? m.chat_contextEngine_moreFiles_one({
-                      count: formatInteger(snippetCount - 6),
-                    })
-                  : m.chat_contextEngine_moreFiles_many({
-                      count: formatInteger(snippetCount - 6),
-                    })}
-              </div>
-            {/if}
+        {#if snippetCount > 6}
+          <div class="text-center text-xs text-subtle py-1.5 border-t border-border mt-1">
+            {snippetCount - 6 === 1
+              ? m.chat_contextEngine_moreFiles_one({
+                  count: formatInteger(snippetCount - 6),
+                })
+              : m.chat_contextEngine_moreFiles_many({
+                  count: formatInteger(snippetCount - 6),
+                })}
           </div>
-        </div>
-      {:else if toolState !== 'error' && parsedResult?.content}
-        <!-- Fallback: plain content -->
-        <div class="px-3 py-2">
-          <div class="code-snippet-wrapper">
-            <CodeBlock code={parsedResult.content} language="plaintext" maxHeight={300} />
-          </div>
-        </div>
-      {:else if toolState !== 'error' && result}
-        <!-- Raw result fallback -->
-        <div class="px-3 py-2">
-          <div class="code-snippet-wrapper">
-            <CodeBlock
-              code={typeof result === 'string' ? result : JSON.stringify(result, null, 2)}
-              language="json"
-              maxHeight={300}
-            />
-          </div>
-        </div>
-      {/if}
+        {/if}
+      </div>
+    </div>
+  {:else if toolState !== 'error' && parsedResult?.content}
+    <!-- Fallback: plain content -->
+    <div class="px-3 py-2">
+      <div class="code-snippet-wrapper">
+        <CodeBlock code={parsedResult.content} language="plaintext" maxHeight={300} />
+      </div>
+    </div>
+  {:else if toolState !== 'error' && result}
+    <!-- Raw result fallback -->
+    <div class="px-3 py-2">
+      <div class="code-snippet-wrapper">
+        <CodeBlock
+          code={typeof result === 'string' ? result : JSON.stringify(result, null, 2)}
+          language="json"
+          maxHeight={300}
+        />
+      </div>
     </div>
   {/if}
-</div>
+{/snippet}
+
+<ChatOperationalRow
+  {leading}
+  {summary}
+  {trailing}
+  showChevron={false}
+  details={expanded ? details : undefined}
+  interactive={isExpandable}
+  {expanded}
+  controls={detailsId}
+  ariaLabel={isExpandable
+    ? m.chat_toolCall_technicalDetails_label()
+    : displayModel.accessibleSentence}
+  title={isExpandable ? m.chat_toolCall_technicalDetails_label() : displayModel.accessibleSentence}
+  summaryTitle={displayModel.accessibleSentence}
+  onclick={toggleExpanded}
+  onkeydown={handleDisclosureKeydown}
+  {detailsId}
+  detailsClass={OPERATIONAL_INLINE_DETAILS_CLASS}
+  {adjacentOperationalRow}
+  streaming={toolState === 'running'}
+  toolIcon
+  testId="context-engine-tool-call"
+  disclosureTestId="context-engine-disclosure"
+  summaryTestId="context-engine-query"
+  toolUseId={toolUse.id}
+  conversationLayer="tool-activity"
+/>
 
 <style>
   /* Override CodeBlock styling for compact display in context engine results */
@@ -425,29 +382,5 @@
 
   .code-snippet-wrapper :global(.code-line) {
     min-height: 18px !important;
-  }
-
-  /* Override CodeBlock styling for hover card - no background, compact, scrollable */
-  .snippet-hover-code {
-    max-height: 120px;
-    overflow: auto;
-  }
-
-  .snippet-hover-code :global(.code-block-container) {
-    margin: 0 !important;
-    border: none !important;
-    border-radius: 0 !important;
-    background: transparent !important;
-  }
-
-  .snippet-hover-code :global(.code-pre) {
-    font-size: 11px !important;
-    line-height: 16px !important;
-    padding: 0 !important;
-    background: transparent !important;
-  }
-
-  .snippet-hover-code :global(.code-line) {
-    min-height: 16px !important;
   }
 </style>

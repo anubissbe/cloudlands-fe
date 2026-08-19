@@ -9,57 +9,52 @@
   import type { TabTypeComponentProps } from './registry';
   import { getPanelHeaderContext } from '$lib/components/layout/panel-system/panel-header-context.svelte';
   import {
-  selectFileTrackingBoundarySha,
-  selectFileTrackingChanges,
-  selectFileTrackingCommits,
-  selectFileTrackingLoading,
-} from '$store/renderer/slices/changes/changes-selectors';
+    selectFileTrackingBoundarySha,
+    selectFileTrackingChanges,
+    selectFileTrackingCommits,
+    selectFileTrackingLoading,
+  } from '$store/renderer/slices/changes/changes-selectors';
   import {
-  discardFiles as discardFilesViaSeam,
-  stageFiles as stageFilesViaSeam,
-  unstageFiles as unstageFilesViaSeam,
-} from '$features/git/git-write-service';
+    discardFiles as discardFilesViaSeam,
+    stageFiles as stageFilesViaSeam,
+    unstageFiles as unstageFilesViaSeam,
+  } from '$features/git/git-write-service';
   import { toast } from '$lib/components/ui/toast';
 
   import { selectWorkspaceById } from '$store/renderer/slices/workspace/workspace-selectors';
   import ChatChangesPanel from '$lib/components/chat/ChatChangesPanel.svelte';
-  import { Button } from '$lib/components/ui/button';
+  import ViewSettingsDropdown from '../components/ViewSettingsDropdown.svelte';
   import {
-  selectLineWrapping,
-  selectFoldUnchanged,
-  selectDiffSideBySide,
-} from '$store/renderer/slices/ui-layout/ui-layout-selectors';
+    selectLineWrapping,
+    selectFoldUnchanged,
+    selectDiffSideBySide,
+  } from '$store/renderer/slices/ui-layout/ui-layout-selectors';
   import {
-  toggleLineWrapping,
-  toggleFoldUnchanged,
-  toggleDiffSideBySide,
-} from '$store/renderer/slices/ui-layout/ui-layout-slice';
+    toggleLineWrapping,
+    toggleFoldUnchanged,
+    toggleDiffSideBySide,
+  } from '$store/renderer/slices/ui-layout/ui-layout-slice';
 
-  import Fa from 'svelte-fa';
-  import {
-  faTextWidth,
-  faMap,
-  faColumns,
-  faCompressAlt,
-} from '@fortawesome/free-solid-svg-icons';
   import { m } from '$shared/paraglide/messages.js';
+  import { isAbsolutePath, normalizePath } from '$lib/utils/path-utils';
   import { store as appStore } from '$store/renderer/store';
 
   const lineWrapping = selectLineWrapping();
   const foldUnchanged = selectFoldUnchanged();
   const diffSideBySide = selectDiffSideBySide();
-  const headerToggleActiveClass =
-    'text-foreground bg-sidebar hover:text-foreground hover:bg-sidebar';
-  const headerToggleInactiveClass = 'text-subtle';
-
   let { workspaceId, isActive }: TabTypeComponentProps = $props();
 
   const headerContext = getPanelHeaderContext();
+  // svelte-ignore state_referenced_locally
   const workspace = selectWorkspaceById(workspaceId);
   const workspacePath = $derived($workspace?.worktreePath || $workspace?.repositoryPath || '');
+  // svelte-ignore state_referenced_locally
   const ftChanges$ = selectFileTrackingChanges(workspaceId);
+  // svelte-ignore state_referenced_locally
   const ftCommits$ = selectFileTrackingCommits(workspaceId);
+  // svelte-ignore state_referenced_locally
   const ftBoundarySha$ = selectFileTrackingBoundarySha(workspaceId);
+  // svelte-ignore state_referenced_locally
   const ftLoading$ = selectFileTrackingLoading(workspaceId);
   const allCommits = $derived($ftCommits$ || []);
 
@@ -74,7 +69,8 @@
     return [
       ...unstaged.map((c) => {
         const rawPath = c.file || c.relativePath;
-        const filePath = rawPath?.startsWith('/') ? rawPath : `${workspacePath}/${rawPath}`;
+        const filePath =
+          rawPath && isAbsolutePath(rawPath) ? rawPath : `${workspacePath}/${rawPath}`;
         return {
           filePath,
           action: 'modify' as const,
@@ -86,11 +82,13 @@
           category: 'unstaged' as const,
           oldContent: c.content?.oldContent,
           newContent: c.content?.newContent,
+          gitlink: c.gitlink,
         };
       }),
       ...staged.map((c) => {
         const rawPath = c.file || c.relativePath;
-        const filePath = rawPath?.startsWith('/') ? rawPath : `${workspacePath}/${rawPath}`;
+        const filePath =
+          rawPath && isAbsolutePath(rawPath) ? rawPath : `${workspacePath}/${rawPath}`;
         return {
           filePath,
           action: 'modify' as const,
@@ -102,15 +100,15 @@
           category: 'staged' as const,
           oldContent: c.content?.oldContent,
           newContent: c.content?.newContent,
+          gitlink: c.gitlink,
         };
       }),
       ...allCommits.flatMap((commit) =>
         (commit.files || []).map(
           (file: { path?: string; additions?: number; deletions?: number } | string) => {
             const filePath = typeof file === 'string' ? file : file.path || '';
-            const normalizedPath = filePath?.startsWith('/')
-              ? filePath
-              : `${workspacePath}/${filePath}`;
+            const normalizedPath =
+              filePath && isAbsolutePath(filePath) ? filePath : `${workspacePath}/${filePath}`;
             const additions = typeof file === 'string' ? 0 : file.additions || 0;
             const deletions = typeof file === 'string' ? 0 : file.deletions || 0;
             return {
@@ -133,11 +131,14 @@
 
   // The panel rows carry absolutized paths (workspacePath-prefixed above);
   // the git.* wire contract takes repo-relative paths, so strip the prefix
-  // before handing them to the write-service seam.
+  // before handing them to the write-service seam. Separators are normalized
+  // on both sides first so backslash-form Windows absolutes (C:\repo\src\a.ts)
+  // relativize against a forward-slash workspace root too.
   function toRepoRelative(path: string): string {
-    return workspacePath && path.startsWith(`${workspacePath}/`)
-      ? path.slice(workspacePath.length + 1)
-      : path;
+    if (!workspacePath) return path;
+    const normalized = normalizePath(path);
+    const root = normalizePath(workspacePath);
+    return normalized.startsWith(`${root}/`) ? normalized.slice(root.length + 1) : path;
   }
 
   // Stage/unstage/revert route through the git-write-service seam
@@ -179,67 +180,27 @@
   // Register header actions
   $effect(() => {
     if (!headerContext || !isActive) return;
-    headerContext.registerActions(changesActions);
+    headerContext.registerActions({ display: changesDisplayActions });
   });
 </script>
 
-{#snippet changesActions()}
-  <Button
-    variant="ghost-light"
-    size="icon-xs"
-    onclick={() => {
+{#snippet changesDisplayActions()}
+  <ViewSettingsDropdown
+    embedded
+    showExpand
+    expanded={changesAllExpanded}
+    onToggleExpand={() => {
       changesAllExpanded = !changesAllExpanded;
       if (changesAllExpanded) changesPanelRef?.expandAll();
       else changesPanelRef?.collapseAll();
     }}
-    tooltip={changesAllExpanded
-      ? m.layout_diffHeader_collapseAllFiles_tooltip()
-      : m.layout_diffHeader_expandAllFiles_tooltip()}
-    tooltipSide="bottom"
-    aria-pressed={changesAllExpanded}
-    class={changesAllExpanded ? headerToggleActiveClass : headerToggleInactiveClass}
-  >
-    <Fa icon={faCompressAlt} size="xs" class={changesAllExpanded ? '' : 'rotate-180'} />
-  </Button>
-  <Button
-    variant="ghost-light"
-    size="icon-xs"
-    onclick={() => appStore.dispatch(toggleLineWrapping())}
-    tooltip={$lineWrapping
-      ? m.layout_diffHeader_wrappingOn_tooltip()
-      : m.layout_diffHeader_wrapLines_tooltip()}
-    tooltipSide="bottom"
-    aria-pressed={$lineWrapping}
-    class={$lineWrapping ? headerToggleActiveClass : headerToggleInactiveClass}
-  >
-    <Fa icon={faTextWidth} size="xs" />
-  </Button>
-  <Button
-    variant="ghost-light"
-    size="icon-xs"
-    onclick={() => appStore.dispatch(toggleFoldUnchanged())}
-    tooltip={$foldUnchanged
-      ? m.layout_diffHeader_foldingOn_tooltip()
-      : m.layout_diffHeader_foldLines_tooltip()}
-    tooltipSide="bottom"
-    aria-pressed={$foldUnchanged}
-    class={$foldUnchanged ? headerToggleActiveClass : headerToggleInactiveClass}
-  >
-    <Fa icon={faMap} size="xs" />
-  </Button>
-  <Button
-    variant="ghost-light"
-    size="icon-xs"
-    onclick={() => appStore.dispatch(toggleDiffSideBySide())}
-    tooltip={$diffSideBySide
-      ? m.layout_diffHeader_unifiedView_tooltip()
-      : m.layout_diffHeader_splitView_tooltip()}
-    tooltipSide="bottom"
-    aria-pressed={$diffSideBySide}
-    class={$diffSideBySide ? headerToggleActiveClass : headerToggleInactiveClass}
-  >
-    <Fa icon={faColumns} size="xs" />
-  </Button>
+    foldEnabled={$foldUnchanged}
+    onToggleFold={() => appStore.dispatch(toggleFoldUnchanged())}
+    wrapEnabled={$lineWrapping}
+    onToggleWrap={() => appStore.dispatch(toggleLineWrapping())}
+    splitEnabled={$diffSideBySide}
+    onToggleSplit={() => appStore.dispatch(toggleDiffSideBySide())}
+  />
 {/snippet}
 
 <ChatChangesPanel

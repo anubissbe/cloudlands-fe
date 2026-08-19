@@ -183,7 +183,6 @@ async function findExecutableBinary(editorId: string): Promise<string | null> {
   for (const binary of binaries) {
     const resolvedPath = await findBinary(binary, {
       commonPaths: searchPaths.map((searchPath) => `${searchPath}/${binary}`),
-      cache: false,
       preferExtensions: [],
       useEnhancedPath: false,
       useLoginShell: false,
@@ -240,7 +239,7 @@ async function findWindowsBinary(editorId: string): Promise<string | null> {
   if (!editor?.platforms?.win32?.binaries) return null;
 
   for (const binary of editor.platforms.win32.binaries) {
-    const resolvedPath = await findBinary(binary, { cache: false });
+    const resolvedPath = await findBinary(binary);
     if (resolvedPath) {
       return binary;
     }
@@ -666,10 +665,10 @@ export function registerExternalEditorsHandlers(): void {
     IPC_CHANNELS.EXTERNAL_EDITORS.OPEN_WITH_OTHER,
     createSafeValidatedHandler(
       OpenWithOtherSchema,
-      async (_event, { path }) => {
+      async (event, { path }) => {
         try {
           // Import dialog here to avoid issues with module loading
-          const { dialog: electronDialog } = await import('electron');
+          const { BrowserWindow, dialog: electronDialog } = await import('electron');
 
           // Platform-specific dialog configuration
           let dialogOptions: Electron.OpenDialogOptions;
@@ -714,7 +713,10 @@ export function registerExternalEditorsHandlers(): void {
             };
           }
 
-          const result = await electronDialog.showOpenDialog(dialogOptions);
+          const ownerWindow = BrowserWindow.fromWebContents(event.sender);
+          const result = ownerWindow
+            ? await electronDialog.showOpenDialog(ownerWindow, dialogOptions)
+            : await electronDialog.showOpenDialog(dialogOptions);
 
           if (result.canceled || result.filePaths.length === 0) {
             return { success: false, error: m.externalEditors_ipc_noApplicationSelected_error() };

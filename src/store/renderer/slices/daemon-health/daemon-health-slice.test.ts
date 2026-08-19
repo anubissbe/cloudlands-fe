@@ -40,6 +40,7 @@ describe('daemonHealthReducer', () => {
       lastUpdated: null,
       polling: false,
       transport: null,
+      reconnectAttempts: 0,
       hostLocality: null,
       sidecarGaveUp: false,
       sidecarGaveUpReason: null,
@@ -95,6 +96,95 @@ describe('daemonHealthReducer', () => {
       expect(next.transport).toEqual(externalTransport);
     });
 
+    it('clears locality reported by a different transport when switching to local UDS', () => {
+      const state = {
+        ...initialState,
+        transport: { mode: 'external-ws', target: 'wss://remote.example' } as const,
+        hostLocality: 'remote' as const,
+      };
+
+      const next = daemonHealthReducer(
+        state,
+        connectionStatusChanged('connected', sidecarTransport),
+      );
+
+      expect(next.transport).toEqual(sidecarTransport);
+      expect(next.hostLocality).toBeNull();
+    });
+
+    it('clears stale stats when connecting to a different daemon (transport switch)', () => {
+      // Stats (incl. version) polled from the previous daemon must not
+      // survive a switch — the selector would compare the OLD daemon's
+      // version against the NEW transport's pin until the next poll.
+      const state = {
+        ...initialState,
+        health: 'down' as const,
+        transport: {
+          mode: 'external-ws',
+          target: 'wss://remote.example',
+          pinnedVersion: '2.0.0',
+        } as const,
+        stats: {
+          clients: 1,
+          agents: 0,
+          listenMode: 'ws',
+          os: 'linux',
+          arch: 'x64',
+          version: '1.0.0',
+        },
+        lastUpdated: '2026-08-14T00:00:00.000Z',
+      };
+
+      const next = daemonHealthReducer(
+        state,
+        connectionStatusChanged('connected', { ...sidecarTransport, pinnedVersion: '2.0.0' }),
+      );
+
+      expect(next.stats).toBeNull();
+      expect(next.lastUpdated).toBeNull();
+    });
+
+    it('preserves stats when reconnecting to the same daemon (no transport change)', () => {
+      const stats = {
+        clients: 1,
+        agents: 0,
+        listenMode: 'uds',
+        os: 'macos',
+        arch: 'aarch64',
+        version: '1.0.0',
+      };
+      const state = {
+        ...initialState,
+        health: 'down' as const,
+        transport: sidecarTransport,
+        stats,
+        lastUpdated: '2026-08-14T00:00:00.000Z',
+      };
+
+      const next = daemonHealthReducer(
+        state,
+        connectionStatusChanged('connected', { ...sidecarTransport }),
+      );
+
+      expect(next.stats).toEqual({ ...stats, transport: sidecarTransport });
+      expect(next.lastUpdated).toBe('2026-08-14T00:00:00.000Z');
+    });
+
+    it('preserves forced locality when reconnecting to the same transport', () => {
+      const state = {
+        ...initialState,
+        transport: sidecarTransport,
+        hostLocality: 'remote' as const,
+      };
+
+      const next = daemonHealthReducer(
+        state,
+        connectionStatusChanged('connected', { ...sidecarTransport }),
+      );
+
+      expect(next.hostLocality).toBe('remote');
+    });
+
     it('preserves last-known transport across a disconnect without transport info', () => {
       const state = { ...initialState, health: 'healthy' as const, transport: sidecarTransport };
       const next = daemonHealthReducer(state, connectionStatusChanged('disconnected'));
@@ -108,6 +198,32 @@ describe('daemonHealthReducer', () => {
         connectionStatusChanged('disconnected', externalTransport),
       );
       expect(next.transport).toEqual(externalTransport);
+    });
+
+    it('stores reconnectAttempts from disconnect/connecting extras (#1750)', () => {
+      const down = daemonHealthReducer(
+        initialState,
+        connectionStatusChanged('disconnected', undefined, { reconnectAttempts: 3 }),
+      );
+      expect(down.reconnectAttempts).toBe(3);
+
+      const connecting = daemonHealthReducer(
+        down,
+        connectionStatusChanged('connecting', undefined, { reconnectAttempts: 4 }),
+      );
+      expect(connecting.reconnectAttempts).toBe(4);
+    });
+
+    it('preserves reconnectAttempts on a disconnect without the extra', () => {
+      const state = { ...initialState, reconnectAttempts: 5 };
+      const next = daemonHealthReducer(state, connectionStatusChanged('disconnected'));
+      expect(next.reconnectAttempts).toBe(5);
+    });
+
+    it('resets reconnectAttempts on a successful connect', () => {
+      const state = { ...initialState, reconnectAttempts: 14 };
+      const next = daemonHealthReducer(state, connectionStatusChanged('connected'));
+      expect(next.reconnectAttempts).toBe(0);
     });
 
     it('latches sidecarGaveUp + reason on a give-up disconnect', () => {
@@ -357,6 +473,8 @@ describe('daemonHealthReducer', () => {
         uptimeSeconds: 120,
         cpuPercent: 12.34,
         memoryBytes: 104857600,
+        workspacesDiskAvailableBytes: 453316378624,
+        workspacesDiskTotalBytes: 1099511627776,
         fingerprint: 'abc123',
         protocolVersion: '2.0',
         host: {
@@ -367,7 +485,7 @@ describe('daemonHealthReducer', () => {
         },
       };
       const state = { ...initialState, polling: true };
-      const receivedAt = '2026-08-01T12:34:56.789Z';
+      const receivedAt = '2026-07-30T20:00:00.000Z';
       const next = daemonHealthReducer(state, systemStatusSuccess(payload, receivedAt));
 
       expect(next.polling).toBe(false);
@@ -382,6 +500,8 @@ describe('daemonHealthReducer', () => {
         uptimeSeconds: 120,
         cpuPercent: 12.34,
         memoryBytes: 104857600,
+        workspacesDiskAvailableBytes: 453316378624,
+        workspacesDiskTotalBytes: 1099511627776,
         os: 'macos',
         arch: 'aarch64',
         transport: undefined,
@@ -398,7 +518,8 @@ describe('daemonHealthReducer', () => {
         port: 9000,
         clients: 1,
         agents: 0,
-        // maxAgents, version, uptimeSeconds, cpuPercent, memoryBytes missing (older daemon)
+        // maxAgents, version, uptimeSeconds, cpuPercent, memoryBytes,
+        // workspacesDisk* missing (older daemon)
         fingerprint: null,
         protocolVersion: '2.0',
         host: {
@@ -409,8 +530,10 @@ describe('daemonHealthReducer', () => {
         },
       };
       const state = { ...initialState, polling: true };
-      const receivedAt = '2026-08-01T00:00:00.000Z';
-      const next = daemonHealthReducer(state, systemStatusSuccess(payload, receivedAt));
+      const next = daemonHealthReducer(
+        state,
+        systemStatusSuccess(payload, '2026-07-30T20:00:01.000Z'),
+      );
 
       expect(next.polling).toBe(false);
       expect(next.stats).toEqual({
@@ -424,12 +547,13 @@ describe('daemonHealthReducer', () => {
         uptimeSeconds: undefined,
         cpuPercent: undefined,
         memoryBytes: undefined,
+        workspacesDiskAvailableBytes: undefined,
+        workspacesDiskTotalBytes: undefined,
         os: 'linux',
         arch: 'x86_64',
         transport: undefined,
       });
       expect(next.hostLocality).toBe('remote');
-      expect(next.lastUpdated).toBe(receivedAt);
     });
 
     it('preserves the last-known hostLocality when the payload omits it (older daemon)', () => {
@@ -445,10 +569,53 @@ describe('daemonHealthReducer', () => {
       const state = { ...initialState, hostLocality: 'local' as const };
       const next = daemonHealthReducer(
         state,
-        systemStatusSuccess(payload, '2026-08-01T00:00:00.000Z'),
+        systemStatusSuccess(payload, '2026-07-30T20:00:02.000Z'),
       );
 
       expect(next.hostLocality).toBe('local');
+    });
+
+    it('falls back to the top-level transport when stats are built for the first time (#1963)', () => {
+      const bootTransport: BackendTransportInfo = {
+        mode: 'sidecar-uds',
+        target: '/tmp/intentd.sock',
+      };
+      // Boot ordering: the connect event lands while stats are still null, so
+      // the transport only exists at the top level of the slice.
+      const connected = daemonHealthReducer(
+        initialState,
+        connectionStatusChanged('connected', bootTransport),
+      );
+      expect(connected.stats).toBeNull();
+      expect(connected.transport).toEqual(bootTransport);
+
+      const payload: SystemStatusWirePayload = {
+        running: true,
+        listenMode: 'uds',
+        transports: ['uds'],
+        port: null,
+        clients: 1,
+        agents: 0,
+        maxAgents: 8,
+        version: '0.1.0',
+        uptimeSeconds: 5,
+        cpuPercent: 1.0,
+        memoryBytes: 1024,
+        fingerprint: 'abc123',
+        protocolVersion: '2.0',
+        host: {
+          os: 'macos',
+          arch: 'aarch64',
+          hasDisplay: true,
+          locality: 'local',
+        },
+      };
+      const next = daemonHealthReducer(
+        connected,
+        systemStatusSuccess(payload, '2026-08-11T00:00:00.000Z'),
+      );
+
+      expect(next.stats?.transport).toEqual(bootTransport);
     });
   });
 

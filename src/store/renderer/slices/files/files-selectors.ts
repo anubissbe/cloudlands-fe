@@ -2,7 +2,7 @@ import { store } from "../../store";
 import {
   getItem,
   getItems,
-} from "$lib/store-shim/utils/collections/collection-utils";
+} from "@augmentcode/themis/utils/collections/collection-utils";
 import { emptyFilesWorkspaceState } from "./files-slice";
 import type { FileContentEntry, FilesWorkspaceState } from "./files-types";
 
@@ -49,6 +49,11 @@ export const selectFileSaving = store.createSelector(
 export const selectFileError = store.createSelector(
   (state, wsId: string, path: string | null | undefined): string | null =>
     selectFileContentEntry.select(state, wsId, path)?.error ?? null,
+);
+
+export const selectFileNotFoundCandidates = store.createSelector(
+  (state, wsId: string, path: string | null | undefined): string[] | null =>
+    selectFileContentEntry.select(state, wsId, path)?.notFoundCandidates ?? null,
 );
 
 export const selectFileIsBinary = store.createSelector(

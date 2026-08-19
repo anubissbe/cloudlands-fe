@@ -94,6 +94,17 @@ export const AgentDeleteRequestSchema = z.object({
   workspaceId: WorkspaceIdSchema,
 });
 
+// Set agent model (`agent.setModel`, PROTOCOL §5.5). `providerId` is optional
+// and names the provider the picked model belongs to — required to resolve a
+// bare modelId when it targets a provider other than the session's current
+// one (cross-provider model pick).
+export const AgentSetModelRequestSchema = z.object({
+  agentId: AgentIdSchema,
+  modelId: z.string().min(1, 'modelId is required'),
+  workspaceId: WorkspaceIdSchema,
+  providerId: z.string().min(1, 'providerId must be a non-empty string when present').optional(),
+});
+
 // Cancel agent subscriptions (`agent.cancelSubscriptions`, PROTOCOL §5.5).
 // Unscoped (neither optional id) cancels everything the agent registered;
 // `subscriptionId` cancels exactly one completion watch, `groupId` one
@@ -153,6 +164,18 @@ export const TerminalWriteRequestSchema = z.object({
 });
 
 // ============================================================================
+// Daemon Wire Method Schemas (PROTOCOL.md)
+// ============================================================================
+
+/** `prMonitor.flush` request (PROTOCOL §5.42): `check?: boolean` is additive —
+ * `true` re-polls the PR before flushing; omitted preserves flush-only. */
+export const PrMonitorFlushRequestSchema = z.object({
+  workspaceId: WorkspaceIdSchema,
+  monitorId: z.string().min(1, 'Monitor ID is required'),
+  check: z.boolean().optional(),
+});
+
+// ============================================================================
 // Schema Registry
 // ============================================================================
 
@@ -162,6 +185,7 @@ const schemas: Record<string, z.ZodSchema<any>> = {
   'agent:get': AgentGetRequestSchema,
   'agent:send-message': AgentSendMessageRequestSchema,
   'agent:list': AgentListRequestSchema,
+  'agent:set-model': AgentSetModelRequestSchema,
   'agent:delete': AgentDeleteRequestSchema,
   'agent:cancel-subscriptions': AgentCancelSubscriptionsRequestSchema,
   'workspace:create': WorkspaceCreateRequestSchema,

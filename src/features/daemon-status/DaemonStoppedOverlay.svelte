@@ -15,15 +15,19 @@
    * Driven by the daemon-health slice: shows after a grace period while
    * health === 'down', auto-dismisses when backend:status returns 'connected'
    * (resubscription on reconnect is handled by the existing RESUB-1 path — this
-   * component issues no wire requests itself). Offers the app-managed sidecar
-   * fallback when the connection mode is external or the sidecar supervisor
-   * gave up restarting.
+   * component issues no wire requests itself). Offers actionable recovery when
+   * the connection is down (T20): "Start local intentd" (offered in any
+   * external mode — it switches the active backend to local first, then spawns
+   * the app-managed sidecar) or the app-managed sidecar retry when the
+   * supervisor gave up restarting, plus a one-click switch to any other saved
+   * backend so the user can fail over without opening the daemon-status menu.
    */
   import { page } from '$app/stores';
   import { store as appStore } from '$store/renderer/store';
   import {
     selectDaemonHealth,
     selectDaemonTransport,
+    selectReconnectAttempts,
     selectSidecarGaveUp,
     selectSidecarGaveUpReason,
     selectSidecarStartupFailed,
@@ -37,12 +41,25 @@
   } from '$store/renderer/slices/daemon-health/daemon-health-selectors';
   import {
     spawnSidecarRequested,
+    switchLocalAndSpawnRequested,
     fetchSidecarRunLogRequested,
   } from '$store/renderer/slices/daemon-health/daemon-health-slice';
+  import {
+    selectConnections,
+    selectActiveConnectionId,
+    selectIsConnecting,
+    selectActiveAuthRejected,
+  } from '$store/renderer/slices/connections/connections-selectors';
+  import { switchConnectionRequested } from '$store/renderer/slices/connections/connections-slice';
+  import { LOCAL_CONNECTION_ID } from '$shared/types/connections';
+  import type { ConnectionRecord } from '$shared/types/connections';
+  import ConnectBackendModal from '$lib/components/layout/ConnectBackendModal.svelte';
+  import Portal from '$lib/components/ui/Portal.svelte';
   import { m } from '$shared/paraglide/messages.js';
 
   const health$ = selectDaemonHealth();
   const transport$ = selectDaemonTransport();
+  const reconnectAttempts$ = selectReconnectAttempts();
   const sidecarGaveUp$ = selectSidecarGaveUp();
   const sidecarGaveUpReason$ = selectSidecarGaveUpReason();
   const sidecarStartupFailed$ = selectSidecarStartupFailed();
@@ -53,6 +70,10 @@
   const runLog$ = selectSidecarRunLog();
   const runLogPending$ = selectSidecarRunLogPending();
   const runLogError$ = selectSidecarRunLogError();
+  const connections$ = selectConnections();
+  const activeConnectionId$ = selectActiveConnectionId();
+  const isConnecting$ = selectIsConnecting();
+  const authRejected$ = selectActiveAuthRejected();
 
   // Presentational grace-period latch: health 'down' arms a timer; a recovery
   // before it fires cancels the overlay entirely (no flash on quick blips).
@@ -61,8 +82,7 @@
   const isSandboxPage = $derived(
     $page.url.pathname === '/sandbox' ||
       $page.url.pathname.startsWith('/sandbox/') ||
-      $page.url.pathname === '/test' ||
-      $page.url.pathname.startsWith('/test/'),
+      $page.url.pathname.startsWith('/test-'),
   );
 
   $effect(() => {
@@ -98,24 +118,87 @@
   // App-managed failure posture: the app runs its own intentd (transport is
   // sidecar-uds or still unresolved) and either the spawn never happened
   // (startup failure) or the supervisor crash-looped past its restart policy.
-  const isSidecarFailure = $derived(
-    ($sidecarStartupFailed$ || $sidecarGaveUp$) && !isExternalMode,
-  );
-  // The on-demand sidecar binds the local UDS socket, which a WS-connected
-  // client would never reconnect to — so the button is only offered when the
-  // connection target is the local socket (external-ws is excluded). Once a
-  // spawn is in flight (or failed), the section stays visible even if a
-  // status broadcast flips the transport to sidecar-uds mid-spawn — hiding it
-  // would drop the pending indicator / error and any way to retry.
+  const isSidecarFailure = $derived(($sidecarStartupFailed$ || $sidecarGaveUp$) && !isExternalMode);
+  // "Start local intentd" is offered in any external mode — external-uds AND
+  // external-ws (T20). The on-demand sidecar binds the local UDS socket, which a
+  // WS-connected client would never reconnect to on its own, so handleSpawnSidecar
+  // first switches the active backend to local (making the spawned sidecar's UDS
+  // the reconnect target) before requesting the spawn. Once a spawn is in flight
+  // (or failed), the section stays visible even if a status broadcast flips the
+  // transport to sidecar-uds mid-spawn — hiding it would drop the pending
+  // indicator / error and any way to retry.
   const showSpawnButton = $derived(
-    $transport$?.mode === 'external-uds' ||
-      $sidecarGaveUp$ ||
-      $spawnPending$ ||
-      $spawnError$ !== null,
+    isExternalMode || $sidecarGaveUp$ || $spawnPending$ || $spawnError$ !== null,
   );
 
+  // Other saved backends the user can fail over to without opening the menu
+  // (T20). Excludes the local entry — "Start local intentd" is its dedicated
+  // action — and the currently-active connection (switching to it is a no-op).
+  const otherConnections = $derived(
+    $connections$.filter((c) => !c.isLocal && c.id !== $activeConnectionId$),
+  );
+
+  // Actionable token-rejected posture: the active remote backend rejected the
+  // WebSocket upgrade with HTTP 401/403 (`connections:auth-rejected`), so
+  // retrying with the same stored token cannot succeed. The overlay swaps the
+  // generic cannot-connect copy for a "re-pair or switch" state: no
+  // "Retrying…" indicator (it would be misleading), and a Re-pair button that
+  // opens the add-connection flow with host/port prefilled — re-adding the
+  // same host:port replaces the stored token, and the resulting add/switch
+  // clears the latched rejection (connectOperationStarted).
+  const isAuthRejected = $derived($authRejected$ !== null);
+  let repairModalOpen = $state(false);
+
+  /** Display label for a remote connection: `hostname (host:port)`, or its raw label. */
+  function connectionLabel(conn: ConnectionRecord): string {
+    const hostname = conn.hostname?.trim();
+    if (hostname && conn.host && conn.port != null) {
+      return `${hostname} (${conn.host}:${conn.port})`;
+    }
+    return conn.label;
+  }
+
+  // Connection details for the lost external daemon (#1750): prefer the active
+  // connection record's `hostname (host:port)` label (captured from host.status
+  // on first connect); fall back to the transport target (sanitized WS URL or
+  // UDS socket path) when the active connection is the local entry (external-uds
+  // adoption) or the record has not loaded.
+  const activeConnection = $derived(
+    $connections$.find((c) => c.id === $activeConnectionId$) ?? null,
+  );
+  const externalTargetLabel = $derived.by(() => {
+    if (activeConnection && !activeConnection.isLocal) return connectionLabel(activeConnection);
+    return $transport$?.target ?? null;
+  });
+
   function handleSpawnSidecar() {
+    // In external/remote mode the active target is a remote backend; the
+    // on-demand sidecar binds the local UDS socket, so we must switch active →
+    // local first (making that UDS the reconnect target) before spawning.
+    //
+    // The switch destroys THIS window (captureAndCloseWindowsForBackendSwitch)
+    // before the switch IPC returns, so a renderer continuation that dispatched
+    // the spawn afterwards could be torn down before it ran — leaving the user on
+    // a fresh local window with intentd never started. Route the whole recovery
+    // through a single main-side action that switches AND spawns atomically, so
+    // it survives the window teardown.
+    if ($activeConnectionId$ !== LOCAL_CONNECTION_ID) {
+      appStore.dispatch(switchLocalAndSpawnRequested());
+      return;
+    }
+    // Already local: no switch, no window teardown — the plain spawn path is safe.
     appStore.dispatch(spawnSidecarRequested());
+  }
+
+  async function handleSwitchConnection(id: string) {
+    try {
+      const action = switchConnectionRequested(id);
+      appStore.dispatch(action);
+      await action.promise;
+    } catch {
+      // Failure surfaces via the connections slice op-status; the list/active
+      // refresh arrives via the connections:changed push.
+    }
   }
 
   // "Show logs from last run" — the daemon-health middleware performs the
@@ -127,149 +210,231 @@
 </script>
 
 {#if visible}
-  <div
-    class="fixed inset-0 z-[1000] flex items-center justify-center bg-black/70 backdrop-blur-sm"
-    role="alertdialog"
-    aria-modal="true"
-    aria-labelledby="daemon-stopped-title"
-    aria-describedby="daemon-stopped-description"
-    tabindex="-1"
-    data-testid="daemon-stopped-overlay"
-  >
-    <div class="mx-4 w-full max-w-md rounded-xl border border-border bg-background p-6 shadow-2xl">
-      <h2 id="daemon-stopped-title" class="text-lg font-semibold text-foreground">
-        {#if isSidecarFailure}
-          {$sidecarStartupFailed$
-            ? m.daemonStatus_overlay_startupFailedTitle_label()
-            : m.daemonStatus_overlay_stoppedUnexpectedlyTitle_label()}
-        {:else if !$hasEverConnected$}
-          {m.daemonStatus_overlay_cannotConnectTitle_label()}
-        {:else}
-          {m.daemonStatus_overlay_stoppedTitle_label()}
-        {/if}
-      </h2>
-
-      <p id="daemon-stopped-description" class="mt-2 text-sm text-muted-foreground">
-        {#if isSidecarFailure}
-          {#if $sidecarStartupFailed$}
-            {$sidecarStartupFailedReason$
-              ? m.daemonStatus_overlay_startupFailedWithReason_description({
-                  reason: $sidecarStartupFailedReason$,
-                })
-              : m.daemonStatus_overlay_startupFailed_description()}
+  <Portal target="body" zIndex={1000}>
+    <div
+      class="fixed inset-0 z-[1000] flex items-center justify-center bg-black/70 backdrop-blur-md"
+      role="alertdialog"
+      aria-modal="true"
+      aria-labelledby="daemon-stopped-title"
+      aria-describedby="daemon-stopped-description"
+      tabindex="-1"
+      data-testid="daemon-stopped-overlay"
+    >
+      <div
+        class="mx-4 w-full max-w-md rounded-xl border border-border bg-background p-6 shadow-2xl"
+      >
+        <h2 id="daemon-stopped-title" class="text-lg font-semibold text-foreground">
+          {#if isAuthRejected}
+            {m.daemonStatus_overlay_authRejectedTitle_label()}
+          {:else if isSidecarFailure}
+            {$sidecarStartupFailed$
+              ? m.daemonStatus_overlay_startupFailedTitle_label()
+              : m.daemonStatus_overlay_stoppedUnexpectedlyTitle_label()}
+          {:else if !$hasEverConnected$}
+            {m.daemonStatus_overlay_cannotConnectTitle_label()}
           {:else}
-            {$sidecarGaveUpReason$
-              ? m.daemonStatus_overlay_gaveUpWithReason_description({
-                  reason: $sidecarGaveUpReason$,
-                })
-              : m.daemonStatus_overlay_gaveUp_description()}
+            {m.daemonStatus_overlay_stoppedTitle_label()}
           {/if}
-        {:else if isExternalMode}
-          {#if $hasEverConnected$}
-            {m.daemonStatus_overlay_externalLost_description()}
-          {:else}
-            {m.daemonStatus_overlay_externalNeverConnected_description()}
-          {/if}
-        {:else if $hasEverConnected$}
-          {m.daemonStatus_overlay_lost_description()}
-        {:else}
-          {m.daemonStatus_overlay_neverConnected_description()}
-        {/if}
-      </p>
+        </h2>
 
-      {#if !isSidecarFailure}
-        <p class="mt-3 text-sm text-muted-foreground" data-testid="daemon-stopped-retrying">
-          <span class="inline-block h-2 w-2 animate-pulse rounded-full bg-yellow-500 align-middle"
-          ></span>
-          <span class="ml-1.5 align-middle">{m.daemonStatus_overlay_retrying_label()}</span>
+        <p id="daemon-stopped-description" class="mt-2 text-sm text-muted-foreground">
+          {#if isAuthRejected && $authRejected$}
+            {$authRejected$.statusCode === 403
+              ? m.daemonStatus_overlay_authRejectedDisabled_description({
+                  host: $authRejected$.host,
+                  port: $authRejected$.port,
+                })
+              : m.daemonStatus_overlay_authRejectedToken_description({
+                  host: $authRejected$.host,
+                  port: $authRejected$.port,
+                })}
+          {:else if isSidecarFailure}
+            {#if $sidecarStartupFailed$}
+              {$sidecarStartupFailedReason$
+                ? m.daemonStatus_overlay_startupFailedWithReason_description({
+                    reason: $sidecarStartupFailedReason$,
+                  })
+                : m.daemonStatus_overlay_startupFailed_description()}
+            {:else}
+              {$sidecarGaveUpReason$
+                ? m.daemonStatus_overlay_gaveUpWithReason_description({
+                    reason: $sidecarGaveUpReason$,
+                  })
+                : m.daemonStatus_overlay_gaveUp_description()}
+            {/if}
+          {:else if isExternalMode}
+            {#if $hasEverConnected$}
+              {m.daemonStatus_overlay_externalLost_description()}
+            {:else}
+              {m.daemonStatus_overlay_externalNeverConnected_description()}
+            {/if}
+          {:else if $hasEverConnected$}
+            {m.daemonStatus_overlay_lost_description()}
+          {:else}
+            {m.daemonStatus_overlay_neverConnected_description()}
+          {/if}
         </p>
-      {/if}
 
-      {#if isSidecarFailure}
-        <div class="mt-4 border-t border-border pt-4">
-          <button
-            type="button"
-            class="w-full rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
-            disabled={$spawnPending$}
-            onclick={handleSpawnSidecar}
-            data-testid="daemon-stopped-spawn-sidecar"
+        {#if !isSidecarFailure && !isAuthRejected && isExternalMode && externalTargetLabel}
+          <p
+            class="mt-2 truncate font-mono text-xs text-muted-foreground"
+            title={externalTargetLabel}
+            data-testid="daemon-stopped-connection-details"
           >
-            {$spawnPending$
-              ? m.daemonStatus_overlay_startingIntentd_label()
-              : m.daemonStatus_overlay_tryStartAgain_label()}
-          </button>
-
-          {#if $spawnError$}
-            <p class="mt-2 text-sm text-destructive" data-testid="daemon-stopped-spawn-error">
-              {$spawnError$}
-            </p>
-          {/if}
-
-          <button
-            type="button"
-            class="mt-2 w-full rounded-md border border-border px-4 py-2 text-sm font-medium text-foreground hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
-            disabled={$runLogPending$}
-            onclick={handleShowRunLog}
-            data-testid="daemon-stopped-show-logs"
-          >
-            {$runLogPending$
-              ? m.daemonStatus_overlay_loadingLogs_label()
-              : m.daemonStatus_overlay_showRunLog_label()}
-          </button>
-
-          {#if $runLogError$}
-            <p class="mt-2 text-sm text-destructive" data-testid="daemon-stopped-run-log-error">
-              {$runLogError$}
-            </p>
-          {:else if $runLog$}
-            <div class="mt-2" data-testid="daemon-stopped-run-log">
-              {#if $runLog$.available}
-                <p class="text-xs text-muted-foreground" data-testid="daemon-stopped-run-log-meta">
-                  {#if $runLog$.spawnError}
-                    {m.daemonStatus_overlay_spawnErrorMeta_label({ error: $runLog$.spawnError })}
-                  {:else}
-                    {m.daemonStatus_overlay_exitMeta_label({
-                      exitCode: $runLog$.exitCode ?? m.daemonStatus_overlay_none_label(),
-                      signal: $runLog$.signal ?? m.daemonStatus_overlay_none_label(),
-                    })}
-                  {/if}
-                </p>
-                <pre
-                  class="mt-1 max-h-48 overflow-auto rounded-md bg-muted p-2 font-mono text-xs whitespace-pre-wrap text-muted-foreground"
-                  data-testid="daemon-stopped-run-log-lines">{$runLog$.lines.join('\n')}</pre>
-              {:else}
-                <p class="text-xs text-muted-foreground">
-                  {m.daemonStatus_overlay_noRunCaptured_label()}
-                </p>
-              {/if}
-            </div>
-          {/if}
-        </div>
-      {:else if showSpawnButton}
-        <div class="mt-4 border-t border-border pt-4">
-          <button
-            type="button"
-            class="w-full rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
-            disabled={$spawnPending$}
-            onclick={handleSpawnSidecar}
-            data-testid="daemon-stopped-spawn-sidecar"
-          >
-            {$spawnPending$
-              ? m.daemonStatus_overlay_startingSidecar_label()
-              : m.daemonStatus_overlay_startSidecar_label()}
-          </button>
-
-          {#if $spawnError$}
-            <p class="mt-2 text-sm text-destructive" data-testid="daemon-stopped-spawn-error">
-              {$spawnError$}
-            </p>
-          {/if}
-
-          <p class="mt-2 text-xs text-muted-foreground">
-            {m.daemonStatus_overlay_dataDirNote_label()}
+            {$hasEverConnected$
+              ? m.daemonStatus_overlay_externalLostDetail_label({ target: externalTargetLabel })
+              : m.daemonStatus_overlay_externalNeverConnectedDetail_label({
+                  target: externalTargetLabel,
+                })}
           </p>
-        </div>
-      {/if}
+        {/if}
+
+        {#if !isSidecarFailure && !isAuthRejected}
+          <p class="mt-3 text-sm text-muted-foreground" data-testid="daemon-stopped-retrying">
+            <span class="inline-block h-2 w-2 animate-pulse rounded-full bg-yellow-500 align-middle"
+            ></span>
+            <span class="ml-1.5 align-middle">
+              {$reconnectAttempts$ > 0
+                ? m.daemonStatus_overlay_retryingWithAttempts_label({
+                    attempt: $reconnectAttempts$,
+                  })
+                : m.daemonStatus_overlay_retrying_label()}
+            </span>
+          </p>
+        {/if}
+
+        {#if isAuthRejected}
+          <div class="mt-4 border-t border-border pt-4">
+            <button
+              type="button"
+              class="w-full rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
+              disabled={$isConnecting$}
+              onclick={() => (repairModalOpen = true)}
+              data-testid="daemon-stopped-repair"
+            >
+              {m.daemonStatus_overlay_repair_label()}
+            </button>
+          </div>
+        {/if}
+
+        {#if isSidecarFailure}
+          <div class="mt-4 border-t border-border pt-4">
+            <button
+              type="button"
+              class="w-full rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
+              disabled={$spawnPending$}
+              onclick={handleSpawnSidecar}
+              data-testid="daemon-stopped-spawn-sidecar"
+            >
+              {$spawnPending$
+                ? m.daemonStatus_overlay_startingIntentd_label()
+                : m.daemonStatus_overlay_tryStartAgain_label()}
+            </button>
+
+            {#if $spawnError$}
+              <p class="mt-2 text-sm text-destructive" data-testid="daemon-stopped-spawn-error">
+                {$spawnError$}
+              </p>
+            {/if}
+
+            <button
+              type="button"
+              class="mt-2 w-full rounded-md border border-border px-4 py-2 text-sm font-medium text-foreground hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+              disabled={$runLogPending$}
+              onclick={handleShowRunLog}
+              data-testid="daemon-stopped-show-logs"
+            >
+              {$runLogPending$
+                ? m.daemonStatus_overlay_loadingLogs_label()
+                : m.daemonStatus_overlay_showRunLog_label()}
+            </button>
+
+            {#if $runLogError$}
+              <p class="mt-2 text-sm text-destructive" data-testid="daemon-stopped-run-log-error">
+                {$runLogError$}
+              </p>
+            {:else if $runLog$}
+              <div class="mt-2" data-testid="daemon-stopped-run-log">
+                {#if $runLog$.available}
+                  <p
+                    class="text-xs text-muted-foreground"
+                    data-testid="daemon-stopped-run-log-meta"
+                  >
+                    {#if $runLog$.spawnError}
+                      {m.daemonStatus_overlay_spawnErrorMeta_label({ error: $runLog$.spawnError })}
+                    {:else}
+                      {m.daemonStatus_overlay_exitMeta_label({
+                        exitCode: $runLog$.exitCode ?? m.daemonStatus_overlay_none_label(),
+                        signal: $runLog$.signal ?? m.daemonStatus_overlay_none_label(),
+                      })}
+                    {/if}
+                  </p>
+                  <pre
+                    class="mt-1 max-h-48 overflow-auto rounded-md bg-muted p-2 font-mono text-xs whitespace-pre-wrap text-muted-foreground"
+                    data-testid="daemon-stopped-run-log-lines">{$runLog$.lines.join('\n')}</pre>
+                {:else}
+                  <p class="text-xs text-muted-foreground">
+                    {m.daemonStatus_overlay_noRunCaptured_label()}
+                  </p>
+                {/if}
+              </div>
+            {/if}
+          </div>
+        {:else if showSpawnButton}
+          <div class="mt-4 border-t border-border pt-4">
+            <button
+              type="button"
+              class="w-full rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
+              disabled={$spawnPending$}
+              onclick={handleSpawnSidecar}
+              data-testid="daemon-stopped-spawn-sidecar"
+            >
+              {$spawnPending$
+                ? m.daemonStatus_overlay_startingIntentd_label()
+                : m.daemonStatus_overlay_startLocalIntentd_label()}
+            </button>
+
+            {#if $spawnError$}
+              <p class="mt-2 text-sm text-destructive" data-testid="daemon-stopped-spawn-error">
+                {$spawnError$}
+              </p>
+            {/if}
+
+            <p class="mt-2 text-xs text-muted-foreground">
+              {isExternalMode
+                ? m.daemonStatus_overlay_externalDataNote_label()
+                : m.daemonStatus_overlay_dataDirNote_label()}
+            </p>
+          </div>
+        {/if}
+
+        {#if otherConnections.length > 0}
+          <div class="mt-4 border-t border-border pt-4" data-testid="daemon-stopped-known-backends">
+            <p class="text-xs text-muted-foreground">
+              {m.daemonStatus_overlay_knownBackends_label()}
+            </p>
+            <div class="mt-2 space-y-2">
+              {#each otherConnections as conn (conn.id)}
+                <button
+                  type="button"
+                  class="w-full truncate rounded-md border border-border px-4 py-2 text-left text-sm font-medium text-foreground hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+                  disabled={$isConnecting$}
+                  onclick={() => handleSwitchConnection(conn.id)}
+                  data-testid="daemon-stopped-switch-backend"
+                >
+                  {connectionLabel(conn)}
+                </button>
+              {/each}
+            </div>
+          </div>
+        {/if}
+      </div>
     </div>
-  </div>
+  </Portal>
+
+  <ConnectBackendModal
+    bind:open={repairModalOpen}
+    prefillHost={$authRejected$?.host ?? null}
+    prefillPort={$authRejected$?.port ?? null}
+  />
 {/if}

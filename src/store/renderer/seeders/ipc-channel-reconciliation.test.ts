@@ -6,9 +6,10 @@
  * (`UnbridgedMockIpcChannelError`) instead of resolving undefined. This suite
  * keeps that guarantee auditable: it statically scans every renderer source
  * file for `invoke(...)` / `typedInvoke(...)` call sites — including named
- * import aliases such as `import { invoke as invokeIpc }` and locally-declared
+ * import aliases such as `import { invoke as invokeIpc }`, locally-declared
  * passthrough wrappers that forward their first parameter to an invoke (the
- * per-provider `invokeModelChannel` helpers) — resolves the channel names
+ * per-provider `invokeModelChannel` helpers), and saga-style effect call
+ * sites (`yield* call(invoke, CHANNEL, …)`) — resolves the channel names
  * (string literals, `X_CHANNELS.KEY`, `IPC_CHANNELS.GROUP.KEY`, and group-alias
  * locals like `const BACKEND = IPC_CHANNELS.BACKEND`), and reconciles them
  * against the channels the seeders register. Channels only ever invoked
@@ -49,6 +50,10 @@ const INCLUDED_FILES = /\.(ts|svelte)$/;
 /** Named-import clauses, whose contents may alias invoke/typedInvoke. */
 const IMPORT_CLAUSE_RE = /import\s*(?:type\s*)?\{([^}]*)\}\s*from\s*['"][^'"]+['"]/g;
 const INVOKE_ALIAS_RE = /\b(?:typedInvoke|invoke)\s+as\s+([A-Za-z_$][A-Za-z0-9_$]*)/g;
+/** Saga-effect import clauses, whose contents may alias the `call` effect. */
+const SAGA_EFFECT_IMPORT_CLAUSE_RE =
+  /import\s*\{([^}]*)\}\s*from\s*['"](?:typed-redux-saga|redux-saga\/effects)['"]/g;
+const CALL_EFFECT_NAME_RE = /\bcall\b(?:\s+as\s+([A-Za-z_$][A-Za-z0-9_$]*))?/g;
 
 /** Function declarations whose first parameter is a string (wrapper candidates). */
 const WRAPPER_DECL_RE =
@@ -74,6 +79,15 @@ function collectPassthroughWrapperNames(source: string): string[] {
   return names;
 }
 
+/** Invoke head names for one source file: typedInvoke/invoke + import aliases. */
+function collectInvokeAliasNames(source: string): Set<string> {
+  const names = new Set(['typedInvoke', 'invoke']);
+  for (const clause of source.matchAll(IMPORT_CLAUSE_RE)) {
+    for (const alias of clause[1].matchAll(INVOKE_ALIAS_RE)) names.add(alias[1]);
+  }
+  return names;
+}
+
 /**
  * Build the invoke( / typedInvoke( call-head regex for one source file,
  * matching up to (but not consuming) the generic argument list or the opening
@@ -82,13 +96,31 @@ function collectPassthroughWrapperNames(source: string): string[] {
  * sites too, so aliased and wrapped invokes cannot escape the audit.
  */
 function buildCallHeadRegex(source: string): RegExp {
-  const names = new Set(['typedInvoke', 'invoke']);
-  for (const clause of source.matchAll(IMPORT_CLAUSE_RE)) {
-    for (const alias of clause[1].matchAll(INVOKE_ALIAS_RE)) names.add(alias[1]);
-  }
+  const names = collectInvokeAliasNames(source);
   for (const wrapper of collectPassthroughWrapperNames(source)) names.add(wrapper);
   const alternation = [...names].sort((a, b) => b.length - a.length).join('|');
   return new RegExp(`\\b(?:${alternation})\\s*(?=[<(])`, 'g');
+}
+
+/**
+ * Build the saga-effect call-head regex for one source file — `call(` plus
+ * any `call as` aliases from typed-redux-saga / redux-saga/effects imports —
+ * consuming through the opening paren. Saga call sites (`yield* call(invoke,
+ * CHANNEL, …)`) pass the invoke head as an ARGUMENT of the `call` effect, so
+ * the direct call-head scan above never sees them (window:set-theme escaped
+ * to a runtime UnbridgedMockIpcChannelError exactly this way,
+ * intent-hq/monorepo#2746). The lookbehind keeps member calls
+ * (`fn.call(...)`) out of the scan.
+ */
+function buildSagaCallHeadRegex(source: string): RegExp {
+  const names = new Set(['call']);
+  for (const clause of source.matchAll(SAGA_EFFECT_IMPORT_CLAUSE_RE)) {
+    for (const m of clause[1].matchAll(CALL_EFFECT_NAME_RE)) {
+      if (m[1]) names.add(m[1]);
+    }
+  }
+  const alternation = [...names].sort((a, b) => b.length - a.length).join('|');
+  return new RegExp(`(?<![.\\w$])(?:${alternation})\\s*\\(`, 'g');
 }
 
 /**
@@ -100,32 +132,71 @@ function buildCallHeadRegex(source: string): RegExp {
  * reached the runtime UnbridgedMockIpcChannelError exactly this way).
  */
 function extractFirstArgument(source: string, index: number): string | undefined {
-  let i = index;
-  if (source[i] === '<') {
-    let depth = 0;
-    while (i < source.length) {
-      const char = source[i];
-      // `=>` inside a function-type generic is not a closing bracket.
-      if (char === '<') depth += 1;
-      else if (char === '>' && source[i - 1] !== '=') {
-        depth -= 1;
-        if (depth === 0) {
-          i += 1;
-          break;
-        }
-      }
-      i += 1;
-    }
-    while (i < source.length && /\s/.test(source[i])) i += 1;
-  }
+  let i = skipGenericArguments(source, index);
   if (source[i] !== '(') return undefined;
   i += 1;
   while (i < source.length && /\s/.test(source[i])) i += 1;
-  const start = i;
+  return readArgumentExpression(source, i);
+}
+
+/** Skip an optional `<...>` generic argument list (plus trailing whitespace). */
+function skipGenericArguments(source: string, index: number): number {
+  let i = index;
+  if (source[i] !== '<') return i;
+  let depth = 0;
+  while (i < source.length) {
+    const char = source[i];
+    // `=>` inside a function-type generic is not a closing bracket.
+    if (char === '<') depth += 1;
+    else if (char === '>' && source[i - 1] !== '=') {
+      depth -= 1;
+      if (depth === 0) {
+        i += 1;
+        break;
+      }
+    }
+    i += 1;
+  }
+  while (i < source.length && /\s/.test(source[i])) i += 1;
+  return i;
+}
+
+/** Read one argument expression starting at `index` (up to `,`, `)`, or EOL). */
+function readArgumentExpression(source: string, index: number): string | undefined {
+  let i = index;
   while (i < source.length && source[i] !== ',' && source[i] !== ')' && source[i] !== '\n') {
     i += 1;
   }
-  return source.slice(start, i).trim() || undefined;
+  return source.slice(index, i).trim() || undefined;
+}
+
+/** Sticky identifier matcher for the saga-call argument parser. */
+const IDENTIFIER_RE = /[A-Za-z_$][A-Za-z0-9_$]*/y;
+
+/**
+ * Extract the channel argument of a saga-style effect call whose opening
+ * paren ends at `index` — `call(invoke, CHANNEL, …)` / `call(typedInvoke<T>,
+ * CHANNEL, …)`. Returns the channel expression only when the effect's first
+ * argument is one of the file's invoke heads (`invokeNames`); any other
+ * callee is not an IPC invoke and is skipped.
+ */
+function extractSagaCallChannelArgument(
+  source: string,
+  index: number,
+  invokeNames: Set<string>,
+): string | undefined {
+  let i = index;
+  while (i < source.length && /\s/.test(source[i])) i += 1;
+  IDENTIFIER_RE.lastIndex = i;
+  const callee = IDENTIFIER_RE.exec(source);
+  if (!callee || !invokeNames.has(callee[0])) return undefined;
+  i = IDENTIFIER_RE.lastIndex;
+  while (i < source.length && /\s/.test(source[i])) i += 1;
+  i = skipGenericArguments(source, i);
+  if (source[i] !== ',') return undefined;
+  i += 1;
+  while (i < source.length && /\s/.test(source[i])) i += 1;
+  return readArgumentExpression(source, i);
 }
 const LITERAL_RE = /^['"`]([^'"`$]+)['"`]$/;
 const CHANNELS_CONST_RE = /^([A-Z][A-Z0-9_]*_CHANNELS)\.([A-Z0-9_]+)$/;
@@ -174,6 +245,36 @@ interface ScanResult {
   unresolved: string[];
 }
 
+/**
+ * Resolve one channel-argument expression to a concrete channel name.
+ * `unresolvedConstant` marks constant-style references the resolver could not
+ * map (audit-exhaustiveness failures); anything else non-matching (variables,
+ * wrapper parameters) is dynamic — the concrete channels show up at the
+ * wrappers' call sites, which the scan covers.
+ */
+function resolveChannelArgument(
+  argument: string,
+  groupAliases: Map<string, string>,
+): { channel?: string; unresolvedConstant: boolean } {
+  let constMatch: RegExpMatchArray | null;
+  if ((constMatch = argument.match(LITERAL_RE))) {
+    return { channel: constMatch[1], unresolvedConstant: false };
+  }
+  if ((constMatch = argument.match(CHANNELS_CONST_RE))) {
+    const channel = resolveRegistryChannel(constMatch[1].replace(/_CHANNELS$/, ''), constMatch[2]);
+    return { channel, unresolvedConstant: !channel };
+  }
+  if ((constMatch = argument.match(REGISTRY_REF_RE))) {
+    const channel = resolveRegistryChannel(constMatch[1], constMatch[2]);
+    return { channel, unresolvedConstant: !channel };
+  }
+  if ((constMatch = argument.match(ALIAS_REF_RE)) && groupAliases.has(constMatch[1])) {
+    const channel = resolveRegistryChannel(groupAliases.get(constMatch[1])!, constMatch[2]);
+    return { channel, unresolvedConstant: !channel };
+  }
+  return { unresolvedConstant: false };
+}
+
 /** Scan renderer sources for statically-resolvable IPC invoke call sites. */
 function scanInvokedChannels(): ScanResult {
   const invoked = new Map<string, string[]>();
@@ -182,32 +283,30 @@ function scanInvokedChannels(): ScanResult {
     const source = fs.readFileSync(file, 'utf8');
     const relative = path.relative(SRC_ROOT, file);
     const groupAliases = collectGroupAliases(source);
-    for (const match of source.matchAll(buildCallHeadRegex(source))) {
-      const argument = extractFirstArgument(source, match.index + match[0].length);
-      if (!argument) continue;
-      const line = source.slice(0, match.index).split('\n').length;
+    const invokeNames = collectInvokeAliasNames(source);
+    const record = (argument: string, matchIndex: number) => {
+      const line = source.slice(0, matchIndex).split('\n').length;
       const site = `${relative}:${line}`;
-      let channel: string | undefined;
-      let constMatch: RegExpMatchArray | null;
-      if ((constMatch = argument.match(LITERAL_RE))) {
-        channel = constMatch[1];
-      } else if ((constMatch = argument.match(CHANNELS_CONST_RE))) {
-        channel = resolveRegistryChannel(constMatch[1].replace(/_CHANNELS$/, ''), constMatch[2]);
-        if (!channel) unresolved.push(`${site} :: ${argument}`);
-      } else if ((constMatch = argument.match(REGISTRY_REF_RE))) {
-        channel = resolveRegistryChannel(constMatch[1], constMatch[2]);
-        if (!channel) unresolved.push(`${site} :: ${argument}`);
-      } else if ((constMatch = argument.match(ALIAS_REF_RE)) && groupAliases.has(constMatch[1])) {
-        channel = resolveRegistryChannel(groupAliases.get(constMatch[1])!, constMatch[2]);
-        if (!channel) unresolved.push(`${site} :: ${argument}`);
-      }
-      // Anything else (variables, wrapper parameters) is dynamic: the concrete
-      // channels show up at the wrappers' call sites, which this scan covers.
+      const { channel, unresolvedConstant } = resolveChannelArgument(argument, groupAliases);
+      if (unresolvedConstant) unresolved.push(`${site} :: ${argument}`);
       if (channel) {
         const sites = invoked.get(channel) ?? [];
         sites.push(site);
         invoked.set(channel, sites);
       }
+    };
+    for (const match of source.matchAll(buildCallHeadRegex(source))) {
+      const argument = extractFirstArgument(source, match.index + match[0].length);
+      if (argument) record(argument, match.index);
+    }
+    // Saga-style effect call sites: `yield* call(invoke, CHANNEL, …)`.
+    for (const match of source.matchAll(buildSagaCallHeadRegex(source))) {
+      const argument = extractSagaCallChannelArgument(
+        source,
+        match.index + match[0].length,
+        invokeNames,
+      );
+      if (argument) record(argument, match.index);
     }
   }
   return { invoked, unresolved };
@@ -250,6 +349,16 @@ describe('IPC channel reconciliation (renderer invoke surface vs bridged channel
     // `api.invoke(BACKEND.REQUEST, …)`, backend-transport.ts). Guards the
     // per-file alias resolver.
     expect(invoked.has('backend:request')).toBe(true);
+    // Saga-style effect call sites (`yield* call(invoke, CHANNEL, …)`) hide
+    // the invoke head inside the `call` effect's argument list, so the direct
+    // call-head scan never sees them — window:set-theme escaped to a runtime
+    // UnbridgedMockIpcChannelError exactly this way (intent-hq/monorepo#2746).
+    // Guards the saga-call extractor across both known saga sites:
+    // theme-saga.ts and workspace-settings-saga.ts. (The saga's third site,
+    // the legacy settings:set global write, was removed — it stomped the
+    // daemon's global git.autoCommit; intent-hq/monorepo#2779.)
+    expect(invoked.has('window:set-theme')).toBe(true);
+    expect(invoked.has('workspace:update-settings')).toBe(true);
     expect([...invoked.keys()].some((channel) => registered.has(channel))).toBe(true);
   });
 
@@ -390,6 +499,12 @@ const LIVE_TRANSPORT_CHANNELS: ReadonlySet<string> = new Set([
   'backend:request',
   'backend:subscribe',
   'backend:unsubscribe',
+  // Console-owner status query (#1928): main-process-owned state (which
+  // window is the last-focused non-HUD window) invoked directly on the real
+  // preload bridge (console-owner-status.ts guards on its presence; without
+  // a bridge the slice default `isConsoleOwner: true` stands and no IPC is
+  // attempted). A mock bridge would shadow the main-process tracker.
+  'hardware-console:get-owner-status',
 ]);
 
 /**
@@ -439,6 +554,11 @@ const KNOWN_UNBRIDGED_CHANNELS: ReadonlySet<string> = new Set([]);
 const BRIDGE_IMPORT_CLAUSE_RE = /import\s*\{([^}]*)\}\s*from\s*['"]\$lib\/electron-bridge['"]/g;
 const BRIDGE_LISTENER_NAME_RE =
   /\b(?:listenSync|listen|on)\b(?:\s+as\s+([A-Za-z_$][A-Za-z0-9_$]*))?/g;
+/** Saga listenSync wrapper heads (with `as` aliases) named in an import clause. */
+const SAGA_LISTENER_IMPORT_CLAUSE_RE =
+  /import\s*\{([^}]*)\}\s*from\s*['"][^'"]*\/utils\/ipc-channel['"]/g;
+const SAGA_LISTENER_NAME_RE =
+  /\b(?:createListenSyncChannel|takeEveryFromListenSync)\b(?:\s+as\s+([A-Za-z_$][A-Za-z0-9_$]*))?/g;
 /** mock-router listener/emitter heads named in an import clause. */
 const ROUTER_IMPORT_CLAUSE_RE = /import\s*\{([^}]*)\}\s*from\s*['"][^'"]*ipc-mock-router['"]/g;
 const ROUTER_LISTENER_NAME_RE = /\baddMockIpcListener\b(?:\s+as\s+([A-Za-z_$][A-Za-z0-9_$]*))?/g;
@@ -457,6 +577,19 @@ const EVENT_SCAN_EXCLUDED_FILES = new Set([
   path.join('shared', 'ipc-mock-router.ts'),
 ]);
 
+/**
+ * Exact generic transport forwarders whose concrete channels live at their
+ * typed helper call sites. Keys deliberately omit line numbers so unrelated
+ * edits do not stale the model. Each key is consumed once: a second matching
+ * dynamic call remains an audit failure.
+ */
+const GENERIC_LISTENER_FORWARDER_SITES: ReadonlyMap<string, string> = new Map([
+  [
+    `${path.join('store', 'renderer', 'utils', 'ipc-channel.ts')} :: listenSync :: eventName`,
+    'createListenSyncChannel forwards its ElectronEventName argument to the bridge; domain saga call sites own the concrete channel.',
+  ],
+]);
+
 interface EventScanResult {
   /** Exact listened channel → call sites. */
   listened: Map<string, string[]>;
@@ -468,6 +601,8 @@ interface EventScanResult {
   emittedPrefixes: Map<string, string[]>;
   /** Listener call sites whose channel argument the scan could not resolve. */
   dynamicListenerSites: string[];
+  /** Explicitly modeled generic transport forwarders found by the scan. */
+  genericListenerForwarderSites: Set<string>;
 }
 
 function collectAliases(source: string, clauseRe: RegExp, nameRe: RegExp): Set<string> {
@@ -488,6 +623,7 @@ function scanEventChannels(): EventScanResult {
     emitted: new Map(),
     emittedPrefixes: new Map(),
     dynamicListenerSites: [],
+    genericListenerForwarderSites: new Set(),
   };
   const record = (map: Map<string, string[]>, key: string, site: string) => {
     const sites = map.get(key) ?? [];
@@ -499,6 +635,13 @@ function scanEventChannels(): EventScanResult {
     if (EVENT_SCAN_EXCLUDED_FILES.has(relative)) continue;
     const source = fs.readFileSync(file, 'utf8');
     const listenerNames = collectAliases(source, BRIDGE_IMPORT_CLAUSE_RE, BRIDGE_LISTENER_NAME_RE);
+    for (const name of collectAliases(
+      source,
+      SAGA_LISTENER_IMPORT_CLAUSE_RE,
+      SAGA_LISTENER_NAME_RE,
+    )) {
+      listenerNames.add(name);
+    }
     for (const name of collectAliases(source, ROUTER_IMPORT_CLAUSE_RE, ROUTER_LISTENER_NAME_RE)) {
       listenerNames.add(name);
     }
@@ -527,7 +670,15 @@ function scanEventChannels(): EventScanResult {
             site,
           );
         } else if (kind === 'listen') {
-          result.dynamicListenerSites.push(`${site} :: ${argument}`);
+          const forwarderKey = `${relative} :: ${match[0].trim()} :: ${argument}`;
+          if (
+            GENERIC_LISTENER_FORWARDER_SITES.has(forwarderKey) &&
+            !result.genericListenerForwarderSites.has(forwarderKey)
+          ) {
+            result.genericListenerForwarderSites.add(forwarderKey);
+          } else {
+            result.dynamicListenerSites.push(`${site} :: ${argument}`);
+          }
         }
       }
     }
@@ -536,8 +687,14 @@ function scanEventChannels(): EventScanResult {
 }
 
 describe('IPC event-channel reconciliation (renderer listener surface vs emitters)', () => {
-  const { listened, listenedPrefixes, emitted, emittedPrefixes, dynamicListenerSites } =
-    scanEventChannels();
+  const {
+    listened,
+    listenedPrefixes,
+    emitted,
+    emittedPrefixes,
+    dynamicListenerSites,
+    genericListenerForwarderSites,
+  } = scanEventChannels();
 
   it('scanner sanity: detects the known listener surface', () => {
     // Simple literal listenSync call sites (WorkspaceProgressCard).
@@ -557,12 +714,26 @@ describe('IPC event-channel reconciliation (renderer listener surface vs emitter
     expect(emittedPrefixes.has('terminal:professional:exit:')).toBe(true);
   });
 
+  it('scanner sanity: recognizes imported saga listenSync wrappers and aliases', () => {
+    const source =
+      'import { createListenSyncChannel, takeEveryFromListenSync as watch } from "../../../utils/ipc-channel";';
+    expect(
+      collectAliases(source, SAGA_LISTENER_IMPORT_CLAUSE_RE, SAGA_LISTENER_NAME_RE),
+    ).toEqual(new Set(['createListenSyncChannel', 'watch']));
+  });
+
   it('resolves every listener channel argument (no unaudited dynamic listeners)', () => {
     expect(
       dynamicListenerSites,
       'Listener call sites with runtime channel arguments escape this audit — rewrite them ' +
         'as statically-resolvable literals/templates or extend the scanner.',
     ).toEqual([]);
+  });
+
+  it('keeps the explicit generic listener-forwarder model exact and non-stale', () => {
+    expect(genericListenerForwarderSites).toEqual(
+      new Set(GENERIC_LISTENER_FORWARDER_SITES.keys()),
+    );
   });
 
   it('every listened channel has a production emitter or a justified allowlist entry', () => {

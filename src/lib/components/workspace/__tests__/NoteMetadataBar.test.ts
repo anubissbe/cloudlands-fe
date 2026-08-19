@@ -1,18 +1,8 @@
 /**
  * @vitest-environment jsdom
  */
-import {
-  render,
-  screen,
-  fireEvent,
-} from '@testing-library/svelte';
-import {
-  beforeEach,
-  describe,
-  expect,
-  it,
-  vi,
-} from 'vitest';
+import { render, screen, fireEvent } from '@testing-library/svelte';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { AgentSession, Note, Workspace } from '$shared/types';
 import { WorkspaceStatusEnum } from '$shared/types';
 import { warmImport } from '../../../../test/warm-import';
@@ -22,6 +12,7 @@ const mocks = vi.hoisted(() => {
   const workspaceAgents: AgentSession[] = [];
   const allNotes: Note[] = [];
   const agentsById = new Map<string, AgentSession>();
+  const navigateToNote = vi.fn();
   const activeWorkspace = {
     id: 'ws-1',
     title: 'Workspace',
@@ -35,7 +26,15 @@ const mocks = vi.hoisted(() => {
     },
   });
 
-  return { dispatch, workspaceAgents, allNotes, agentsById, activeWorkspace, readable };
+  return {
+    dispatch,
+    workspaceAgents,
+    allNotes,
+    agentsById,
+    navigateToNote,
+    activeWorkspace,
+    readable,
+  };
 });
 
 vi.mock('$lib/utils/client-logger', () => ({
@@ -43,7 +42,8 @@ vi.mock('$lib/utils/client-logger', () => ({
 }));
 
 vi.mock('$store/renderer/store', async () => {
-  const { createAppStoreMockModule } = await import('$store/renderer/utils/test-helpers/store-mock');
+  const { createAppStoreMockModule } =
+    await import('$store/renderer/utils/test-helpers/store-mock');
 
   return createAppStoreMockModule({
     state: () => ({}),
@@ -52,13 +52,36 @@ vi.mock('$store/renderer/store', async () => {
 });
 
 vi.mock('$store/renderer/slices/workspace/workspace-selectors', () => ({
-  selectActiveWorkspace: Object.assign(() => mocks.readable(mocks.activeWorkspace), {
-    select: () => mocks.activeWorkspace,
-  }),
+  selectWorkspaceById: Object.assign(
+    (_workspaceId: string | { subscribe: unknown }) => mocks.readable(mocks.activeWorkspace),
+    { select: () => mocks.activeWorkspace },
+  ),
+}));
+
+vi.mock('$lib/utils/workspace-route-context', () => ({
+  getWorkspaceRouteContext: () => ({ workspaceId: 'ws-1' }),
 }));
 
 vi.mock('$store/renderer/slices/workspace-notes/workspace-notes-selectors', () => ({
   selectAllNotes: () => mocks.readable(mocks.allNotes),
+  selectNotesVersion: () => mocks.readable(0),
+  selectNoteById: Object.assign(
+    (_workspaceId: unknown, noteIdStore: any) => {
+      let noteId = '';
+      const unsubscribe = noteIdStore.subscribe((value: string) => (noteId = value));
+      unsubscribe();
+      return mocks.readable(mocks.allNotes.find((note) => note.id === noteId));
+    },
+    {
+      select: (_state: unknown, _wsId: string, noteId: string) =>
+        mocks.allNotes.find((n) => n.id === noteId),
+    },
+  ),
+}));
+
+vi.mock('$lib/utils/workspace-navigation', () => ({
+  navigateToNote: mocks.navigateToNote,
+  findSourcePanelId: () => undefined,
 }));
 
 vi.mock('$store/renderer/slices/workspace-agents/workspace-agents-selectors', () => ({
@@ -66,7 +89,9 @@ vi.mock('$store/renderer/slices/workspace-agents/workspace-agents-selectors', ()
 }));
 
 vi.mock('$store/renderer/slices/agent-session/agent-session-selectors', () => ({
-  selectAgentSession: { select: (_state: unknown, agentId: string) => mocks.agentsById.get(agentId) },
+  selectAgentSession: {
+    select: (_state: unknown, agentId: string) => mocks.agentsById.get(agentId),
+  },
 }));
 
 vi.mock('$store/renderer/slices/app-layout/app-layout-slice', () => ({
@@ -99,7 +124,7 @@ vi.mock('$store/renderer/slices/workspace-agents/workspace-agents-slice', () => 
   })),
 }));
 
-vi.mock('$lib/components/ui/auggie-avatar/AuggieAvatar.svelte', async () => ({
+vi.mock('$features/agent/components/agent-avatar/AgentAvatar.svelte', async () => ({
   default: (await import('../sidebar/__tests__/mocks/MockSimple.svelte')).default,
 }));
 
@@ -124,14 +149,32 @@ function makeAgent(id: string, name: string, createdAt: string): AgentSession {
   };
 }
 
-function makeTaskNote(assignedAgentIds: string[]): Note {
+function makeTaskNote(
+  assignedAgentIds: string[],
+  taskOverrides: Record<string, unknown> = {},
+): Note {
   return {
     id: 'note-1' as Note['id'],
     title: 'Task Note',
     content: 'Task body',
     createdAt: '2026-01-01T00:00:00.000Z',
     updatedAt: '2026-01-01T00:00:00.000Z',
-    metadata: { task: { status: 'in_progress', assignedAgentIds } },
+    metadata: { task: { status: 'in_progress', assignedAgentIds, ...taskOverrides } },
+  } as Note;
+}
+
+function makeRelatedNote(
+  id: string,
+  title: string,
+  taskOverrides: Record<string, unknown> = {},
+): Note {
+  return {
+    id: id as Note['id'],
+    title,
+    content: '',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+    metadata: { task: { status: 'not_started', ...taskOverrides } },
   } as Note;
 }
 
@@ -180,5 +223,109 @@ describe('NoteMetadataBar smoke coverage', () => {
       type: 'workspaceAgents/runAgentForNoteRequested',
       payload: ['ws-1', 'note-1', 'Task Note'],
     });
+  });
+});
+
+describe('NoteMetadataBar relations section (monorepo#1974)', () => {
+  beforeEach(() => {
+    mocks.dispatch.mockClear();
+    mocks.navigateToNote.mockClear();
+    mocks.workspaceAgents.length = 0;
+    mocks.allNotes.length = 0;
+    mocks.agentsById.clear();
+    mocks.activeWorkspace.id = 'ws-1' as Workspace['id'];
+    mocks.activeWorkspace.status = WorkspaceStatusEnum.Active;
+  });
+
+  async function renderBar(note: Note) {
+    const NoteMetadataBar = (await import('../NoteMetadataBar.svelte')).default;
+    return render(NoteMetadataBar, {
+      props: { workspaceId: 'ws-1' as Workspace['id'], note },
+    });
+  }
+
+  it('hides all relation rows when the task has no relations', async () => {
+    await renderBar(makeTaskNote([]));
+
+    expect(screen.queryByText('Depends on')).toBeNull();
+    expect(screen.queryByText('Depended on by')).toBeNull();
+    expect(screen.queryByText('Conflicts with')).toBeNull();
+  });
+
+  it('renders dependsOn links with titles and marks daemon-reported unmet deps', async () => {
+    mocks.allNotes.push(
+      makeRelatedNote('dep-a', 'Dep A', { status: 'complete' }),
+      makeRelatedNote('dep-b', 'Dep B'),
+    );
+
+    const { container } = await renderBar(
+      makeTaskNote([], { dependsOn: ['dep-a', 'dep-b'], unmetDependsOn: ['dep-b'] }),
+    );
+
+    expect(screen.getByText('Depends on')).toBeTruthy();
+    expect(screen.getByText('Dep A')).toBeTruthy();
+    expect(screen.getByText('Dep B')).toBeTruthy();
+    // Only the unmet dep carries the hourglass marker.
+    const unmetMarkers = container.querySelectorAll('[title="Waiting on this dependency"]');
+    expect(unmetMarkers.length).toBe(1);
+  });
+
+  it('suppresses unmet highlighting once the task itself is complete', async () => {
+    mocks.allNotes.push(makeRelatedNote('dep-a', 'Dep A'));
+
+    const { container } = await renderBar(
+      makeTaskNote([], {
+        status: 'complete',
+        dependsOn: ['dep-a'],
+        unmetDependsOn: ['dep-a'],
+      }),
+    );
+
+    expect(screen.getByText('Dep A')).toBeTruthy();
+    expect(container.querySelectorAll('[title="Waiting on this dependency"]').length).toBe(0);
+  });
+
+  it('computes "Depended on by" reverse edges from the notes slice', async () => {
+    mocks.allNotes.push(
+      makeRelatedNote('dependent-1', 'Dependent One', { dependsOn: ['note-1'] }),
+      makeRelatedNote('unrelated-1', 'Unrelated', { dependsOn: ['other'] }),
+      makeRelatedNote('dependent-2', 'Dependent Two', { dependsOn: ['x', 'note-1'] }),
+    );
+
+    await renderBar(makeTaskNote([]));
+
+    expect(screen.getByText('Depended on by')).toBeTruthy();
+    expect(screen.getByText('Dependent One')).toBeTruthy();
+    expect(screen.getByText('Dependent Two')).toBeTruthy();
+    expect(screen.queryByText('Unrelated')).toBeNull();
+  });
+
+  it('renders conflictsWith links', async () => {
+    mocks.allNotes.push(makeRelatedNote('conflict-1', 'Conflicting Task'));
+
+    await renderBar(makeTaskNote([], { conflictsWith: ['conflict-1'] }));
+
+    expect(screen.getByText('Conflicts with')).toBeTruthy();
+    expect(screen.getByText('Conflicting Task')).toBeTruthy();
+  });
+
+  it('navigates to the related note when a relation link is clicked', async () => {
+    mocks.allNotes.push(makeRelatedNote('dep-a', 'Dep A'));
+
+    await renderBar(makeTaskNote([], { dependsOn: ['dep-a'] }));
+
+    await fireEvent.click(screen.getByText('Dep A'));
+
+    expect(mocks.navigateToNote).toHaveBeenCalledWith(
+      'dep-a',
+      expect.objectContaining({ workspaceId: 'ws-1', openInAdjacentPanel: false }),
+    );
+  });
+
+  it('falls back to a not-found label for relations pointing at missing notes', async () => {
+    await renderBar(makeTaskNote([], { dependsOn: ['ghost-note'] }));
+
+    expect(screen.getByText('Depends on')).toBeTruthy();
+    expect(screen.getByText(/ghost-note/)).toBeTruthy();
   });
 });

@@ -7,7 +7,7 @@ import {
 } from '$store/renderer/slices/provider-catalog/provider-catalog-selectors';
 import { store as appStore } from '$store/renderer/store';
 
-interface ModelPickerOptionInput {
+export interface ModelPickerOptionInput {
   value: string;
   label: string;
   description?: string;
@@ -15,6 +15,113 @@ interface ModelPickerOptionInput {
   costTier?: number;
   effortLevels?: string[];
   isDefault?: boolean;
+}
+
+const CODEX_EFFORT_LADDER = ['low', 'medium', 'high', 'xhigh', 'max', 'ultra', 'none'];
+const CODEX_EFFORTS = new Set(CODEX_EFFORT_LADDER);
+
+function stripTrailingEffort(
+  value: string,
+  delimiters: [string, string][],
+): {
+  base: string;
+  effort?: string;
+} {
+  const trimmed = value.trim();
+  const lower = trimmed.toLowerCase();
+
+  for (const effort of CODEX_EFFORT_LADDER) {
+    for (const [open, close] of delimiters) {
+      const suffix = `${open}${effort}${close}`;
+      if (lower.endsWith(suffix) && trimmed.length > suffix.length) {
+        return { base: trimmed.slice(0, -suffix.length).trimEnd(), effort };
+      }
+    }
+  }
+
+  return { base: trimmed };
+}
+
+function orderedEffortUnion(levels: string[]): string[] {
+  const normalized = new Map<string, string>();
+  for (const level of levels) {
+    const key = level.toLowerCase();
+    if (!normalized.has(key)) normalized.set(key, CODEX_EFFORTS.has(key) ? key : level);
+  }
+  return [
+    ...CODEX_EFFORT_LADDER.filter((level) => normalized.delete(level)),
+    ...normalized.values(),
+  ];
+}
+
+function descriptionHasEffortLevel(description: string): boolean {
+  const words = description.toLowerCase().split(/[^a-z0-9]+/);
+  return words.some((word) => CODEX_EFFORTS.has(word));
+}
+
+function preferredDescription(current?: string, candidate?: string): string | undefined {
+  const currentText = current?.trim();
+  const candidateText = candidate?.trim();
+  if (!currentText) return candidateText || undefined;
+  if (!candidateText) return currentText;
+
+  const currentIsSpecific = descriptionHasEffortLevel(currentText);
+  const candidateIsSpecific = descriptionHasEffortLevel(candidateText);
+  if (currentIsSpecific !== candidateIsSpecific) {
+    return candidateIsSpecific ? currentText : candidateText;
+  }
+  return candidateText.length > currentText.length ? candidateText : currentText;
+}
+
+export function collapseCodexEffortModels(
+  models: ModelPickerOptionInput[],
+): ModelPickerOptionInput[] {
+  const collapsed: ModelPickerOptionInput[] = [];
+  const groupIndexes = new Map<string, number>();
+
+  for (const model of models) {
+    const { providerId, modelId } = splitCompoundModelId(model.value);
+    if (providerId?.toLowerCase() !== 'codex') {
+      collapsed.push(model);
+      continue;
+    }
+
+    const parsedId = stripTrailingEffort(modelId, [
+      ['[', ']'],
+      ['/', ''],
+      [':', ''],
+    ]);
+    const parsedLabel = stripTrailingEffort(model.label, [['(', ')']]);
+    const baseValue = `${providerId}:${parsedId.base}`;
+    const key = `${providerId.toLowerCase()}:${parsedId.base.toLowerCase()}`;
+    const levels = orderedEffortUnion([
+      ...(model.effortLevels ?? []),
+      ...(parsedId.effort ? [parsedId.effort] : []),
+      ...(parsedLabel.effort ? [parsedLabel.effort] : []),
+    ]);
+    const existingIndex = groupIndexes.get(key);
+
+    if (existingIndex === undefined) {
+      groupIndexes.set(key, collapsed.length);
+      collapsed.push({
+        ...model,
+        value: baseValue,
+        label: parsedLabel.base || parsedId.base,
+        effortLevels: levels.length > 0 ? levels : model.effortLevels,
+      });
+      continue;
+    }
+
+    const existing = collapsed[existingIndex];
+    collapsed[existingIndex] = {
+      ...existing,
+      description: preferredDescription(existing.description, model.description),
+      effortLevels: orderedEffortUnion([...(existing.effortLevels ?? []), ...levels]),
+      isDefault: existing.isDefault || model.isDefault,
+    };
+  }
+
+  return collapsed;
 }
 
 function formatCostTier(tier: number | undefined): string | undefined {
@@ -25,7 +132,7 @@ function formatCostTier(tier: number | undefined): string | undefined {
 }
 
 export function toDropdownOptions(models: ModelPickerOptionInput[]): DropdownOption[] {
-  return models.map((m) => ({
+  return collapseCodexEffortModels(models).map((m) => ({
     value: m.value,
     label: m.label,
     description: m.description,
@@ -106,17 +213,19 @@ export function isProviderEnabled(enabledProviderIds: string[], providerId: stri
 }
 
 /**
- * Normalize a model ID for equivalence comparison: strip the effective
- * default-provider prefix so `auggie:sonnet4.6` matches bare `sonnet4.6`
- * (and vice versa) when `auggie` is the effective default provider.
- * Other prefixes are preserved so `opencode:foo` still only matches the
- * compound form.
+ * Normalize a model ID for equivalence comparison. Explicit compound ids use
+ * their canonical provider; bare ids use the picker's effective provider when
+ * supplied, then the global default. This keeps a valid bare session model
+ * matched while the global default is unresolved without conflating models
+ * from different providers.
  */
-export function normalizeModelIdForMatch(modelId: string): string {
+export function normalizeModelIdForMatch(modelId: string, bareProviderId?: string): string {
+  const { providerId: explicitProviderId, modelId: baseModelId } = splitCompoundModelId(modelId);
   const defaultProviderId = selectEffectiveDefaultProviderId.select(appStore.state);
-  if (!defaultProviderId) return modelId;
-  const prefix = `${defaultProviderId}:`;
-  return modelId.startsWith(prefix) ? modelId.slice(prefix.length) : modelId;
+  const providerId = explicitProviderId || bareProviderId || defaultProviderId;
+  if (!providerId) return baseModelId;
+  const normalizedProviderId = selectNormalizedProviderId.select(appStore.state, providerId);
+  return `${normalizedProviderId}:${baseModelId}`;
 }
 
 export interface FindModelFallbackOptionParams {

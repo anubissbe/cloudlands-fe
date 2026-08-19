@@ -7,6 +7,11 @@
 import { app, BrowserWindow, clipboard, dialog, ipcMain, nativeTheme, shell } from 'electron';
 import { spawn } from 'child_process';
 import { collectOpenWorkspaceIds, collectWindowIdsForWorkspace } from './window-workspace-tracking';
+import {
+  clearWindowBrowserFocusOwner,
+  hasWindowBrowserFocusOwner,
+  updateWindowBrowserFocusOwner,
+} from './window-browser-focus-ownership';
 import { createRequire } from 'module';
 import { dirname } from 'path';
 import { fileURLToPath } from 'url';
@@ -63,6 +68,12 @@ import { Logger } from '../../../shared/logger';
 import { m } from '../../../shared/paraglide/messages.js';
 import { MINIMUM_NODE_VERSION } from '../../../shared/constants/auggie';
 import { findVSCodeAsync } from '../../../shared/main/async-utils';
+import { withDiffTempFiles } from '../../ide/main/diff-temp-files.service';
+import {
+  getWindowAppearanceOptions,
+  getWindowBackgroundColor,
+  getWindowTitleBarOptions,
+} from '../../../shared/main/window-appearance';
 import { meetsMinimumVersion } from '../../../shared/utils/version-compare';
 import { posixSingleQuote } from '../../../shared/utils/posix-single-quote';
 
@@ -73,6 +84,20 @@ const __dirname = dirname(__filename);
 const require = createRequire(import.meta.url);
 
 const logger = new Logger('SystemIPC');
+let nativeThemeBackgroundSyncInstalled = false;
+
+function refreshNativeWindowBackgrounds(): void {
+  const backgroundColor = getWindowBackgroundColor(nativeTheme.shouldUseDarkColors);
+  for (const window of BrowserWindow.getAllWindows()) {
+    window.setBackgroundColor(backgroundColor);
+  }
+}
+
+function installNativeThemeBackgroundSync(): void {
+  if (nativeThemeBackgroundSyncInstalled || typeof nativeTheme.on !== 'function') return;
+  nativeTheme.on('updated', refreshNativeWindowBackgrounds);
+  nativeThemeBackgroundSyncInstalled = true;
+}
 
 const CONTENT_BEARING_WORKSPACE_CHANNELS = new Set([
   'file:content-changed',
@@ -132,8 +157,6 @@ function getPayloadWorkspaceId(data: unknown): string | undefined {
 const windowWorkspaceState = new Map<number, boolean>();
 /** Track which workspace ID each window is viewing */
 const windowWorkspaceIds = new Map<number, string>();
-/** Track which windows have a browser panel as the focused/active panel */
-const windowBrowserFocusState = new Map<number, boolean>();
 /** Track which workspace tabs are open per window */
 const windowOpenWorkspaceTabs = new Map<number, string[]>();
 
@@ -215,6 +238,25 @@ export function getWindowIdsForWorkspace(workspaceId: string): number[] {
 }
 
 /**
+ * Delivery report from {@link sendToWorkspaceWindows} (intent-hq/monorepo#2602).
+ * Lets callers detect messages that were dropped because the target workspace
+ * has no open window (and no browser-mode WebSocket client) instead of
+ * reporting phantom success.
+ */
+export interface WorkspaceWindowDelivery {
+  /** Number of Electron windows the message was sent to. */
+  windowCount: number;
+  /**
+   * Whether the browser-mode WebSocket bridge hook explicitly acknowledged
+   * (returned true) that at least one connected client received the message.
+   * A registered-but-clientless bridge reports false.
+   */
+  browserClientsNotified: boolean;
+  /** True when at least one window or the browser bridge received the message. */
+  delivered: boolean;
+}
+
+/**
  * Send an IPC message to all windows viewing a specific workspace.
  * Workspace-scoped messages are delivered only to windows that have that
  * workspace active or open in a tab. If no matching windows exist, the Electron
@@ -224,12 +266,15 @@ export function getWindowIdsForWorkspace(workspaceId: string): number[] {
  *
  * This is the preferred way to send workspace-scoped IPC messages from the main process.
  * Use this instead of manually calling BrowserWindow.getAllWindows() + webContents.send().
+ *
+ * @returns a delivery report so callers can surface "nothing received this
+ *          message" instead of silently succeeding (intent-hq/monorepo#2602)
  */
 export function sendToWorkspaceWindows(
   workspaceId: string | undefined,
   channel: string,
   data: unknown,
-): void {
+): WorkspaceWindowDelivery {
   let targetWindows: BrowserWindow[];
   const isContentBearing = isContentBearingWorkspaceChannel(channel, data);
   const effectiveWorkspaceId =
@@ -253,19 +298,29 @@ export function sendToWorkspaceWindows(
     targetWindows = BrowserWindow.getAllWindows().filter((w) => !w.isDestroyed());
   }
 
+  let windowCount = 0;
   for (const window of targetWindows) {
     if (window.webContents && !window.webContents.isDestroyed()) {
       window.webContents.send(channel, data);
+      windowCount++;
     }
   }
 
   // Also broadcast to browser-mode WebSocket clients (if any are connected).
   // The named adapter owns the legacy global hook used by the HTTP MCP bridge.
+  let browserClientsNotified = false;
   try {
-    broadcastToBrowserIpcClients(channel, data, effectiveWorkspaceId);
+    browserClientsNotified =
+      broadcastToBrowserIpcClients(channel, data, effectiveWorkspaceId) === true;
   } catch {
     // Ignore — WebSocket bridge may not be initialized yet
   }
+
+  return {
+    windowCount,
+    browserClientsNotified,
+    delivered: windowCount > 0 || browserClientsNotified,
+  };
 }
 
 /**
@@ -275,7 +330,7 @@ export function sendToWorkspaceWindows(
 export function isFocusedWindowBrowserActive(): boolean {
   const focusedWindow = BrowserWindow.getFocusedWindow();
   if (!focusedWindow) return false;
-  return windowBrowserFocusState.get(focusedWindow.id) ?? false;
+  return hasWindowBrowserFocusOwner(focusedWindow.id);
 }
 
 // Clean up state when windows are closed
@@ -283,7 +338,7 @@ app.on('browser-window-created', (_event, window) => {
   window.on('closed', () => {
     windowWorkspaceState.delete(window.id);
     windowWorkspaceIds.delete(window.id);
-    windowBrowserFocusState.delete(window.id);
+    clearWindowBrowserFocusOwner(window.id);
     windowOpenWorkspaceTabs.delete(window.id);
     // A close changes the set of open workspaces: notify listeners (menu
     // rebuild, cache trim, notification-service reconciliation) so services
@@ -508,6 +563,8 @@ export async function autoRepairCliSymlink(): Promise<void> {
 // ============================================================================
 
 export function setupSystemIPC() {
+  installNativeThemeBackgroundSync();
+
   // App info
   ipcMain.handle(
     APP_CHANNELS.VERSION,
@@ -691,18 +748,9 @@ export function setupSystemIPC() {
         try {
           const window = BrowserWindow.fromWebContents(event.sender);
           if (window) {
-            // Determine the effective theme
-            let isDark: boolean;
-            if (validated.theme === 'system') {
-              // Use native theme detector
-              const { nativeTheme } = await import('electron');
-              isDark = nativeTheme.shouldUseDarkColors;
-            } else {
-              isDark = validated.theme === 'dark';
-            }
-
-            // Update the window's background color (vibrancy disabled for performance)
-            window.setBackgroundColor(isDark ? '#0a0a0a' : '#ffffff');
+            nativeTheme.themeSource = validated.theme;
+            const isDark = nativeTheme.shouldUseDarkColors;
+            window.setBackgroundColor(getWindowBackgroundColor(isDark));
 
             logger.info('Window theme updated', { theme: validated.theme, isDark });
           }
@@ -810,7 +858,11 @@ export function setupSystemIPC() {
       async (event, validated) => {
         const window = BrowserWindow.fromWebContents(event.sender);
         if (window) {
-          windowBrowserFocusState.set(window.id, validated.browserFocused);
+          updateWindowBrowserFocusOwner(
+            window.id,
+            validated.browserFocused,
+            validated.focusOwnerId,
+          );
         }
         return { success: true };
       },
@@ -858,14 +910,9 @@ export function setupSystemIPC() {
         nodeIntegration: false,
         webviewTag: true,
       },
-      titleBarStyle: process.platform === 'darwin' ? 'hiddenInset' : 'default',
-      frame: process.platform !== 'darwin',
-      ...(process.platform === 'darwin' && {
-        trafficLightPosition: { x: 9, y: 11 },
-        tabbingIdentifier: 'intent',
-      }),
+      ...getWindowTitleBarOptions(),
       title: 'Intent',
-      backgroundColor: isDarkMode ? '#0a0a0a' : '#ffffff',
+      ...getWindowAppearanceOptions(isDarkMode),
     });
     forwardRendererConsoleToMainLog(newWindow);
 
@@ -1302,89 +1349,66 @@ export function setupSystemIPC() {
       VscodeOpenDiffSchema,
       async (_event, validated) => {
         try {
-          const { promises: fsPromises } = require('fs');
-          const path = require('path');
-          const os = require('os');
-          // LOCAL-GUI: launches the user's VSCode on the client host to view a
-          // diff of two temp files; not workspace execution.
-          const { spawn } = require('child_process');
-
-          // Create temp directory (ASYNC)
-          const tempDir = path.join(os.tmpdir(), 'vscode-diff');
-          await fsPromises.mkdir(tempDir, { recursive: true }).catch(() => {
-            // Directory might already exist, that's fine
-          });
-
-          // Create temp files with unique names to avoid conflicts
-          const timestamp = Date.now();
-          const oldFilePath = path.join(tempDir, `${timestamp}-${validated.oldFileName}`);
-          const newFilePath = path.join(tempDir, `${timestamp}-${validated.newFileName}`);
-
-          // Write content to temp files (ASYNC)
-          await Promise.all([
-            fsPromises.writeFile(oldFilePath, validated.oldContent, 'utf-8'),
-            fsPromises.writeFile(newFilePath, validated.newContent, 'utf-8'),
-          ]);
-
-          // PERF: Find VSCode asynchronously to avoid blocking the main thread
-          const codeCommand = (await findVSCodeAsync()) || 'code';
-
-          // Open diff view in VSCode using -d flag
-          // Format: code -d <file1> <file2>
-          // Include --skip-add-to-recently-opened to prevent GitLens tracking
-          // Only use shell: true if we're using 'code' (from PATH), not for full paths
-          const useShell = codeCommand === 'code';
-          const child = spawn(
-            codeCommand,
-            ['-n', '--skip-add-to-recently-opened', '-d', oldFilePath, newFilePath],
+          await withDiffTempFiles(
             {
-              detached: true,
-              stdio: 'ignore',
-              shell: useShell, // Use shell only when needed for PATH resolution
-              windowsHide: true,
+              oldContent: validated.oldContent,
+              newContent: validated.newContent,
+              oldDisplayLabel: validated.oldFileName,
+              newDisplayLabel: validated.newFileName,
+            },
+            async (tempFiles) => {
+              // LOCAL-GUI: launches the user's VSCode on the client host to view a
+              // diff of two temp files; not workspace execution.
+              const { spawn } = require('child_process');
+              const codeCommand = (await findVSCodeAsync()) || 'code';
+              const useShell = codeCommand === 'code';
+              const child = spawn(
+                codeCommand,
+                [
+                  '-n',
+                  '--skip-add-to-recently-opened',
+                  '-d',
+                  tempFiles.oldFile.path,
+                  tempFiles.newFile.path,
+                ],
+                {
+                  detached: true,
+                  stdio: 'ignore',
+                  shell: useShell,
+                  windowsHide: true,
+                },
+              );
+
+              const spawnResult = await new Promise<boolean>((resolve) => {
+                let resolved = false;
+
+                child.on('error', (error: any) => {
+                  if (!resolved) {
+                    resolved = true;
+                    logger.error('Failed to spawn code command for diff:', error as Error, {
+                      error,
+                    });
+                    resolve(false);
+                  }
+                });
+
+                setTimeout(() => {
+                  if (!resolved) {
+                    resolved = true;
+                    resolve(true);
+                  }
+                }, 100);
+              });
+
+              if (!spawnResult) throw new Error('code command not found');
+              child.unref();
+            },
+            {
+              cleanupDelayMs: 5000,
+              onCleanupError: (error) =>
+                logger.warn('Failed to clean up temp diff directory', error as Error),
             },
           );
-
-          // Wait for error or successful spawn
-          const spawnResult = await new Promise<boolean>((resolve) => {
-            let resolved = false;
-
-            // If error occurs, resolve with false
-            child.on('error', (error: any) => {
-              if (!resolved) {
-                resolved = true;
-                logger.error('Failed to spawn code command for diff:', error as Error, { error });
-                resolve(false);
-              }
-            });
-
-            // If spawn succeeds, resolve with true after a short delay
-            setTimeout(() => {
-              if (!resolved) {
-                resolved = true;
-                resolve(true);
-              }
-            }, 100);
-          });
-
-          if (!spawnResult) {
-            // Clean up temp files immediately if spawn failed (ASYNC)
-            await Promise.all([
-              fsPromises.unlink(oldFilePath).catch(() => {}),
-              fsPromises.unlink(newFilePath).catch(() => {}),
-            ]);
-            throw new Error('code command not found');
-          }
-
-          child.unref();
-
-          // Clean up temp files after a delay (VSCode will have read them by then) - ASYNC
-          setTimeout(async () => {
-            await Promise.all([
-              fsPromises.unlink(oldFilePath).catch(() => {}),
-              fsPromises.unlink(newFilePath).catch(() => {}),
-            ]);
-          }, 5000);
 
           return { success: true };
         } catch (error) {
@@ -2204,26 +2228,6 @@ export function setupSystemIPC() {
     ),
   );
 
-  // Get workspace root directory
-  ipcMain.handle(
-    SYSTEM_CHANNELS.WORKSPACE_ROOT,
-    createSafeValidatedHandler(
-      EmptySchema,
-      async () => {
-        const os = require('os');
-        const path = require('path');
-        const override =
-          process.env.WORKSPACES_BASE_DIR ||
-          process.env.INTENT_WORKSPACES_ROOT ||
-          process.env.AUGMENT_WORKSPACES_ROOT;
-        const workspaceRoot =
-          override && override.trim().length > 0 ? override : path.join(os.homedir(), 'intent');
-        return { success: true, data: workspaceRoot };
-      },
-      SYSTEM_CHANNELS.WORKSPACE_ROOT,
-    ),
-  );
-
   // Legacy: Get home directory (for backward compatibility)
   ipcMain.handle(
     LEGACY_CHANNELS.GET_HOME_DIRECTORY,
@@ -2287,8 +2291,8 @@ export function setupSystemIPC() {
           // SECURITY WARNING: This executes arbitrary commands
           // This should only be used for trusted, internal operations
           logger.warn('Executing command - ensure input is trusted', {
-            command: command.substring(0, 100),
-            cwd,
+            commandLength: command.length,
+            hasCwd: typeof cwd === 'string' && cwd.length > 0,
           });
 
           const [shellCmd, shellFlag] =
@@ -2320,8 +2324,10 @@ export function setupSystemIPC() {
             },
           };
         } catch (error) {
-          logger.error('Command execution failed', error as Error, {
-            command: validated.command?.substring(0, 100),
+          logger.error('Command execution failed', {
+            commandLength: validated.command.length,
+            hasCwd: typeof validated.cwd === 'string' && validated.cwd.length > 0,
+            errorType: error instanceof Error ? error.name : typeof error,
           });
           return {
             success: false,
@@ -2413,6 +2419,10 @@ export function setupSystemIPC() {
   // Check git availability — delegated to the daemon host so detection
   // matches the machine actually running git (and is consistent across
   // local/remote transports). Mapped back to the existing IPC contract.
+  // Only a daemon-reported probe answer may fold to available:false; a
+  // transport failure (RPC timeout / daemon unreachable) folds to
+  // available:'unknown' so the UI never renders "Git is not installed"
+  // when the check simply couldn't run.
   ipcMain.handle(SYSTEM_CHANNELS.CHECK_GIT, async () => {
     try {
       const result = await getBackendClient().request<{ available: boolean; version?: string }>(
@@ -2428,19 +2438,19 @@ export function setupSystemIPC() {
       logger.warn('host.checkGit failed', {
         error: error instanceof Error ? error.message : String(error),
       });
-      return { success: true, data: { available: false } };
+      return { success: true, data: { available: 'unknown' } };
     }
   });
 
   // Check Node.js availability + minimum version — delegated to the daemon
-  // host (host.findBinary best-effort version-probes the resolved binary) so
-  // detection matches the runtime agents actually use. Mirrors CHECK_GIT: a
-  // missing binary or failed probe folds to available:false, never an error.
+  // host via the uncached host.checkNode probe (host.checkGit idiom) so a
+  // newly installed node is detected without an app restart. Mirrors
+  // CHECK_GIT: a missing binary or failed probe folds to available:false,
+  // never an error.
   ipcMain.handle(SYSTEM_CHANNELS.CHECK_NODE, async () => {
     try {
       const result = await getBackendClient().request<{ available: boolean; version?: string }>(
-        'host.findBinary',
-        { name: 'node' },
+        'host.checkNode',
       );
       if (result?.available !== true) {
         return { success: true, data: { available: false, versionOk: false } };
@@ -2456,22 +2466,21 @@ export function setupSystemIPC() {
         },
       };
     } catch (error) {
-      logger.warn('host.findBinary node failed', {
+      logger.warn('host.checkNode failed', {
         error: error instanceof Error ? error.message : String(error),
       });
       return { success: true, data: { available: false, versionOk: false } };
     }
   });
 
-  // Check GitHub CLI (gh) availability — delegated to the daemon host
-  // (host.findBinary, PROTOCOL §5.14) like CHECK_NODE. Informational only:
-  // the onboarding gate never blocks on gh, and a missing binary or failed
-  // probe folds to available:false, never an error.
+  // Check GitHub CLI (gh) availability — delegated to the daemon host via
+  // the uncached host.checkGh probe (host.checkGit idiom) like CHECK_NODE.
+  // Informational only: the onboarding gate never blocks on gh, and a
+  // missing binary or failed probe folds to available:false, never an error.
   ipcMain.handle(SYSTEM_CHANNELS.CHECK_GH, async () => {
     try {
       const result = await getBackendClient().request<{ available: boolean; version?: string }>(
-        'host.findBinary',
-        { name: 'gh' },
+        'host.checkGh',
       );
       const available = result?.available === true;
       const version = typeof result?.version === 'string' ? result.version : undefined;
@@ -2480,7 +2489,7 @@ export function setupSystemIPC() {
         data: available ? { available: true, version } : { available: false },
       };
     } catch (error) {
-      logger.warn('host.findBinary gh failed', {
+      logger.warn('host.checkGh failed', {
         error: error instanceof Error ? error.message : String(error),
       });
       return { success: true, data: { available: false } };
@@ -2490,7 +2499,7 @@ export function setupSystemIPC() {
   // Check rtk availability
   ipcMain.handle(SYSTEM_CHANNELS.CHECK_RTK, async () => {
     try {
-      const rtkPath = await findBinary('rtk', { cache: false });
+      const rtkPath = await findBinary('rtk');
       return { success: true, data: { available: rtkPath !== null } };
     } catch {
       return { success: true, data: { available: false } };
@@ -2515,19 +2524,13 @@ export function setupSystemIPC() {
           }
           const allFonts = await getFonts();
 
-          // Clean up font names (font-list returns them with quotes)
-          const cleanedFonts = allFonts.map((font: string) => font.replace(/^["']|["']$/g, ''));
+          // Clean up font names (font-list returns them with quotes), remove duplicates,
+          // and keep the response order deterministic without filtering installed families.
+          const cleanedFonts = Array.from(
+            new Set(allFonts.map((font: string) => font.trim().replace(/^["']|["']$/g, ''))),
+          ).sort((a: string, b: string) => a.localeCompare(b));
 
-          // Filter for monospace fonts by checking known patterns
-          const monoFonts = cleanedFonts
-            .filter((name: string) =>
-              /mono|code|consol|courier|terminal|fixed|hack|source.*pro|fira|jetbrains|sf.*mono|menlo|monaco|andale|iosevka|inconsolata|dejavu.*mono|liberation.*mono|ubuntu.*mono|droid.*mono|noto.*mono|roboto.*mono|cascadia|operator|input|pragmata|anonymous|hermit|envy/i.test(
-                name,
-              ),
-            )
-            .sort((a: string, b: string) => a.localeCompare(b));
-
-          return { success: true, data: monoFonts };
+          return { success: true, data: cleanedFonts };
         } catch (error) {
           logger.error('Failed to list fonts', { error });
           return { success: false, error: m.system_ipc_enumerateFontsFailed_error() };

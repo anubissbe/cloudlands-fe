@@ -1,16 +1,5 @@
-import {
-  afterEach,
-  beforeEach,
-  describe,
-  expect,
-  it,
-  vi,
-} from 'vitest';
-import {
-  cleanup,
-  render,
-  screen,
-} from '@testing-library/svelte';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { cleanup, render, screen } from '@testing-library/svelte';
 import type { AgentNode } from '../types';
 
 const {
@@ -24,6 +13,7 @@ const {
   selectAgentIsWaitingForOtherAgentsMock,
   selectAgentIsRespondingMock,
   selectAgentAttentionRequestMock,
+  selectAgentSessionMock,
 } = vi.hoisted(() => {
   const thinkingByAgentId = new Map<string, boolean>();
   const waitingByAgentId = new Map<string, boolean>();
@@ -66,6 +56,12 @@ const {
         return () => {};
       },
     })),
+    selectAgentSessionMock: vi.fn(() => ({
+      subscribe: (run: (value: null) => void) => {
+        run(null);
+        return () => {};
+      },
+    })),
   };
 });
 
@@ -75,13 +71,14 @@ vi.mock('$store/renderer/slices/agent-session/agent-session-selectors', () => ({
   selectAgentIsWaiting: selectAgentIsWaitingMock,
   selectAgentIsWaitingForOtherAgents: selectAgentIsWaitingForOtherAgentsMock,
   selectAgentAttentionRequest: selectAgentAttentionRequestMock,
+  selectAgentSession: selectAgentSessionMock,
 }));
 
 vi.mock('svelte-fa', async () => ({
   default: (await import('../../ui/__tests__/mocks/Fa.svelte')).default,
 }));
 
-vi.mock('$lib/components/ui/auggie-avatar/AugieAvatarWithState.svelte', async () => ({
+vi.mock('$features/agent/components/agent-avatar/AgentAvatarWithState.svelte', async () => ({
   default: (await import('../../chat/__tests__/mocks/MockAvatarWithState.svelte')).default,
 }));
 
@@ -124,6 +121,7 @@ describe('AgentHierarchyCard Thinking consumer wiring', () => {
     selectAgentIsWaitingForOtherAgentsMock.mockClear();
     selectAgentIsRespondingMock.mockClear();
     selectAgentAttentionRequestMock.mockClear();
+    selectAgentSessionMock.mockClear();
   });
 
   afterEach(() => cleanup());

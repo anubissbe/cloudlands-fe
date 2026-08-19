@@ -1,52 +1,105 @@
 <script lang="ts">
   /* eslint-disable max-lines */
-import { selectAgentSession } from '$store/renderer/slices/agent-session/agent-session-selectors';
+  import { selectAgentSession } from '$store/renderer/slices/agent-session/agent-session-selectors';
+  import { writable } from 'svelte/store';
   import type { ParsedToolResult } from './tool-result-parser';
   import { extractPayloadText } from './tool-result-pairing';
   import Fa from 'svelte-fa';
   import {
-  faCopy,
-  faCheck,
-  faExclamationTriangle,
-  faFolder,
-  faFile,
-} from '@fortawesome/free-solid-svg-icons';
-  import { DiffViewer } from '$lib/components/ui/diff';
+    faCopy,
+    faCheck,
+    faExclamationTriangle,
+    faFolder,
+    faFile,
+  } from '@fortawesome/free-solid-svg-icons';
+  import { DiffViewer } from '$features/file-tracking/components/diff';
   import MarkdownRenderer from '$lib/components/editor/MarkdownRenderer.svelte';
   import CodeBlock from '$lib/components/editor/CodeBlock.svelte';
   import AgentCard from './AgentCard.svelte';
 
-  import { selectActiveWorkspaceId } from '$store/renderer/slices/workspace/workspace-selectors';
+  import { selectWorkspaceById } from '$store/renderer/slices/workspace/workspace-selectors';
 
   import { isGenericAgentName } from '$lib/utils/agent-name-generator';
-  import AuggieAvatar from '$lib/components/ui/auggie-avatar/AuggieAvatar.svelte';
+  import AgentAvatar from '$features/agent/components/agent-avatar/AgentAvatar.svelte';
   import {
-  focusBrowserTabRequested,
-  openAgentTabRequested,
-} from '$store/renderer/slices/app-layout/app-layout-slice';
+    focusBrowserTabRequested,
+    openAgentTabRequested,
+  } from '$store/renderer/slices/app-layout/app-layout-slice';
   import {
-  openWorkspaceFile,
-  openWorkspaceNote,
-} from '$store/renderer/slices/workspace-navigation/workspace-navigation-slice';
+    openWorkspaceFile,
+    openWorkspaceNote,
+  } from '$store/renderer/slices/workspace-navigation/workspace-navigation-slice';
   import { store as appStore } from '$store/renderer/store';
   import { formatDate, formatInteger } from '$lib/i18n/format';
   import { m } from '$shared/paraglide/messages.js';
+  import {
+    sanitizeMultilineToolText,
+    sanitizeToolPayload,
+    sanitizeToolText,
+  } from './tool-display-model';
 
   interface Props {
     input: Record<string, any>;
     result?: any;
     parsedResult?: ParsedToolResult | null;
     isError?: boolean;
+    /** The tool call is still running: show only the input, never a result section. */
+    pending?: boolean;
+    /** The tool is classified as a terminal command (gates the terminal-style pending view). */
+    isTerminal?: boolean;
     workspaceId?: string;
+    suppressOkOnlyResult?: boolean;
   }
 
-  const { input, result, parsedResult, isError = false, workspaceId }: Props = $props();
+  const {
+    input,
+    result,
+    parsedResult,
+    isError = false,
+    pending = false,
+    isTerminal = false,
+    workspaceId,
+    suppressOkOnlyResult = false,
+  }: Props = $props();
+
+  // This tool result is scoped by the workspaceId prop rather than ambient UI
+  // state; it may render outside the route workspace. Pass the ID to AgentCard
+  // so it can dispatch
+  // ensureAgentSessionLoaded and resolve the delegated agent.
+  // svelte-ignore state_referenced_locally - intentional initial capture; the $effect below syncs later changes
+  const toolWorkspaceIdStore = writable(workspaceId ?? '');
+  $effect(() => {
+    toolWorkspaceIdStore.set(workspaceId ?? '');
+  });
+  const toolWorkspace = selectWorkspaceById(toolWorkspaceIdStore);
 
   let copied = $state(false);
-  let showRaw = $state(false);
+  const sanitizedInput = $derived(sanitizeToolPayload(input) as Record<string, any>);
+  const sanitizedResult = $derived(sanitizeToolPayload(result));
 
-  // Whether this tool call has a rich (non-raw) preview available
-  const hasRichPreview = $derived(parsedResult != null && parsedResult.type !== 'unknown');
+  // Disposition summary for batch delegate results ("2 started · 1 held · 1 skipped").
+  // The started count always shows; held/skipped/failed only when non-zero.
+  const delegateBatchSummary = $derived.by(() => {
+    const batch = parsedResult?.delegateBatch;
+    if (!batch) return null;
+    const parts = [
+      m.chat_toolDetails_delegateBatchStarted_label({ count: formatInteger(batch.started) }),
+    ];
+    if (batch.held > 0) {
+      parts.push(m.chat_toolDetails_delegateBatchHeld_label({ count: formatInteger(batch.held) }));
+    }
+    if (batch.skipped > 0) {
+      parts.push(
+        m.chat_toolDetails_delegateBatchSkipped_label({ count: formatInteger(batch.skipped) }),
+      );
+    }
+    if (batch.errors > 0) {
+      parts.push(
+        m.chat_toolDetails_delegateBatchFailed_label({ count: formatInteger(batch.errors) }),
+      );
+    }
+    return parts.join(' · ');
+  });
 
   // Special input keys that should be shown at the top of output (not hidden)
   // These are the "query" or "request" that provides important context
@@ -92,7 +145,7 @@ import { selectAgentSession } from '$store/renderer/slices/agent-session/agent-s
   const featuredInput = $derived.by(() => {
     for (const key of FEATURED_INPUT_KEYS) {
       if (input[key] && typeof input[key] === 'string') {
-        return input[key] as string;
+        return sanitizeToolText(input[key]);
       }
     }
     return null;
@@ -102,7 +155,8 @@ import { selectAgentSession } from '$store/renderer/slices/agent-session/agent-s
   function formatValue(val: unknown): string {
     if (val == null) return '';
     if (typeof val === 'string') {
-      return val.length > 150 ? val.slice(0, 150) + '…' : val;
+      const sanitized = sanitizeToolText(val);
+      return sanitized.length > 150 ? sanitized.slice(0, 150) + '…' : sanitized;
     }
     if (typeof val === 'number' || typeof val === 'boolean') return String(val);
     if (Array.isArray(val))
@@ -119,7 +173,7 @@ import { selectAgentSession } from '$store/renderer/slices/agent-session/agent-s
   const inputEntries = $derived.by(() => {
     if (!input) return null;
     const entries: Array<{ key: string; value: string }> = [];
-    for (const [key, val] of Object.entries(input)) {
+    for (const [key, val] of Object.entries(sanitizedInput)) {
       if (val == null) continue;
       // Skip very long values in the summary (like file_content, instructions_reminder)
       if (FEATURED_INPUT_KEYS.has(key)) continue;
@@ -131,77 +185,130 @@ import { selectAgentSession } from '$store/renderer/slices/agent-session/agent-s
     return entries.length > 0 ? entries : null;
   });
 
-  // Extract display text from an error result payload (§7.1 shapes: string,
-  // MCP content-item array, `{ output }` fallback), else the raw JSON
-  // representation
+  // Full multiline command for pending terminal calls (whitespace preserved so
+  // the complete command is inspectable while the result is still pending).
+  // Gated on the classified terminal category: non-terminal tools that happen
+  // to carry a `command` field (e.g. str-replace-editor) must fall through to
+  // the JSON input view so all their fields stay inspectable.
+  const pendingCommand = $derived.by(() => {
+    if (!isTerminal) return null;
+    if (typeof input?.command !== 'string' || !input.command.trim()) return null;
+    return sanitizeMultilineToolText(input.command);
+  });
+
+  // Extract concise display text from common error payloads. Structured raw
+  // data stays behind the explicit disclosure below.
   const errorText = $derived.by(() => {
     if (result == null) return null;
     const text = extractPayloadText(result);
-    if (text !== null) return text;
-    try {
-      return JSON.stringify(result, null, 2);
-    } catch {
-      return String(result);
+    if (text !== null) return sanitizeToolText(text);
+    if (typeof result === 'object' && typeof result.message === 'string') {
+      return sanitizeToolText(result.message);
     }
+    return null;
   });
 </script>
 
-{#snippet fallbackDetails()}
-  <!-- Fallback: input details + raw result (or "Completed" when there is no result) -->
-  {#if inputEntries}
-    <div class="flex flex-col gap-1 pb-2 mb-2 border-b border-border/50">
-      {#each inputEntries as { key, value }}
-        <div class="text-xs">
-          <span class="text-subtle">{key}</span>
-          <span class="text-subtle ml-1.5 break-all">{value}</span>
-        </div>
-      {/each}
+{#snippet rawDetails()}
+  {#if inputEntries || result != null}
+    <div class="flex min-w-0 flex-col gap-2" data-tool-raw-details>
+      {#if inputEntries}
+        <section class="min-w-0" data-tool-detail-section="input">
+          <div class="type-caption mb-1 text-muted-foreground">
+            {m.chat_toolDetails_input_label()}
+          </div>
+          <pre
+            class="m-0 max-h-48 overflow-auto whitespace-pre-wrap break-words font-mono text-xs text-subtle">{JSON.stringify(
+              sanitizedInput,
+              null,
+              2,
+            )}</pre>
+        </section>
+      {/if}
+      {#if result != null}
+        <section class="min-w-0" data-tool-detail-section="output">
+          <div class="type-caption mb-1 text-muted-foreground">
+            {m.chat_toolDetails_result_label()}
+          </div>
+          <pre
+            class="m-0 max-h-72 overflow-auto whitespace-pre-wrap break-words font-mono text-xs text-subtle">{typeof sanitizedResult ===
+            'string'
+              ? sanitizedResult
+              : JSON.stringify(sanitizedResult, null, 2)}</pre>
+        </section>
+      {/if}
     </div>
-  {/if}
-  {#if result != null}
-    <div class="overflow-hidden rounded">
-      <pre
-        class="m-0 p-2 font-mono text-sm leading-relaxed overflow-x-auto max-h-72 overflow-y-auto text-subtle">{typeof result ===
-        'string'
-          ? result
-          : JSON.stringify(result, null, 2)}</pre>
-    </div>
-  {:else}
-    <div class="text-xs text-subtle italic">{m.chat_toolDetails_completed_label()}</div>
   {/if}
 {/snippet}
 
-<div class="flex flex-col text-sm">
+{#snippet fallbackDetails()}
+  <!-- The parent operational row is the only disclosure control. -->
+  {@render rawDetails()}
+{/snippet}
+
+<div class="flex min-w-0 flex-col text-sm" data-tool-details-inline>
   <!-- Error display -->
   {#if isError}
-    <div class="rounded-md border border-border overflow-hidden mb-2 divide-y divide-border">
-      {#if inputEntries}
-        <div class="px-3 py-2 flex flex-col gap-1 bg-muted/30">
-          {#each inputEntries as { key, value }}
-            <div class="text-xs">
-              <span class="text-subtle">{key}</span>
-              <span class="text-subtle ml-1.5">{value}</span>
-            </div>
-          {/each}
-        </div>
-      {/if}
+    <div class="flex min-w-0 flex-col gap-2" data-tool-detail-error>
       {#if errorText}
-        <div class="px-3 py-2 flex items-start gap-2">
-          <Fa icon={faExclamationTriangle} size="xs" class="text-red-500/70 mt-0.5 shrink-0" />
+        <div class="flex min-w-0 items-start gap-2">
+          <Fa
+            icon={faExclamationTriangle}
+            size="xs"
+            class="text-error-foreground mt-0.5 shrink-0"
+          />
           <pre
-            class="m-0 whitespace-pre-wrap font-mono text-xs text-red-600 dark:text-red-400">{errorText}</pre>
+            class="m-0 min-w-0 whitespace-pre-wrap break-words font-mono text-xs text-error-foreground">{errorText}</pre>
         </div>
       {:else}
-        <div class="px-3 py-2 flex items-start gap-2">
-          <Fa icon={faExclamationTriangle} size="xs" class="text-red-500/70 mt-0.5 shrink-0" />
+        <div class="flex min-w-0 items-start gap-2">
+          <Fa
+            icon={faExclamationTriangle}
+            size="xs"
+            class="text-error-foreground mt-0.5 shrink-0"
+          />
           <span class="text-xs text-subtle">{m.chat_toolDetails_noErrorDetails_label()}</span>
         </div>
       {/if}
+      {#if inputEntries || result != null}
+        {@render rawDetails()}
+      {/if}
     </div>
+  {:else if pending}
+    <!-- Running tool call: show the full input while the result is pending. -->
+    {#if pendingCommand}
+      <!-- Terminal command with whitespace preserved so multiline commands are readable -->
+      <div class="overflow-hidden rounded bg-[#1a1b26]">
+        <div class="flex items-start gap-2 p-2">
+          <span class="text-[#7aa2f7] font-mono text-xs mt-px shrink-0">$</span>
+          <pre
+            class="m-0 flex-1 font-mono text-xs leading-relaxed whitespace-pre-wrap break-words max-h-72 overflow-y-auto text-[#a9b1d6]/90">{pendingCommand}</pre>
+        </div>
+      </div>
+    {:else}
+      <div class="flex flex-col gap-2 rounded bg-muted/30 p-2">
+        {#if featuredInput}
+          <div class="text-subtle italic">"{featuredInput}"</div>
+        {/if}
+        <div>
+          <div class="type-caption mb-1 text-subtle">
+            {m.chat_toolDetails_input_label()}
+          </div>
+          <pre
+            class="m-0 max-h-72 overflow-auto whitespace-pre-wrap break-words font-mono text-xs text-subtle">{JSON.stringify(
+              sanitizedInput,
+              null,
+              2,
+            )}</pre>
+        </div>
+      </div>
+    {/if}
+  {:else if suppressOkOnlyResult}
+    <!-- Successful ok-only mutations intentionally have no expanded body. -->
   {:else if result || parsedResult}
     <!-- Output Section (no Input section - hidden for cleaner display) -->
     <div class="flex flex-col">
-      <div class="p-2 bg-muted/30 relative group/details">
+      <div class="relative min-w-0 group/details">
         <!-- Featured input (query/request) shown at top with border below -->
         {#if featuredInput}
           <div class="pb-2 mb-2 border-b border-border text-subtle italic">
@@ -209,25 +316,18 @@ import { selectAgentSession } from '$store/renderer/slices/agent-session/agent-s
           </div>
         {/if}
 
-        <!-- Top-right action buttons (appear on hover) -->
-        <div class="absolute top-2 right-2 flex items-center gap-1 transition-all z-10 {showRaw ? 'opacity-100' : 'opacity-0 group-hover/details:opacity-100'}">
-          <!-- Raw/Formatted toggle - only when rich preview exists -->
-          {#if hasRichPreview}
-            <button
-              class="px-1.5 py-0.5 rounded text-ui font-medium bg-muted/80 border border-border/50 text-muted-foreground hover:bg-muted hover:text-foreground cursor-pointer transition-colors"
-              onclick={() => (showRaw = !showRaw)}
-              title={showRaw
-                ? m.chat_toolDetails_showFormatted_title()
-                : m.chat_toolDetails_showRaw_title()}
-            >
-              {showRaw ? m.chat_toolDetails_formatted_label() : m.chat_toolDetails_raw_label()}
-            </button>
-          {/if}
+        <!-- Copy remains available without adding a second disclosure control. -->
+        <div
+          class="absolute top-0 right-0 z-10 flex items-center opacity-0 transition-opacity group-hover/details:opacity-100 focus-within:opacity-100"
+        >
           <!-- Copy button - Skip for file-view since CodeBlock has its own copy button -->
           {#if (parsedResult?.content || parsedResult?.newContent) && parsedResult?.type !== 'file-view'}
             <button
-              class="p-1.5 rounded bg-muted/80 border border-border/50 text-muted-foreground hover:bg-muted hover:text-foreground cursor-pointer transition-colors"
-              onclick={() => copyToClipboard(input.content || parsedResult?.newContent || parsedResult?.content || '')}
+              class="cursor-pointer border-0 bg-transparent p-1 text-muted-foreground transition-colors hover:text-foreground"
+              onclick={() =>
+                copyToClipboard(
+                  input.content || parsedResult?.newContent || parsedResult?.content || '',
+                )}
               title={m.chat_toolDetails_copyContent_title()}
             >
               <Fa icon={copied ? faCheck : faCopy} size="xs" />
@@ -235,28 +335,7 @@ import { selectAgentSession } from '$store/renderer/slices/agent-session/agent-s
           {/if}
         </div>
 
-        {#if showRaw && hasRichPreview}
-          <!-- Raw data view (toggled) -->
-          <div class="overflow-hidden rounded flex flex-col gap-2">
-            {#if input && Object.keys(input).length > 0}
-              <div>
-                <div class="text-xs font-medium text-subtle mb-1">{m.chat_toolDetails_input_label()}</div>
-                <pre
-                  class="m-0 p-2 font-mono text-xs leading-relaxed overflow-x-auto max-h-48 overflow-y-auto text-subtle bg-muted/30 rounded">{JSON.stringify(input, null, 2)}</pre>
-              </div>
-            {/if}
-            {#if result != null}
-              <div>
-                <div class="text-xs font-medium text-subtle mb-1">{m.chat_toolDetails_result_label()}</div>
-                <pre
-                  class="m-0 p-2 font-mono text-xs leading-relaxed overflow-x-auto max-h-72 overflow-y-auto text-subtle bg-muted/30 rounded">{typeof result ===
-                    'string'
-                      ? result
-                      : JSON.stringify(result, null, 2)}</pre>
-              </div>
-            {/if}
-          </div>
-        {:else if parsedResult && parsedResult.type !== 'unknown'}
+        {#if parsedResult && parsedResult.type !== 'unknown'}
           {#if (parsedResult.type === 'file-edit' || parsedResult.type === 'note-edit') && parsedResult.oldContent && parsedResult.newContent}
             <!-- Diff view using DiffViewer component -->
             <DiffViewer
@@ -271,7 +350,7 @@ import { selectAgentSession } from '$store/renderer/slices/agent-session/agent-s
           {:else if parsedResult.type === 'note-edit' && (parsedResult.newContent || parsedResult.content)}
             <!-- Note edit without diff - render markdown -->
             <div
-              class="overflow-hidden rounded border border-border/40 bg-muted/20 max-h-72 overflow-y-auto"
+              class="overflow-hidden rounded border border-border bg-muted/20 max-h-72 overflow-y-auto"
             >
               <div class="p-3">
                 <MarkdownRenderer
@@ -368,20 +447,21 @@ import { selectAgentSession } from '$store/renderer/slices/agent-session/agent-s
                 {@const fileName = snippet.path.split('/').pop() || snippet.path}
                 {@const dirPath = snippet.path.split('/').slice(0, -1).join('/')}
                 <div
-                  class="group/snippet rounded-md overflow-hidden border border-border/60 hover:border-border transition-colors"
+                  class="group/snippet rounded-md overflow-hidden border border-border hover:border-border transition-colors"
                 >
                   <!-- File header with icon-like styling -->
                   <div
-                    class="flex items-center gap-1.5 px-2 py-1 bg-muted/50 border-b border-border/40"
+                    class="flex items-center gap-1.5 px-2 py-1 bg-muted/50 border-b border-border"
                   >
-                    <span class="font-mono text-xs font-medium text-muted-foreground">{fileName}</span>
+                    <span class="font-mono text-xs font-medium text-muted-foreground"
+                      >{fileName}</span
+                    >
                     {#if snippet.lineStart}
                       <span class="text-xs text-subtle">:{snippet.lineStart}</span>
                     {/if}
                     {#if dirPath}
-                      <span
-                        class="text-xs text-subtle truncate ml-auto"
-                        title={snippet.path}>{dirPath}</span
+                      <span class="text-xs text-subtle truncate ml-auto" title={snippet.path}
+                        >{dirPath}</span
                       >
                     {/if}
                   </div>
@@ -394,9 +474,7 @@ import { selectAgentSession } from '$store/renderer/slices/agent-session/agent-s
                 </div>
               {/each}
               {#if parsedResult.snippets.length > 8}
-                <div
-                  class="text-center text-xs text-subtle py-1 border-t border-border/30 mt-1"
-                >
+                <div class="text-center text-xs text-subtle py-1 border-t border-border mt-1">
                   {plural(
                     parsedResult.snippets.length - 8,
                     m.chat_toolDetails_moreResults_one,
@@ -426,17 +504,25 @@ import { selectAgentSession } from '$store/renderer/slices/agent-session/agent-s
               {#if parsedResult.command}
                 <div class="flex items-center gap-2 px-2 pt-2 pb-1 border-b border-[#a9b1d6]/10">
                   <span class="text-[#7aa2f7] font-mono text-xs">$</span>
-                  <span class="font-mono text-xs text-[#a9b1d6]/90 truncate flex-1">{parsedResult.command}</span>
+                  <span class="font-mono text-xs text-[#a9b1d6]/90 truncate flex-1"
+                    >{parsedResult.command}</span
+                  >
                   {#if parsedResult.exitCode !== undefined}
-                    <span class="text-ui font-mono px-1.5 py-0.5 rounded {parsedResult.exitCode === 0 ? 'bg-[#9ece6a]/20 text-[#9ece6a]' : 'bg-[#f7768e]/20 text-[#f7768e]'}">
-                      {m.chat_toolDetails_exitCode_label({ code: formatInteger(parsedResult.exitCode) })}
+                    <span
+                      class="text-ui font-mono px-1.5 py-0.5 rounded {parsedResult.exitCode === 0
+                        ? 'bg-[#9ece6a]/20 text-[#9ece6a]'
+                        : 'bg-[#f7768e]/20 text-[#f7768e]'}"
+                    >
+                      {m.chat_toolDetails_exitCode_label({
+                        code: formatInteger(parsedResult.exitCode),
+                      })}
                     </span>
                   {/if}
                 </div>
               {/if}
               {#if parsedResult.content}
                 <pre
-                  class="m-0 p-2 font-mono text-sm leading-relaxed overflow-x-auto max-h-72 overflow-y-auto text-[#a9b1d6]">{parsedResult.content}</pre>
+                  class="m-0 p-2 font-mono text-sm leading-relaxed whitespace-pre-wrap break-words max-h-72 overflow-y-auto text-[#a9b1d6]">{parsedResult.content}</pre>
               {:else}
                 <pre
                   class="m-0 p-2 font-mono text-sm leading-relaxed text-[#a9b1d6]/50">{m.chat_toolDetails_noOutput_label()}</pre>
@@ -487,26 +573,45 @@ import { selectAgentSession } from '$store/renderer/slices/agent-session/agent-s
           {:else if parsedResult.type === 'note-view' && parsedResult.content}
             <!-- Note view - rendered markdown -->
             <div
-              class="overflow-hidden rounded border border-border/40 bg-muted/20 max-h-72 overflow-y-auto"
+              class="overflow-hidden rounded border border-border bg-muted/20 max-h-72 overflow-y-auto"
             >
               <div class="p-3">
                 <MarkdownRenderer content={parsedResult.content} className="text-sm" />
               </div>
             </div>
           {:else if parsedResult.type === 'delegate-task'}
-            <!-- Delegate task - show task name and agent card -->
+            <!-- Delegate task - show task name and agent card(s) -->
             <div class="flex flex-col gap-2">
-              {#if parsedResult.delegatedTaskName}
-                <div class="text-sm text-subtle">
-                  {m.chat_toolDetails_task_label()} <span class="text-foreground font-medium"
-                    >{parsedResult.delegatedTaskName}</span
-                  >
-                </div>
-              {/if}
-              {#if parsedResult.agentId}
-                <AgentCard agentId={parsedResult.agentId} />
+              {#if parsedResult.delegateBatch && delegateBatchSummary}
+                <!-- Batch delegate: disposition summary + cards for started agents -->
+                <div class="text-sm text-subtle">{delegateBatchSummary}</div>
+                {#each parsedResult.delegateBatch.startedRows as row (row.agentId)}
+                  <AgentCard
+                    agentId={row.agentId}
+                    agentName={row.agentName}
+                    workspace={$toolWorkspace ?? null}
+                  />
+                {/each}
               {:else}
-                <div class="text-xs text-subtle italic">{m.chat_toolDetails_agentSpawned_label()}</div>
+                {#if parsedResult.delegatedTaskName}
+                  <div class="text-sm text-subtle">
+                    {m.chat_toolDetails_task_label()}
+                    <span class="text-foreground font-medium">{parsedResult.delegatedTaskName}</span
+                    >
+                  </div>
+                {/if}
+                {#if parsedResult.agentId}
+                  <AgentCard
+                    agentId={parsedResult.agentId}
+                    agentName={parsedResult.delegatedAgentName}
+                    provider={parsedResult.delegatedAgentProvider}
+                    workspace={$toolWorkspace ?? null}
+                  />
+                {:else}
+                  <div class="text-xs text-subtle italic">
+                    {m.chat_toolDetails_agentSpawned_label()}
+                  </div>
+                {/if}
               {/if}
             </div>
           {:else if parsedResult.type === 'agent-list' && parsedResult.agents?.length}
@@ -534,14 +639,18 @@ import { selectAgentSession } from '$store/renderer/slices/agent-session/agent-s
                     );
                   }}
                 >
-                  <AuggieAvatar agentId={agent.agentId} size={18} class="shrink-0" />
-                  <span class="text-sm font-medium text-foreground truncate flex-1">{agent.name}</span>
+                  <AgentAvatar agentId={agent.agentId} size={18} class="shrink-0" />
+                  <span class="text-sm font-medium text-foreground truncate flex-1"
+                    >{agent.name}</span
+                  >
                   {#if agent.status}
-                    <span class="text-xs px-1.5 py-0.5 rounded bg-muted {statusColor}">{agent.status}</span>
+                    <span class="text-xs px-1.5 py-0.5 rounded bg-muted {statusColor}"
+                      >{agent.status}</span
+                    >
                   {/if}
                 </button>
               {/each}
-              <div class="text-xs text-subtle pt-1 border-t border-border/30 mt-1">
+              <div class="text-xs text-subtle pt-1 border-t border-border mt-1">
                 {plural(
                   parsedResult.agents.length,
                   m.chat_toolDetails_agentCount_one,
@@ -583,7 +692,7 @@ import { selectAgentSession } from '$store/renderer/slices/agent-session/agent-s
               {/if}
               {#if parsedResult.taskContent}
                 <div
-                  class="overflow-hidden rounded border border-border/40 bg-muted/20 p-3 max-h-48 overflow-y-auto"
+                  class="overflow-hidden rounded border border-border bg-muted/20 p-3 max-h-48 overflow-y-auto"
                 >
                   <MarkdownRenderer content={parsedResult.taskContent} className="text-sm" />
                 </div>
@@ -624,8 +733,9 @@ import { selectAgentSession } from '$store/renderer/slices/agent-session/agent-s
             <!-- Agent message - show "Sent message to [agent]" with clickable link, then the message -->
             {@const agentId = parsedResult.toAgentId}
             {@const toolState = appStore.state}
-            {@const toolWsId = selectActiveWorkspaceId.select(toolState)}
-            {@const session = agentId && toolWsId ? selectAgentSession.select(toolState, agentId) : null}
+            {@const toolWsId = workspaceId}
+            {@const session =
+              agentId && toolWsId ? selectAgentSession.select(toolState, agentId) : null}
             {@const agentName =
               session?.name && !isGenericAgentName(session.name)
                 ? session.name
@@ -650,11 +760,13 @@ import { selectAgentSession } from '$store/renderer/slices/agent-session/agent-s
                       );
                     }}
                   >
-                    <AuggieAvatar {agentId} size={14} class="shrink-0" />
+                    <AgentAvatar {agentId} size={14} class="shrink-0" />
                     <span>{agentName}</span>
                   </button>
                 {:else}
-                  <span class="text-foreground font-medium">{m.chat_toolDetails_agent_fallback()}</span>
+                  <span class="text-foreground font-medium"
+                    >{m.chat_toolDetails_agent_fallback()}</span
+                  >
                 {/if}
               </div>
               <!-- Message content -->
@@ -703,9 +815,7 @@ import { selectAgentSession } from '$store/renderer/slices/agent-session/agent-s
                         {m.chat_toolDetails_noAnchor_label()}
                       {/if}
                     </span>
-                    <span
-                      class="text-xs px-1.5 py-0.5 rounded bg-muted text-subtle shrink-0"
-                    >
+                    <span class="text-xs px-1.5 py-0.5 rounded bg-muted text-subtle shrink-0">
                       {thread.status}
                     </span>
                   </div>
@@ -716,7 +826,7 @@ import { selectAgentSession } from '$store/renderer/slices/agent-session/agent-s
                     m.chat_toolDetails_totalComments_one,
                     m.chat_toolDetails_totalComments_many,
                   )}
-                  <div class="text-xs text-subtle pt-1 border-t border-border/30 mt-1">
+                  <div class="text-xs text-subtle pt-1 border-t border-border mt-1">
                     {parsedResult.commentThreads.length === 1
                       ? m.chat_toolDetails_inThreads_one({
                           comments: commentsPart,
@@ -766,15 +876,13 @@ import { selectAgentSession } from '$store/renderer/slices/agent-session/agent-s
                           >
                         {/each}
                         {#if note.tags.length > 2}
-                          <span class="text-xs text-subtle"
-                            >+{note.tags.length - 2}</span
-                          >
+                          <span class="text-xs text-subtle">+{note.tags.length - 2}</span>
                         {/if}
                       </div>
                     {/if}
                   </button>
                 {/each}
-                <div class="text-xs text-subtle pt-1 border-t border-border/30 mt-1">
+                <div class="text-xs text-subtle pt-1 border-t border-border mt-1">
                   {plural(
                     parsedResult.notes.length,
                     m.chat_toolDetails_noteCount_one,
@@ -790,7 +898,7 @@ import { selectAgentSession } from '$store/renderer/slices/agent-session/agent-s
             <div class="flex flex-col gap-2">
               {#if parsedResult.figmaScreenshot}
                 <!-- Inline Figma screenshot -->
-                <div class="overflow-hidden rounded border border-border/40">
+                <div class="overflow-hidden rounded border border-border">
                   <img
                     src={`data:${parsedResult.figmaScreenshotMimeType || 'image/png'};base64,${parsedResult.figmaScreenshot}`}
                     alt={m.chat_toolDetails_figmaScreenshot_alt()}
@@ -839,15 +947,18 @@ import { selectAgentSession } from '$store/renderer/slices/agent-session/agent-s
             <div class="flex flex-col gap-2">
               {#if parsedResult.screenshotBase64 || parsedResult.screenshotUrl}
                 <!-- Inline screenshot -->
-                <div class="overflow-hidden rounded border border-border/40">
+                <div class="overflow-hidden rounded border border-border">
                   <img
-                    src={parsedResult.screenshotUrl || `data:image/png;base64,${parsedResult.screenshotBase64}`}
+                    src={parsedResult.screenshotUrl ||
+                      `data:image/png;base64,${parsedResult.screenshotBase64}`}
                     alt={m.chat_toolDetails_browserScreenshot_alt()}
                     class="w-full h-auto max-h-96 object-contain bg-white"
-                    style={parsedResult.screenshotWidth ? `max-width: ${Math.min(parsedResult.screenshotWidth, 600)}px` : ''}
+                    style={parsedResult.screenshotWidth
+                      ? `max-width: ${Math.min(parsedResult.screenshotWidth, 600)}px`
+                      : ''}
                   />
                   {#if parsedResult.screenshotWidth && parsedResult.screenshotHeight}
-                    <div class="px-2 py-1 text-ui text-subtle border-t border-border/30">
+                    <div class="px-2 py-1 text-ui text-subtle border-t border-border">
                       {parsedResult.screenshotWidth} × {parsedResult.screenshotHeight}
                     </div>
                   {/if}
@@ -861,14 +972,16 @@ import { selectAgentSession } from '$store/renderer/slices/agent-session/agent-s
                       class="flex items-center gap-2 px-2 py-1.5 text-sm hover:bg-muted/30 rounded cursor-pointer text-left w-full"
                       onclick={() => {
                         if (tab.tabId && workspaceId) {
-                          appStore.dispatch(
-                            focusBrowserTabRequested(workspaceId, tab.tabId),
-                          );
+                          appStore.dispatch(focusBrowserTabRequested(workspaceId, tab.tabId));
                         }
                       }}
                       title={m.chat_toolDetails_focusTab_title()}
                     >
-                      <span class="w-2 h-2 rounded-full shrink-0 {tab.mounted ? 'bg-green-500/70' : 'bg-muted-foreground/30'}"></span>
+                      <span
+                        class="w-2 h-2 rounded-full shrink-0 {tab.mounted
+                          ? 'bg-green-500/70'
+                          : 'bg-muted-foreground/30'}"
+                      ></span>
                       <span class="text-foreground truncate flex-1" title={tab.url}>
                         {tab.title || tab.url || tab.tabId}
                       </span>
@@ -879,7 +992,7 @@ import { selectAgentSession } from '$store/renderer/slices/agent-session/agent-s
                       {/if}
                     </button>
                   {/each}
-                  <div class="text-xs text-subtle pt-1 border-t border-border/30 mt-1">
+                  <div class="text-xs text-subtle pt-1 border-t border-border mt-1">
                     {plural(
                       parsedResult.browserTabs.length,
                       m.chat_toolDetails_tabCount_one,
@@ -896,13 +1009,15 @@ import { selectAgentSession } from '$store/renderer/slices/agent-session/agent-s
                       {#each evaluateExpressions as expr}
                         <div class="flex items-start gap-2">
                           <span class="text-[#7aa2f7] font-mono text-xs shrink-0 mt-px">›</span>
-                          <pre class="m-0 font-mono text-xs text-[#a9b1d6]/90 whitespace-pre-wrap break-all">{expr}</pre>
+                          <pre
+                            class="m-0 font-mono text-xs text-[#a9b1d6]/90 whitespace-pre-wrap break-all">{expr}</pre>
                         </div>
                       {/each}
                     </div>
                   {/if}
                   {#if parsedResult.evaluateResult !== undefined}
-                    <pre class="m-0 p-2 font-mono text-sm leading-relaxed overflow-x-auto max-h-48 overflow-y-auto text-[#a9b1d6]">{parsedResult.evaluateResult}</pre>
+                    <pre
+                      class="m-0 p-2 font-mono text-sm leading-relaxed overflow-x-auto max-h-48 overflow-y-auto text-[#a9b1d6]">{parsedResult.evaluateResult}</pre>
                   {/if}
                 </div>
               {/if}
@@ -910,22 +1025,31 @@ import { selectAgentSession } from '$store/renderer/slices/agent-session/agent-s
                 <!-- Accessibility tree -->
                 <div class="overflow-hidden rounded bg-[#1a1b26]">
                   <div class="flex items-center gap-2 px-2 pt-2 pb-1 border-b border-[#a9b1d6]/10">
-                    <span class="text-xs font-medium text-[#a9b1d6]/70">{m.chat_toolDetails_accessibilityTree_label()}</span>
+                    <span class="text-xs font-medium text-[#a9b1d6]/70"
+                      >{m.chat_toolDetails_accessibilityTree_label()}</span
+                    >
                   </div>
-                  <pre class="m-0 p-2 font-mono text-xs leading-relaxed overflow-x-auto max-h-64 overflow-y-auto text-[#a9b1d6]/80">{parsedResult.accessibilityTree}</pre>
+                  <pre
+                    class="m-0 p-2 font-mono text-xs leading-relaxed overflow-x-auto max-h-64 overflow-y-auto text-[#a9b1d6]/80">{parsedResult.accessibilityTree}</pre>
                 </div>
               {/if}
               {#if parsedResult.error}
                 <!-- Error -->
                 <div class="flex items-start gap-2 p-2">
-                  <Fa icon={faExclamationTriangle} size="xs" class="text-red-500/70 mt-0.5 shrink-0" />
-                  <pre class="m-0 whitespace-pre-wrap font-mono text-xs text-red-600 dark:text-red-400">{parsedResult.error}</pre>
+                  <Fa
+                    icon={faExclamationTriangle}
+                    size="xs"
+                    class="text-error-foreground mt-0.5 shrink-0"
+                  />
+                  <pre
+                    class="m-0 whitespace-pre-wrap font-mono text-xs text-error-foreground">{parsedResult.error}</pre>
                 </div>
               {/if}
               {#if parsedResult.content && !parsedResult.screenshotBase64 && !parsedResult.screenshotUrl && !parsedResult.browserTabs?.length && !parsedResult.evaluateResult && !parsedResult.accessibilityTree && !parsedResult.error}
                 <!-- Fallback content for other browser actions -->
                 <div class="overflow-hidden rounded">
-                  <pre class="m-0 p-2 font-mono text-sm leading-relaxed overflow-x-auto max-h-48 overflow-y-auto text-muted-foreground">{parsedResult.content}</pre>
+                  <pre
+                    class="m-0 p-2 font-mono text-sm leading-relaxed whitespace-pre-wrap break-words max-h-48 overflow-y-auto text-muted-foreground">{parsedResult.content}</pre>
                 </div>
               {/if}
             </div>
@@ -933,15 +1057,21 @@ import { selectAgentSession } from '$store/renderer/slices/agent-session/agent-s
             <!-- Sentry issue detail card -->
             {@const issue = parsedResult.sentryIssue}
             {@const levelColor =
-              issue.level === 'fatal' ? 'bg-red-600 text-white' :
-              issue.level === 'error' ? 'bg-red-500/20 text-red-600 dark:text-red-400' :
-              issue.level === 'warning' ? 'bg-amber-500/20 text-amber-600 dark:text-amber-400' :
-              issue.level === 'info' ? 'bg-blue-500/20 text-blue-600 dark:text-blue-400' :
-              'bg-muted text-subtle'}
+              issue.level === 'fatal'
+                ? 'bg-red-600 text-white'
+                : issue.level === 'error'
+                  ? 'bg-red-500/20 text-red-600 dark:text-red-400'
+                  : issue.level === 'warning'
+                    ? 'bg-amber-500/20 text-amber-600 dark:text-amber-400'
+                    : issue.level === 'info'
+                      ? 'bg-blue-500/20 text-blue-600 dark:text-blue-400'
+                      : 'bg-muted text-subtle'}
             {@const statusColor =
-              issue.status === 'resolved' ? 'bg-emerald-500/20 text-emerald-600 dark:text-emerald-400' :
-              issue.status === 'ignored' ? 'bg-muted text-subtle' :
-              'bg-orange-500/20 text-orange-600 dark:text-orange-400'}
+              issue.status === 'resolved'
+                ? 'bg-emerald-500/20 text-emerald-600 dark:text-emerald-400'
+                : issue.status === 'ignored'
+                  ? 'bg-muted text-subtle'
+                  : 'bg-orange-500/20 text-orange-600 dark:text-orange-400'}
             <div class="rounded-md border border-border overflow-hidden">
               <!-- Header with title and badges -->
               <div class="px-3 py-2.5 flex flex-col gap-1.5">
@@ -954,15 +1084,21 @@ import { selectAgentSession } from '$store/renderer/slices/agent-session/agent-s
                   </div>
                 </div>
                 <div class="flex items-center gap-1.5 flex-wrap">
-                  <span class="px-1.5 py-0.5 text-ui font-medium rounded {statusColor}">{issue.status}</span>
-                  <span class="px-1.5 py-0.5 text-ui font-medium rounded {levelColor}">{issue.level}</span>
+                  <span class="px-1.5 py-0.5 text-ui font-medium rounded {statusColor}"
+                    >{issue.status}</span
+                  >
+                  <span class="px-1.5 py-0.5 text-ui font-medium rounded {levelColor}"
+                    >{issue.level}</span
+                  >
                   {#if issue.project}
                     <span class="text-ui text-subtle">{issue.project}</span>
                   {/if}
                 </div>
               </div>
               <!-- Stats row -->
-              <div class="px-3 py-2 border-t border-border/50 bg-muted/20 flex items-center gap-4 text-xs">
+              <div
+                class="px-3 py-2 border-t border-border bg-muted/20 flex items-center gap-4 text-xs"
+              >
                 <div class="flex items-center gap-1">
                   <span class="text-subtle">{m.chat_toolDetails_events_label()}</span>
                   <span class="font-medium text-foreground">{formatInteger(issue.count)}</span>
@@ -980,14 +1116,20 @@ import { selectAgentSession } from '$store/renderer/slices/agent-session/agent-s
               </div>
               <!-- Stacktrace summary (if available) -->
               {#if issue.stacktraceSummary}
-                <div class="px-3 py-2 border-t border-border/50 bg-muted/10">
-                  <pre class="m-0 font-mono text-ui leading-relaxed text-subtle overflow-x-auto">{issue.stacktraceSummary}</pre>
+                <div class="px-3 py-2 border-t border-border bg-muted/10">
+                  <pre
+                    class="m-0 font-mono text-ui leading-relaxed text-subtle overflow-x-auto">{issue.stacktraceSummary}</pre>
                 </div>
               {/if}
               <!-- Link to Sentry -->
               {#if issue.url}
-                <div class="px-3 py-1.5 border-t border-border/50 bg-muted/10">
-                  <a href={issue.url} target="_blank" rel="noopener noreferrer" class="text-ui text-primary hover:underline">
+                <div class="px-3 py-1.5 border-t border-border bg-muted/10">
+                  <a
+                    href={issue.url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    class="text-ui text-primary hover:underline"
+                  >
                     {m.chat_toolDetails_viewInSentry_label()}
                   </a>
                 </div>
@@ -998,23 +1140,36 @@ import { selectAgentSession } from '$store/renderer/slices/agent-session/agent-s
             <div class="flex flex-col gap-1 max-h-80 overflow-y-auto">
               {#each parsedResult.sentryIssues as issue}
                 {@const levelDot =
-                  issue.level === 'fatal' ? 'bg-red-600' :
-                  issue.level === 'error' ? 'bg-red-500' :
-                  issue.level === 'warning' ? 'bg-amber-500' :
-                  issue.level === 'info' ? 'bg-blue-500' :
-                  'bg-muted-foreground'}
+                  issue.level === 'fatal'
+                    ? 'bg-red-600'
+                    : issue.level === 'error'
+                      ? 'bg-red-500'
+                      : issue.level === 'warning'
+                        ? 'bg-amber-500'
+                        : issue.level === 'info'
+                          ? 'bg-blue-500'
+                          : 'bg-muted-foreground'}
                 {@const statusText =
-                  issue.status === 'resolved' ? 'text-emerald-600 dark:text-emerald-400' :
-                  issue.status === 'ignored' ? 'text-subtle' :
-                  'text-orange-600 dark:text-orange-400'}
-                <div class="flex items-center gap-2 px-2 py-1.5 rounded hover:bg-muted/30 transition-colors">
+                  issue.status === 'resolved'
+                    ? 'text-emerald-600 dark:text-emerald-400'
+                    : issue.status === 'ignored'
+                      ? 'text-subtle'
+                      : 'text-orange-600 dark:text-orange-400'}
+                <div
+                  class="flex items-center gap-2 px-2 py-1.5 rounded hover:bg-muted/30 transition-colors"
+                >
                   <span class="w-2 h-2 rounded-full shrink-0 {levelDot}"></span>
                   <div class="flex-1 min-w-0 flex items-center gap-1.5">
                     {#if issue.shortId}
                       <span class="text-ui text-subtle font-mono shrink-0">{issue.shortId}</span>
                     {/if}
                     {#if issue.url}
-                      <a href={issue.url} target="_blank" rel="noopener noreferrer" class="text-sm text-foreground truncate hover:underline">{issue.title}</a>
+                      <a
+                        href={issue.url}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        class="text-sm text-foreground truncate hover:underline">{issue.title}</a
+                      >
                     {:else}
                       <span class="text-sm text-foreground truncate">{issue.title}</span>
                     {/if}
@@ -1025,7 +1180,7 @@ import { selectAgentSession } from '$store/renderer/slices/agent-session/agent-s
                   {/if}
                 </div>
               {/each}
-              <div class="text-xs text-subtle pt-1 border-t border-border/30 mt-1">
+              <div class="text-xs text-subtle pt-1 border-t border-border mt-1">
                 {plural(
                   parsedResult.sentryIssues.length,
                   m.chat_toolDetails_issueCount_one,
@@ -1037,20 +1192,38 @@ import { selectAgentSession } from '$store/renderer/slices/agent-session/agent-s
             <!-- GitHub Issues/PRs list -->
             <div class="flex flex-col gap-1 max-h-72 overflow-y-auto">
               {#each parsedResult.githubIssues as issue}
-                {@const stateColor = issue.state === 'open' ? 'text-green-600 dark:text-green-400' : issue.state === 'closed' ? 'text-purple-600 dark:text-purple-400' : 'text-subtle'}
-                {@const stateIcon = issue.state === 'open' ? '●' : issue.state === 'closed' ? '✓' : '○'}
-                <div class="flex items-start gap-2 px-2 py-1.5 rounded hover:bg-muted/30 transition-colors">
-                  <span class="shrink-0 text-xs mt-0.5 {stateColor}" title={issue.state}>{stateIcon}</span>
+                {@const stateColor =
+                  issue.state === 'open'
+                    ? 'text-green-600 dark:text-green-400'
+                    : issue.state === 'closed'
+                      ? 'text-purple-600 dark:text-purple-400'
+                      : 'text-subtle'}
+                {@const stateIcon =
+                  issue.state === 'open' ? '●' : issue.state === 'closed' ? '✓' : '○'}
+                <div
+                  class="flex items-start gap-2 px-2 py-1.5 rounded hover:bg-muted/30 transition-colors"
+                >
+                  <span class="shrink-0 text-xs mt-0.5 {stateColor}" title={issue.state}
+                    >{stateIcon}</span
+                  >
                   <div class="flex flex-col gap-0.5 min-w-0 flex-1">
                     <div class="flex items-center gap-1.5 flex-wrap">
                       <span class="text-subtle text-xs font-mono shrink-0">#{issue.number}</span>
                       {#if issue.url}
-                        <a href={issue.url} target="_blank" rel="noopener noreferrer" class="text-sm text-foreground hover:underline truncate">{issue.title}</a>
+                        <a
+                          href={issue.url}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          class="text-sm text-foreground hover:underline truncate">{issue.title}</a
+                        >
                       {:else}
                         <span class="text-sm text-foreground truncate">{issue.title}</span>
                       {/if}
                       {#if issue.isPR}
-                        <span class="text-ui px-1 py-0.5 rounded bg-blue-500/15 text-blue-600 dark:text-blue-400 shrink-0">{m.chat_toolDetails_pr_badge()}</span>
+                        <span
+                          class="text-ui px-1 py-0.5 rounded bg-blue-500/15 text-blue-600 dark:text-blue-400 shrink-0"
+                          >{m.chat_toolDetails_pr_badge()}</span
+                        >
                       {/if}
                     </div>
                     {#if issue.labels && issue.labels.length > 0}
@@ -1058,17 +1231,19 @@ import { selectAgentSession } from '$store/renderer/slices/agent-session/agent-s
                         {#each issue.labels as label}
                           <span
                             class="text-ui px-1.5 py-0.5 rounded-full font-medium"
-                            style={label.color ? `background-color: #${label.color}20; color: #${label.color}; border: 1px solid #${label.color}40` : ''}
+                            style={label.color
+                              ? `background-color: #${label.color}20; color: #${label.color}; border: 1px solid #${label.color}40`
+                              : ''}
                             class:bg-muted={!label.color}
-                            class:text-subtle={!label.color}
-                          >{label.name}</span>
+                            class:text-subtle={!label.color}>{label.name}</span
+                          >
                         {/each}
                       </div>
                     {/if}
                   </div>
                 </div>
               {/each}
-              <div class="text-xs text-subtle pt-1 border-t border-border/30 mt-1">
+              <div class="text-xs text-subtle pt-1 border-t border-border mt-1">
                 {plural(
                   parsedResult.githubIssues.length,
                   m.chat_toolDetails_resultCount_one,
@@ -1080,11 +1255,29 @@ import { selectAgentSession } from '$store/renderer/slices/agent-session/agent-s
             <!-- GitHub PR Changed Files -->
             <div class="flex flex-col gap-0.5 max-h-72 overflow-y-auto">
               {#each parsedResult.githubFiles as file}
-                {@const statusIcon = file.status === 'added' ? '+' : file.status === 'removed' ? '−' : file.status === 'renamed' ? '→' : '~'}
-                {@const statusColor = file.status === 'added' ? 'text-green-600 dark:text-green-400' : file.status === 'removed' ? 'text-red-600 dark:text-red-400' : 'text-amber-600 dark:text-amber-400'}
-                <div class="flex items-center gap-2 px-2 py-1 rounded hover:bg-muted/30 transition-colors">
-                  <span class="shrink-0 text-xs font-mono w-3 text-center {statusColor}">{statusIcon}</span>
-                  <span class="text-sm text-foreground truncate flex-1 font-mono">{file.filename}</span>
+                {@const statusIcon =
+                  file.status === 'added'
+                    ? '+'
+                    : file.status === 'removed'
+                      ? '−'
+                      : file.status === 'renamed'
+                        ? '→'
+                        : '~'}
+                {@const statusColor =
+                  file.status === 'added'
+                    ? 'text-green-600 dark:text-green-400'
+                    : file.status === 'removed'
+                      ? 'text-red-600 dark:text-red-400'
+                      : 'text-amber-600 dark:text-amber-400'}
+                <div
+                  class="flex items-center gap-2 px-2 py-1 rounded hover:bg-muted/30 transition-colors"
+                >
+                  <span class="shrink-0 text-xs font-mono w-3 text-center {statusColor}"
+                    >{statusIcon}</span
+                  >
+                  <span class="text-sm text-foreground truncate flex-1 font-mono"
+                    >{file.filename}</span
+                  >
                   <div class="flex items-center gap-1.5 shrink-0 text-xs font-mono">
                     {#if file.additions > 0}
                       <span class="text-green-600 dark:text-green-400">+{file.additions}</span>
@@ -1096,9 +1289,15 @@ import { selectAgentSession } from '$store/renderer/slices/agent-session/agent-s
                 </div>
               {/each}
               {#if parsedResult.githubFiles.length}
-                {@const totalAdditions = parsedResult.githubFiles.reduce((s, f) => s + f.additions, 0)}
-                {@const totalDeletions = parsedResult.githubFiles.reduce((s, f) => s + f.deletions, 0)}
-                <div class="text-xs text-subtle pt-1 border-t border-border/30 mt-1 flex gap-2">
+                {@const totalAdditions = parsedResult.githubFiles.reduce(
+                  (s, f) => s + f.additions,
+                  0,
+                )}
+                {@const totalDeletions = parsedResult.githubFiles.reduce(
+                  (s, f) => s + f.deletions,
+                  0,
+                )}
+                <div class="text-xs text-subtle pt-1 border-t border-border mt-1 flex gap-2">
                   <span
                     >{plural(
                       parsedResult.githubFiles.length,
@@ -1119,16 +1318,52 @@ import { selectAgentSession } from '$store/renderer/slices/agent-session/agent-s
             <!-- GitHub CI Check Runs -->
             <div class="flex flex-col gap-0.5 max-h-72 overflow-y-auto">
               {#if parsedResult.githubOverallStatus}
-                {@const overallColor = parsedResult.githubOverallStatus === 'success' ? 'text-green-600 dark:text-green-400' : parsedResult.githubOverallStatus === 'failure' || parsedResult.githubOverallStatus === 'error' ? 'text-red-600 dark:text-red-400' : 'text-amber-600 dark:text-amber-400'}
-                <div class="flex items-center gap-2 px-2 py-1.5 mb-1 border-b border-border/30">
-                  <span class="text-sm font-medium {overallColor}">{m.chat_toolDetails_overall_label({ status: parsedResult.githubOverallStatus })}</span>
+                {@const overallColor =
+                  parsedResult.githubOverallStatus === 'success'
+                    ? 'text-green-600 dark:text-green-400'
+                    : parsedResult.githubOverallStatus === 'failure' ||
+                        parsedResult.githubOverallStatus === 'error'
+                      ? 'text-red-600 dark:text-red-400'
+                      : 'text-amber-600 dark:text-amber-400'}
+                <div class="flex items-center gap-2 px-2 py-1.5 mb-1 border-b border-border">
+                  <span class="text-sm font-medium {overallColor}"
+                    >{m.chat_toolDetails_overall_label({
+                      status: parsedResult.githubOverallStatus,
+                    })}</span
+                  >
                 </div>
               {/if}
               {#each parsedResult.githubChecks as check}
                 {@const conclusion = check.conclusion || check.status}
-                {@const checkIcon = conclusion === 'success' ? '✓' : conclusion === 'failure' || conclusion === 'error' || conclusion === 'timed_out' ? '✗' : conclusion === 'in_progress' || conclusion === 'queued' || conclusion === 'pending' ? '⏳' : conclusion === 'skipped' || conclusion === 'neutral' ? '–' : '○'}
-                {@const checkColor = conclusion === 'success' ? 'text-green-600 dark:text-green-400' : conclusion === 'failure' || conclusion === 'error' || conclusion === 'timed_out' ? 'text-red-600 dark:text-red-400' : conclusion === 'in_progress' || conclusion === 'queued' || conclusion === 'pending' ? 'text-amber-600 dark:text-amber-400' : 'text-subtle'}
-                <div class="flex items-center gap-2 px-2 py-1 rounded hover:bg-muted/30 transition-colors">
+                {@const checkIcon =
+                  conclusion === 'success'
+                    ? '✓'
+                    : conclusion === 'failure' ||
+                        conclusion === 'error' ||
+                        conclusion === 'timed_out'
+                      ? '✗'
+                      : conclusion === 'in_progress' ||
+                          conclusion === 'queued' ||
+                          conclusion === 'pending'
+                        ? '⏳'
+                        : conclusion === 'skipped' || conclusion === 'neutral'
+                          ? '–'
+                          : '○'}
+                {@const checkColor =
+                  conclusion === 'success'
+                    ? 'text-green-600 dark:text-green-400'
+                    : conclusion === 'failure' ||
+                        conclusion === 'error' ||
+                        conclusion === 'timed_out'
+                      ? 'text-red-600 dark:text-red-400'
+                      : conclusion === 'in_progress' ||
+                          conclusion === 'queued' ||
+                          conclusion === 'pending'
+                        ? 'text-amber-600 dark:text-amber-400'
+                        : 'text-subtle'}
+                <div
+                  class="flex items-center gap-2 px-2 py-1 rounded hover:bg-muted/30 transition-colors"
+                >
                   <span class="shrink-0 text-sm {checkColor}">{checkIcon}</span>
                   <span class="text-sm text-foreground truncate flex-1">{check.name}</span>
                   {#if check.conclusion && check.conclusion !== check.status}
@@ -1137,9 +1372,13 @@ import { selectAgentSession } from '$store/renderer/slices/agent-session/agent-s
                 </div>
               {/each}
               {#if parsedResult.githubChecks.length}
-                {@const passed = parsedResult.githubChecks.filter(c => (c.conclusion || c.status) === 'success').length}
-                {@const failed = parsedResult.githubChecks.filter(c => ['failure', 'error', 'timed_out'].includes(c.conclusion || c.status)).length}
-                <div class="text-xs text-subtle pt-1 border-t border-border/30 mt-1 flex gap-2">
+                {@const passed = parsedResult.githubChecks.filter(
+                  (c) => (c.conclusion || c.status) === 'success',
+                ).length}
+                {@const failed = parsedResult.githubChecks.filter((c) =>
+                  ['failure', 'error', 'timed_out'].includes(c.conclusion || c.status),
+                ).length}
+                <div class="text-xs text-subtle pt-1 border-t border-border mt-1 flex gap-2">
                   <span
                     >{plural(
                       parsedResult.githubChecks.length,
@@ -1148,10 +1387,18 @@ import { selectAgentSession } from '$store/renderer/slices/agent-session/agent-s
                     )}</span
                   >
                   {#if passed > 0}
-                    <span class="text-green-600 dark:text-green-400">{m.chat_toolDetails_checksPassed_label({ count: formatInteger(passed) })}</span>
+                    <span class="text-green-600 dark:text-green-400"
+                      >{m.chat_toolDetails_checksPassed_label({
+                        count: formatInteger(passed),
+                      })}</span
+                    >
                   {/if}
                   {#if failed > 0}
-                    <span class="text-red-600 dark:text-red-400">{m.chat_toolDetails_checksFailed_label({ count: formatInteger(failed) })}</span>
+                    <span class="text-red-600 dark:text-red-400"
+                      >{m.chat_toolDetails_checksFailed_label({
+                        count: formatInteger(failed),
+                      })}</span
+                    >
                   {/if}
                 </div>
               {/if}
@@ -1160,13 +1407,13 @@ import { selectAgentSession } from '$store/renderer/slices/agent-session/agent-s
             <!-- Confirmation/info result - clean text display -->
             <div class="overflow-hidden rounded">
               <pre
-                class="m-0 p-2 text-sm leading-relaxed overflow-x-auto max-h-72 overflow-y-auto text-muted-foreground whitespace-pre-wrap">{parsedResult.content}</pre>
+                class="m-0 p-2 text-sm leading-relaxed max-h-72 overflow-y-auto text-muted-foreground whitespace-pre-wrap break-words">{parsedResult.content}</pre>
             </div>
           {:else if parsedResult.content}
             <!-- Plain text preview (no syntax highlighting for cleaner light/dark mode support) -->
             <div class="overflow-hidden rounded">
               <pre
-                class="m-0 p-2 font-mono text-sm leading-relaxed overflow-x-auto max-h-72 overflow-y-auto text-muted-foreground">{parsedResult.content}</pre>
+                class="m-0 p-2 font-mono text-sm leading-relaxed whitespace-pre-wrap break-words max-h-72 overflow-y-auto text-muted-foreground">{parsedResult.content}</pre>
             </div>
           {:else}
             <!-- Rich-typed result with nothing renderable — never leave the container empty -->
@@ -1178,28 +1425,8 @@ import { selectAgentSession } from '$store/renderer/slices/agent-session/agent-s
       </div>
     </div>
   {:else if inputEntries}
-    <!-- No result, but we have input details to show -->
-    <div class="flex flex-col">
-      <div class="p-2 bg-muted/30">
-        <div class="flex flex-col gap-1">
-          {#each inputEntries as { key, value }}
-            <div class="text-xs">
-              <span class="text-subtle">{key}</span>
-              <span class="text-subtle ml-1.5 break-all">{value}</span>
-            </div>
-          {/each}
-        </div>
-        <div class="text-xs text-subtle mt-2 italic">{m.chat_toolDetails_completed_label()}</div>
-      </div>
-    </div>
+    {@render rawDetails()}
   {:else}
-    <!-- No result and no input details — tool completed with no output -->
-    <div class="p-2 bg-muted/30">
-      <span class="text-xs text-subtle italic"
-        >{isError
-          ? m.chat_toolDetails_noDetails_label()
-          : m.chat_toolDetails_completed_label()}</span
-      >
-    </div>
+    <!-- No meaningful output: the collapsed row is the complete presentation. -->
   {/if}
 </div>

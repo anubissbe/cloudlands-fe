@@ -12,63 +12,62 @@
   import { getSelectedTextWithinSurface } from '$lib/utils/selected-text';
   import { m } from '$shared/paraglide/messages.js';
   import { formatInteger } from '$lib/i18n/format';
-  import {
-  untrack,
-  onMount,
-  onDestroy,
-} from 'svelte';
+  import { untrack, onMount, onDestroy } from 'svelte';
   import { createTaskAgentStatusMountManager } from './note-with-comments/task-agent-status-mount-manager';
   import { runAssignAgentTaskMenuAction } from './note-with-comments/task-menu-assign-agent-action';
+  import {
+    applySuggestionDecision,
+    type SuggestionDecision,
+  } from './note-with-comments/suggestion-actions';
   import { runTaskBreakdownTaskMenuAction } from './note-with-comments/task-menu-task-breakdown-action';
   import {
-  createImageDropHandler,
-  createImagePasteHandler,
-} from './note-with-comments/image-upload-handlers';
+    createImageDropHandler,
+    createImagePasteHandler,
+  } from './note-with-comments/image-upload-handlers';
   import {
-  discoverTaskMenuPopovers,
-  type TaskMenuPopoverData,
-} from './note-with-comments/task-menu-popover-discovery';
+    discoverTaskMenuPopovers,
+    type TaskMenuPopoverData,
+  } from './note-with-comments/task-menu-popover-discovery';
   import {
-  getTaskAssociationKeysInEditor,
-  getTaskTextsInEditor,
-  restoreTaskAgentAssociations,
-} from './note-with-comments/task-item-utils';
+    getTaskAssociationKeysInEditor,
+    getTaskTextsInEditor,
+    restoreTaskAgentAssociations,
+  } from './note-with-comments/task-item-utils';
   import {
-  createScrollToHeadingHandler,
-  createScrollToTaskHandler,
-} from './note-with-comments/note-scroll-handlers';
+    createScrollToHeadingHandler,
+    createScrollToTaskHandler,
+  } from './note-with-comments/note-scroll-handlers';
   import TaskMenu from '$lib/components/tiptap/TaskMenu.svelte';
   import NoteMetadataBar from '$lib/components/workspace/NoteMetadataBar.svelte';
   import NoteCodeChangesCard from '$lib/components/workspace/NoteCodeChangesCard.svelte';
   import type { Workspace } from '$shared/types';
   import type { CommentManagerV2 } from '$features/comments/comment-manager-v2';
   import {
-  runExternalContentUpdateEffect,
-  shouldIgnoreLocalEditorUpdate,
-  shouldRequeueExternalUpdateAfterTypingStops,
-  shouldSafetyNetTrigger,
-} from './note-with-comments/external-update-effect';
+    runExternalContentUpdateEffect,
+    shouldIgnoreLocalEditorUpdate,
+    shouldRequeueExternalUpdateAfterTypingStops,
+    shouldSafetyNetTrigger,
+  } from './note-with-comments/external-update-effect';
   import { applyExternalUpdateHtmlToEditorPreservingCursor } from './note-with-comments/external-update-editor';
   import {
-  destroyAndClearCommentManagerV2,
-  maybeCreateCommentManagerV2,
-} from './note-with-comments/comment-manager-lifecycle';
+    destroyAndClearCommentManagerV2,
+    maybeCreateCommentManagerV2,
+  } from './note-with-comments/comment-manager-lifecycle';
   import {
-  createOnCommentManagerContentChangedAfterAnchorInsertion,
-  createOnCommentManagerContentChangedUpdateLastKnownContent,
-} from './note-with-comments/comment-manager-content-change-handlers';
+    createOnCommentManagerContentChangedAfterAnchorInsertion,
+    createOnCommentManagerContentChangedUpdateLastKnownContent,
+  } from './note-with-comments/comment-manager-content-change-handlers';
   import { setupCommentMarkClickHandlerV2 } from './note-with-comments/comment-mark-click-handler';
   import { Editor } from '@tiptap/core';
   import { NoteId } from '$shared/types/branded-ids';
   import { TextSelection } from '@tiptap/pm/state';
 
-
   import { selectComments } from '$store/renderer/slices/comments/comments-selectors';
   import {
-  selectCommentAction,
-  updateCommentAction,
-  clearCommentsAction,
-} from '$store/renderer/slices/comments/comments-slice';
+    selectCommentAction,
+    updateCommentAction,
+    clearCommentsAction,
+  } from '$store/renderer/slices/comments/comments-slice';
 
   import { createEditorConfig } from '$lib/utils/editor-config';
 
@@ -77,31 +76,25 @@
   import { createLogger } from '$lib/utils/client-logger';
 
   import {
-  restoreNoteVersion,
-  clearNewlyCreatedNoteId,
-} from '$store/renderer/slices/workspace-notes/workspace-notes-slice';
+    restoreNoteVersion,
+    clearNewlyCreatedNoteId,
+  } from '$store/renderer/slices/workspace-notes/workspace-notes-slice';
   import { hasPendingNoteContent, updateNoteContent } from '$features/notes/notes-write-service';
   import {
-  selectNoteById,
-  selectNewlyCreatedNoteId,
-} from '$store/renderer/slices/workspace-notes/workspace-notes-selectors';
-  import {
-  processMarkdownToHTML,
-  processHTMLToMarkdown,
-} from '$lib/utils/markdown-processor';
+    selectNoteById,
+    selectNewlyCreatedNoteId,
+  } from '$store/renderer/slices/workspace-notes/workspace-notes-selectors';
+  import { processMarkdownToHTML, processHTMLToMarkdown } from '$lib/utils/markdown-processor';
   import { setupEditorListeners } from '$lib/utils/editor-listeners';
   import { updateCommentDecorations } from '$lib/components/tiptap/CommentDecorations';
-  import {
-  pruneTaskAgentAssociationsForNote,
-} from '$store/renderer/slices/task-agent-associations/task-agent-associations-slice';
+  import { pruneTaskAgentAssociationsForNote } from '$store/renderer/slices/task-agent-associations/task-agent-associations-slice';
   import { selectAssociationsForNote } from '$store/renderer/slices/task-agent-associations/task-agent-associations-selectors';
   import { selectSelectedModel } from '$store/renderer/slices/model/model-selectors';
 
-
   import {
-  selectNoteFontStyle,
-  selectSpellcheckEnabled,
-} from '$store/renderer/slices/user-preferences/user-preferences-selectors';
+    selectNoteFontStyle,
+    selectSpellcheckEnabled,
+  } from '$store/renderer/slices/user-preferences/user-preferences-selectors';
 
   import { selectWorkspaceNavigationHistory } from '$store/renderer/slices/workspace-navigation/workspace-navigation-selectors';
   import { openWorkspaceFile } from '$store/renderer/slices/workspace-navigation/workspace-navigation-slice';
@@ -490,6 +483,7 @@
   let externalUpdateVersion = $state(0);
 
   let editor: Editor = $state(null!);
+  let editorInitializationPromise: Promise<void> | null = null;
   let selectedSuggestion: any = $state(null);
   let tooltipPosition = $state({ x: 0, y: 0 });
   // Task menu state - track discovered task buttons
@@ -545,7 +539,9 @@
 
   // Writable stores mirror prop values so the Redux selector re-evaluates
   // when workspace.id or noteId changes (same pattern as file-tree-view / AgentSubscriptions).
+  // svelte-ignore state_referenced_locally - intentional initial capture; the $effect below syncs later changes
   const workspaceIdStore = writable(workspace?.id ?? '');
+  // svelte-ignore state_referenced_locally - intentional initial capture; the $effect below syncs later changes
   const noteIdStore = writable(noteId ?? '');
   $effect(() => {
     workspaceIdStore.set(workspace?.id ?? '');
@@ -699,7 +695,7 @@
       if (wasRawNoteViewEnabled && !editor && element && !isComponentDestroyed) {
         wasRawNoteViewEnabled = false;
         isInitializing = true;
-        void initializeEditor()
+        void ensureCurrentWorkspaceEditor()
           .catch((err) => {
             logger.error(
               '[NoteWithComments] Failed to initialize editor after raw view closed',
@@ -775,9 +771,12 @@
           lastKnownContent,
         })
       ) {
-        logger.info('[NoteWithComments] Typing stopped with diverged content - requeueing external update', {
-          noteId,
-        });
+        logger.info(
+          '[NoteWithComments] Typing stopped with diverged content - requeueing external update',
+          {
+            noteId,
+          },
+        );
         externalUpdateVersion = externalUpdateVersion + 1;
       }
     }, 1000);
@@ -849,14 +848,19 @@
     }
   }
 
+  async function handleSuggestionDecision(decision: SuggestionDecision) {
+    const suggestionId = selectedSuggestion?.id;
+    if (!editor || !suggestionId) return;
+    const applied = await applySuggestionDecision(editor, suggestionId, decision, () =>
+      saveEditorContent(true),
+    );
+    if (applied) selectedSuggestion = null;
+  }
+
   function syncTaskAgentAssociations() {
     if (!editor || editor.isDestroyed || !workspace?.id || !noteId) return;
 
-    const associations = selectAssociationsForNote.select(
-      appStore.state,
-      workspace.id,
-      noteId,
-    );
+    const associations = selectAssociationsForNote.select(appStore.state, workspace.id, noteId);
     const currentTaskKeys = getTaskAssociationKeysInEditor(editor);
     const currentTaskTextCounts = getTaskTextsInEditor(editor).reduce<Record<string, number>>(
       (counts, taskText) => {
@@ -1032,6 +1036,12 @@
   async function initializeEditor() {
     if (!element) return;
 
+    // Snapshot the owner for this editor instance. If the component is reused for
+    // another workspace while markdown conversion is pending, do not create an
+    // editor whose task node views retain the previous workspace.
+    const editorWorkspace = workspace;
+    const editorWorkspaceId = editorWorkspace?.id;
+
     let goalContent = '';
     if (noteId && workspace?.id) {
       {
@@ -1098,14 +1108,17 @@
     // right away instead of a blank screen while markdown processing runs
     const isLargeContent = goalContent.length > 5000;
     const enableRichEditorComments = showComments && !isRawNoteViewEnabled;
+    const initialEditorContent = isLargeContent
+      ? ''
+      : await processMarkdownToHTML(goalContent, { preserveAnchors: true });
+
+    if (isComponentDestroyed || editorWorkspaceId !== workspace?.id) return;
 
     const config = createEditorConfig({
       element,
-      content: isLargeContent
-        ? ''
-        : await processMarkdownToHTML(goalContent, { preserveAnchors: true }),
+      content: initialEditorContent,
       editable,
-      workspace, // Pass workspace for mention support
+      workspace: editorWorkspace, // Also supplies the task-item owner workspace.
       onUpdate: () => {
         debounceUpdate();
         // Discover and create TaskMenu popovers for any new task items
@@ -1114,9 +1127,7 @@
       },
       onSelectionUpdate: (selectedText) => {
         // Get the note title from store if available, otherwise use noteId
-        const note = noteId
-          ? selectNoteById.select(appStore.state, workspace.id, noteId)
-          : null;
+        const note = noteId ? selectNoteById.select(appStore.state, workspace.id, noteId) : null;
         const noteLabel = note?.title || noteId || m.workspace_addContext_note_label();
 
         if (selectedText) {
@@ -1309,6 +1320,22 @@
     };
   }
 
+  function ensureCurrentWorkspaceEditor(): Promise<void> {
+    if (editorInitializationPromise) return editorInitializationPromise;
+
+    editorInitializationPromise = (async () => {
+      while (!isComponentDestroyed && element && !editor) {
+        const targetWorkspaceId = workspace?.id;
+        await initializeEditor();
+        if (editor || workspace?.id === targetWorkspaceId) return;
+      }
+    })().finally(() => {
+      editorInitializationPromise = null;
+    });
+
+    return editorInitializationPromise;
+  }
+
   // Cleanup
   function cleanup() {
     // Flush any pending save BEFORE destroying the editor
@@ -1355,35 +1382,35 @@
   // NOTE: These are NOT $state to avoid triggering reactive loops when updated in effects
   let lastKnownContent: string = '';
   let lastNoteId: string | undefined = undefined;
+  let lastWorkspaceId: string | undefined = undefined;
   let lastSaveTimestamp: string | null = null; // Track when last save happened
+  let noteConversionGeneration = 0;
 
   // Non-reactive dedupe guard for the safety-net effect.
   // Tracks the last Redux content snapshot that was already synced to externalUpdateVersion,
   // so the effect doesn't re-fire after its own increment.
   let lastSafetyNetSyncedContent: string | undefined = undefined;
 
-  // Debounce reinitialize to prevent rapid successive calls
-  let reinitializeTimeout: ReturnType<typeof setTimeout> | null = null;
-
   // Watch for note changes and reinitialize editor
   $effect(() => {
     // Read noteId reactively
     const currentNoteId = noteId;
+    const currentWorkspaceId = workspace?.id;
+    const workspaceChanged = currentWorkspaceId !== lastWorkspaceId;
+    const noteChanged = currentNoteId !== lastNoteId;
 
-    // Compare with non-reactive lastNoteId
-    if (currentNoteId !== lastNoteId) {
-      // Clear any pending reinitialize from previous rapid changes
-      if (reinitializeTimeout) {
-        clearTimeout(reinitializeTimeout);
-        reinitializeTimeout = null;
-      }
+    if (workspaceChanged || noteChanged) {
+      const conversionGeneration = ++noteConversionGeneration;
 
-      logger.debug('[NoteWithComments] Note ID changed, scheduling reinitialize', {
+      logger.debug('[NoteWithComments] Editor owner changed, scheduling reinitialize', {
+        oldWorkspaceId: lastWorkspaceId,
+        newWorkspaceId: currentWorkspaceId,
         oldNoteId: lastNoteId,
         newNoteId: currentNoteId,
       });
 
       // Update tracking variables (non-reactive, won't trigger re-runs)
+      lastWorkspaceId = currentWorkspaceId;
       lastNoteId = currentNoteId;
       lastKnownContent = '';
       hasUserEditedSinceLastSave = false;
@@ -1401,8 +1428,49 @@
       commentManager = destroyAndClearCommentManagerV2(commentManager);
 
       // If editor exists and note changed, reinitialize
-      if (editor && isInitialized) {
+      if (editor) {
+        if (workspaceChanged) {
+          // Extension options are immutable for an editor instance. Tear down the
+          // old editor without flushing it through the new workspace prop, then
+          // create a fresh instance with the new explicit owner.
+          taskAgentStatusMountManager.destroy();
+          cleanupFn?.();
+          cleanupFn = null;
+          editor = null!;
+          isInitialized = false;
+          isInitializing = true;
+
+          void ensureCurrentWorkspaceEditor()
+            .then(() => {
+              if (
+                isComponentDestroyed ||
+                conversionGeneration !== noteConversionGeneration ||
+                workspace?.id !== currentWorkspaceId
+              ) {
+                return;
+              }
+              isInitializing = false;
+              isInitialized = true;
+            })
+            .catch((error) => {
+              logger.error('[NoteWithComments] Failed to recreate editor for workspace', error);
+              if (conversionGeneration === noteConversionGeneration) {
+                isInitializing = false;
+                isInitialized = true;
+              }
+            });
+          return;
+        }
+
         const newContent = currentNoteContent;
+        const conversionEditor = editor;
+        const conversionWorkspaceId = workspace?.id;
+        const conversionShowComments = showComments;
+        const ownsConversion = () =>
+          !isComponentDestroyed &&
+          conversionGeneration === noteConversionGeneration &&
+          editor === conversionEditor &&
+          !conversionEditor.isDestroyed;
 
         // Guard: if new note content exceeds the safe size limit, show plain text fallback
         if (newContent.length > MAX_NOTE_CONTENT_SIZE) {
@@ -1430,22 +1498,40 @@
         processMarkdownToHTML(newContent, {
           preserveAnchors: true,
         }).then(async (newHtmlContent) => {
-          if (!editor || editor.isDestroyed) return;
+          if (!ownsConversion()) return;
 
           const onContentChanged = createOnCommentManagerContentChangedUpdateLastKnownContent({
-            getEditor: () => editor,
+            getEditor: () => (ownsConversion() ? conversionEditor : null),
             processHTMLToMarkdown,
             setLastKnownContent: (content) => {
-              lastKnownContent = content;
+              if (ownsConversion()) lastKnownContent = content;
             },
           });
 
+          const initializeCommentManager = async () => {
+            const nextCommentManager = await maybeCreateCommentManagerV2({
+              showComments: conversionShowComments,
+              workspaceId: conversionWorkspaceId,
+              noteId: currentNoteId,
+              editor: conversionEditor,
+              onContentChanged,
+            });
+
+            if (!ownsConversion()) {
+              destroyAndClearCommentManagerV2(nextCommentManager);
+              return false;
+            }
+
+            commentManager = nextCommentManager;
+            return true;
+          };
+
           // Save cursor position before updating
-          const cursorPos = editor.state.selection.$head.pos;
+          const cursorPos = conversionEditor.state.selection.$head.pos;
 
           // Mark this as an external update to prevent orphan checks
           const didUpdate = applyExternalUpdateHtmlToEditorPreservingCursor({
-            editor,
+            editor: conversionEditor,
             html: newHtmlContent,
             cursorPos,
             createTextSelection: TextSelection.create,
@@ -1456,16 +1542,11 @@
 
           if (!didUpdate) {
             // Content is the same, no need to update
-            commentManager = await maybeCreateCommentManagerV2({
-              showComments,
-              workspaceId: workspace?.id,
-              noteId,
-              editor,
-              onContentChanged,
-            });
+            if (!(await initializeCommentManager())) return;
 
             // Ensure flags are cleared even when no update is needed.
             setTimeout(() => {
+              if (!ownsConversion()) return;
               isInitializing = false;
               isUpdatingFromExternal = false;
             }, 200);
@@ -1476,19 +1557,38 @@
           syncTaskAgentAssociations();
 
           // After content is set, initialize comment manager for the new note
-          commentManager = await maybeCreateCommentManagerV2({
-            showComments,
-            workspaceId: workspace?.id,
-            noteId,
-            editor,
-            onContentChanged,
-          });
+          if (!(await initializeCommentManager())) return;
 
           setTimeout(() => {
+            if (!ownsConversion()) return;
             isInitializing = false;
             isUpdatingFromExternal = false;
           }, 200);
         });
+      }
+
+      if (workspaceChanged && element && !editor) {
+        isInitialized = false;
+        isInitializing = true;
+        void ensureCurrentWorkspaceEditor()
+          .then(() => {
+            if (
+              isComponentDestroyed ||
+              conversionGeneration !== noteConversionGeneration ||
+              workspace?.id !== currentWorkspaceId
+            ) {
+              return;
+            }
+            isInitializing = false;
+            isInitialized = true;
+          })
+          .catch((error) => {
+            logger.error('[NoteWithComments] Failed to initialize editor for workspace', error);
+            if (conversionGeneration === noteConversionGeneration) {
+              isInitializing = false;
+              isInitialized = true;
+            }
+          });
       }
     }
   });
@@ -1636,13 +1736,9 @@
     // from accessing reactive state after destruction, which would cause
     // "N is not a function" errors in Svelte's reactive system.
     isComponentDestroyed = true;
+    noteConversionGeneration += 1;
 
     taskAgentStatusMountManager.destroy();
-    // Clean up reinitialize timeout
-    if (reinitializeTimeout) {
-      clearTimeout(reinitializeTimeout);
-      reinitializeTimeout = null;
-    }
   });
 
   // Lifecycle
@@ -1704,7 +1800,7 @@
             try {
               if (editor && !editor.isDestroyed && editor.view) {
                 editor.view.focus();
-                editor.commands.focus('end');
+                editor.commands.focus('start');
               }
             } catch {
               // Editor view may not be fully mounted yet - safe to ignore
@@ -1734,10 +1830,7 @@
       // Fall back to navigation history
       if (!workspace?.id || !noteId) return;
 
-      const navigation = selectWorkspaceNavigationHistory.select(
-        appStore.state,
-        workspace.id,
-      );
+      const navigation = selectWorkspaceNavigationHistory.select(appStore.state, workspace.id);
       // Get the current navigation entry
       const currentEntry = navigation.history[navigation.currentIndex];
       if (
@@ -1760,7 +1853,7 @@
 
     // Defer editor initialization to next tick for better perceived performance
     requestAnimationFrame(() => {
-      initializeEditor()
+      ensureCurrentWorkspaceEditor()
         .then(() => {
           // Use requestAnimationFrame instead of setTimeout for smoother transition
           requestAnimationFrame(() => {
@@ -1828,7 +1921,11 @@
               // re-check — the flag latches on the first local edit, and genuinely
               // unsaved edits are protected downstream by
               // shouldRejectExternalUpdateDueToUnsavedEdits in the update pipeline.
-              if (delayedContent !== undefined && delayedContent !== lastKnownContent && !isUserTyping) {
+              if (
+                delayedContent !== undefined &&
+                delayedContent !== lastKnownContent &&
+                !isUserTyping
+              ) {
                 logger.info(
                   '[NoteWithComments] Delayed re-check: content diverged, triggering update',
                   {
@@ -2011,23 +2108,14 @@
             suggestion={selectedSuggestion}
             x={tooltipPosition.x}
             y={tooltipPosition.y}
-            onAccept={() => {
-              selectedSuggestion = null;
-            }}
-            onReject={() => {
-              selectedSuggestion = null;
-            }}
+            onAccept={() => void handleSuggestionDecision('accept')}
+            onReject={() => void handleSuggestionDecision('reject')}
           />
         {/if}
 
         <!-- Bubble Menu for formatting and comments -->
         {#if editor && !shouldShowRawNoteView}
-          <BubbleMenu
-            {editor}
-            {workspace}
-            {noteId}
-            onAddComment={handleAddCommentClick}
-          />
+          <BubbleMenu {editor} {workspace} {noteId} onAddComment={handleAddCommentClick} />
         {/if}
 
         <!-- Comment Dialog -->
@@ -2153,7 +2241,7 @@
     border-radius: 0.5rem;
     margin: 1.5rem 0;
     /* Subtle shadow for images that break out of text column */
-    box-shadow: 0 1px 3px 0 hsl(var(--foreground) / 0.04);
+    box-shadow: var(--elevation-raised);
   }
 
   /* Highlight for comment marks */

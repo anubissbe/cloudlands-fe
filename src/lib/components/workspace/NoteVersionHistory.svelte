@@ -1,7 +1,7 @@
 <script lang="ts">
   import type { NoteVersion } from '$shared/types';
   import { formatDistanceToNow } from '$lib/i18n/format';
-  import DiffViewer from '$lib/components/ui/diff/DiffViewer.svelte';
+  import DiffViewer from '$features/file-tracking/components/diff/DiffViewer.svelte';
   import { Button } from '$lib/components/ui/button';
   import Fa from 'svelte-fa';
   import { faRotateLeft } from '@fortawesome/free-solid-svg-icons';
@@ -9,6 +9,7 @@
   import { fetchNoteVersions } from '$store/renderer/slices/workspace-notes/workspace-notes-slice';
   import { selectNoteVersions } from '$store/renderer/slices/workspace-notes/workspace-notes-selectors';
   import { store as appStore } from '$store/renderer/store';
+  import { writable } from 'svelte/store';
   import { m } from '$shared/paraglide/messages.js';
 
   let {
@@ -25,7 +26,17 @@
     onRestore?: (versionId: string) => void;
   } = $props();
 
-  const noteVersionsState = selectNoteVersions(workspace.id);
+  // Writable store mirrors workspace.id so the Redux selector re-evaluates
+  // when the workspace prop changes (selector readables are init-time only).
+  // svelte-ignore state_referenced_locally - intentional initial capture; the $effect below syncs later changes
+  const workspaceIdStore = writable(workspace.id);
+  $effect(() => {
+    workspaceIdStore.set(workspace.id);
+    // Reset any local selection when the workspace changes so displayContent
+    // never indexes the new workspace's versions with a stale selection.
+    selectedVersionIndex = null;
+  });
+  const noteVersionsState = selectNoteVersions(workspaceIdStore);
 
   const versions = $derived(
     $noteVersionsState?.versions ? [...$noteVersionsState.versions].reverse().slice(0, 10) : [],
@@ -111,13 +122,19 @@
       class:selected={selectedVersionIndex === null}
       onclick={() => (selectedVersionIndex = null)}
     >
-      <span class="text-ui font-mono font-medium">{m.workspace_noteVersionHistory_current_label()}</span>
+      <span class="text-ui font-mono font-medium"
+        >{m.workspace_noteVersionHistory_current_label()}</span
+      >
     </button>
 
     {#if loading}
-      <div class="px-2.5 py-1.5 text-ui text-subtle">{m.workspace_noteVersionHistory_loading_label()}</div>
+      <div class="px-2.5 py-1.5 text-ui text-subtle">
+        {m.workspace_noteVersionHistory_loading_label()}
+      </div>
     {:else if error}
-      <div class="px-2.5 py-1.5 text-ui text-destructive-foreground">{m.workspace_noteVersionHistory_error_label()}</div>
+      <div class="px-2.5 py-1.5 text-ui text-error-foreground">
+        {m.workspace_noteVersionHistory_error_label()}
+      </div>
     {:else}
       {#each versions as version, index (version.versionId)}
         <button
@@ -136,9 +153,13 @@
   <!-- Diff area -->
   <div class="flex flex-col flex-1 min-w-0">
     {#if selectedVersionIndex !== null}
-      <div class="flex items-center justify-between gap-2 px-3 py-1.5 border-b border-border shrink-0">
+      <div
+        class="flex items-center justify-between gap-2 px-3 py-1.5 border-b border-border shrink-0"
+      >
         <div class="flex items-center gap-1.5 text-ui text-subtle min-w-0">
-          <span class="font-medium text-foreground">V{versions[selectedVersionIndex].versionNumber}</span>
+          <span class="font-medium text-foreground"
+            >V{versions[selectedVersionIndex].versionNumber}</span
+          >
           <span>·</span>
           <span>{formatRelativeTime(versions[selectedVersionIndex].createdAt)}</span>
           {#if versions[selectedVersionIndex].author?.name}

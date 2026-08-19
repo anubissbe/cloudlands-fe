@@ -2,6 +2,10 @@
 
 Quick routing guide for AI agents. Start here, then open the smallest relevant doc.
 
+> **Merge permission**: never merge a PR or arm auto-merge without explicit permission
+> from a human — approved + green is not enough. See the monorepo root
+> [`AGENTS.md`](../../AGENTS.md) (resolves in a monorepo checkout) for the full rule.
+
 ## Tech stack
 
 - Electron + SvelteKit + TypeScript desktop app
@@ -27,31 +31,33 @@ src/
 
 ## Where to look
 
-| Working on…         | Open                                                                  |
-| ------------------- | --------------------------------------------------------------------- |
-| agents              | docs/AGENT_ARCHITECTURE.md                                            |
-| state/store         | docs/STATE_MANAGEMENT.md, src/store/renderer/docs/                    |
-| UI components       | docs/COMPONENT_RESPONSIBILITIES.md                                    |
-| component design    | docs/COMPONENTS_DESIGN.md                                             |
-| panels/layout       | docs/panel-system-refactoring.md, docs/proposals/PANEL_TAB_UX_SPEC.md |
-| PR descriptions     | docs/PR_DESCRIPTION_GUIDE.md                                          |
-| browser/CDP         | docs/BROWSER_PANEL_SPEC.md, docs/CDP_MCP_TOOLS.md                     |
-| module boundaries   | docs/MODULE_BOUNDARY_GUIDE.md                                         |
-| debugging           | docs/TROUBLESHOOTING_GUIDE.md, docs/IPC_DEBUG_GUIDE.md                |
-| error handling      | docs/ERROR_HANDLING_SYSTEM.md                                         |
-| TypeScript/types    | docs/TYPE_SYSTEM_GUIDE.md                                             |
-| events/IPC          | docs/EVENT_SYSTEM.md                                                  |
-| keybindings         | docs/KEYBINDINGS.md                                                   |
-| deploying/releasing | docs/real/DEPLOYING.md                                                |
+FE docs live in the monorepo's `docs/fe/` — the `../../docs/fe/` paths below resolve
+in a monorepo checkout, where this repo mounts at `packages/cloudlands-fe/`.
+
+| Working on…         | Open                                                                                       |
+| ------------------- | ------------------------------------------------------------------------------------------ |
+| agents              | ../../docs/fe/agent-message-dedup-and-stream-sagas.md, ../../docs/fe/RULES_SYSTEM.md       |
+| state/store         | ../../docs/fe/STATE_MANAGEMENT.md, src/store/renderer/docs/                                |
+| component design    | ../../docs/fe/COMPONENTS_DESIGN.md                                                         |
+| panels/layout       | ../../docs/fe/panel-system-refactoring.md, ../../docs/fe/PANEL_TAB_UX_SPEC.md              |
+| PR descriptions     | ../../docs/fe/PR_DESCRIPTION_GUIDE.md                                                      |
+| browser/CDP         | ../../docs/fe/BROWSER_PANEL_SPEC.md, ../../docs/fe/CDP_MCP_TOOLS.md                        |
+| module boundaries   | ../../docs/fe/MODULE_BOUNDARY_GUIDE.md                                                     |
+| debugging           | ../../docs/fe/TROUBLESHOOTING_GUIDE.md, ../../docs/fe/IPC_DEBUG_GUIDE.md                   |
+| error handling      | ../../docs/fe/ERROR_HANDLING_SYSTEM.md                                                     |
+| TypeScript/types    | ../../docs/fe/TYPE_SYSTEM_GUIDE.md                                                         |
+| events/IPC          | ../../docs/fe/EVENT_SYSTEM.md                                                              |
+| keybindings         | ../../docs/fe/KEYBINDINGS.md                                                               |
+| deploying/releasing | ../../docs/fe/DEPLOYING.md                                                                 |
 
 ## Key conventions
 
-- **Svelte stores are DEPRECATED** — All `.store.svelte.ts` files are migration targets. New shared/domain state MUST use Redux slices + sagas (ephemeral component-local UI state is fine without Redux). If refactoring encounters `.store.svelte.ts` usage, do not expand or entrench it — follow the [Migration Guide](src/store/renderer/docs/MIGRATION_GUIDE.md) to move toward complete store removal. See `docs/STATE_MANAGEMENT.md`.
+- **Svelte stores are DEPRECATED** — All `.store.svelte.ts` files are migration targets. New shared/domain state MUST use Redux slices + sagas (ephemeral component-local UI state is fine without Redux). If refactoring encounters `.store.svelte.ts` usage, do not expand or entrench it — follow the [Migration Guide](src/store/renderer/docs/MIGRATION_GUIDE.md) to move toward complete store removal. See `../../docs/fe/STATE_MANAGEMENT.md`.
 - Use `pnpm`, not `npm`.
 - Put renderer product work in `src/features/`; shared utilities live in `src/lib/`.
 - Create agents via `agentFactory.createAgent()`.
 - Keep shared app state in `src/store/renderer/`, not ad-hoc component state.
-- **Selector readables belong at component init only** — `selector()` uses Svelte context and must not run in event handlers or callbacks. Dispatch actions and perform one-time selector reads through the configured app `Store` instance, e.g. `store.dispatch(action)` and `selector.select(store.state, ...args)`. See `docs/STATE_MANAGEMENT.md` for details.
+- **Selector readables belong at component init only** — `selector()` uses Svelte context and must not run in event handlers or callbacks. Dispatch actions and perform one-time selector reads through the configured app `Store` instance, e.g. `store.dispatch(action)` and `selector.select(store.state, ...args)`. See `../../docs/fe/STATE_MANAGEMENT.md` for details.
 - **Never import from a feature's **`main/`** subtree in renderer code** (or vice-versa).
 - **Don't export utility functions from orchestration modules** — extract to a dedicated `utils/` file.
 - **Keep utilities dependency-light** — no stores, services, or side effects.
@@ -67,7 +73,7 @@ All user-facing strings (labels, aria-labels, placeholders, tooltips, toasts, er
 - **Module-scope constants** holding localized text use property getters (`get description() { return m.…() }`) so strings re-evaluate on locale change; identifier-bearing fields stay literal.
 - **Exemptions** — log lines, wire/IPC constants, agent-generated content, brand names, file paths, URLs, shell commands — mark with `// i18n-ignore (reason)` or `<!-- i18n-ignore (reason) -->` on the same line or the line above.
 - **Enforcement**: `scripts/check-hardcoded-strings.mjs` (chained into `pnpm run lint`) blocks hardcoded strings inside `ENFORCED_DIRS`. New features in enforced dirs must be string-free from day one; when you migrate a directory to messages, add it to `ENFORCED_DIRS`.
-- **Catalog completeness**: `scripts/check-i18n-completeness.mjs` (also chained into `pnpm run lint`) fails CI when any locale catalog diverges from `messages/en.json` — missing keys, extra keys, per-key `{param}` placeholder mismatches, unpaired `_one`/`_many` plurals — or when `messages/*.json` files and the `project.inlang/settings.json` locale registration disagree.
+- **Catalog completeness**: `scripts/check-i18n-completeness.mjs` (also chained into `pnpm run lint`) fails CI when any locale catalog diverges from `messages/en.json` — missing keys, extra keys, per-key `{param}` placeholder mismatches, unpaired `_one`/`_many` plurals — or when `messages/*.json` files and the `project.inlang/settings.json` locale registration disagree. It also flags non-base values byte-identical to the English value when they contain letters (letter-free values are auto-exempt): translate them, or record intentional invariants (brand names, placeholder-only strings, etc.) in `scripts/i18n-equal-allowlist.json` (per key, `"*"` or a locale array); stale allowlist entries fail the check.
 - **Reference example**: `src/lib/components/settings` (the pilot extraction).
 
 ## Common commands
@@ -82,6 +88,86 @@ pnpm run format        # Prettier
 pnpm run test:unit     # Vitest suite
 pnpm run test:playwright
 ```
+
+## Dogfooding a dev FE against the production daemon (UDS→WS bridge)
+
+The monorepo ships a source-only dev shim — `scripts/uds-ws-bridge.mjs`, run as
+`make uds-to-unauthed-wss-bridge` from a monorepo checkout (not shipped in any package) —
+that exposes the installed production intentd's UDS socket as an **UNAUTHENTICATED**
+plain `ws://` endpoint on `127.0.0.1:51337/ws` (`BRIDGE_PORT` / `INTENTD_SOCKET`
+override the defaults). It lets a dev FE debug against the real daemon without touching
+the daemon's auth posture (UDS + authed WSS for iOS stay as-is). Loopback-only is by
+design — the bridge refuses non-loopback binds, and while it runs the full
+unauthenticated daemon API is on that port — never expose it beyond localhost.
+
+### Loop A — web build in an embedded tab (primary; renderer/UI work)
+
+Live-proven flow (zero FE changes needed):
+
+1. From the monorepo root: `make uds-to-unauthed-wss-bridge` → bridge on
+   `ws://127.0.0.1:51337/ws`.
+2. `VITE_INTENTD_WS_URL=ws://127.0.0.1:51337/ws pnpm dev:web` — with no Electron preload
+   the renderer selects the browser WebSocket transport and speaks JSON-RPC directly
+   over the bridge (plain `ws://` is accepted for loopback hosts only; anything else
+   needs `wss://`).
+3. Open the vite dev URL in an embedded tab of the running packaged app via
+   `browser.exec` (`openTab` / `navigate`) using an `http://daemon.localhost:<port>`
+   URL, then drive the tab with `screenshot` / `evaluate` / `getAccessibilityTree`.
+   Humans can eyeball the same tab. REV-1 first-client stickiness is a feature here:
+   the reverse call lands on the packaged app, which hosts the tab.
+
+Always give `browser.exec` `http://daemon.localhost:<port>` URLs and let the client
+resolve them: same-machine setups rewrite to `127.0.0.1`; with a **remote daemon** the
+embedded tab renders on the client machine, and an unreachable daemon-loopback port is
+automatically tunneled (`openTab`/`navigate` echo `tunneled: true` plus the client-local
+forward URL). In the remote case the page itself also dials the bridge from the client,
+so mint a forward for the bridge port first — open a tab to
+`http://daemon.localhost:51337/`, read the client-local port from the tunneled echo (the
+tab shows the bridge's HTTP 400 "This is a WebSocket endpoint" body — that error page is
+the success signal, the forward is minted regardless) — and restart dev:web with
+`VITE_INTENTD_WS_URL=ws://127.0.0.1:<client-local-port>/ws`.
+Expect a slow cold load over the tunnel (dev mode serves ~250 module requests).
+
+Tunnel forwards are **persistent** — the minted `localPort` is stable, so baking it into
+`VITE_INTENTD_WS_URL` is safe. Whether minted explicitly (`openTunnel`) or implicitly
+(the `openTab`/`navigate` fallback above), a forward has no idle expiry and survives
+`/tunnel` WebSocket drops: the local listener (and its port) stays open and the next
+accepted connection lazily reconnects the tunnel. A forward closes only on explicit
+`closeTunnel`, a backend switch (forwards target the old daemon's loopback), app quit,
+or — for forwards minted on behalf of a workspace — when every owning workspace has been
+archived or deleted (refcounted; a port shared by several workspaces closes with the
+last owner, and forwards minted with no workspace are app-lifetime). One exception: a
+definitively connection-refused daemon-side port (e.g. the bridge process died) drops
+that forward immediately — re-run `openTunnel` (or the openTab probe) to re-mint it.
+
+### Loop B — dev Electron FE + CDP (Electron shell work)
+
+When the change touches Electron main/preload/native/sidecar, Loop A cannot see it —
+run the dev Electron FE on the daemon machine with `pnpm run dev:cdp` (sets
+`ENABLE_CDP_DEBUG=true`; remote-debugging port 9223 by default — the launcher picks the
+first free port from 9223, so read the actual value from its output, e.g.
+`CDP targets: http://127.0.0.1:<port>/json/list` — and every webContents — app window
+and embedded tabs — is a target) and attach CDP locally. See
+`../../docs/fe/CDP_MCP_TOOLS.md`.
+
+### Caveats
+
+- The web build has no Electron preload: daemon RPCs work over the WS transport, but
+  Electron-only capabilities (native dialogs, window management, some IPC-bridged
+  channels) are absent or mocked — Loop A covers renderer/UI work only.
+- `browser.exec` reaches embedded tabs only, never the app's own chrome — inspecting
+  the Electron shell itself is always Loop B/CDP.
+
+## PR test builds
+
+`.github/workflows/manual-signed-build.yml` ("Manual Signed Build") is dispatch-only and
+builds any branch/ref — e.g. a PR branch — into platform-specific installers for testing:
+`gh workflow run manual-signed-build.yml --ref <pr-branch> -f build_macos=true` (also
+`build_windows` / `build_linux`; `sign` defaults to true — macOS Developer ID +
+notarization, Windows DigiCert). Output is installers + blockmaps only, uploaded as
+short-lived workflow artifacts (7-day retention), version-suffixed `-manual.<run_number>`.
+Nothing publishes to intent-hq/cloudlands-releases and no auto-updater manifest is
+produced — manual install/testing only.
 
 ## Verification
 
@@ -161,7 +247,7 @@ active-streams fan-out). Prefer a targeted query for the affected workspace, or 
 daemon-side aggregate that returns everything in one RPC — if none exists, request one
 on the BE rather than looping on the client.
 
-### Mutation middleware & soft-hide-then-commit
+### Saga-owned mutations & soft-hide-then-commit
 
 Some async-action triggers (`*Requested` actions with a `.promise`) lost their handlers
 when the saga runtime was removed. They are re-homed in a **mutation middleware** rather
@@ -172,24 +258,25 @@ reducer runs, calls the `AppClient` seam and dispatches the per-dispatch
 dependency-light (no selector imports — they evaluate `store.createSelector` at chain
 construction); read state directly off `appStore.state` and import the toast lib lazily.
 
-Agent **deletion** uses a **soft-hide-then-commit** pattern (the handlers live in that
-same middleware):
+Agent **deletion** uses the **daemon-owned delete grace window** (PROTOCOL §5.5, v6.7+;
+the handlers live in the agent mutation saga):
 
-- `deleteAgentWithUndoRequested` optimistically **soft-hides** the session locally (drops
-  it from the visible list) **without** calling the daemon, shows an Undo toast, and arms a
-  15s commit timer. The action resolves immediately with the removed session.
-- `undoAgentDeletionRequested` cancels the timer and **un-hides** the session — no daemon
-  call, because the delete was never sent.
-- `commitPendingAgentDeletionRequested` / `flushPendingAgentDeletionsRequested` (and the
-  timer elapsing) call the real `appClient.agents.delete` (`agent.delete`, PROTOCOL §5.5).
-  On success the daemon emits `agent:deleted` (in `AGENT_LIFECYCLE_EVENTS`), so the
-  reactive `subscribe` refetch reconciles the list — the FE does not hand-roll list
-  mutation. On failure the session is un-hidden and the error surfaced.
+- `deleteAgentWithUndoRequested` **soft-hides** the session locally (drops it from the
+  visible list) and sends `agent.delete { undoDelayMs: 15000 }` **immediately**, so the
+  daemon owns the 15s window and commits at the deadline even if the FE quits or crashes
+  mid-window. The action resolves with the removed session once the daemon acks the
+  schedule; a wire failure un-hides the session and rejects.
+- `undoAgentDeletionRequested` issues the race-safe `agent.cancelDelete`:
+  `{ cancelled: true }` un-hides the session; `{ cancelled: false }` (already committed)
+  surfaces a "could not undo" toast without resurrecting it.
+- There is **no FE-side commit timer or flush** — the daemon commits at the deadline and
+  emits `agent:deleted` (in `AGENT_LIFECYCLE_EVENTS`), so the reactive `subscribe`
+  refetch reconciles the list — the FE does not hand-roll list mutation.
 
-Why not a true undo? Once `agent.delete` reaches the daemon the deletion is permanent, so
-"undo" can only exist **before** commit. Deferring the wire call for the undo window is the
-only way to offer undo without a daemon-side restore path. The pending deletions are
-transient UI-only state (a module-level `Map`), never Redux.
+The pending deletions are transient UI-only state (a module-level `Map`), never Redux.
+During the window (and for a tombstone grace period after the deadline, so stale
+refetches cannot resurrect the agent) read paths consult `isAgentDeletionPending()` and
+drop wire rows carrying the additive `pendingDeleteAt` field.
 
 ### Testing — every feature/fix against a mock BE
 
@@ -219,18 +306,10 @@ above) before opening a PR.
 
 ## Filing issues
 
-When you encounter a bug or limitation while working on this codebase, file a GitHub
-issue on [intent-hq/monorepo](https://github.com/intent-hq/monorepo/issues) — the single
-tracker for all components. Do not track issues in markdown files.
-
-- **Labels**: apply the appropriate `component:*` label (`component:fe` for this repo)
-  plus `agent-filed`.
-- **Aggressive dedup**: search existing issues first
-  (`gh issue list --repo intent-hq/monorepo --search "<keywords>" --state all`) and
-  comment on / link the existing issue instead of filing a duplicate.
-- **Cross-reference**: reference the issue number in related commits/PRs (e.g.
-  `fix: correct panel focus (#123)`).
-- **Fix references**: when a PR fixes a monorepo issue, use the full cross-repo form
-  `Fixes intent-hq/monorepo#N` in the squash-commit message or PR body — it auto-closes
-  the issue on merge and lets the release notifier (`scripts/notify-fixed-issues.sh`)
-  comment on it when the fix ships in a beta/stable release.
+File bugs on [intent-hq/monorepo](https://github.com/intent-hq/monorepo/issues) — the
+single tracker for all components; never track issues in markdown files. Label with
+`component:fe` + `agent-filed`. See the root [`AGENTS.md`](../../AGENTS.md) → Filing
+Issues for the full conventions (dedup, cross-referencing, `Fixes intent-hq/monorepo#N` —
+the release notifier `scripts/notify-fixed-issues.sh` comments on the issue once a
+release fully delivers the fix, i.e. every linked fix PR across cloudlands-fe and
+intentd is merged and contained in the released versions).

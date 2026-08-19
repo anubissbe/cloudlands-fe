@@ -1,9 +1,4 @@
-import {
-  describe,
-  expect,
-  it,
-  vi,
-} from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import type { AuggieModel } from '$features/auggie/auggie-models.client';
 import type { DropdownOption } from '$lib/components/ui/dropdown';
@@ -11,15 +6,12 @@ import type { DropdownOption } from '$lib/components/ui/dropdown';
 // The picker utils normalize provider ids via the providerCatalog slice —
 // provide a hydrated §5.38-shaped mock state instead of booting the full store.
 vi.mock('$store/renderer/store', async () => {
-  const { createAppStoreMockModule } = await import(
-    '$store/renderer/utils/test-helpers/store-mock'
-  );
-  const { initialState, providerCatalogLoaded, providerCatalogReducer } = await import(
-    '$store/renderer/slices/provider-catalog/provider-catalog-slice'
-  );
-  const { MOCK_PROVIDER_CATALOG } = await import(
-    '../../../../test/fixtures/provider-catalog.fixture'
-  );
+  const { createAppStoreMockModule } =
+    await import('$store/renderer/utils/test-helpers/store-mock');
+  const { initialState, providerCatalogLoaded, providerCatalogReducer } =
+    await import('$store/renderer/slices/provider-catalog/provider-catalog-slice');
+  const { MOCK_PROVIDER_CATALOG } =
+    await import('../../../../test/fixtures/provider-catalog.fixture');
   const providerCatalog = providerCatalogReducer(
     initialState,
     providerCatalogLoaded(MOCK_PROVIDER_CATALOG),
@@ -27,7 +19,12 @@ vi.mock('$store/renderer/store', async () => {
   return createAppStoreMockModule({ state: () => ({ providerCatalog }) });
 });
 
-import { findModelFallbackOption, isUserProviderSettled } from './model-picker-utils';
+import {
+  collapseCodexEffortModels,
+  findModelFallbackOption,
+  isUserProviderSettled,
+  normalizeModelIdForMatch,
+} from './model-picker-utils';
 
 const sampleModel: AuggieModel = { value: 'auggie:sonnet4.6', label: 'Sonnet 4.6' };
 const sampleDropdownOption: DropdownOption = {
@@ -35,6 +32,75 @@ const sampleDropdownOption: DropdownOption = {
   label: 'Sonnet 4.6',
   description: 'A model',
 };
+
+describe('normalizeModelIdForMatch', () => {
+  it('matches a bare session model to its compound catalog id when the default is unresolved', () => {
+    expect(normalizeModelIdForMatch('gpt5.6-sol', 'auggie')).toBe('auggie:gpt5.6-sol');
+    expect(normalizeModelIdForMatch('auggie:gpt5.6-sol', 'auggie')).toBe('auggie:gpt5.6-sol');
+  });
+
+  it('preserves an explicit different provider', () => {
+    expect(normalizeModelIdForMatch('codex:gpt5.6-sol', 'auggie')).toBe('codex:gpt5.6-sol');
+  });
+});
+
+describe('collapseCodexEffortModels', () => {
+  it('collapses live-shaped Codex effort rows to one base model', () => {
+    const result = collapseCodexEffortModels([
+      {
+        value: 'codex:gpt-5.6-sol[LOW]',
+        label: 'GPT-5.6-Sol',
+        description: 'Low reasoning effort',
+        effortLevels: ['low'],
+      },
+      {
+        value: 'codex:gpt-5.6-sol/medium',
+        label: 'GPT-5.6-Sol',
+        description: 'Codex model with balanced speed and intelligence',
+        effortLevels: ['medium'],
+      },
+      {
+        value: 'codex:gpt-5.6-sol:xhigh',
+        label: 'GPT-5.6-Sol',
+        description: 'Higher effort',
+        effortLevels: ['xhigh'],
+      },
+      {
+        value: 'codex:gpt-5.6-sol[ultra]',
+        label: 'GPT-5.6-Sol (Ultra)',
+        description: 'Ultra reasoning effort',
+        effortLevels: ['ultra', 'high', 'custom'],
+        isDefault: true,
+      },
+    ]);
+
+    expect(result).toEqual([
+      expect.objectContaining({
+        value: 'codex:gpt-5.6-sol',
+        label: 'GPT-5.6-Sol',
+        description: 'Codex model with balanced speed and intelligence',
+        effortLevels: ['low', 'medium', 'high', 'xhigh', 'ultra', 'custom'],
+        isDefault: true,
+      }),
+    ]);
+  });
+
+  it('keeps the same base id isolated across providers', () => {
+    const result = collapseCodexEffortModels([
+      { value: 'codex:gpt-5.5[none]', label: 'GPT-5.5 (none)' },
+      { value: 'auggie:gpt-5.5[none]', label: 'Auggie GPT-5.5 (none)' },
+    ]);
+
+    expect(result).toEqual([
+      expect.objectContaining({
+        value: 'codex:gpt-5.5',
+        label: 'GPT-5.5',
+        effortLevels: ['none'],
+      }),
+      { value: 'auggie:gpt-5.5[none]', label: 'Auggie GPT-5.5 (none)' },
+    ]);
+  });
+});
 
 describe('isUserProviderSettled', () => {
   it('returns false while a disabled agent provider fetch is still pending', () => {

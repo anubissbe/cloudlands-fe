@@ -152,21 +152,21 @@
     width: 7px;
     height: 7px;
     border-radius: 50%;
-    background: hsl(var(--destructive-foreground));
+    background: hsl(var(--error-foreground));
   }
   .hud-footer-dot-online {
     background: hsl(var(--primary));
     animation: hudpulse 2.2s ease-in-out infinite;
   }
   .hud-footer-system-key {
-    color: hsl(var(--text-subtle));
+    color: hsl(var(--muted-foreground));
     letter-spacing: 0.12em;
   }
   .hud-footer-online {
     color: hsl(var(--primary));
   }
   .hud-footer-offline {
-    color: hsl(var(--destructive-foreground));
+    color: hsl(var(--error-foreground));
     animation: hudblink 1.6s step-end infinite;
   }
   .hud-footer-stats {
@@ -182,7 +182,7 @@
     align-items: baseline;
   }
   .hud-footer-stat-key {
-    color: hsl(var(--text-ghost));
+    color: hsl(var(--muted-foreground) / 0.65);
   }
   .hud-footer-stat-value {
     font-size: 15px;
@@ -202,13 +202,13 @@
   /* Canonical HUD_STATE_COLORS tokens (hud-card-meta): idle grey, unread/PR
      blue, completed the same stable green as running. */
   .hud-stat-idle {
-    color: hsl(var(--text-ghost));
+    color: hsl(var(--muted-foreground) / 0.65);
   }
   .hud-stat-unread {
     color: hsl(var(--ring));
   }
   .hud-stat-fail {
-    color: hsl(var(--destructive-foreground));
+    color: hsl(var(--error-foreground));
   }
   .hud-stat-completed {
     color: hsl(var(--primary));
@@ -217,7 +217,7 @@
     animation: hudblink 1.6s step-end infinite;
   }
   .hud-stat-zero {
-    color: hsl(var(--text-subtle));
+    color: hsl(var(--muted-foreground));
   }
   .hud-footer-versions {
     margin-left: auto;
@@ -226,7 +226,7 @@
     gap: 10px;
     font-size: 11px;
     letter-spacing: 0.08em;
-    color: hsl(var(--text-subtle));
+    color: hsl(var(--muted-foreground));
     white-space: nowrap;
   }
   .hud-footer-version-sep {

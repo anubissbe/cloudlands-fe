@@ -4,11 +4,10 @@
  * Actions and reducer for tracking ACP provider availability status.
  */
 
-import { createAction } from '$lib/store-shim/utils/store/create-action';
-import { createReducer } from '$lib/store-shim/utils/store/create-reducer';
+import { createAction } from '@augmentcode/themis/utils/store/create-action';
+import { createReducer } from '@augmentcode/themis/utils/store/create-reducer';
 import type {
   AgentAvailabilityState,
-  ManagedInstallStatus,
   ProviderStatus,
 } from './agent-availability-types';
 import type { NpxStatus } from '$shared/types/provider-availability';
@@ -20,6 +19,7 @@ import type { NpxStatus } from '$shared/types/provider-availability';
 export const initialState: AgentAvailabilityState = {
   providerStatusMap: {},
   providerLoadingMap: {},
+  providerCheckEpochMap: {},
   providerUserInfoLoadingMap: {},
   hasCheckedOnce: false,
   watchedTerminalIds: [],
@@ -35,11 +35,17 @@ export const checkSingleProviderRequested = createAction<[providerId: string]>(
   'agentAvailability/checkSingleProviderRequested',
 );
 
-export const checkSingleProviderSuccess = createAction<[providerId: string, status: ProviderStatus]>(
-  'agentAvailability/checkSingleProviderSuccess',
-);
+/**
+ * `epoch` is the provider's check generation captured when the probe started
+ * (see `providerCheckEpochMap`). The reducer drops the result when a newer
+ * check has started since, so a slow stale probe can never overwrite a
+ * fresher one. `undefined` skips the guard (direct dispatches in tests).
+ */
+export const checkSingleProviderSuccess = createAction<
+  [providerId: string, status: ProviderStatus, epoch?: number]
+>('agentAvailability/checkSingleProviderSuccess');
 
-export const checkSingleProviderFailure = createAction<[providerId: string]>(
+export const checkSingleProviderFailure = createAction<[providerId: string, epoch?: number]>(
   'agentAvailability/checkSingleProviderFailure',
 );
 
@@ -85,11 +91,6 @@ export const ensureProvidersChecked = createAction(
   'agentAvailability/ensureProvidersChecked',
 );
 
-export const setManagedInstallStatus = createAction<[
-  providerId: string,
-  status: Partial<ManagedInstallStatus>,
-]>('agentAvailability/setManagedInstallStatus');
-
 /** Set npx availability status from host.providerDiscovery response. */
 export const setNpxStatus = createAction<[npxStatus: NpxStatus | null]>(
   'agentAvailability/setNpxStatus',
@@ -99,33 +100,85 @@ export const setNpxStatus = createAction<[npxStatus: NpxStatus | null]>(
 // Reducer
 // ---------------------------------------------------------------------------
 
-export const agentAvailabilityReducer = createReducer<AgentAvailabilityState>(initialState)
-  .with(setAllProvidersLoading, (state, { payload: [loadingMap] }) => ({
+export const agentAvailabilityReducer = createReducer<AgentAvailabilityState>(initialState);
+
+/** Whether a result carrying `epoch` is stale (a newer check started since). */
+function isStaleResult(
+  state: AgentAvailabilityState,
+  providerId: string,
+  epoch: number | undefined,
+): boolean {
+  return epoch !== undefined && epoch !== (state.providerCheckEpochMap[providerId] ?? 0);
+}
+
+agentAvailabilityReducer.with(setAllProvidersLoading, (state, { payload: [loadingMap] }) => {
+  const providerCheckEpochMap = { ...state.providerCheckEpochMap };
+  for (const providerId of Object.keys(loadingMap)) {
+    providerCheckEpochMap[providerId] = (providerCheckEpochMap[providerId] ?? 0) + 1;
+  }
+  return {
     ...state,
     providerLoadingMap: loadingMap,
-  }))
-  .with(checkSingleProviderRequested, (state, { payload: [providerId] }) => ({
-    ...state,
-    providerLoadingMap: { ...state.providerLoadingMap, [providerId]: true },
-  }))
-  .with(checkSingleProviderSuccess, (state, { payload: [providerId, status] }) => ({
-    ...state,
-    providerStatusMap: { ...state.providerStatusMap, [providerId]: status },
-    providerLoadingMap: { ...state.providerLoadingMap, [providerId]: false },
-  }))
-  .with(checkSingleProviderFailure, (state, { payload: [providerId] }) => ({
-    ...state,
-    providerLoadingMap: { ...state.providerLoadingMap, [providerId]: false },
-  }))
-  .with(checkAllProvidersComplete, (state) => ({
+    providerCheckEpochMap,
+  };
+});
+agentAvailabilityReducer.with(checkSingleProviderRequested, (state, { payload: [providerId] }) => ({
+  ...state,
+  providerLoadingMap: { ...state.providerLoadingMap, [providerId]: true },
+  providerCheckEpochMap: {
+    ...state.providerCheckEpochMap,
+    [providerId]: (state.providerCheckEpochMap[providerId] ?? 0) + 1,
+  },
+}));
+agentAvailabilityReducer.with(
+  checkSingleProviderSuccess,
+  (state, { payload: [providerId, status, epoch] }) => {
+    // A newer check started while this probe was in flight — its result is
+    // stale (e.g. a pre-install focus sweep landing after a successful
+    // post-install recheck) and must not overwrite the fresher one. The
+    // newer check's own terminal action settles the loading flag.
+    if (isStaleResult(state, providerId, epoch)) return state;
+    return {
+      ...state,
+      providerStatusMap: { ...state.providerStatusMap, [providerId]: status },
+      providerLoadingMap: { ...state.providerLoadingMap, [providerId]: false },
+    };
+  },
+);
+agentAvailabilityReducer.with(
+  checkSingleProviderFailure,
+  (state, { payload: [providerId, epoch] }) => {
+    if (isStaleResult(state, providerId, epoch)) return state;
+    // Settle the in-flight flag but never fabricate a status or erase a
+    // previously successful one — a failed probe proves nothing about
+    // availability.
+    return {
+      ...state,
+      providerLoadingMap: { ...state.providerLoadingMap, [providerId]: false },
+    };
+  },
+);
+agentAvailabilityReducer.with(checkAllProvidersComplete, (state) => {
+  // A sweep where every probe failed lands no statuses — presenting it as
+  // "checked" would let consumers read the empty map as "confirmed nothing
+  // available" instead of "unknown".
+  if (state.hasCheckedOnce) return state;
+  if (Object.keys(state.providerStatusMap).length === 0) return state;
+  return {
     ...state,
     hasCheckedOnce: true,
-  }))
-  .with(fetchProviderUserInfoRequested, (state, { payload: [providerId] }) => ({
+  };
+});
+agentAvailabilityReducer.with(
+  fetchProviderUserInfoRequested,
+  (state, { payload: [providerId] }) => ({
     ...state,
     providerUserInfoLoadingMap: { ...state.providerUserInfoLoadingMap, [providerId]: true },
-  }))
-  .with(fetchProviderUserInfoSuccess, (state, { payload: [providerId, status] }) => {
+  }),
+);
+agentAvailabilityReducer.with(
+  fetchProviderUserInfoSuccess,
+  (state, { payload: [providerId, status] }) => {
     const existing = state.providerStatusMap[providerId];
     if (!existing) return state;
     return {
@@ -139,40 +192,31 @@ export const agentAvailabilityReducer = createReducer<AgentAvailabilityState>(in
         },
       },
     };
-  })
-  .with(fetchProviderUserInfoComplete, (state, { payload: [providerId] }) => ({
+  },
+);
+agentAvailabilityReducer.with(
+  fetchProviderUserInfoComplete,
+  (state, { payload: [providerId] }) => ({
     ...state,
     providerUserInfoLoadingMap: { ...state.providerUserInfoLoadingMap, [providerId]: false },
-  }))
-  .with(setManagedInstallStatus, (state, { payload: [providerId, managedStatus] }) => {
-    const existing = state.providerStatusMap[providerId] ?? { available: false };
-    return {
-      ...state,
-      providerStatusMap: {
-        ...state.providerStatusMap,
-        [providerId]: {
-          ...existing,
-          ...managedStatus,
-        },
-      },
-    };
-  })
-  .with(trackInstallTerminal, (state, { payload: [terminalId] }) => {
-    if (state.watchedTerminalIds.includes(terminalId)) return state;
-    return {
-      ...state,
-      watchedTerminalIds: [...state.watchedTerminalIds, terminalId],
-    };
-  })
-  .with(removeWatchedTerminal, (state, { payload: [terminalId] }) => {
-    const idx = state.watchedTerminalIds.indexOf(terminalId);
-    if (idx === -1) return state;
-    return {
-      ...state,
-      watchedTerminalIds: state.watchedTerminalIds.filter((id) => id !== terminalId),
-    };
-  })
-  .with(setNpxStatus, (state, { payload: [npxStatus] }) => ({
+  }),
+);
+agentAvailabilityReducer.with(trackInstallTerminal, (state, { payload: [terminalId] }) => {
+  if (state.watchedTerminalIds.includes(terminalId)) return state;
+  return {
     ...state,
-    npxStatus,
-  }));
+    watchedTerminalIds: [...state.watchedTerminalIds, terminalId],
+  };
+});
+agentAvailabilityReducer.with(removeWatchedTerminal, (state, { payload: [terminalId] }) => {
+  const idx = state.watchedTerminalIds.indexOf(terminalId);
+  if (idx === -1) return state;
+  return {
+    ...state,
+    watchedTerminalIds: state.watchedTerminalIds.filter((id) => id !== terminalId),
+  };
+});
+agentAvailabilityReducer.with(setNpxStatus, (state, { payload: [npxStatus] }) => ({
+  ...state,
+  npxStatus,
+}));

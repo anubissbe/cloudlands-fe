@@ -21,22 +21,22 @@
   import { slide } from 'svelte/transition';
   import { cubicOut } from 'svelte/easing';
   import {
-  selectIsTerminalOverlayOpenForWorkspace,
-  selectTerminalOverlayHeight,
-  selectActiveTerminalIdForWorkspace,
-  selectTerminalsForWorkspace,
-} from '$store/renderer/slices/terminals/terminals-selectors';
+    selectIsTerminalOverlayOpenForWorkspace,
+    selectTerminalOverlayHeight,
+    selectActiveTerminalIdForWorkspace,
+    selectTerminalsForWorkspace,
+  } from '$store/renderer/slices/terminals/terminals-selectors';
   import {
-  openTerminalOverlay,
-  closeTerminalOverlay,
-  selectTerminal as selectTerminalAction,
-  addTerminal,
-  removeTerminal,
-  setTerminalOverlayHeight,
-  renameTerminal,
-  terminalCreated,
-  type TerminalTab,
-} from '$store/renderer/slices/terminals/terminals-slice';
+    openTerminalOverlay,
+    closeTerminalOverlay,
+    selectTerminal as selectTerminalAction,
+    addTerminal,
+    removeTerminal,
+    setTerminalOverlayHeight,
+    renameTerminal,
+    terminalCreated,
+    type TerminalTab,
+  } from '$store/renderer/slices/terminals/terminals-slice';
   import { appClient } from '$lib/client';
   import { toast } from '$lib/components/ui/toast';
   // RootQuakeTerminalOverlay uses ROOT_WORKSPACE_ID as its workspace ID
@@ -44,12 +44,12 @@
   import Terminal from './Terminal.svelte';
   import Fa from 'svelte-fa';
   import {
-  faPlus,
-  faXmark,
-  faChevronDown,
-  faTerminal,
-  faBan,
-} from '@fortawesome/free-solid-svg-icons';
+    faPlus,
+    faXmark,
+    faChevronDown,
+    faTerminal,
+    faBan,
+  } from '@fortawesome/free-solid-svg-icons';
   import { cn } from '$lib/utils';
   import { Tooltip } from '$lib/components/ui/tooltip';
   import Button from '$lib/components/ui/button/button.svelte';
@@ -387,7 +387,7 @@
   >
     <!-- Expanded Terminal Panel -->
     <div
-      class="terminal-panel relative flex flex-col bg-sidebar border-t border-border/50 shadow-2xl w-full"
+      class="terminal-panel relative flex flex-col bg-sidebar border-t border-border shadow-2xl w-full"
       class:is-resizing={isResizing}
       style="height: {$height}vh;"
       transition:slide={{ axis: 'y', duration: 200, easing: cubicOut }}
@@ -395,17 +395,16 @@
       <!-- Resize Handle -->
       <!-- svelte-ignore a11y_no_static_element_interactions -->
       <div
-        class="absolute -top-1 left-0 right-0 h-3 cursor-ns-resize z-10 flex items-center justify-center group/resize"
+        class="app-resize-handle absolute -top-2 left-0 right-0 z-10 h-4"
+        data-resize-axis="y"
+        data-resize-indicator="short"
+        data-resizing={isResizing}
         onmousedown={startResize}
-      >
-        <div
-          class="w-9 h-1 rounded-sm bg-muted-foreground/20 transition-all duration-150 group-hover/resize:bg-muted-foreground/40 group-hover/resize:scale-x-110"
-        ></div>
-      </div>
+      ></div>
 
       <!-- Header Bar -->
       <div
-        class="flex items-center justify-between h-9 px-3 bg-sidebar/50 border-b border-border/30 shrink-0"
+        class="flex items-center justify-between h-9 px-3 bg-sidebar/50 border-b border-border shrink-0"
       >
         <!-- Title (click to edit) -->
         <div class="flex items-center gap-2">
@@ -476,7 +475,7 @@
 
       <!-- Tab Bar - integrated into the terminal panel for root overlay -->
       <div
-        class="flex items-center justify-between h-9 px-1 bg-sidebar backdrop-blur-xl border-t border-border/50 shrink-0"
+        class="flex items-center justify-between h-9 px-1 bg-sidebar backdrop-blur-xl border-t border-border shrink-0"
       >
         <div class="flex items-center h-full min-w-0 overflow-x-auto scrollbar-none">
           <div class="pl-2 pr-3">
@@ -488,7 +487,7 @@
             <!-- svelte-ignore a11y_no_static_element_interactions -->
             <div
               class={cn(
-                'flex items-center gap-1.5 h-full px-2.5 text-sm font-medium text-subtle cursor-pointer transition-all duration-150 min-w-0 max-w-90 whitespace-nowrap border-x border-border/50 -ml-px group/tab',
+                'flex items-center gap-1.5 h-full px-2.5 text-sm font-medium text-subtle cursor-pointer transition-all duration-150 min-w-0 max-w-90 whitespace-nowrap border-x border-border -ml-px group/tab',
                 'hover:text-foreground hover:bg-muted/80',
                 isActive && 'text-foreground bg-background shadow-sm',
               )}

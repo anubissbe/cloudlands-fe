@@ -2,12 +2,16 @@
   /**
    * CheckoutModePill - Tiny, quiet metadata pill showing how the workspace
    * checkout was provisioned (PROTOCOL §5.1). Renders nothing when
-   * `checkoutMode` is absent (non-daemon-provisioned checkouts).
+   * `checkoutMode` is absent (non-daemon-provisioned checkouts). A `cow`
+   * checkout is labeled "CoW" only while effective CoW agent isolation is
+   * active (the `workspace.cowIsolation` setting is on and the machine
+   * supports CoW); otherwise agents work directly in the checkout, so the
+   * pill says "Direct".
    *
    * When a workspace is provided, hovering the pill opens the disk-usage
    * tooltip and fetches the footprint on demand via the `workspace.diskUsage`
    * method (PROTOCOL §5.1) — list/get rows no longer carry it
-   * (monorepo#1396). While a walk is in flight with no value yet a spinner
+   * (monorepo#1396). While a walk is in flight with no value yet a skeleton
    * shows; once a value exists the tooltip renders total size + file count,
    * the physical-space/scope notes, the per-directory breakdown, and a
    * "shrink" link (a stale value shows immediately with a subtle refreshing
@@ -20,16 +24,28 @@
   import { m } from '$shared/paraglide/messages.js';
   import { formatBytesBinary, formatInteger } from '$lib/i18n/format';
   import Tooltip from '$lib/components/ui/tooltip/Tooltip.svelte';
+  import { Skeleton } from '$lib/components/ui/skeleton';
   import { runShrinkWorkspaceAction } from './shrink-workspace-action';
   import { pollWorkspaceDiskUsage } from './disk-usage-poll';
+  import { resolveEffectiveIsolationMode } from './initializer/isolation-mode';
+  import Fa from 'svelte-fa';
+  import { faArrowRight, faCodeFork, faLayerGroup } from '@fortawesome/free-solid-svg-icons';
 
   interface Props {
     checkoutMode?: 'cow' | 'worktree' | 'direct';
     workspace?: Workspace | null;
     class?: string;
+    presentation?: 'pill' | 'repository';
+    repositoryOpen?: boolean;
   }
 
-  let { checkoutMode, workspace, class: className = '' }: Props = $props();
+  let {
+    checkoutMode,
+    workspace,
+    class: className = '',
+    presentation = 'pill',
+    repositoryOpen = false,
+  }: Props = $props();
 
   // When a workspace is provided, its checkoutMode is authoritative so the
   // label always matches the workspace whose diskUsage the tooltip shows.
@@ -40,17 +56,63 @@
   // instead of the raw checkout mode.
   const isMicrovm = $derived(workspace?.executionEnvironment === 'microvm');
 
-  // i18n-ignore (CoW / Worktree / Direct / MicroVM are technical terms)
+  // A `cow` checkoutMode records that the clone was provisioned with CoW
+  // primitives, not that agents are isolated from it: cache-hydrated
+  // GitHub-pick workspaces persist `cow` while agents work directly in the
+  // checkout (isolation follows the BE-owned `workspace.cowIsolation`
+  // setting, PROTOCOL §5.1/§5.12). Show "CoW" only when effective CoW agent
+  // isolation is active; default to "Direct" until the async settings read
+  // resolves so the label never flashes "CoW"→"Direct". The setting is
+  // machine-global, so the resolver reads it through a module-level cached
+  // single-flight promise (cow-isolation-setting.ts) — every pill instance
+  // and every list-refetch re-run share one RPC, invalidated on
+  // `settings:changed`.
+  let cowIsolationActive = $state(false);
+  // Bumped on every effect re-run and on teardown so a resolver settling for a
+  // previous workspace/mode never applies its stale result out of order.
+  let isolationGeneration = 0;
+  $effect(() => {
+    // Reset to the Direct default before resolving so a prior workspace's
+    // "CoW" never lingers across a prop change while the read is in flight.
+    cowIsolationActive = false;
+    if (mode !== 'cow') return;
+    const ws = workspace;
+    const gen = ++isolationGeneration;
+    void resolveEffectiveIsolationMode(ws?.cowSupported === true ? [ws] : undefined).then(
+      (resolved) => {
+        if (gen === isolationGeneration) cowIsolationActive = resolved === 'cow';
+      },
+    );
+    return () => {
+      isolationGeneration += 1;
+    };
+  });
+
+  const effectiveMode = $derived(mode === 'cow' ? (cowIsolationActive ? 'cow' : 'direct') : mode);
   const label = $derived(
     isMicrovm
-      ? 'MicroVM'
-      : mode === 'cow'
-        ? 'CoW'
-        : mode === 'worktree'
-          ? 'Worktree'
-          : mode === 'direct'
-            ? 'Direct'
+      ? 'MicroVM' // i18n-ignore (MicroVM is a technical term)
+      : effectiveMode === 'cow'
+        ? m.workspace_checkoutModePill_cow_label()
+        : effectiveMode === 'worktree'
+          ? m.workspace_checkoutModePill_worktree_label()
+          : effectiveMode === 'direct'
+            ? m.workspace_checkoutModePill_direct_label()
             : null,
+  );
+  const modeIcon = $derived(
+    effectiveMode === 'cow'
+      ? faLayerGroup
+      : effectiveMode === 'worktree'
+        ? faCodeFork
+        : faArrowRight,
+  );
+  // microVM workspaces replace the checkout-mode tooltip line with the VM
+  // isolation explanation (PROTOCOL §5.1 `executionEnvironment`, v3.3).
+  const tooltipText = $derived(
+    isMicrovm
+      ? m.workspace_microvmPill_tooltip()
+      : m.workspace_checkoutModePill_tooltip({ label: label ?? '' }),
   );
 
   /** Poll cadence while the tooltip is open and a daemon walk is in flight. */
@@ -132,6 +194,11 @@
     }
   }
 
+  $effect(() => {
+    if (presentation !== 'repository') return;
+    handleOpenChange(repositoryOpen);
+  });
+
   // Scope the fetched state to the hovered workspace: when this component
   // instance receives a different workspace, drop the previous workspace's
   // value instead of briefly rendering it.
@@ -167,17 +234,104 @@
   }
 </script>
 
+{#snippet details()}
+  <div class="flex flex-col gap-1.5 text-left whitespace-normal" data-checkout-mode-details>
+    <div
+      class="flex items-center gap-1.5 text-xs text-subtle"
+      aria-label={tooltipText}
+      data-effective-checkout-mode={effectiveMode}
+    >
+      <span
+        class="grid size-4 shrink-0 place-items-center"
+        data-checkout-mode-icon={effectiveMode}
+        aria-hidden="true"
+      >
+        <Fa icon={modeIcon} size="xs" />
+      </span>
+      <span>{tooltipText}</span>
+    </div>
+    {#if diskUsage && formattedSize}
+      <div class="font-medium">
+        {m.workspace_diskUsagePill_totalSize_label({ size: formattedSize })}
+        <span class="text-subtle">
+          · {diskUsage.fileCount === 1
+            ? m.workspace_diskUsagePill_fileCount_one()
+            : m.workspace_diskUsagePill_fileCount_many({
+                count: formatInteger(diskUsage.fileCount),
+              })}
+        </span>
+        {#if refreshing}
+          <span
+            role="status"
+            aria-label={m.workspace_diskUsagePill_refreshing_ariaLabel()}
+            class="ml-1 inline-block size-3 animate-spin rounded-full border border-current border-t-transparent align-middle text-subtle"
+          ></span>
+        {/if}
+      </div>
+      <div class="flex flex-col gap-0.5 text-xs text-subtle text-pretty">
+        <p class="m-0">
+          {mode === 'cow'
+            ? m.workspace_diskUsagePill_physicalNote_label()
+            : m.workspace_diskUsagePill_physicalNotePlain_label()}
+        </p>
+        <p class="m-0">{m.workspace_diskUsagePill_scopeNote_label()}</p>
+      </div>
+      {#if diskUsage.breakdown.length > 0}
+        <ul class="flex flex-col gap-0.5 text-xs">
+          {#each diskUsage.breakdown as entry (entry.name)}
+            <li class="flex items-baseline justify-between gap-3">
+              <span class="truncate">{entry.name}</span>
+              <span class="shrink-0 tabular-nums">{formatBytesBinary(entry.bytes)}</span>
+            </li>
+          {/each}
+        </ul>
+      {/if}
+      <div class="mt-0.5 flex flex-col gap-1 border-t border-border pt-1.5 text-xs">
+        <div class="text-subtle">{m.workspace_diskUsagePill_shrink_description()}</div>
+        <button
+          type="button"
+          class="self-start cursor-pointer border-none bg-transparent p-0 font-medium text-accent-foreground underline decoration-dotted underline-offset-2 hover:opacity-80"
+          onclick={handleShrinkClick}
+        >
+          {m.workspace_diskUsagePill_shrink_label()}
+        </button>
+      </div>
+    {:else if loading}
+      <div
+        class="flex min-w-56 flex-col gap-2 py-1"
+        role="status"
+        aria-label={m.workspace_diskUsagePill_loading_ariaLabel()}
+      >
+        <Skeleton class="h-4 w-36" />
+        <Skeleton class="h-3 w-full" />
+        <Skeleton class="h-3 w-4/5" />
+      </div>
+    {/if}
+  </div>
+{/snippet}
+
 {#snippet pill(title?: string)}
   <span
-    class="inline-flex items-center shrink-0 rounded-full bg-muted/20 px-1 text-ui-sm leading-4 text-subtle {className}"
+    class="inline-flex h-5 shrink-0 cursor-help items-center justify-center rounded-full bg-muted/20 text-ui-sm leading-4 text-subtle {mode ===
+    'worktree'
+      ? 'w-5'
+      : 'px-1'} {className}"
+    aria-label={tooltipText}
+    data-checkout-mode={mode}
     {title}
   >
-    {label}
+    {#if mode === 'worktree'}
+      <Fa icon={faCodeFork} size="xs" />
+    {:else}
+      {label}
+    {/if}
   </span>
 {/snippet}
 
 {#if label}
-  {#if workspace}
+  {#if presentation === 'repository'}
+    {@render details()}
+  {:else if workspace}
     <Tooltip
       side="bottom"
       align="start"
@@ -188,69 +342,11 @@
       onOpenChange={handleOpenChange}
     >
       {#snippet content()}
-        <div class="flex flex-col gap-1.5 text-left whitespace-normal">
-          <div class="text-xs text-subtle">
-            {isMicrovm
-              ? m.workspace_microvmPill_tooltip()
-              : m.workspace_checkoutModePill_tooltip({ label: label ?? '' })}
-          </div>
-          {#if diskUsage && formattedSize}
-            <div class="font-medium">
-              {m.workspace_diskUsagePill_totalSize_label({ size: formattedSize })}
-              <span class="text-subtle">
-                · {diskUsage.fileCount === 1
-                  ? m.workspace_diskUsagePill_fileCount_one()
-                  : m.workspace_diskUsagePill_fileCount_many({
-                      count: formatInteger(diskUsage.fileCount),
-                    })}
-              </span>
-              {#if refreshing}
-                <span
-                  role="status"
-                  aria-label={m.workspace_diskUsagePill_refreshing_ariaLabel()}
-                  class="ml-1 inline-block size-3 animate-spin rounded-full border border-current border-t-transparent align-middle text-subtle"
-                ></span>
-              {/if}
-            </div>
-            <div class="flex flex-col gap-0.5 text-xs text-subtle">
-              <p class="m-0">{m.workspace_diskUsagePill_physicalNote_label()}</p>
-              <p class="m-0">{m.workspace_diskUsagePill_scopeNote_label()}</p>
-            </div>
-            {#if diskUsage.breakdown.length > 0}
-              <ul class="flex flex-col gap-0.5 text-xs">
-                {#each diskUsage.breakdown as entry (entry.name)}
-                  <li class="flex items-baseline justify-between gap-3">
-                    <span class="truncate font-mono">{entry.name}</span>
-                    <span class="shrink-0 tabular-nums">{formatBytesBinary(entry.bytes)}</span>
-                  </li>
-                {/each}
-              </ul>
-            {/if}
-            <button
-              type="button"
-              class="self-start text-xs underline decoration-dotted underline-offset-2 cursor-pointer bg-transparent border-none p-0 text-accent-foreground hover:opacity-80"
-              onclick={handleShrinkClick}
-            >
-              {m.workspace_diskUsagePill_shrink_label()}
-            </button>
-          {:else if loading}
-            <div class="flex items-center justify-center py-1">
-              <span
-                role="status"
-                aria-label={m.workspace_diskUsagePill_loading_ariaLabel()}
-                class="inline-block size-4 animate-spin rounded-full border-2 border-current border-t-transparent text-subtle"
-              ></span>
-            </div>
-          {/if}
-        </div>
+        {@render details()}
       {/snippet}
       {@render pill()}
     </Tooltip>
   {:else}
-    {@render pill(
-      isMicrovm
-        ? m.workspace_microvmPill_tooltip()
-        : m.workspace_checkoutModePill_tooltip({ label }),
-    )}
+    {@render pill(tooltipText)}
   {/if}
 {/if}

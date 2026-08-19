@@ -1,13 +1,17 @@
-import type { TaskStatus, WorkspaceTask, WorkspaceTaskStats } from "$shared/types";
-import { createAction } from "$lib/store-shim/utils/store/create-action";
-import { createReducer } from "$lib/store-shim/utils/store/create-reducer";
+import type { TaskStatus, Workspace, WorkspaceTask, WorkspaceTaskStats } from "$shared/types";
+import { createAction } from "@augmentcode/themis/utils/store/create-action";
+import { createReducer } from "@augmentcode/themis/utils/store/create-reducer";
 import {
   createCollection,
   getItem,
   updateItem,
-} from "$lib/store-shim/utils/collections/collection-utils";
+} from "@augmentcode/themis/utils/collections/collection-utils";
 import { createWorkspaceScopedHelpers } from "../../utils/workspace-scoped";
-import { removeWorkspaceEntity } from "../workspace/workspace-slice";
+import {
+  removeWorkspaceEntity,
+  replaceWorkspaceList,
+  setWorkspaceEntity,
+} from "../workspace/workspace-slice";
 import type { WorkspaceTasksState, WorkspaceTasksWorkspaceState } from "./workspace-tasks-types";
 
 export type { WorkspaceTasksState, WorkspaceTasksWorkspaceState };
@@ -79,8 +83,8 @@ export const clearWorkspaceTasks = createAction<[workspaceId: string]>(
 // Reducer
 // ---------------------------------------------------------------------------
 
-export const workspaceTasksReducer = createReducer<WorkspaceTasksState>(initialState)
-  .with(loadWorkspaceTasksRequested, (state, { payload: [workspaceId] }) => {
+export const workspaceTasksReducer = createReducer<WorkspaceTasksState>(initialState);
+workspaceTasksReducer.with(loadWorkspaceTasksRequested, (state, { payload: [workspaceId] }) => {
     const ws = getWorkspaceState(state, workspaceId);
     if (ws.loading && ws.error === null) return state;
     return setWorkspaceState(state, workspaceId, {
@@ -88,8 +92,8 @@ export const workspaceTasksReducer = createReducer<WorkspaceTasksState>(initialS
       loading: true,
       error: null,
     });
-  })
-  .with(loadWorkspaceTasksSucceeded, (state, { payload: [workspaceId, tasks, stats] }) => {
+  });
+workspaceTasksReducer.with(loadWorkspaceTasksSucceeded, (state, { payload: [workspaceId, tasks, stats] }) => {
     const ws = getWorkspaceState(state, workspaceId);
     return setWorkspaceState(state, workspaceId, {
       ...ws,
@@ -99,8 +103,8 @@ export const workspaceTasksReducer = createReducer<WorkspaceTasksState>(initialS
       error: null,
       initialized: true,
     });
-  })
-  .with(loadWorkspaceTasksFailed, (state, { payload: [workspaceId, error] }) => {
+  });
+workspaceTasksReducer.with(loadWorkspaceTasksFailed, (state, { payload: [workspaceId, error] }) => {
     const ws = getWorkspaceState(state, workspaceId);
     if (!ws.loading && ws.error === error) return state;
     return setWorkspaceState(state, workspaceId, {
@@ -108,8 +112,8 @@ export const workspaceTasksReducer = createReducer<WorkspaceTasksState>(initialS
       loading: false,
       error,
     });
-  })
-  .with(applyTaskStatusChanged, (state, { payload: [workspaceId, taskId, newStatus] }) => {
+  });
+workspaceTasksReducer.with(applyTaskStatusChanged, (state, { payload: [workspaceId, taskId, newStatus] }) => {
     const ws = state.byWorkspaceId[workspaceId];
     if (!ws?.initialized) return state;
 
@@ -120,9 +124,39 @@ export const workspaceTasksReducer = createReducer<WorkspaceTasksState>(initialS
       ...ws,
       tasks: updateItem(ws.tasks, { id: task.id, status: newStatus }),
     });
-  })
-  .with(clearWorkspaceTasks, (state, { payload: [workspaceId] }) =>
+  });
+workspaceTasksReducer.with(clearWorkspaceTasks, (state, { payload: [workspaceId] }) =>
     clearWorkspaceState(state, workspaceId)
-  )
-  .with(removeWorkspaceEntity, (state, { payload: [wsId] }) => clearWorkspaceState(state, wsId));
+  );
+workspaceTasksReducer.with(removeWorkspaceEntity, (state, { payload: [wsId] }) => clearWorkspaceState(state, wsId));
+
+/**
+ * Seed `stats` from a workspace list row's `taskStats` rollup (PROTOCOL §5.1)
+ * so sidebar progress renders before any per-workspace `task.list` load.
+ * `task.list` stays authoritative: a seed never touches an `initialized`
+ * workspace and never marks one `initialized`.
+ */
+function seedStatsFromListRow(state: WorkspaceTasksState, workspace: Workspace): WorkspaceTasksState {
+  const stats = workspace.taskStats;
+  if (!stats) return state;
+
+  const ws = getWorkspaceState(state, workspace.id);
+  if (ws.initialized) return state;
+  // Shallow-compare every field present on the incoming rollup so the no-op
+  // check stays correct if the wire shape grows beyond the current trio.
+  const keys = Object.keys(stats) as (keyof WorkspaceTaskStats)[];
+  if (keys.every((key) => ws.stats[key] === stats[key])) return state;
+
+  return setWorkspaceState(state, workspace.id, {
+    ...ws,
+    stats,
+  });
+}
+
+workspaceTasksReducer.with(replaceWorkspaceList, (state, { payload: [workspaces] }) =>
+    workspaces.reduce(seedStatsFromListRow, state)
+  );
+workspaceTasksReducer.with(setWorkspaceEntity, (state, { payload: [workspace] }) =>
+    seedStatsFromListRow(state, workspace)
+  );
 

@@ -57,11 +57,10 @@ async function buildState() {
   const { initialState } =
     await import('$store/renderer/slices/hardware-console/hardware-console-slice');
   const { createCollection } =
-    await import('$lib/store-shim/utils/collections/collection-utils');
+    await import('@augmentcode/themis/utils/collections/collection-utils');
   return {
     hardwareConsole: { ...initialState, enabled: true },
     workspace: {
-      activeWorkspaceId: null,
       workspaces: createCollection('id', [
         workspace('ws-a', 'Alpha', '2026-08-01T12:00:00Z'),
         workspace('ws-b', 'Beta', '2026-08-01T11:00:00Z'),

@@ -1,33 +1,28 @@
 <script lang="ts">
   import type { AgentSession } from '$shared/types';
   import AgentCard from '$lib/components/chat/AgentCard.svelte';
+  import LazyAgentCard from './LazyAgentCard.svelte';
   import CreateAgentSection from './CreateAgentSection.svelte';
   import { ListEmpty } from '$lib/components/ui/list';
   import VirtualList from '$lib/components/ui/VirtualList.svelte';
   import { Skeleton } from '$lib/components/ui/skeleton';
-  import {
-  faChevronDown,
-  faRobot,
-  faSitemap,
-} from '@fortawesome/free-solid-svg-icons';
-  import Button from '../ui/button/button.svelte';
+  import { faChevronDown } from '@fortawesome/free-solid-svg-icons';
   import Fa from 'svelte-fa';
   import { slide } from 'svelte/transition';
-  import AugieAvatarWithState from '$lib/components/ui/auggie-avatar/AugieAvatarWithState.svelte';
-  import { activeStreamsTracker } from '$features/agent/services/active-streams-tracker';
-  import { onMount } from 'svelte';
-  import { getAvatarState } from '$lib/components/ui/auggie-avatar/avatar-state';
-  import { getAgentAttentionRequest } from '$shared/utils/agent-attention';
-
-  import {
-  selectAgentIsResponding,
-  selectAgentIsWaiting,
-} from '$store/renderer/slices/agent-session/agent-session-selectors';
-  import Header from '../ui/Header.svelte';
-  import { getWorkspaceAgentsVisibilitySummary } from './workspace-agents-list-utils';
-  import { store as appStore } from '$store/renderer/store';
-  import { m } from '$shared/paraglide/messages.js';
+  import Button from '$lib/components/ui/button/button.svelte';
+  import Header from '$lib/components/ui/Header.svelte';
   import { formatInteger } from '$lib/i18n/format';
+  import {
+    filterWorkspaceAgentRows,
+    getFlatWorkspaceAgentRows,
+    isBackgroundAgentSession as isBackgroundAgent,
+    isCoordinatorAgentSession as isCoordinator,
+    shouldVirtualizeWorkspaceAgentRows,
+    WORKSPACE_AGENT_ROW_HEIGHT,
+  } from './workspace-agents-list-utils';
+  import { m } from '$shared/paraglide/messages.js';
+  import type { PanelTab } from '$store/renderer/slices/panel-layout/panel-layout-types';
+  import { getPanelTabOpenState } from '$store/renderer/slices/panel-layout/panel-layout-selectors';
 
   interface Props {
     agents?: AgentSession[];
@@ -35,9 +30,12 @@
     onSelect?: (detail: { agentId: string }) => void;
     onCreate?: () => void;
     onCreateWithSpecialist?: (specialistId: string | null) => void;
-    onOpenAgentOverview?: () => void;
-    useVirtualScrolling?: boolean;
+    runningAgentIds?: string[];
     loading?: boolean;
+    workspaceId?: string;
+    openPanelTabs?: PanelTab[];
+    activePanelTab?: PanelTab | null;
+    searchQuery?: string;
   }
 
   let {
@@ -46,383 +44,175 @@
     onSelect,
     onCreate,
     onCreateWithSpecialist,
-    onOpenAgentOverview,
-    useVirtualScrolling = true,
+    runningAgentIds = [],
     loading = false,
+    workspaceId = '',
+    openPanelTabs = [],
+    activePanelTab,
+    searchQuery = '',
   }: Props = $props();
 
-  // Toggle to show/hide background agents (default to false - hide them)
-  let showBackgroundAgents = $state(false);
+  const flatAgentRows = $derived(getFlatWorkspaceAgentRows(agents));
+  const filteredAgentRows = $derived(filterWorkspaceAgentRows(flatAgentRows, searchQuery));
+  const hasActiveSearch = $derived(Boolean(searchQuery.trim()));
+  const runningAgentIdSet = $derived(new Set(runningAgentIds));
+  const directChildrenByAgentId = $derived.by(() => {
+    const children = new Map<string, AgentSession[]>();
+    const ancestors: { id: string; depth: number }[] = [];
 
-  // Track which delegator agents have their delegated children expanded (collapsed by default)
-  let expandedDelegations = $state(new Set<string>());
+    for (const row of filteredAgentRows) {
+      while (ancestors.length > 0 && ancestors[ancestors.length - 1].depth >= row.depth) {
+        ancestors.pop();
+      }
+      const parent = ancestors[ancestors.length - 1];
+      if (parent?.depth === row.depth - 1) {
+        const siblings = children.get(parent.id) ?? [];
+        siblings.push(row.agent);
+        children.set(parent.id, siblings);
+      }
+      ancestors.push({ id: row.agent.id, depth: row.depth });
+    }
+
+    return children;
+  });
+  const topLevelAgents = $derived(
+    filteredAgentRows.filter((row) => row.depth === 0).map((row) => row.agent),
+  );
+  const topLevelForegroundAgents = $derived(
+    topLevelAgents.filter((agent) => !isBackgroundAgent(agent)),
+  );
+  const standaloneBackgroundAgents = $derived(
+    topLevelAgents.filter((agent) => isBackgroundAgent(agent)),
+  );
+  const hasCoordinator = $derived(topLevelForegroundAgents.some(isCoordinator));
+  // Fall back to the regular list when delegations exist (tree heights are variable)
+  // or a coordinator is present (its section headers need the regular rendering).
+  const shouldUseVirtual = $derived(shouldVirtualizeWorkspaceAgentRows(filteredAgentRows));
+  // The selectable row and lazy placeholder share this exact single-line height.
+  const itemHeight = WORKSPACE_AGENT_ROW_HEIGHT;
+  const containerHeight = 600;
+  let expandedAgentIds = $state(new Set<string>());
+  let showBackgroundAgents = $state(false);
+  const runningBackgroundCount = $derived(
+    standaloneBackgroundAgents.filter((agent) => isAgentRunning(agent.id)).length,
+  );
+
+  function isAgentRunning(agentId: string): boolean {
+    return runningAgentIdSet.has(agentId);
+  }
 
   function toggleDelegation(agentId: string) {
-    const next = new Set(expandedDelegations);
-    if (next.has(agentId)) {
-      next.delete(agentId);
-    } else {
-      next.add(agentId);
-    }
-    expandedDelegations = next;
+    const next = new Set(expandedAgentIds);
+    if (next.has(agentId)) next.delete(agentId);
+    else next.add(agentId);
+    expandedAgentIds = next;
   }
-
-  // Track streaming state changes for reactivity
-  let activeStreamsVersion = $state(0);
-
-  onMount(() => {
-    // Start polling for active streams and subscribe to changes
-    activeStreamsTracker.startPolling();
-    const unsubscribe = activeStreamsTracker.subscribe(() => {
-      activeStreamsVersion++;
-    });
-    return () => {
-      unsubscribe();
-    };
-  });
-
-  // Helper to check if an agent is currently responding.
-  function isAgentRunning(agentId: string): boolean {
-    // Reference activeStreamsVersion for reactivity while deriving from canonical selectors.
-    activeStreamsVersion;
-    const state = appStore.state;
-    const isWaiting = selectAgentIsWaiting.select(state, agentId);
-    const isResponding = selectAgentIsResponding.select(state, agentId);
-    return isResponding && !isWaiting;
-  }
-
-  // Helper to check if an agent is a background agent
-  function isBackgroundAgent(agent: AgentSession): boolean {
-    return !!(agent.isBackground || agent.metadata?.isBackground);
-  }
-
-  // Helper to get specialist ID for an agent
-  function getAgentSpecialistId(
-    agent: AgentSession,
-  ): 'spec-writer' | 'implementor' | 'verifier' | 'ui-designer' | null {
-    const specialistId = agent.metadata?.specialist || agent.agentMetadata?.specialist;
-    // Only return if it's one of the known specialist types, otherwise null
-    if (
-      specialistId === 'spec-writer' ||
-      specialistId === 'implementor' ||
-      specialistId === 'verifier' ||
-      specialistId === 'ui-designer'
-    ) {
-      return specialistId;
-    }
-    return null;
-  }
-
-  // Helper to get the last updated timestamp for sorting by recency
-  function getAgentRecency(agent: AgentSession): number {
-    const ts = agent.updatedAt ?? agent.createdAt;
-    if (!ts) return 0;
-    const t = new Date(ts).getTime();
-    return Number.isFinite(t) ? t : 0;
-  }
-
-  // Helper to get avatar state for an agent
-  function getAgentAvatarState(agent: AgentSession) {
-    const state = appStore.state;
-    const isWaiting = selectAgentIsWaiting.select(state, agent.id);
-    const isRunning = isAgentRunning(agent.id);
-    return getAvatarState(
-      {
-        isStreaming: isRunning,
-        status: isWaiting ? 'waiting' : agent.status,
-      },
-      {
-        attentionKind: getAgentAttentionRequest(agent)?.kind ?? null,
-      },
-    );
-  }
-
-  // Dedupe agents by ID to avoid duplicate key errors
-  const dedupedAgents = $derived.by(() => {
-    const agentList = Array.isArray(agents) ? agents : [];
-    const seen = new Set<string>();
-    const result: AgentSession[] = [];
-    for (const a of agentList) {
-      if (a && a.id && !seen.has(a.id)) {
-        seen.add(a.id);
-        result.push(a);
-      }
-    }
-    return result;
-  });
-
-  // Map of parent agent ID → delegated child agents (via createdByAgentId only, not forks)
-  const delegationMap = $derived.by(() => {
-    const agentIds = new Set<string>(dedupedAgents.map((a) => a.id));
-    const map = new Map<string, AgentSession[]>();
-
-    for (const agent of dedupedAgents) {
-      const parentId =
-        typeof agent.metadata?.createdByAgentId === 'string'
-          ? agent.metadata.createdByAgentId
-          : undefined;
-      if (parentId && agentIds.has(parentId)) {
-        if (!map.has(parentId)) map.set(parentId, []);
-        map.get(parentId)!.push(agent);
-      }
-    }
-
-    // Sort each group by most recent activity (newest first)
-    for (const children of map.values()) {
-      children.sort((a, b) => {
-        const aTime = getAgentRecency(a);
-        const bTime = getAgentRecency(b);
-        return bTime - aTime;
-      });
-    }
-    return map;
-  });
-
-  // IDs of all agents that are nested under a parent (removed from top-level lists)
-  const delegatedAgentIds = $derived.by(() => {
-    const ids = new Set<string>();
-    for (const children of delegationMap.values()) {
-      for (const child of children) {
-        ids.add(child.id);
-      }
-    }
-    return ids;
-  });
-
-  // Get delegated children for a given agent
-  function getDelegatedChildren(agentId: string): AgentSession[] {
-    return delegationMap.get(agentId) || [];
-  }
-
-  // Helper to check if an agent is the coordinator (initial spec-writer agent)
-
-  // Top-level foreground agents: not background, not delegated under another agent
-  // Coordinator agent is always sorted first, then by most recent activity
-  const topLevelForegroundAgents = $derived.by(() => {
-    return dedupedAgents
-      .filter((a) => !isBackgroundAgent(a) && !delegatedAgentIds.has(a.id))
-      .sort((a, b) => {
-        // Spec-writer coordinator always first
-        const aCoord = getAgentSpecialistId(a) === 'spec-writer';
-        const bCoord = getAgentSpecialistId(b) === 'spec-writer';
-        if (aCoord && !bCoord) return -1;
-        if (!aCoord && bCoord) return 1;
-        // Then by most recent activity (newest first)
-        const aTime = getAgentRecency(a);
-        const bTime = getAgentRecency(b);
-        return bTime - aTime;
-      });
-  });
-
-  // Background agents that are NOT delegated (delegated ones appear under their parent)
-  const standaloneBackgroundAgents = $derived.by(() => {
-    return dedupedAgents
-      .filter((a) => isBackgroundAgent(a) && !delegatedAgentIds.has(a.id))
-      .sort((a, b) => {
-        const aTime = a.updatedAt
-          ? new Date(a.updatedAt).getTime()
-          : a.lastActivity
-            ? new Date(a.lastActivity).getTime()
-            : 0;
-        const bTime = b.updatedAt
-          ? new Date(b.updatedAt).getTime()
-          : b.lastActivity
-            ? new Date(b.lastActivity).getTime()
-            : 0;
-        return bTime - aTime;
-      });
-  });
-
-  let standaloneBackgroundCount = $derived(standaloneBackgroundAgents.length);
-
-  // Count running standalone background agents
-  let runningStandaloneBackgroundCount = $derived.by(() => {
-    activeStreamsVersion;
-    return standaloneBackgroundAgents.filter((a) => isAgentRunning(a.id)).length;
-  });
-
-  // Whether the workspace has a coordinator agent (must be a spec-writer specialist)
-  const hasCoordinator = $derived(
-    topLevelForegroundAgents.some((a) => getAgentSpecialistId(a) === 'spec-writer'),
-  );
-
-  // Fall back to regular list when delegations exist (tree heights are variable)
-  const shouldUseVirtual = $derived(
-    useVirtualScrolling && topLevelForegroundAgents.length > 20 && delegationMap.size === 0,
-  );
-  const visibilitySummary = $derived(getWorkspaceAgentsVisibilitySummary(dedupedAgents));
-  const shouldShowVisibilitySummary = $derived(
-    visibilitySummary.totalCount > 0 &&
-      (visibilitySummary.delegatedCount > 0 || visibilitySummary.backgroundCount > 0),
-  );
-  const itemHeight = 72;
-  const containerHeight = 600;
 
   function handleAgentClick(agentId: string) {
     onSelect?.({ agentId });
   }
+
+  function getAgentPanelState(agentId: string) {
+    return getPanelTabOpenState(openPanelTabs, activePanelTab, workspaceId, {
+      type: 'agent',
+      agentId,
+      workspaceId,
+    });
+  }
 </script>
 
-<!-- New Agent Row -->
-{#if onCreate || onCreateWithSpecialist}
-  <div class="px-3 mt-0.5">
-    <CreateAgentSection {onCreate} {onCreateWithSpecialist} />
-  </div>
-{/if}
-
-{#if !loading && shouldShowVisibilitySummary}
-  <div class="px-3 pb-2 pt-0.5">
-    <p class="text-xs text-subtle">
-      {m.workspace_agentsList_visibilitySummary_label({
-        topLevel: formatInteger(visibilitySummary.topLevelForegroundCount),
-        total: formatInteger(visibilitySummary.totalCount),
-      })}
-      {#if visibilitySummary.delegatedCount > 0}
-        {m.workspace_agentsList_delegatedCount_label({
-          count: formatInteger(visibilitySummary.delegatedCount),
-        })}
-      {/if}
-      {#if visibilitySummary.backgroundCount > 0}
-        {m.workspace_agentsList_backgroundCount_label({
-          count: formatInteger(visibilitySummary.backgroundCount),
-        })}
-      {/if}
-    </p>
-  </div>
-{/if}
-
-<!-- Recursive snippet: renders an agent card + collapsible delegated children -->
-{#snippet agentTree(agentList: AgentSession[], depth: number, showCoordinatorBanner?: boolean)}
-  {#each agentList as agent, i (agent.id)}
-    {#if showCoordinatorBanner && i === 0 && getAgentSpecialistId(agent) === 'spec-writer'}
-      <div class="pt-1 pb-0.5">
-        <Header size={6}>{m.workspace_agentsList_coordinator_label()}</Header>
-      </div>
-    {/if}
-
-    <!-- Section header before the first non-coordinator agent when a coordinator exists -->
-    {#if showCoordinatorBanner && hasCoordinator && getAgentSpecialistId(agent) !== 'spec-writer' && depth === 0}
-      {@const isFirstNonCoordinator = agentList
-        .slice(0, i)
-        .every((a) => getAgentSpecialistId(a) === 'spec-writer')}
-      {#if isFirstNonCoordinator}
-        <div class="pt-2.5 pb-0.5">
-          <Header size={6}>{m.workspace_overviewTimeline_yourAgents_label()}</Header>
-          <p class="text-xs text-subtle mt-0.5">
-            {m.workspace_overviewTimeline_coordinatorDelegates_description()}
-          </p>
-        </div>
-      {/if}
-    {/if}
-
-    <AgentCard
+{#snippet agentTree(agentList: AgentSession[])}
+  {#each agentList as agent (agent.id)}
+    {@const panelState = getAgentPanelState(agent.id)}
+    <LazyAgentCard
+      cacheKey={agent.id}
       agentId={agent.id}
       agentName={agent.name}
       isBackground={isBackgroundAgent(agent)}
       selected={agent.id === selectedAgentId}
-      {depth}
+      openPanelCount={panelState.count}
+      activeInPanel={panelState.isActive}
+      updatedAt={agent.updatedAt}
+      hidePreview
+      panelRow
       onclick={() => handleAgentClick(agent.id)}
     />
 
-    <!-- Delegated children section (collapsed by default) -->
-    {@const children = getDelegatedChildren(agent.id)}
+    {@const children = directChildrenByAgentId.get(agent.id) ?? []}
     {#if children.length > 0}
-      {@const isExpanded = expandedDelegations.has(agent.id)}
-      {@const runningChildCount = children.filter((c) => isAgentRunning(c.id)).length}
-      <div style="padding-left: {(depth + 1) * 26}px;" class="mb-2">
-        <!-- Toggle row: avatars preview + count + chevron -->
-        <button
-          type="button"
-          class="delegation-toggle container w-full flex items-center gap-2 py-1 pl-1.75 pr-3
-            text-sm text-muted-foreground hover:text-muted-foreground/80 transition-colors cursor-pointer"
-          onclick={(e: MouseEvent) => {
-            e.stopPropagation();
+      {@const isExpanded = hasActiveSearch || expandedAgentIds.has(agent.id)}
+      {@const runningChildren = children.filter((child) => isAgentRunning(child.id))}
+      <div class="mb-2" style="padding-left: 26px;">
+        <Button
+          variant="ghost-light"
+          size="sm"
+          class="flex h-9 w-full cursor-pointer items-center gap-2 rounded-md px-2 text-sm font-normal text-muted-foreground transition-colors hover:bg-muted/45 hover:text-foreground focus-visible:ring-1 focus-visible:ring-ring"
+          onclick={(event) => {
+            event.stopPropagation();
             toggleDelegation(agent.id);
           }}
+          aria-expanded={isExpanded}
+          aria-label={isExpanded
+            ? m.ui_vscodePanel_collapse_ariaLabel()
+            : m.ui_vscodePanel_expand_ariaLabel()}
+          data-agent-delegation-toggle={agent.id}
         >
-          {#if !isExpanded}
-            <div class="flex items-center shrink-0 mr-1">
-              {#each children.slice(0, 4) as child (child.id)}
-                <div class="avatar -mr-1.5 flex flex-col">
-                  <AugieAvatarWithState
-                    agentId={child.id}
-                    state={getAgentAvatarState(child)}
-                    specialist={getAgentSpecialistId(child)}
-                    size={20}
-                  />
-                </div>
-              {/each}
-            </div>
-          {/if}
           <span class="truncate text-left">
-            {#if !isExpanded && runningChildCount > 0}
+            {#if !isExpanded && runningChildren.length > 0}
               {m.workspace_agentsList_delegatedRunning_label({
-                running: formatInteger(runningChildCount),
+                running: formatInteger(runningChildren.length),
                 total: formatInteger(children.length),
               })}
             {:else}
-              {m.workspace_agentsList_delegated_label({
-                count: formatInteger(children.length),
-              })}
+              {m.workspace_agentsList_delegated_label({ count: formatInteger(children.length) })}
             {/if}
           </span>
           <Fa
             icon={faChevronDown}
             size="xs"
-            class="ml-auto shrink-0 transition-transform duration-200 opacity-50 {isExpanded
+            class="ml-auto shrink-0 opacity-50 transition-transform duration-200 {isExpanded
               ? ''
               : 'rotate-90'}"
           />
-        </button>
+        </Button>
 
-        <!-- Expanded: show full delegated agent tree (including nested grandchildren) -->
         {#if isExpanded}
           <div class="flex flex-col gap-0.5" transition:slide={{ axis: 'y', duration: 150 }}>
-            {@render agentTree(children, 0)}
+            {@render agentTree(children)}
           </div>
-        {:else}
-          <!-- Collapsed: show only running delegated agents as flat cards -->
-          {@const runningChildren = children.filter((c) => isAgentRunning(c.id))}
-          {#if runningChildren.length > 0}
-            <div class="flex flex-col gap-0.5">
-              {#each runningChildren as child (child.id)}
-                <div class="w-full" transition:slide={{ axis: 'y', duration: 150 }}>
-                  <AgentCard
-                    agentId={child.id}
-                    agentName={child.name}
-                    isBackground={isBackgroundAgent(child)}
-                    selected={child.id === selectedAgentId}
-                    depth={0}
-                    onclick={() => handleAgentClick(child.id)}
-                  />
-                </div>
-              {/each}
-            </div>
-          {/if}
         {/if}
       </div>
     {/if}
   {/each}
 {/snippet}
 
+{#if onCreate || onCreateWithSpecialist}
+  <div class="px-3 mt-0.5">
+    <CreateAgentSection {onCreate} {onCreateWithSpecialist} />
+  </div>
+{/if}
+
 {#if loading}
-  <!-- Skeleton loader while agents are loading -->
-  <div class="space-y-2 px-3 py-2">
+  <div class="space-y-2 py-2">
     {#each [1, 2, 3] as { }}
-      <div class="flex items-center gap-3 py-2 px-2 rounded-md bg-muted/20">
-        <Skeleton class="h-4 w-4 rounded-full shrink-0" />
-        <div class="flex-1 space-y-1.5">
-          <Skeleton class="h-3.5 w-24" />
-          <Skeleton class="h-2.5 w-16" />
-        </div>
+      <div class="flex h-10 items-center gap-2 rounded-md px-2">
+        <Skeleton class="size-6 shrink-0 rounded-md" />
+        <Skeleton class="h-3.5 w-24" />
       </div>
     {/each}
   </div>
-{:else if topLevelForegroundAgents.length === 0 && standaloneBackgroundCount === 0}
-  <ListEmpty message="No agents yet" icon={faRobot} />
+{:else if topLevelForegroundAgents.length === 0 && standaloneBackgroundAgents.length === 0}
+  <ListEmpty
+    message={hasActiveSearch
+      ? m.workspace_agentsList_noSearchResults_label()
+      : m.workspace_agentsList_empty_label()}
+    class={hasActiveSearch ? 'min-h-14 py-3' : undefined}
+    role="status"
+    aria-live="polite"
+  />
 {:else if shouldUseVirtual}
-  <!-- Virtual scrolling fallback (flat, no delegations) -->
-  <div class="h-full max-h-150 overflow-hidden pl-2">
+  <!-- Virtual scrolling fallback (flat, no delegations, no coordinator) -->
+  <div class="h-full max-h-150 overflow-hidden">
     <VirtualList
       items={topLevelForegroundAgents}
       {itemHeight}
@@ -430,85 +220,95 @@
       getKey={(agent: AgentSession) => agent.id}
     >
       {#snippet children({ item: agent }: { item: AgentSession })}
-        <AgentCard
-          agentId={agent.id}
-          agentName={agent.name}
-          isBackground={false}
-          selected={agent.id === selectedAgentId}
-          depth={0}
-          onclick={() => handleAgentClick(agent.id)}
-        />
+        {@const panelState = getAgentPanelState(agent.id)}
+        <div class="w-full">
+          <AgentCard
+            agentId={agent.id}
+            agentName={agent.name}
+            isBackground={false}
+            selected={agent.id === selectedAgentId}
+            openPanelCount={panelState.count}
+            activeInPanel={panelState.isActive}
+            updatedAt={agent.updatedAt}
+            hidePreview
+            panelRow
+            onclick={() => handleAgentClick(agent.id)}
+          />
+        </div>
       {/snippet}
     </VirtualList>
   </div>
 {:else}
-  <!-- Tree list for foreground agents with collapsible delegated children -->
-  <div class="flex flex-col gap-0.5 pl-2">
-    {@render agentTree(topLevelForegroundAgents, 0, true)}
+  <div class="flex flex-col gap-0.5">
+    {#if topLevelForegroundAgents.length > 0}
+      {#if hasCoordinator}
+        <div class="pt-1 pb-0.5">
+          <Header size={6}>{m.workspace_agentsList_coordinator_label()}</Header>
+        </div>
+      {/if}
+      {@const coordinatorAgents = topLevelForegroundAgents.filter(isCoordinator)}
+      {@const otherAgents = topLevelForegroundAgents.filter((agent) => !isCoordinator(agent))}
+      {@render agentTree(coordinatorAgents)}
+      {#if otherAgents.length > 0}
+        {#if hasCoordinator}
+          <div class="pt-2.5 pb-0.5">
+            <Header size={6}>{m.workspace_overviewTimeline_yourAgents_label()}</Header>
+          </div>
+        {/if}
+        {@render agentTree(otherAgents)}
+      {/if}
+    {/if}
   </div>
 {/if}
 
-<!-- Standalone background agents toggle (at bottom) -->
-{#if standaloneBackgroundCount > 0}
-  <div class="container w-full min-w-0 px-1.5 pt-2">
+{#if !loading && standaloneBackgroundAgents.length > 0}
+  <div class="container w-full min-w-0 pt-2">
     <Button
       variant="ghost-light"
       size="sm"
-      class="w-full min-w-0 text-sm gap-1.5"
+      class="h-9 w-full min-w-0 gap-1.5 rounded-md px-2 text-sm font-normal hover:bg-muted/45 focus-visible:ring-1 focus-visible:ring-ring"
       onclick={() => (showBackgroundAgents = !showBackgroundAgents)}
+      aria-expanded={showBackgroundAgents}
+      data-agent-background-toggle
     >
-      {#if !showBackgroundAgents}
-        <!-- Avatar row preview when collapsed -->
-        <div class="flex items-center gap-3 flex-1 min-w-0">
-          <div class="flex items-center shrink-0">
-            {#each standaloneBackgroundAgents.slice(0, 5) as agent (agent.id)}
-              {@const state = getAgentAvatarState(agent)}
-              {@const specialist = getAgentSpecialistId(agent)}
-              <div class="avatar -mr-1.5">
-                <AugieAvatarWithState agentId={agent.id} {state} {specialist} size={16} />
-              </div>
-            {/each}
-          </div>
-          <span class="truncate flex-1 min-w-0 text-left">
-            {#if runningStandaloneBackgroundCount > 0}
-              {m.workspace_agentsList_backgroundAgentsRunning_label({
-                running: formatInteger(runningStandaloneBackgroundCount),
-                total: formatInteger(standaloneBackgroundCount),
-              })}
-            {:else}
-              {m.workspace_agentsList_backgroundAgents_label({
-                count: formatInteger(standaloneBackgroundCount),
-              })}
-            {/if}
-          </span>
-        </div>
-      {:else}
-        <span
-          >{m.workspace_agentsList_backgroundAgents_label({
-            count: formatInteger(standaloneBackgroundCount),
-          })}</span
-        >
-      {/if}
+      <span class="min-w-0 flex-1 truncate text-left">
+        {#if !showBackgroundAgents && runningBackgroundCount > 0}
+          {m.workspace_agentsList_backgroundAgentsRunning_label({
+            running: formatInteger(runningBackgroundCount),
+            total: formatInteger(standaloneBackgroundAgents.length),
+          })}
+        {:else}
+          {m.workspace_agentsList_backgroundAgents_label({
+            count: formatInteger(standaloneBackgroundAgents.length),
+          })}
+        {/if}
+      </span>
       <Fa
         icon={faChevronDown}
         size="xs"
-        class="ml-auto transition-transform duration-200 {showBackgroundAgents ? 'rotate-180' : ''}"
+        class="ml-auto shrink-0 transition-transform duration-200 {showBackgroundAgents
+          ? ''
+          : 'rotate-90'}"
       />
     </Button>
   </div>
 
-  <!-- Background agents list: show all when expanded, only running when collapsed -->
-  <div class="flex flex-col gap-0.5 pl-2 pt-1">
+  <div class="flex flex-col gap-0.5 pt-1">
     {#each standaloneBackgroundAgents as agent (agent.id)}
-      {@const isRunning = isAgentRunning(agent.id)}
-      {#if showBackgroundAgents || isRunning}
-        <div class="w-full" transition:slide={{ axis: 'y', duration: 150 }}>
-          <AgentCard
+      {@const panelState = getAgentPanelState(agent.id)}
+      {#if hasActiveSearch || showBackgroundAgents || isAgentRunning(agent.id)}
+        <div transition:slide={{ axis: 'y', duration: 150 }}>
+          <LazyAgentCard
+            cacheKey={agent.id}
             agentId={agent.id}
             agentName={agent.name}
-            isBackground={true}
+            isBackground
             selected={agent.id === selectedAgentId}
-            depth={0}
+            openPanelCount={panelState.count}
+            activeInPanel={panelState.isActive}
+            updatedAt={agent.updatedAt}
+            hidePreview
+            panelRow
             onclick={() => handleAgentClick(agent.id)}
           />
         </div>
@@ -516,42 +316,3 @@
     {/each}
   </div>
 {/if}
-
-{#if onOpenAgentOverview && agents.length > 1}
-  <div class="px-1.5 pt-2">
-    <button
-      type="button"
-      class="flex items-center gap-1.5 w-full px-2.5 py-1.5 text-xs text-subtle hover:text-muted-foreground hover:bg-muted/50 rounded-md transition-colors cursor-pointer"
-      onclick={() => onOpenAgentOverview?.()}
-    >
-      <Fa icon={faSitemap} size="xs" class="opacity-50" />
-      <span>{m.workspace_overviewTimeline_viewAgentTree_label()}</span>
-    </button>
-  </div>
-{/if}
-
-<style>
-  .container {
-    container-type: inline-size;
-  }
-
-  /* down to <3 agents */
-  @container (max-width: 230px) {
-    .avatar:nth-child(n + 4) {
-      display: none;
-    }
-  }
-
-  /* down to <2 agents */
-  @container (max-width: 210px) {
-    .avatar:nth-child(n + 3) {
-      display: none;
-    }
-  }
-  /* down to <1 agents */
-  @container (max-width: 100px) {
-    .avatar:nth-child(n + 2) {
-      display: none;
-    }
-  }
-</style>

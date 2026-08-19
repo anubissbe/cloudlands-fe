@@ -12,24 +12,29 @@
   import { store as appStore } from '$store/renderer/store';
   import { hudTakeoverRequested } from '$store/renderer/slices/hud/hud-slice';
   import type { HudWorkspaceCard } from '$store/renderer/slices/hud/hud-selectors';
+  import { microConnectedReadable } from '$features/hardware-console/device/connection-status';
+  import HudKeySlotSquare from '../components/HudKeySlotSquare.svelte';
   import { formatHudTimer } from '../utils/hud-format';
   import { takeoverBlinkTarget } from '../takeover/hud-takeover-bus';
   import {
     agentBucketColor,
     cardStateColor,
     cardStateLabel,
+    cardWaitingSuffixLabel,
     formatCardTokens,
   } from './hud-card-meta';
   import HudAgentLine from './HudAgentLine.svelte';
 
   let { card, nowMs }: { card: HudWorkspaceCard; nowMs: number } = $props();
 
+  // Hardware-key square: same gate as every key-slot surface (sidebar badge,
+  // header menu) — only while a micro is connected, not mere presence.
+  const microConnected$ = microConnectedReadable();
+
   const color = $derived(cardStateColor(card.stateKey));
   const blinking = $derived($takeoverBlinkTarget === card.workspaceId);
   const isFailed = $derived(card.stateKey === 'failed');
-  const isAttention = $derived(
-    card.stateKey === 'wait' || card.stateKey === 'blocked' || isFailed,
-  );
+  const isAttention = $derived(card.stateKey === 'wait' || card.stateKey === 'blocked' || isFailed);
 
   /** Mock `taskSegs`: completed → in-progress → remaining segment colors. */
   const segments = $derived.by(() => {
@@ -90,6 +95,7 @@
 <button
   class="hud-ws-card"
   class:hud-ws-card-flash={blinking}
+  class:hud-ws-card-unread={card.isUnread}
   data-testid="hud-ws-card"
   data-workspace-id={card.workspaceId}
   onclick={handleClick}
@@ -100,6 +106,9 @@
   {/if}
   <div class="hud-ws-card-corner hud-ws-card-corner-tl" style:border-color={color}></div>
   <div class="hud-ws-card-corner hud-ws-card-corner-br" style:border-color={color}></div>
+  {#if card.isUnread}
+    <div class="hud-ws-card-dogear" aria-hidden="true"></div>
+  {/if}
 
   <div class="hud-ws-card-status">
     <span
@@ -109,10 +118,20 @@
       style:background={color}
     ></span>
     <span class="hud-ws-card-state" style:color>{cardStateLabel(card.stateKey)}</span>
+    {#if card.isWaiting}
+      <!-- Orthogonal waiting overlay: dimmed suffix, base label keeps its
+           state color. Never feeds the attention banner/blink. -->
+      <span class="hud-ws-card-state hud-ws-card-state-waiting">{cardWaitingSuffixLabel()}</span>
+    {/if}
   </div>
 
   <div class="hud-ws-card-heading">
-    <div class="hud-ws-card-title">{card.title}</div>
+    <div class="hud-ws-card-title-row">
+      <div class="hud-ws-card-title">{card.title}</div>
+      {#if $microConnected$ && card.keySlot !== null}
+        <HudKeySlotSquare slot={card.keySlot} class="h-6 w-6" />
+      {/if}
+    </div>
     <div class="hud-ws-card-repo">{card.repoRef}</div>
   </div>
 
@@ -215,7 +234,7 @@
     pointer-events: none;
     background: repeating-linear-gradient(
       135deg,
-      hsl(var(--destructive-foreground)) 0 2px,
+      hsl(var(--error-foreground)) 0 2px,
       transparent 2px 14px
     );
     opacity: 0.07;
@@ -255,10 +274,21 @@
       monospace;
     letter-spacing: 0.12em;
   }
+  .hud-ws-card-state-waiting {
+    color: hsl(var(--muted-foreground));
+  }
   .hud-ws-card-heading {
     padding: 0 12px;
   }
+  /* Title + key square sit on one row; the square hugs the title and the
+     nowrap title shrinks (ellipsis) instead of pushing it out. */
+  .hud-ws-card-title-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
   .hud-ws-card-title {
+    min-width: 0;
     font:
       600 14.5px Inter,
       system-ui,
@@ -272,7 +302,7 @@
     font:
       500 10px 'JetBrains Mono',
       monospace;
-    color: hsl(var(--text-subtle));
+    color: hsl(var(--muted-foreground));
     margin-top: 1px;
     white-space: nowrap;
     overflow: hidden;
@@ -297,7 +327,7 @@
     font:
       500 9px 'JetBrains Mono',
       monospace;
-    color: hsl(var(--text-ghost));
+    color: hsl(var(--muted-foreground) / 0.65);
     white-space: nowrap;
   }
   .hud-ws-card-body {
@@ -313,7 +343,7 @@
     font:
       500 11px 'JetBrains Mono',
       monospace;
-    color: hsl(var(--text-subtle));
+    color: hsl(var(--muted-foreground));
     line-height: 1.55;
     padding-top: 2px;
     user-select: text;
@@ -335,7 +365,7 @@
     line-height: 1.45;
   }
   .hud-ws-card-agent-tree {
-    color: hsl(var(--text-ghost));
+    color: hsl(var(--muted-foreground) / 0.65);
     white-space: pre;
     flex: none;
   }
@@ -351,7 +381,7 @@
   }
   .hud-ws-card-agent-elapsed {
     margin-left: auto;
-    color: hsl(var(--text-ghost));
+    color: hsl(var(--muted-foreground) / 0.65);
   }
   .hud-ws-card-agent-msg {
     padding-left: 12px;
@@ -375,7 +405,7 @@
     font:
       500 10px 'JetBrains Mono',
       monospace;
-    color: hsl(var(--text-subtle));
+    color: hsl(var(--muted-foreground));
   }
   .hud-ws-card-footer-spacer {
     flex: 1;
@@ -391,6 +421,32 @@
   }
   .hud-anim-blink {
     animation: hudblink 1.6s step-end infinite;
+  }
+  /* Unread overlay (workspace.attention === 'unread'): the card keeps its
+     real state banner/colors and shows a blue corner-fold "dog-ear" triangle
+     flush with the top-right corner (hypotenuse facing into the card) — the
+     HUD's non-urgent counterpart to the main app's blue dot. The fold
+     breathes with a gentle opacity pulse; under reduced motion it renders as
+     a static fold. */
+  .hud-ws-card-dogear {
+    position: absolute;
+    top: 0;
+    right: 0;
+    width: 22px;
+    height: 22px;
+    background: hsl(var(--ring));
+    clip-path: polygon(0 0, 100% 0, 100% 100%);
+    pointer-events: none;
+    animation: huddogearbreathe 1s ease-in-out infinite;
+  }
+  @keyframes huddogearbreathe {
+    0%,
+    100% {
+      opacity: 1;
+    }
+    50% {
+      opacity: 0.45;
+    }
   }
   /* Takeover pre-roll flash: 3 fast blinks (0.18s × 3 = 540ms, inside the
      630ms HUD_TAKEOVER_BLINK_MS pend window — kept in sync with the queue). */
@@ -409,7 +465,8 @@
   @media (prefers-reduced-motion: reduce) {
     .hud-anim-pulse,
     .hud-anim-blink,
-    .hud-ws-card-flash {
+    .hud-ws-card-flash,
+    .hud-ws-card-dogear {
       animation: none;
     }
   }

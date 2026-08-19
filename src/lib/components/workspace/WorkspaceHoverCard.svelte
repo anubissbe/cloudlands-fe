@@ -1,48 +1,49 @@
 <script lang="ts">
   import type {
-  AgentSession,
-  PullRequestInfo,
-  Workspace,
-  WorkspaceAgentInfo,
-  WorkspaceGitSummary,
-  WorkspaceTask,
-} from '$shared/types';
-  import {
-  PullRequestStatus,
-  WorkspaceStatusEnum,
-} from '$shared/types';
+    AgentSession,
+    PullRequestInfo,
+    Workspace,
+    WorkspaceAgentInfo,
+    WorkspaceGitSummary,
+  } from '$shared/types';
+  import { PullRequestStatus, WorkspaceStatusEnum } from '$shared/types';
   import { formatDistanceToNow } from '$lib/i18n/format';
   import { Skeleton } from '$lib/components/ui/skeleton';
-  import AugieAvatarWithState from '$lib/components/ui/auggie-avatar/AugieAvatarWithState.svelte';
-  import type { AvatarState } from '$lib/components/ui/auggie-avatar/avatar-state';
+  import AgentAvatarWithState from '$features/agent/components/agent-avatar/AgentAvatarWithState.svelte';
+  import AgentAvatarStack, {
+    type AgentAvatarStackItem,
+  } from '$features/agent/components/agent-avatar/AgentAvatarStack.svelte';
+  import type { AvatarState } from '$features/agent/components/agent-avatar/avatar-state';
   import type { BuiltinSpecialistId } from '$lib/constants/specialists';
   import { activeStreamsTracker } from '$features/agent/services/active-streams-tracker';
   import { onMount } from 'svelte';
   import { writable } from 'svelte/store';
   import Fa from 'svelte-fa';
-  import {
-  faCodeMerge,
-  faCodePullRequest,
-} from '@fortawesome/free-solid-svg-icons';
+  import { faCodeMerge, faCodePullRequest } from '@fortawesome/free-solid-svg-icons';
   import { selectAllWorkspaceAgents } from '$store/renderer/slices/workspace-agents/workspace-agents-selectors';
   import { ensureAgentSessionLoaded } from '$store/renderer/slices/workspace-agents/workspace-agents-slice';
   import {
-  selectWorkspaceTaskDisplayList,
-  selectWorkspaceTaskProgress,
-} from '$store/renderer/slices/workspace-tasks/workspace-tasks-selectors';
+    selectWorkspaceTaskDisplayList,
+    selectWorkspaceTaskProgress,
+    selectWorkspaceTasksInitialized,
+  } from '$store/renderer/slices/workspace-tasks/workspace-tasks-selectors';
   import { ensureWorkspaceTasksLoaded } from '$store/renderer/slices/workspace-tasks/workspace-tasks-slice';
-  import type { WorkspaceTaskProgress } from '$store/renderer/slices/workspace-tasks/workspace-tasks-types';
   import {
-  selectWorkspaceDiffSummary,
-  selectWorkspaceGitSummary,
-} from '$store/renderer/slices/workspace-summaries/workspace-summaries-selectors';
+    selectWorkspaceDiffSummary,
+    selectWorkspaceGitSummary,
+  } from '$store/renderer/slices/workspace-summaries/workspace-summaries-selectors';
   import { loadWorkspaceSummariesRequested } from '$store/renderer/slices/workspace-summaries/workspace-summaries-slice';
-
 
   import { getWorkspaceActivityDisplayTime } from '$shared/utils/workspace-activity-time';
   import { store as appStore } from '$store/renderer/store';
   import { m } from '$shared/paraglide/messages.js';
   import { formatInteger } from '$lib/i18n/format';
+  import TaskStatusProgress from './TaskStatusProgress.svelte';
+  import WorkspaceStatusIcon from './WorkspaceStatusIcon.svelte';
+  import {
+    getWorkspaceStatusPresentation,
+    resolveWorkspaceStatusState,
+  } from './utils/workspace-status-presentation';
 
   interface Props {
     workspace: Workspace | null;
@@ -121,7 +122,10 @@
     };
   }
 
-  function getPullRequestDisplayStatus(pr: PullRequestInfo | null, legacyStatus?: PullRequestStatus) {
+  function getPullRequestDisplayStatus(
+    pr: PullRequestInfo | null,
+    legacyStatus?: PullRequestStatus,
+  ) {
     return pr?.isDraft ? PullRequestStatus.Draft : (pr?.status ?? legacyStatus ?? null);
   }
 
@@ -156,7 +160,10 @@
     return status === PullRequestStatus.Merged ? faCodeMerge : faCodePullRequest;
   }
 
-  function getPullRequestDetailsColor(pr: PullRequestInfo | null, status: PullRequestStatus | null) {
+  function getPullRequestDetailsColor(
+    pr: PullRequestInfo | null,
+    status: PullRequestStatus | null,
+  ) {
     if (pr?.mergeConflicts || pr?.ciStatus?.failed || pr?.reviewDecision === 'CHANGES_REQUESTED') {
       return 'text-red-500';
     }
@@ -174,60 +181,6 @@
     if (summary.behind > 0) return `${pluralize(summary.behind, 'commit')} behind remote`;
     if (summary.hasUnpushed) return m.workspace_hoverCard_unpushedCommits_label();
     return null;
-  }
-
-  function formatTaskProgress(progress: WorkspaceTaskProgress) {
-    if (progress.total === 0) return null;
-
-    const parts = [`${progress.completed}/${progress.total} done`];
-    if (progress.inProgress > 0) parts.push(`${progress.inProgress} active`);
-    return parts.join(' · ');
-  }
-
-  function getTaskStatusColor(status: string) {
-    switch (status) {
-      case 'complete':
-        return 'bg-emerald-500';
-      case 'in_progress':
-        return 'bg-sky-400';
-      case 'review_required':
-        return 'bg-blue-500';
-      case 'waiting':
-        return 'bg-muted';
-      default:
-        return 'bg-muted/60';
-    }
-  }
-
-  function buildTaskProgressSegments(progress: WorkspaceTaskProgress, tasks: WorkspaceTask[]) {
-    if (progress.total === 0) return [];
-
-    if (tasks.length) {
-      return tasks.map((task) => ({
-        label: task.title,
-        status: task.status,
-        weight: 1,
-      }));
-    }
-
-    const waiting = Math.max(0, progress.total - progress.completed - progress.inProgress);
-    return [
-      {
-        label: m.workspace_hoverCard_segmentComplete_label(),
-        status: 'complete',
-        weight: progress.completed,
-      },
-      {
-        label: m.workspace_hoverCard_segmentInProgress_label(),
-        status: 'in_progress',
-        weight: progress.inProgress,
-      },
-      {
-        label: m.workspace_hoverCard_segmentNotStarted_label(),
-        status: 'not_started',
-        weight: waiting,
-      },
-    ].filter((segment) => segment.weight > 0);
   }
 
   function getAgentStatus(agent: Pick<WorkspaceAgentInfo, 'status'>) {
@@ -261,7 +214,11 @@
     return {
       id: session.id,
       name: session.name || m.workspace_fileChanges_agent_label(),
-      status: session.isStreaming ? 'streaming' : session.isProcessing ? 'processing' : session.status,
+      status: session.isStreaming
+        ? 'streaming'
+        : session.isProcessing
+          ? 'processing'
+          : session.status,
       specialist: session.metadata?.specialist as WorkspaceAgentInfo['specialist'],
       lastActivity: lastActivity instanceof Date ? lastActivity.toISOString() : lastActivity,
     };
@@ -306,6 +263,7 @@
   const workspaceAgentSessions$ = selectAllWorkspaceAgents(workspaceIdStore);
   const workspaceTaskProgress$ = selectWorkspaceTaskProgress(workspaceIdStore);
   const workspaceTaskDisplayList$ = selectWorkspaceTaskDisplayList(workspaceIdStore);
+  const workspaceTasksInitialized$ = selectWorkspaceTasksInitialized(workspaceIdStore);
   const workspaceDiffSummary$ = selectWorkspaceDiffSummary(workspaceIdStore);
   const workspaceGitSummary$ = selectWorkspaceGitSummary(workspaceIdStore);
 
@@ -368,6 +326,8 @@
   );
 
   let statusMessage = $derived(workspace?.statusMessage?.trim());
+  let workspaceStatusState = $derived(resolveWorkspaceStatusState(workspace ?? {}));
+  let workspaceStatusPresentation = $derived(getWorkspaceStatusPresentation(workspaceStatusState));
 
   let lifecycleText = $derived.by(() => {
     if (!workspace) return null;
@@ -408,28 +368,60 @@
     );
   });
 
+  let sessionLoadWorkspaceId: string | null = null;
+  let relevantAgentSessionIds = new Set<string>();
+
   $effect(() => {
     const workspaceId = workspace?.id;
-    if (!loadAgentSessions || !workspaceId) return;
-    // Member sessions provide real names/statuses for IDs-only summaries.
-    const agentIds = new Set([
-      ...memberAgentIds.slice(0, 6),
-      ...runningAgents.slice(0, 3).map((agent) => agent.id),
-    ]);
-    for (const agentId of agentIds) {
-      appStore.dispatch(ensureAgentSessionLoaded(String(workspaceId), agentId));
+    if (!loadAgentSessions || !workspaceId) {
+      sessionLoadWorkspaceId = null;
+      relevantAgentSessionIds = new Set();
+      return;
     }
+
+    const workspaceIdString = String(workspaceId);
+    if (sessionLoadWorkspaceId !== workspaceIdString) {
+      sessionLoadWorkspaceId = workspaceIdString;
+      relevantAgentSessionIds = new Set();
+    }
+
+    // Member sessions provide real names/statuses for IDs-only summaries.
+    const nextRelevantAgentSessionIds = new Set([
+      ...memberAgentIds.slice(0, 6).map(String),
+      ...runningAgents.slice(0, 3).map((agent) => String(agent.id)),
+    ]);
+    for (const agentId of nextRelevantAgentSessionIds) {
+      if (!relevantAgentSessionIds.has(agentId)) {
+        appStore.dispatch(ensureAgentSessionLoaded(workspaceIdString, agentId));
+      }
+    }
+    relevantAgentSessionIds = nextRelevantAgentSessionIds;
   });
 
   let streamingAgentIdsWithoutInfo = $derived.by(() => {
     const knownAgentIds = new Set(hoverAgentInfos.map((agent) => agent.id));
     return streamingAgentIds.filter((agentId) => !knownAgentIds.has(agentId));
   });
+  let hoverCardStackItems = $derived([
+    ...streamingAgentIdsWithoutInfo.map((agentId): AgentAvatarStackItem => ({
+      key: `running:${agentId}`,
+      agentId,
+      state: 'running',
+    })),
+    ...unreadOnlyAgentIds.map((agentId): AgentAvatarStackItem => ({
+      key: `unread:${agentId}`,
+      agentId,
+      state: 'unread',
+    })),
+  ]);
 
-  let taskSummaryText = $derived(workspace ? formatTaskProgress($workspaceTaskProgress$) : null);
-  let taskProgressSegments = $derived(
-    workspace ? buildTaskProgressSegments($workspaceTaskProgress$, $workspaceTaskDisplayList$) : [],
+  let taskStatuses = $derived(
+    workspace ? $workspaceTaskDisplayList$.map((task) => task.status) : [],
   );
+  let taskProgressRatio = $derived.by(() => {
+    if (!workspace || $workspaceTaskProgress$.total === 0) return 0;
+    return $workspaceTaskProgress$.completed / $workspaceTaskProgress$.total;
+  });
 
   let activePullRequest = $derived(getWorkspacePullRequest(workspace));
   let pullRequestDisplayStatus = $derived(
@@ -462,13 +454,15 @@
   });
 </script>
 
-<div class="bg-popover shadow-2xl ring-1 ring-border/70 py-3 px-4 w-[320px] shrink-0 max-w-[calc(100vw-1rem)] flex flex-col gap-1.5 text-left">
+<div
+  class="bg-popover shadow-(--elevation-overlay) ring-1 ring-border/70 py-3 px-4 w-[320px] shrink-0 max-w-[calc(100vw-1rem)] flex flex-col gap-1.5 text-left"
+>
   <!-- Header: Title and repo -->
-  <div class="w-full">
+  <div class="w-full" data-workspace-hover-card-header>
     {#if isLoading || !workspace}
       <Skeleton class="h-5 w-40" />
     {:else}
-      <div class="flex items-start gap-2">
+      <div class="flex items-start gap-2" data-workspace-hover-card-title-row>
         <div class="min-w-0 flex-1">
           <div class="text-sm font-semibold text-foreground truncate">
             {workspace?.title || m.workspace_links_untitled_label()}
@@ -482,29 +476,31 @@
           </div>
         {/if}
       </div>
-      <div class="w-full flex items-center -mt-0.5 gap-1">
+      <div class="w-full flex items-center -mt-0.5 gap-1" data-workspace-hover-card-repo-row>
         <div
           class="flex-1 text-muted-foreground text-sm truncate text-left bg-transparent border-none p-0 font-inherit"
         >
           {repoDisplayName}
         </div>
       </div>
-      {#if taskSummaryText}
-        <div class="mt-2 flex flex-col gap-1.5">
-          <div
-            class="flex h-2.5 w-full gap-px rounded-xs overflow-hidden"
-            aria-label={m.workspace_hoverCard_taskProgress_ariaLabel()}
-          >
-            {#each taskProgressSegments as segment, index (`${segment.label}-${index}`)}
-              <div
-                class="min-w-[3px] flex-1 {getTaskStatusColor(segment.status)}"
-                style="flex: {segment.weight} 1 0%;"
-                title={segment.label}
-              ></div>
-            {/each}
-          </div>
-        </div>
-      {/if}
+      <div
+        class="mt-1 flex w-full min-w-0 items-center gap-2 text-sm text-muted-foreground"
+        data-workspace-hover-card-status-row
+      >
+        <WorkspaceStatusIcon status={workspaceStatusState} size={14} decorative />
+        <span class="min-w-0 truncate">{workspaceStatusPresentation.label}</span>
+      </div>
+      <div class="mt-2 min-w-0" data-workspace-hover-card-progress>
+        <TaskStatusProgress
+          statuses={taskStatuses}
+          progress={taskProgressRatio}
+          loading={!$workspaceTasksInitialized$}
+          animationKey={String(workspace.id)}
+          ariaLabel={m.workspace_hoverCard_taskProgress_ariaLabel()}
+          size="compact"
+          fallback={$workspaceTaskProgress$}
+        />
+      </div>
       {#if statusMessage}
         <div
           class="mt-2 w-full text-sm text-subtle bg-transparent border-none px-0.5 pt-1 text-left break-words whitespace-pre-wrap transition-all duration-150 leading-snug"
@@ -517,7 +513,6 @@
 
   {#if !isLoading && workspace}
     <div class="grid gap-1.5 text-xs text-subtle">
-
       {#if runningAgents.length > 0}
         <div class="mt-1 flex w-full min-w-0 flex-col pb-2">
           <div
@@ -533,9 +528,9 @@
               >
                 <div class="flex-1 flex min-w-0 flex-1 items-center gap-2">
                   <span class="grid h-6 w-6 shrink-0 place-items-center">
-                    <AugieAvatarWithState
+                    <AgentAvatarWithState
                       agentId={agent.id}
-                      size={20}
+                      variant="standard"
                       state={getRunningAgentAvatarState(agent)}
                       specialist={agent.specialist as BuiltinSpecialistId | null}
                     />
@@ -557,14 +552,12 @@
         </div>
       {/if}
 
-      {#if streamingAgentIdsWithoutInfo.length > 0 || unreadOnlyAgentIds.length > 0}
-        <div class="flex items-center -space-x-1 py-1">
-          {#each streamingAgentIdsWithoutInfo.slice(0, 3) as agentId (agentId)}
-            <AugieAvatarWithState {agentId} size={16} state="running" />
-          {/each}
-          {#each unreadOnlyAgentIds.slice(0, Math.max(0, 3 - streamingAgentIdsWithoutInfo.length)) as agentId (agentId)}
-            <AugieAvatarWithState {agentId} size={16} state="unread" />
-          {/each}
+      {#if hoverCardStackItems.length > 0}
+        <div
+          class="flex items-center py-1 pl-[var(--agent-avatar-emphasized-ring-width)] pr-[var(--agent-avatar-emphasized-ring-width)]"
+          data-workspace-hover-card-agent-stack
+        >
+          <AgentAvatarStack items={hoverCardStackItems} />
         </div>
       {/if}
 
@@ -609,7 +602,6 @@
           </span>
         </div>
       {/if}
-
 
       <div class="flex items-center justify-between gap-3">
         <span class="min-w-0 truncate text-right"

@@ -3,6 +3,11 @@
  *
  * Clean, secure bridge between renderer and main process.
  * Uses contextBridge for security.
+ *
+ * ⚠️  src/preload/index.ts is GENERATED from src/preload/index.template.ts by
+ *     scripts/inline-ipc-channels.ts, which runs on every 'npm run dev' and
+ *     every 'npm run build'. Edit the TEMPLATE. Anything written directly into
+ *     index.ts is overwritten at build time and never reaches a packaged app.
  */
 
 import {
@@ -170,8 +175,6 @@ const ALLOWED_CHANNELS = [
   "events:getStatistics",
   "events:get-agent-subscriptions",
   "events:unsubscribe-agent",
-  "auggie:check-availability",
-  "auggie:status",
   "auggie:install",
   "auggie:authenticate",
   "auggie:get-models",
@@ -193,8 +196,6 @@ const ALLOWED_CHANNELS = [
   "claude-code:get-models",
   "codex:check-availability",
   "codex:get-models",
-  "codex/managed-install/status",
-  "codex/managed-install/progress",
   "cortex:check-availability",
   "cortex:get-models",
   "pi:get-models",
@@ -208,6 +209,8 @@ const ALLOWED_CHANNELS = [
   "providers:get-paths",
   "providers:check-single",
   "file:read",
+  "file:read-chunk",
+  "file:hash",
   "file:write",
   "file:delete",
   "file:exists",
@@ -222,6 +225,8 @@ const ALLOWED_CHANNELS = [
   "file:getGitStatus",
   "file:getTreeWithSizes",
   "file:getDirectoryStatus",
+  "file:download",
+  "file:download-attachment",
   "codebase:search",
   "terminal:runCommand",
   "terminal:killProcess",
@@ -234,7 +239,6 @@ const ALLOWED_CHANNELS = [
   "system:write-clipboard",
   "system:beep",
   "system:home-directory",
-  "system:workspace-root",
   "system:execute-command",
   "system:execute-command-streaming",
   "system:check-git",
@@ -348,10 +352,14 @@ const ALLOWED_CHANNELS = [
   "browser:register-tab",
   "browser:unregister-tab",
   "browser:exec",
+  "browser:resolve-url",
   "browser:focus-tab",
   "browser:list-tabs-request",
   "browser:list-tabs-response",
   "browser:open-tab",
+  "browser:close-tab",
+  "browser:tab-navigated",
+  "browser:tab-owner-changed",
   "file-tracking:agent-file-changed",
   "streaming:start",
   "streaming:stop",
@@ -364,9 +372,6 @@ const ALLOWED_CHANNELS = [
   "log:track-file-change",
   "log:track-agent-event",
   "log:track-mcp-call",
-  "log:get-events",
-  "log:clear-events",
-  "log:events-updated",
   "log:paths",
   "log:read",
   "log:clear",
@@ -413,10 +418,6 @@ const ALLOWED_CHANNELS = [
   "user-activity:mark-note-read",
   "user-activity:get-note-read-status",
   "user-activity:get-unread-note-ids",
-  "diffs:list",
-  "diffs:create",
-  "diffs:update",
-  "diffs:get",
   "line-attribution:updated",
   "git-tracking:get-state",
   "git-tracking:get-sync-status",
@@ -511,15 +512,6 @@ const ALLOWED_CHANNELS = [
   "websocket-api:set-enabled",
   "websocket-api:regenerate-token",
   "websocket-api:set-discovery",
-  "scripts:list",
-  "scripts:create",
-  "scripts:update",
-  "scripts:remove",
-  "scripts:start",
-  "scripts:stop",
-  "scripts:restart",
-  "scripts:get-status",
-  "scripts:get-output",
   "token-usage:get",
   "token-usage:changed",
   "sandbox:profiles:list",
@@ -533,9 +525,30 @@ const ALLOWED_CHANNELS = [
   "backend:notification",
   "backend:status",
   "backend:spawn-sidecar",
+  "backend:switch-local-and-spawn",
   "backend:get-sidecar-run-log",
+  "backend:restart-orphaned-sidecar",
+  "connections:list",
+  "connections:capture-fingerprint",
+  "connections:add",
+  "connections:forget",
+  "connections:switch",
+  "connections:changed",
+  "connections:cert-mismatch",
+  "connections:protocol-mismatch",
+  "connections:auth-rejected",
+  "connections:get-boot-fallback",
+  "transfer:start",
+  "transfer:finalize",
+  "transfer:cancel",
+  "transfer:progress",
+  "transfer:import-start",
+  "transfer:import-cancel",
+  "transfer:import-progress",
   "hardware-console:clear-lighting",
   "hardware-console:clear-lighting-done",
+  "hardware-console:get-owner-status",
+  "hardware-console:owner-changed",
   "event:workspace:created",
   "event:workspace:updated",
   "event:workspace:deleted",
@@ -613,11 +626,8 @@ const ALLOWED_CHANNELS = [
   "terminal:professional:command:finished",
   "terminal:professional:command:executed",
   "terminal:professional:cwd:changed",
-  "codex/managed-install/status",
-  "codex/managed-install/progress",
   "terminal:disposed",
   "events:new",
-  "events:cleared",
   "app:ready",
   "app:ui:navigate",
   "app:ui:highlight",
@@ -676,16 +686,22 @@ const ALLOWED_CHANNELS = [
   "browser:focus-tab",
   "browser:list-tabs-request",
   "browser:open-tab",
-  "script:started",
-  "script:stopped",
-  "script:output",
-  "script:error",
-  "script:url-detected",
+  "browser:close-tab",
+  "browser:tab-navigated",
+  "browser:tab-owner-changed",
   "websocket-api:discovery-auto-disabled",
   "token-usage:changed",
   "backend:notification",
   "backend:status",
-  "hardware-console:clear-lighting"
+  "hardware-console:clear-lighting",
+  "hardware-console:owner-changed",
+  "connections:changed",
+  "connections:cert-mismatch",
+  "connections:protocol-mismatch",
+  "connections:auth-rejected",
+  "transfer:progress",
+  "transfer:import-progress",
+  "menu:import-workspace"
 ];
 
 // Dynamic channel patterns that are matched with startsWith()
@@ -786,11 +802,8 @@ const EVENT_CHANNELS = [
   "terminal:professional:command:finished",
   "terminal:professional:command:executed",
   "terminal:professional:cwd:changed",
-  "codex/managed-install/status",
-  "codex/managed-install/progress",
   "terminal:disposed",
   "events:new",
-  "events:cleared",
   "app:ready",
   "app:ui:navigate",
   "app:ui:highlight",
@@ -849,16 +862,22 @@ const EVENT_CHANNELS = [
   "browser:focus-tab",
   "browser:list-tabs-request",
   "browser:open-tab",
-  "script:started",
-  "script:stopped",
-  "script:output",
-  "script:error",
-  "script:url-detected",
+  "browser:close-tab",
+  "browser:tab-navigated",
+  "browser:tab-owner-changed",
   "websocket-api:discovery-auto-disabled",
   "token-usage:changed",
   "backend:notification",
   "backend:status",
-  "hardware-console:clear-lighting"
+  "hardware-console:clear-lighting",
+  "hardware-console:owner-changed",
+  "connections:changed",
+  "connections:cert-mismatch",
+  "connections:protocol-mismatch",
+  "connections:auth-rejected",
+  "transfer:progress",
+  "transfer:import-progress",
+  "menu:import-workspace"
 ];
 
 /**
@@ -1053,6 +1072,22 @@ const electronAPI = {
     } else {
       logger.warn(`[Preload] Blocked removeAllListeners on unauthorized channel: ${channel}`);
     }
+  },
+
+  // Diagnostics: current listener registrations per channel.
+  //
+  // The renderer cannot see ipcRenderer's own emitter, so this is the only
+  // truthful source for "how many subscriptions are live" — used by the
+  // renderer retention fingerprint to spot accumulation (e.g. the
+  // backend:notification pile-up) without a heap snapshot. Channels with no
+  // listeners are omitted; once() listeners are not tracked by the registry
+  // and so are not counted. Read-only: returns a plain snapshot object.
+  getIpcListenerCounts: (): Record<string, number> => {
+    const counts: Record<string, number> = {};
+    for (const [channel, entries] of listenerRegistry) {
+      if (entries.size > 0) counts[channel] = entries.size;
+    }
+    return counts;
   },
 
   // IPC once (listen once)

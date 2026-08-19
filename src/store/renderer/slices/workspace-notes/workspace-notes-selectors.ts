@@ -10,7 +10,7 @@ import type { Note } from "$shared/types";
 import {
   getItem,
   getItems,
-} from "$lib/store-shim/utils/collections/collection-utils";
+} from "@augmentcode/themis/utils/collections/collection-utils";
 import { emptyWorkspaceNotesState } from "./workspace-notes-slice";
 import type { NoteVersionsState, WorkspaceNotesWorkspaceState } from "./workspace-notes-types";
 
@@ -74,7 +74,7 @@ export const selectSpec = store.createSelector(
 );
 
 export const selectAllNotes = store.createSelector(
-  (state, workspaceId?: string): Note[] => {
+  (state, workspaceId?: string | null): Note[] => {
     if (!workspaceId) return [];
     const ws = state.workspaceNotes.byWorkspaceId[workspaceId];
     if (!ws) return [];

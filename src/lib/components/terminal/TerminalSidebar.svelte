@@ -1,61 +1,55 @@
 <script lang="ts">
   /* eslint-disable max-lines */
-import { selectAgentSession } from '$store/renderer/slices/agent-session/agent-session-selectors';
+  import { selectAgentSession } from '$store/renderer/slices/agent-session/agent-session-selectors';
   import { flip } from 'svelte/animate';
   import { scriptsClient } from '$features/scripts/scripts.client';
-  import type { ScriptCategory,
-  ScriptMode,
-  ScriptWithState } from '$features/scripts/types';
+  import type { ScriptCategory, ScriptMode, ScriptWithState } from '$features/scripts/types';
   import { isLiveScriptStatus } from '$features/scripts/utils/script-status';
 
   import { selectScriptEntries } from '$store/renderer/slices/scripts/scripts-selectors';
   import {
-  refreshScripts,
-  removeScript,
-  upsertScript,
-} from '$store/renderer/slices/scripts/scripts-slice';
-  import { selectActiveWorkspace } from '$store/renderer/slices/workspace/workspace-selectors';
+    refreshScripts,
+    removeScript,
+    upsertScript,
+  } from '$store/renderer/slices/scripts/scripts-slice';
+  import { selectWorkspaceById } from '$store/renderer/slices/workspace/workspace-selectors';
+  import { writable } from 'svelte/store';
 
-  import AugieAvatarWithState from '$lib/components/ui/auggie-avatar/AugieAvatarWithState.svelte';
+  import AgentAvatarWithState from '$features/agent/components/agent-avatar/AgentAvatarWithState.svelte';
   import Button from '$lib/components/ui/button/button.svelte';
-  import {
-  ListContainer,
-  ListItem,
-  ListSection,
-} from '$lib/components/ui/list';
+  import { ListContainer, ListItem, ListSection } from '$lib/components/ui/list';
   import { Skeleton } from '$lib/components/ui/skeleton';
   import { toast } from '$lib/components/ui/toast';
   import { useBackgroundAgent } from '$lib/hooks/use-background-agent.svelte';
   import {
-  selectExecutorIsRunning,
-  selectExecutorAgentId,
-} from '$store/renderer/slices/background-agent-executor/background-agent-executor-selectors';
+    selectExecutorIsRunning,
+    selectExecutorAgentId,
+  } from '$store/renderer/slices/background-agent-executor/background-agent-executor-selectors';
   import {
-  selectActiveTerminalId as selectActiveTerminalIdSelector,
-  selectUserTerminals as selectTerminalsSelector,
-} from '$store/renderer/slices/terminals/terminals-selectors';
+    selectActiveTerminalId as selectActiveTerminalIdSelector,
+    selectUserTerminals as selectTerminalsSelector,
+  } from '$store/renderer/slices/terminals/terminals-selectors';
   import { removeTerminal } from '$store/renderer/slices/terminals/terminals-slice';
   import { terminalDisplayName } from '$lib/utils/terminal-display-name';
 
-  const activeWorkspace = selectActiveWorkspace();
-
   import { openAgentTabRequested } from '$store/renderer/slices/app-layout/app-layout-slice';
+  import { getNavigationContext } from '$lib/components/layout/panel-system/panel-context';
   import { cn } from '$lib/utils';
   import { createLogger } from '$lib/utils/client-logger';
   import { pushEscapeLayer } from '$lib/utils/escapeLayers';
   import {
-  faCheck,
-  faFloppyDisk,
-  faPlay,
-  faPlus,
-  faRotateRight,
-  faSearch,
-  faSpinner,
-  faStop,
-  faTerminal,
-  faTrash,
-  faWandMagicSparkles,
-} from '@fortawesome/free-solid-svg-icons';
+    faCheck,
+    faFloppyDisk,
+    faPlay,
+    faPlus,
+    faRotateRight,
+    faSearch,
+    faSpinner,
+    faStop,
+    faTerminal,
+    faTrash,
+    faWandMagicSparkles,
+  } from '@fortawesome/free-solid-svg-icons';
   import Fa from 'svelte-fa';
   import { store as appStore } from '$store/renderer/store';
   import { m } from '$shared/paraglide/messages.js';
@@ -77,6 +71,10 @@ import { selectAgentSession } from '$store/renderer/slices/agent-session/agent-s
     onCreateTerminal,
     class: className,
   }: Props = $props();
+
+  const workspaceIdStore = writable('');
+  $effect(() => workspaceIdStore.set(workspaceId));
+  const activeWorkspace = selectWorkspaceById(workspaceIdStore);
 
   const logger = createLogger('TerminalSidebar');
 
@@ -123,7 +121,7 @@ Your entire response must be ONLY the tags with JSON inside. Nothing else.`;
   let pendingScrollScriptId = $state<string | null>(null);
 
   async function handleDetectionResult(parsed: any): Promise<void> {
-    const snapshot = selectScriptEntries.select(appStore.state).map((s) => {
+    const snapshot = selectScriptEntries.select(appStore.state, workspaceId).map((s) => {
       // eslint-disable-next-line @typescript-eslint/no-unused-vars
       const { runtime, ...scriptDef } = s;
       return { ...scriptDef };
@@ -138,7 +136,7 @@ Your entire response must be ONLY the tags with JSON inside. Nothing else.`;
       let addedCount = 0;
       let updatedCount = 0;
       let removedCount = 0;
-      const scriptEntries = selectScriptEntries.select(appStore.state);
+      const scriptEntries = selectScriptEntries.select(appStore.state, workspaceId);
       const autoDetectedIds = new Set(
         scriptEntries.filter((s) => s.source === 'auto-detected').map((s) => s.id),
       );
@@ -225,14 +223,14 @@ Your entire response must be ONLY the tags with JSON inside. Nothing else.`;
       if (removedCount > 0)
         parts.push(m.terminal_sidebar_detectRemoved_part({ count: removedCount }));
 
-      showAgentAssist = selectScriptEntries.select(appStore.state).length === 0;
+      showAgentAssist = selectScriptEntries.select(appStore.state, workspaceId).length === 0;
 
       if (parts.length > 0) {
         toast.success(m.terminal_sidebar_scriptsUpdated_success({ changes: parts.join(', ') }), {
           action: {
             label: m.terminal_sidebar_undo_label(),
             onClick: async () => {
-              for (const s of selectScriptEntries.select(appStore.state)) {
+              for (const s of selectScriptEntries.select(appStore.state, workspaceId)) {
                 await scriptsClient.remove(workspaceId, s.id);
               }
               for (const s of snapshot) {
@@ -273,7 +271,9 @@ Your entire response must be ONLY the tags with JSON inside. Nothing else.`;
     // Fallback: old flat array format — deduplicate
     if (Array.isArray(parsed)) {
       const existingKeys = new Set(
-        selectScriptEntries.select(appStore.state).map((s) => `${s.name}::${s.command}`),
+        selectScriptEntries
+          .select(appStore.state, workspaceId)
+          .map((s) => `${s.name}::${s.command}`),
       );
 
       let createdCount = 0;
@@ -298,7 +298,7 @@ Your entire response must be ONLY the tags with JSON inside. Nothing else.`;
         }
       }
 
-      showAgentAssist = selectScriptEntries.select(appStore.state).length === 0;
+      showAgentAssist = selectScriptEntries.select(appStore.state, workspaceId).length === 0;
 
       if (createdCount > 0) {
         toast.success(
@@ -335,7 +335,11 @@ Your entire response must be ONLY the tags with JSON inside. Nothing else.`;
     },
     onError: async () => {
       // Try to salvage JSON from the agent's raw messages via Redux
-      const currentAgentId = selectExecutorAgentId.select(appStore.state, workspaceId, 'script-detect');
+      const currentAgentId = selectExecutorAgentId.select(
+        appStore.state,
+        workspaceId,
+        'script-detect',
+      );
       const agentSession = currentAgentId
         ? selectAgentSession.select(appStore.state, currentAgentId)
         : undefined;
@@ -413,7 +417,7 @@ Your entire response must be ONLY the tags with JSON inside. Nothing else.`;
         );
       }
       logger.info('Local detection complete', {
-        totalScripts: selectScriptEntries.select(appStore.state).length,
+        totalScripts: selectScriptEntries.select(appStore.state, workspaceId).length,
         detectedCount,
         source: options.source ?? 'primary',
       });
@@ -430,7 +434,7 @@ Your entire response must be ONLY the tags with JSON inside. Nothing else.`;
   }
 
   function buildExistingScriptsContext(): string {
-    const existingScripts = selectScriptEntries.select(appStore.state).map((s) => ({
+    const existingScripts = selectScriptEntries.select(appStore.state, workspaceId).map((s) => ({
       id: s.id,
       name: s.name,
       command: s.command,
@@ -468,12 +472,11 @@ Your entire response must be ONLY the tags with JSON inside. Nothing else.`;
   const COLLAPSED_SCRIPT_LIMIT = 6;
 
   // Store bindings
-  const _sidebarTerminals = selectTerminalsSelector();
-  const _sidebarActiveTerminalId = selectActiveTerminalIdSelector();
-  const scriptEntries$ = selectScriptEntries();
-  // Background agent executor state via direct selector subscriptions
-  const _scriptDetectIsRunning$ = selectExecutorIsRunning(workspaceId, 'script-detect');
-  const _scriptDetectAgentId$ = selectExecutorAgentId(workspaceId, 'script-detect');
+  const _sidebarTerminals = selectTerminalsSelector(workspaceIdStore);
+  const _sidebarActiveTerminalId = selectActiveTerminalIdSelector(workspaceIdStore);
+  const scriptEntries$ = selectScriptEntries(workspaceIdStore);
+  const _scriptDetectIsRunning$ = selectExecutorIsRunning(workspaceIdStore, 'script-detect');
+  const _scriptDetectAgentId$ = selectExecutorAgentId(workspaceIdStore, 'script-detect');
 
   // Derived
   const hasScripts = $derived($scriptEntries$.length > 0);
@@ -677,7 +680,7 @@ Your entire response must be ONLY the tags with JSON inside. Nothing else.`;
     // Range select with Shift+click
     if (event && event.shiftKey && lastClickedScriptId) {
       event.preventDefault();
-      const scripts = sortScripts(selectScriptEntries.select(appStore.state));
+      const scripts = sortScripts(selectScriptEntries.select(appStore.state, workspaceId));
       const lastIndex = scripts.findIndex((s) => s.id === lastClickedScriptId);
       const currentIndex = scripts.findIndex((s) => s.id === scriptId);
       if (lastIndex !== -1 && currentIndex !== -1) {
@@ -720,7 +723,9 @@ Your entire response must be ONLY the tags with JSON inside. Nothing else.`;
     contextMenuScriptId = null;
   }
 
-  async function handleContextMenuAction(action: 'start' | 'stop' | 'restart' | 'edit' | 'delete' | 'startAll' | 'stopAll') {
+  async function handleContextMenuAction(
+    action: 'start' | 'stop' | 'restart' | 'edit' | 'delete' | 'startAll' | 'stopAll',
+  ) {
     if (action === 'delete') {
       // Delete all selected scripts
       const idsToDelete = Array.from(selectedScriptIds);
@@ -844,7 +849,9 @@ Your entire response must be ONLY the tags with JSON inside. Nothing else.`;
   // Scroll started script into view once it transitions to running
   $effect(() => {
     if (pendingScrollScriptId) {
-      const script = selectScriptEntries.select(appStore.state).find((s) => s.id === pendingScrollScriptId);
+      const script = selectScriptEntries
+        .select(appStore.state, workspaceId)
+        .find((s) => s.id === pendingScrollScriptId);
       if (script?.runtime.status === 'running') {
         const id = pendingScrollScriptId;
         pendingScrollScriptId = null;
@@ -893,7 +900,7 @@ Your entire response must be ONLY the tags with JSON inside. Nothing else.`;
       <!-- Scripts Section -->
       <ListSection
         title={m.terminal_quakeOverlay_scripts_title()}
-        titleClass="mb-0.5 mt-1.5 px-3.5!"
+        titleClass="mb-0.5 mt-1.5 px-3.5! pb-0!"
         icon={faPlay}
         class="py-1 shrink-0"
       >
@@ -939,7 +946,10 @@ Your entire response must be ONLY the tags with JSON inside. Nothing else.`;
                 const wsId = $activeWorkspace?.id;
                 if (wsId) {
                   appStore.dispatch(
-                    openAgentTabRequested(wsId, { agentId: $_scriptDetectAgentId$ }),
+                    openAgentTabRequested(wsId, {
+                      agentId: $_scriptDetectAgentId$,
+                      ...getNavigationContext(e),
+                    }),
                   );
                 }
               }}
@@ -949,11 +959,7 @@ Your entire response must be ONLY the tags with JSON inside. Nothing else.`;
                 class="shrink-0 flex-none"
                 style="min-width: 16px; min-height: 16px; width: 16px; height: 16px;"
               >
-                <AugieAvatarWithState
-                  agentId={$_scriptDetectAgentId$}
-                  state="running"
-                  size={16}
-                />
+                <AgentAvatarWithState agentId={$_scriptDetectAgentId$} state="running" size={16} />
               </div>
               <span class="text-ui">{m.terminal_sidebar_askingAgent_label()}</span>
             </button>
@@ -1027,13 +1033,13 @@ Your entire response must be ONLY the tags with JSON inside. Nothing else.`;
               type="text"
               bind:value={newName}
               placeholder={m.terminal_quakeOverlay_name_placeholder()}
-              class="w-full text-xs bg-muted/50 border border-border/40 rounded-md px-2 py-1.5 outline-none focus:border-primary/50 focus:bg-background text-foreground placeholder:text-muted-foreground/50 transition-colors"
+              class="w-full text-xs bg-muted/50 border border-border rounded-md px-2 py-1.5 outline-none focus:border-primary/50 focus:bg-background text-foreground placeholder:text-muted-foreground/50 transition-colors"
             />
             <input
               type="text"
               bind:value={newCommand}
               placeholder={m.terminal_sidebar_command_placeholder()}
-              class="w-full text-xs bg-muted/50 border border-border/40 rounded-md px-2 py-1.5 outline-none focus:border-primary/50 focus:bg-background text-foreground placeholder:text-muted-foreground/50 font-mono transition-colors"
+              class="w-full text-xs bg-muted/50 border border-border rounded-md px-2 py-1.5 outline-none focus:border-primary/50 focus:bg-background text-foreground placeholder:text-muted-foreground/50 font-mono transition-colors"
             />
             <div class="flex items-center gap-1.5 justify-end">
               <Button variant="ghost-light" size="xs" onclick={() => (showAddForm = false)}>
@@ -1057,43 +1063,46 @@ Your entire response must be ONLY the tags with JSON inside. Nothing else.`;
           <ListContainer spacing="compact" class="py-0.5 px-1.5">
             {#each visibleScripts as script (script.id)}
               <div animate:flip={{ duration: 200 }} data-script-id={script.id}>
-              <ListItem
-                size="sm"
-                class={cn('pr-1.5! pl-1.5!', selectedScriptIds.has(script.id) && 'bg-accent/50! hover:bg-accent/60!')}
-                title={editingScriptId === script.id ? '' : script.name}
-                subtitle={editingScriptId === script.id ? '' : script.command}
-                subtitleClass="leading-none"
-                active={selectedScriptId === script.id}
-                onclick={(e) => handleSelectScript(script.id, e as MouseEvent)}
-                ondblclick={() => startEditingScript(script.id, script.name)}
-                oncontextmenu={(e) => handleScriptContextMenu(script.id, e as MouseEvent)}
-                actions={getScriptActions(script)}
-                actionsVisible="hover"
-                actionsClass="absolute right-0 top-1/2 -translate-y-1/2 bg-background px-1 rounded"
-              >
-                {#snippet iconSnippet()}
-                  <div class="flex items-center justify-center w-4">
-                    <div
-                      class={cn('w-2 h-2 rounded-full', getStatusColor(script))}
-                      title={getStatusLabel(script)}
-                    ></div>
-                  </div>
-                {/snippet}
-                {#if editingScriptId === script.id}
-                  {#snippet children()}
-                    <input
-                      type="text"
-                      data-edit-script={script.id}
-                      bind:value={editingScriptName}
-                      onblur={finishEditingScript}
-                      onkeydown={handleEditScriptKeydown}
-                      onclick={(e) => e.stopPropagation()}
-                      placeholder={m.terminal_quakeOverlay_name_placeholder()}
-                      class="w-full p-0 border-none bg-transparent text-sm outline-none focus:outline-none! focus:ring-0!"
-                    />
+                <ListItem
+                  size="sm"
+                  class={cn(
+                    'pr-1.5! pl-1.5!',
+                    selectedScriptIds.has(script.id) && 'bg-accent/50! hover:bg-accent/60!',
+                  )}
+                  title={editingScriptId === script.id ? '' : script.name}
+                  subtitle={editingScriptId === script.id ? '' : script.command}
+                  subtitleClass="leading-none"
+                  active={selectedScriptId === script.id}
+                  onclick={(e) => handleSelectScript(script.id, e as MouseEvent)}
+                  ondblclick={() => startEditingScript(script.id, script.name)}
+                  oncontextmenu={(e) => handleScriptContextMenu(script.id, e as MouseEvent)}
+                  actions={getScriptActions(script)}
+                  actionsVisible="hover"
+                  actionsClass="absolute right-0 top-1/2 -translate-y-1/2 bg-background px-1 rounded"
+                >
+                  {#snippet iconSnippet()}
+                    <div class="flex items-center justify-center w-4">
+                      <div
+                        class={cn('w-2 h-2 rounded-full', getStatusColor(script))}
+                        title={getStatusLabel(script)}
+                      ></div>
+                    </div>
                   {/snippet}
-                {/if}
-              </ListItem>
+                  {#if editingScriptId === script.id}
+                    {#snippet children()}
+                      <input
+                        type="text"
+                        data-edit-script={script.id}
+                        bind:value={editingScriptName}
+                        onblur={finishEditingScript}
+                        onkeydown={handleEditScriptKeydown}
+                        onclick={(e) => e.stopPropagation()}
+                        placeholder={m.terminal_quakeOverlay_name_placeholder()}
+                        class="w-full p-0 border-none bg-transparent text-sm outline-none focus:outline-none! focus:ring-0!"
+                      />
+                    {/snippet}
+                  {/if}
+                </ListItem>
               </div>
             {/each}
             {#if showScriptListToggle}
@@ -1177,7 +1186,7 @@ Your entire response must be ONLY the tags with JSON inside. Nothing else.`;
                   <div class="border-t border-border my-1"></div>
                   <button
                     type="button"
-                    class="w-full text-left px-3 py-1.5 text-sm hover:bg-accent cursor-pointer transition-colors text-destructive-foreground hover:bg-destructive/10"
+                    class="w-full text-left px-3 py-1.5 text-sm hover:bg-accent cursor-pointer transition-colors text-error-foreground hover:bg-destructive/10"
                     onclick={() => handleContextMenuAction('delete')}
                   >
                     {selectedScriptIds.size > 1
@@ -1217,7 +1226,7 @@ Your entire response must be ONLY the tags with JSON inside. Nothing else.`;
       <!-- Terminals Section -->
       <ListSection
         title={m.terminal_sidebar_terminals_title()}
-        titleClass="mb-0.5 mt-1.5 px-3.5!"
+        titleClass="mb-0.5 mt-1.5 px-3.5! pb-0!"
         icon={faTerminal}
         class="py-1 shrink-0"
       >
@@ -1280,6 +1289,11 @@ Your entire response must be ONLY the tags with JSON inside. Nothing else.`;
   {/if}
   {#if !collapsed}
     <!-- svelte-ignore a11y_no_static_element_interactions -->
-    <div class="absolute top-0 left-0 w-1 h-full cursor-ew-resize hover:bg-primary/20 transition-colors z-10 -ml-0.5" onmousedown={startResize}></div>
+    <div
+      class="app-resize-handle absolute -left-2 top-0 z-10 h-full w-4"
+      data-resize-axis="x"
+      data-resizing={isResizing}
+      onmousedown={startResize}
+    ></div>
   {/if}
 </div>

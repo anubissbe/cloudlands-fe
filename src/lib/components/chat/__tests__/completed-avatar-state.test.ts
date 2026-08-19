@@ -1,16 +1,5 @@
-import {
-  afterEach,
-  beforeEach,
-  describe,
-  expect,
-  it,
-  vi,
-} from 'vitest';
-import {
-  cleanup,
-  render,
-  screen,
-} from '@testing-library/svelte';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { cleanup, render, screen } from '@testing-library/svelte';
 
 const makeReadable = <T>(value: T) => ({
   subscribe: (run: (value: T) => void) => {
@@ -23,7 +12,21 @@ const makeReadable = <T>(value: T) => ({
 const agentFlags = vi.hoisted(() => ({ isResponding: false, isBlockedWaiting: false }));
 
 vi.mock('$store/renderer/slices/agent-session/agent-session-selectors', () => ({
-  selectAgentSession: () => makeReadable(null),
+  selectAgentSession: () =>
+    makeReadable(
+      agentFlags.isResponding || agentFlags.isBlockedWaiting
+        ? {
+            id: 'agent-1',
+            backendSessionId: null,
+            workspaceId: 'workspace-1',
+            name: 'Agent',
+            status: agentFlags.isBlockedWaiting ? 'waiting' : 'active',
+            messages: [],
+            isResponding: agentFlags.isResponding,
+            isWaitingForOtherAgents: agentFlags.isBlockedWaiting,
+          }
+        : null,
+    ),
   selectAgentIsResponding: () => makeReadable(agentFlags.isResponding),
   selectAgentIsWaiting: () => makeReadable(agentFlags.isBlockedWaiting),
   selectAgentIsBlockedWaiting: () => makeReadable(agentFlags.isBlockedWaiting),
@@ -45,7 +48,7 @@ vi.mock('$store/renderer/slices/changes/changes-selectors', () => ({
   selectAgentLineStats: () => makeReadable(null),
 }));
 
-vi.mock('../../ui/auggie-avatar/AugieAvatarWithState.svelte', async () => ({
+vi.mock('$features/agent/components/agent-avatar/AgentAvatarWithState.svelte', async () => ({
   default: (await import('./mocks/MockAvatarWithState.svelte')).default,
 }));
 
@@ -93,6 +96,68 @@ describe('isCompleted avatar state wiring', () => {
     expect(screen.getByTestId('mock-avatar-with-state').dataset.state).toBe('idle');
   });
 
+  it('AgentCard presents wake-up details in one compact inline row', () => {
+    render(AgentCard, {
+      props: {
+        agentId: 'agent-1',
+        agentName: 'Verifier',
+        inline: true,
+        hidePreview: true,
+        statusLabel: 'finished',
+        lastResponseSummary: 'All checks passed',
+      },
+    });
+
+    const row = screen.getByRole('button');
+    expect(row.textContent).toContain('Verifier');
+    expect(row.textContent).toContain('finished');
+    expect(row.textContent).not.toContain('All checks passed');
+    expect(row.textContent).not.toContain('·');
+    expect(row.className).toContain('type-body');
+    expect(row.querySelector('.agent-card-content')?.className).toContain('flex-row');
+    expect(row.querySelector('.agent-card-header')?.className).toContain(
+      'inline-agent-card-header',
+    );
+    expect(row.querySelector('.agent-card-header')?.className).not.toContain('max-w-[52%]');
+    expect(row.querySelector('.inline-agent-card-preview')).toBeNull();
+    expect(row.querySelector('h3')?.parentElement?.className).toContain('overflow-hidden');
+    expect(row.querySelector('h3')?.className).not.toContain('text-sm');
+    const avatarClasses = Array.from(
+      screen.getByTestId('mock-avatar-with-state').parentElement?.classList ?? [],
+    );
+    expect(avatarClasses).toContain('relative');
+    expect(avatarClasses).toContain('shrink-0');
+    expect(
+      avatarClasses.filter((name) => name.startsWith('mt-') || name.startsWith('-mb-')),
+    ).toEqual([]);
+  });
+
+  it('uses the emphasized single-line grammar for Agents-panel rows', () => {
+    render(AgentCard, {
+      props: {
+        agentId: 'agent-panel',
+        agentName: 'A very long agent name',
+        panelRow: true,
+        hidePreview: true,
+        isBackground: true,
+        openPanelCount: 2,
+        lastResponseSummary: 'must not be exposed',
+      },
+    });
+
+    const row = screen.getByRole('button');
+    expect(row.getAttribute('data-agent-panel-row')).toBe('agent-panel');
+    expect(row.className).toContain('h-10');
+    expect(row.className).toContain('border-transparent');
+    expect(screen.getByTestId('mock-avatar-with-state').dataset.variant).toBe('emphasized');
+    expect(row.querySelector('[data-agent-row-name]')?.className).toContain('truncate');
+    expect(row.querySelector('[data-agent-row-trailing]')).toBeTruthy();
+    expect(row.querySelector('[data-agent-background-badge]')).toBeTruthy();
+    expect(row.querySelector('[data-panel-open-count="2"]')).toBeTruthy();
+    expect(screen.queryByTestId('agent-card-preview')).toBeNull();
+    expect(row.textContent).not.toContain('must not be exposed');
+  });
+
   it('AgentCard renders running, not completed, for a re-woken completed agent', () => {
     agentFlags.isResponding = true;
 
@@ -110,7 +175,6 @@ describe('isCompleted avatar state wiring', () => {
   });
 
   it('AgentCard renders waiting for a genuinely blocked agent', () => {
-    agentFlags.isResponding = true;
     agentFlags.isBlockedWaiting = true;
 
     render(AgentCard, { props: { agentId: 'agent-1' } });

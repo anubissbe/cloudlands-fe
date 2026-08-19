@@ -20,8 +20,8 @@
     isEnhancePromptAvailable,
   } from '$lib/client/live/live-prompt-enhancement';
   import { selectEffectiveDefaultProviderId } from '$store/renderer/slices/provider-catalog/provider-catalog-selectors';
-  import { v4 as uuidv4 } from 'uuid';
   import { goto } from '$app/navigation';
+  import { v4 as uuidv4 } from 'uuid';
   import { toast } from 'svelte-sonner';
   import { m } from '$shared/paraglide/messages.js';
 
@@ -29,14 +29,20 @@
   import {
     selectOnboardingStep,
     selectOnboardingState,
+    selectOnboardingFullFlowRequested,
   } from '$store/renderer/slices/onboarding/onboarding-selectors';
   import {
     goToStep,
     setProjectConfig,
     setOnboardingWorkspaceId,
     resetOnboarding,
+    setOnboardingFullFlowRequested,
   } from '$store/renderer/slices/onboarding/onboarding-slice';
   import { STEP_ORDER as ONBOARDING_STEP_ORDER } from '$store/renderer/slices/onboarding/onboarding-types';
+  import {
+    beginWorkspaceCreateProgress,
+    clearWorkspaceCreateProgress,
+  } from '$store/renderer/slices/workspace-create-progress/workspace-create-progress-slice';
   import { cancelGitHubAuth } from '$store/renderer/slices/github-auth/github-auth-slice';
   import { selectGitHubAuthIsAuthenticating } from '$store/renderer/slices/github-auth/github-auth-selectors';
 
@@ -58,6 +64,19 @@
     selectAllRequirementsMet,
     selectHostRequirementsHasCheckedOnce,
   } from '$store/renderer/slices/host-requirements/host-requirements-selectors';
+  import {
+    selectProviderStatusMap,
+    selectHasCheckedOnce as selectProvidersCheckedOnce,
+  } from '$store/renderer/slices/agent-availability/agent-availability-selectors';
+  import { ensureProvidersChecked } from '$store/renderer/slices/agent-availability/agent-availability-slice';
+  import { hasReadyProvider } from '$store/renderer/slices/setup-prompt/setup-prompt-utils';
+  import { selectHasCompletedProviderSetup } from '$store/renderer/slices/user-preferences/user-preferences-selectors';
+  import { selectWorkspaceItems } from '$store/renderer/slices/workspace/workspace-selectors';
+  import { hasAvailableWorkspace } from '$features/workspace/utils/empty-window-destination';
+  import {
+    determineOnboardingInitialStep,
+    resolveFastPathSettlement,
+  } from '$features/onboarding/utils/determine-onboarding-initial-step';
 
   import { Button } from '$lib/components/ui/button';
   import type { ProjectSelection } from '$features/onboarding/messages/ProjectPickerMessage.svelte';
@@ -73,17 +92,30 @@
     parseInlineImages,
     extractLinearIssue,
     extractSentryIssue,
+    type ContextReference,
   } from '$features/onboarding/utils/parse-context-references';
   import { setInitialAgentId } from '$store/renderer/slices/workspace-agents/workspace-agents-slice';
-  import { selectLastUsedScriptForRepo } from '$store/renderer/slices/setup-scripts/setup-scripts-selectors';
+  import {
+  hasBlockingAttachments,
+  type ContextItem,
+} from '$lib/components/chat/input/context-api';
+  import {
+  hasStagedFileItems,
+  redeemStagedAttachments,
+  sendHeldFirstMessage,
+} from '$lib/components/workspace/initializer/staged-attachments';
   import {
     SETUP_SCRIPT_TEMPLATES,
     getTemplateContent,
     chooseDefaultSetupScript,
     createRepoConfigProbeScheduler,
+    resolveSetupScriptParam,
     REPO_CONFIG_SCRIPT_NAME,
   } from '$features/setup-scripts';
-  import { saveScript } from '$store/renderer/slices/setup-scripts/setup-scripts-slice';
+  import {
+    getLastUsedSetupScript,
+    recordLastUsedSetupScript,
+  } from '$features/setup-scripts/last-used';
   import { setHasCompletedProviderSetup } from '$store/renderer/slices/user-preferences/user-preferences-slice';
   import {
     cancelWorkspaceInitializerOnboardingFormStateDebounce,
@@ -95,6 +127,8 @@
   } from '$store/renderer/slices/workspace-initializer/workspace-initializer-selectors';
   import { selectModel } from '$store/renderer/slices/model/model-slice';
   import { hydrateWorkspaceNavigation } from '$store/renderer/slices/workspace-navigation/workspace-navigation-slice';
+  import { openWorkspaceTab } from '$store/renderer/slices/tab-state/tab-state-slice';
+  import { bootstrapNewWorkspaceLayout } from '$store/renderer/slices/panel-layout/panel-layout-slice';
   import { createLogger } from '$lib/utils/client-logger';
   import { cn } from '$lib/utils';
 
@@ -136,6 +170,9 @@
   const workspaceInitializerHydrated$ = selectWorkspaceInitializerHydrated();
   const allRequirementsMet$ = selectAllRequirementsMet();
   const requirementsCheckedOnce$ = selectHostRequirementsHasCheckedOnce();
+  const providerStatusMap$ = selectProviderStatusMap();
+  const providersCheckedOnce$ = selectProvidersCheckedOnce();
+  const workspaceItems$ = selectWorkspaceItems();
 
   let projectSelection = $state<ProjectSelection | null>(null);
   let projectName = $derived.by(() => {
@@ -295,6 +332,20 @@
   let onboardingInputValue = $state(getInitialOnboardingPrompt());
   let promptStepRef: OnboardingPromptStep | null = $state(null);
   let isOnboardingEnhancing = $state(false);
+  // Non-image files staged path-only in the prompt step; placed into the
+  // workspace at create (`file.placeAttachment`, PROTOCOL §5.9) and
+  // referenced from the first message via attachment-reference blocks.
+  let onboardingStagedItems = $state<ContextItem[]>([]);
+  // Set when the workspace was created but staged-attachment placement (or
+  // the held first-message send) failed: submit resumes this flow instead of
+  // creating a second workspace. The created workspace is never rolled back.
+  let onboardingPendingSend = $state<{
+    workspaceId: string;
+    agentId?: string;
+    prompt: string;
+    imageBlocks: Array<{ type: 'image'; data: string; mimeType: string }>;
+    contextReferences: ContextReference[];
+  } | null>(null);
 
   // §5.31 gate — enhance is auggie-only; the daemon derives the effective
   // provider from settings, so the FE mirror gates on the same derivation.
@@ -356,9 +407,18 @@
   let setupBranchStatus = $state<SetupStepStatus>('pending');
   let setupAgentStatus = $state<SetupStepStatus>('pending');
   let setupWorktreePath = $state<string | undefined>(undefined);
+  let setupWorkspaceId = $state<string | undefined>(undefined);
   let setupScriptStatus = $state<SetupStepStatus | undefined>(undefined);
+  // progressId of the in-flight create — drives the live clone progress on
+  // the setup card's repo step; null until the first create is submitted.
+  // Kept across settlement so the visible card isn't remounted mid-flow; a
+  // retry create mints a fresh id, which rekeys the card and rebinds its
+  // init-bound selector cleanly.
+  let onboardingCreateProgressId = $state<string | null>(null);
 
-  // Setup script state
+  // Setup script state — session-local: the default is restored per repo
+  // from the repo config / localStorage last-used, never from persisted
+  // form state.
   let setupScript = $state('');
   let showSetupScript = $state(false);
   let setupScriptName = $state('Custom');
@@ -371,8 +431,7 @@
   let onboardingModelWasOverridden = $state(false);
 
   // One-time restore of a persisted mid-onboarding model pick once the
-  // workspace-initializer state has hydrated (mirrors how the persisted form
-  // state round-trips setupScript et al.).
+  // workspace-initializer state has hydrated.
   let onboardingModelRestoreApplied = false;
   $effect(() => {
     if (!isOnboarding || !$workspaceInitializerHydrated$ || onboardingModelRestoreApplied) return;
@@ -418,7 +477,10 @@
   // Priority: repo-committed `.intent/config.json` setupScript > last used for
   // this repo > generic "Copy config files only" template.
   function restoreLastUsedSetupScript(repo: string) {
-    const lastUsed = repo ? selectLastUsedScriptForRepo.select(appStore.state, repo) : undefined;
+    // GitHub selections key last-used by path + source URL: the path is only
+    // the clone destination, which two different repos can share.
+    const ghUrl = projectSelection?.type === 'github' ? projectSelection?.githubUrl : undefined;
+    const lastUsed = repo ? getLastUsedSetupScript(repo, ghUrl) : undefined;
     const genericTemplate = SETUP_SCRIPT_TEMPLATES.find((t) => t.id === 'generic');
     const choice = chooseDefaultSetupScript({
       repoConfigScript: repo && repo === repoConfigScriptRepo ? repoConfigScript : null,
@@ -436,15 +498,11 @@
     const selection = projectSelection;
     const skipIso = onboardingSkipIsolation;
     const step = $onboardingStep$;
-    const script = setupScript;
-    const scriptName = setupScriptName;
-    const customScript = isCustomSetupScript;
     const pickedModel = onboardingSelectedModel;
     const modelOverridden = onboardingModelWasOverridden;
 
     if (!isOnboarding || !$workspaceInitializerHydrated$) return;
-    if (!(selection || skipIso || script || (step !== 'requirements' && step !== 'welcome')))
-      return;
+    if (!(selection || skipIso || (step !== 'requirements' && step !== 'welcome'))) return;
     appStore.dispatch(
       debounceWorkspaceInitializerOnboardingFormState({
         projectSelection: selection
@@ -454,15 +512,11 @@
               branch: selection.branch,
               scope: selection.scope,
               githubUrl: selection.githubUrl,
-              clonePath: selection.clonePath,
               projectName: selection.projectName,
               isValid: selection.isValid,
             }
           : null,
         skipIsolation: skipIso,
-        setupScript: script,
-        setupScriptName: scriptName,
-        isCustomSetupScript: customScript,
         selectedModel: pickedModel,
         modelWasOverridden: modelOverridden,
         step,
@@ -471,7 +525,16 @@
   });
 
   let hasConnectedProvider = $state(false);
+  let agentGridRef: AgentGrid | null = $state(null);
   let onboardingSkipIsolation = $state(false);
+
+  /** Advance from the welcome step, first committing the grid's resolved
+   *  provider selection so a no-click advance still enables/activates the
+   *  visually-selected provider (D1(B): commit only on explicit advance). */
+  function advanceFromWelcomeStep() {
+    agentGridRef?.commitSelection();
+    appStore.dispatch(goToStep('github'));
+  }
 
   // Pull conflict state
   let onboardingBranchBehind = $state(0);
@@ -524,15 +587,29 @@
   onMount(() => {
     // Always start onboarding from the beginning. Related persisted initializer
     // state and session handoffs are cleared by the workspace-initializer saga.
+    // (resetOnboarding preserves a pending fullFlowRequested — see the slice.)
     if (isOnboarding) {
       appStore.dispatch(resetOnboarding());
+      // Kick the bulk provider check so the initial-step decision (and the
+      // fast-path settlement below) has real availability data to settle on
+      // even when the welcome step's AgentGrid never mounts.
+      appStore.dispatch(ensureProvidersChecked());
     }
   });
 
-  // Requirements gate: auto-advance to 'welcome' only once the check group
-  // has settled with every requirement met; otherwise stay blocked on the
-  // requirements step (OnboardingRequirementsStep renders the setup guidance
-  // and re-checks on focus/visibility until the tools appear).
+  // True while 'project' was entered on the persisted local flag alone; the
+  // settlement effect below corrects back to 'welcome' if the provider check
+  // settles with no ready provider and no workspaces.
+  let onboardingFastPathPending = $state(false);
+
+  // Requirements gate: advance only once the check group has settled with
+  // every requirement met; otherwise stay blocked on the requirements step
+  // (OnboardingRequirementsStep renders the setup guidance and re-checks on
+  // focus/visibility until the tools appear). Once green, jump to the step
+  // the provider-setup state warrants: 'project' when setup is already done
+  // (ready provider / existing workspaces / persisted local flag), 'welcome'
+  // for the full flow otherwise. An explicit full-flow request (Command
+  // Palette "Show onboarding") always gets the full flow and is consumed here.
   $effect(() => {
     if (
       isOnboarding &&
@@ -540,6 +617,34 @@
       $requirementsCheckedOnce$ &&
       $allRequirementsMet$
     ) {
+      const fullFlowRequested = selectOnboardingFullFlowRequested.select(appStore.state);
+      const decision = determineOnboardingInitialStep({
+        fullFlowRequested,
+        hasReadyProvider: hasReadyProvider($providerStatusMap$),
+        hasCompletedProviderSetup: selectHasCompletedProviderSetup.select(appStore.state),
+        hasWorkspaces: hasAvailableWorkspace($workspaceItems$),
+      });
+      if (fullFlowRequested) {
+        appStore.dispatch(setOnboardingFullFlowRequested(false));
+      }
+      onboardingFastPathPending = decision.viaLocalFastPath;
+      appStore.dispatch(goToStep(decision.step));
+    }
+  });
+
+  // Local fast-path settlement: the persisted flag skipped ahead while the
+  // bulk provider check was still pending; once it settles with no ready
+  // provider (and no workspaces exist), route back into provider setup.
+  $effect(() => {
+    if (!isOnboarding || !onboardingFastPathPending) return;
+    const settlement = resolveFastPathSettlement({
+      hasReadyProvider: hasReadyProvider($providerStatusMap$),
+      providersCheckedOnce: $providersCheckedOnce$,
+      hasWorkspaces: hasAvailableWorkspace($workspaceItems$),
+    });
+    if (settlement === 'pending') return;
+    onboardingFastPathPending = false;
+    if (settlement === 'correct' && $onboardingStep$ === 'project') {
       appStore.dispatch(goToStep('welcome'));
     }
   });
@@ -772,7 +877,7 @@
 
     if (isWelcomeStep && hasConnectedProvider) {
       e.preventDefault();
-      appStore.dispatch(goToStep('github'));
+      advanceFromWelcomeStep();
     } else if (isGitHubStep) {
       // Continue when connected, skip otherwise — both advance to project.
       // Skipping abandons a still-pending device flow, so cancel it rather
@@ -789,9 +894,79 @@
     }
   }
 
+  /**
+   * Resume a create whose staged-attachment placement or first-message send
+   * failed: the workspace already exists, so re-place the remaining staged
+   * items and deliver the held message instead of creating again.
+   */
+  async function resumeOnboardingPendingSend() {
+    const pending = onboardingPendingSend;
+    if (!pending) return;
+    isOnboardingCreating = true;
+    onboardingCreationError = null;
+    try {
+      const redemption = await redeemStagedAttachments(
+        pending.workspaceId,
+        onboardingStagedItems,
+      );
+      onboardingStagedItems = redemption.items;
+      if (redemption.failedCount > 0) {
+        onboardingCreationError = m.onboarding_page_attachmentPlacementFailed_error();
+        return;
+      }
+      // `sendHeldFirstMessage` rebuilds the wire params as plain JSON: this
+      // pending state is a Svelte $state deep-reactive Proxy tree, which
+      // Electron's structured clone rejects — passing it through verbatim
+      // made the held send fail before reaching the daemon (monorepo#2576).
+      const snapshot = $state.snapshot(pending);
+      const sendResult = await sendHeldFirstMessage(
+        {
+          workspaceId: snapshot.workspaceId,
+          agentId: snapshot.agentId,
+          content: snapshot.prompt,
+          imageBlocks: snapshot.imageBlocks,
+          contextReferences: snapshot.contextReferences,
+        },
+        redemption.fileBlocks,
+      );
+      if (!sendResult.sent) {
+        // Framed like the compact initializer: the workspace already exists,
+        // Create resumes this flow — with the daemon's detail when available.
+        throw new Error(
+          sendResult.errorDetail
+            ? m.onboarding_page_firstMessageSendFailedDetail_error({
+                detail: sendResult.errorDetail,
+              })
+            : m.onboarding_page_firstMessageSendFailed_error(),
+        );
+      }
+      onboardingPendingSend = null;
+      onboardingStagedItems = [];
+      await goto(`/workspace/${pending.workspaceId}`);
+    } catch (err) {
+      onboardingCreationError =
+        err instanceof Error ? err.message : m.onboarding_page_createFailed_error();
+    } finally {
+      isOnboardingCreating = false;
+    }
+  }
+
   async function handleOnboardingSubmit() {
     const prompt = onboardingInputValue.trim();
     if (!prompt || isOnboardingCreating || !projectSelection?.isValid) return;
+    // Failed staged-attachment pills block create (retry or remove first —
+    // unless a created workspace is waiting on its held first message, in
+    // which case submit IS the retry).
+    if (onboardingPendingSend) {
+      await resumeOnboardingPendingSend();
+      return;
+    }
+    if (hasBlockingAttachments(onboardingStagedItems)) {
+      // The error banner's Retry also lands here — surface why nothing
+      // happened instead of a silent no-op (pills must be retried/removed).
+      toast.error(m.onboarding_page_blockingAttachments_toast());
+      return;
+    }
 
     isOnboardingCreating = true;
     onboardingCreationError = null;
@@ -800,6 +975,15 @@
     setupBranchStatus = 'active';
     setupAgentStatus = 'pending';
     setupScriptStatus = setupScript.trim() ? 'pending' : undefined;
+
+    // FE-minted correlation id for this create's provisioning progress: the
+    // daemon echoes it on git:clone:progress/done frames (PROTOCOL §5.1), and
+    // the bridge folds them into the workspaceCreateProgress slice. Registered
+    // BEFORE the request so mid-flight frames always find their entry; cleared
+    // in the finally below once the create settles.
+    const createProgressId = uuidv4();
+    appStore.dispatch(beginWorkspaceCreateProgress(createProgressId));
+    onboardingCreateProgressId = createProgressId;
 
     try {
       const reduxState = appStore.state;
@@ -856,7 +1040,8 @@
             branch: projectSelection.branch,
           });
         } catch (err) {
-          onboardingPullError = err instanceof Error ? err.message : m.onboarding_page_pullFailed_error();
+          onboardingPullError =
+            err instanceof Error ? err.message : m.onboarding_page_pullFailed_error();
           onboardingShowPullConflictDialog = true;
           isOnboardingCreating = false;
           return;
@@ -870,34 +1055,64 @@
           ? selectedPRBranch
           : currentBranch;
 
+      // Await any in-flight repo-config probe (bounded, sub-second) so the
+      // setup-script decision below sees the committed `.intent/config.json`
+      // instead of racing the probe (monorepo#1862).
+      await setupScriptProbeScheduler.settled();
+
+      // The shown script is what runs: send it as-is, EXCEPT the unedited
+      // repo-config script — the daemon persists an explicit setupScript into
+      // the worktree's tracked .intent/config.json (PROTOCOL §5.1) and the
+      // committed file already holds it (it still executes when omitted).
+      const setupScriptParam = resolveSetupScriptParam({
+        setupScript,
+        setupScriptName,
+        repoPath: projectSelection.repoPath,
+        repoConfigScript,
+        repoConfigScriptRepo,
+      });
+
+      // Picked repo (GitHub selection): the daemon hydrates the checkout
+      // from its repo cache — send githubUrl + branch ONLY, no
+      // clonePath/repositoryPath (repoPath holds the owner/repo shorthand,
+      // not a local path). Mirrors CompactWorkspaceInitializer's flow.
+      const isGithubPick = projectSelection.type === 'github' && !!projectSelection.githubUrl;
+
+      // Staged non-image files cannot ride the daemon-owned initial prompt:
+      // placement needs the workspace to exist. With staged files, hold the
+      // prompt out of initialAgent and send it after placement (create →
+      // placeAttachment → agent.sendMessage with the attachment references).
+      const hasStagedFiles = hasStagedFileItems(onboardingStagedItems);
+
       const result = await workspaceClient.create({
         title: '',
-        repositoryPath: projectSelection.repoPath,
+        repositoryPath: isGithubPick ? undefined : projectSelection.repoPath,
         githubUrl: projectSelection.githubUrl,
-        clonePath: projectSelection.clonePath,
         baseRef: effectiveBranch,
         isNewRepo,
         skipIsolation: onboardingSkipIsolation || undefined,
         scope: projectSelection.scope || undefined,
-        setupScript: setupScript.trim() || undefined,
+        setupScript: setupScriptParam,
         linearIssue,
         sentryIssue,
         initialAgent: {
           name: 'Coordinator',
           model: effectiveModel,
-          prompt,
+          prompt: hasStagedFiles ? undefined : prompt,
           agentType,
           specialist: specialistId,
           behaviorPrompt,
           provider,
-          contextReferences: contextReferences.length > 0 ? contextReferences : undefined,
-          imageBlocks: imageBlocks.length > 0 ? imageBlocks : undefined,
+          contextReferences:
+            !hasStagedFiles && contextReferences.length > 0 ? contextReferences : undefined,
+          imageBlocks: !hasStagedFiles && imageBlocks.length > 0 ? imageBlocks : undefined,
           metadata: {
             source: 'onboarding',
             isInitialAgent: true,
             specialist: specialistId,
           },
         },
+        progressId: createProgressId, // Echoed on git:clone:progress/done frames (PROTOCOL §5.1)
       });
 
       if (!result.ok) {
@@ -912,6 +1127,95 @@
       // The daemon assigns the initial agent's id and returns it on the
       // create result; the FE no longer pre-mints one.
       const agentId = result.data.initialAgent?.id;
+
+      // Install the panel layout before attachment delivery so both the normal
+      // path and a later attachment retry open the daemon-created initial
+      // agent. Legacy navigation stays empty so drawer migration cannot
+      // replace the canonical panel seed.
+      try {
+        getPanelLayoutManager(workspace.id).clearLayout();
+      } catch {
+        /* ignore */
+      }
+      try {
+        const { workspaceStorageManager: wsm } =
+          await import('$store/renderer/slices/workspace/utils/workspace-storage-manager');
+        wsm.clearState(workspace.id);
+      } catch {
+        /* ignore */
+      }
+      appStore.dispatch(setWorkspaceEntity(workspace));
+      if (agentId) {
+        appStore.dispatch(setInitialAgentId(workspace.id, agentId));
+      }
+      appStore.dispatch(
+        bootstrapNewWorkspaceLayout(
+          workspace.id,
+          agentId ?? null,
+          'Coordinator',
+          specialistId === 'spec-writer',
+        ),
+      );
+      appStore.dispatch(
+        hydrateWorkspaceNavigation(workspace.id, {
+          version: 2,
+          workspace: { id: workspace.id, status: 'loading' },
+          mainPanel: { type: 'empty' },
+          drawer: { open: false, type: null, itemId: null },
+          navigation: { history: [], currentIndex: -1 },
+          ui: { hasInitialized: false },
+        }),
+      );
+      appStore.dispatch(openWorkspaceTab(workspace.id));
+
+      // Place staged attachments now that the workspace exists and deliver
+      // the held-back first message with the attachment-reference blocks.
+      // On failure the failed pills stay visible (retry or remove) and
+      // `onboardingPendingSend` makes the Create button resume this flow —
+      // the created workspace is never rolled back or duplicated.
+      if (hasStagedFiles) {
+        onboardingPendingSend = {
+          workspaceId: workspace.id,
+          agentId,
+          prompt,
+          imageBlocks,
+          contextReferences,
+        };
+        const redemption = await redeemStagedAttachments(workspace.id, onboardingStagedItems);
+        onboardingStagedItems = redemption.items;
+        if (redemption.failedCount > 0) {
+          onboardingCreationErrorCode = null;
+          throw new Error(m.onboarding_page_attachmentPlacementFailed_error());
+        }
+        // `sendHeldFirstMessage` rebuilds the wire params as plain JSON so
+        // reactive Proxies from $state never reach Electron's structured
+        // clone (monorepo#2576); on failure `onboardingPendingSend` stays
+        // set so submit resumes this flow.
+        const sendResult = await sendHeldFirstMessage(
+          {
+            workspaceId: workspace.id,
+            agentId,
+            content: prompt,
+            imageBlocks,
+            contextReferences,
+          },
+          redemption.fileBlocks,
+        );
+        if (!sendResult.sent) {
+          onboardingCreationErrorCode = null;
+          // Framed like the compact initializer: the workspace already
+          // exists, submit resumes — with the daemon's detail when available.
+          throw new Error(
+            sendResult.errorDetail
+              ? m.onboarding_page_firstMessageSendFailedDetail_error({
+                  detail: sendResult.errorDetail,
+                })
+              : m.onboarding_page_firstMessageSendFailed_error(),
+          );
+        }
+        onboardingPendingSend = null;
+        onboardingStagedItems = [];
+      }
       logger.info('Workspace created with paths', {
         id: workspace.id,
         path: workspace.path,
@@ -932,79 +1236,31 @@
           });
       }
 
-      // Clear stale layout/storage
-      try {
-        getPanelLayoutManager(workspace.id).clearLayout();
-      } catch {
-        /* ignore */
-      }
-      try {
-        const { workspaceStorageManager: wsm } =
-          await import('$store/renderer/slices/workspace/utils/workspace-storage-manager');
-        wsm.clearState(workspace.id);
-      } catch {
-        /* ignore */
-      }
-
-      appStore.dispatch(setWorkspaceEntity(workspace));
-
-      // Save the setup script to the store for future reuse.
+      // Record the script as this repo's last-used default (localStorage).
       // Skip the unedited repo-config script — the committed .intent/config.json
-      // is its source of truth, and saving a copy would both duplicate it in the
-      // saved list and shadow future repo-config changes as the last-used default.
+      // is its source of truth, and recording a copy would shadow future
+      // repo-config changes as the last-used default.
       const isUneditedRepoConfigScript =
         setupScriptName === REPO_CONFIG_SCRIPT_NAME &&
         repoConfigScriptRepo === projectSelection.repoPath &&
         setupScript.trim() === (repoConfigScript ?? '').trim();
       if (setupScript.trim() && projectSelection.repoPath && !isUneditedRepoConfigScript) {
-        const now = new Date().toISOString();
-        const scriptToSave = {
-          id: uuidv4(),
-          name: setupScriptName || m.onboarding_page_customScript_label(),
-          content: setupScript.trim(),
-          repoPath: projectSelection.repoPath,
-          projectType: 'generic' as string,
-          lastUsedAt: now,
-          usageCount: 1,
-          createdAt: now,
-        };
-        appStore.dispatch(saveScript(scriptToSave));
-        logger.info('Saved setup script to store', {
-          name: setupScriptName,
-          repoPath: projectSelection.repoPath,
-        });
+        recordLastUsedSetupScript(
+          projectSelection.repoPath,
+          {
+            name: setupScriptName || m.onboarding_page_customScript_label(),
+            content: setupScript,
+          },
+          projectSelection.type === 'github' ? projectSelection.githubUrl : undefined,
+        );
       }
-
-      // Initial-agent delivery (message + sends) is owned by the daemon; the
-      // FE only records which agent is the initial one so the UI can highlight
-      // and focus it. The id is daemon-assigned (from the create result); when
-      // it is somehow absent, skip the highlight/focus rather than invent one.
-      if (agentId) {
-        appStore.dispatch(setInitialAgentId(workspace.id, agentId));
-      }
-
-      // Same intent as CompactWorkspaceInitializer: land on the initial-agent
-      // conversation as the only tab, full-width. The spec note remains
-      // reachable from the sidebar; the main panel stays empty here so the
-      // middleware doesn't need to special-case an agent-only screen.
-      appStore.dispatch(
-        hydrateWorkspaceNavigation(workspace.id, {
-          version: 2,
-          workspace: { id: workspace.id, status: 'loading' },
-          mainPanel: { type: 'empty' },
-          drawer: agentId
-            ? { open: true, type: 'agent' as const, itemId: agentId }
-            : { open: false, type: null, itemId: null },
-          navigation: { history: [], currentIndex: -1 },
-          ui: { hasInitialized: false },
-        }),
-      );
 
       setupRepoStatus = 'done';
       setupBranchStatus = 'done';
       if (setupScriptStatus) setupScriptStatus = 'active';
       setupAgentStatus = setupScriptStatus ? 'pending' : 'active';
       setupWorktreePath = workspace.worktreePath || workspace.repositoryPath;
+      setupWorkspaceId = workspace.id;
       logger.info('Workspace paths for setup card', {
         worktreePath: workspace.worktreePath,
         repositoryPath: workspace.repositoryPath,
@@ -1023,7 +1279,7 @@
       // persistence/session cleanup is handled by the workspace-initializer saga.
       appStore.dispatch(resetOnboarding());
 
-      // Mark provider setup as complete so the home page won't redirect back here
+      // Mark provider setup as complete so the app shell won't redirect back here.
       appStore.dispatch(setHasCompletedProviderSetup(true));
 
       appStore.dispatch(setOnboardingWorkspaceId(workspace.id));
@@ -1037,8 +1293,15 @@
       await goto(`/workspace/${workspace.id}`, { replaceState: true });
     } catch (err) {
       logger.error('Workspace creation failed', err as Error);
-      onboardingCreationError = err instanceof Error ? err.message : m.onboarding_page_unexpected_error();
+      onboardingCreationError =
+        err instanceof Error ? err.message : m.onboarding_page_unexpected_error();
       isOnboardingCreating = false;
+    } finally {
+      // The create settled (success or failure) — drop the transient progress
+      // entry so the slice never accumulates stale ids. The local
+      // onboardingCreateProgressId is kept: the card stays mounted on success
+      // and its selector just reads null; a retry mints a fresh id.
+      appStore.dispatch(clearWorkspaceCreateProgress(createProgressId));
     }
   }
 </script>
@@ -1059,24 +1322,30 @@
           in:fly={{ y: 20, duration: 400, easing: cubicOut }}
         >
           <div class="w-full max-w-lg">
-            <WorkspaceSetupCard
-              repoName={projectSelection?.projectName ||
-                projectSelection?.repoPath?.split('/').pop() ||
-                m.onboarding_page_yourProject_label()}
-              repoUrl={projectSelection?.githubUrl}
-              repoPath={projectSelection?.repoPath}
-              worktreePath={setupWorktreePath}
-              branch={projectSelection?.branch}
-              baseRef={projectSelection?.branch
-                ? `origin/${projectSelection.branch}`
-                : 'origin/main'}
-              specialistName="Coordinator"
-              {setupScriptStatus}
-              repoStatus={setupRepoStatus}
-              branchStatus={setupBranchStatus}
-              agentStatus={setupAgentStatus}
-              skipIsolation={onboardingSkipIsolation}
-            />
+            <!-- Key on the progressId: the card binds its progress selector at
+                 init, so a retry create (fresh id) must destroy/recreate it. -->
+            {#key onboardingCreateProgressId}
+              <WorkspaceSetupCard
+                repoName={projectSelection?.projectName ||
+                  projectSelection?.repoPath?.split('/').pop() ||
+                  m.onboarding_page_yourProject_label()}
+                repoUrl={projectSelection?.githubUrl}
+                repoPath={projectSelection?.repoPath}
+                worktreePath={setupWorktreePath}
+                workspaceId={setupWorkspaceId}
+                branch={projectSelection?.branch}
+                baseRef={projectSelection?.branch
+                  ? `origin/${projectSelection.branch}`
+                  : 'origin/main'}
+                specialistName="Coordinator"
+                {setupScriptStatus}
+                repoStatus={setupRepoStatus}
+                branchStatus={setupBranchStatus}
+                agentStatus={setupAgentStatus}
+                skipIsolation={onboardingSkipIsolation}
+                progressId={onboardingCreateProgressId ?? undefined}
+              />
+            {/key}
           </div>
         </div>
       {:else}
@@ -1202,6 +1471,7 @@
                         <div class="py-6 overflow-x-auto scrollbar-none -mx-6">
                           <div class="pl-[max(1.5rem,calc((100%-64rem)/2))] pr-32">
                             <AgentGrid
+                              bind:this={agentGridRef}
                               onAvailabilityChange={(hasAny) => {
                                 hasConnectedProvider = hasAny;
                               }}
@@ -1214,7 +1484,7 @@
                             size="xl"
                             variant={!hasConnectedProvider ? 'outline' : 'default'}
                             disabled={!hasConnectedProvider}
-                            onclick={() => appStore.dispatch(goToStep('github'))}
+                            onclick={advanceFromWelcomeStep}
                           >
                             {m.onboarding_page_letsGo_label()}
                             {#if hasConnectedProvider}
@@ -1298,6 +1568,7 @@
                           {hideSetupScriptControl}
                           {visibleSuggestions}
                           bind:focusedSuggestionIndex
+                          bind:stagedContextItems={onboardingStagedItems}
                           selectedModel={onboardingSelectedModel}
                           modelWasOverridden={onboardingModelWasOverridden}
                           onModelChange={handleOnboardingModelChange}

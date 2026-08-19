@@ -34,18 +34,18 @@ import { m } from '$shared/paraglide/messages.js';
 import { type Workspace } from '$shared/types';
 import { CHIEF_WORKSPACE_ID } from '$shared/types/branded-ids';
 import { SPEC_NOTE_ID } from '$shared/constants/notes';
-import { getItems, type Collection } from '$lib/store-shim/utils/collections/collection-utils';
+import { type Collection } from '@augmentcode/themis/utils/collections/collection-utils';
 import type { StoredAgentSession } from '$store/renderer/slices/agent-session/agent-session-types';
 import { agentSessionStopChatRequested } from '$store/renderer/slices/agent-session/agent-session-slice';
 import { openAgentTabRequested } from '$store/renderer/slices/app-layout/app-layout-slice';
 import { actionHudShown } from '$store/renderer/slices/hardware-console/hardware-console-slice';
-import { applyPreset } from '$store/renderer/slices/panel-layout/panel-layout-slice';
 import {
   setMultiSelectSidebarSelectedTabs,
   setShowCreateModal,
 } from '$store/renderer/slices/sidebar-nav/sidebar-nav-slice';
 import {
   createAgentWithSpecialistRequested,
+  hydrateAgentsRequested,
   setActiveAgentId,
 } from '$store/renderer/slices/workspace-agents/workspace-agents-slice';
 import { openWorkspaceNote } from '$store/renderer/slices/workspace-navigation/workspace-navigation-slice';
@@ -53,6 +53,7 @@ import {
   resolveEffectiveVoiceEngine,
   type EffectiveVoiceEngineInputs,
 } from '$features/voice/effective-voice-engine';
+import { createLogger } from '$lib/utils/client-logger';
 import { isVoiceRecordingSupported } from '../voice/voice-recorder';
 import {
   handleVoiceKeyDown,
@@ -63,20 +64,27 @@ import { showVoiceSetupToast } from '../voice/voice-setup-toast';
 import type { ActionKeyActionId } from './action-mapping';
 import {
   collectCycleAgents,
+  collectUnreadWorkspaceStops,
   compareLastIdleDesc,
+  cycleStopKey,
   isSessionCyclable,
   isSessionIdle,
   isSessionInProgress,
+  sessionAttentionPriority,
   sessionHasFailed,
   sessionNeedsAttention,
+  WORKSPACE_STOP_KEY_PREFIX,
   type CycleAgentEntry,
+  type CycleStopEntry,
+  type SessionAttentionPriority,
 } from './agent-cycle';
 import type { CycleScope, CycleScopeFamilyId } from './cycle-scope';
+
+const logger = createLogger('HardwareConsoleActionKeyRegistry');
 
 /** The narrow slice of the app store state the action registry reads. */
 export interface ActionKeyState {
   workspace: {
-    activeWorkspaceId: string | null;
     workspaces: Collection<Workspace, 'id'>;
   };
   workspaceAgents: {
@@ -94,6 +102,7 @@ export interface ActionKeyState {
   sidebarNav: {
     multiSelectTabOrder: string[];
     multiSelectSelectedTabIdsByWorkspaceId: Record<string, string[]>;
+    showCreateModal: boolean;
   };
   /** Engine preference + configuration reality for the push-to-talk gate. */
   voiceSettings: EffectiveVoiceEngineInputs;
@@ -102,6 +111,7 @@ export interface ActionKeyState {
 /** Everything an action needs to check availability and run. */
 export interface ActionKeyContext {
   state: ActionKeyState;
+  workspaceId: string | null;
   dispatch: (action: unknown) => unknown;
   /** Navigate the app to a route (workspace switching). */
   navigate: (route: string) => Promise<void>;
@@ -140,13 +150,13 @@ export interface ActionKeyDefinition {
 /** Mirror of the sidebar TAB_DEFINITIONS ids (MultiSelectTabbedSidebar). */
 const SIDEBAR_TAB_IDS = ['overview', 'agents', 'context', 'changes', 'files'] as const;
 
-const LAYOUT_PRESETS = ['single', 'split-horizontal', 'split-vertical', 'three-column'] as const;
+const LAYOUT_PRESETS = ['planning', 'agents-row', 'changes', 'review'] as const;
 
 /** Transient per-workspace cursor for layout-preset cycling (UI-only). */
 const layoutPresetCursor = new Map<string, number>();
 
-function activeWorkspaceId(state: ActionKeyState): string | null {
-  const wsId = state.workspace.activeWorkspaceId;
+function activeWorkspaceId(context: ActionKeyContext): string | null {
+  const wsId = context.workspaceId;
   if (typeof wsId !== 'string' || wsId.length === 0 || wsId === CHIEF_WORKSPACE_ID) return null;
   return wsId;
 }
@@ -155,9 +165,35 @@ function workspaceActiveAgentId(state: ActionKeyState, wsId: string): string | n
   return state.workspaceAgents.byWorkspaceId[wsId]?.activeAgentId ?? null;
 }
 
+/**
+ * Advance the per-workspace layout-preset cursor and return the preset to
+ * apply. `agents-row` is skipped when the workspace has no agents — the
+ * preset executor returns false there, which would make the press a silent
+ * no-op (intent-hq/monorepo#1612). Mirrors the executor's own criterion
+ * (`applyAgentsRowPreset` in preset-executor.ts only tiles agents with a
+ * resolvable session) by requiring at least one workspace agentId to have an
+ * entry in `agentSessions.byAgentId`, rather than just counting agentIds —
+ * an agentId whose session hasn't loaded yet would otherwise cycle to an
+ * empty agents-row. The cursor lands on the preset actually applied so the
+ * next press continues from the right stop.
+ */
+function nextLayoutPreset(state: ActionKeyState, wsId: string): (typeof LAYOUT_PRESETS)[number] {
+  const agentIds = state.workspaceAgents.byWorkspaceId[wsId]?.agentIds ?? [];
+  const hasAgents = agentIds.some(
+    (agentId) => state.agentSessions.byAgentId[agentId] !== undefined,
+  );
+  const applicable = LAYOUT_PRESETS.filter((presetId) => presetId !== 'agents-row' || hasAgents);
+  const previous = layoutPresetCursor.get(wsId) ?? -1;
+  const presetId =
+    applicable.find((candidate) => LAYOUT_PRESETS.indexOf(candidate) > previous) ?? applicable[0];
+  layoutPresetCursor.set(wsId, LAYOUT_PRESETS.indexOf(presetId));
+  return presetId;
+}
+
 /** The globally focused agent: the active workspace's active agent id. */
-function focusedAgentId(state: ActionKeyState): string | null {
-  const wsId = activeWorkspaceId(state);
+function focusedAgentId(context: ActionKeyContext): string | null {
+  const { state } = context;
+  const wsId = activeWorkspaceId(context);
   const current = wsId === null ? null : workspaceActiveAgentId(state, wsId);
   return current === null ? null : String(current);
 }
@@ -178,38 +214,50 @@ function inProgressAgents(state: ActionKeyState): CycleAgentEntry[] {
 }
 
 /**
- * The unread-cycle walk: union of two walks, deduped by agent id — each
- * walk is in workspace order, and unread-workspace entries precede
- * attention-only entries: (a) the top-level agents of each unread
- * workspace (unread is workspace-level, BE-owned `workspace.attention`) —
- * a fixed top-level walk; and (b) every attention-requesting agent (the
- * LED attention definition), which follows the `cycle-attention-agents`
- * configured scope so the settings toggle also governs this portion.
- * `attentionAgentIds` records walk (b) membership independent of dedup
- * position, for the remaining-stop count.
+ * The unread-cycle walk: union of two walks, deduped by stop key — each
+ * walk is in workspace order, and attention entries precede unread-workspace
+ * entries, ordered by attention priority: (a) every attention-requesting
+ * agent (the LED attention definition) bucketed blocker → pending wizard
+ * question → discussion (`sessionAttentionPriority`; an agent with several
+ * signals classifies at its highest bucket), following the
+ * `cycle-attention-agents` configured scope so the settings toggle also
+ * governs this portion; then (b) one stop per unread workspace
+ * (`collectUnreadWorkspaceStops`) — its last active top-level agent when
+ * sessions are hydrated (intent-hq/monorepo#1779), else a workspace-level
+ * stop (intent-hq/monorepo#2438) — since visiting the workspace clears its
+ * whole unread flag anyway. `attentionAgentIds` records walk (a)
+ * membership independent of dedup position, for the remaining-stop count.
  */
 function collectUnreadCycleEntries(state: ActionKeyState): {
-  entries: CycleAgentEntry[];
+  entries: CycleStopEntry[];
   attentionAgentIds: Set<string>;
 } {
-  const unreadWorkspaceIds = new Set<string>(
-    getItems(state.workspace.workspaces)
-      .filter((workspace) => workspace.attention === 'unread')
-      .map((workspace) => workspace.id),
-  );
-  const unreadEntries = collectCycleAgents(state, isSessionCyclable).filter((entry) =>
-    unreadWorkspaceIds.has(entry.wsId),
-  );
+  const unreadEntries = collectUnreadWorkspaceStops(state);
   const attentionEntries = collectCycleAgents(
     state,
     sessionNeedsAttention,
     undefined,
     familyScope(state, 'cycle-attention-agents'),
   );
+  const buckets: Record<SessionAttentionPriority, CycleAgentEntry[]> = {
+    blocker: [],
+    question: [],
+    discussion: [],
+  };
+  for (const entry of attentionEntries) {
+    const priority = sessionAttentionPriority(state.agentSessions.byAgentId[entry.agentId]);
+    if (priority !== null) buckets[priority].push(entry);
+  }
   const seen = new Set<string>();
-  const entries = [...unreadEntries, ...attentionEntries].filter((entry) => {
-    if (seen.has(entry.agentId)) return false;
-    seen.add(entry.agentId);
+  const entries = [
+    ...buckets.blocker,
+    ...buckets.question,
+    ...buckets.discussion,
+    ...unreadEntries,
+  ].filter((entry) => {
+    const key = cycleStopKey(entry);
+    if (seen.has(key)) return false;
+    seen.add(key);
     return true;
   });
   return { entries, attentionAgentIds: new Set(attentionEntries.map((entry) => entry.agentId)) };
@@ -226,19 +274,20 @@ function focusAgent(context: ActionKeyContext, wsId: string, agentId: string): v
 }
 
 /**
- * Per-family round-robin cursor: the agent id a cycle action last stepped
- * to. The state-derived anchor (active workspace + its active agent) lags
- * after a cross-workspace hop — `navigate()` resolves before the route
- * mounts and dispatches `setActiveWorkspaceId`, and the workspace loader
- * may re-point `activeAgentId` — so anchoring on it alone re-entered the
- * walk at the same position press after press. Transient UI-only state
+ * Per-family round-robin cursor: the stop key (`cycleStopKey`) a cycle
+ * action last stepped to. The state-derived anchor (active workspace + its
+ * active agent) lags after a cross-workspace hop — `navigate()` resolves
+ * before the route mounts and activates the workspace tab, and the workspace
+ * loader may re-point `activeAgentId` — so anchoring on it alone re-entered
+ * the walk at the same position press after press. Transient UI-only state
  * (like `layoutPresetCursor` below).
  */
-const lastCycledAgentByAction = new Map<ActionKeyActionId, string>();
+const lastCycledStopByAction = new Map<ActionKeyActionId, string>();
 
 /** Reset the cycle cursors (test isolation). */
 export function resetActionKeyCycleCursors(): void {
-  lastCycledAgentByAction.clear();
+  lastCycledStopByAction.clear();
+  layoutPresetCursor.clear();
 }
 
 /** One entry of the global cross-workspace cycle family. */
@@ -261,8 +310,8 @@ interface GlobalCycleSpec {
    * needs its own visit; override it when one step clears several
    * entries at once (e.g. workspace-level unread).
    */
-  countRemaining?(state: ActionKeyState, entries: CycleAgentEntry[], next: CycleAgentEntry): number;
-  collect(state: ActionKeyState): CycleAgentEntry[];
+  countRemaining?(state: ActionKeyState, entries: CycleStopEntry[], next: CycleStopEntry): number;
+  collect(state: ActionKeyState): CycleStopEntry[];
 }
 
 /**
@@ -294,27 +343,52 @@ function makeGlobalCycleAction(spec: GlobalCycleSpec): ActionKeyDefinition {
       const { state } = context;
       const entries = spec.collect(state);
       if (entries.length === 0) return;
-      const focused = focusedAgentId(state);
-      if (entries.length === 1 && entries[0].agentId === focused) {
-        lastCycledAgentByAction.set(spec.id, entries[0].agentId);
+      const focused = focusedAgentId(context);
+      const alreadyThere =
+        entries.length === 1 &&
+        (entries[0].agentId !== null
+          ? entries[0].agentId === focused
+          : entries[0].wsId === activeWorkspaceId(context));
+      if (alreadyThere) {
+        lastCycledStopByAction.set(spec.id, cycleStopKey(entries[0]));
+        // Workspace-level stop we're already on: still (re-)request hydration
+        // so the press converges the session cache even if the route-mount
+        // hydration failed.
+        if (entries[0].agentId === null) {
+          context.dispatch(hydrateAgentsRequested(entries[0].wsId));
+        }
         context.showHint(spec.getSingleCandidateHint());
         return;
       }
-      const cursor = lastCycledAgentByAction.get(spec.id);
-      let index = cursor === undefined ? -1 : entries.findIndex((e) => e.agentId === cursor);
+      const cursor = lastCycledStopByAction.get(spec.id);
+      let index = cursor === undefined ? -1 : entries.findIndex((e) => cycleStopKey(e) === cursor);
+      if (index === -1 && cursor !== undefined && cursor.startsWith(WORKSPACE_STOP_KEY_PREFIX)) {
+        // The stored cursor was a workspace-level stop whose workspace has
+        // since hydrated (its stop now keys by agent id): resume from that
+        // workspace's stop instead of restarting the walk.
+        const cursorWsId = cursor.slice(WORKSPACE_STOP_KEY_PREFIX.length);
+        index = entries.findIndex((e) => e.wsId === cursorWsId);
+      }
       if (index === -1 && focused !== null) {
         index = entries.findIndex((e) => e.agentId === focused);
       }
       const next = entries[(index + 1) % entries.length];
-      lastCycledAgentByAction.set(spec.id, next.agentId);
+      lastCycledStopByAction.set(spec.id, cycleStopKey(next));
       // Successful step: surface what the button did in the bottom-center
       // HUD (the middleware hides it after inactivity).
       const remaining = spec.countRemaining?.(state, entries, next) ?? entries.length - 1;
       context.dispatch(actionHudShown(spec.getHudLabel?.(remaining) ?? spec.getLabel()));
-      if (next.wsId !== activeWorkspaceId(state)) {
+      if (next.wsId !== activeWorkspaceId(context)) {
         void context.navigate(`/workspace/${next.wsId}`);
       }
-      focusAgent(context, next.wsId, next.agentId);
+      if (next.agentId !== null) {
+        focusAgent(context, next.wsId, next.agentId);
+      } else {
+        // Workspace-level stop (no hydrated sessions yet): visiting the
+        // workspace clears its unread flag; hydrating converges the local
+        // session cache so later stops can target a concrete agent.
+        context.dispatch(hydrateAgentsRequested(next.wsId));
+      }
     },
   };
 }
@@ -374,14 +448,17 @@ export const ACTION_KEY_REGISTRY: readonly ActionKeyDefinition[] = [
           : m.hardwareConsole_actionKey_cycleUnreadAgents_hudRemaining_many({ count: remaining }),
     countRemaining: (state, entries, next) => {
       // Stepping to `next` visits its workspace, which clears the whole
-      // workspace's unread flag — every unread-only entry of that workspace
-      // stops being a candidate along with it. Attention entries persist
-      // individually until handled, so they always count as their own stop.
+      // workspace's unread flag — that workspace's unread entry (one per
+      // unread workspace) stops being a candidate along with it. Attention
+      // entries persist individually until handled, so they always count as
+      // their own stop.
       const { attentionAgentIds } = collectUnreadCycleEntries(state);
+      const nextKey = cycleStopKey(next);
       return entries.filter(
         (entry) =>
-          entry.agentId !== next.agentId &&
-          (attentionAgentIds.has(entry.agentId) || entry.wsId !== next.wsId),
+          cycleStopKey(entry) !== nextKey &&
+          ((entry.agentId !== null && attentionAgentIds.has(entry.agentId)) ||
+            entry.wsId !== next.wsId),
       ).length;
     },
     collect: (state) => collectUnreadCycleEntries(state).entries,
@@ -406,15 +483,16 @@ export const ACTION_KEY_REGISTRY: readonly ActionKeyDefinition[] = [
       return m.hardwareConsole_actionKey_stopAgent_label();
     },
     icon: faStop,
-    isAvailable({ state }) {
-      const wsId = activeWorkspaceId(state);
+    isAvailable(context) {
+      const { state } = context;
+      const wsId = activeWorkspaceId(context);
       if (wsId === null) return false;
       const agentId = workspaceActiveAgentId(state, wsId);
       return agentId !== null && isSessionInProgress(state.agentSessions.byAgentId[agentId]);
     },
     execute(context) {
       const { state, dispatch } = context;
-      const wsId = activeWorkspaceId(state);
+      const wsId = activeWorkspaceId(context);
       if (wsId === null) return;
       const agentId = workspaceActiveAgentId(state, wsId);
       if (agentId === null || !isSessionInProgress(state.agentSessions.byAgentId[agentId])) return;
@@ -429,11 +507,12 @@ export const ACTION_KEY_REGISTRY: readonly ActionKeyDefinition[] = [
       return m.hardwareConsole_actionKey_seeSpec_label();
     },
     icon: faFileLines,
-    isAvailable({ state }) {
-      return activeWorkspaceId(state) !== null;
+    isAvailable(context) {
+      return activeWorkspaceId(context) !== null;
     },
-    execute({ state, dispatch }) {
-      const wsId = activeWorkspaceId(state);
+    execute(context) {
+      const { dispatch } = context;
+      const wsId = activeWorkspaceId(context);
       if (wsId === null) return;
       dispatch(openWorkspaceNote(wsId, SPEC_NOTE_ID));
     },
@@ -444,11 +523,12 @@ export const ACTION_KEY_REGISTRY: readonly ActionKeyDefinition[] = [
       return m.hardwareConsole_actionKey_toggleSidebarTabs_label();
     },
     icon: faTableColumns,
-    isAvailable({ state }) {
-      return activeWorkspaceId(state) !== null;
+    isAvailable(context) {
+      return activeWorkspaceId(context) !== null;
     },
-    execute({ state, dispatch }) {
-      const wsId = activeWorkspaceId(state);
+    execute(context) {
+      const { state, dispatch } = context;
+      const wsId = activeWorkspaceId(context);
       if (wsId === null) return;
       const order =
         state.sidebarNav.multiSelectTabOrder.length > 0
@@ -465,11 +545,12 @@ export const ACTION_KEY_REGISTRY: readonly ActionKeyDefinition[] = [
       return m.hardwareConsole_actionKey_newAgent_label();
     },
     icon: faRobot,
-    isAvailable({ state }) {
-      return activeWorkspaceId(state) !== null;
+    isAvailable(context) {
+      return activeWorkspaceId(context) !== null;
     },
-    execute({ state, dispatch }) {
-      const wsId = activeWorkspaceId(state);
+    execute(context) {
+      const { dispatch } = context;
+      const wsId = activeWorkspaceId(context);
       if (wsId === null) return;
       dispatch(createAgentWithSpecialistRequested(wsId, null));
     },
@@ -483,8 +564,8 @@ export const ACTION_KEY_REGISTRY: readonly ActionKeyDefinition[] = [
     isAvailable() {
       return true;
     },
-    execute({ dispatch }) {
-      dispatch(setShowCreateModal(true));
+    execute({ state, dispatch }) {
+      dispatch(setShowCreateModal(!state.sidebarNav.showCreateModal));
     },
   },
   {
@@ -493,15 +574,40 @@ export const ACTION_KEY_REGISTRY: readonly ActionKeyDefinition[] = [
       return m.hardwareConsole_actionKey_switchWindowLayouts_label();
     },
     icon: faWindowRestore,
-    isAvailable({ state }) {
-      return activeWorkspaceId(state) !== null;
+    isAvailable(context) {
+      return activeWorkspaceId(context) !== null;
     },
-    execute({ state, dispatch }) {
-      const wsId = activeWorkspaceId(state);
+    execute(context) {
+      const { state, showHint } = context;
+      const wsId = activeWorkspaceId(context);
       if (wsId === null) return;
-      const next = ((layoutPresetCursor.get(wsId) ?? -1) + 1) % LAYOUT_PRESETS.length;
-      layoutPresetCursor.set(wsId, next);
-      dispatch(applyPreset(wsId, LAYOUT_PRESETS[next]));
+      const presetId = nextLayoutPreset(state, wsId);
+      // Dynamic import: panel-layout-adapter/preset-executor transitively pull
+      // in selectors that call `store.createSelector` at module scope, which
+      // would crash if evaluated eagerly here — this registry is imported by
+      // middleware.ts during store construction, before `store` exists. See
+      // panel-layout-persistence-service.ts for the same workaround.
+      void Promise.all([
+        import('$features/layout/panel-layout-adapter'),
+        import('$features/layout/preset-executor'),
+      ])
+        .then(([{ getPanelLayoutManager }, { applyContentPreset }]) =>
+          applyContentPreset(presetId, getPanelLayoutManager(wsId), {
+            workspaceId: wsId,
+            containerWidth: window.innerWidth,
+            containerHeight: window.innerHeight,
+          }),
+        )
+        .then((applied) => {
+          // Race fallback: the preset became inapplicable between the
+          // synchronous skip check and the async application (e.g. the last
+          // agent disappeared), so tell the user instead of dead-pressing.
+          if (!applied)
+            showHint(m.hardwareConsole_actionKey_switchWindowLayouts_notApplicable_hint());
+        })
+        .catch((error: unknown) => {
+          logger.error('Failed to apply layout preset', { presetId, wsId, error });
+        });
     },
   },
   {

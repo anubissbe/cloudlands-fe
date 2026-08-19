@@ -7,28 +7,21 @@
  * (`agent.update` via the AppClient seam + the session-field dispatch), and
  * re-derivation when the session's model changes.
  */
-import {
-  afterEach,
-  beforeEach,
-  describe,
-  expect,
-  it,
-  vi,
-} from 'vitest';
-import {
-  cleanup,
-  fireEvent,
-  render,
-  screen,
-  waitFor,
-} from '@testing-library/svelte';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/svelte';
 import { writable } from 'svelte/store';
 
-type Session = { id: string; workspaceId: string; model?: string; reasoningEffort?: string | null };
+type Session = {
+  id: string;
+  workspaceId: string;
+  model?: string | null;
+  reasoningEffort?: string | null;
+};
 
 const sessions = new Map<string, Session>();
 const sessionVersion$ = writable(0);
 const modelEffortLevels = new Map<string, string[]>();
+let inheritedModel: string | undefined;
 
 const bumpVersion = () => sessionVersion$.update((value) => value + 1);
 
@@ -73,16 +66,18 @@ vi.mock('$lib/components/ui/button/button.svelte', async () => {
 vi.mock('$features/agent/reasoning-effort', () => ({ applyReasoningEffort }));
 
 vi.mock('$store/renderer/store', async () => {
-  const { createAppStoreMockModule } = await import(
-    '$store/renderer/utils/test-helpers/store-mock'
-  );
+  const { createAppStoreMockModule } =
+    await import('$store/renderer/utils/test-helpers/store-mock');
   return createAppStoreMockModule({ state: () => ({ sessions }), dispatch: mockDispatch });
 });
 
 vi.mock('$store/renderer/slices/agent-session/agent-session-selectors', () => ({
   selectAgentReasoningEffort: Object.assign(
     (agentIdStore: Parameters<typeof selectorReadable>[0]) =>
-      selectorReadable(agentIdStore, (agentId) => sessions.get(agentId)?.reasoningEffort ?? undefined),
+      selectorReadable(
+        agentIdStore,
+        (agentId) => sessions.get(agentId)?.reasoningEffort ?? undefined,
+      ),
     { select: (_state: unknown, agentId: string) => sessions.get(agentId)?.reasoningEffort },
   ),
 }));
@@ -91,7 +86,7 @@ vi.mock('$store/renderer/slices/model/model-selectors', () => ({
   selectAgentModelEffortLevels: Object.assign(
     (agentIdStore: Parameters<typeof selectorReadable>[0]) =>
       selectorReadable(agentIdStore, (agentId) => {
-        const model = sessions.get(agentId)?.model;
+        const model = sessions.get(agentId)?.model ?? inheritedModel;
         return model ? modelEffortLevels.get(model) : undefined;
       }),
     { select: () => undefined },
@@ -108,6 +103,8 @@ describe('EffortPicker', () => {
     modelEffortLevels.clear();
     modelEffortLevels.set('codex:gpt-5.3-codex', ['low', 'medium', 'high', 'xhigh']);
     modelEffortLevels.set('codex:gpt-5.1-codex-max', ['low', 'high']);
+    modelEffortLevels.set('gpt5.6-sol', ['low', 'medium', 'high', 'max']);
+    inheritedModel = undefined;
     sessionVersion$.set(0);
   });
 
@@ -131,34 +128,118 @@ describe('EffortPicker', () => {
     expect(screen.queryByTestId('effort-picker-trigger')).toBeFalsy();
   });
 
-  it('renders the Default label when the session has no explicit effort', () => {
-    mount({ id: 'agent-1', workspaceId: 'ws-1', model: 'codex:gpt-5.3-codex' });
-    expect(trigger().textContent ?? '').toContain('Default');
+  it('renders for an effort-capable provider model inherited by the session', () => {
+    inheritedModel = 'gpt5.6-sol';
+    mount({ id: 'agent-1', workspaceId: 'ws-1', model: null });
+
+    expect(trigger().getAttribute('aria-label')).toContain('Default');
+    expect(screen.getByTestId('effort-gauge')).toBeTruthy();
   });
 
-  it('renders the current effort level on the trigger', () => {
+  it('renders an icon-only gauge with the current default in its accessible label', () => {
+    mount({ id: 'agent-1', workspaceId: 'ws-1', model: 'codex:gpt-5.3-codex' });
+    expect(trigger().getAttribute('aria-label')).toContain('Default');
+    expect(trigger().textContent?.trim()).toBe('');
+    expect(screen.getByTestId('effort-gauge').dataset.gaugeValue).toBe('0');
+    expect(screen.getByTestId('effort-gauge').dataset.gaugeCentered).toBe('true');
+    expect(screen.getByTestId('effort-gauge-needle').getAttribute('style')).toContain(
+      'rotate(0deg)',
+    );
+    expect(trigger().dataset.size).toBe('icon-sm');
+    expect(screen.getByTestId('effort-gauge').getAttribute('width')).toBe('16');
+    expect(screen.getByTestId('effort-gauge').getAttribute('height')).toBe('16');
+  });
+
+  it('reuses the slider content without a trigger or popover in embedded mode', async () => {
+    const onEffortChange = vi.fn(async () => true);
+    render(EffortPicker, {
+      props: {
+        mode: 'embedded',
+        agentId: 'agent-1',
+        workspaceId: 'ws-1',
+        effortLevels: ['low', 'high'],
+        effort: 'low',
+        onEffortChange,
+      },
+    });
+
+    expect(screen.queryByTestId('effort-picker-trigger')).toBeNull();
+    expect(screen.queryByRole('dialog')).toBeNull();
+    const content = screen.getByTestId('effort-picker-content');
+    expect(content.textContent).not.toContain('Reasoning effort');
+    expect(screen.queryByTestId('effort-current-value')).toBeNull();
+    const nextSendCaption = screen.getByText('Applies on the next message you send.');
+    expect(nextSendCaption).toBeTruthy();
+    expect(nextSendCaption.className).toContain('text-muted-foreground');
+    expect(nextSendCaption.parentElement?.className).toContain('justify-between');
+    const gauge = screen.getByTestId('effort-gauge');
+    expect(nextSendCaption.parentElement?.contains(gauge)).toBe(true);
+    expect(gauge.dataset.gaugeValue).toBe('0');
+    expect(gauge.dataset.gaugeCentered).toBe('false');
+    const slider = screen.getByRole('slider');
+    expect(slider.getAttribute('max')).toBe('2');
+    expect(slider.getAttribute('aria-valuetext')).toBe('Low');
+    expect(screen.getAllByTestId('effort-slider-tick')).toHaveLength(3);
+
+    await fireEvent.change(slider, { target: { value: '2' } });
+    expect(onEffortChange).toHaveBeenCalledWith('high');
+    expect(gauge.dataset.gaugeValue).toBe('1');
+    expect(applyReasoningEffort).not.toHaveBeenCalled();
+  });
+
+  it('represents the current effort level on the gauge', () => {
     mount({
       id: 'agent-1',
       workspaceId: 'ws-1',
       model: 'codex:gpt-5.3-codex',
       reasoningEffort: 'high',
     });
-    expect(trigger().textContent ?? '').toContain('High');
+    expect(trigger().getAttribute('aria-label')).toContain('High');
+    expect(screen.getByTestId('effort-gauge').dataset.gaugeValue).toBe('2');
+    expect(screen.getByTestId('effort-gauge').dataset.gaugeCentered).toBe('false');
   });
 
-  it('renders one slider step per advertised level, in catalog order, after Default', async () => {
+  it('updates the label, stable ticks, and animated gauge live while sliding', async () => {
     mount({ id: 'agent-1', workspaceId: 'ws-1', model: 'codex:gpt-5.3-codex' });
     await fireEvent.click(trigger());
 
     await waitFor(() => {
       expect(screen.getByRole('dialog', { name: /reasoning effort/i })).toBeTruthy();
     });
-
-    const labels = screen.getAllByTestId('effort-step-label').map((el) => el.textContent?.trim());
-    expect(labels).toEqual(['Default', 'Low', 'Medium', 'High', 'Extra high']);
+    expect(screen.getByRole('dialog').textContent).toContain('Reasoning effort');
 
     const slider = screen.getByRole('slider');
     expect(slider.getAttribute('max')).toBe('4');
+    expect(slider.className).toContain('operate-slider');
+    expect(screen.getAllByTestId('effort-slider-tick')).toHaveLength(5);
+    expect(screen.getByTestId('effort-current-value').textContent?.trim()).toBe('Default');
+    expect(screen.queryByTestId('effort-gauge-popover')).toBeNull();
+    expect(
+      screen
+        .getAllByTestId('effort-slider-tick')
+        .every((tick) => tick.className.includes('h-3 w-px')),
+    ).toBe(true);
+
+    await fireEvent.input(slider, { target: { value: '2' } });
+    expect(slider.getAttribute('aria-valuetext')).toBe('Medium');
+    expect(screen.getByTestId('effort-current-value').textContent?.trim()).toBe('Medium');
+    expect(
+      screen.getByTestId('effort-current-value').querySelector('[data-motion-direction]')?.dataset
+        .motionDirection,
+    ).toBe('up');
+    expect(screen.getByTestId('effort-gauge').dataset.gaugeValue).toBe('1');
+    expect(screen.getByTestId('effort-gauge-needle').className.baseVal).toContain(
+      'transition-transform',
+    );
+    const markers = screen.getAllByTestId('effort-slider-tick-marker');
+    expect(markers.every((marker) => marker.className.includes('w-px'))).toBe(true);
+
+    await fireEvent.input(slider, { target: { value: '1' } });
+    expect(screen.getByTestId('effort-current-value').textContent?.trim()).toBe('Low');
+    expect(
+      screen.getByTestId('effort-current-value').querySelector('[data-motion-direction]')?.dataset
+        .motionDirection,
+    ).toBe('down');
   });
 
   it('commits the selected level, passing the previous effort for rollback', async () => {
@@ -237,7 +318,7 @@ describe('EffortPicker', () => {
       model: 'codex:gpt-5.3-codex',
       reasoningEffort: 'xhigh',
     });
-    expect(trigger().textContent ?? '').toContain('Extra high');
+    expect(trigger().getAttribute('aria-label')).toContain('Extra high');
 
     sessions.set('agent-1', {
       id: 'agent-1',
@@ -248,14 +329,13 @@ describe('EffortPicker', () => {
     bumpVersion();
 
     await waitFor(() => {
-      expect(trigger().textContent ?? '').toContain('Default');
+      expect(trigger().getAttribute('aria-label')).toContain('Default');
     });
 
     await fireEvent.click(trigger());
-    const labels = await waitFor(() =>
-      screen.getAllByTestId('effort-step-label').map((el) => el.textContent?.trim()),
-    );
-    expect(labels).toEqual(['Default', 'Low', 'High']);
+    const slider = await waitFor(() => screen.getByRole('slider'));
+    expect(slider.getAttribute('max')).toBe('2');
+    expect(screen.getAllByTestId('effort-slider-tick')).toHaveLength(3);
   });
 
   it('hides the control once the session switches to a model without effort levels', async () => {

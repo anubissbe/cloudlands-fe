@@ -13,26 +13,28 @@
    * - "this terminal" → focuses the setup terminal
    * - Specialist name → rich tooltip with description, prompt preview, settings link
    */
-  import {
-  slide,
-  blur,
-} from 'svelte/transition';
+  import { slide, blur } from 'svelte/transition';
   import { cubicOut } from 'svelte/easing';
   import Fa from 'svelte-fa';
   import {
-  faFolderOpen,
-  faCodeBranch,
-  faTerminal,
-  faRobot,
-  faCopy,
-} from '@fortawesome/free-solid-svg-icons';
+    faFolderOpen,
+    faCodeBranch,
+    faTerminal,
+    faRobot,
+    faCopy,
+  } from '@fortawesome/free-solid-svg-icons';
   import { toast } from 'svelte-sonner';
   import { m } from '$shared/paraglide/messages.js';
   import ShimmerOverlay from '$lib/components/ui/ShimmerOverlay.svelte';
-  import OpenComboButton from '$lib/components/ui/OpenComboButton.svelte';
+  import OpenComboButton from '$features/external-editors/components/OpenComboButton.svelte';
   import { TooltipRich } from '$lib/components/ui/tooltip';
   import { getSpecialistById } from '$lib/constants/specialists';
   import { navigateToSettings } from '$lib/utils/workspace-navigation';
+  import { selectWorkspaceCreateProgress } from '$store/renderer/slices/workspace-create-progress/workspace-create-progress-selectors';
+  import {
+    createProgressLabel,
+    formatCreateProgressPercent,
+  } from '$lib/components/workspace/initializer/create-progress-label';
 
   type StepStatus = 'pending' | 'active' | 'done';
 
@@ -45,6 +47,8 @@
     repoPath?: string;
     /** Where the worktree/clone was created */
     worktreePath?: string;
+    /** Workspace the worktree belongs to; gates editor opens on workspace locality (monorepo#2171) */
+    workspaceId?: string;
     /** Branch name for the workspace */
     branch?: string;
     /** Base ref the branch was created from (e.g. "origin/main") */
@@ -69,12 +73,22 @@
     agentStatus?: StepStatus;
     /** If true, the workspace works directly on the branch without an isolated checkout (worktree or CoW clone) */
     skipIsolation?: boolean;
+    /**
+     * FE-minted correlation id of the in-flight `workspace.create` (echoed on
+     * git:clone:progress frames, PROTOCOL §5.1). When set and frames arrive,
+     * the repo step shows the live stage label + percent + bar; without it
+     * (ChatPanel usage, older daemons) the card renders exactly as before.
+     * The caller must key this component on the id — the selector readable
+     * binds at init only (STATE_MANAGEMENT.md).
+     */
+    progressId?: string;
   }
 
   let {
     repoName,
     repoPath,
     worktreePath,
+    workspaceId,
     branch,
     baseRef = 'origin/main',
     projectType,
@@ -88,7 +102,26 @@
     branchStatus = 'pending',
     agentStatus = 'pending',
     skipIsolation = false,
+    progressId,
   }: Props = $props();
+
+  // Selector readables bind at component init only (STATE_MANAGEMENT.md); the
+  // caller keys this component on progressId, so the initial value is the only
+  // one it ever renders. An absent id binds a never-matching key (null entry).
+  // svelte-ignore state_referenced_locally
+  const progressEntry$ = selectWorkspaceCreateProgress(progressId ?? '');
+
+  // Monotonic floor: track the highest percent seen so the label and bar
+  // never move backwards even if frames arrive out of order. Clamped to 100
+  // at the source so text, bar width, and ARIA can never disagree (negatives
+  // are excluded by the > maxPercent guard against the initial 0).
+  let maxPercent = $state(0);
+  $effect(() => {
+    const percent = Math.min($progressEntry$?.percent ?? 0, 100);
+    if (percent > maxPercent) maxPercent = percent;
+  });
+
+  const liveProgress = $derived($progressEntry$?.sawFrame === true);
 
   /** For skipIsolation mode, strip the remote prefix (e.g. "origin/main" → "main") */
   const displayBranch = $derived(baseRef.replace(/^[^/]+\//, ''));
@@ -223,17 +256,45 @@
       {/if}
     {/snippet}
     {#snippet repoActive()}
-      {#if skipIsolation}
-        {m.onboarding_setupCard_opening_before()} {@render repoNameCopyable()}{m.onboarding_setupCard_opening_after()}
+      {#if liveProgress && $progressEntry$}
+        <!-- Live daemon-driven provisioning progress (git:clone:progress
+             frames, PROTOCOL §5.1): stage label + monotonic percent, with a
+             determinate bar. Mirrors CreateButtonProgress. -->
+        <span data-testid="setup-card-progress-label">
+          {m.workspace_compactInitializer_progressWithPercent_label({
+            label: createProgressLabel($progressEntry$),
+            percent: formatCreateProgressPercent(maxPercent),
+          })}
+        </span>
+        <div
+          class="mt-1 h-[2px] w-full max-w-64 rounded-full bg-secondary overflow-hidden"
+        >
+          <div
+            class="h-full bg-foreground/60 transition-[width] duration-300 ease-out"
+            style="width: {maxPercent}%"
+            role="progressbar"
+            aria-label={createProgressLabel($progressEntry$)}
+            aria-valuemin="0"
+            aria-valuemax="100"
+            aria-valuenow={maxPercent}
+            data-testid="setup-card-progress-bar"
+          ></div>
+        </div>
+      {:else if skipIsolation}
+        {m.onboarding_setupCard_opening_before()}
+        {@render repoNameCopyable()}{m.onboarding_setupCard_opening_after()}
       {:else}
         {m.onboarding_setupCard_creatingIsolatedCopy_before()} {@render repoNameCopyable()}
       {/if}
     {/snippet}
     {#snippet repoDone()}
       {#if skipIsolation}
-        {m.onboarding_setupCard_workingDirectlyOn_before()} <code class="text-sm bg-secondary py-1 px-1.5">{displayBranch}</code> {#if worktreePath}{' '}{m.onboarding_setupCard_at_label()}
+        {m.onboarding_setupCard_workingDirectlyOn_before()}
+        <code class="text-sm bg-secondary py-1 px-1.5">{displayBranch}</code>
+        {#if worktreePath}{' '}{m.onboarding_setupCard_at_label()}
           <OpenComboButton
             filePath={worktreePath}
+            {workspaceId}
             isDirectory={true}
             variant="sidebar"
             compact
@@ -245,10 +306,12 @@
             >
           </OpenComboButton>{/if}.
       {:else}
-        {m.onboarding_setupCard_createdIsolatedCopy_before()} {@render repoNameCopyable()}
+        {m.onboarding_setupCard_createdIsolatedCopy_before()}
+        {@render repoNameCopyable()}
         {#if worktreePath}{' '}{m.onboarding_setupCard_at_label()}
           <OpenComboButton
             filePath={worktreePath}
+            {workspaceId}
             isDirectory={true}
             variant="sidebar"
             compact
@@ -269,15 +332,18 @@
     {#snippet branchActive()}
       {#if skipIsolation}
         {#if branch}
-          {m.onboarding_setupCard_workingOnBranchNamed_before()} <span class="">{branch}</span>{m.onboarding_setupCard_workingOnBranchActive_after()}
+          {m.onboarding_setupCard_workingOnBranchNamed_before()}
+          <span class="">{branch}</span>{m.onboarding_setupCard_workingOnBranchActive_after()}
         {:else}
           {m.onboarding_setupCard_workingOnBranch_label()}
         {/if}
       {:else if branch}
-        {m.onboarding_setupCard_creatingBranch_before()} <span class="">{branch}</span> {m.onboarding_setupCard_creatingBranch_middle()}
+        {m.onboarding_setupCard_creatingBranch_before()} <span class="">{branch}</span>
+        {m.onboarding_setupCard_creatingBranch_middle()}
         <button
           class="underline underline-offset-2 cursor-pointer hover:text-foreground transition-colors"
-          onclick={() => copyToClipboard(baseRef, m.onboarding_setupCard_baseRef_label())}>{baseRef}</button
+          onclick={() => copyToClipboard(baseRef, m.onboarding_setupCard_baseRef_label())}
+          >{baseRef}</button
         >{m.onboarding_setupCard_creatingBranch_after()}
       {:else}
         {m.onboarding_setupCard_creatingBranchNoName_label()}
@@ -297,14 +363,24 @@
     {#snippet branchDone()}
       {#if skipIsolation}
         {#if branch}
-          {m.onboarding_setupCard_workingOnBranchNamed_before()} {@render copyableRef(branch, m.onboarding_setupCard_branchName_label())}{m.onboarding_setupCard_workingOnBranchDone_after()}
+          {m.onboarding_setupCard_workingOnBranchNamed_before()}
+          {@render copyableRef(
+            branch,
+            m.onboarding_setupCard_branchName_label(),
+          )}{m.onboarding_setupCard_workingOnBranchDone_after()}
         {:else}
           {m.onboarding_setupCard_workingDirectlyOnBranch_label()}
         {/if}
       {:else if branch}
         {m.onboarding_setupCard_workingInNewBranch_before()}
-        {@render copyableRef(branch, m.onboarding_setupCard_branchName_label())}{m.onboarding_setupCard_workingInNewBranch_middle()}
-        {@render copyableRef(baseRef, m.onboarding_setupCard_baseRef_label())}{m.onboarding_setupCard_workingInNewBranch_after()}
+        {@render copyableRef(
+          branch,
+          m.onboarding_setupCard_branchName_label(),
+        )}{m.onboarding_setupCard_workingInNewBranch_middle()}
+        {@render copyableRef(
+          baseRef,
+          m.onboarding_setupCard_baseRef_label(),
+        )}{m.onboarding_setupCard_workingInNewBranch_after()}
       {:else}
         {m.onboarding_setupCard_branchCreated_label()}
       {/if}
@@ -315,10 +391,16 @@
       {@render stepRow(setupScriptStatus, faTerminal, 'ml-[0.5px]', setupActive, setupDone)}
     {/if}
     {#snippet setupActive()}
-      {m.onboarding_setupCard_runningSetup_before()} {#if projectType}<span class="">{projectType}</span>{:else}{m.onboarding_setupCard_project_label()}{/if} {m.onboarding_setupCard_runningSetup_after()}
+      {m.onboarding_setupCard_runningSetup_before()}
+      {#if projectType}<span class="">{projectType}</span
+        >{:else}{m.onboarding_setupCard_project_label()}{/if}
+      {m.onboarding_setupCard_runningSetup_after()}
     {/snippet}
     {#snippet setupDone()}
-      {m.onboarding_setupCard_ranSetup_before()} {#if projectType}<span class="">{projectType}</span>{:else}{m.onboarding_setupCard_project_label()}{/if} {m.onboarding_setupCard_ranSetup_middle()}{#if onFocusSetupTerminal}{' '}{m.onboarding_setupCard_ranSetupIn_middle()}
+      {m.onboarding_setupCard_ranSetup_before()}
+      {#if projectType}<span class="">{projectType}</span
+        >{:else}{m.onboarding_setupCard_project_label()}{/if}
+      {m.onboarding_setupCard_ranSetup_middle()}{#if onFocusSetupTerminal}{' '}{m.onboarding_setupCard_ranSetupIn_middle()}
         <TooltipRich side="bottom" align="start" interactive maxWidth="22rem" delayDuration={300}>
           {#snippet trigger()}
             <button
@@ -333,7 +415,9 @@
             {/if}
           {/snippet}
           {#snippet footer()}
-            <span class="text-xs text-muted-foreground opacity-50">{m.onboarding_setupCard_openTerminal_footer()}</span>
+            <span class="text-xs text-muted-foreground opacity-50"
+              >{m.onboarding_setupCard_openTerminal_footer()}</span
+            >
           {/snippet}
         </TooltipRich>{/if}{m.onboarding_setupCard_ranSetup_after()}
     {/snippet}
@@ -356,32 +440,46 @@
           {/if}
         {/snippet}
         {#snippet footer()}
-          <span class="text-xs text-muted-foreground opacity-50"> {m.onboarding_setupCard_editInSettings_footer()} </span>
+          <span class="text-xs text-muted-foreground opacity-50">
+            {m.onboarding_setupCard_editInSettings_footer()}
+          </span>
         {/snippet}
       </TooltipRich>
     {/snippet}
     {#snippet agentActive()}
       {#if !hasPrompt && specialistId}
-        {m.onboarding_setupCard_agentReadyNamed_before()} {@render specialistWithTooltip()} {m.onboarding_setupCard_agentReadyNamed_after()}
+        {m.onboarding_setupCard_agentReadyNamed_before()}
+        {@render specialistWithTooltip()}
+        {m.onboarding_setupCard_agentReadyNamed_after()}
       {:else if !hasPrompt}
         {m.onboarding_setupCard_agentReady_label()}
       {:else if specialistId === 'spec-writer'}
-        {m.onboarding_setupCard_specStartingUp_before()} {@render specialistWithTooltip()} {m.onboarding_setupCard_specStartingUp_after()}
+        {m.onboarding_setupCard_specStartingUp_before()}
+        {@render specialistWithTooltip()}
+        {m.onboarding_setupCard_specStartingUp_after()}
       {:else if specialistId}
-        {m.onboarding_setupCard_startingUpNamed_before()} {@render specialistWithTooltip()} {m.onboarding_setupCard_startingUpNamed_after()}
+        {m.onboarding_setupCard_startingUpNamed_before()}
+        {@render specialistWithTooltip()}
+        {m.onboarding_setupCard_startingUpNamed_after()}
       {:else}
         {m.onboarding_setupCard_startingUp_label()}
       {/if}
     {/snippet}
     {#snippet agentDone()}
       {#if !hasPrompt && specialistId}
-        {m.onboarding_setupCard_agentReadyNamed_before()} {@render specialistWithTooltip()} {m.onboarding_setupCard_agentReadyNamed_after()}
+        {m.onboarding_setupCard_agentReadyNamed_before()}
+        {@render specialistWithTooltip()}
+        {m.onboarding_setupCard_agentReadyNamed_after()}
       {:else if !hasPrompt}
         {m.onboarding_setupCard_agentReady_label()}
       {:else if specialistId === 'spec-writer'}
-        {m.onboarding_setupCard_specDone_before()} {@render specialistWithTooltip()} {m.onboarding_setupCard_specDone_after()}
+        {m.onboarding_setupCard_specDone_before()}
+        {@render specialistWithTooltip()}
+        {m.onboarding_setupCard_specDone_after()}
       {:else if specialistId}
-        {m.onboarding_setupCard_agentDoneNamed_before()} {@render specialistWithTooltip()} {m.onboarding_setupCard_agentDoneNamed_after()}
+        {m.onboarding_setupCard_agentDoneNamed_before()}
+        {@render specialistWithTooltip()}
+        {m.onboarding_setupCard_agentDoneNamed_after()}
       {:else}
         {m.onboarding_setupCard_agentOrienting_label()}
       {/if}

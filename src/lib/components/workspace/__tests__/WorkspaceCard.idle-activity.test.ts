@@ -1,25 +1,22 @@
 /**
  * Tests for WorkspaceCard idle activity behavior.
  *
- * Verifies that when workspace.activity === 'idle', the card suppresses
- * running-state agent avatars regardless of stale tracker/Redux data,
- * while preserving unread-agent icons.
+ * Verifies that compact workspace rows use the shared workspace status
+ * indicator without rendering local status dots or agent clusters.
  */
 
-import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { render } from '@testing-library/svelte';
-import type { Workspace, AgentSession, WorkspaceId, AgentId } from '$shared/types';
-import { WorkspaceStatus, AgentStatus } from '$shared/types';
-import { createTestWorkspaceId, createTestAgentId } from '../../../../test/factories/workspace.factory';
+import { describe, it, expect, vi } from 'vitest';
+import { fireEvent, render, screen, waitFor } from '@testing-library/svelte';
+import type { Workspace } from '$shared/types';
+import { PullRequestStatus, WorkspaceStatus } from '$shared/types';
+import {
+  createTestWorkspaceId,
+  createTestAgentId,
+} from '../../../../test/factories/workspace.factory';
 
 const mocks = vi.hoisted(() => {
   const dispatch = vi.fn();
-  const streamingAgentIds: string[] = [];
-  const state = {
-    agentSessions: {
-      byAgentId: {} as Record<string, AgentSession>,
-    },
-  };
+  const state = {};
 
   const readable = <T>(value: T) => ({
     subscribe(run: (v: T) => void) {
@@ -29,48 +26,39 @@ const mocks = vi.hoisted(() => {
   });
 
   const selector = <T>(getter: (state: any, ...args: any[]) => T) =>
-    Object.assign(
-      (...args: any[]) => readable(getter(state, ...args)),
-      { select: (s: any, ...a: any[]) => getter(s ?? state, ...a) }
-    );
+    Object.assign((...args: any[]) => readable(getter(state, ...args)), {
+      select: (s: any, ...a: any[]) => getter(s ?? state, ...a),
+    });
 
-  return { dispatch, streamingAgentIds, state, readable, selector };
+  return { dispatch, state, readable, selector };
 });
+const pageState = vi.hoisted(() => ({ url: new URL('http://localhost/') }));
 
-vi.mock('$app/state', () => ({ page: { url: new URL('http://localhost/') } }));
+vi.mock('$app/state', () => ({ page: pageState }));
 
 vi.mock('$store/renderer/store', async () => {
-  const { createAppStoreMockModule } = await import('$store/renderer/utils/test-helpers/store-mock');
+  const { createAppStoreMockModule } =
+    await import('$store/renderer/utils/test-helpers/store-mock');
   return createAppStoreMockModule({
     state: () => mocks.state,
     dispatch: mocks.dispatch,
   });
 });
 
-vi.mock('$store/renderer/slices/agent-session/agent-session-selectors', () => ({
-  selectAgentSession: mocks.selector((state, agentId: string) => state.agentSessions.byAgentId[agentId] ?? null),
-  selectAgentIsResponding: mocks.selector((state, agentId: string) => {
-    const session = state.agentSessions.byAgentId[agentId];
-    return session?.isStreaming || session?.isProcessing || false;
-  }),
-  selectAgentIsWaiting: mocks.selector(() => false),
-  selectAgentProvider: mocks.selector(() => 'auggie'),
-}));
-
 vi.mock('$store/renderer/slices/workspace-tasks/workspace-tasks-selectors', () => ({
+  selectWorkspaceTasksLoading: mocks.selector(() => false),
   selectWorkspaceTaskProgress: mocks.selector(() => ({ total: 0, completed: 0 })),
 }));
 
 vi.mock('$store/renderer/slices/workspace-tasks/workspace-tasks-slice', () => ({
-  ensureWorkspaceTasksLoaded: vi.fn((id) => ({ type: 'workspace-tasks/ensureLoaded', payload: id })),
+  ensureWorkspaceTasksLoaded: vi.fn((id) => ({
+    type: 'workspace-tasks/ensureLoaded',
+    payload: id,
+  })),
 }));
 
 vi.mock('$store/renderer/slices/workspace/workspace-selectors', () => ({
   selectWorkspaceActivePullRequest: mocks.selector(() => null),
-}));
-
-vi.mock('$lib/components/ui/auggie-avatar/AugieAvatarWithState.svelte', async () => ({
-  default: (await import('./mocks/MockAugieAvatar.svelte')).default,
 }));
 
 import WorkspaceCard from '../WorkspaceCard.svelte';
@@ -87,97 +75,293 @@ function makeWorkspace(overrides: Partial<Workspace> = {}): Workspace {
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
     activity: 'idle',
+    displayStatus: 'idle',
     agentSummary: { agentIds: [], hasActiveAgents: false },
     ...overrides,
   } as Workspace;
 }
 
-function makeSession(agentId: AgentId, workspaceId: WorkspaceId, overrides: Partial<AgentSession> = {}): AgentSession {
-  return {
-    id: agentId,
-    backendSessionId: null,
-    workspaceId,
-    name: 'Test Agent',
-    status: AgentStatus.Idle,
-    messages: [],
-    model: 'test-model',
-    createdAt: new Date(),
-    updatedAt: new Date(),
-    isStreaming: false,
-    isProcessing: false,
-    ...overrides,
-  } as AgentSession;
-}
-
-describe('WorkspaceCard idle activity behavior', () => {
-  beforeEach(() => {
-    mocks.state.agentSessions.byAgentId = {};
-    mocks.streamingAgentIds.length = 0;
-  });
-
-  it('suppresses running avatars when workspace.activity === "idle" despite stale tracker data', () => {
+describe('WorkspaceCard compact agent metadata', () => {
+  it('uses the daemon display status without inferring state from activity', () => {
     const wsId = createTestWorkspaceId();
     const agentId = createTestAgentId();
-    const workspace = makeWorkspace({ id: wsId, activity: 'idle', agentSummary: { agentIds: [agentId], hasActiveAgents: false } });
-
-    // Stale tracker claims agent is streaming
-    mocks.streamingAgentIds.push(agentId);
-
-    const { container } = render(WorkspaceCard, {
-      props: { workspace, streamingAgentIds: mocks.streamingAgentIds, isRunning: true },
+    const workspace = makeWorkspace({
+      id: wsId,
+      activity: 'agent_running',
+      agentSummary: { agentIds: [agentId], hasActiveAgents: true },
     });
 
-    // No running-state avatars should render (the mocked avatar with data-state="running")
-    const runningAvatars = container.querySelectorAll('[data-state="running"]');
-    expect(runningAvatars).toHaveLength(0);
+    const { container } = render(WorkspaceCard, {
+      props: { workspace, streamingAgentIds: [agentId], isRunning: true },
+    });
+
+    expect(container.querySelector('[data-workspace-card-agents]')).toBeNull();
+    expect(container.querySelector('[data-testid="mock-avatar"]')).toBeNull();
+    expect(container.querySelectorAll('[data-workspace-status]')).toHaveLength(1);
+    expect(container.querySelector('[data-workspace-status="idle"]')).toBeTruthy();
   });
 
-  it('suppresses running avatars when workspace.activity === "idle" despite Redux isStreaming=true', () => {
-    const wsId = createTestWorkspaceId();
-    const agentId = createTestAgentId();
-    const workspace = makeWorkspace({ id: wsId, activity: 'idle', agentSummary: { agentIds: [agentId], hasActiveAgents: false } });
+  it('updates the same shared icon through unread, waiting, running, and blocked states', async () => {
+    const workspace = makeWorkspace({ attention: 'unread', waiting: true });
+    const { container, rerender } = render(WorkspaceCard, { props: { workspace } });
+    const icon = container.querySelector('[data-workspace-status]');
 
-    // Stale Redux session claims streaming
-    mocks.state.agentSessions.byAgentId[agentId] = makeSession(agentId, wsId, { isStreaming: true });
+    expect(icon?.getAttribute('data-workspace-status')).toBe('unread');
+    expect(container.querySelectorAll('[data-workspace-status]')).toHaveLength(1);
 
-    const { container } = render(WorkspaceCard, {
-      props: { workspace, streamingAgentIds: [], isRunning: false },
-    });
+    await rerender({ workspace: makeWorkspace({ waiting: true }) });
+    expect(container.querySelector('[data-workspace-status]')).toBe(icon);
+    expect(icon?.getAttribute('data-workspace-status')).toBe('waiting');
 
-    const runningAvatars = container.querySelectorAll('[data-state="running"]');
-    expect(runningAvatars).toHaveLength(0);
+    await rerender({ workspace: makeWorkspace({ displayStatus: 'in_progress', waiting: true }) });
+    expect(container.querySelector('[data-workspace-status]')).toBe(icon);
+    expect(icon?.getAttribute('data-workspace-status')).toBe('in_progress');
+    expect(icon?.getAttribute('data-workspace-status-icon')).toBeNull();
+
+    await rerender({ workspace: makeWorkspace({ displayStatus: 'blocked', attention: 'unread' }) });
+    expect(container.querySelector('[data-workspace-status]')).toBe(icon);
+    expect(icon?.getAttribute('data-workspace-status')).toBe('blocked');
+    expect(icon?.getAttribute('data-workspace-status-icon')).toBe('xmark');
   });
 
-  it('renders running avatars when workspace.activity === "agent_running"', () => {
-    const wsId = createTestWorkspaceId();
-    const agentId = createTestAgentId();
-    const workspace = makeWorkspace({ id: wsId, activity: 'agent_running', agentSummary: { agentIds: [agentId], hasActiveAgents: true } });
+  it('uses the canonical compact row hierarchy and inset styling', () => {
+    const { container } = render(WorkspaceCard, { props: { workspace: makeWorkspace() } });
+    const row = container.querySelector('[data-workspace-card-row]');
+    const title = container.querySelector('[data-workspace-card-title]');
+    const time = container.querySelector('[data-workspace-card-time] span');
 
-    mocks.streamingAgentIds.push(agentId);
-
-    const { container } = render(WorkspaceCard, {
-      props: { workspace, streamingAgentIds: mocks.streamingAgentIds, isRunning: true },
-    });
-
-    // Running avatars should render when workspace is not idle
-    const runningAvatars = container.querySelectorAll('[data-state="running"]');
-    expect(runningAvatars.length).toBeGreaterThan(0);
+    expect(row?.className).toContain('mx-1');
+    expect(row?.className).toContain('rounded-md');
+    expect(row?.className).toContain('py-2');
+    expect(row?.className).toContain('font-normal');
+    expect(row?.className).toContain('hover:bg-background/40');
+    expect(title?.className).toContain('type-body');
+    expect(title?.className).toContain('font-normal!');
+    expect(time?.className).toContain('type-caption');
+    expect(time?.className).toContain('tabular-nums');
   });
 
-  it('preserves unread-agent icons when workspace.activity === "idle"', () => {
-    const wsId = createTestWorkspaceId();
-    const agentId = createTestAgentId();
-    const workspace = makeWorkspace({ id: wsId, activity: 'idle', agentSummary: { agentIds: [agentId], hasActiveAgents: false } });
-
-    // Agent is idle (not streaming/processing in Redux)
-    mocks.state.agentSessions.byAgentId[agentId] = makeSession(agentId, wsId, { isStreaming: false });
-
-    const { container } = render(WorkspaceCard, {
-      props: { workspace, streamingAgentIds: [], isRunning: false, unreadAgentIds: [agentId] },
+  it('uses sibling named controls and reveals canonical-size actions to keyboard focus', async () => {
+    const onClick = vi.fn();
+    const onTogglePin = vi.fn();
+    const onMarkAsRead = vi.fn();
+    const { container, getByRole } = render(WorkspaceCard, {
+      props: {
+        workspace: makeWorkspace(),
+        isUnread: true,
+        onClick,
+        onTogglePin,
+        onMarkAsRead,
+      },
     });
 
-    // Unread agent avatars should still render (even though workspace is idle)
-    const avatars = container.querySelectorAll('[data-agent-id]');
-    expect(avatars.length).toBeGreaterThan(0);
+    const workspaceButton = getByRole('button', { name: 'Test Workspace' });
+    const pinButton = getByRole('button', { name: 'Pin' });
+    const markAsReadButton = getByRole('button', { name: 'Mark as read' });
+    const actions = container.querySelector('[class*="wc-actions"]');
+
+    expect(workspaceButton.contains(pinButton)).toBe(false);
+    expect(workspaceButton.contains(markAsReadButton)).toBe(false);
+    expect(pinButton.className).toContain('size-7');
+    expect(markAsReadButton.className).toContain('size-7');
+    expect(actions?.className).toContain('focus-within:opacity-100');
+
+    pinButton.focus();
+    expect(document.activeElement).toBe(pinButton);
+    await fireEvent.click(pinButton);
+    expect(onTogglePin).toHaveBeenCalledOnce();
+    expect(onClick).not.toHaveBeenCalled();
+
+    await fireEvent.click(workspaceButton);
+    expect(onClick).toHaveBeenCalledOnce();
+  });
+
+  it('presents pinned state persistently beside the title without creating another action', async () => {
+    const onTogglePin = vi.fn();
+    const workspace = makeWorkspace();
+    const { container, getByRole, rerender } = render(WorkspaceCard, {
+      props: { workspace, isPinned: true, onTogglePin },
+    });
+
+    const title = container.querySelector('[data-workspace-card-title]')!;
+    const titleGroup = container.querySelector('[data-workspace-card-title-group]')!;
+    const marker = container.querySelector('[data-workspace-card-pin-indicator]')!;
+    const trigger = getByRole('button', { name: 'Test Workspace', description: /Pinned/ });
+
+    expect(titleGroup.contains(title)).toBe(true);
+    expect(title.nextElementSibling).toBe(marker);
+    expect(marker.getAttribute('aria-hidden')).toBe('true');
+    expect(marker.classList.contains('opacity-0')).toBe(false);
+    expect(getByRole('button', { name: 'Unpin' })).toBeTruthy();
+    expect(container.querySelectorAll('[data-workspace-card-pin-indicator]')).toHaveLength(1);
+    expect(trigger.getAttribute('aria-describedby')).toBe(
+      `workspace-status-state-${workspace.id} workspace-pinned-state-${workspace.id}`,
+    );
+
+    await fireEvent.click(getByRole('button', { name: 'Unpin' }));
+    expect(onTogglePin).toHaveBeenCalledOnce();
+
+    await rerender({ workspace, isPinned: false, onTogglePin });
+    expect(container.querySelector('[data-workspace-card-pin-indicator]')).toBeNull();
+    expect(getByRole('button', { name: 'Test Workspace' }).getAttribute('aria-describedby')).toBe(
+      `workspace-status-state-${workspace.id}`,
+    );
+    expect(getByRole('button', { name: 'Pin' })).toBeTruthy();
+  });
+
+  it('keeps dense pinned rows contained and replaces the passive marker with the action on hover/focus', () => {
+    const workspace = makeWorkspace({
+      title: 'A very long localized workspace title that must truncate before metadata',
+      prStatus: PullRequestStatus.Open,
+      prNumber: 42,
+    });
+    const { container, getByRole, getByText } = render(WorkspaceCard, {
+      props: {
+        workspace,
+        isPinned: true,
+        isRunning: true,
+        selected: true,
+        trailingLabel: 'Archived',
+        onTogglePin: vi.fn(),
+      },
+    });
+
+    const row = container.querySelector('[data-workspace-card-row]')!;
+    const titleGroup = container.querySelector('[data-workspace-card-title-group]')!;
+    const title = container.querySelector('[data-workspace-card-title]')!;
+    const marker = container.querySelector('[data-workspace-card-pin-indicator]')!;
+    const actions = container.querySelector('.wc-actions')!;
+    const trigger = getByRole('button', { name: workspace.title });
+    const unpin = getByRole('button', { name: 'Unpin' });
+
+    expect(row.className).toContain('w-auto');
+    expect(titleGroup.className).toContain('min-w-0');
+    expect(titleGroup.className).toContain('flex-1');
+    expect(title.className).toContain('truncate');
+    expect(marker.className).toContain('shrink-0');
+    expect(marker.className).toContain('group-hover:opacity-0');
+    expect(actions.className).toContain('group-hover:opacity-100');
+    expect(actions.className).toContain('group-focus-within:opacity-100');
+    expect(getByText('PR #42')).toBeTruthy();
+    expect(container.querySelector('[data-workspace-card-time]')).toBeTruthy();
+    expect(container.querySelector('[data-workspace-status]')?.contains(marker)).toBe(false);
+    expect(trigger.className).not.toMatch(/focus-visible:ring-(?:1|2|4|8)|ring-inset|ring-offset/);
+    expect(unpin.className).not.toMatch(/focus-visible:ring-(?:1|2|4|8)|ring-inset|ring-offset/);
+    expect(trigger.className).toContain('focus-visible:bg-background/50');
+  });
+
+  it('retains one visible pin across current, highlighted, and unread row states', () => {
+    const workspace = makeWorkspace({
+      id: 'current-pinned' as Workspace['id'],
+      attention: 'unread',
+    });
+    pageState.url = new URL('http://localhost/workspace/current-pinned');
+    const { container, getByRole } = render(WorkspaceCard, {
+      props: {
+        workspace,
+        isPinned: true,
+        isUnread: true,
+        highlighted: true,
+        onTogglePin: vi.fn(),
+      },
+    });
+
+    expect(container.querySelector('[data-workspace-card-row]')?.className).toContain(
+      'bg-background/60',
+    );
+    expect(container.querySelector('[data-workspace-status="unread"]')).toBeTruthy();
+    expect(container.querySelector('[data-workspace-card-pin-indicator]')?.className).toContain(
+      'opacity-0',
+    );
+    expect(container.querySelector('.wc-actions')?.className).toContain('opacity-100');
+    expect(getByRole('button', { name: 'Unpin' })).toBeTruthy();
+    pageState.url = new URL('http://localhost/');
+  });
+
+  it.each(['Enter', ' '])(
+    'opens the All Workspaces overflow menu with %s without activating the row',
+    async (key) => {
+      const onClick = vi.fn();
+      const onOpenInNewWindow = vi.fn();
+      const { container } = render(WorkspaceCard, {
+        props: { workspace: makeWorkspace(), onClick, onOpenInNewWindow },
+      });
+      const trigger = screen.getByRole('button', { name: 'Workspace actions' });
+
+      expect(trigger.getAttribute('aria-expanded')).toBe('false');
+      trigger.focus();
+      await fireEvent.keyDown(trigger, { key });
+      const menu = await screen.findByRole('menu');
+
+      expect(trigger.getAttribute('aria-expanded')).toBe('true');
+      expect(container.contains(menu)).toBe(false);
+      expect(onClick).not.toHaveBeenCalled();
+
+      await fireEvent.keyDown(menu, { key: 'Escape' });
+      await waitFor(() => expect(screen.queryByRole('menu')).toBeNull());
+      expect(document.activeElement).toBe(trigger);
+    },
+  );
+
+  it('opens on pointer click and dismisses outside', async () => {
+    const onClick = vi.fn();
+    const onOpenInNewWindow = vi.fn();
+    render(WorkspaceCard, {
+      props: { workspace: makeWorkspace(), onClick, onOpenInNewWindow },
+    });
+    const trigger = screen.getByRole('button', { name: 'Workspace actions' });
+
+    await fireEvent.pointerDown(trigger, { button: 0, pointerType: 'mouse' });
+    await fireEvent.click(trigger, { detail: 1 });
+    await screen.findByRole('menu');
+    expect(onClick).not.toHaveBeenCalled();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    await fireEvent.pointerDown(document.body, {
+      button: 0,
+      pointerType: 'mouse',
+      clientX: 100,
+      clientY: 100,
+    });
+    await waitFor(() => {
+      expect(screen.queryByRole('menu')).toBeNull();
+      expect(trigger.getAttribute('aria-expanded')).toBe('false');
+    });
+  });
+
+  it('runs an overflow action once without activating the row', async () => {
+    const onClick = vi.fn();
+    const onOpenInNewWindow = vi.fn();
+    render(WorkspaceCard, {
+      props: { workspace: makeWorkspace(), onClick, onOpenInNewWindow },
+    });
+    const trigger = screen.getByRole('button', { name: 'Workspace actions' });
+
+    await fireEvent.click(trigger);
+    await fireEvent.click(await screen.findByRole('menuitem', { name: 'Open in New Window' }));
+    expect(onOpenInNewWindow).toHaveBeenCalledTimes(1);
+    expect(onClick).not.toHaveBeenCalled();
+  });
+
+  it('keeps the right-click context menu working beside the overflow trigger', async () => {
+    const { container } = render(WorkspaceCard, {
+      props: { workspace: makeWorkspace(), onOpenInNewWindow: vi.fn() },
+    });
+    const row = container.querySelector<HTMLElement>('[data-workspace-card-row]')!;
+
+    await fireEvent.contextMenu(row, { clientX: 20, clientY: 30 });
+
+    expect(await screen.findByRole('menu')).toBeTruthy();
+    expect(screen.getByRole('menuitem', { name: 'Open in New Window' })).toBeTruthy();
+  });
+
+  it('omits busy agent counts from the compact row', () => {
+    const workspace = makeWorkspace({ activity: 'agent_running' });
+    const streamingAgentIds = Array.from({ length: 5 }, () => createTestAgentId());
+    const { container } = render(WorkspaceCard, {
+      props: { workspace, streamingAgentIds, isRunning: true },
+    });
+    expect(container.querySelector('[data-workspace-card-agents]')).toBeNull();
+    expect(container.querySelector('[data-testid="mock-avatar"]')).toBeNull();
+    expect(container.textContent).not.toContain('+4');
   });
 });

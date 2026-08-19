@@ -80,6 +80,9 @@ export const WORKSPACE_EVENT_TYPE_LITERALS = [
   'task:ready-tasks-changed',
   // Terminal events
   'terminal:command',
+  // Script events
+  'script:state',
+  'script:output',
   // Test events
   'test:started',
   'test:completed',
@@ -93,6 +96,7 @@ export const WORKSPACE_EVENT_TYPE_LITERALS = [
   'workspace:opened',
   'workspace:closed',
   'workspace:activity',
+  'workspace:displayStatus-changed',
   // Spec/goal events
   'spec:updated',
   'goal:updated',
@@ -391,6 +395,26 @@ export const FileReadSchema = z.object({
   workspaceId: z.string().optional(), // For remote workspace file routing
 });
 
+/**
+ * Sequential chunked read for large-file uploads (remote attachment
+ * placement): one bounded slice per call, base64-encoded. The length cap
+ * matches the daemon's 16 MiB `file.attachmentUpload.chunk` decoded cap.
+ */
+export const FileReadChunkSchema = z.object({
+  path: z.string().min(1, 'Path is required'),
+  offset: z.number().int().nonnegative(),
+  length: z
+    .number()
+    .int()
+    .positive()
+    .max(16 * 1024 * 1024),
+});
+
+/** Streaming SHA-256 of a host-local file (never buffers the whole file). */
+export const FileHashSchema = z.object({
+  path: z.string().min(1, 'Path is required'),
+});
+
 export const FileWriteSchema = z.object({
   path: z.string().min(1, 'Path is required'),
   content: z.string(),
@@ -420,6 +444,19 @@ export const FileReadBatchSchema = z.object({
 export const FileExistsSchema = z.object({
   path: z.string().min(1, 'Path is required'),
   workspaceId: z.string().optional(), // For remote workspace file routing
+});
+
+export const FileDownloadSchema = z.object({
+  path: z.string().min(1, 'Path is required'),
+});
+
+// Attachment-chip download (monorepo#2458): save a workspace-relative
+// attachment to a user-chosen location. `path` is daemon-side
+// workspace-relative (`.intent/attachments/…`), never a host path.
+export const FileDownloadAttachmentSchema = z.object({
+  workspaceId: z.string().min(1, 'Workspace ID is required'),
+  path: z.string().min(1, 'Path is required'),
+  fileName: z.string().min(1, 'File name is required'),
 });
 
 export const FileReadDirWithStatsSchema = z.object({
@@ -929,24 +966,6 @@ export const TerminalCreateWithCommandSchema = z.object({
 
 // Legacy Terminal Schemas
 // ============================================================================
-// Diffs Schemas
-// ============================================================================
-
-export const DiffsListSchema = z.object({
-  workspaceId: WorkspaceIdSchema,
-});
-
-export const DiffsCreateSchema = z.object({
-  workspaceId: WorkspaceIdSchema,
-  diff: z.any(), // The diff object structure varies
-});
-
-export const DiffsUpdateSchema = z.object({
-  workspaceId: WorkspaceIdSchema,
-  diff: z.any(), // The diff object structure varies
-});
-
-// ============================================================================
 // Agent Context Schemas
 // ============================================================================
 
@@ -1111,6 +1130,7 @@ export const WindowSetFullScreenSchema = z.object({
 
 export const WindowSetBrowserFocusedSchema = z.object({
   browserFocused: z.boolean(),
+  focusOwnerId: z.string().min(1, 'Focus owner ID is required'),
 });
 
 // DIALOG_CHANNELS schemas
@@ -1314,19 +1334,26 @@ export const DeepLinkValidateWorkspaceSchema = z.object({
 
 export const FirstVisitStateLoadSchema = z.object({
   workspaceId: WorkspaceIdSchema,
+  // Active backend id — keys the on-disk state dir under userData so two
+  // backends sharing a workspace id keep separate first-visit state
+  // (intent-hq/monorepo#1760). Absent → the local sidecar.
+  backendId: z.string().optional(),
 });
 
 export const FirstVisitStateSaveSchema = z.object({
   workspaceId: WorkspaceIdSchema,
+  backendId: z.string().optional(),
   state: FirstVisitStateSchema,
 });
 
 export const FirstVisitStateDeleteSchema = z.object({
   workspaceId: WorkspaceIdSchema,
+  backendId: z.string().optional(),
 });
 
 export const FirstVisitStateExistsSchema = z.object({
   workspaceId: WorkspaceIdSchema,
+  backendId: z.string().optional(),
 });
 
 // ============================================================================
@@ -1342,10 +1369,15 @@ const LayoutSnapshotSchema = z.object({
 
 export const PanelLayoutLoadSchema = z.object({
   workspaceId: WorkspaceIdSchema,
+  // Active backend id (multi-backend connect, cloudlands-fe#823) — namespaces
+  // the on-disk history file so two backends sharing a workspace id keep
+  // separate undo/redo snapshots. Absent/local → the legacy un-namespaced file.
+  backendId: z.string().optional(),
 });
 
 export const PanelLayoutSaveSchema = z.object({
   workspaceId: WorkspaceIdSchema,
+  backendId: z.string().optional(),
   data: z.object({
     version: z.number(),
     workspaceId: z.string(),
@@ -1354,7 +1386,6 @@ export const PanelLayoutSaveSchema = z.object({
     lastUpdated: z.string(),
   }),
 });
-
 
 // ============================================================================
 // Rules Schemas
@@ -1502,4 +1533,41 @@ export const VoiceTranscribeLocalSchema = z.object({
   contextualStrings: z.array(z.string().max(100)).max(100).optional(),
   /** BCP-47 locale for the recognizer (e.g. "de"); absent = system locale. */
   locale: z.string().min(1).max(35).optional(),
+});
+
+// ============================================================================
+// Connections Schemas (multi-backend connect)
+//
+// Request-payload validation for the `connections:*` channels. Shapes only —
+// the handlers land in T3. The renderer-facing contract types live in
+// `shared/types/connections.ts`; these schemas mirror the `*Params` shapes
+// there. Note: `capture-fingerprint` and `add` carry the bearer token
+// renderer→main (the user just typed it); it is consumed by main and never
+// echoed back on any connection shape.
+// ============================================================================
+
+export const ConnectionsListSchema = EmptySchema;
+
+export const ConnectionsCaptureFingerprintSchema = z.object({
+  host: z.string().min(1, 'Host is required'),
+  port: z.number().int().positive('Port must be a positive integer'),
+  token: z.string().min(1, 'Token is required'),
+});
+
+export const ConnectionsAddSchema = z.object({
+  label: z.string().min(1, 'Label is required'),
+  host: z.string().min(1, 'Host is required'),
+  port: z.number().int().positive('Port must be a positive integer'),
+  fingerprint: z.string().min(1, 'Fingerprint is required'),
+  token: z.string().min(1, 'Token is required'),
+  /** "Detect all backend IPs" option (#1746); absent = enabled. */
+  detectHosts: z.boolean().optional(),
+});
+
+export const ConnectionsForgetSchema = z.object({
+  id: z.string().min(1, 'Connection ID is required'),
+});
+
+export const ConnectionsSwitchSchema = z.object({
+  id: z.string().min(1, 'Connection ID is required'),
 });

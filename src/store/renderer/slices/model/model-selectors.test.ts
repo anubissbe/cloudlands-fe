@@ -1,8 +1,4 @@
-import {
-  describe,
-  expect,
-  it,
-} from 'vitest';
+import { describe, expect, it } from 'vitest';
 import { initialState as modelInitialState } from './model-slice';
 import { initialState as providerSettingsInitialState } from '../provider-settings/provider-settings-slice';
 import {
@@ -12,7 +8,7 @@ import {
   selectModelEffortLevels,
   selectSelectedModel,
 } from './model-selectors';
-import { createCollection } from '$lib/store-shim/utils/collections/collection-utils';
+import { createCollection } from '@augmentcode/themis/utils/collections/collection-utils';
 import type { AuggieModel } from '$features/auggie/auggie-models.client';
 import type { ModelState } from './model-types';
 import type { ProviderSettingsState } from '../provider-settings/provider-settings-slice';
@@ -222,7 +218,11 @@ describe('selectModelEffortLevels', () => {
     const state = mockState({
       defaultProviderId,
       availableModels: createCollection<AuggieModel, 'value'>('value', [
-        { value: `${defaultProviderId}:sonnet4.6`, label: 'Claude Sonnet 4.6', effortLevels: efforts },
+        {
+          value: `${defaultProviderId}:sonnet4.6`,
+          label: 'Claude Sonnet 4.6',
+          effortLevels: efforts,
+        },
       ]),
     });
     expect(selectModelEffortLevels.select(state, 'sonnet4.6')).toEqual(efforts);
@@ -255,8 +255,130 @@ describe('selectAgentModelEffortLevels', () => {
     } as unknown as StoreState;
 
     expect(selectAgentModelEffortLevels.select(state, 'a1')).toEqual(['low', 'high']);
-    // No model on the session (provider default) / unknown agent → undefined.
+    // No resolvable provider default / unknown agent → undefined.
     expect(selectAgentModelEffortLevels.select(state, 'a2')).toBeUndefined();
     expect(selectAgentModelEffortLevels.select(state, 'unknown')).toBeUndefined();
+  });
+
+  it('resolves effort levels from the provider model when the session inherits its model', () => {
+    const base = mockState({
+      defaultProviderId,
+      providerModels: { auggie: 'gpt5.6-sol' },
+      availableModels: createCollection<AuggieModel, 'value'>('value', [
+        {
+          value: 'gpt5.6-sol',
+          label: 'GPT-5.6 Sol',
+          effortLevels: ['low', 'medium', 'high', 'max'],
+        },
+      ]),
+    });
+    const state = {
+      ...base,
+      agentSessions: {
+        byAgentId: {
+          inherited: { id: 'inherited', workspaceId: 'ws-1', provider: 'auggie', model: null },
+        },
+        agentIdsByWorkspace: {},
+      },
+    } as unknown as StoreState;
+
+    expect(selectAgentModelEffortLevels.select(state, 'inherited')).toEqual([
+      'low',
+      'medium',
+      'high',
+      'max',
+    ]);
+  });
+
+  it('prefers the session-advertised effortLevels over the catalog metadata (§5.5)', () => {
+    // The daemon-discovered `thought_level` levels win even when the catalog
+    // row carries its own (possibly stale) static effortLevels.
+    const base = mockState({
+      defaultProviderId,
+      availableModels: createCollection<AuggieModel, 'value'>('value', [
+        { value: 'codex:gpt-5.3-codex', label: 'GPT-5.3 Codex', effortLevels: ['low', 'high'] },
+      ]),
+    });
+    const state = {
+      ...base,
+      agentSessions: {
+        byAgentId: {
+          a1: {
+            id: 'a1',
+            workspaceId: 'ws-1',
+            model: 'codex:gpt-5.3-codex',
+            effortLevels: ['minimal', 'low', 'medium', 'high', 'xhigh'],
+          },
+        },
+        agentIdsByWorkspace: {},
+      },
+    } as unknown as StoreState;
+
+    expect(selectAgentModelEffortLevels.select(state, 'a1')).toEqual([
+      'minimal',
+      'low',
+      'medium',
+      'high',
+      'xhigh',
+    ]);
+  });
+
+  it('resolves session-advertised effortLevels for a model absent from the catalog (claude-code case)', () => {
+    // claude-code models have no catalog effortLevels; the picker gates purely
+    // on what the session discovered at open.
+    const base = mockState({
+      defaultProviderId,
+      availableModels: createCollection<AuggieModel, 'value'>('value', [
+        { value: 'claude-code:opus', label: 'Claude Opus' },
+      ]),
+    });
+    const state = {
+      ...base,
+      agentSessions: {
+        byAgentId: {
+          a1: {
+            id: 'a1',
+            workspaceId: 'ws-1',
+            model: 'claude-code:opus',
+            effortLevels: ['low', 'medium', 'high', 'max'],
+          },
+        },
+        agentIdsByWorkspace: {},
+      },
+    } as unknown as StoreState;
+
+    expect(selectAgentModelEffortLevels.select(state, 'a1')).toEqual([
+      'low',
+      'medium',
+      'high',
+      'max',
+    ]);
+  });
+
+  it('falls back to the catalog when the session effortLevels are absent or empty', () => {
+    const base = mockState({
+      defaultProviderId,
+      availableModels: createCollection<AuggieModel, 'value'>('value', [
+        { value: 'codex:gpt-5.3-codex', label: 'GPT-5.3 Codex', effortLevels: ['low', 'high'] },
+      ]),
+    });
+    const state = {
+      ...base,
+      agentSessions: {
+        byAgentId: {
+          absent: { id: 'absent', workspaceId: 'ws-1', model: 'codex:gpt-5.3-codex' },
+          empty: {
+            id: 'empty',
+            workspaceId: 'ws-1',
+            model: 'codex:gpt-5.3-codex',
+            effortLevels: [],
+          },
+        },
+        agentIdsByWorkspace: {},
+      },
+    } as unknown as StoreState;
+
+    expect(selectAgentModelEffortLevels.select(state, 'absent')).toEqual(['low', 'high']);
+    expect(selectAgentModelEffortLevels.select(state, 'empty')).toEqual(['low', 'high']);
   });
 });

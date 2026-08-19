@@ -19,34 +19,25 @@
   import { createLogger } from '$lib/utils/client-logger';
   import { navigateToNote } from '$lib/utils/workspace-navigation';
   import ChatPanel from '$lib/components/chat/ChatPanel.svelte';
-  import { Button } from '$lib/components/ui/button';
-  import { cycleFontStyle } from '$store/renderer/slices/user-preferences/user-preferences-slice';
-  import {
-  selectAgentFontStyleLabel,
-  selectIsAgentMonospace,
-} from '$store/renderer/slices/user-preferences/user-preferences-selectors';
+  import ChatMessageNavigator from '$lib/components/chat/ChatMessageNavigator.svelte';
+  import type { ChatNavigationState } from '$lib/components/chat/chat-message-navigation';
+  import * as Menu from '$lib/components/ui/menu';
+  import AgentViewSettingsDropdown from './AgentViewSettingsDropdown.svelte';
 
   import { selectSelectedModel } from '$store/renderer/slices/model/model-selectors';
   import {
-  selectSpecialistName,
-  selectSpecialists,
-} from '$store/renderer/slices/specialists/specialists-selectors';
-  import Fa from 'svelte-fa';
-  import {
-  faCheck,
-  faCopy,
-  faTrash,
-} from '@fortawesome/free-solid-svg-icons';
+    selectSpecialistName,
+    selectSpecialists,
+  } from '$store/renderer/slices/specialists/specialists-selectors';
+  import { faCheck, faCircleInfo, faCopy, faTrash } from '@fortawesome/free-solid-svg-icons';
   import { faNote } from '$lib/icons/faNote';
+  import HarnessFeaturesModal from '$lib/components/chat/HarnessFeaturesModal.svelte';
   import { formatAgentMessagesForClipboard } from '$lib/utils/clipboard-formatters';
   import { m } from '$shared/paraglide/messages.js';
   import { deleteAgentWithUndoRequested } from '$store/renderer/slices/workspace-agents/workspace-agents-slice';
   import { store as appStore } from '$store/renderer/store';
 
   const logger = createLogger('AgentTabType');
-
-  const fontStyleLabel = selectAgentFontStyleLabel();
-  const isMonospace = selectIsAgentMonospace();
 
   let { tab, workspaceId, isActive, isPanelFocused }: TabTypeComponentProps = $props();
 
@@ -115,10 +106,27 @@
     agentSession?.metadata?.taskNoteId || agentSession?.agentMetadata?.taskNoteId || null,
   );
 
+  // Read-only harness version stamp (PROTOCOL §5.5). Mirrors the AgentCard
+  // context-menu entry: hidden for sessions from daemons that predate the
+  // field; selecting the item opens the read-only harness-features modal
+  // (monorepo#2459). Legacy sessions without a harnessFeatures snapshot
+  // still open the modal — every catalog feature renders OFF.
+  const harnessVersion = $derived($agent$?.harnessVersion ?? null);
+  const harnessFeatures = $derived($agent$?.harnessFeatures ?? null);
+  let harnessModalOpen = $state(false);
+
   // Copy/delete state
   let agentCopyFeedback = $state<string | null>(null);
   let agentCopyTimeoutId: ReturnType<typeof setTimeout> | null = null;
   let isAgentDeleting = $state(false);
+  let chatPanelRef = $state<{
+    scrollToBottom: () => void;
+    navigateToUserMessage: (messageId: string) => Promise<boolean>;
+  } | null>(null);
+  let chatNavigationState = $state<ChatNavigationState>({
+    isAtBottom: true,
+    userMessages: [],
+  });
 
   onDestroy(() => {
     if (agentCopyTimeoutId) {
@@ -173,73 +181,85 @@
     if (!headerContext || !isActive) return;
     const subtitleParts: string[] = [];
     if (agentSpecialistName) subtitleParts.push(agentSpecialistName);
-    if (delegatedByName) subtitleParts.push(m.layout_panelTabBar_delegatedBy_label({ name: delegatedByName }));
+    if (delegatedByName)
+      subtitleParts.push(m.layout_panelTabBar_delegatedBy_label({ name: delegatedByName }));
     const subtitle = subtitleParts.length > 0 ? subtitleParts.join(' · ') : undefined;
     untrack(() => {
-      headerContext.registerActions(agentActions);
+      headerContext.registerActions({
+        primary: agentPrimaryActions,
+        display: agentDisplayActions,
+        actions: agentActions,
+      });
       headerContext.registerState({ subtitle });
     });
   });
 </script>
 
+{#snippet agentPrimaryActions()}
+  <ChatMessageNavigator
+    messages={chatNavigationState.userMessages}
+    isAtBottom={chatNavigationState.isAtBottom}
+    onSelectMessage={(messageId) => chatPanelRef?.navigateToUserMessage(messageId) ?? false}
+    onScrollToBottom={() => chatPanelRef?.scrollToBottom()}
+  />
+{/snippet}
+
+{#snippet agentDisplayActions()}
+  <AgentViewSettingsDropdown embedded />
+{/snippet}
+
 {#snippet agentActions()}
   {#if agentTaskNoteId}
-    <Button
-      variant="ghost-light"
-      size="icon-xs"
-      onclick={handleGoToTaskNote}
-      tooltip={m.layout_agentTab_goToTaskNote_tooltip()}
-      tooltipSide="bottom"
-    >
-      <Fa icon={faNote} size="xs" />
-    </Button>
+    <Menu.CommandItem
+      icon={faNote}
+      label={m.layout_agentTab_goToTaskNote_tooltip()}
+      onclick={(event) => handleGoToTaskNote(event)}
+    />
   {/if}
-  <Button
-    variant="ghost-light"
-    size="icon-xs"
-    onclick={() => appStore.dispatch(cycleFontStyle())}
-    tooltip={m.layout_agentTab_font_tooltip({ font: $fontStyleLabel })}
-    tooltipSide="bottom"
-  >
-    <span class="text-xs font-semibold tracking-tight" class:font-mono={$isMonospace}
-      >{m.layout_agentTab_fontSample_label()}</span
-    >
-  </Button>
-  <Button
-    variant="ghost-light"
-    size="icon-xs"
+  <Menu.CommandItem
+    icon={agentCopyFeedback ? faCheck : faCopy}
+    label={agentCopyFeedback || m.layout_agentTab_copyConversation_tooltip()}
     onclick={handleCopyAgentConversation}
-    tooltip={agentCopyFeedback || m.layout_agentTab_copyConversation_tooltip()}
-    tooltipSide="bottom"
     disabled={agentMessages.length === 0}
-    class={agentCopyFeedback ? 'text-success' : ''}
-  >
-    <Fa icon={agentCopyFeedback ? faCheck : faCopy} size="xs" />
-  </Button>
-  <Button
-    variant="ghost-light"
-    size="icon-xs"
+  />
+  <Menu.CommandItem
+    icon={faTrash}
+    label={m.layout_agentTab_deleteAgent_tooltip()}
     onclick={handleDeleteAgent}
-    tooltip={m.layout_agentTab_deleteAgent_tooltip()}
-    tooltipSide="bottom"
     disabled={isAgentDeleting}
-    class="hover:text-destructive-foreground"
-  >
-    <Fa icon={faTrash} size="xs" />
-  </Button>
+    destructive
+  />
+  {#if harnessVersion}
+    <Menu.Separator />
+    <Menu.CommandItem
+      icon={faCircleInfo}
+      label={m.chat_agentCard_menu_harnessVersion_label({ version: harnessVersion })}
+      onclick={() => (harnessModalOpen = true)}
+    />
+  {/if}
 {/snippet}
+
+{#if harnessVersion}
+  <HarnessFeaturesModal
+    bind:open={harnessModalOpen}
+    version={harnessVersion}
+    features={harnessFeatures}
+  />
+{/if}
 
 {#if tab.agentId}
   {#if $workspace}
     {#key tab.agentId}
-      <div class="w-full h-full flex-1 flex pb-1.5">
+      <div class="flex h-full min-h-0 w-full flex-1">
         <ChatPanel
+          bind:this={chatPanelRef}
           workspace={$workspace}
           agentId={tab.agentId}
           {agentModel}
           {isActive}
           {isPanelFocused}
           {isInitialWorkspaceAgent}
+          onNavigationStateChange={(state) => (chatNavigationState = state)}
         />
       </div>
     {/key}

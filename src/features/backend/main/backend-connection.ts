@@ -2,24 +2,15 @@
  * Connection-target resolution and the default socket factory for the live
  * backend transport.
  *
- * Local dev normally talks to intentd over a plain WebSocket on loopback; the
- * packaged app stays on the Unix Domain Socket. The target is configurable via
- * environment variables so the same client works in every posture:
+ * Local dev and packaged builds talk to intentd over its Unix Domain Socket by
+ * default. The target is configurable via environment variables so the same
+ * client works in every posture:
  *   - `INTENTD_SOCKET=/path/to.sock` → force UDS (highest precedence).
  *   - `INTENTD_WS_URL=ws://host:port[/ws]` → plain WebSocket to that URL.
  *   - `INTENTD_TCP=host:port` → legacy TCP (optionally TLS) stub, unchanged.
- *   - dev build (see [[ResolveBackendConfigOptions.isDev]]) with the sidecar
- *     spawn policy in effect (INTENTD_SIDECAR=1, no transport override) →
- *     UDS at `defaultSocketPath(env)` (honors `INTENTD_DATA_DIR`), matching
- *     the socket the sidecar spawns intentd on.
- *   - dev build with no sidecar and no env override → `ws://127.0.0.1:5181/ws`
- *     (loopback, no TLS, no token) — the two-terminal `dev-daemon + run-fe`
- *     flow.
- *   - packaged build with no env override → the default dev UDS path.
- *
- * The dev+sidecar branch reuses [[shouldSpawnSidecar]] rather than duplicating
- * env-string logic so the resolver and the spawn policy can never diverge on
- * whether to connect over UDS or the loopback WebSocket.
+ *   - no transport override → UDS at `defaultSocketPath(env)` (honors
+ *     `INTENTD_DATA_DIR`), whether intentd is an adopted installed daemon, an
+ *     explicitly spawned dev sidecar, or the packaged sidecar.
  *
  * The daemon's WebSocket endpoint at `/ws` frames JSON-RPC as one message per
  * text frame (`intent-transport/src/ws.rs::connection_loop`). The
@@ -28,15 +19,18 @@
  * adapter that translates between the two framings.
  */
 import net from 'node:net';
-import os from 'node:os';
-import path from 'node:path';
 import tls from 'node:tls';
 import { Duplex } from 'node:stream';
 import { createRequire } from 'node:module';
+import type { IncomingMessage } from 'node:http';
 import type { RawData, WebSocket as WsWebSocket } from 'ws';
 
-import { shouldSpawnSidecar } from './intentd-spawn-policy';
-import { defaultWindowsSocketPath, toLocalEndpoint, windowsPipeName } from './intentd-pipe-name';
+import { Logger } from '$shared/logger';
+import { describeBackendUrl } from './backend-log-descriptor';
+import { resolveIntentdSocketPath } from './intentd-data-dir';
+import { toLocalEndpoint } from './intentd-pipe-name';
+
+const raceLogger = new Logger('BackendConnection');
 
 // The `ws` package is CJS and the vitest suite aliases the ESM import to a
 // browser-safe stub (see `vitest.config.ts`); `createRequire` sidesteps both.
@@ -47,25 +41,45 @@ const { WebSocket: NodeWebSocket } = nodeRequire('ws') as {
 
 /** Resolved connection target for the backend transport. */
 export interface BackendConnectionConfig {
-  transport: 'uds' | 'tcp' | 'ws';
+  transport: 'uds' | 'tcp' | 'ws' | 'wss';
   /** UDS socket path (when `transport === 'uds'`). */
   socketPath?: string;
-  /** Host (when `transport === 'tcp'`). */
+  /** Host (when `transport === 'tcp'` or `'wss'`). */
   host?: string;
-  /** Port (when `transport === 'tcp'`). */
+  /**
+   * Candidate hosts for the `wss` transport (#1746): the primary `host` plus
+   * any additional IPs the backend reported at pairing time. When more than
+   * one distinct candidate is present, every connect races them all in
+   * parallel (mirroring iOS `raceHosts`) and keeps whichever pin-verified
+   * connection succeeds first. Optional — absent or single-entry behaves
+   * exactly like the plain single-host connect.
+   */
+  hosts?: string[];
+  /** Port (when `transport === 'tcp'` or `'wss'`). */
   port?: number;
   /** Use TLS for the TCP transport (remote). Defaults to true for TCP. */
   tls?: boolean;
   /** Full `ws://…` URL (when `transport === 'ws'`); `/ws` is added if missing. */
   wsUrl?: string;
+  /**
+   * Bearer token for the `wss` transport (PROTOCOL §2.1), presented on the
+   * WebSocket upgrade via the `Authorization` header (with a `?token=` query
+   * fallback).
+   */
+  token?: string;
+  /**
+   * Pinned self-signed certificate SHA-256 fingerprint for the `wss` transport
+   * (PROTOCOL §1.2), colon-separated uppercase hex. Every connect verifies the
+   * presented cert against this pin; a mismatch fails with {@link PinMismatchError}.
+   */
+  fingerprint?: string;
 }
 
 /** Options for [[resolveBackendConfig]]. */
 export interface ResolveBackendConfigOptions {
   /**
-   * `true` when running an unpackaged/dev Electron build. When no env override
-   * is present and this flag is set, the resolver picks the loopback dev
-   * WebSocket default (`ws://127.0.0.1:5181/ws`).
+   * Retained for call-site compatibility. Build posture does not change the
+   * zero-config UDS target; WebSocket transport requires `INTENTD_WS_URL`.
    */
   isDev?: boolean;
   /** Platform override for tests; defaults to `process.platform`. */
@@ -75,34 +89,23 @@ export interface ResolveBackendConfigOptions {
 /**
  * Default local connect target for the running intentd daemon.
  *
- * Honors `INTENTD_DATA_DIR` (socket = `$INTENTD_DATA_DIR/intentd.sock`) so the
- * FE connects to the same socket the sidecar spawned intentd with. On win32
- * the daemon serves a named pipe derived from the socket path, so this
- * returns the pipe name (see `intentd-pipe-name.ts` for the contract); the
- * no-data-dir default mirrors the daemon's `%APPDATA%\intentd\data`.
+ * The socket lives in the daemon's data dir — resolved by
+ * `intentd-data-dir.ts`, which honors `INTENTD_DATA_DIR` (so the FE connects
+ * to the same socket the sidecar spawned intentd with) and mirrors the
+ * daemon's platform defaults (macOS: `~/Library/Application Support/intentd`,
+ * Linux: `$XDG_DATA_HOME/intentd` with a `~/.local/share/intentd` fallback,
+ * Windows: `%APPDATA%\intentd\data`). On win32 the daemon serves a named pipe
+ * derived from the socket path, so this returns the pipe name (see
+ * `intentd-pipe-name.ts` for the contract).
  */
 export function defaultSocketPath(
   env: NodeJS.ProcessEnv = process.env,
   platform: NodeJS.Platform = process.platform,
 ): string {
-  const dataDir = env.INTENTD_DATA_DIR?.trim();
-  if (platform === 'win32') {
-    const socketPath = dataDir
-      ? path.win32.join(dataDir, 'intentd.sock')
-      : defaultWindowsSocketPath(env);
-    return windowsPipeName(socketPath);
-  }
-  if (dataDir) {
-    return path.join(dataDir, 'intentd.sock');
-  }
-  // i18n-ignore (filesystem path)
-  return path.join(os.homedir(), 'Library', 'Application Support', 'intentd', 'intentd.sock');
+  return toLocalEndpoint(resolveIntentdSocketPath(env, platform), platform);
 }
 
-/** Default dev WebSocket URL (loopback, no TLS, no token). */
-export const DEFAULT_DEV_WS_URL = 'ws://127.0.0.1:5181/ws';
-
-/** Resolve the connection target from environment variables (with dev default). */
+/** Resolve the connection target from environment variables (with UDS default). */
 export function resolveBackendConfig(
   env: NodeJS.ProcessEnv = process.env,
   opts: ResolveBackendConfigOptions = {},
@@ -124,20 +127,6 @@ export function resolveBackendConfig(
     const host = lastColon > 0 ? tcp.slice(0, lastColon) : '127.0.0.1';
     const port = Number(lastColon > 0 ? tcp.slice(lastColon + 1) : tcp);
     return { transport: 'tcp', host, port, tls: env.INTENTD_TCP_INSECURE !== '1' };
-  }
-  if (opts.isDev) {
-    // Dev builds default to the loopback WebSocket for the two-terminal flow
-    // (`make dev-daemon` + `make run-fe`). When the sidecar spawn policy is
-    // in effect (`INTENTD_SIDECAR=1`, no transport override — the one-command
-    // `make dev` flow) intentd runs as our sidecar on its UDS socket, so we
-    // must connect there instead of ECONNREFUSEing 127.0.0.1:5181. Deriving
-    // the decision from `shouldSpawnSidecar` keeps the resolver and the
-    // spawn-policy in lockstep (see the pinning test in
-    // `backend-connection.test.ts`).
-    if (shouldSpawnSidecar(env, /* isPackaged */ false).shouldSpawn) {
-      return { transport: 'uds', socketPath: defaultSocketPath(env, platform) };
-    }
-    return { transport: 'ws', wsUrl: DEFAULT_DEV_WS_URL };
   }
   return { transport: 'uds', socketPath: defaultSocketPath(env, platform) };
 }
@@ -162,10 +151,11 @@ function normalizeWsUrl(raw: string): string {
 /**
  * Create a connected stream for the given config.
  *
- * UDS and the loopback `ws://` transport are fully supported. The TCP/TLS
- * branch remains a remote-transport stub: it opens a (optionally TLS) socket
- * but does NOT implement the WSS `/ws` handshake, so remote framing beyond a
- * raw newline-delimited stream is out of scope.
+ * UDS, the loopback `ws://` transport, and the pinned `wss://` remote transport
+ * (self-signed-cert fingerprint pinning + bearer token, see
+ * {@link createWssSocket}) are fully supported. The legacy TCP configuration is
+ * retained for diagnostics only and fails closed until authenticated transport
+ * and compatible framing are implemented.
  */
 export function createBackendSocket(config: BackendConnectionConfig): Duplex {
   if (config.transport === 'uds') {
@@ -176,25 +166,457 @@ export function createBackendSocket(config: BackendConnectionConfig): Duplex {
     if (!config.wsUrl) throw new Error('WS transport requires a wsUrl');
     return new WebSocketDuplex(new NodeWebSocket(config.wsUrl));
   }
-  if (!config.host || !config.port) {
-    throw new Error('TCP transport requires host and port');
+  if (config.transport === 'wss') {
+    const hosts = candidateWssHosts(config);
+    if (hosts.length > 1) {
+      return raceWssSockets(config, hosts);
+    }
+    return createWssSocket(config);
   }
-  // Remote transport stub: TLS-with-pinning and the WSS handshake are deferred.
-  // Certificate validation stays at the Node default (rejectUnauthorized: true).
-  if (config.tls) {
-    return tls.connect({
-      host: config.host,
-      port: config.port,
-    });
-  }
-  return net.connect({ host: config.host, port: config.port });
+  throw new Error(
+    // i18n-ignore (developer-facing config error naming env vars; surfaces in logs, not UI)
+    'Legacy INTENTD_TCP transport is disabled because authenticated remote transport is not implemented; use INTENTD_SOCKET or INTENTD_WS_URL',
+  );
 }
 
 /** Human-readable description of a connection target (for logs). */
 export function describeBackendConfig(config: BackendConnectionConfig): string {
   if (config.transport === 'uds') return `uds:${config.socketPath}`;
-  if (config.transport === 'ws') return `ws:${config.wsUrl}`;
+  if (config.transport === 'ws') return `ws:${describeBackendUrl(config.wsUrl)}`;
+  // Deliberately omit the token and fingerprint — this string reaches logs.
+  if (config.transport === 'wss') {
+    const extra = candidateWssHosts(config).length - 1;
+    const suffix = extra > 0 ? ` (+${extra} candidate${extra === 1 ? '' : 's'})` : '';
+    return `wss:${config.host}:${config.port}${suffix}`;
+  }
   return `tcp:${config.host}:${config.port}${config.tls ? ' (tls)' : ''}`;
+}
+
+/**
+ * Distinct candidate hosts for a `wss` config: the primary `host` first, then
+ * the `hosts` extras, trimmed and deduplicated in order.
+ */
+export function candidateWssHosts(config: BackendConnectionConfig): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const raw of [config.host ?? '', ...(config.hosts ?? [])]) {
+    const host = raw.trim();
+    if (!host || seen.has(host)) continue;
+    seen.add(host);
+    out.push(host);
+  }
+  return out;
+}
+
+/**
+ * Raised when a `wss` peer presents a certificate whose SHA-256 fingerprint
+ * does not match the pinned value (PROTOCOL §1.2). Distinct from a generic
+ * connect failure so the switch/UI layer can surface the "certificate changed"
+ * failure modal instead of a transient reconnect.
+ */
+export class PinMismatchError extends Error {
+  /** Pinned fingerprint (colon-hex uppercase). */
+  readonly expected: string;
+  /** Fingerprint the peer actually presented (colon-hex uppercase). */
+  readonly actual: string;
+  constructor(expected: string, actual: string) {
+    super(
+      `certificate fingerprint mismatch: expected ${expected || '(none)'}, got ${actual || '(none)'}`,
+    );
+    this.name = 'PinMismatchError';
+    this.expected = expected;
+    this.actual = actual;
+  }
+}
+
+/**
+ * Raised when a `wss` upgrade is rejected by the daemon's bearer-token check
+ * (PROTOCOL §2.1): HTTP 401 on a bad/rotated token, 403 when the WS API is
+ * disabled. Distinct from a generic transport error so the switch/UI layer can
+ * surface "authentication rejected" instead of a transient reconnect.
+ */
+export class AuthRejectedError extends Error {
+  /** HTTP status the upgrade was rejected with (401 or 403). */
+  readonly statusCode: number;
+  constructor(statusCode: number) {
+    // i18n-ignore (main-process error message for logs, not renderer copy)
+    super(`WebSocket upgrade rejected with HTTP ${statusCode} (authentication rejected)`);
+    this.name = 'AuthRejectedError';
+    this.statusCode = statusCode;
+  }
+}
+
+/**
+ * Normalize a certificate SHA-256 fingerprint to the daemon's canonical form
+ * (PROTOCOL §1.2): colon-separated **uppercase** hex byte pairs. Accepts any
+ * mix of case and separators (Node's `fingerprint256` is already colon-hex
+ * uppercase, but a user-pasted or persisted pin may not be), so both sides of
+ * a pin comparison can be run through it before an exact string match.
+ */
+export function normalizeFingerprint(fingerprint: string): string {
+  const hex = fingerprint.replace(/[^0-9a-fA-F]/g, '').toUpperCase();
+  return hex.match(/.{2}/g)?.join(':') ?? '';
+}
+
+/**
+ * Build the daemon's `wss://<host>:<port>/ws` upgrade URL, bracketing a bare
+ * IPv6 host and optionally appending the `?token=` query fallback (PROTOCOL
+ * §2.1 checks the header first, then the query).
+ */
+function formatWssUrl(host: string, port: number, token?: string): string {
+  const authority = host.includes(':') && !host.startsWith('[') ? `[${host}]` : host;
+  const base = `wss://${authority}:${port}/ws`;
+  if (!token) return base;
+  const url = new URL(base);
+  url.searchParams.set('token', token);
+  return url.toString();
+}
+
+/** Read the peer cert fingerprint (normalized) from an upgrade/response socket. */
+function peerFingerprint(response: IncomingMessage): string {
+  const socket = response.socket as tls.TLSSocket;
+  const cert = socket.getPeerCertificate?.();
+  return normalizeFingerprint(cert?.fingerprint256 ?? '');
+}
+
+/**
+ * Connect the pinned `wss` transport: open the TLS WebSocket with
+ * `rejectUnauthorized: false` (the daemon's cert is self-signed, PROTOCOL
+ * §1.2) and **manually verify** the presented cert's fingerprint against the
+ * config pin on the upgrade handshake — before any application data flows. A
+ * mismatch destroys the stream with a {@link PinMismatchError}; a match hands
+ * the connection to the shared {@link WebSocketDuplex} newline framing adapter.
+ * The bearer token is sent via the `Authorization` header (PROTOCOL §2.1) with
+ * a `?token=` query fallback. An upgrade rejected with HTTP 401/403 (bad token
+ * / WS API disabled, PROTOCOL §2.1) destroys the stream with a distinct
+ * {@link AuthRejectedError} instead of a generic transport error.
+ */
+function createWssSocket(config: BackendConnectionConfig): Duplex {
+  const { host, port, token, fingerprint } = config;
+  if (!host || !port) throw new Error('WSS transport requires host and port');
+  if (!token) throw new Error('WSS transport requires a token');
+  if (!fingerprint) throw new Error('WSS transport requires a pinned fingerprint');
+  const expected = normalizeFingerprint(fingerprint);
+
+  const ws = new NodeWebSocket(formatWssUrl(host, port, token), {
+    rejectUnauthorized: false,
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  const duplex = new WebSocketDuplex(ws);
+  ws.on('upgrade', (response: IncomingMessage) => {
+    const actual = peerFingerprint(response);
+    if (actual !== expected) {
+      // Destroy through the duplex so the JSON-RPC client observes a single
+      // `error` (then `close`) — the same failure path every transport uses.
+      duplex.destroy(new PinMismatchError(expected, actual));
+    }
+  });
+  ws.on('unexpected-response', (_req, response: IncomingMessage) => {
+    // Attaching this listener suppresses ws's own generic error, so every
+    // status must be handled here. Verify the pinned fingerprint FIRST: a
+    // changed or intercepted endpoint can also answer 401/403, and classifying
+    // that as an auth rejection would steer the user into re-pairing (typing a
+    // fresh secret) against an untrusted certificate. The pin decides trust
+    // before any status-code interpretation.
+    const actual = peerFingerprint(response);
+    if (actual !== expected) {
+      duplex.destroy(new PinMismatchError(expected, actual));
+      return;
+    }
+    // 401/403 are the daemon's auth rejections (PROTOCOL §2.1); anything else
+    // keeps the generic failure shape.
+    const statusCode = response.statusCode ?? 0;
+    if (statusCode === 401 || statusCode === 403) {
+      duplex.destroy(new AuthRejectedError(statusCode));
+      return;
+    }
+    duplex.destroy(new Error(`Unexpected server response: ${statusCode}`));
+  });
+  return duplex;
+}
+
+/** One racing attempt: a candidate host plus a factory for its socket. */
+export interface RaceAttempt {
+  host: string;
+  create: () => Duplex;
+}
+
+/** Overall bound on the multi-host race; matches the capture timeout. */
+const RACE_TIMEOUT_MS = 10_000;
+
+/**
+ * Race the pinned `wss` transport across all candidate hosts (#1746),
+ * mirroring iOS `ConnectionManager.raceHosts`: one socket per candidate, the
+ * first to complete the pin-verified connect wins and the losers are torn
+ * down. Returns a facade `Duplex` the JSON-RPC client drives exactly like a
+ * single-host socket.
+ */
+function raceWssSockets(config: BackendConnectionConfig, hosts: string[]): Duplex {
+  return raceDuplexSockets(
+    hosts.map((host) => ({ host, create: () => createWssSocket({ ...config, host }) })),
+  );
+}
+
+/**
+ * Generic first-connect-wins race over candidate socket attempts. Exported
+ * (with an injectable per-attempt factory) so unit tests can drive it with
+ * in-memory fake sockets.
+ *
+ * Semantics (see #1746 acceptance criteria):
+ * - The first candidate to emit `connect` wins; all others are destroyed.
+ * - Before a winner settles, a {@link PinMismatchError} on ANY candidate fails
+ *   the whole race with that error — a cert mismatch is surfaced as a cert
+ *   error, never silently skipped as "unreachable" (no fallback onto other
+ *   candidates).
+ * - Once a pin-verified winner has settled, the winner takes precedence: a
+ *   late mismatch on a losing candidate is logged and discarded rather than
+ *   tearing down the established (itself pin-verified) connection. This
+ *   mirrors iOS `raceHosts` (first success cancels the task group) and keeps
+ *   one stale IP now owned by a foreign pinned daemon from blocking a
+ *   connection that has a valid candidate.
+ * - If every candidate fails without a pin mismatch, the facade errors with
+ *   the last candidate failure.
+ * - A race-wide timeout bounds the whole attempt so a black-hole candidate
+ *   set cannot hang the client's connect (the reconnect loop retries).
+ */
+export function raceDuplexSockets(
+  attempts: RaceAttempt[],
+  options: { timeoutMs?: number } = {},
+): Duplex {
+  const timeoutMs = options.timeoutMs ?? RACE_TIMEOUT_MS;
+  let winner: Duplex | null = null;
+  let settled = false;
+  let pendingCount = attempts.length;
+  let lastError: Error | null = null;
+  const candidates: Duplex[] = [];
+
+  // Tear a losing/failed candidate down without leaving it listener-less: a
+  // destroyed-but-alive socket can still emit async 'error' events, and a
+  // zero-listener 'error' is an uncaught exception in the main process. A
+  // late pin mismatch is logged so it is observed, never fully silent.
+  const teardownCandidate = (candidate: Duplex): void => {
+    candidate.removeAllListeners();
+    candidate.on('error', (error: Error) => {
+      if (error instanceof PinMismatchError) {
+        raceLogger.warn('pin mismatch on a losing race candidate (winner already settled)', {
+          error: error.message,
+        });
+      }
+    });
+    candidate.destroy();
+  };
+
+  const facade = new Duplex({
+    allowHalfOpen: false,
+    read() {
+      // Inbound data is pushed from the winning socket's `data` events.
+    },
+    write(chunk, encoding, callback) {
+      if (winner) {
+        winner.write(chunk, encoding, callback);
+        return;
+      }
+      // The JSON-RPC client only writes after `connect`, so a pre-win write is
+      // unexpected — fail it like a not-yet-open socket.
+      callback(new Error('Socket is not connected'));
+    },
+    destroy(error, callback) {
+      settled = true;
+      clearTimeout(timer);
+      for (const candidate of candidates) {
+        if (candidate !== winner) teardownCandidate(candidate);
+      }
+      winner?.removeAllListeners();
+      winner?.destroy();
+      callback(error);
+    },
+  });
+
+  const failRace = (error: Error): void => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(timer);
+    for (const candidate of candidates) {
+      teardownCandidate(candidate);
+    }
+    facade.destroy(error);
+  };
+
+  const timer = setTimeout(
+    () => failRace(new Error(`connection race timed out after ${timeoutMs}ms`)),
+    timeoutMs,
+  );
+  timer.unref?.();
+
+  const countCandidateFailure = (error: Error): void => {
+    if (settled) return;
+    // A pinned-cert mismatch on any candidate before a winner settles fails
+    // the whole race — never silently skipped as unreachable (#1746
+    // acceptance).
+    if (error instanceof PinMismatchError) {
+      failRace(error);
+      return;
+    }
+    lastError = error;
+    pendingCount -= 1;
+    if (pendingCount <= 0) {
+      failRace(lastError);
+    }
+  };
+
+  const onCandidateFailure = (candidate: Duplex, error: Error): void => {
+    // A failed candidate is dead to the race either way — destroy it now so
+    // it cannot raise an uncaught 'error' while other racers continue, and so
+    // its socket is freed before the race settles.
+    teardownCandidate(candidate);
+    countCandidateFailure(error);
+  };
+
+  const onCandidateWin = (candidate: Duplex): void => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(timer);
+    winner = candidate;
+    for (const other of candidates) {
+      if (other === candidate) continue;
+      teardownCandidate(other);
+    }
+    candidate.removeAllListeners();
+    // Forward the winning socket through the facade: data, error, and close
+    // all surface exactly as they would on a single-host socket.
+    candidate.on('data', (chunk: Buffer | string) => facade.push(chunk));
+    candidate.on('error', (error: Error) => {
+      if (!facade.destroyed) facade.destroy(error);
+    });
+    candidate.on('close', () => facade.push(null));
+    facade.emit('connect');
+  };
+
+  for (const attempt of attempts) {
+    let candidate: Duplex;
+    try {
+      candidate = attempt.create();
+    } catch (error) {
+      countCandidateFailure(error instanceof Error ? error : new Error(String(error)));
+      continue;
+    }
+    candidates.push(candidate);
+    // A failing candidate can emit `error` AND `close`; count it out only once.
+    let counted = false;
+    const failOnce = (error: Error): void => {
+      if (counted) return;
+      counted = true;
+      onCandidateFailure(candidate, error);
+    };
+    const onConnect = (): void => onCandidateWin(candidate);
+    candidate.once('connect', onConnect);
+    candidate.once('secureConnect', onConnect);
+    candidate.once('error', failOnce);
+    candidate.once('close', () => {
+      failOnce(new Error(`connection to ${attempt.host} closed before connecting`));
+    });
+  }
+  // Every attempt threw synchronously (or the list was empty).
+  if (candidates.length === 0 && !settled) {
+    failRace(lastError ?? new Error('no candidate hosts to connect'));
+  }
+
+  return facade;
+}
+
+/** Successful trust-on-first-use capture: the presented cert's fingerprint. */
+export interface CaptureFingerprintOk {
+  ok: true;
+  /** Presented cert SHA-256 fingerprint, colon-hex uppercase (PROTOCOL §1.2). */
+  fingerprint: string;
+  /**
+   * `false` when the daemon rejected the upgrade with HTTP 401/403 (bad token
+   * / WS API disabled, PROTOCOL §2.1) — the cert was still captured from the
+   * TLS layer, but pairing with this token would fail. `true` for an accepted
+   * upgrade (and for non-auth upgrade statuses, which say nothing about the
+   * token).
+   */
+  tokenValid: boolean;
+  /** HTTP status the upgrade was rejected with when `tokenValid` is false (401 or 403). */
+  statusCode?: number;
+}
+
+/** Failed trust-on-first-use capture, with a machine-readable reason. */
+export interface CaptureFingerprintError {
+  ok: false;
+  code: 'no-certificate' | 'connect-failed' | 'timeout';
+  error: string;
+}
+
+export type CaptureFingerprintResult = CaptureFingerprintOk | CaptureFingerprintError;
+
+/**
+ * Trust-on-first-use helper: open a `wss` connection to `{host, port}` with
+ * `rejectUnauthorized: false`, read the presented self-signed cert's SHA-256
+ * fingerprint (PROTOCOL §1.2), then close. Returns the normalized fingerprint
+ * for the user to confirm, or a structured error. The bearer token is sent so
+ * the capture exercises the real upgrade path; the fingerprint is still read
+ * from the TLS layer even when the token is rejected (401/403 → unexpected
+ * response), and the rejection is reported as `tokenValid: false` (with the
+ * status code) so a bad or stale token surfaces during pairing rather than
+ * only at pinned-connect time.
+ */
+export function captureFingerprint(
+  target: { host: string; port: number; token: string },
+  options: { timeoutMs?: number } = {},
+): Promise<CaptureFingerprintResult> {
+  const { host, port, token } = target;
+  const timeoutMs = options.timeoutMs ?? 10_000;
+  return new Promise<CaptureFingerprintResult>((resolve) => {
+    let settled = false;
+    const ws = new NodeWebSocket(formatWssUrl(host, port, token), {
+      rejectUnauthorized: false,
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    const finish = (result: CaptureFingerprintResult): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try {
+        ws.terminate();
+      } catch {
+        // ignore teardown errors
+      }
+      resolve(result);
+    };
+    const timer = setTimeout(
+      () =>
+        finish({
+          ok: false,
+          code: 'timeout',
+          error: `fingerprint capture timed out after ${timeoutMs}ms`,
+        }),
+      timeoutMs,
+    );
+    timer.unref?.();
+    const readCert = (response: IncomingMessage, authRejectedStatus?: number): void => {
+      const fingerprint = peerFingerprint(response);
+      if (!fingerprint) {
+        finish({ ok: false, code: 'no-certificate', error: 'server presented no certificate' });
+        return;
+      }
+      if (authRejectedStatus !== undefined) {
+        finish({ ok: true, fingerprint, tokenValid: false, statusCode: authRejectedStatus });
+        return;
+      }
+      finish({ ok: true, fingerprint, tokenValid: true });
+    };
+    ws.on('upgrade', (response: IncomingMessage) => readCert(response));
+    ws.on('unexpected-response', (_req, response: IncomingMessage) => {
+      // 401/403 are the daemon's auth rejections (PROTOCOL §2.1); any other
+      // status says nothing about the token, so tokenValid stays true.
+      const statusCode = response.statusCode ?? 0;
+      readCert(response, statusCode === 401 || statusCode === 403 ? statusCode : undefined);
+    });
+    ws.on('error', (err: Error) =>
+      finish({ ok: false, code: 'connect-failed', error: err.message }),
+    );
+  });
 }
 
 /**

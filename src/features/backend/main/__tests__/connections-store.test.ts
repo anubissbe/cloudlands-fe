@@ -1,0 +1,406 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import * as fs from 'fs/promises';
+import * as os from 'os';
+import * as path from 'path';
+
+/**
+ * Round-trip tests for the multi-backend connections store
+ * (features/backend/main/connections-store.ts).
+ *
+ * The store persists remote intentd connections + the active selection to
+ * `backend-connections.json` under `app.getPath('userData')`, encrypting the
+ * bearer token via Electron `safeStorage` when available (plaintext fallback
+ * otherwise). A synthesized, non-forgettable "This machine (local)" entry is
+ * always first. `safeStorage` is mocked per-suite to exercise both paths.
+ */
+
+let tmpDir: string;
+
+/** Toggle used by the mocked safeStorage across suites. */
+let encryptionAvailable = true;
+
+function mockElectron() {
+  vi.doMock('electron', () => ({
+    app: { getPath: () => tmpDir },
+    safeStorage: {
+      isEncryptionAvailable: () => encryptionAvailable,
+      // Reversible "encryption" so tests can assert round-trip + at-rest ciphertext.
+      encryptString: (s: string) => Buffer.from(`enc:${s}`, 'utf8'),
+      decryptString: (b: Buffer) => b.toString('utf8').replace(/^enc:/, ''),
+    },
+  }));
+  vi.doMock('../../../shared/logger', () => ({
+    Logger: class {
+      debug() {}
+      info() {}
+      warn() {}
+      error() {}
+    },
+  }));
+}
+
+beforeEach(async () => {
+  tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'backend-connections-'));
+  encryptionAvailable = true;
+  vi.resetModules();
+  mockElectron();
+});
+
+afterEach(async () => {
+  const mod = await import('../connections-store');
+  await mod.__drainWriteChainForTesting();
+  await fs.rm(tmpDir, { recursive: true, force: true });
+  vi.doUnmock('electron');
+});
+
+const sampleConn = {
+  label: 'Studio Mac',
+  host: '192.168.1.10',
+  port: 8443,
+  fingerprint: 'AA:BB:CC',
+  token: 'secret-token',
+};
+
+describe('connections-store', () => {
+  it('list() synthesizes the local entry first even with an empty store', async () => {
+    const store = await import('../connections-store');
+    const list = await store.list();
+    expect(list).toHaveLength(1);
+    expect(list[0]).toMatchObject({
+      id: store.LOCAL_CONNECTION_ID,
+      label: store.LOCAL_CONNECTION_LABEL,
+      isLocal: true,
+      host: null,
+      port: null,
+      fingerprint: null,
+    });
+  });
+
+  it('local entry defaults to the active id', async () => {
+    const store = await import('../connections-store');
+    expect(await store.getActiveId()).toBe(store.LOCAL_CONNECTION_ID);
+  });
+
+  it('add → list round-trips through disk, local stays first, no token leaked', async () => {
+    const store = await import('../connections-store');
+    const rec = await store.add(sampleConn);
+    expect(rec.id).not.toBe(store.LOCAL_CONNECTION_ID);
+    expect(rec).not.toHaveProperty('encToken');
+    expect(rec).not.toHaveProperty('token');
+
+    const list = await store.list();
+    expect(list).toHaveLength(2);
+    expect(list[0].id).toBe(store.LOCAL_CONNECTION_ID);
+    expect(list[1]).toMatchObject({
+      id: rec.id,
+      label: 'Studio Mac',
+      host: '192.168.1.10',
+      port: 8443,
+      fingerprint: 'AA:BB:CC',
+      isLocal: false,
+    });
+    expect(list[1]).not.toHaveProperty('token');
+    expect(list[1]).not.toHaveProperty('encToken');
+  });
+
+  it('forget removes a remote but rejects forgetting local', async () => {
+    const store = await import('../connections-store');
+    const rec = await store.add(sampleConn);
+    await expect(store.forget(store.LOCAL_CONNECTION_ID)).rejects.toThrow();
+    // Local still present after the rejected forget.
+    expect((await store.list()).some((c) => c.id === store.LOCAL_CONNECTION_ID)).toBe(true);
+
+    await store.forget(rec.id);
+    const list = await store.list();
+    expect(list).toHaveLength(1);
+    expect(list[0].id).toBe(store.LOCAL_CONNECTION_ID);
+  });
+
+  it('setActiveId persists and forgetting the active one falls back to local', async () => {
+    const store = await import('../connections-store');
+    const rec = await store.add(sampleConn);
+    await store.setActiveId(rec.id);
+    expect(await store.getActiveId()).toBe(rec.id);
+
+    await store.forget(rec.id);
+    expect(await store.getActiveId()).toBe(store.LOCAL_CONNECTION_ID);
+  });
+
+  it('setActiveId rejects an unknown id but accepts local', async () => {
+    const store = await import('../connections-store');
+    await expect(store.setActiveId('does-not-exist')).rejects.toThrow();
+    await store.setActiveId(store.LOCAL_CONNECTION_ID);
+    expect(await store.getActiveId()).toBe(store.LOCAL_CONNECTION_ID);
+  });
+
+  it('active id persists across a fresh module load (through disk)', async () => {
+    const store = await import('../connections-store');
+    const rec = await store.add(sampleConn);
+    await store.setActiveId(rec.id);
+    await store.__drainWriteChainForTesting();
+
+    vi.resetModules();
+    mockElectron();
+    const reloaded = await import('../connections-store');
+    expect(await reloaded.getActiveId()).toBe(rec.id);
+    expect((await reloaded.list()).map((c) => c.id)).toContain(rec.id);
+  });
+
+  it('getDecryptedToken returns the original token; local has none', async () => {
+    const store = await import('../connections-store');
+    const rec = await store.add(sampleConn);
+    expect(await store.getDecryptedToken(rec.id)).toBe('secret-token');
+    expect(await store.getDecryptedToken(store.LOCAL_CONNECTION_ID)).toBeNull();
+    expect(await store.getDecryptedToken('unknown')).toBeNull();
+  });
+
+  it('token is encrypted at rest when safeStorage is available', async () => {
+    const store = await import('../connections-store');
+    await store.add(sampleConn);
+    await store.__drainWriteChainForTesting();
+
+    const raw = await fs.readFile(path.join(tmpDir, 'backend-connections.json'), 'utf8');
+    const parsed = JSON.parse(raw);
+    const enc = parsed.connections[0].encToken;
+    expect(enc.encrypted).toBe(true);
+    expect(enc.value).not.toContain('secret-token');
+    // base64 of "enc:secret-token"
+    expect(Buffer.from(enc.value, 'base64').toString('utf8')).toBe('enc:secret-token');
+  });
+
+  it('falls back to marked plaintext when safeStorage is unavailable', async () => {
+    encryptionAvailable = false;
+    const store = await import('../connections-store');
+    const rec = await store.add(sampleConn);
+    await store.__drainWriteChainForTesting();
+
+    const raw = await fs.readFile(path.join(tmpDir, 'backend-connections.json'), 'utf8');
+    const parsed = JSON.parse(raw);
+    const enc = parsed.connections[0].encToken;
+    expect(enc.encrypted).toBe(false);
+    expect(enc.value).toBe('secret-token');
+    // Still decrypts (identity) via the store API.
+    expect(await store.getDecryptedToken(rec.id)).toBe('secret-token');
+  });
+
+  it('serializes concurrent adds without losing writes', async () => {
+    const store = await import('../connections-store');
+    // Distinct host:port targets — same-target adds intentionally upsert.
+    await Promise.all([
+      store.add({ ...sampleConn, port: 8443, label: 'A' }),
+      store.add({ ...sampleConn, port: 8444, label: 'B' }),
+      store.add({ ...sampleConn, port: 8445, label: 'C' }),
+    ]);
+    const labels = (await store.list())
+      .filter((c) => !c.isLocal)
+      .map((c) => c.label)
+      .sort();
+    expect(labels).toEqual(['A', 'B', 'C']);
+  });
+
+  it('re-adding an existing host:port upserts in place (same id, fresh token/fingerprint/label)', async () => {
+    const store = await import('../connections-store');
+    const original = await store.add(sampleConn);
+    await store.setHostname(original.id, 'studio.local');
+
+    const updated = await store.add({
+      label: 'Renamed Mac',
+      host: sampleConn.host,
+      port: sampleConn.port,
+      fingerprint: 'DD:EE:FF',
+      token: 'fresh-token',
+    });
+
+    // Same record: id preserved, captured hostname preserved, fields refreshed.
+    expect(updated.id).toBe(original.id);
+    expect(updated).toMatchObject({
+      label: 'Renamed Mac',
+      fingerprint: 'DD:EE:FF',
+      hostname: 'studio.local',
+    });
+
+    // No duplicate: local + the single upserted remote.
+    const list = await store.list();
+    expect(list).toHaveLength(2);
+    expect(list[1]).toMatchObject({ id: original.id, label: 'Renamed Mac', fingerprint: 'DD:EE:FF' });
+
+    // The stored token was replaced.
+    expect(await store.getDecryptedToken(original.id)).toBe('fresh-token');
+  });
+
+  it('collapses pre-existing host:port duplicates on add (keeps the first, drops the rest)', async () => {
+    // Earlier app versions allowed repeated host:port entries — seed such a
+    // file directly (add() itself can no longer produce duplicates).
+    await fs.writeFile(
+      path.join(tmpDir, 'backend-connections.json'),
+      JSON.stringify({
+        connections: [
+          { id: 'dup-1', label: 'First', host: '192.168.1.10', port: 8443, fingerprint: 'AA', encToken: { encrypted: false, value: 'tok-1' } },
+          { id: 'dup-2', label: 'Second', host: '192.168.1.10', port: 8443, fingerprint: 'BB', hostname: 'studio.local', encToken: { encrypted: false, value: 'tok-2' } },
+          { id: 'other', label: 'Other', host: '192.168.1.11', port: 8443, fingerprint: 'CC', encToken: { encrypted: false, value: 'tok-3' } },
+        ],
+        activeId: 'local',
+      }),
+      'utf8',
+    );
+    const store = await import('../connections-store');
+
+    const updated = await store.add(sampleConn);
+
+    // No duplicate is active → the FIRST match survives, refreshed in place,
+    // inheriting the captured hostname from the dropped duplicate.
+    expect(updated).toMatchObject({ id: 'dup-1', label: 'Studio Mac', hostname: 'studio.local' });
+
+    // All host:port duplicates collapsed into one; the unrelated record survives.
+    const remotes = (await store.list()).filter((c) => !c.isLocal);
+    expect(remotes.map((c) => c.id).sort()).toEqual(['dup-1', 'other']);
+    expect(await store.getDecryptedToken('dup-1')).toBe('secret-token');
+    expect(await store.getDecryptedToken('dup-2')).toBeNull();
+  });
+
+  it('collapsing duplicates prefers the ACTIVE duplicate\u2019s id (active re-pair keeps its id)', async () => {
+    await fs.writeFile(
+      path.join(tmpDir, 'backend-connections.json'),
+      JSON.stringify({
+        connections: [
+          { id: 'dup-1', label: 'First', host: '192.168.1.10', port: 8443, fingerprint: 'AA', encToken: { encrypted: false, value: 'tok-1' } },
+          { id: 'dup-2', label: 'Second', host: '192.168.1.10', port: 8443, fingerprint: 'BB', encToken: { encrypted: false, value: 'tok-2' } },
+        ],
+        activeId: 'dup-2',
+      }),
+      'utf8',
+    );
+    const store = await import('../connections-store');
+
+    const updated = await store.add(sampleConn);
+
+    // The ACTIVE duplicate survives (not the first), so a re-pair of the live
+    // backend returns the active id and the caller's active-reconnect path fires.
+    expect(updated.id).toBe('dup-2');
+    expect(await store.getActiveId()).toBe('dup-2');
+
+    const remotes = (await store.list()).filter((c) => !c.isLocal);
+    expect(remotes).toHaveLength(1);
+    expect(remotes[0]).toMatchObject({ id: 'dup-2', label: 'Studio Mac', fingerprint: 'AA:BB:CC' });
+    expect(await store.getDecryptedToken('dup-2')).toBe('secret-token');
+  });
+
+  it('adding a different host:port still appends a new record', async () => {
+    const store = await import('../connections-store');
+    const first = await store.add(sampleConn);
+    const samePortOtherHost = await store.add({ ...sampleConn, host: '192.168.1.11' });
+    const sameHostOtherPort = await store.add({ ...sampleConn, port: 9443 });
+
+    expect(samePortOtherHost.id).not.toBe(first.id);
+    expect(sameHostOtherPort.id).not.toBe(first.id);
+    expect((await store.list()).filter((c) => !c.isLocal)).toHaveLength(3);
+  });
+
+  it('records default to a null hostname until one is captured', async () => {
+    const store = await import('../connections-store');
+    const rec = await store.add(sampleConn);
+    expect(rec.hostname).toBeNull();
+    expect((await store.list())[1].hostname).toBeNull();
+  });
+
+  it('setHostname persists the captured hostname and it round-trips through disk', async () => {
+    const store = await import('../connections-store');
+    const rec = await store.add(sampleConn);
+    await store.setHostname(rec.id, 'studio.local');
+    await store.__drainWriteChainForTesting();
+
+    vi.resetModules();
+    mockElectron();
+    const reloaded = await import('../connections-store');
+    const remote = (await reloaded.list()).find((c) => c.id === rec.id);
+    expect(remote?.hostname).toBe('studio.local');
+  });
+
+  it('setHostname trims whitespace and ignores an empty hostname (keeps host:port fallback)', async () => {
+    const store = await import('../connections-store');
+    const rec = await store.add(sampleConn);
+
+    await store.setHostname(rec.id, '  my-mac.local  ');
+    expect((await store.list())[1].hostname).toBe('my-mac.local');
+
+    // A blank capture must not blank out the label.
+    await store.setHostname(rec.id, '   ');
+    expect((await store.list())[1].hostname).toBe('my-mac.local');
+  });
+
+  it('setHostname is a no-op for an unknown id (fail-soft)', async () => {
+    const store = await import('../connections-store');
+    await store.add(sampleConn);
+    await expect(store.setHostname('does-not-exist', 'ghost.local')).resolves.toBeUndefined();
+    expect((await store.list()).some((c) => c.hostname === 'ghost.local')).toBe(false);
+  });
+
+  it('malformed JSON on disk yields just the local entry (defensive)', async () => {
+    await fs.writeFile(path.join(tmpDir, 'backend-connections.json'), 'not json', 'utf8');
+    const store = await import('../connections-store');
+    const list = await store.list();
+    expect(list).toHaveLength(1);
+    expect(list[0].id).toBe(store.LOCAL_CONNECTION_ID);
+    expect(await store.getActiveId()).toBe(store.LOCAL_CONNECTION_ID);
+  });
+
+  it('new records default to a single-host candidate list and detectHosts enabled (#1746)', async () => {
+    const store = await import('../connections-store');
+    const rec = await store.add(sampleConn);
+    expect(rec.hosts).toEqual(['192.168.1.10']);
+    expect(await store.getDetectHosts(rec.id)).toBe(true);
+  });
+
+  it('pre-#1746 records (no hosts field) migrate to a one-element list', async () => {
+    const store = await import('../connections-store');
+    const rec = await store.add(sampleConn);
+    await store.__drainWriteChainForTesting();
+
+    // Simulate a record written before the hosts/detectHosts fields existed.
+    const file = path.join(tmpDir, 'backend-connections.json');
+    const parsed = JSON.parse(await fs.readFile(file, 'utf8'));
+    delete parsed.connections[0].hosts;
+    delete parsed.connections[0].detectHosts;
+    await fs.writeFile(file, JSON.stringify(parsed), 'utf8');
+
+    vi.resetModules();
+    mockElectron();
+    const reloaded = await import('../connections-store');
+    const remote = (await reloaded.list()).find((c) => c.id === rec.id);
+    expect(remote?.hosts).toEqual(['192.168.1.10']);
+    // Old records default to detection enabled.
+    expect(await reloaded.getDetectHosts(rec.id)).toBe(true);
+  });
+
+  it('setHosts persists deduplicated extras with the primary host first', async () => {
+    const store = await import('../connections-store');
+    const rec = await store.add(sampleConn);
+    await store.setHosts(rec.id, ['10.0.0.5', '192.168.1.10', ' 10.0.0.5 ', 'fe80::1', '']);
+    await store.__drainWriteChainForTesting();
+
+    vi.resetModules();
+    mockElectron();
+    const reloaded = await import('../connections-store');
+    const remote = (await reloaded.list()).find((c) => c.id === rec.id);
+    expect(remote?.hosts).toEqual(['192.168.1.10', '10.0.0.5', 'fe80::1']);
+    // The primary host stays untouched.
+    expect(remote?.host).toBe('192.168.1.10');
+  });
+
+  it('setHosts is a no-op for unknown ids and detectHosts=false records', async () => {
+    const store = await import('../connections-store');
+    await expect(store.setHosts('does-not-exist', ['10.0.0.5'])).resolves.toBeUndefined();
+
+    const optedOut = await store.add({ ...sampleConn, detectHosts: false });
+    expect(await store.getDetectHosts(optedOut.id)).toBe(false);
+    await store.setHosts(optedOut.id, ['10.0.0.5']);
+    const remote = (await store.list()).find((c) => c.id === optedOut.id);
+    expect(remote?.hosts).toEqual(['192.168.1.10']);
+  });
+
+  it('getDetectHosts is false for local and unknown ids', async () => {
+    const store = await import('../connections-store');
+    expect(await store.getDetectHosts(store.LOCAL_CONNECTION_ID)).toBe(false);
+    expect(await store.getDetectHosts('does-not-exist')).toBe(false);
+  });
+});

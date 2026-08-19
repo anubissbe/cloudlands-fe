@@ -18,6 +18,8 @@
   import ErrorBoundary from '$lib/components/ErrorBoundary.svelte';
   import { Logger } from '$shared/logger';
   import { m } from '$shared/paraglide/messages.js';
+  import { COLUMN_SIDEBAR_MAX_WIDTH } from '$store/renderer/slices/ui-layout/ui-layout-slice';
+  import { selectIsCollapsed } from '$store/renderer/slices/ui-layout/ui-layout-selectors';
 
   // Props
   interface Props {
@@ -47,6 +49,18 @@
     // Start with sidebar collapsed (width 0) — used for onboarding flow
     startCollapsed?: boolean;
 
+    // Let an outer container own resizing while the sidebar fills its available width.
+    sidebarFillsAvailableWidth?: boolean;
+
+    // Keep the inner sidebar fixed while an outer workspace column animates.
+    disableSidebarWidthTransition?: boolean;
+
+    // Report the sidebar's fixed width to an outer workspace column.
+    onSidebarWidthChange?: (width: number) => void;
+
+    // Apply the compact, refresh-stable sidebar contract used by workspace columns.
+    columnMode?: boolean;
+
     // Allow additional props to pass through
     [key: string]: unknown;
   }
@@ -58,16 +72,21 @@
     modals,
     sidebarStorageKey = 'workspace-left-panel-width',
     sidebarExpandedStorageKey = 'workspace-left-panel-expanded-width',
-    sidebarMinWidth = 180,
+    sidebarMinWidth = 280,
     sidebarMaxWidth = 800,
-    sidebarDefaultWidth = 350,
+    sidebarDefaultWidth = 360,
     sidebarDefaultExpandedWidth = 600,
-    sidebarPercentageWeight = 0.5,
+    sidebarPercentageWeight = 0,
     sidebarSide = 'left',
     startCollapsed = false,
+    sidebarFillsAvailableWidth = false,
+    disableSidebarWidthTransition = false,
+    onSidebarWidthChange,
+    columnMode = false,
   }: Props = $props();
 
   const workspaceLogger = new Logger('WorkspaceLayout');
+  const sidebarIsCollapsed = selectIsCollapsed();
 </script>
 
 <ErrorBoundary logger={workspaceLogger}>
@@ -77,10 +96,14 @@
     aria-label={m.workspace_layout_ariaLabel()}
   >
     <!-- Upper Area: Sidebar + Content (shrinks when terminal is open) -->
-    <div class="upper-area flex-1 flex min-h-0">
+    <div class="upper-area flex-1 flex min-h-0" class:workspace-column-layout={columnMode}>
       {#if sidebarSide === 'right'}
         <!-- Main Content Area (Panel Layout) - rendered first when sidebar is on right -->
-        <div class="main-content-area flex h-full min-w-0 z-10">
+        <div
+          class="main-content-area flex h-full min-w-0 z-10 bg-sidebar {columnMode
+            ? ''
+            : 'pl-2 sm:pl-3'}"
+        >
           {@render content()}
         </div>
       {/if}
@@ -89,14 +112,22 @@
       <ResizablePanel
         side={sidebarSide}
         minWidth={sidebarMinWidth}
-        maxWidth={sidebarMaxWidth}
+        maxWidth={columnMode ? COLUMN_SIDEBAR_MAX_WIDTH : sidebarMaxWidth}
         defaultWidth={sidebarDefaultWidth}
-        defaultExpandedWidth={sidebarDefaultExpandedWidth}
+        defaultExpandedWidth={columnMode ? COLUMN_SIDEBAR_MAX_WIDTH : sidebarDefaultExpandedWidth}
         storageKey={sidebarStorageKey}
         expandedStorageKey={sidebarExpandedStorageKey}
         percentageWeight={sidebarPercentageWeight}
         initiallyCollapsed={startCollapsed}
-        className="flex-none h-full min-w-0 {sidebarSide === 'left'
+        doSkipResize={sidebarFillsAvailableWidth}
+        preserveFixedWidthAfterFill={columnMode}
+        disableWidthTransition={disableSidebarWidthTransition}
+        notifyAutomaticWidthChanges={!columnMode}
+        clampStoredWidth={columnMode}
+        followSidebarCollapsed={!columnMode}
+        onWidthChange={onSidebarWidthChange}
+        className="workspace-sidebar-panel workspace-sidebar-{sidebarSide} flex-none h-full min-w-0 bg-sidebar {sidebarSide ===
+        'left'
           ? 'mr-auto ml-0'
           : 'ml-auto mr-0'}"
       >
@@ -105,7 +136,10 @@
 
       {#if sidebarSide === 'left'}
         <!-- Main Content Area (Panel Layout) - rendered after when sidebar is on left -->
-        <div class="main-content-area flex h-full min-w-0 z-10">
+        <div
+          class="main-content-area flex h-full min-w-0 z-10 bg-sidebar"
+          class:pl-2={!columnMode && $sidebarIsCollapsed}
+        >
           {@render content()}
         </div>
       {/if}
@@ -132,6 +166,22 @@
 
   .main-content-area {
     flex: 1;
+  }
+
+  @media (max-width: 639px) {
+    .upper-area:not(.workspace-column-layout) :global(.workspace-sidebar-panel) {
+      position: absolute;
+      inset-block: 0;
+      z-index: 20;
+    }
+
+    .upper-area :global(.workspace-sidebar-left) {
+      left: 0;
+    }
+
+    .upper-area :global(.workspace-sidebar-right) {
+      right: 0;
+    }
   }
 
   /* Terminal Overlay - positioned at bottom, shrinks content above */

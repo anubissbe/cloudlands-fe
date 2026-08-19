@@ -13,6 +13,7 @@
 import type {
   AppClient,
   GitHubBranchListing,
+  GitHubCachedBranchListing,
   GitHubRepoConfigResult,
   IntegrationsClient,
   SubscriptionHandler,
@@ -57,31 +58,73 @@ export class LiveIntegrationsClient implements IntegrationsClient {
 
   /**
    * `github.branches.list` (§5.27) for the branch names plus `github.repos.get`
-   * for the repo's default branch. Unlike the issue reads, branch-list failures
-   * PROPAGATE: the BranchSelector must render an explicit error/auth state,
-   * never an empty-or-fabricated list. The default-branch read is best-effort —
-   * its failure degrades to `undefined`.
+   * for the repo's default branch, issued CONCURRENTLY (both are REST-backed,
+   * so sequencing them doubles the settle time). Unlike the issue reads,
+   * branch-list failures PROPAGATE: the BranchSelector must render an explicit
+   * error/auth state, never an empty-or-fabricated list. The default-branch
+   * read is best-effort — its failure degrades to `undefined`. A non-empty
+   * `prefix` is forwarded so the daemon filters server-side (matching-refs);
+   * empty/omitted keeps the unfiltered wire shape for older daemons. Prefix
+   * searches SKIP the `github.repos.get` leg entirely — the default branch
+   * can't change based on the filter and the caller discards it, so per-
+   * keystroke searches cost one REST call, not two.
    */
-  async githubBranches(owner: string, repo: string): Promise<GitHubBranchListing> {
-    const result = await backendRequest<{ branches?: unknown }>("github.branches.list", {
-      owner,
-      repo,
-    });
+  async githubBranches(owner: string, repo: string, prefix?: string): Promise<GitHubBranchListing> {
+    const [result, defaultBranch] = await Promise.all([
+      backendRequest<{ branches?: unknown }>("github.branches.list", {
+        owner,
+        repo,
+        ...(prefix ? { prefix } : {}),
+      }),
+      prefix
+        ? Promise.resolve(undefined)
+        : backendRequest<{ repo?: { defaultBranch?: unknown } | null }>("github.repos.get", {
+            owner,
+            repo,
+          }).then(
+            (repoResult) => {
+              const value = repoResult?.repo?.defaultBranch;
+              return typeof value === "string" && value.length > 0 ? value : undefined;
+            },
+            // Default branch is a nicety; the branch list alone is sufficient.
+            () => undefined,
+          ),
+    ]);
     const branches = Array.isArray(result?.branches)
       ? result.branches.filter((branch): branch is string => typeof branch === "string")
       : [];
-    let defaultBranch: string | undefined;
-    try {
-      const repoResult = await backendRequest<{ repo?: { defaultBranch?: unknown } | null }>(
-        "github.repos.get",
-        { owner, repo },
-      );
-      const value = repoResult?.repo?.defaultBranch;
-      if (typeof value === "string" && value.length > 0) defaultBranch = value;
-    } catch {
-      // Default branch is a nicety; the branch list alone is sufficient.
-    }
     return { branches, defaultBranch };
+  }
+
+  /**
+   * `github.branches.listCached` (§5.27) — branch names from the daemon's
+   * local repo cache, or its one-round-trip `git ls-remote` fallback on a
+   * cache miss (`source: "ls-remote"`). Purely a fast first paint for the
+   * BranchSelector: failures fold to a cold-cache miss
+   * (`{ cached: false, branches: [] }`) so the authoritative
+   * `githubBranches` path stays the only error authority.
+   */
+  async githubBranchesCached(owner: string, repo: string): Promise<GitHubCachedBranchListing> {
+    try {
+      const result = await backendRequest<{
+        cached?: unknown;
+        branches?: unknown;
+        defaultBranch?: unknown;
+        source?: unknown;
+      }>("github.branches.listCached", { owner, repo });
+      const branches = Array.isArray(result?.branches)
+        ? result.branches.filter((branch): branch is string => typeof branch === "string")
+        : [];
+      const defaultBranch =
+        typeof result?.defaultBranch === "string" && result.defaultBranch.length > 0
+          ? result.defaultBranch
+          : undefined;
+      const source =
+        result?.source === "cache" || result?.source === "ls-remote" ? result.source : undefined;
+      return { cached: result?.cached === true, branches, defaultBranch, source };
+    } catch {
+      return { cached: false, branches: [] };
+    }
   }
 
   /**

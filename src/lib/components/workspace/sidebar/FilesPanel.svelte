@@ -18,6 +18,8 @@
   import { loadGitStatus } from '$store/renderer/slices/git/git-slice';
   import { refreshFileExplorer } from '$store/renderer/slices/file-explorer/file-explorer-slice';
   import { selectEffectiveFileExplorerWorkspacePath } from '$store/renderer/slices/file-explorer/file-explorer-selectors';
+  import { writable } from 'svelte/store';
+  import type { PanelTab } from '$store/renderer/slices/panel-layout/panel-layout-types';
 
   import { store as appStore } from '$store/renderer/store';
 
@@ -83,6 +85,8 @@
     showOnlyChanged?: boolean;
     searchQuery?: string;
     class?: string;
+    openPanelTabs?: PanelTab[];
+    activePanelTab?: PanelTab | null;
   }
 
   let {
@@ -95,15 +99,24 @@
     showOnlyChanged = false,
     searchQuery = '',
     class: className,
+    openPanelTabs = [],
+    activePanelTab,
   }: Props = $props();
 
   const effectiveWsId = $derived(workspaceId);
-  const fileExplorerWorkspacePath = selectEffectiveFileExplorerWorkspacePath(workspaceId);
+  // Writable store mirrors the prop so the Redux selector re-evaluates when
+  // workspaceId changes (selector readables are init-time only).
+  // svelte-ignore state_referenced_locally - intentional initial capture; the $effect below syncs later changes
+  const workspaceIdStore = writable(workspaceId);
+  $effect(() => {
+    workspaceIdStore.set(workspaceId);
+  });
+  const fileExplorerWorkspacePath = selectEffectiveFileExplorerWorkspacePath(workspaceIdStore);
 
   // Handle file rename via IPC
   async function handleRenameFile(oldPath: string, newPath: string) {
     try {
-      const response = (await invoke('file:move', { oldPath, newPath })) as {
+      const response = (await invoke('file:move', { oldPath, newPath, workspaceId })) as {
         success: boolean;
         error?: string;
       };
@@ -235,6 +248,7 @@
           response = (await invoke('file:copy', {
             sourcePath,
             destinationPath,
+            workspaceId,
           })) as { success: boolean; error?: string; data?: { isDirectory?: boolean } };
         } else {
           // Files without path property (from Finder/OS file manager) - read content and use file:write
@@ -257,6 +271,7 @@
             path: destinationPath,
             content: base64Content,
             encoding: 'base64',
+            workspaceId,
           })) as { success: boolean; error?: string; data?: { isDirectory?: boolean } };
         }
 
@@ -407,9 +422,9 @@
   }
 </script>
 
-<div class={cn('pb-3', className)}>
+<div class={cn('flex h-full min-h-0 flex-col pb-3', className)}>
   {#if $fileExplorerWorkspacePath}
-    <div class="overflow-y-auto">
+    <div class="min-h-0 flex-1 overflow-hidden">
       <FileTreeView
         bind:this={fileTreeRef}
         {workspaceId}
@@ -421,6 +436,8 @@
         selectedFile={selectedFile ?? ''}
         {showOnlyChanged}
         {searchQuery}
+        {openPanelTabs}
+        {activePanelTab}
       />
     </div>
   {:else}

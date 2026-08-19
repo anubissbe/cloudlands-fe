@@ -5,24 +5,24 @@
  * `/workspace/{id}`, land on the agent that plausibly holds the unread message
  * rather than whatever tab the workspace last had active.
  *
- * ## Unread is workspace-level, not per-agent
+ * ## Workspace-level trigger, per-agent answer
  *
- * The unread signal the user sees is the BE-owned workspace `attention` flag
+ * The unread signal the user clicks is the BE-owned workspace `attention` flag
  * (`attention === 'unread'`, PROTOCOL §5.1) — the same flag the Unread section
- * itself filters on. There is no per-agent unread flag on the wire:
- * `AgentSession.hasUnread` exists in the FE type but is never populated (it is
- * absent from AgentLite, which carries the per-conversation seen marker
- * `metadata.lastSeenMessageId` instead), and nothing derives it client-side.
+ * itself filters on. Per agent, `AgentSession.hasUnread` is FE-derived at wire
+ * ingest (monorepo#1597, see `deriveAgentHasUnread`) from the AgentLite
+ * freshness fields: the newest transcript message id (`lastMessageId`) versus
+ * the per-conversation seen marker (`metadata.lastSeenMessageId`). Older
+ * daemons omit `lastMessageId`, deriving `hasUnread: false` everywhere.
  *
- * So this helper mirrors what every other FE surface already does — see
+ * So this helper starts from the workspace flag — mirroring
  * `WorkspaceHoverCard.svelte`, `SpacesSwitcherOverlay.svelte`, and
  * `WorkspaceTableView.svelte`, which all treat a workspace's member agents as
  * unread when the workspace flag is raised — and then picks the most plausible
  * member by the tiered heuristic in
- * {@link findFirstUnreadForegroundAgentId}: the exact `hasUnread` marker first
- * (inert today, so the fix tracked in intent-hq/monorepo#1597 lands here for
- * free), then "the agent spoke last", then the workspace's first foreground
- * agent. It is a heuristic, not an exact answer.
+ * {@link findFirstUnreadForegroundAgentId}: the exact `hasUnread` marker
+ * first, then "the agent spoke last" (the older-daemon fallback), then the
+ * workspace's first foreground agent.
  *
  * The caller must pass the workspace's `attention === 'unread'` state as
  * `wasUnread`, captured **before** navigation: viewing a workspace fires
@@ -48,6 +48,7 @@
 import { store as appStore } from '$store/renderer/store';
 import { openAgentTabRequested } from '$store/renderer/slices/app-layout/app-layout-slice';
 import { setActiveAgentId } from '$store/renderer/slices/workspace-agents/workspace-agents-slice';
+import { selectCurrentWorkspaceTabId } from '$store/renderer/slices/tab-state/tab-state-selectors';
 
 /** How long to wait for the navigation-triggered agent load to land. */
 const DEFAULT_TIMEOUT_MS = 5_000;
@@ -57,6 +58,8 @@ export interface FocusFirstUnreadAgentDeps {
   timeoutMs?: number;
   /** Store-change subscription seam. Defaults to the app store's readable state. */
   subscribe?: (listener: () => void) => () => void;
+  /** Current workspace-tab seam, re-read on every store emission. */
+  getCurrentWorkspaceId?: () => string | null;
 }
 
 function subscribeToStore(listener: () => void): () => void {
@@ -70,9 +73,10 @@ function subscribeToStore(listener: () => void): () => void {
  * Three tiers, each scanned in `foregroundAgentIds` order so the daemon's agent
  * order breaks ties (see the module doc for why a heuristic is needed at all):
  *
- * 1. `session.hasUnread === true` — the exact per-agent answer. Never matches
- *    today (nothing populates the field), kept so the projection tracked in
- *    intent-hq/monorepo#1597 takes effect here without a code change.
+ * 1. `session.hasUnread === true` — the exact per-agent answer, derived at
+ *    wire ingest from `lastMessageId` vs `metadata.lastSeenMessageId`
+ *    (intent-hq/monorepo#1597). Never matches on daemons that predate
+ *    `lastMessageId`.
  * 2. `session.lastMessageRole === 'assistant'` (`AgentLite`, PROTOCOL §5.5) —
  *    the agent spoke last, so there is plausibly something new to read.
  * 3. The first foreground agent — the workspace *is* unread, so landing on its
@@ -168,8 +172,8 @@ export function focusFirstUnreadAgent(
   // this workspace, or when an existing agent selection changed under us.
   //
   // The workspace guard tolerates the arming gap: the watch arms right after
-  // `goto()` is *invoked*, but `setActiveWorkspaceId(workspaceId)` only lands
-  // with the navigation effect, so until then the store still reports the
+  // `goto()` is *invoked*, but the current workspace tab only changes with the
+  // navigation effect, so until then the store still reports the
   // workspace we departed from. An eager equality guard would read every
   // emission in that gap as a navigation away and cancel the watch before
   // hydration ever landed.
@@ -192,10 +196,12 @@ export function focusFirstUnreadAgent(
   // With a selection already in place both hydration paths preserve it, so a
   // change then really is someone else moving the tab.
   const armedActiveAgentId = activeAgentIdOf(workspaceId);
-  const departedFrom = appStore.state.workspace?.activeWorkspaceId ?? null;
+  const getCurrentWorkspaceId =
+    deps.getCurrentWorkspaceId ?? (() => selectCurrentWorkspaceTabId.select(appStore.state));
+  const departedFrom = getCurrentWorkspaceId();
   let arrived = departedFrom === workspaceId;
   function userTookOver(): boolean {
-    const activeWorkspaceId = appStore.state.workspace?.activeWorkspaceId ?? null;
+    const activeWorkspaceId = getCurrentWorkspaceId();
     if (activeWorkspaceId === workspaceId) arrived = true;
     else if (arrived || activeWorkspaceId !== departedFrom) return true;
     if (armedActiveAgentId === null) return false;

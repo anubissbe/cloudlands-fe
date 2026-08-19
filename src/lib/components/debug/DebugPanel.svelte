@@ -3,10 +3,7 @@
 
   const logger = createLogger('DebugPanel');
 
-  import {
-  debugConfig,
-  type DebugFlags,
-} from '$lib/config/debug';
+  import { debugConfig, type DebugFlags } from '$lib/config/debug';
   import { onMount } from 'svelte';
   import Button from '$lib/components/ui/button/button.svelte';
   import { Switch } from '$lib/components/ui/switch';
@@ -15,22 +12,26 @@
   import { Select } from '$lib/components/ui/select';
   import Fa from 'svelte-fa';
   import {
-  faBug,
-  faTimes,
-  faRotate,
-  faPlay,
-  faStop,
-  faChevronUp,
-  faChevronDown,
-  faWaveSquare,
-} from '@fortawesome/free-solid-svg-icons';
+    faBug,
+    faTimes,
+    faRotate,
+    faPlay,
+    faStop,
+    faChevronLeft,
+    faChevronDown,
+    faWaveSquare,
+  } from '@fortawesome/free-solid-svg-icons';
   import { goto } from '$app/navigation';
   import { invoke } from '$lib/electron-bridge';
+  import { m } from '$shared/paraglide/messages.js';
 
-  import { selectActiveWorkspace } from '$store/renderer/slices/workspace/workspace-selectors';
+  import { selectWorkspaceById } from '$store/renderer/slices/workspace/workspace-selectors';
   import { selectAllWorkspaceAgents } from '$store/renderer/slices/workspace-agents/workspace-agents-selectors';
   import { resetWorkspaceState } from '$store/renderer/slices/workspace/workspace-slice';
   import { store as appStore } from '$store/renderer/store';
+  import { getWorkspaceRouteContext } from '$lib/utils/workspace-route-context';
+
+  const routeWorkspaceId = getWorkspaceRouteContext()?.workspaceId;
 
   let flags: DebugFlags = $state(debugConfig.getAll());
   let isOpen = $state(false);
@@ -55,10 +56,9 @@
   const isMac =
     typeof navigator !== 'undefined' && navigator.platform.toUpperCase().includes('MAC');
 
-  // Check if we're on the creation page (home page with create param, or just home)
+  // Check if we're on the workspace creation page.
   $effect(() => {
-    isOnCreationPage =
-      window.location.pathname === '/' && window.location.search.includes('create=true');
+    isOnCreationPage = window.location.pathname === '/workspace/new';
 
     // Load simulation state from sessionStorage
     const savedSimulation = sessionStorage.getItem('debug-simulation-state');
@@ -224,7 +224,9 @@
 
   // Load available agents from the unified state store
   function loadAvailableAgents() {
-    const workspace = selectActiveWorkspace.select(appStore.state);
+    const workspace = routeWorkspaceId
+      ? selectWorkspaceById.select(appStore.state, routeWorkspaceId)
+      : undefined;
     if (!workspace?.id) {
       availableAgents = [];
       return;
@@ -251,7 +253,9 @@
 
   // Trigger backend-initiated resume
   async function triggerBackendResume() {
-    const workspace = selectActiveWorkspace.select(appStore.state);
+    const workspace = routeWorkspaceId
+      ? selectWorkspaceById.select(appStore.state, routeWorkspaceId)
+      : undefined;
     if (!workspace?.id || !selectedAgentId) {
       backendResumeError = 'No space or agent selected'; // i18n-ignore (dev-only debug UI)
       backendResumeStatus = 'error';
@@ -559,7 +563,7 @@
               <!-- i18n-ignore (dev-only debug UI) -->
               <p class="text-xs text-green-500">✓ Resume triggered successfully</p>
             {:else if backendResumeStatus === 'error'}
-              <p class="text-xs text-red-500">✗ {backendResumeError}</p>
+              <p class="text-xs text-error-foreground">✗ {backendResumeError}</p>
             {/if}
           </div>
         </div>
@@ -583,17 +587,15 @@
       type="button"
       class="flex items-center justify-between px-3 py-2 border-t border-border bg-muted/50 shrink-0 hover:bg-muted/70 transition-colors cursor-pointer"
       onclick={() => (isCollapsed = !isCollapsed)}
-      data-i18n-ignore="dev-only debug UI" title="Click to {isCollapsed ? 'expand' : 'collapse'}"
+      title={isCollapsed
+        ? m.ui_vscodePanel_expand_ariaLabel()
+        : m.ui_vscodePanel_collapse_ariaLabel()}
     >
       <div class="flex items-center gap-2">
         <Fa icon={faBug} class="text-orange-500" size="sm" />
         <!-- i18n-ignore (dev-only debug UI) -->
         <h3 class="font-medium text-sm">Debug Panel</h3>
-        <Fa
-          icon={isCollapsed ? faChevronUp : faChevronDown}
-          class="text-subtle"
-          size="xs"
-        />
+        <Fa icon={isCollapsed ? faChevronLeft : faChevronDown} class="text-subtle" size="xs" />
       </div>
       <div class="flex items-center gap-1">
         <Button
@@ -603,7 +605,7 @@
             e.stopPropagation();
             handleReset();
           }}
-          data-i18n-ignore="dev-only debug UI" title="Reset to defaults"
+          title={m.settings_reset_button()}
           class="h-7 w-7 p-0"
         >
           <Fa icon={faRotate} size="xs" />

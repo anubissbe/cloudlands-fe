@@ -2,13 +2,7 @@
  * Unit tests for workspace navigation utilities
  */
 
-import {
-  describe,
-  it,
-  expect,
-  vi,
-  beforeEach,
-} from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
 import {
   navigateToAgent,
   navigateToNote,
@@ -18,12 +12,13 @@ import {
   closeDrawer,
   clearMainContent,
   navigateAfterWorkspaceRemoval,
+  navigateToFirstWorkspace,
+  navigateToSettings,
 } from './workspace-navigation';
 
-const { mockDispatch, mockCloseTab, mockCurrentTabId } = vi.hoisted(() => ({
+const { mockDispatch, mockWorkspaceItems } = vi.hoisted(() => ({
   mockDispatch: vi.fn(),
-  mockCloseTab: vi.fn(),
-  mockCurrentTabId: { value: null as string | null },
+  mockWorkspaceItems: { value: [] as Array<{ id: string; status: string }> },
 }));
 
 // Mock svelte/store (SvelteKit mocks are in test-setup.ts)
@@ -32,7 +27,8 @@ vi.mock('svelte/store', () => ({
 }));
 
 vi.mock('$store/renderer/store', async () => {
-  const { createAppStoreMockModule } = await import('$store/renderer/utils/test-helpers/store-mock');
+  const { createAppStoreMockModule } =
+    await import('$store/renderer/utils/test-helpers/store-mock');
 
   return createAppStoreMockModule({
     state: () => ({}),
@@ -40,13 +36,9 @@ vi.mock('$store/renderer/store', async () => {
   });
 });
 
-vi.mock('$store/renderer/slices/tab-state/tab-state-slice', () => ({
-  closeWorkspaceTab: (...args: unknown[]) => mockCloseTab(...args),
-}));
-
-vi.mock('$store/renderer/slices/tab-state/tab-state-selectors', () => ({
-  selectCurrentWorkspaceTabId: {
-    select: () => mockCurrentTabId.value,
+vi.mock('$store/renderer/slices/workspace/workspace-selectors', () => ({
+  selectWorkspaceItems: {
+    select: () => mockWorkspaceItems.value,
   },
 }));
 
@@ -77,13 +69,25 @@ describe('workspace-navigation', () => {
 
     // Reset search params
     mockPage.url.searchParams = new URLSearchParams();
+    mockWorkspaceItems.value = [];
 
     // Mock window.location.href - dynamically build from mockPage.url.searchParams
     Object.defineProperty(window, 'location', {
       value: {
         get href() {
           const params = mockPage.url.searchParams.toString();
-          return `http://localhost:3000/workspace/test-workspace-id${params ? `?${params}` : ''}`;
+          return `http://localhost:3000${mockPage.url.pathname}${params ? `?${params}` : ''}${
+            mockPage.url.hash ?? ''
+          }`;
+        },
+        get origin() {
+          return 'http://localhost:3000';
+        },
+        get pathname() {
+          return mockPage.url.pathname;
+        },
+        get hash() {
+          return mockPage.url.hash ?? '';
         },
       },
       writable: true,
@@ -149,6 +153,7 @@ describe('workspace-navigation', () => {
       expect(mockDispatch).toHaveBeenCalledWith(
         openWorkspaceNote('test-workspace-id', 'note-456', {
           openInAdjacentPanel: false,
+          openInNewAdjacentPanel: false,
           sourcePanelId: undefined,
         }),
       );
@@ -159,6 +164,18 @@ describe('workspace-navigation', () => {
 
       const action = mockDispatch.mock.calls[0][0];
       expect(action.payload[0]).toBe('test-workspace-id');
+    });
+
+    it('uses an explicit owner workspace instead of the route workspace', async () => {
+      await navigateToNote('note-456', { workspaceId: 'owner-workspace' });
+
+      expect(mockDispatch).toHaveBeenCalledWith(
+        openWorkspaceNote('owner-workspace', 'note-456', {
+          openInAdjacentPanel: false,
+          openInNewAdjacentPanel: false,
+          sourcePanelId: undefined,
+        }),
+      );
     });
 
     it('should handle spec note', async () => {
@@ -339,79 +356,76 @@ describe('workspace-navigation', () => {
     });
   });
 
+  describe('navigateToFirstWorkspace', () => {
+    it('navigates to the first active workspace', async () => {
+      mockWorkspaceItems.value = [
+        { id: 'archived-workspace', status: 'Archived' },
+        { id: 'active-workspace', status: 'Active' },
+      ];
+
+      await navigateToFirstWorkspace();
+
+      expect(goto).toHaveBeenCalledWith('/workspace/active-workspace');
+    });
+
+    it('navigates to workspace creation when no workspace is available', async () => {
+      await navigateToFirstWorkspace();
+
+      expect(goto).toHaveBeenCalledWith('/workspace/new');
+    });
+
+    it('navigates to workspace creation when only archived workspaces exist', async () => {
+      mockWorkspaceItems.value = [{ id: 'archived-workspace', status: 'Archived' }];
+
+      await navigateToFirstWorkspace();
+
+      expect(goto).toHaveBeenCalledWith('/workspace/new');
+    });
+  });
+
   describe('navigateAfterWorkspaceRemoval', () => {
-    beforeEach(() => {
-      mockCloseTab.mockReset();
-      mockCurrentTabId.value = null;
+    it('excludes the removed workspace when choosing the next destination', async () => {
+      mockWorkspaceItems.value = [
+        { id: 'removed-workspace', status: 'Active' },
+        { id: 'remaining-workspace', status: 'Active' },
+      ];
+
+      await navigateAfterWorkspaceRemoval('removed-workspace');
+
+      expect(goto).toHaveBeenCalledWith('/workspace/remaining-workspace');
     });
 
-    it('should close the tab for the removed workspace', async () => {
-      mockCurrentTabId.value = 'workspace-to-remove';
-      mockCloseTab.mockImplementation(() => {
-        mockCurrentTabId.value = null;
+    it('uses the empty-window destination when no workspace remains', async () => {
+      mockWorkspaceItems.value = [{ id: 'removed-workspace', status: 'Active' }];
+
+      await navigateAfterWorkspaceRemoval('removed-workspace');
+
+      expect(goto).toHaveBeenCalledWith('/workspace/new');
+    });
+  });
+
+  describe('settings navigation', () => {
+    it('preserves the workspace owner and all settings URL options', async () => {
+      await navigateToSettings({
+        tab: 'agents',
+        specialist: 'reviewer & co',
+        view: 'create-specialist',
+        hash: 'specialists',
       });
 
-      await navigateAfterWorkspaceRemoval('workspace-to-remove');
-
-      expect(mockCloseTab).toHaveBeenCalledWith('workspace-to-remove');
+      expect(goto).toHaveBeenCalledWith(
+        '/settings?tab=agents&specialist=reviewer+%26+co&view=create-specialist&workspaceId=test-workspace-id#specialists',
+      );
     });
 
-    it('should navigate to next tab when one exists', async () => {
-      // Start with the workspace being removed as the current tab
-      mockCurrentTabId.value = 'workspace-to-remove';
-      // closeTab mock simulates selecting next tab
-      mockCloseTab.mockImplementation(() => {
-        mockCurrentTabId.value = 'next-workspace-id';
-      });
+    it('uses an explicit owner and does not treat workspace creation as an owner', async () => {
+      mockPage.url.pathname = '/workspace/new';
+      await navigateToSettings({ workspaceId: 'explicit-owner' });
+      expect(goto).toHaveBeenCalledWith('/settings?workspaceId=explicit-owner');
 
-      await navigateAfterWorkspaceRemoval('workspace-to-remove');
-
-      expect(mockCloseTab).toHaveBeenCalledWith('workspace-to-remove');
-      expect(goto).toHaveBeenCalledWith('/workspace/next-workspace-id');
-    });
-
-    it('should navigate to home when no other tabs exist', async () => {
-      mockCurrentTabId.value = null;
-
-      await navigateAfterWorkspaceRemoval('workspace-to-remove');
-
-      expect(goto).toHaveBeenCalledWith('/');
-    });
-
-    it('should navigate to home when nextTabId is empty string', async () => {
-      mockCurrentTabId.value = '' as string;
-
-      await navigateAfterWorkspaceRemoval('workspace-to-remove');
-
-      expect(goto).toHaveBeenCalledWith('/');
-    });
-
-    it('should navigate to home when nextTabId is sentinel "undefined"', async () => {
-      mockCurrentTabId.value = 'undefined';
-
-      await navigateAfterWorkspaceRemoval('workspace-to-remove');
-
-      expect(goto).toHaveBeenCalledWith('/');
-    });
-
-    it('should navigate to home when nextTabId is sentinel "null"', async () => {
-      mockCurrentTabId.value = 'null';
-
-      await navigateAfterWorkspaceRemoval('workspace-to-remove');
-
-      expect(goto).toHaveBeenCalledWith('/');
-    });
-
-    it('should navigate to home when nextTabId equals the removed workspace id', async () => {
-      mockCurrentTabId.value = 'workspace-to-remove';
-      // closeTab is a no-op - doesn't change currentTabId
-      mockCloseTab.mockImplementation(() => {
-        // Tab state corrupted - still points to removed workspace
-      });
-
-      await navigateAfterWorkspaceRemoval('workspace-to-remove');
-
-      expect(goto).toHaveBeenCalledWith('/');
+      vi.clearAllMocks();
+      await navigateToSettings({ tab: 'general' });
+      expect(goto).toHaveBeenCalledWith('/settings?tab=general');
     });
   });
 });

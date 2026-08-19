@@ -1,23 +1,11 @@
 /**
  * @vitest-environment jsdom
  */
-import {
-  render,
-  screen,
-  waitFor,
-} from '@testing-library/svelte';
-import {
-  beforeEach,
-  describe,
-  expect,
-  it,
-  vi,
-} from 'vitest';
+import { render, screen, waitFor } from '@testing-library/svelte';
+import { tick } from 'svelte';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { AgentSession, Workspace } from '$shared/types';
-import {
-  PullRequestStatus,
-  WorkspaceStatusEnum,
-} from '$shared/types';
+import { PullRequestStatus, WorkspaceStatusEnum } from '$shared/types';
 import { warmImport } from '../../../../test/warm-import';
 
 const mocks = vi.hoisted(() => {
@@ -69,7 +57,8 @@ vi.mock('$features/agent/services/active-streams-tracker', () => ({
 }));
 
 vi.mock('$store/renderer/store', async () => {
-  const { createAppStoreMockModule } = await import('$store/renderer/utils/test-helpers/store-mock');
+  const { createAppStoreMockModule } =
+    await import('$store/renderer/utils/test-helpers/store-mock');
 
   return createAppStoreMockModule({
     state: () => ({}),
@@ -89,6 +78,13 @@ vi.mock('$store/renderer/slices/workspace-agents/workspace-agents-selectors', ()
   }),
 }));
 
+vi.mock('$store/renderer/slices/workspace-agents/workspace-agents-slice', () => ({
+  ensureAgentSessionLoaded: vi.fn((workspaceId: string, agentId: string) => ({
+    type: 'workspaceAgents/ensureAgentSessionLoaded',
+    payload: [workspaceId, agentId],
+  })),
+}));
+
 vi.mock('$store/renderer/slices/workspace-tasks/workspace-tasks-selectors', () => {
   const taskProgress = (workspaceId: string) => {
     const tasks = mocks.tasksByWorkspace[workspaceId] ?? [];
@@ -106,11 +102,11 @@ vi.mock('$store/renderer/slices/workspace-tasks/workspace-tasks-selectors', () =
   return {
     selectWorkspaceTaskProgress: vi.fn(mocks.createWorkspaceValueReadable(taskProgress)),
     selectWorkspaceTaskDisplayList: vi.fn(
-      mocks.createWorkspaceValueReadable(
-        (workspaceId: string) =>
-          (mocks.tasksByWorkspace[workspaceId] ?? []).filter((task) => task.status !== 'cancelled'),
+      mocks.createWorkspaceValueReadable((workspaceId: string) =>
+        (mocks.tasksByWorkspace[workspaceId] ?? []).filter((task) => task.status !== 'cancelled'),
       ),
     ),
+    selectWorkspaceTasksInitialized: vi.fn(mocks.createWorkspaceValueReadable(() => true)),
   };
 });
 
@@ -127,10 +123,6 @@ vi.mock('$store/renderer/slices/workspace-summaries/workspace-summaries-selector
   ),
 }));
 
-vi.mock('$lib/components/ui/auggie-avatar/AugieAvatarWithState.svelte', async () => ({
-  default: (await import('../sidebar/__tests__/mocks/MockSimple.svelte')).default,
-}));
-
 const baseWorkspace = {
   id: 'ws-1',
   title: 'Hover Card Workspace',
@@ -139,6 +131,7 @@ const baseWorkspace = {
   timeline: [],
   conversationInfo: [],
   status: WorkspaceStatusEnum.Active,
+  displayStatus: 'idle',
   createdAt: '2026-05-05T00:00:00.000Z',
   updatedAt: '2026-05-05T00:00:00.000Z',
   lastActivity: '2026-05-05T19:00:00.000Z',
@@ -146,13 +139,20 @@ const baseWorkspace = {
   repositoryName: 'intent',
 } as Workspace;
 
+const ENSURE_AGENT_SESSION_LOADED = 'workspaceAgents/ensureAgentSessionLoaded';
+
 async function renderHoverCard(
   overrides: Partial<Workspace> = {},
   lineStats?: { additions: number; deletions: number },
+  props: {
+    activeAgentIds?: string[];
+    loadAgentSessions?: boolean;
+    loadWorkspaceData?: boolean;
+  } = {},
 ) {
   const WorkspaceHoverCard = (await import('../WorkspaceHoverCard.svelte')).default;
   const workspace = { ...baseWorkspace, ...overrides } as Workspace;
-  return render(WorkspaceHoverCard, { props: { workspace, lineStats } });
+  return render(WorkspaceHoverCard, { props: { workspace, lineStats, ...props } });
 }
 
 function normalizedText(element: Element) {
@@ -176,6 +176,17 @@ function expectVisibleChangesRow(expected: string) {
 warmImport(() => import('../sidebar/__tests__/mocks/MockSimple.svelte'));
 warmImport(() => import('../WorkspaceHoverCard.svelte'));
 
+function getEnsureSessionLoadPayloads() {
+  return mocks.dispatch.mock.calls.flatMap(([action]) => {
+    const dispatchedAction = action as { type?: string; payload?: unknown } | undefined;
+    return dispatchedAction?.type === ENSURE_AGENT_SESSION_LOADED ? [dispatchedAction.payload] : [];
+  });
+}
+
+async function waitForEnsureSessionLoads(expected: unknown[]) {
+  await waitFor(() => expect(getEnsureSessionLoadPayloads()).toEqual(expected));
+}
+
 describe('WorkspaceHoverCard', () => {
   beforeEach(() => {
     mocks.dispatch.mockClear();
@@ -190,6 +201,90 @@ describe('WorkspaceHoverCard', () => {
         delete record[workspaceId];
       }
     }
+  });
+
+  it('does not request unchanged member and running agent sessions again', async () => {
+    const { rerender } = await renderHoverCard(
+      { agentSummary: { agentIds: ['agent-member'] } },
+      undefined,
+      { activeAgentIds: ['agent-running'], loadWorkspaceData: false },
+    );
+
+    await waitForEnsureSessionLoads([
+      ['ws-1', 'agent-member'],
+      ['ws-1', 'agent-running'],
+    ]);
+
+    await rerender({
+      workspace: { ...baseWorkspace, agentSummary: { agentIds: ['agent-member'] } },
+      activeAgentIds: ['agent-running'],
+      loadWorkspaceData: false,
+    });
+    await tick();
+
+    expect(getEnsureSessionLoadPayloads()).toEqual([
+      ['ws-1', 'agent-member'],
+      ['ws-1', 'agent-running'],
+    ]);
+  });
+
+  it('requests added agent IDs once and requests removed IDs when they become relevant again', async () => {
+    const { rerender } = await renderHoverCard(
+      { agentSummary: { agentIds: ['agent-a'] } },
+      undefined,
+      { loadWorkspaceData: false },
+    );
+
+    await waitForEnsureSessionLoads([['ws-1', 'agent-a']]);
+
+    await rerender({
+      workspace: { ...baseWorkspace, agentSummary: { agentIds: ['agent-a', 'agent-b'] } },
+      loadWorkspaceData: false,
+    });
+    await waitForEnsureSessionLoads([
+      ['ws-1', 'agent-a'],
+      ['ws-1', 'agent-b'],
+    ]);
+
+    await rerender({
+      workspace: { ...baseWorkspace, agentSummary: { agentIds: ['agent-b'] } },
+      loadWorkspaceData: false,
+    });
+    await tick();
+    expect(getEnsureSessionLoadPayloads()).toEqual([
+      ['ws-1', 'agent-a'],
+      ['ws-1', 'agent-b'],
+    ]);
+
+    await rerender({
+      workspace: { ...baseWorkspace, agentSummary: { agentIds: ['agent-a', 'agent-b'] } },
+      loadWorkspaceData: false,
+    });
+    await waitForEnsureSessionLoads([
+      ['ws-1', 'agent-a'],
+      ['ws-1', 'agent-b'],
+      ['ws-1', 'agent-a'],
+    ]);
+  });
+
+  it('requests relevant agent sessions again after a workspace change', async () => {
+    const { rerender } = await renderHoverCard(
+      { agentSummary: { agentIds: ['agent-shared'] } },
+      undefined,
+      { loadWorkspaceData: false },
+    );
+
+    await waitForEnsureSessionLoads([['ws-1', 'agent-shared']]);
+
+    await rerender({
+      workspace: { ...baseWorkspace, id: 'ws-2', agentSummary: { agentIds: ['agent-shared'] } },
+      loadWorkspaceData: false,
+    });
+
+    await waitForEnsureSessionLoads([
+      ['ws-1', 'agent-shared'],
+      ['ws-2', 'agent-shared'],
+    ]);
   });
 
   it('updates loaded agent sessions when the workspace id changes after initial null', async () => {
@@ -258,6 +353,88 @@ describe('WorkspaceHoverCard', () => {
     expect(status.className).not.toMatch(/line-clamp|truncate|text-ellipsis/);
   });
 
+  it('renders title, repository, and named semantic status as three ordered rows', async () => {
+    const { container } = await renderHoverCard({ displayStatus: 'in_progress' });
+    const header = container.querySelector('[data-workspace-hover-card-header]');
+    const rows = header?.querySelectorAll(
+      '[data-workspace-hover-card-title-row], [data-workspace-hover-card-repo-row], [data-workspace-hover-card-status-row]',
+    );
+    const statusRow = container.querySelector('[data-workspace-hover-card-status-row]');
+
+    expect(rows).toHaveLength(3);
+    expect([...rows!].map((row) => normalizedText(row))).toEqual([
+      'Hover Card Workspace',
+      'augment/intent',
+      'In progress',
+    ]);
+    expect(statusRow?.querySelector('[data-workspace-status="in_progress"]')).toBeTruthy();
+    expect(statusRow?.querySelector('[data-workspace-status]')?.getAttribute('aria-hidden')).toBe(
+      'true',
+    );
+  });
+
+  it('keeps one shared workspace icon and named agent surfaces through live state changes', async () => {
+    mocks.agentSessionsByWorkspace['ws-1'] = [
+      {
+        id: 'agent-running',
+        name: 'Running Agent',
+        status: 'running',
+        messages: [],
+      } as AgentSession,
+      {
+        id: 'agent-waiting',
+        name: 'Waiting Agent',
+        status: 'waiting',
+        messages: [],
+      } as AgentSession,
+    ];
+
+    const view = await renderHoverCard({
+      displayStatus: 'in_progress',
+      agentSummary: { agentIds: ['agent-running', 'agent-waiting'] },
+    });
+    const workspaceIcon = view.container.querySelector('[data-workspace-status]');
+    const agentIcons = view.container.querySelectorAll('[data-agent-avatar-with-state]');
+
+    expect(view.container.querySelectorAll('[data-workspace-status]')).toHaveLength(1);
+    expect(workspaceIcon?.getAttribute('data-workspace-status')).toBe('in_progress');
+    expect(workspaceIcon?.getAttribute('data-workspace-status-visual')).toBe('dot');
+    expect(workspaceIcon?.getAttribute('data-workspace-status-icon')).toBeNull();
+    expect(agentIcons).toHaveLength(2);
+    expect([...agentIcons].map((icon) => icon.getAttribute('data-avatar-variant'))).toEqual([
+      'standard',
+      'standard',
+    ]);
+    expect([...agentIcons].map((icon) => icon.getAttribute('data-avatar-state'))).toEqual([
+      'running',
+      'waiting',
+    ]);
+
+    await view.rerender({
+      workspace: { ...baseWorkspace, displayStatus: 'blocked' } as Workspace,
+    });
+    expect(view.container.querySelector('[data-workspace-status]')).toBe(workspaceIcon);
+    expect(workspaceIcon?.getAttribute('data-workspace-status')).toBe('blocked');
+    expect(workspaceIcon?.getAttribute('data-workspace-status-icon')).toBe('xmark');
+  });
+
+  it('uses named card-stack agent indicators for unread cover-card summaries', async () => {
+    const { container } = await renderHoverCard({
+      attention: 'unread',
+      agentSummary: { agentIds: ['agent-unread-1', 'agent-unread-2'] },
+    });
+
+    const stack = container.querySelector('[data-workspace-hover-card-agent-stack]');
+    const avatars = stack?.querySelectorAll('[data-agent-avatar-with-state]') ?? [];
+    expect(avatars).toHaveLength(2);
+    expect(
+      [...avatars].every((avatar) => avatar.getAttribute('data-avatar-variant') === 'card-stack'),
+    ).toBe(true);
+    expect(
+      [...avatars].every((avatar) => avatar.getAttribute('data-avatar-state') === 'unread'),
+    ).toBe(true);
+  });
+
   it('does not render status placeholder text when the workspace status message is empty', async () => {
     const { container } = await renderHoverCard({ statusMessage: '   ' });
 
@@ -276,7 +453,7 @@ describe('WorkspaceHoverCard', () => {
     expect(root.className.split(/\s+/)).not.toContain('border');
     expect(root.className.split(/\s+/)).not.toContain('border-border');
     expect(root.className).not.toMatch(/rounded/);
-    expect(root.className).toContain('shadow-2xl');
+    expect(root.className).toContain('shadow-(--elevation-overlay)');
     expect(root.className).toContain('ring-1');
   });
 
@@ -368,15 +545,18 @@ describe('WorkspaceHoverCard', () => {
     [{ ahead: 0, behind: 2, hasUnpushed: false }, '2 commits behind remote'],
     [{ ahead: 3, behind: 1, hasUnpushed: true }, '+3 -1'],
     [{ ahead: 0, behind: 0, hasUnpushed: true }, 'Local commits not pushed'],
-  ])('formats git-only summary copy without labels or middle dots', async (gitSummary, expected) => {
-    mocks.gitSummaryByWorkspace['ws-1'] = gitSummary;
+  ])(
+    'formats git-only summary copy without labels or middle dots',
+    async (gitSummary, expected) => {
+      mocks.gitSummaryByWorkspace['ws-1'] = gitSummary;
 
-    const { container } = await renderHoverCard();
+      const { container } = await renderHoverCard();
 
-    expect(screen.queryByText('Git')).toBeNull();
-    expectVisibleChangesRow(expected);
-    expect(container.textContent).not.toContain(' · ');
-  });
+      expect(screen.queryByText('Git')).toBeNull();
+      expectVisibleChangesRow(expected);
+      expect(container.textContent).not.toContain(' · ');
+    },
+  );
 
   it('renders line-stat-only local changes as a visible summary row', async () => {
     const { container } = await renderHoverCard({}, { additions: 2, deletions: 1 });
@@ -388,9 +568,24 @@ describe('WorkspaceHoverCard', () => {
 
   it('renders running and background agent statuses as compact rows', async () => {
     mocks.agentSessionsByWorkspace['ws-1'] = [
-      { id: 'agent-running', name: 'Running Agent', status: 'running', messages: [] } as AgentSession,
-      { id: 'agent-background', name: 'Worker Agent', status: 'background', messages: [] } as AgentSession,
-      { id: 'agent-waiting', name: 'Waiting Agent', status: 'waiting', messages: [] } as AgentSession,
+      {
+        id: 'agent-running',
+        name: 'Running Agent',
+        status: 'running',
+        messages: [],
+      } as AgentSession,
+      {
+        id: 'agent-background',
+        name: 'Worker Agent',
+        status: 'background',
+        messages: [],
+      } as AgentSession,
+      {
+        id: 'agent-waiting',
+        name: 'Waiting Agent',
+        status: 'waiting',
+        messages: [],
+      } as AgentSession,
     ];
 
     await renderHoverCard({

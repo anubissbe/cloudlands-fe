@@ -4,19 +4,17 @@
  * (there is no main process, so `agent:idle` → OS notification →
  * `notification:show`/`notification:navigate` never happens).
  *
- * Active ONLY when `getPlatform() === 'web'` (NOT `isElectron()`, which is
- * true under the dev browser mock). On Electron this middleware registers
- * nothing and the native pipeline is untouched.
- *
- * Event source: the daemon `events.subscribe` firehose the renderer already
- * receives — `daemon-events-bridge.client.ts` re-emits `agent:idle` onto the
- * legacy mock-IPC channel (`relayLegacyIpcEvent`), which this service listens
- * on. Trigger conditions, suppression rules, and payload shape are a port of
+ * The notifications saga owns the platform-gated `agent:idle` channel. This
+ * module retains callable browser notification helpers used by the web bridge
+ * and focused tests. Trigger conditions, suppression rules, and payload shape
+ * are a port of
  * `main/notification.service.ts#handleAgentIdle`:
  *   - `notifications.enabled` off → skip (read from the renderer store, which
- *     the user-preferences-notification-persistence middleware keeps in sync
- *     with the daemon `notifications.*` catalog).
+ *     the settings saga keeps in sync with the daemon catalog).
  *   - background agents (event fast path or `agent.list` metadata) → skip.
+ *   - archived workspace (`workspaceArchived` event fast path) → skip.
+ *   - agent idle while waiting on other agents, active background hooks
+ *     (§3.1), or active PR monitors (§5.42) → skip (event fast path).
  *   - other agents still streaming/responding in the workspace → skip.
  *   - focused + viewing the event's workspace + `soundOnlyWhenUnfocused` →
  *     suppress the banner but still run the sound gate (the Electron
@@ -36,13 +34,11 @@
  * the shared `handleNotificationNavigate` (workspace page, or chief → sidebar
  * Assistant panel + thread selection).
  */
-import type { StoreMiddleware } from '$lib/store-shim/types';
 import { store as appStore } from '$store/renderer/store';
 import type { StoreState } from '$store/renderer/types';
-import { addMockIpcListener } from '$shared/ipc-mock-router';
 import { backendRequest } from '$lib/client/live/backend-transport';
-import { getPlatform } from '$lib/utils/platform-capabilities';
 import { createLogger } from '$lib/utils/client-logger';
+import { selectCurrentWorkspaceTabId } from '$store/renderer/slices/tab-state/tab-state-selectors';
 import { m } from '$shared/paraglide/messages.js';
 import { CHIEF_WORKSPACE_ID } from '$shared/types/branded-ids';
 import type { AgentIdleEvent } from '$features/events/types';
@@ -52,7 +48,6 @@ import { playNotificationSoundPerSettings } from './notification-sound-gate';
 
 const logger = createLogger('WebNotificationService');
 
-let installed = false;
 /** Log the missing-permission skip once, not on every idle event. */
 let loggedPermissionSkip = false;
 /** In-flight permission prompt, shared so concurrent idle events coalesce
@@ -61,12 +56,7 @@ let loggedPermissionSkip = false;
 let pendingPermissionRequest: Promise<NotificationPermission> | null = null;
 /** Strong refs so pending notifications aren't GC'd before click (parity with main). */
 const activeNotifications = new Set<Notification>();
-/**
- * Latest notification per tag. Tag-based replacement may not fire `onclose`
- * for the replaced instance, so we evict it here to keep the strong-reference
- * set from growing over repeated same-tag idles.
- */
-const notificationsByTag = new Map<string, Notification>();
+const activeNotificationsByTag = new Map<string, Notification>();
 
 /** True when the browser exposes the Notification API (jsdom-safe guard). */
 function isNotificationSupported(): boolean {
@@ -184,8 +174,7 @@ interface AgentListResult {
 async function fetchWorkspaceTitle(workspaceId: string): Promise<string | undefined> {
   try {
     const response = (await backendRequest('workspace.get', { workspaceId })) as
-      | { workspace?: { title?: string } }
-      | undefined;
+      { workspace?: { title?: string } } | undefined;
     const title = response?.workspace?.title;
     return typeof title === 'string' && title.length > 0 ? title : undefined;
   } catch {
@@ -211,33 +200,19 @@ async function showWebNotification(
   if (!granted) return;
 
   try {
-    // Native tag-based replacement: same workspace+agent notifications
-    // replace instead of stacking. No `renotify` — our own sound gate above
-    // already plays the sound on every idle that reaches this path. Test
-    // notifications (no workspaceId/agentId) carry no tag and stack freely.
     const tag = workspaceId && agentId ? `${workspaceId}:${agentId}` : undefined;
     const notification = new Notification(content.title, {
       body: content.body,
       ...(tag ? { tag } : {}),
     });
+    const previous = tag ? activeNotificationsByTag.get(tag) : undefined;
+    if (previous) activeNotifications.delete(previous);
     activeNotifications.add(notification);
-    if (tag) {
-      // Tag replacement may retire the previous notification WITHOUT an
-      // onclose — evict it so the set cannot leak.
-      const replaced = notificationsByTag.get(tag);
-      if (replaced) {
-        activeNotifications.delete(replaced);
-      }
-      notificationsByTag.set(tag, notification);
-    }
-    const release = () => {
-      activeNotifications.delete(notification);
-      if (tag && notificationsByTag.get(tag) === notification) {
-        notificationsByTag.delete(tag);
-      }
-    };
+    if (tag) activeNotificationsByTag.set(tag, notification);
     notification.onclick = () => {
-      release();
+      activeNotifications.delete(notification);
+      if (tag && activeNotificationsByTag.get(tag) === notification)
+        activeNotificationsByTag.delete(tag);
       try {
         window.focus();
       } catch {
@@ -253,10 +228,14 @@ async function showWebNotification(
       notification.close();
     };
     notification.onclose = () => {
-      release();
+      activeNotifications.delete(notification);
+      if (tag && activeNotificationsByTag.get(tag) === notification)
+        activeNotificationsByTag.delete(tag);
     };
     notification.onerror = () => {
-      release();
+      activeNotifications.delete(notification);
+      if (tag && activeNotificationsByTag.get(tag) === notification)
+        activeNotificationsByTag.delete(tag);
       logger.warn('Web notification failed to show', { title: content.title });
     };
   } catch (error) {
@@ -268,7 +247,10 @@ async function showWebNotification(
  * Handle a relayed `agent:idle` event — a port of the main-process
  * `NotificationService.handleAgentIdle` decision logic.
  */
-export async function handleWebAgentIdle(event: AgentIdleEvent): Promise<void> {
+export async function handleWebAgentIdle(
+  event: AgentIdleEvent,
+  activeWorkspaceId: string | null = selectCurrentWorkspaceTabId.select(appStore.state),
+): Promise<void> {
   try {
     const workspaceId = event.workspaceId;
     if (typeof workspaceId !== 'string' || workspaceId.length === 0) return;
@@ -292,6 +274,16 @@ export async function handleWebAgentIdle(event: AgentIdleEvent): Promise<void> {
       return;
     }
 
+    // Fast path: the event's workspace is archived — archived workspaces
+    // never notify. Absent on older daemons (treated as not archived).
+    if (event.data.workspaceArchived === true) {
+      logger.debug('Skipping notification for archived workspace', {
+        workspaceId,
+        agentName: event.data.agentName,
+      });
+      return;
+    }
+
     // Fast path: the agent ended its turn while awaiting delegated
     // sub-agents (pending completion watches) — the workspace isn't truly
     // quiet even if the children haven't started responding yet. Absent on
@@ -304,13 +296,31 @@ export async function handleWebAgentIdle(event: AgentIdleEvent): Promise<void> {
       return;
     }
 
+    // Fast path: the agent went idle while it still owns active background
+    // hooks (PROTOCOL §3.1) or active PR monitors (§5.42) — it will run
+    // again when a hook dispatches/expires or a monitor condition fires, so
+    // the workspace isn't truly quiet yet. Absent on older daemons.
+    if ((event.data.waitingOnHooks?.length ?? 0) > 0) {
+      logger.debug('Skipping notification for agent waiting on hooks', {
+        workspaceId,
+        agentName: event.data.agentName,
+      });
+      return;
+    }
+    if ((event.data.waitingOnPrMonitors?.length ?? 0) > 0) {
+      logger.debug('Skipping notification for agent waiting on PR monitors', {
+        workspaceId,
+        agentName: event.data.agentName,
+      });
+      return;
+    }
+
     // `agent.list` (PROTOCOL §5.5) serves two purposes: AgentLite `metadata`
     // carries `isBackground`/`specialist` (absent from the daemon idle
     // payload), and `isStreaming`/`isResponding` feed the other-agents-active
     // suppression gate below (parity with main/notification.service.ts).
     const agentList = (await backendRequest('agent.list', { workspaceId })) as
-      | AgentListResult
-      | undefined;
+      AgentListResult | undefined;
     const agents = agentList?.agents ?? [];
     const idleAgent = agents.find((agent) => agent.id === event.data.agentId);
 
@@ -355,9 +365,6 @@ export async function handleWebAgentIdle(event: AgentIdleEvent): Promise<void> {
     // runs regardless of focus (Electron parity: `notification:show` is
     // always sent). Electron's per-window focus check collapses to
     // `document.hasFocus()` + the active workspace id on the single web tab.
-    const activeWorkspaceId =
-      (appStore.state as { workspace?: { activeWorkspaceId?: string | null } }).workspace
-        ?.activeWorkspaceId ?? null;
     const focusedViewingWorkspace =
       typeof document !== 'undefined' && document.hasFocus() && activeWorkspaceId === workspaceId;
     if (focusedViewingWorkspace && soundOnlyWhenUnfocused) {
@@ -440,36 +447,15 @@ export async function requestWebNotificationPermission(): Promise<{
   }
 }
 
-/**
- * Middleware activating the web notification service. Registers ONE listener
- * on the relayed legacy `agent:idle` channel when the platform is web;
- * registers nothing on Electron (native pipeline unchanged). The listener
- * persists for the renderer lifetime (zoom-sync/notification-ipc idiom).
- */
-export function createWebNotificationMiddleware(): StoreMiddleware {
-  return () => {
-    if (!installed && getPlatform() === 'web') {
-      installed = true;
-      addMockIpcListener('agent:idle', (payload) => {
-        const event = payload as AgentIdleEvent | undefined;
-        if (!event || event.type !== 'agent:idle' || !event.data) return;
-        void handleWebAgentIdle(event);
-      });
-    }
-    return (next) => (action) => next(action);
-  };
-}
-
-/** Test-only: observe the strong-reference set size (leak regression). @internal */
-export function __getActiveWebNotificationCountForTesting(): number {
-  return activeNotifications.size;
-}
-
 /** Test-only: reset module state between tests. @internal */
 export function __resetWebNotificationServiceForTesting(): void {
-  installed = false;
   loggedPermissionSkip = false;
   pendingPermissionRequest = null;
   activeNotifications.clear();
-  notificationsByTag.clear();
+  activeNotificationsByTag.clear();
+}
+
+/** Test-only: visible active notification strong-reference count. @internal */
+export function __getActiveWebNotificationCountForTesting(): number {
+  return activeNotifications.size;
 }

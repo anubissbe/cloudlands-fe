@@ -15,6 +15,11 @@ import type { Component } from 'svelte';
 import type { IconDefinition } from '@fortawesome/fontawesome-common-types';
 import type { PanelTab } from '$store/renderer/slices/panel-layout/panel-layout-types';
 import { m } from '$shared/paraglide/messages.js';
+import {
+  getPanelDefaultWidthForType,
+  getPanelDefaultWidthTier,
+} from '$shared/panel-default-width-tiers';
+import { getPanelDefaultWidth, type PanelDefaultWidthTier } from '$shared/panel-layout-sizing';
 
 /**
  * Props that all tab type components must accept
@@ -22,6 +27,8 @@ import { m } from '$shared/paraglide/messages.js';
 export interface TabTypeComponentProps {
   tab: PanelTab;
   workspaceId: string;
+  /** Panel-layout state key; differs from workspaceId in column view. */
+  layoutId?: string;
   /** Whether this tab is currently the active/visible tab */
   isActive: boolean;
   /** Whether this panel is currently focused AND this tab is active */
@@ -54,6 +61,9 @@ export interface TabTypeDefinition {
 
   /** Whether tabs of this type can be renamed */
   renameable?: boolean;
+
+  /** Intentional responsive width tier used for new, automatic, and reset sizing. */
+  defaultWidthTier: PanelDefaultWidthTier;
 }
 
 /**
@@ -121,6 +131,19 @@ class TabTypeRegistry {
    */
   isRenameable(type: string): boolean {
     return this.types.get(type)?.renameable ?? false;
+  }
+
+  /** Get the declared width tier, using the narrow safety fallback for unknown types. */
+  getDefaultWidthTier(type: string): PanelDefaultWidthTier {
+    return this.types.get(type)?.defaultWidthTier ?? getPanelDefaultWidthTier(type);
+  }
+
+  /** Resolve the intrinsic panel width for a tab type and usable viewport. */
+  getDefaultWidth(type: string, viewportWidth = 0): number {
+    const definition = this.types.get(type);
+    return definition
+      ? getPanelDefaultWidth(definition.defaultWidthTier, viewportWidth)
+      : getPanelDefaultWidthForType(type, viewportWidth);
   }
 }
 

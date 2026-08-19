@@ -47,7 +47,7 @@ import { isPendingAgentSession as isNewPendingAgentSession } from './types/agent
 import { isAgentSession as isNewAgentSession } from './types/agent-session.guards';
 
 // Import consolidated ContentBlock type
-import type { ContentBlock } from './types/content-block';
+import type { ContentBlock, VideoContentBlock, VideoSource } from './types/content-block';
 import type {
   BulkProposalItem,
   Proposal,
@@ -60,6 +60,8 @@ import type {
 import { isProposal, isProposalKind, PROPOSAL_KINDS } from './types/proposal';
 import {
   isContentBlock,
+  dedupeAgentVideoContentBlocks,
+  normalizeAgentVideoContentBlocks,
   normalizeContentBlock,
   normalizeContentBlocks,
 } from './types/content-block';
@@ -72,6 +74,7 @@ import {
   isFileBlock,
   isImageBlock,
   isMediaBlock,
+  isVideoBlock,
   isTextBlock,
   isThinkingBlock,
   isToolBlock,
@@ -137,10 +140,12 @@ export {
   isAudioBlock,
   isCodeBlock,
   isContentBlock,
+  dedupeAgentVideoContentBlocks,
   isErrorBlock,
   isFileBlock,
   isImageBlock,
   isMediaBlock,
+  isVideoBlock,
   isTextBlock,
   isThinkingBlock,
   isToolBlock,
@@ -150,8 +155,9 @@ export {
   migrateFromLegacy,
   normalizeContentBlock,
   normalizeContentBlocks,
+  normalizeAgentVideoContentBlocks,
 };
-export type { ContentBlock };
+export type { ContentBlock, VideoContentBlock, VideoSource };
 export { isProposal, isProposalKind, PROPOSAL_KINDS };
 export type {
   BulkProposalItem,
@@ -219,17 +225,18 @@ export const WORKSPACE_STATUS_MESSAGE_MAX_LENGTH = 500;
  *  guard, and every consumer set derive from this array. `idle` (intentd#793)
  *  folds live agent activity into the daemon-side derivation: a running agent
  *  promotes to `in_progress`, and without one the task-stage rollups
- *  (`in_progress`/`not_started`) demote to `idle`. `failed`, `blocked` and
- *  `unread` (intentd#945) complete the BE-owned canonical precedence
- *  `failed > blocked > needs_attention > in_progress > unread > PR/task rollup`,
- *  so clients no longer synthesize those axes locally. */
+ *  (`in_progress`/`not_started`) demote to `idle`. `failed` and `blocked`
+ *  (intentd#945) complete the BE-owned canonical precedence
+ *  `failed > blocked > needs_attention > in_progress > PR/task rollup`,
+ *  so clients no longer synthesize those axes locally. Unread is NOT a
+ *  displayStatus (intentd#1186): it travels only on the dismissible
+ *  `workspace.attention` flag and overlays the real status. */
 export const WORKSPACE_DISPLAY_STATUS_VALUES = [
   'failed',
   'blocked',
   'needs_attention',
   'not_started',
   'in_progress',
-  'unread',
   'idle',
   'complete',
   'pr_ready',
@@ -245,7 +252,8 @@ export type WorkspaceDisplayStatus = (typeof WORKSPACE_DISPLAY_STATUS_VALUES)[nu
  *  is no local re-derivation from PR/task fields. */
 export function isWorkspaceDisplayStatus(value: unknown): value is WorkspaceDisplayStatus {
   return (
-    typeof value === 'string' && (WORKSPACE_DISPLAY_STATUS_VALUES as readonly string[]).includes(value)
+    typeof value === 'string' &&
+    (WORKSPACE_DISPLAY_STATUS_VALUES as readonly string[]).includes(value)
   );
 }
 
@@ -302,6 +310,13 @@ export interface Workspace {
    *  `workspace.markSeen` / `workspace.dismissAttention`. Optional on decode —
    *  when absent (older daemons) the FE treats it as 'none'. */
   attention?: WorkspaceAttention;
+  /** BE-derived orthogonal waiting flag (PROTOCOL §5.1): true when the
+   *  workspace's agents are purely waiting on external conditions (active
+   *  background hooks, PR monitors, or watched agents). Overlays the real
+   *  displayStatus rather than folding into it. Presence-detected on the
+   *  wire — omitted when false, so older daemons (which never send it) read
+   *  as not waiting. */
+  waiting?: boolean;
   createdAt: string;
   updatedAt: string;
   lastActivity?: string;
@@ -327,11 +342,17 @@ export interface Workspace {
   environmentConfig?: EnvironmentConfig;
   archived?: boolean;
   archivedAt?: string;
+  /** ISO deadline of an in-memory pending deletion (PROTOCOL §5.1 delete grace
+   *  window, v6.7+). Present only while a `workspace.delete { undoDelayMs > 0 }`
+   *  grace window is running; cleared by `workspace.cancelDelete` and dropped by
+   *  a daemon restart (the workspace survives). Rows carrying it are hidden
+   *  from the FE workspace list. */
+  pendingDeleteAt?: string;
   defaultModel?: string; // Default model for new agents in this workspace
   /** IDs-only agent membership summary; derive counts from `agentIds.length` and fetch agent details from agent/session sources. */
   agentSummary?: WorkspaceAgentIdSummary;
-  /** @deprecated High-frequency data — fetch on demand via WORKSPACE_CHANNELS.GET_TASKS. Excluded from WorkspaceMetadata payloads. */
-  taskStats?: WorkspaceTaskStats; // Task progress for list views (like flame graph)
+  /** Task progress rollup for list views (like flame graph); carried on WorkspaceMetadata payloads when the daemon provides it (PROTOCOL §5.1). */
+  taskStats?: WorkspaceTaskStats;
   /** @deprecated High-frequency data — fetch on demand via WORKSPACE_CHANNELS.GET_GIT_SUMMARY. Excluded from WorkspaceMetadata payloads. */
   gitSummary?: WorkspaceGitSummary; // Git status for list views (commits ahead/behind)
   /** Copy-on-Write filesystem capability of the workspaces root (a machine capability, independent of the workspace or checkout mode). */
@@ -372,18 +393,19 @@ export interface WorkspaceAgentIdSummary {
 /**
  * Metadata-only workspace payload for list/get/open responses.
  * High-frequency summary fields are structurally excluded (`never`) so a
- * metadata payload cannot carry diff/git summaries or task lists/stats;
- * fetch those on demand via the dedicated WORKSPACE_CHANNELS endpoints.
+ * metadata payload cannot carry diff/git summaries; fetch those on demand
+ * via the dedicated WORKSPACE_CHANNELS endpoints. `taskStats` is the cheap
+ * daemon-computed task progress rollup (PROTOCOL §5.1) and rides along when
+ * the daemon provides it.
  */
 export type WorkspaceMetadata = Omit<
   Workspace,
-  'diffSummary' | 'gitSummary' | 'taskStats' | 'agentSummary' | 'diffs'
+  'diffSummary' | 'gitSummary' | 'agentSummary' | 'diffs'
 > & {
   agentSummary?: WorkspaceAgentIdSummary;
   diffs?: never;
   diffSummary?: never;
   gitSummary?: never;
-  taskStats?: never;
 };
 
 export interface EnvironmentConfig {
@@ -448,10 +470,7 @@ export interface FirstVisitState {
 
 // FileChange is now defined in shared/types/change-detector.types.ts
 // Re-export for convenience
-import type {
-  FileChange,
-  FileChangeAction,
-} from './types/change-detector.types';
+import type { FileChange, FileChangeAction } from './types/change-detector.types';
 export type { FileChange, FileChangeAction };
 
 export interface ChangeSet {
@@ -662,6 +681,21 @@ export interface WorkspaceTask {
    * then omit `expectedVersion` and last-writer-wins applies.
    */
   rev?: number;
+  /**
+   * Daemon-computed: true iff this task's id is linked from the spec note
+   * body (PROTOCOL §5.4, additive). `undefined` when the daemon predates the
+   * field — consumers then keep their legacy (pre-`specLinked`) behavior.
+   */
+  specLinked?: boolean;
+  /** Task-note ids this task depends on (hard ordering edges); omitted when empty. */
+  dependsOn?: NoteId[];
+  /** Task-note ids this task may conflict with (advisory); omitted when empty. */
+  conflictsWith?: NoteId[];
+  /**
+   * Daemon-computed: `dependsOn` ids whose task is not yet `complete` (missing
+   * and cancelled deps count as unmet). Omitted when empty (PROTOCOL §5.4).
+   */
+  unmetDependsOn?: NoteId[];
 }
 
 /**
@@ -851,6 +885,17 @@ export interface TaskMetadata {
   completedAt?: string;
   startedAt?: string;
   peerOrder?: number; // Order among sibling tasks with same parentId (uses gaps of 100 for easy insertion)
+  /** Task-note ids this task depends on (hard ordering edges); omitted when empty. */
+  dependsOn?: NoteId[];
+  /** Task-note ids this task may conflict with (advisory); omitted when empty. */
+  conflictsWith?: NoteId[];
+  /**
+   * Daemon-computed at read/push time (never persisted): `dependsOn` ids whose
+   * task note is not `complete` (missing and cancelled deps count as unmet).
+   * Present on note-shaped read/push payloads only (PROTOCOL §5.2, v6.8,
+   * monorepo#1979); omitted when empty and on mutation-response notes.
+   */
+  unmetDependsOn?: NoteId[];
 }
 
 /**
@@ -984,10 +1029,7 @@ export interface AgentInfo {
 }
 
 export type AgentScope =
-  | 'workspace'
-  | { diffs: string[] }
-  | { filePattern: string }
-  | { taskType: string };
+  'workspace' | { diffs: string[] } | { filePattern: string } | { taskType: string };
 
 // Auggie output markers
 export const AUGGIE_MARKERS = {
@@ -1121,6 +1163,10 @@ export interface ToolUseBlock {
   /** Provider tool-call id — tool_result blocks reference it via `tool_use_id` (PROTOCOL §7.1) */
   toolCallId?: string;
   metadata?: Record<string, unknown>;
+  /** Slim projection (§5.5): `input` is a bounded preview of the full body. */
+  inputTruncated?: boolean;
+  /** Slim projection (§5.5): byte size of the full `input` body. */
+  inputBytes?: number;
 }
 
 export interface ToolResultBlock {
@@ -1128,11 +1174,12 @@ export interface ToolResultBlock {
   /** Addressable block id (PROTOCOL §7.1) */
   id?: string;
   tool_use_id: string;
-  /** Tool result payload (PROTOCOL §7.1) */
-  output?: unknown;
-  /** Legacy payload field — superseded by `output` */
-  content?: string;
+  output: unknown;
   is_error?: boolean;
+  /** Slim projection (§5.5): `output` is a bounded preview of the full body. */
+  outputTruncated?: boolean;
+  /** Slim projection (§5.5): byte size of the full `output` body. */
+  outputBytes?: number;
 }
 
 // ToolCall is now imported from ./types/agent-message.ts
@@ -1160,6 +1207,16 @@ export interface FileStatus {
   path: string;
   status: GitFileStatus;
   staged: boolean;
+  /**
+   * Octal tree-entry mode string, present only for submodule (gitlink)
+   * entries (`"160000"`) so they can route to a dedicated presentation
+   * without probing `git.showFile` (intent-hq/monorepo#1739).
+   */
+  mode?: string;
+  /** Pre-change submodule pin SHA (absent for a newly added submodule). */
+  oldSha?: string;
+  /** Post-change submodule pin SHA (absent for a deleted submodule). */
+  newSha?: string;
 }
 
 export enum GitFileStatus {
@@ -1444,6 +1501,7 @@ export interface CreateWorkspaceRequest {
   isNewRepo?: boolean; // If true, initialize a new git repository at repositoryPath
   skipIsolation?: boolean; // If true, skip the isolated checkout (worktree or CoW clone) and work directly in the repo folder (wire: canonical for the deprecated skipWorktree alias)
   executionEnvironment?: 'direct' | 'worktree' | 'cow' | 'microvm'; // Explicit execution-environment selection (PROTOCOL §5.1, v3.3); validated daemon-side against enabled profiles + host capabilities
+  progressId?: string; // FE-minted correlation id echoed on git:clone:progress/done frames emitted during this create (PROTOCOL §5.1)
   initialAgent?: {
     /**
      * DEPRECATED: the daemon assigns the initial agent's id and returns it on

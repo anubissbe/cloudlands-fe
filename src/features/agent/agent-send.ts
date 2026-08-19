@@ -4,7 +4,7 @@
  * Module-level `sendMessage()` — session restore/activation, the optimistic
  * user message, and the single PROTOCOL.md §5.5 `agent.sendMessage` wire call.
  * Streaming and terminal state arrive via the standing `chat.subscribe` delta
- * stream (chat-subscribe-service) and the daemon events bridge — this module
+ * stream (chat-subscribe saga) and the daemon events bridge — this module
  * assembles no transcript state and owns no stream lifecycle.
  */
 
@@ -32,6 +32,7 @@ import {
 import {
   addMessage as addAgentSessionMessage,
   setAgentStreaming,
+  updateMessage as updateAgentSessionMessage,
   upsertSession,
 } from '$store/renderer/slices/agent-session/agent-session-slice';
 import { errorRecovery, DEFAULT_STRATEGIES } from './browser/services/error-recovery.service';
@@ -40,6 +41,7 @@ import { chatQueuedRetryRecordParked } from '$store/renderer/slices/chat-state/c
 import { buildRecordedAttempt } from '$features/agent/utils/build-recorded-attempt';
 import { replaceAgentQueue } from '$store/renderer/slices/agent-queue/agent-queue-slice';
 import { selectAgentQueueMessages } from '$store/renderer/slices/agent-queue/agent-queue-selectors';
+import { getAgentQueueEventSnapshotSeq, hydrateAgentQueue } from './agent-queue-read-service';
 import { workspaceMetrics } from '$store/renderer/slices/workspace/utils/workspace-metrics';
 import { store as appStore } from '$store/renderer/store';
 import { m } from '$shared/paraglide/messages.js';
@@ -88,7 +90,17 @@ export async function sendMessage(
       [key: string]: unknown;
     }>;
     imageBlocks?: Array<{ type: 'image'; data: string; mimeType: string }>;
-    fileBlocks?: Array<{ type: 'file'; data: string; mimeType: string; fileName: string }>;
+    /**
+     * Attachment-reference file blocks (PROTOCOL §5.5): the attachment
+     * registry UUID plus chip metadata — no bytes cross the wire.
+     */
+    fileBlocks?: Array<{
+      type: 'file';
+      attachmentId: string;
+      fileName: string;
+      mimeType?: string;
+      size?: number;
+    }>;
     model?: string;
     modelId?: string;
     noteIds?: string[];
@@ -112,6 +124,12 @@ export async function sendMessage(
      * immediately instead of queueing). Used by force-send (⌘Enter).
      */
     priority?: 'interrupt';
+    /**
+     * Opaque per-message payload persisted on the user message row
+     * (PROTOCOL.md §5.5 `messageMetadata`). Used by the Q&A wizard to tag its
+     * answer message `{ type: "question_answers", answeredQuestionsMessageId }`.
+     */
+    messageMetadata?: Record<string, unknown>;
   } = {},
 ): Promise<void> {
   // Wrap entire sendMessage operation with performance tracking
@@ -222,22 +240,32 @@ export async function sendMessage(
           for (const file of options.fileBlocks) {
             userContentBlocks.push({
               type: 'file' as const,
-              data: file.data,
-              mimeType: file.mimeType,
+              attachmentId: file.attachmentId,
               fileName: file.fileName,
+              ...(file.mimeType !== undefined ? { mimeType: file.mimeType } : {}),
+              ...(file.size !== undefined ? { size: file.size } : {}),
             });
           }
         }
         const userAppMessageId = options.userAppMessageId ?? createAppMessageId();
+        // Kept separate from the wire tag below so a failed send can roll the
+        // optimistic row back to exactly this metadata.
+        const baseUserMetadata = options.contextReferences?.length
+          ? { contextReferences: options.contextReferences }
+          : {};
         const userMessage: AgentMessage = {
           id: createMessageId(uuidv4()),
           appMessageId: userAppMessageId,
           role: 'user',
           contentBlocks: userContentBlocks,
           timestamp: new Date().toISOString(),
-          metadata: options.contextReferences?.length
-            ? { contextReferences: options.contextReferences }
-            : {},
+          metadata: {
+            ...baseUserMetadata,
+            // Mirror the wire tag on the optimistic row so transcript-driven
+            // derivations (the Q&A wizard's answer resolution) settle without
+            // waiting for the daemon echo.
+            ...(options.messageMetadata ?? {}),
+          },
         };
 
         dispatchRedux(addAgentSessionMessage(session.id, userMessage));
@@ -267,7 +295,7 @@ export async function sendMessage(
                 async () => {
                   // Streaming and terminal state for this turn arrive via the
                   // standing chat.subscribe delta stream (PROTOCOL §7.1,
-                  // chat-subscribe-service) and the daemon events bridge
+                  // chat-subscribe saga) and the daemon events bridge
                   // (events.subscribe → agent:stream:* / agent:idle, §7) —
                   // no transcript state is assembled here.
                   //
@@ -299,12 +327,20 @@ export async function sendMessage(
                           type: b.type,
                           fileName: b.fileName,
                           mimeType: b.mimeType,
-                          dataLength: b.data?.length || 0,
+                          attachmentId: b.attachmentId,
+                          size: b.size,
                         })) || [],
                     },
                   );
 
                   const wireModel = options.model ?? options.modelId ?? session.model ?? undefined;
+                  // Captured BEFORE the wire call: an authoritative snapshot
+                  // folded while the RPC is in flight — a live
+                  // agent:queue:updated fold (monorepo#2481) or a
+                  // hydrate-reconciled fold (monorepo#2486) — advances this
+                  // seq, and the queued-response queue seed below must then
+                  // yield to it.
+                  const queueSeqAtSend = getAgentQueueEventSnapshotSeq(agentId);
                   // PROTOCOL.md §5.5 `agent.sendMessage` — one direct daemon call over
                   // the BackendTransport seam. History is daemon-owned (loaded from
                   // persistence); legacy-only fields (messages, resetHistory,
@@ -328,6 +364,12 @@ export async function sendMessage(
                       assistantAppMessageId,
                       // Message priority for force-send interrupt (PROTOCOL.md §5.5)
                       priority: options.priority,
+                      // Opaque per-message tag persisted on the user row
+                      // (PROTOCOL.md §5.5) — omitted entirely when absent so
+                      // ordinary sends keep their exact request shape.
+                      ...(options.messageMetadata
+                        ? { messageMetadata: options.messageMetadata }
+                        : {}),
                     },
                   );
 
@@ -419,11 +461,38 @@ export async function sendMessage(
                             { agentId, queuedMessageId: queuedMessage.id },
                           );
                         }
-                        const existing = selectAgentQueueMessages.select(appStore.state, agentId);
-                        const next = existing.some((m) => m.id === queuedMessage.id)
-                          ? existing
-                          : [...existing, queuedMessage];
-                        dispatchRedux(replaceAgentQueue(agentId, next));
+                        // Seed only when no authoritative snapshot — live
+                        // agent:queue:updated fold or hydrate-reconciled fold
+                        // — landed since the send started: a snapshot
+                        // (including the shrunk-after-drain one) is at least
+                        // as fresh as this echo, so seeding over it would
+                        // re-add a just-drained row (monorepo#2481).
+                        if (getAgentQueueEventSnapshotSeq(agentId) === queueSeqAtSend) {
+                          const existing = selectAgentQueueMessages.select(
+                            appStore.state,
+                            agentId,
+                          );
+                          const next = existing.some((m) => m.id === queuedMessage.id)
+                            ? existing
+                            : [...existing, queuedMessage];
+                          dispatchRedux(replaceAgentQueue(agentId, next));
+                        } else {
+                          logger.debug(
+                            'queued-response queue seed superseded by an authoritative snapshot; reconciling via hydrate',
+                            { agentId, queuedMessageId: queuedMessage.id },
+                          );
+                          // Client-side apply order cannot rank the superseding
+                          // snapshot against this echo — a hydrate whose
+                          // getQueue the daemon served BEFORE this send would
+                          // wrongly suppress a still-queued row (monorepo#2486
+                          // review). By now the daemon has processed the send,
+                          // so one reconciling hydrate returns the true queue
+                          // in both directions: the row if still queued,
+                          // without it if drained. Swallowed on failure — the
+                          // send itself succeeded, and the service leaves the
+                          // prior mirror intact on error.
+                          await hydrateAgentQueue(agentId).catch(() => undefined);
+                        }
                       }
 
                       // Exit early — no stream is starting
@@ -460,6 +529,17 @@ export async function sendMessage(
           // setAgentStreaming(true), reset the streaming flag so the UI
           // doesn't stay stuck on "Thinking…" until the safety detector fires.
           dispatchRedux(setAgentStreaming(session.id, false));
+          // The optimistic user row is retained on failure, so an answer tag
+          // mirrored onto it would resolve the wizard's pending set even though
+          // the daemon never accepted the answer. Strip it back to the
+          // pre-send metadata; "Try again" re-mirrors it on the next attempt.
+          if (options.messageMetadata) {
+            dispatchRedux(
+              updateAgentSessionMessage(session.id, userMessage.id, {
+                metadata: baseUserMetadata,
+              }),
+            );
+          }
           throw streamingError;
         }
       }

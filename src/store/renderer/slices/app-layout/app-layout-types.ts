@@ -1,4 +1,4 @@
-export type CommandPaletteAction = { type: "create-file"; workspaceId: string };
+export type CommandPaletteAction = { type: 'create-file'; workspaceId: string };
 
 export type SidebarLocateTarget = {
   sidebarTabId: string;
@@ -25,12 +25,20 @@ export type ShowAgentDetail = {
 
 export type OpenAgentTabDetail = {
   agentId: string;
+  pin?: boolean;
   openInAdjacentPanel?: boolean;
+  openInNewColumn?: boolean;
   sourcePanelId?: string;
+  panelLayoutId?: string;
+  availablePanelCanvasWidth?: number;
+  adaptiveFirstChat?: boolean;
 };
 
 export type OpenTerminalTabDetail = {
   terminalId: string;
+  openInAdjacentPanel?: boolean;
+  sourcePanelId?: string;
+  panelLayoutId?: string;
 };
 
 export type CreateWorkspaceForRepoDetail = {

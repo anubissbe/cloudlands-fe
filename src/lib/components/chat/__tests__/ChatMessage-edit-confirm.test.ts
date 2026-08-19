@@ -13,26 +13,13 @@ const { dispatchMock } = vi.hoisted(() => ({ dispatchMock: vi.fn() }));
 
 // Mock Redux store and selectors (same seams as the sibling ChatMessage tests).
 vi.mock('$store/renderer/store', async () => {
-  const { createAppStoreMockModule } = await import(
-    '$store/renderer/utils/test-helpers/store-mock'
-  );
+  const { createAppStoreMockModule } =
+    await import('$store/renderer/utils/test-helpers/store-mock');
   return createAppStoreMockModule({
     state: () => ({}),
     dispatch: dispatchMock,
   });
 });
-
-vi.mock('$store/renderer/slices/workspace/workspace-selectors', () => ({
-  selectActiveWorkspaceId: Object.assign(
-    () => ({
-      subscribe: (run: (value: string | null) => void) => {
-        run('ws-1');
-        return () => {};
-      },
-    }),
-    { select: () => 'ws-1' },
-  ),
-}));
 
 vi.mock('$store/renderer/slices/workspace-notes/workspace-notes-selectors', () => ({
   selectAllNotes: Object.assign(
@@ -104,7 +91,9 @@ describe('ChatMessage edit-and-regenerate confirm gate', () => {
 
     await fireEvent.click(screen.getByRole('button', { name: 'Edit & regenerate' }));
 
-    await waitFor(() => expect(onEditSubmit).toHaveBeenCalledWith('original text', undefined));
+    await waitFor(() =>
+      expect(onEditSubmit).toHaveBeenCalledWith('original text', undefined, undefined),
+    );
     // Confirming closes both the dialog and edit mode (the edit input exits
     // via a slide transition, so wait for its removal).
     expect(screen.queryByRole('dialog')).toBeNull();
@@ -131,13 +120,17 @@ describe('ChatMessage edit-and-regenerate confirm gate', () => {
     // Portaled out of the ChatMessage subtree (where ancestor overflow/
     // transforms clip the fixed overlay) into the body-level portal root.
     expect(container.contains(dialog)).toBe(false);
-    expect(dialog.closest('.portal-container')?.parentElement).toBe(document.body);
+    expect(dialog.parentElement).toBe(document.body);
     // Full overlay modal with both actions visible.
     expect(dialog.getAttribute('aria-modal')).toBe('true');
     expect(screen.getByRole('button', { name: 'Edit & regenerate' })).toBeTruthy();
     expect(screen.getByRole('button', { name: 'Cancel' })).toBeTruthy();
-    // Focus moves into the dialog on open — the wiring Escape relies on.
-    await waitFor(() => expect(document.activeElement).toBe(dialog));
+    // Destructive confirmation receives initial focus.
+    await waitFor(() =>
+      expect(document.activeElement).toBe(
+        screen.getByRole('button', { name: 'Edit & regenerate' }),
+      ),
+    );
   });
 
   it('Escape cancels back to edit mode with the draft intact', async () => {
@@ -148,23 +141,74 @@ describe('ChatMessage edit-and-regenerate confirm gate', () => {
 
     await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
     expect(onEditSubmit).not.toHaveBeenCalled();
-    expect(screen.getByTestId('mock-rich-input').getAttribute('data-value')).toBe(
-      'original text',
-    );
+    expect(screen.getByTestId('mock-rich-input').getAttribute('data-value')).toBe('original text');
   });
 
-  it('backdrop click cancels back to edit mode with the draft intact', async () => {
+  it('close affordance cancels back to edit mode with the draft intact', async () => {
     const onEditSubmit = vi.fn();
     await renderAndSave(onEditSubmit);
 
-    const backdrop = screen.getByRole('dialog').parentElement!;
-    expect(backdrop.getAttribute('role')).toBe('presentation');
-    await fireEvent.click(backdrop);
+    await fireEvent.click(screen.getByRole('button', { name: 'Close' }));
 
     await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
     expect(onEditSubmit).not.toHaveBeenCalled();
-    expect(screen.getByTestId('mock-rich-input').getAttribute('data-value')).toBe(
-      'original text',
+    expect(screen.getByTestId('mock-rich-input').getAttribute('data-value')).toBe('original text');
+  });
+
+  it('confirm threads attachment blocks (image + attachment-reference file) through onEditSubmit', async () => {
+    // Message carrying both an image block and an attachment-reference file
+    // block (PROTOCOL §5.5/§6.12): the edit restores them as context items
+    // and confirming must rebuild + forward BOTH block kinds — attachments
+    // survive edit/regenerate rather than being dropped to text+model.
+    const message: AgentMessage = {
+      id: 'msg-blocks',
+      role: 'user',
+      contentBlocks: [
+        { type: 'text', text: 'original text' },
+        { type: 'image', data: 'aW1n', mimeType: 'image/png' },
+        {
+          type: 'file',
+          attachmentId: 'att-uuid-9',
+          fileName: 'report.pdf',
+          mimeType: 'application/pdf',
+          size: 4096,
+        },
+      ],
+      timestamp: new Date('2026-01-01T12:00:00Z'),
+    } as AgentMessage;
+    const onEditSubmit = vi.fn();
+    render(ChatMessage, { props: { message, onEditSubmit } });
+
+    await fireEvent.click(screen.getByText('original text'));
+    await waitFor(() => expect(screen.getByTestId('mock-rich-input')).toBeTruthy());
+    await fireEvent.click(screen.getByTestId('mock-input-submit'));
+    await waitFor(() => expect(screen.getByRole('dialog')).toBeTruthy());
+    await fireEvent.click(screen.getByRole('button', { name: 'Edit & regenerate' }));
+
+    await waitFor(() =>
+      expect(onEditSubmit).toHaveBeenCalledWith('original text', undefined, {
+        imageBlocks: [{ type: 'image', data: 'aW1n', mimeType: 'image/png' }],
+        fileBlocks: [
+          {
+            type: 'file',
+            attachmentId: 'att-uuid-9',
+            fileName: 'report.pdf',
+            mimeType: 'application/pdf',
+            size: 4096,
+          },
+        ],
+      }),
+    );
+  });
+
+  it('confirm passes no blocks argument for a plain text message', async () => {
+    const onEditSubmit = vi.fn();
+    await renderAndSave(onEditSubmit);
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Edit & regenerate' }));
+
+    await waitFor(() =>
+      expect(onEditSubmit).toHaveBeenCalledWith('original text', undefined, undefined),
     );
   });
 });

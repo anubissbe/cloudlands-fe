@@ -1,4 +1,4 @@
-import type { Collection } from '$lib/store-shim/utils/collections/collection-utils';
+import type { Collection } from '@augmentcode/themis/utils/collections/collection-utils';
 import type { OnboardingStep } from '../onboarding/onboarding-types';
 
 export type WorkspaceInitializerRepoType = 'local' | 'github' | 'remote';
@@ -24,7 +24,6 @@ export interface WorkspaceInitializerRepoSelection {
   path: string;
   type: WorkspaceInitializerRepoType;
   githubUrl?: string;
-  clonePath?: string;
   isNewRepo?: boolean;
   isValidPath?: boolean;
   scope?: string;
@@ -43,6 +42,7 @@ export interface WorkspaceInitializerAgentSettings {
   selectedSpecialist?: string | null;
   selectedModel?: string;
   modelWasOverridden?: boolean;
+  selectedReasoningEffort?: string;
   isTeamMode?: boolean;
 }
 
@@ -50,7 +50,6 @@ export interface CompactWorkspaceInitializerFormState extends WorkspaceInitializ
   repoPath?: string;
   repoType?: WorkspaceInitializerRepoType;
   githubUrl?: string;
-  clonePath?: string;
   branch?: string;
   isNewRepo?: boolean;
   isValidPath?: boolean;
@@ -58,12 +57,7 @@ export interface CompactWorkspaceInitializerFormState extends WorkspaceInitializ
   scopeRepoPath?: string;
   remoteSetup?: WorkspaceInitializerRemoteSetup | null;
   selectedProvider?: string;
-  setupScript?: string;
-  showSetupScript?: boolean;
-  setupScriptName?: string;
-  isCustomSetupScript?: boolean;
   skipIsolation?: boolean;
-  stayOnHomePage?: boolean;
 }
 
 export interface WorkspaceInitializerOnboardingFormState {
@@ -73,14 +67,10 @@ export interface WorkspaceInitializerOnboardingFormState {
     branch?: string;
     scope?: string;
     githubUrl?: string;
-    clonePath?: string;
     projectName?: string;
     isValid?: boolean;
   } | null;
   skipIsolation?: boolean;
-  setupScript?: string;
-  setupScriptName?: string;
-  isCustomSetupScript?: boolean;
   /** User-picked model for the initial Coordinator agent (step 3 picker). */
   selectedModel?: string;
   /** Whether the user explicitly overrode the model (vs the auto-resolved default). */

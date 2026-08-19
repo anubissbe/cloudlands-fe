@@ -14,8 +14,8 @@
  * The UI localizes row labels off `kind`.
  */
 
-import { createAction } from '$lib/store-shim/utils/store/create-action';
-import { createReducer } from '$lib/store-shim/utils/store/create-reducer';
+import { createAction } from '@augmentcode/themis/utils/store/create-action';
+import { createReducer } from '@augmentcode/themis/utils/store/create-reducer';
 import type { Workspace, WorkspaceDisplayStatus } from '$shared/types';
 import { replaceWorkspaceList, setWorkspaceEntity } from '../workspace/workspace-slice';
 import {
@@ -69,6 +69,17 @@ export interface HudUsageTotals {
   outputTokens: number;
   cacheReadTokens: number;
   cacheCreationTokens: number;
+  thoughtTokens?: number;
+}
+
+export function sumHudUsageTotals(totals: HudUsageTotals): number {
+  return (
+    totals.inputTokens +
+    totals.outputTokens +
+    totals.cacheReadTokens +
+    totals.cacheCreationTokens +
+    (totals.thoughtTokens ?? 0)
+  );
 }
 
 /** One TOK/MIN chart sample — a trailing 24h hourly bucket. */
@@ -94,7 +105,12 @@ export interface HudRateHistorySample {
   /** UTC minute floor — wire ISO string, verbatim (`"2026-07-30T14:07:00Z"`). */
   bucketUtc: string;
   /** Sum of the four token counters in the minute bucket. */
-  tokens: number;
+  tokens?: number;
+  inputTokens?: number;
+  outputTokens?: number;
+  cacheReadTokens?: number;
+  cacheCreationTokens?: number;
+  thoughtTokens?: number;
 }
 
 export interface HudRateHistoryState {
@@ -148,17 +164,14 @@ export interface HudState {
   attentionByWorkspaceId: Record<string, HudAttentionFlag>;
   /** Live overrides from `workspace:displayStatus-changed`. */
   displayStatusByWorkspaceId: Record<string, WorkspaceDisplayStatus>;
-  /**
-   * Ids whose live override one entity delivery has already contradicted.
-   * Second-delivery guard for the override retirement — see
-   * `reconcileDisplayStatusOverride`.
-   */
   displayStatusOverridesContradicted: Record<string, true>;
   usage: HudUsageState | null;
   usageError: string | null;
   /** Per-minute TOK/MIN history from `stats.getRateHistory` (PROTOCOL §5.39). */
   rateHistory: HudRateHistoryState | null;
   rateHistoryError: string | null;
+  burnRatePerMin: number;
+  burnTrend: 'up' | 'down' | 'none';
   /** Latest captured clarifying question per agent (§7.1 trailingBlocks). */
   questionsByAgentId: Record<string, HudCapturedQuestion>;
   /** Header FLEET OPS repo + status grid filter (shared with the center grid). */
@@ -183,6 +196,8 @@ export const initialState: HudState = {
   usageError: null,
   rateHistory: null,
   rateHistoryError: null,
+  burnRatePerMin: 0,
+  burnTrend: 'none',
   questionsByAgentId: {},
   gridFilter: EMPTY_HUD_GRID_FILTER,
   takeoverRequestWorkspaceId: null,
@@ -219,7 +234,9 @@ export const hudQuestionCaptured = createAction<[question: HudCapturedQuestion]>
  * later user message supersedes the questions), so the captured question is
  * answered/moot and must stop pending everywhere.
  */
-export const hudQuestionSuperseded = createAction<[agentId: string]>('hud/questionSuperseded');
+export const hudQuestionsResolvedForWorkspace = createAction<[workspaceId: string]>(
+  'hud/questionsResolvedForWorkspace',
+);
 /** Header FLEET OPS repo pick (null = all workspaces). */
 export const hudGridFilterRepoPicked = createAction<[repo: string | null]>(
   'hud/gridFilterRepoPicked',
@@ -233,76 +250,57 @@ export const hudGridFilterStatesCleared = createAction('hud/gridFilterStatesClea
 
 // ── Reducer ──
 
-/**
- * Reconcile live `displayStatus` overrides against entities that just arrived
- * carrying a BE value.
- *
- * The override bridges the gap between a `workspace:displayStatus-changed`
- * event and the entity catching up, but nothing retired it, so a dropped
- * event left a stale override winning forever. Retirement cannot simply be
- * "an entity carries a value" though: neither delivery order nor entity
- * freshness is guaranteed. The daemon derives `displayStatus` at serve time
- * (PROTOCOL §5.1), so a `workspace.list` issued BEFORE the event can resolve
- * after it and carry the older value — clearing on that response would
- * reintroduce the very staleness the override exists to cover.
- *
- * Two-strike rule: the FIRST entity delivery that disagrees with an override
- * is assumed to be that in-flight response and only marks the override
- * contradicted; a SECOND disagreeing delivery retires it (an in-flight
- * response cannot predate the event twice, so by then the entity is the
- * fresher value). An entity that AGREES with the override retires it
- * immediately — the entity has caught up and the override is redundant — and
- * also clears the contradicted mark, since agreement proves the store is
- * current as of the override.
- */
-function reconcileDisplayStatusOverride(state: HudState, workspaces: readonly Workspace[]) {
+function reconcileDisplayStatusOverride(state: HudState, workspaces: readonly Workspace[]): HudState {
   let overrides = state.displayStatusByWorkspaceId;
   let contradicted = state.displayStatusOverridesContradicted;
   let changed = false;
-
   for (const workspace of workspaces) {
     const id = String(workspace.id);
     const override = overrides[id];
-    // An entity without a value carries nothing fresher — leave it alone.
     if (override === undefined || workspace.displayStatus === undefined) continue;
-
     const retire = workspace.displayStatus === override || contradicted[id] === true;
-    if (!retire) {
-      if (!changed) {
-        overrides = { ...overrides };
-        contradicted = { ...contradicted };
-        changed = true;
-      }
-      contradicted[id] = true;
-      continue;
-    }
     if (!changed) {
       overrides = { ...overrides };
       contradicted = { ...contradicted };
       changed = true;
     }
-    delete overrides[id];
-    delete contradicted[id];
+    if (retire) {
+      delete overrides[id];
+      delete contradicted[id];
+    } else {
+      contradicted[id] = true;
+    }
   }
-
-  if (!changed) return state;
-  return {
-    ...state,
-    displayStatusByWorkspaceId: overrides,
-    displayStatusOverridesContradicted: contradicted,
-  };
+  return changed
+    ? { ...state, displayStatusByWorkspaceId: overrides, displayStatusOverridesContradicted: contradicted }
+    : state;
 }
 
-export const hudReducer = createReducer<HudState>(initialState)
-  // Activation resets to a clean slate — the feed is live-only (no backfill).
-  .with(hudActivated, () => ({ ...initialState, active: true }))
-  .with(hudDeactivated, () => initialState)
-  .with(hudFeedEntryReceived, (state, { payload: [entry] }) => {
+export function computeBurnRatePerMin(samples: readonly HudRateHistorySample[]): number {
+  if (samples.length === 0) return 0;
+  const window = samples.slice(-5);
+  const sum = window.reduce((total, sample) => {
+    if (sample.tokens !== undefined) return total + sample.tokens;
+    return total + sumHudUsageTotals({
+      inputTokens: sample.inputTokens ?? 0,
+      outputTokens: sample.outputTokens ?? 0,
+      cacheReadTokens: sample.cacheReadTokens ?? 0,
+      cacheCreationTokens: sample.cacheCreationTokens ?? 0,
+      thoughtTokens: sample.thoughtTokens,
+    });
+  }, 0);
+  return Math.round(sum / Math.min(5, window.length));
+}
+
+export const hudReducer = createReducer<HudState>(initialState);
+hudReducer.with(hudActivated, () => ({ ...initialState, active: true }));
+hudReducer.with(hudDeactivated, () => initialState);
+hudReducer.with(hudFeedEntryReceived, (state, { payload: [entry] }) => {
     if (!state.active) return state;
     if (state.feed.some((existing) => existing.id === entry.id)) return state;
     return { ...state, feed: [entry, ...state.feed].slice(0, HUD_FEED_LIMIT) };
-  })
-  .with(hudAttentionChanged, (state, { payload: [workspaceId, attention, raisedAtTs] }) => {
+  });
+hudReducer.with(hudAttentionChanged, (state, { payload: [workspaceId, attention, raisedAtTs] }) => {
     // The wire field is single-valued, so any untracked value ("none" —
     // e.g. from `workspace.markSeen`) means no flag is currently raised:
     // clear. Tracked values are the HUD attention allowlist plus the
@@ -325,10 +323,8 @@ export const hudReducer = createReducer<HudState>(initialState)
         [workspaceId]: { attention, raisedAtTs },
       },
     };
-  })
-  .with(hudDisplayStatusChanged, (state, { payload: [workspaceId, displayStatus] }) => {
-    // A newer event restarts the two-strike count: entity deliveries that
-    // contradicted the PREVIOUS override say nothing about this one.
+  });
+hudReducer.with(hudDisplayStatusChanged, (state, { payload: [workspaceId, displayStatus] }) => {
     const contradicted = { ...state.displayStatusOverridesContradicted };
     delete contradicted[workspaceId];
     return {
@@ -339,54 +335,70 @@ export const hudReducer = createReducer<HudState>(initialState)
       },
       displayStatusOverridesContradicted: contradicted,
     };
-  })
-  // Entity deliveries reconcile the override (see `reconcileDisplayStatusOverride`).
-  .with(setWorkspaceEntity, (state, { payload: [workspace] }) =>
-    reconcileDisplayStatusOverride(state, [workspace]),
-  )
-  .with(replaceWorkspaceList, (state, { payload: [workspaces] }) =>
-    reconcileDisplayStatusOverride(state, workspaces),
-  )
-  .with(hudUsageLoaded, (state, { payload: [usage] }) => ({ ...state, usage, usageError: null }))
-  .with(hudUsageFailed, (state, { payload: [error] }) => ({ ...state, usageError: error }))
-  .with(hudRateHistoryLoaded, (state, { payload: [rateHistory] }) => ({
-    ...state,
-    rateHistory,
-    rateHistoryError: null,
-  }))
-  .with(hudRateHistoryFailed, (state, { payload: [error] }) => ({
+  });
+hudReducer.with(setWorkspaceEntity, (state, { payload: [workspace] }) =>
+  reconcileDisplayStatusOverride(state, [workspace]),
+);
+hudReducer.with(replaceWorkspaceList, (state, { payload: [workspaces] }) =>
+  reconcileDisplayStatusOverride(state, workspaces),
+);
+hudReducer.with(hudUsageLoaded, (state, { payload: [usage] }) => ({ ...state, usage, usageError: null }));
+hudReducer.with(hudUsageFailed, (state, { payload: [error] }) => ({ ...state, usageError: error }));
+hudReducer.with(hudRateHistoryLoaded, (state, { payload: [rateHistory] }) => {
+    const incomingNewest = rateHistory.samples.at(-1)?.bucketUtc;
+    const storedNewest = state.rateHistory?.samples.at(-1)?.bucketUtc;
+    if (incomingNewest !== undefined && storedNewest !== undefined && incomingNewest < storedNewest) {
+      return state;
+    }
+    const burnRatePerMin = computeBurnRatePerMin(rateHistory.samples);
+    return {
+      ...state,
+      rateHistory,
+      rateHistoryError: null,
+      burnRatePerMin,
+      burnTrend:
+        state.rateHistory === null
+          ? 'none'
+          : burnRatePerMin > state.burnRatePerMin
+            ? 'up'
+            : burnRatePerMin < state.burnRatePerMin
+              ? 'down'
+              : 'none',
+    };
+  });
+hudReducer.with(hudRateHistoryFailed, (state, { payload: [error] }) => ({
     ...state,
     rateHistoryError: error,
-  }))
-  .with(hudTakeoverRequested, (state, { payload: [workspaceId] }) =>
+  }));
+hudReducer.with(hudTakeoverRequested, (state, { payload: [workspaceId] }) =>
     state.takeoverRequestWorkspaceId === workspaceId
       ? state
       : { ...state, takeoverRequestWorkspaceId: workspaceId },
-  )
-  .with(hudTakeoverRequestCleared, (state) =>
+  );
+hudReducer.with(hudTakeoverRequestCleared, (state) =>
     state.takeoverRequestWorkspaceId === null
       ? state
       : { ...state, takeoverRequestWorkspaceId: null },
-  )
-  .with(hudQuestionCaptured, (state, { payload: [question] }) => {
+  );
+hudReducer.with(hudQuestionCaptured, (state, { payload: [question] }) => {
     if (!state.active) return state;
     return {
       ...state,
       questionsByAgentId: { ...state.questionsByAgentId, [question.agentId]: question },
     };
-  })
-  .with(hudQuestionSuperseded, (state, { payload: [agentId] }) => {
-    if (!(agentId in state.questionsByAgentId)) return state;
-    const next = { ...state.questionsByAgentId };
-    delete next[agentId];
-    return { ...state, questionsByAgentId: next };
-  })
-  .with(hudGridFilterRepoPicked, (state, { payload: [repo] }) =>
+  });
+hudReducer.with(hudQuestionsResolvedForWorkspace, (state, { payload: [workspaceId] }) => {
+    const entries = Object.entries(state.questionsByAgentId);
+    const kept = entries.filter(([, question]) => question.workspaceId !== workspaceId);
+    if (kept.length === entries.length) return state;
+    return { ...state, questionsByAgentId: Object.fromEntries(kept) };
+  });
+hudReducer.with(hudGridFilterRepoPicked, (state, { payload: [repo] }) =>
     state.gridFilter.repo === repo
       ? state
       : { ...state, gridFilter: { ...state.gridFilter, repo } },
-  )
-  .with(hudGridFilterStateToggled, (state, { payload: [stateKey] }) => ({
+  );
+hudReducer.with(hudGridFilterStateToggled, (state, { payload: [stateKey] }) => ({
     ...state,
     gridFilter: {
       ...state.gridFilter,
@@ -394,8 +406,8 @@ export const hudReducer = createReducer<HudState>(initialState)
         ? state.gridFilter.states.filter((existing) => existing !== stateKey)
         : [...state.gridFilter.states, stateKey],
     },
-  }))
-  .with(hudGridFilterStatesCleared, (state) =>
+  }));
+hudReducer.with(hudGridFilterStatesCleared, (state) =>
     state.gridFilter.states.length === 0
       ? state
       : { ...state, gridFilter: { ...state.gridFilter, states: [] } },

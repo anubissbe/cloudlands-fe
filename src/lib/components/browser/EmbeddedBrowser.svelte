@@ -8,43 +8,40 @@
    * - Loading indicator
    * - Error handling
    */
-  import {
-  onMount,
-  tick,
-} from 'svelte';
+  import { onMount, tick } from 'svelte';
   import { createLogger } from '$lib/utils/client-logger';
   import { hasCapability } from '$lib/utils/platform-capabilities';
   import { Button } from '$lib/components/ui/button';
   import { toast } from '$lib/components/ui/toast';
   import { invoke } from '$shared/generated/ipc-client';
-  import {
-  BROWSER_PANEL_PARTITION,
-  BROWSER_PROTOCOLS,
-} from '../../../shared/constants';
+  import { BROWSER_PANEL_PARTITION, BROWSER_PROTOCOLS } from '../../../shared/constants';
   import { writeTextToClipboard } from '$lib/utils/clipboard';
 
   import {
-  addRecentUrl,
-  clearBrowserTabZoomRequest,
-  updateUrlMetadata,
-} from '$store/renderer/slices/browser/browser-slice';
+    addRecentUrl,
+    clearBrowserTabZoomRequest,
+    updateUrlMetadata,
+  } from '$store/renderer/slices/browser/browser-slice';
   import { selectPendingBrowserZoom } from '$store/renderer/slices/browser/browser-selectors';
   import {
-  createEmbeddedBrowserNavigationSyncState,
-  reconcileEmbeddedBrowserUrlProp,
-  recordEmbeddedBrowserNavigation,
-} from './embedded-browser-navigation-sync';
+    createEmbeddedBrowserNavigationSyncState,
+    navigateEmbeddedBrowserWebview,
+    reconcileEmbeddedBrowserLoadCompletion,
+    reconcileEmbeddedBrowserUrlProp,
+    recordEmbeddedBrowserNavigation,
+  } from './embedded-browser-navigation-sync';
+  import { isValidBrowserUrl } from './embedded-browser-url-validation';
   import Fa from 'svelte-fa';
   import {
-  faArrowLeft,
-  faArrowRight,
-  faRefresh,
-  faExternalLinkAlt,
-  faLock,
-  faExclamationTriangle,
-  faTimes,
-  faCode,
-} from '@fortawesome/free-solid-svg-icons';
+    faArrowLeft,
+    faArrowRight,
+    faRefresh,
+    faExternalLinkAlt,
+    faLock,
+    faExclamationTriangle,
+    faTimes,
+    faCode,
+  } from '@fortawesome/free-solid-svg-icons';
   import Input from '../ui/input/input.svelte';
   import { store as appStore } from '$store/renderer/store';
   import { m } from '$shared/paraglide/messages.js';
@@ -53,42 +50,6 @@
 
   // Use shared protocol constants — single source of truth in src/shared/constants.ts
   const ALLOWED_PROTOCOLS = BROWSER_PROTOCOLS.NAVIGATION_ALLOWED;
-
-  // Check if URL is valid and safe to load
-  // - Must use an allowed protocol (see BROWSER_PROTOCOLS.NAVIGATION_ALLOWED)
-  // - Must not be the app's own URL
-  // Defined early so it can be used during state initialization
-  function isValidBrowserUrl(targetUrl: string): boolean {
-    if (!targetUrl) {
-      logger.debug('isValidBrowserUrl: empty URL');
-      return false;
-    }
-    try {
-      const parsedUrl = new URL(targetUrl);
-      // Block dangerous protocols
-      if (!ALLOWED_PROTOCOLS.includes(parsedUrl.protocol)) {
-        logger.debug('isValidBrowserUrl: blocked protocol', {
-          url: targetUrl,
-          protocol: parsedUrl.protocol,
-        });
-        return false;
-      }
-      // Don't allow loading the app itself
-      const appOrigin = typeof window !== 'undefined' ? window.location.origin : '';
-      const isValid = parsedUrl.origin !== appOrigin;
-      if (!isValid) {
-        logger.debug('isValidBrowserUrl: URL matches app origin', {
-          url: targetUrl,
-          appOrigin,
-          urlOrigin: parsedUrl.origin,
-        });
-      }
-      return isValid;
-    } catch (e) {
-      logger.debug('isValidBrowserUrl: URL parse error', { url: targetUrl, error: e });
-      return false;
-    }
-  }
 
   interface Props {
     url: string;
@@ -104,6 +65,8 @@
     focusUrlBarOnMount?: boolean;
     /** Whether this browser panel is the focused panel (for handling global shortcuts like Cmd+R) */
     isFocused?: boolean;
+    /** Whether this tab is visible; inactive cached tabs remain mounted but muted. */
+    isActive?: boolean;
   }
 
   let {
@@ -117,13 +80,14 @@
     onFocus,
     focusUrlBarOnMount = false,
     isFocused = false,
+    isActive = true,
   }: Props = $props();
-
 
   // Reactive readable for per-tab pending zoom requests dispatched by the
   // menu zoom sagas. The selector form (called at component init) returns a
   // Svelte readable that updates only when the selected slice value changes,
   // so the $effect below is not woken by unrelated dispatches.
+  // svelte-ignore state_referenced_locally - selector readables must be created at component init; tabId/workspaceId are stable per panel
   const pendingZoom$ = tabId ? selectPendingBrowserZoom(_workspaceId, tabId) : null;
 
   // Log the URL prop on mount and changes
@@ -192,6 +156,7 @@
         setZoomLevel: (level: number) => void;
         getZoomFactor: () => number;
         setZoomFactor: (factor: number) => void;
+        setAudioMuted?: (muted: boolean) => void;
       })
     | null = $state(null);
   // displayUrl tracks the URL shown in the URL bar - can differ from prop `url` after navigation
@@ -208,16 +173,30 @@
   // Flag to hide webview during URL switch to force recreation
   let isRecreatingWebview = $state(false);
 
-  // Track the current URL that the webview should load
-  // Initialize from url prop if valid, otherwise use about:blank
-  // This ensures the webview starts with the correct URL on first render
+  // Track the current URL that the webview should load.
+  // Initialize from url prop if valid, otherwise use about:blank. The browser
+  // loads exactly the URL it is given — programmatic entry points (script
+  // URLs, terminal links) resolve loopback URLs BEFORE opening a tab, and
+  // user-typed address-bar URLs load literally (intent-hq/monorepo#2404).
   // svelte-ignore state_referenced_locally - intentional: we want initial value, effect syncs later changes
   let currentWebviewUrl = $state<string>(isValidBrowserUrl(url) ? url : 'about:blank');
+
+  // Cached browser tabs stay mounted to preserve page state. Keep inactive
+  // guests silent while Chromium applies its normal background throttling.
+  $effect(() => {
+    if (!webviewRef) return;
+    try {
+      webviewRef.setAudioMuted?.(!isActive);
+    } catch {
+      // WebView may have been detached between the reactive update and call.
+    }
+  });
 
   // Track the previous URL prop value to detect when it changes externally.
   // This is intentionally non-reactive: navigation event handlers update it as
   // bookkeeping before notifying the parent, and those writes must not wake the
   // prop-change effect or they can cause a redundant webview load/reload.
+  // svelte-ignore state_referenced_locally - intentional initial capture (see comment above)
   const navigationSync = createEmbeddedBrowserNavigationSyncState(url);
 
   // Focus URL bar on mount if requested
@@ -240,7 +219,10 @@
   // IMPORTANT: Only triggers when the PROP changes, not when user navigates internally
   $effect(() => {
     const decision = reconcileEmbeddedBrowserUrlProp(navigationSync, url, {
-      webviewReady,
+      // `|| !webviewRef` keeps prop-driven navigations alive when no webview
+      // is mounted (about:blank / invalid current URL): loadUrl's no-webview
+      // branch recreates the webview with the new URL.
+      webviewReady: webviewReady || !webviewRef,
       isValidBrowserUrl,
     });
 
@@ -474,8 +456,8 @@
       // Clean up webview listeners
       cleanupWebviewListeners();
       // NOTE: We intentionally do NOT unregister the tab from CDP here.
-      // The component may unmount due to tab caching (Panel.svelte evicts
-      // inactive tabs after 30s), but the webview/tab still exists.
+      // The component may unmount when its panel cache entry expires, but the
+      // backend filters destroyed webContents from tab discovery.
       // The backend's listTabs() filters out destroyed webContents,
       // so stale entries are automatically cleaned up.
     };
@@ -510,10 +492,13 @@
 
     addWebviewListener('did-stop-loading', () => {
       isLoading = false;
+      webviewReady = true;
+      syncCompletedWebviewNavigation(displayUrl);
       updateNavigationState();
     });
 
-    // Navigation events
+    // Navigation events - the webview reports the URL it actually loaded,
+    // which is exactly what the address bar shows.
     addWebviewListener('did-navigate', (e: any) => {
       displayUrl = e.url;
       isSecure = e.url?.startsWith('https://');
@@ -629,6 +614,18 @@
     }
   }
 
+  function syncCompletedWebviewNavigation(requestedUrl: string) {
+    const completedUrl = reconcileEmbeddedBrowserLoadCompletion(
+      navigationSync,
+      requestedUrl,
+      webviewRef?.getURL?.(),
+    );
+    if (!completedUrl) return;
+    displayUrl = completedUrl;
+    isSecure = completedUrl.startsWith('https://');
+    onNavigate?.(completedUrl);
+  }
+
   async function loadUrl(targetUrl: string) {
     if (!targetUrl) return;
 
@@ -665,13 +662,22 @@
         webviewReady,
       });
 
-      // If webview is ready, navigate directly to preserve history (back/forward)
-      // Only recreate webview on initial load or when webview isn't ready
-      if (webviewRef && webviewReady) {
+      // An attached webview must navigate through loadURL so Electron emits
+      // did-navigate and the owning panel can persist the new URL. dom-ready
+      // can fire before our listener is installed, so webviewReady is not a
+      // reliable gate for choosing this path.
+      if (webviewRef) {
         // Navigate within the existing webview to preserve navigation history
-        logger.info('loadUrl: setting webviewRef.src', { targetUrl });
-        webviewRef.src = targetUrl;
-        currentWebviewUrl = targetUrl;
+        logger.info('loadUrl: calling webviewRef.loadURL', { targetUrl });
+        const currentWebview = webviewRef;
+        void navigateEmbeddedBrowserWebview(currentWebview, targetUrl)
+          .then(() => {
+            syncCompletedWebviewNavigation(targetUrl);
+            updateNavigationState();
+          })
+          .catch((error) => {
+            logger.warn('Webview navigation failed', { targetUrl, error });
+          });
       } else {
         // Initial load or webview not ready - recreate the webview
         // This is needed for the first URL or when recovering from errors
@@ -787,7 +793,9 @@
       }
       logger.info('Loading URL from form', { urlToLoad });
       loadUrl(urlToLoad);
-      appStore.dispatch(addRecentUrl(_workspaceId, urlToLoad, undefined, undefined, new Date().toISOString()));
+      appStore.dispatch(
+        addRecentUrl(_workspaceId, urlToLoad, undefined, undefined, new Date().toISOString()),
+      );
       // Blur the input to indicate the action was taken
       urlInputRef?.blur();
     }
@@ -898,7 +906,7 @@
   <!-- Error banner -->
   {#if errorMessage}
     <div
-      class="flex items-center gap-2 px-3 py-2 bg-destructive/10 text-destructive-foreground text-sm border-b border-destructive/20"
+      class="flex items-center gap-2 px-3 py-2 bg-destructive/10 text-error-foreground text-sm border-b border-destructive/20"
     >
       <Fa icon={faExclamationTriangle} />
       <span>{errorMessage}</span>

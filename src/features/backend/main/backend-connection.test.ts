@@ -7,10 +7,13 @@
  * so the adapter's newline framing + event-push path exercise the same code
  * a live daemon would.
  */
+import crypto from 'node:crypto';
+import https from 'node:https';
 import { createRequire } from 'node:module';
 import type { AddressInfo } from 'node:net';
+import os from 'node:os';
 import path from 'node:path';
-import type { Duplex } from 'node:stream';
+import { Duplex } from 'node:stream';
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 
 import {
@@ -18,14 +21,19 @@ import {
   shouldIsolateDevIntentdDataDir,
 } from '../../../main/utils/resolve-dev-instance';
 import {
-  DEFAULT_DEV_WS_URL,
+  AuthRejectedError,
+  candidateWssHosts,
+  captureFingerprint,
+  createBackendSocket,
   defaultSocketPath,
   describeBackendConfig,
+  normalizeFingerprint,
+  PinMismatchError,
+  raceDuplexSockets,
   resolveBackendConfig,
   WebSocketDuplex,
 } from './backend-connection';
 import { resolveSocketPath } from './intentd-sidecar';
-import { shouldSpawnSidecar } from './intentd-spawn-policy';
 import { isWindowsPipePath, toLocalEndpoint, windowsPipeName } from './intentd-pipe-name';
 import { JsonRpcClient } from './json-rpc-client';
 
@@ -74,9 +82,9 @@ describe('resolveBackendConfig precedence', () => {
     expect(config.tls).toBe(false);
   });
 
-  it('defaults dev builds without sidecar to the loopback WebSocket URL', () => {
+  it('defaults dev builds without sidecar to the installed daemon UDS', () => {
     const config = resolveBackendConfig({}, { isDev: true });
-    expect(config).toEqual({ transport: 'ws', wsUrl: DEFAULT_DEV_WS_URL });
+    expect(config).toEqual({ transport: 'uds', socketPath: defaultSocketPath({}) });
   });
 
   it('defaults dev+sidecar (INTENTD_SIDECAR=1) to the UDS transport', () => {
@@ -92,9 +100,9 @@ describe('resolveBackendConfig precedence', () => {
     expect(config).toEqual({ transport: 'uds', socketPath: '/tmp/dev-seat/intentd.sock' });
   });
 
-  it('dev+INTENTD_SIDECAR=0 stays on the loopback WebSocket default', () => {
+  it('dev+INTENTD_SIDECAR=0 still adopts the default UDS without a transport override', () => {
     const config = resolveBackendConfig({ INTENTD_SIDECAR: '0' }, { isDev: true });
-    expect(config).toEqual({ transport: 'ws', wsUrl: DEFAULT_DEV_WS_URL });
+    expect(config).toEqual({ transport: 'uds', socketPath: defaultSocketPath({}) });
   });
 
   it('defaults packaged builds to the dev UDS path (backward compatible)', () => {
@@ -193,12 +201,43 @@ describe('win32 named-pipe derivation (pipe-name contract)', () => {
   });
 });
 
-describe('resolveBackendConfig × shouldSpawnSidecar pinning', () => {
-  // These two functions must not be able to disagree on whether the dev
-  // build is talking to a sidecar-spawned intentd over UDS or to an external
-  // dev-daemon over the loopback WebSocket. If a future change to
-  // `shouldSpawnSidecar` widens/narrows the spawn set, this test fails until
-  // `resolveBackendConfig` is updated to match.
+describe('defaultSocketPath platform defaults (no INTENTD_DATA_DIR)', () => {
+  // Mirrors the daemon's `Config::resolve` data-dir defaults — see
+  // `intentd-data-dir.ts` (the single FE-side resolver).
+  it('darwin resolves ~/Library/Application Support/intentd/intentd.sock', () => {
+    expect(defaultSocketPath({}, 'darwin')).toBe(
+      path.join(os.homedir(), 'Library', 'Application Support', 'intentd', 'intentd.sock'),
+    );
+  });
+
+  it('linux falls back to ~/.local/share/intentd/intentd.sock', () => {
+    expect(defaultSocketPath({}, 'linux')).toBe(
+      path.join(os.homedir(), '.local', 'share', 'intentd', 'intentd.sock'),
+    );
+  });
+
+  it('linux honors XDG_DATA_HOME', () => {
+    expect(defaultSocketPath({ XDG_DATA_HOME: '/xdg/data' }, 'linux')).toBe(
+      path.join('/xdg/data', 'intentd', 'intentd.sock'),
+    );
+  });
+
+  it('linux INTENTD_DATA_DIR takes precedence over XDG_DATA_HOME', () => {
+    expect(
+      defaultSocketPath({ INTENTD_DATA_DIR: '/custom/data', XDG_DATA_HOME: '/xdg/data' }, 'linux'),
+    ).toBe('/custom/data/intentd.sock');
+  });
+
+  it('stays in lockstep with the sidecar resolver on every platform', () => {
+    for (const platform of ['darwin', 'linux', 'win32'] as const) {
+      expect(defaultSocketPath({}, platform)).toBe(resolveSocketPath({}, platform));
+    }
+  });
+});
+
+describe('resolveBackendConfig build/spawn posture', () => {
+  // Spawn policy decides whether Electron launches intentd, not how the local
+  // client addresses it. Every zero-config posture adopts the canonical UDS.
   const matrix: Array<{ name: string; env: NodeJS.ProcessEnv }> = [
     { name: 'no env', env: {} },
     { name: 'INTENTD_SIDECAR=1', env: { INTENTD_SIDECAR: '1' } },
@@ -210,16 +249,9 @@ describe('resolveBackendConfig × shouldSpawnSidecar pinning', () => {
   ];
 
   for (const { name, env } of matrix) {
-    it(`dev+${name}: transport matches spawn policy`, () => {
+    it(`dev+${name}: uses the canonical UDS`, () => {
       const config = resolveBackendConfig(env, { isDev: true });
-      const decision = shouldSpawnSidecar(env, /* isPackaged */ false);
-      if (decision.shouldSpawn) {
-        expect(config.transport).toBe('uds');
-        expect(config.socketPath).toBe(defaultSocketPath(env));
-      } else {
-        expect(config.transport).toBe('ws');
-        expect(config.wsUrl).toBe(DEFAULT_DEV_WS_URL);
-      }
+      expect(config).toEqual({ transport: 'uds', socketPath: defaultSocketPath(env) });
     });
   }
 
@@ -251,7 +283,6 @@ describe('resolveBackendConfig × shouldSpawnSidecar pinning', () => {
   ];
   for (const { name, env, expectTransport } of overrides) {
     it(`dev+${name} override: sidecar suppressed AND transport is the override`, () => {
-      expect(shouldSpawnSidecar(env, false).shouldSpawn).toBe(false);
       expect(resolveBackendConfig(env, { isDev: true }).transport).toBe(expectTransport);
     });
   }
@@ -273,6 +304,15 @@ describe('dev intentd data-dir isolation × resolveBackendConfig', () => {
     }
     return next;
   }
+
+  it('connect-only dev uses the existing global daemon socket', () => {
+    const env = applyDevIsolation({ DEV_PORT: '5190' }, true);
+    expect(env.INTENTD_DATA_DIR).toBeUndefined();
+    expect(resolveBackendConfig(env, { isDev: true })).toEqual({
+      transport: 'uds',
+      socketPath: defaultSocketPath({}),
+    });
+  });
 
   it('dev+sidecar with no INTENTD_* env resolves the per-port UDS socket', () => {
     const env = applyDevIsolation({ INTENTD_SIDECAR: '1', DEV_PORT: '5190' }, true);
@@ -360,6 +400,30 @@ describe('describeBackendConfig', () => {
     expect(describeBackendConfig({ transport: 'tcp', host: 'h', port: 2, tls: false })).toBe(
       'tcp:h:2',
     );
+  });
+
+  it('renders wss without leaking the token or fingerprint into logs', () => {
+    expect(
+      describeBackendConfig({
+        transport: 'wss',
+        host: '10.0.0.9',
+        port: 5181,
+        token: 'super-secret',
+        fingerprint: 'AB:CD',
+      }),
+    ).toBe('wss:10.0.0.9:5181');
+  });
+});
+
+describe('createBackendSocket security boundary', () => {
+  it('fails closed for the unfinished legacy TCP/TLS transport', () => {
+    expect(() =>
+      createBackendSocket({ transport: 'tcp', host: 'remote.example', port: 6000, tls: true }),
+    ).toThrow('Legacy INTENTD_TCP transport is disabled');
+
+    expect(() =>
+      createBackendSocket({ transport: 'tcp', host: 'remote.example', port: 6000, tls: false }),
+    ).toThrow('Legacy INTENTD_TCP transport is disabled');
   });
 });
 
@@ -532,5 +596,628 @@ describe('WebSocketDuplex framing adapter (loopback ws://)', () => {
     await vi.waitFor(() => expect(echoes).toHaveLength(1));
     expect(JSON.parse(echoes[0])).toMatchObject({ id: 1, method: 'system.status' });
     duplex.destroy();
+  });
+});
+
+// Self-signed EC (P-256) cert + key, generated once with openssl and pinned
+// here so the fake daemon presents a stable identity whose fingerprint the
+// pinning tests can derive (via `crypto.X509Certificate`) rather than hardcode.
+//   subject/issuer CN=localhost, SAN DNS:localhost + IP:127.0.0.1, 10y validity.
+const WSS_CERT_PEM = Buffer.from(
+  'LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1JSUJtVENDQVQrZ0F3SUJBZ0lVWVlzc05zWkxXdTZXZXdkb2p6UlpFY3k0LzRzd0NnWUlLb1pJemowRUF3SXcKRkRFU01CQUdBMVVFQXd3SmJHOWpZV3hvYjNOME1CNFhEVEkyTURnd056QXhOVGt6TkZvWERUTTJNRGd3TkRBeApOVGt6TkZvd0ZERVNNQkFHQTFVRUF3d0piRzlqWVd4b2IzTjBNRmt3RXdZSEtvWkl6ajBDQVFZSUtvWkl6ajBECkFRY0RRZ0FFSlkvM2I0RHdRQXAyVVdIay84SGljZEFxaVdXL0pBVnRtMkRFbmUrZ3RBa0daVmo1VGlYUDZBREkKeXltbEc0bWRWU25QVUtXS2NUYmFxT3NWZVVGd2Y2TnZNRzB3SFFZRFZSME9CQllFRk80WTZBc2c2NEJVV1RhQgo2SzBUeDgvczR2S21NQjhHQTFVZEl3UVlNQmFBRk80WTZBc2c2NEJVV1RhQjZLMFR4OC9zNHZLbU1BOEdBMVVkCkV3RUIvd1FGTUFNQkFmOHdHZ1lEVlIwUkJCTXdFWUlKYkc5allXeG9iM04waHdSL0FBQUJNQW9HQ0NxR1NNNDkKQkFNQ0EwZ0FNRVVDSVFET3hKTXBKcy9DcmQwOG95U2tGdVRueVo0c3VqVklvL3BDK1RVWUpRMEY5UUlnU2pvagppWG56RlZ0Q1U0Wll2VWFtRkc0bFNUYmlQano5QXlubWxpSkI1a289Ci0tLS0tRU5EIENFUlRJRklDQVRFLS0tLS0K',
+  'base64',
+).toString('utf8');
+
+const WSS_KEY_PEM = Buffer.from(
+  'LS0tLS1CRUdJTiBFQyBQQVJBTUVURVJTLS0tLS0KQmdncWhrak9QUU1CQnc9PQotLS0tLUVORCBFQyBQQVJBTUVURVJTLS0tLS0KLS0tLS1CRUdJTiBFQyBQUklWQVRFIEtFWS0tLS0tCk1IY0NBUUVFSVBLTnFYZll2aEdqbDErMmNpMmEyOFZDNC9BbTVWLzBOV1JvS0cxeWlLbWFvQW9HQ0NxR1NNNDkKQXdFSG9VUURRZ0FFSlkvM2I0RHdRQXAyVVdIay84SGljZEFxaVdXL0pBVnRtMkRFbmUrZ3RBa0daVmo1VGlYUAo2QURJeXltbEc0bWRWU25QVUtXS2NUYmFxT3NWZVVGd2Z3PT0KLS0tLS1FTkQgRUMgUFJJVkFURSBLRVktLS0tLQo=',
+  'base64',
+).toString('utf8');
+
+/**
+ * Fake WSS daemon: an HTTPS server presenting the pinned self-signed cert with
+ * a `ws` upgrade handler that mirrors `FakeWsDaemon` (one JSON envelope per text
+ * frame). Records the bearer token seen on the upgrade so the auth-header test
+ * can assert it.
+ */
+class FakeWssDaemon {
+  private server!: https.Server;
+  private wss!: import('ws').WebSocketServer;
+  host = '127.0.0.1';
+  port = 0;
+  fingerprint = '';
+  lastAuthHeader: string | undefined;
+  handler: (req: {
+    id?: number | string;
+    method: string;
+    params?: unknown;
+  }) => { result?: unknown; error?: { code: number; message: string } } | undefined = () => ({
+    result: null,
+  });
+  private clients: import('ws').WebSocket[] = [];
+
+  async start(): Promise<void> {
+    this.fingerprint = new crypto.X509Certificate(WSS_CERT_PEM).fingerprint256;
+    this.server = https.createServer({ cert: WSS_CERT_PEM, key: WSS_KEY_PEM });
+    this.wss = new WebSocketServer({ server: this.server });
+    this.wss.on('connection', (socket, req) => {
+      this.lastAuthHeader = req.headers.authorization;
+      this.clients.push(socket);
+      socket.on('message', (data, isBinary) => {
+        if (isBinary) return;
+        const text = Buffer.isBuffer(data) ? data.toString('utf8') : String(data);
+        const req2 = JSON.parse(text) as { id?: number | string; method: string; params?: unknown };
+        const outcome = this.handler(req2);
+        if (!outcome) return;
+        socket.send(JSON.stringify({ jsonrpc: '2.0', id: req2.id, ...outcome }));
+      });
+    });
+    await new Promise<void>((res) => this.server.listen(0, '127.0.0.1', () => res()));
+    this.port = (this.server.address() as AddressInfo).port;
+  }
+
+  async stop(): Promise<void> {
+    for (const c of this.clients) c.terminate();
+    await new Promise<void>((res) => this.wss.close(() => res()));
+    await new Promise<void>((res) => this.server.close(() => res()));
+  }
+}
+
+describe('WSS pinned transport (fingerprint + bearer token)', () => {
+  let daemon: FakeWssDaemon;
+  const TOKEN = 'a'.repeat(64);
+
+  beforeAll(async () => {
+    daemon = new FakeWssDaemon();
+    await daemon.start();
+  });
+
+  afterAll(async () => {
+    await daemon.stop();
+  });
+
+  afterEach(() => {
+    daemon.handler = () => ({ result: null });
+  });
+
+  it('connects, pins the matching fingerprint, and speaks JSON-RPC framing', async () => {
+    daemon.handler = (req) => {
+      if (req.method === 'workspace.list') return { result: { workspaces: ['x'] } };
+      return { error: { code: -32601, message: 'no such method' } };
+    };
+    const client = new JsonRpcClient({
+      config: {
+        transport: 'wss',
+        host: daemon.host,
+        port: daemon.port,
+        token: TOKEN,
+        fingerprint: daemon.fingerprint,
+      },
+      heartbeatIntervalMs: 0,
+      requestTimeoutMs: 2000,
+    });
+    client.on('error', () => {});
+    await expect(client.request('workspace.list')).resolves.toEqual({ workspaces: ['x'] });
+    // Bearer token presented on the upgrade (PROTOCOL §2.1).
+    expect(daemon.lastAuthHeader).toBe(`Bearer ${TOKEN}`);
+    client.dispose();
+  });
+
+  it('pins a case/separator-variant fingerprint (normalization)', async () => {
+    daemon.handler = () => ({ result: 'ok' });
+    // Same fingerprint, lowercased with the colons stripped — must still match.
+    const messyPin = daemon.fingerprint.replace(/:/g, '').toLowerCase();
+    const client = new JsonRpcClient({
+      config: {
+        transport: 'wss',
+        host: daemon.host,
+        port: daemon.port,
+        token: TOKEN,
+        fingerprint: messyPin,
+      },
+      heartbeatIntervalMs: 0,
+      requestTimeoutMs: 2000,
+    });
+    client.on('error', () => {});
+    await expect(client.request('system.status')).resolves.toBe('ok');
+    client.dispose();
+  });
+
+  it('rejects a fingerprint mismatch with a distinct PinMismatchError', async () => {
+    const wrong = Array.from({ length: 32 }, () => 'FF').join(':');
+    const client = new JsonRpcClient({
+      config: {
+        transport: 'wss',
+        host: daemon.host,
+        port: daemon.port,
+        token: TOKEN,
+        fingerprint: wrong,
+      },
+      heartbeatIntervalMs: 0,
+      requestTimeoutMs: 2000,
+      // Keep the client from re-dialing mid-assertion.
+      reconnectDelayMs: 10_000,
+    });
+    const errors: Error[] = [];
+    client.on('error', (e) => errors.push(e));
+    await expect(client.request('system.status')).rejects.toBeInstanceOf(PinMismatchError);
+    expect(errors.some((e) => e instanceof PinMismatchError)).toBe(true);
+    const mismatch = errors.find((e): e is PinMismatchError => e instanceof PinMismatchError);
+    expect(mismatch?.actual).toBe(daemon.fingerprint);
+    expect(mismatch?.expected).toBe(wrong);
+    expect(client.getStatus()).toBe('disconnected');
+    client.dispose();
+  });
+
+  it('captureFingerprint returns the presented fingerprint for TOFU', async () => {
+    const result = await captureFingerprint({
+      host: daemon.host,
+      port: daemon.port,
+      token: TOKEN,
+    });
+    expect(result).toEqual({ ok: true, fingerprint: daemon.fingerprint, tokenValid: true });
+  });
+
+  it('captureFingerprint surfaces a structured error when the host is unreachable', async () => {
+    // 127.0.0.1:1 is guaranteed refused.
+    const result = await captureFingerprint(
+      { host: '127.0.0.1', port: 1, token: TOKEN },
+      { timeoutMs: 1000 },
+    );
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.code).toBe('connect-failed');
+  });
+});
+
+/**
+ * TLS server that REJECTS every WebSocket upgrade with a fixed HTTP status —
+ * the daemon's auth-rejection shape (PROTOCOL §2.1: 401 bad token, 403 WS API
+ * disabled). Presents the same pinned cert as {@link FakeWssDaemon} so only
+ * the upgrade outcome differs.
+ */
+class RejectingWssDaemon {
+  private server!: https.Server;
+  host = '127.0.0.1';
+  port = 0;
+  fingerprint = '';
+  statusCode = 401;
+  /** Number of upgrade attempts observed (for reconnect-halt assertions). */
+  upgradeAttempts = 0;
+
+  async start(): Promise<void> {
+    this.fingerprint = new crypto.X509Certificate(WSS_CERT_PEM).fingerprint256;
+    this.server = https.createServer({ cert: WSS_CERT_PEM, key: WSS_KEY_PEM });
+    this.server.on('upgrade', (_req, socket) => {
+      this.upgradeAttempts += 1;
+      socket.write(
+        `HTTP/1.1 ${this.statusCode} Rejected\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`,
+      );
+      socket.destroy();
+    });
+    await new Promise<void>((res) => this.server.listen(0, '127.0.0.1', () => res()));
+    this.port = (this.server.address() as AddressInfo).port;
+  }
+
+  async stop(): Promise<void> {
+    await new Promise<void>((res) => this.server.close(() => res()));
+  }
+}
+
+describe('WSS auth rejection (401/403 upgrade responses)', () => {
+  let daemon: RejectingWssDaemon;
+  const TOKEN = 'b'.repeat(64);
+
+  beforeAll(async () => {
+    daemon = new RejectingWssDaemon();
+    await daemon.start();
+  });
+
+  afterAll(async () => {
+    await daemon.stop();
+  });
+
+  function makeClient() {
+    return new JsonRpcClient({
+      config: {
+        transport: 'wss',
+        host: daemon.host,
+        port: daemon.port,
+        token: TOKEN,
+        fingerprint: daemon.fingerprint,
+      },
+      heartbeatIntervalMs: 0,
+      requestTimeoutMs: 2000,
+      // Keep the client from re-dialing mid-assertion.
+      reconnectDelayMs: 10_000,
+    });
+  }
+
+  it('surfaces a 401 upgrade rejection as a distinct AuthRejectedError', async () => {
+    daemon.statusCode = 401;
+    const client = makeClient();
+    const errors: Error[] = [];
+    client.on('error', (e) => errors.push(e));
+    await expect(client.request('system.status')).rejects.toBeInstanceOf(AuthRejectedError);
+    const rejection = errors.find((e): e is AuthRejectedError => e instanceof AuthRejectedError);
+    expect(rejection?.statusCode).toBe(401);
+    // Not misreported as a cert-pin failure.
+    expect(errors.some((e) => e instanceof PinMismatchError)).toBe(false);
+    expect(client.getStatus()).toBe('disconnected');
+    client.dispose();
+  });
+
+  it('surfaces a 403 upgrade rejection (WS API disabled) with its statusCode', async () => {
+    daemon.statusCode = 403;
+    const client = makeClient();
+    const errors: Error[] = [];
+    client.on('error', (e) => errors.push(e));
+    await expect(client.request('system.status')).rejects.toBeInstanceOf(AuthRejectedError);
+    const rejection = errors.find((e): e is AuthRejectedError => e instanceof AuthRejectedError);
+    expect(rejection?.statusCode).toBe(403);
+    client.dispose();
+  });
+
+  it('keeps a non-auth upgrade rejection (500) a generic transport error', async () => {
+    daemon.statusCode = 500;
+    const client = makeClient();
+    const errors: Error[] = [];
+    client.on('error', (e) => errors.push(e));
+    await expect(client.request('system.status')).rejects.toThrow();
+    expect(errors.length).toBeGreaterThan(0);
+    expect(errors.some((e) => e instanceof AuthRejectedError)).toBe(false);
+    expect(errors.some((e) => /unexpected server response: 500/i.test(e.message))).toBe(true);
+    client.dispose();
+  });
+
+  it('classifies a 401 from a cert that fails the pin as PinMismatchError, not auth rejection', async () => {
+    // A changed/intercepted endpoint can also answer 401/403 — the pin check
+    // must win so the user is never steered into re-pairing (typing a fresh
+    // secret) against an untrusted certificate.
+    daemon.statusCode = 401;
+    const wrongPin = Array.from({ length: 32 }, () => 'FF').join(':');
+    const client = new JsonRpcClient({
+      config: {
+        transport: 'wss',
+        host: daemon.host,
+        port: daemon.port,
+        token: TOKEN,
+        fingerprint: wrongPin,
+      },
+      heartbeatIntervalMs: 0,
+      requestTimeoutMs: 2000,
+      reconnectDelayMs: 10_000,
+    });
+    const errors: Error[] = [];
+    client.on('error', (e) => errors.push(e));
+    await expect(client.request('system.status')).rejects.toBeInstanceOf(PinMismatchError);
+    expect(errors.some((e) => e instanceof PinMismatchError)).toBe(true);
+    expect(errors.some((e) => e instanceof AuthRejectedError)).toBe(false);
+    client.dispose();
+  });
+
+  it('halts the automatic reconnect loop after an auth rejection', async () => {
+    daemon.statusCode = 401;
+    const client = new JsonRpcClient({
+      config: {
+        transport: 'wss',
+        host: daemon.host,
+        port: daemon.port,
+        token: TOKEN,
+        fingerprint: daemon.fingerprint,
+      },
+      heartbeatIntervalMs: 0,
+      requestTimeoutMs: 2000,
+      // A short delay so a (buggy) scheduled reconnect would fire within the wait.
+      reconnectDelayMs: 50,
+      maxReconnectDelayMs: 50,
+    });
+    client.on('error', () => {});
+    await expect(client.request('system.status')).rejects.toBeInstanceOf(AuthRejectedError);
+    const attemptsAfterRejection = daemon.upgradeAttempts;
+    await new Promise((res) => setTimeout(res, 300));
+    // No further upgrade attempts: the stale credential is not re-sent.
+    expect(daemon.upgradeAttempts).toBe(attemptsAfterRejection);
+    expect(client.getStatus()).toBe('disconnected');
+    client.dispose();
+  });
+
+  it('captureFingerprint reports tokenValid: false with the status on a 401 rejection', async () => {
+    daemon.statusCode = 401;
+    const result = await captureFingerprint({
+      host: daemon.host,
+      port: daemon.port,
+      token: TOKEN,
+    });
+    expect(result).toEqual({
+      ok: true,
+      fingerprint: normalizeFingerprint(daemon.fingerprint),
+      tokenValid: false,
+      statusCode: 401,
+    });
+  });
+
+  it('captureFingerprint reports tokenValid: false with the status on a 403 rejection', async () => {
+    daemon.statusCode = 403;
+    const result = await captureFingerprint({
+      host: daemon.host,
+      port: daemon.port,
+      token: TOKEN,
+    });
+    expect(result).toEqual({
+      ok: true,
+      fingerprint: normalizeFingerprint(daemon.fingerprint),
+      tokenValid: false,
+      statusCode: 403,
+    });
+  });
+
+  it('captureFingerprint keeps tokenValid: true on a non-auth upgrade rejection (500)', async () => {
+    daemon.statusCode = 500;
+    const result = await captureFingerprint({
+      host: daemon.host,
+      port: daemon.port,
+      token: TOKEN,
+    });
+    expect(result).toEqual({
+      ok: true,
+      fingerprint: normalizeFingerprint(daemon.fingerprint),
+      tokenValid: true,
+    });
+  });
+});
+
+describe('normalizeFingerprint', () => {
+  it('canonicalizes to colon-separated uppercase hex byte pairs', () => {
+    expect(normalizeFingerprint('ab:cd:ef:01')).toBe('AB:CD:EF:01');
+    expect(normalizeFingerprint('abcdef01')).toBe('AB:CD:EF:01');
+    expect(normalizeFingerprint('AB CD ef 01')).toBe('AB:CD:EF:01');
+    expect(normalizeFingerprint('')).toBe('');
+  });
+});
+
+describe('candidateWssHosts', () => {
+  it('keeps the primary host first and deduplicates the extras', () => {
+    expect(
+      candidateWssHosts({
+        transport: 'wss',
+        host: '192.168.1.10',
+        hosts: [' 10.0.0.5 ', '192.168.1.10', 'fe80::1', '', '10.0.0.5'],
+        port: 5181,
+      }),
+    ).toEqual(['192.168.1.10', '10.0.0.5', 'fe80::1']);
+  });
+
+  it('falls back to just the primary host when hosts is absent', () => {
+    expect(candidateWssHosts({ transport: 'wss', host: 'h', port: 1 })).toEqual(['h']);
+  });
+});
+
+describe('describeBackendConfig with candidate hosts', () => {
+  it('mentions extra candidates without leaking the token or fingerprint', () => {
+    const description = describeBackendConfig({
+      transport: 'wss',
+      host: '10.0.0.9',
+      hosts: ['10.0.0.9', '192.168.1.9'],
+      port: 5181,
+      token: 'super-secret',
+      fingerprint: 'AB:CD',
+    });
+    expect(description).toBe('wss:10.0.0.9:5181 (+1 candidate)');
+    expect(description).not.toContain('super-secret');
+    expect(description).not.toContain('AB:CD');
+  });
+});
+
+/** In-memory fake candidate socket for raceDuplexSockets tests. */
+class FakeCandidate extends Duplex {
+  written: string[] = [];
+  destroyedByRace = false;
+  constructor() {
+    super({ allowHalfOpen: false });
+  }
+  override _read(): void {}
+  override _write(chunk: unknown, _enc: BufferEncoding, cb: (error?: Error | null) => void): void {
+    this.written.push(String(chunk));
+    cb();
+  }
+  override _destroy(error: Error | null, cb: (err: Error | null) => void): void {
+    this.destroyedByRace = true;
+    cb(error);
+  }
+}
+
+describe('raceDuplexSockets (multi-host racing, #1746)', () => {
+  it('first candidate to connect wins; losers are destroyed', async () => {
+    const a = new FakeCandidate();
+    const b = new FakeCandidate();
+    const facade = raceDuplexSockets([
+      { host: 'a', create: () => a },
+      { host: 'b', create: () => b },
+    ]);
+    const connected = new Promise<void>((res) => facade.once('connect', () => res()));
+    b.emit('connect');
+    await connected;
+    expect(a.destroyedByRace).toBe(true);
+    expect(b.destroyedByRace).toBe(false);
+
+    // Writes route to the winner; inbound data flows back through the facade.
+    facade.write('ping\n');
+    expect(b.written).toEqual(['ping\n']);
+    const received = new Promise<string>((res) =>
+      facade.once('data', (chunk: Buffer) => res(chunk.toString('utf8'))),
+    );
+    b.push('pong\n');
+    expect(await received).toBe('pong\n');
+    facade.destroy();
+  });
+
+  it('a candidate failure does not lose the race while another connects', async () => {
+    const a = new FakeCandidate();
+    const b = new FakeCandidate();
+    const facade = raceDuplexSockets([
+      { host: 'a', create: () => a },
+      { host: 'b', create: () => b },
+    ]);
+    const errors: Error[] = [];
+    facade.on('error', (e) => errors.push(e));
+    const connected = new Promise<void>((res) => facade.once('connect', () => res()));
+    a.emit('error', new Error('ECONNREFUSED'));
+    b.emit('connect');
+    await connected;
+    expect(errors).toHaveLength(0);
+    facade.destroy();
+  });
+
+  it('fails with the last candidate error when every candidate fails', async () => {
+    const a = new FakeCandidate();
+    const b = new FakeCandidate();
+    const facade = raceDuplexSockets([
+      { host: 'a', create: () => a },
+      { host: 'b', create: () => b },
+    ]);
+    const failed = new Promise<Error>((res) => facade.once('error', (e: Error) => res(e)));
+    a.emit('error', new Error('ECONNREFUSED a'));
+    b.emit('error', new Error('ECONNREFUSED b'));
+    expect((await failed).message).toBe('ECONNREFUSED b');
+  });
+
+  it('a PinMismatchError on ANY candidate fails the whole race immediately', async () => {
+    const a = new FakeCandidate();
+    const b = new FakeCandidate();
+    const facade = raceDuplexSockets([
+      { host: 'a', create: () => a },
+      { host: 'b', create: () => b },
+    ]);
+    const failed = new Promise<Error>((res) => facade.once('error', (e: Error) => res(e)));
+    a.emit('error', new PinMismatchError('AA', 'BB'));
+    const error = await failed;
+    expect(error).toBeInstanceOf(PinMismatchError);
+    // The other candidate is torn down — no silent fallback past a bad cert.
+    expect(b.destroyedByRace).toBe(true);
+    // A late connect on the other candidate must not resurrect the race.
+    b.emit('connect');
+    expect(facade.destroyed).toBe(true);
+  });
+
+  it('a pin mismatch AFTER a valid winner settles is discarded — winner takes precedence', async () => {
+    const good = new FakeCandidate();
+    const stale = new FakeCandidate();
+    const facade = raceDuplexSockets([
+      { host: 'good', create: () => good },
+      { host: 'stale', create: () => stale },
+    ]);
+    const errors: Error[] = [];
+    facade.on('error', (e) => errors.push(e));
+    const connected = new Promise<void>((res) => facade.once('connect', () => res()));
+    good.emit('connect');
+    await connected;
+    // A stale IP now owned by a foreign pinned daemon reports a mismatch late:
+    // the established pin-verified winner must not be torn down by it.
+    stale.emit('error', new PinMismatchError('AA', 'BB'));
+    expect(errors).toHaveLength(0);
+    expect(facade.destroyed).toBe(false);
+    // The facade still proxies the winner.
+    facade.write('ping\n');
+    expect(good.written).toEqual(['ping\n']);
+    facade.destroy();
+  });
+
+  it('destroys a failed candidate immediately and absorbs its later async errors', async () => {
+    const failing = new FakeCandidate();
+    const other = new FakeCandidate();
+    const facade = raceDuplexSockets([
+      { host: 'failing', create: () => failing },
+      { host: 'other', create: () => other },
+    ]);
+    const errors: Error[] = [];
+    facade.on('error', (e) => errors.push(e));
+    failing.emit('error', new Error('ECONNREFUSED'));
+    // The failed candidate is torn down right away, not left until settle.
+    expect(failing.destroyedByRace).toBe(true);
+    // A second async 'error' from the dead candidate must not become an
+    // uncaught exception (zero-listener EventEmitter) nor fail the race.
+    failing.emit('error', new Error('late async failure'));
+    const connected = new Promise<void>((res) => facade.once('connect', () => res()));
+    other.emit('connect');
+    await connected;
+    expect(errors).toHaveLength(0);
+    facade.destroy();
+  });
+
+  it('times out when no candidate ever connects', async () => {
+    const a = new FakeCandidate();
+    const facade = raceDuplexSockets([{ host: 'a', create: () => a }], { timeoutMs: 50 });
+    const failed = new Promise<Error>((res) => facade.once('error', (e: Error) => res(e)));
+    expect((await failed).message).toContain('timed out');
+    expect(a.destroyedByRace).toBe(true);
+  });
+
+  it('fails when every attempt factory throws synchronously', async () => {
+    const facade = raceDuplexSockets([
+      {
+        host: 'a',
+        create: () => {
+          throw new Error('boom');
+        },
+      },
+    ]);
+    const failed = new Promise<Error>((res) => facade.once('error', (e: Error) => res(e)));
+    expect((await failed).message).toBe('boom');
+  });
+});
+
+describe('multi-host wss connect through JsonRpcClient (#1746)', () => {
+  let daemon: FakeWssDaemon;
+  const TOKEN = 'b'.repeat(64);
+
+  beforeAll(async () => {
+    daemon = new FakeWssDaemon();
+    await daemon.start();
+  });
+
+  afterAll(async () => {
+    await daemon.stop();
+  });
+
+  it('connects via a secondary candidate when the primary host is unreachable', async () => {
+    daemon.handler = () => ({ result: 'ok' });
+    const client = new JsonRpcClient({
+      config: {
+        transport: 'wss',
+        // Primary host is a blackhole (RFC 5737 TEST-NET-1) — only the
+        // secondary candidate (the real daemon) can answer.
+        host: '192.0.2.1',
+        hosts: ['192.0.2.1', daemon.host],
+        port: daemon.port,
+        token: TOKEN,
+        fingerprint: daemon.fingerprint,
+      },
+      heartbeatIntervalMs: 0,
+      requestTimeoutMs: 5000,
+    });
+    client.on('error', () => {});
+    await expect(client.request('system.status')).resolves.toBe('ok');
+    client.dispose();
+  });
+
+  it('a fingerprint mismatch on a candidate surfaces as PinMismatchError, not a skip', async () => {
+    const wrong = Array.from({ length: 32 }, () => 'FF').join(':');
+    const client = new JsonRpcClient({
+      config: {
+        transport: 'wss',
+        host: '192.0.2.1',
+        hosts: ['192.0.2.1', daemon.host],
+        port: daemon.port,
+        token: TOKEN,
+        fingerprint: wrong,
+      },
+      heartbeatIntervalMs: 0,
+      requestTimeoutMs: 5000,
+      reconnectDelayMs: 10_000,
+    });
+    const errors: Error[] = [];
+    client.on('error', (e) => errors.push(e));
+    await expect(client.request('system.status')).rejects.toBeInstanceOf(PinMismatchError);
+    expect(errors.some((e) => e instanceof PinMismatchError)).toBe(true);
+    client.dispose();
   });
 });

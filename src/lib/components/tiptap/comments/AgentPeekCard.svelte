@@ -8,18 +8,15 @@
 
   import { selectAgentLineStats } from '$store/renderer/slices/changes/changes-selectors';
   import { requestAgentLineStats } from '$store/renderer/slices/changes/changes-slice';
-  import {
-  getAgentPeekData,
-  truncateToLines,
-} from '$lib/utils/agent-peek-utils';
+  import { getAgentPeekData, truncateToLines } from '$lib/utils/agent-peek-utils';
 
   import { selectAgentIsResponding } from '$store/renderer/slices/agent-session/agent-session-selectors';
   import { ensureAgentSessionLoaded } from '$store/renderer/slices/workspace-agents/workspace-agents-slice';
 
-  import { selectActiveWorkspace } from '$store/renderer/slices/workspace/workspace-selectors';
+  import { getWorkspaceRouteContext } from '$lib/utils/workspace-route-context';
 
   import { openAgentTabRequested } from '$store/renderer/slices/app-layout/app-layout-slice';
-  import AuggieAvatar from '$lib/components/ui/auggie-avatar/AuggieAvatar.svelte';
+  import AgentAvatar from '$features/agent/components/agent-avatar/AgentAvatar.svelte';
   import { m } from '$shared/paraglide/messages.js';
   import { formatInteger } from '$lib/i18n/format';
   import LineChangeStats from '$lib/components/shared/LineChangeStats.svelte';
@@ -27,12 +24,12 @@
   import { Button } from '$lib/components/ui/button';
   import Fa from 'svelte-fa';
   import {
-  faArrowRight,
-  faSpinner,
-  faExclamationTriangle,
-} from '@fortawesome/free-solid-svg-icons';
+    faArrowRight,
+    faSpinner,
+    faExclamationTriangle,
+  } from '@fortawesome/free-solid-svg-icons';
   import { cn } from '$lib/utils';
-import { selectAgentSession } from '$store/renderer/slices/agent-session/agent-session-selectors';
+  import { selectAgentSession } from '$store/renderer/slices/agent-session/agent-session-selectors';
   import { store as appStore } from '$store/renderer/store';
   import { writable } from 'svelte/store';
 
@@ -54,7 +51,7 @@ import { selectAgentSession } from '$store/renderer/slices/agent-session/agent-s
     onShow,
   }: Props = $props();
 
-  const activeWorkspace = selectActiveWorkspace();
+  const workspaceId = getWorkspaceRouteContext()?.workspaceId;
   // svelte-ignore state_referenced_locally -- selectors are initialized with the current agent; the effect below mirrors prop changes.
   const agentIdStore = writable(agentId);
   $effect(() => {
@@ -63,16 +60,14 @@ import { selectAgentSession } from '$store/renderer/slices/agent-session/agent-s
 
   // Reactive agent session from Redux. The ensure saga dispatch below
   // triggers the disk restore; running it in an effect ensures we
-  // re-dispatch when the active workspace or agentId changes while the
+  // re-dispatch when the route workspace or agentId changes while the
   // component stays mounted.
   const agent$ = selectAgentSession(agentIdStore);
   const agentIsResponding$ = selectAgentIsResponding(agentIdStore);
   const agentData = $derived(getAgentPeekData($agent$));
-
   $effect(() => {
-    const workspace = $activeWorkspace;
-    if (!workspace?.id) return;
-    appStore.dispatch(ensureAgentSessionLoaded(String(workspace.id), agentId));
+    if (!workspaceId) return;
+    appStore.dispatch(ensureAgentSessionLoaded(workspaceId, agentId));
   });
 
   // Get line change stats
@@ -136,7 +131,7 @@ import { selectAgentSession } from '$store/renderer/slices/agent-session/agent-s
       aria-label={m.tiptap_agentPeek_session_ariaLabel({ name: agentData.name })}
     >
       <div class="icon-wrapper">
-        <AuggieAvatar
+        <AgentAvatar
           size={24}
           agentId={agentData.id}
           class={cn($agentIsResponding$ && 'animate-pulse')}
@@ -179,7 +174,7 @@ import { selectAgentSession } from '$store/renderer/slices/agent-session/agent-s
     {#if agentData}
       <!-- Header - Always visible (collapsed and expanded) -->
       <div class="flex items-center gap-2 px-3 py-2">
-        <AuggieAvatar
+        <AgentAvatar
           size={isCollapsed ? 18 : 20}
           agentId={agentData.id}
           class={cn($agentIsResponding$ && 'animate-pulse')}
@@ -199,7 +194,9 @@ import { selectAgentSession } from '$store/renderer/slices/agent-session/agent-s
           {:else}
             <div class="font-medium text-sm truncate">
               {agentData.name}<span class="text-xs text-subtle"
-                >{$agentIsResponding$ ? m.tiptap_agentPeek_active_label() : m.tiptap_agentPeek_idle_label()}</span
+                >{$agentIsResponding$
+                  ? m.tiptap_agentPeek_active_label()
+                  : m.tiptap_agentPeek_idle_label()}</span
               >
             </div>
           {/if}
@@ -214,7 +211,7 @@ import { selectAgentSession } from '$store/renderer/slices/agent-session/agent-s
             const panelElement = (e.target as HTMLElement)?.closest('[data-panel-id]');
             const sourcePanelId = panelElement?.getAttribute('data-panel-id') ?? undefined;
             const openInAdjacentPanel = e.metaKey || e.ctrlKey;
-            const wsId = $activeWorkspace?.id;
+            const wsId = workspaceId;
             if (wsId) {
               appStore.dispatch(
                 openAgentTabRequested(wsId, {
@@ -281,15 +278,17 @@ import { selectAgentSession } from '$store/renderer/slices/agent-session/agent-s
             <Fa icon={faSpinner} class="h-4 w-4 animate-spin text-ghost" />
             <div class="flex-1">
               <div class="text-sm font-medium">{m.tiptap_agentPeek_waitingLaunch_label()}</div>
-              <div class="text-xs text-subtle mt-0.5">{m.tiptap_agentPeek_appearOnceReady_label()}</div>
+              <div class="text-xs text-subtle mt-0.5">
+                {m.tiptap_agentPeek_appearOnceReady_label()}
+              </div>
             </div>
           </div>
         {:else}
           <!-- Agent not found error (comment is old) -->
           <div class="flex items-start gap-2">
-            <Fa icon={faExclamationTriangle} class="h-4 w-4 mt-0.5 text-destructive-foreground" />
+            <Fa icon={faExclamationTriangle} class="h-4 w-4 mt-0.5 text-error-foreground" />
             <div class="flex-1">
-              <div class="text-sm font-medium text-destructive-foreground">
+              <div class="text-sm font-medium text-error-foreground">
                 {displayMode === 'full'
                   ? m.tiptap_agentPeek_assignedNotFound_label()
                   : m.tiptap_agentPeek_notFound_label()}
@@ -337,7 +336,7 @@ import { selectAgentSession } from '$store/renderer/slices/agent-session/agent-s
 
   .icon-button.session-comment.error {
     border-color: var(--destructive);
-    background: var(--destructive-foreground);
+    background: var(--error-foreground);
   }
 
   .icon-button:hover {

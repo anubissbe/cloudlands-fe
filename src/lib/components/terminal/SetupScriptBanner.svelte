@@ -19,20 +19,17 @@
   import { cubicOut } from 'svelte/easing';
   import Fa from 'svelte-fa';
   import {
-  faWandMagicSparkles,
-  faXmark,
-  faFloppyDisk,
-  faChevronRight,
-} from '@fortawesome/free-solid-svg-icons';
+    faWandMagicSparkles,
+    faXmark,
+    faFloppyDisk,
+    faChevronRight,
+  } from '@fortawesome/free-solid-svg-icons';
   import { Button } from '$lib/components/ui/button';
   import CodeEditor from '$lib/components/editor/CodeEditor.svelte';
-  import { v4 as uuidv4 } from 'uuid';
 
-  import {
-  dismissSetupScriptBannerGlobally,
-  saveScript,
-} from '$store/renderer/slices/setup-scripts/setup-scripts-slice';
+  import { dismissSetupScriptBannerGlobally } from '$store/renderer/slices/setup-scripts/setup-scripts-slice';
   import { selectIsSetupScriptBannerDismissed } from '$store/renderer/slices/setup-scripts/setup-scripts-selectors';
+  import { recordLastUsedSetupScript } from '$features/setup-scripts';
   import { terminalHistoryTracker } from '$features/terminal/terminal-history-tracker';
   import { selectWorkspaceById } from '$store/renderer/slices/workspace/workspace-selectors';
   import { toast } from 'svelte-sonner';
@@ -51,6 +48,8 @@
   }
 
   let { workspaceId }: Props = $props();
+  // Initial value only; the $effect below keeps the store in sync.
+  // svelte-ignore state_referenced_locally
   const workspaceIdStore = writable(workspaceId);
   $effect(() => {
     workspaceIdStore.set(workspaceId);
@@ -106,9 +105,7 @@
 
   // Should show the banner?
   // Hide while the setup-script check is pending (avoid flash) and when a non-empty script exists
-  const shouldShow = $derived(
-    isOpen && !isDismissed && repoHasSetupScript === false,
-  );
+  const shouldShow = $derived(isOpen && !isDismissed && repoHasSetupScript === false);
 
   // Check for existing setup script on mount and when workspaceId changes
   $effect(() => {
@@ -185,17 +182,17 @@
       toast.error(m.terminal_setupBanner_emptyScript_error());
       return;
     }
+    // recordLastUsedSetupScript is a no-op without a repo path — don't claim
+    // success (and drop the script) when the workspace has no repositoryPath.
+    if (!repoPath) {
+      toast.error(m.terminal_setupBanner_noRepo_error());
+      return;
+    }
 
-    const now = new Date().toISOString();
-    appStore.dispatch(saveScript({
-      id: uuidv4(),
+    recordLastUsedSetupScript(repoPath, {
       name: scriptName || m.terminal_setupBanner_defaultName_label(),
       content: scriptContent,
-      repoPath: repoPath || undefined,
-      lastUsedAt: now,
-      usageCount: 1,
-      createdAt: now,
-    }));
+    });
 
     toast.success(m.terminal_setupBanner_saved_success({ name: scriptName }));
     logger.info('Setup script saved from terminal banner', { repoPath, scriptName });
@@ -295,12 +292,14 @@
     <!-- Resize handle -->
     <!-- svelte-ignore a11y_no_static_element_interactions -->
     <div
-      class="absolute top-0 bottom-0 left-0 w-1 cursor-col-resize hover:bg-primary/30 active:bg-primary/50 z-20"
+      class="app-resize-handle absolute -left-2 bottom-0 top-0 z-20 w-4"
+      data-resize-axis="x"
+      data-resizing={isResizing}
       onmousedown={startResize}
     ></div>
 
     <!-- Header -->
-    <div class="flex items-center justify-between px-3 py-2 border-b border-border/50">
+    <div class="flex items-center justify-between px-3 py-2 border-b border-border">
       <div class="flex items-start gap-2">
         <!-- <Fa icon={faWandMagicSparkles} class="w-3.5 h-3.5 text-primary/70 mt-1" /> -->
         <div class="flex flex-col">
@@ -330,7 +329,7 @@
     </div>
 
     <!-- Script name -->
-    <div class="flex items-center gap-2 px-3 py-1.5 border-b border-border/30">
+    <div class="flex items-center gap-2 px-3 py-1.5 border-b border-border">
       <span class="text-xs text-subtle">{m.terminal_setupBanner_name_label()}</span>
       <input
         type="text"

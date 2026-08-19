@@ -3,7 +3,7 @@
  *
  * Drives the real daemon-health slice through connectionStatusChanged and
  * asserts the overlay's show / grace-period / dismiss / spawn-sidecar flows.
- * The spawn button goes through the real daemon-health middleware to the
+ * The spawn button goes through the real root-owned daemon-health saga to the
  * backend:spawn-sidecar channel (asserted on the stubbed electronAPI.invoke).
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
@@ -13,12 +13,76 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, cleanup, fireEvent, screen } from '@testing-library/svelte';
 import { flushSync } from 'svelte';
 
+vi.mock('$store/renderer/store', async () => {
+  const { runSaga, stdChannel } = await import('redux-saga');
+  const { daemonHealthReducer, initialState } =
+    await import('$store/renderer/slices/daemon-health/daemon-health-slice');
+  const { connectionsReducer, initialState: connectionsInitialState } =
+    await import('$store/renderer/slices/connections/connections-slice');
+  let state = { daemonHealth: initialState, connections: connectionsInitialState };
+  const listeners = new Set<() => void>();
+  const channel = stdChannel();
+  const store = {
+    get state() {
+      return state;
+    },
+    init() {
+      state = { daemonHealth: initialState, connections: connectionsInitialState };
+      listeners.forEach((listener) => listener());
+      return () => {};
+    },
+    dispose() {
+      listeners.clear();
+    },
+    dispatch(action: { type: string }) {
+      state = {
+        daemonHealth: daemonHealthReducer(state.daemonHealth, action as never),
+        connections: connectionsReducer(state.connections, action as never),
+      };
+      channel.put(action);
+      listeners.forEach((listener) => listener());
+      return action;
+    },
+    createSelector<T>(select: (value: typeof state) => T) {
+      return Object.assign(
+        () => ({
+          subscribe(run: (value: T) => void) {
+            const update = () => run(select(state));
+            update();
+            listeners.add(update);
+            return () => listeners.delete(update);
+          },
+        }),
+        {
+          select,
+          effect: function* () {
+            return select(state);
+          },
+        },
+      );
+    },
+    runSaga(saga: () => Generator) {
+      const task = runSaga({ channel, dispatch: store.dispatch, getState: () => state }, saga);
+      return () => task.cancel();
+    },
+  };
+  return { store };
+});
+
 import { store as appStore } from '$store/renderer/store';
 import { IPC_CHANNELS } from '$shared/ipc-registry';
 import { mockInvoke, resetMockIpcRouter } from '$shared/ipc-mock-router';
-import { disposeDaemonHealthService } from '$store/renderer/middlewares/daemon-health-service';
 import { connectionStatusChanged } from '$store/renderer/slices/daemon-health/daemon-health-slice';
+import { connectionsListReceived } from '$store/renderer/slices/connections/connections-slice';
+import type { ConnectionRecord } from '$shared/types/connections';
 import type { BackendTransportInfo } from '$store/renderer/slices/daemon-health/daemon-health-types';
+import { daemonHealthSaga } from '$store/renderer/slices/daemon-health/sagas/daemon-health-saga';
+import {
+  authRejectedReceived,
+  connectionsListReceived,
+  connectOperationStarted,
+} from '$store/renderer/slices/connections/connections-slice';
+import { LOCAL_CONNECTION_ID } from '$shared/types/connections';
 
 const route = vi.hoisted(() => ({ pathname: '/' }));
 
@@ -39,7 +103,8 @@ const sidecarTransport: BackendTransportInfo = { mode: 'sidecar-uds', target: '/
 const externalTransport: BackendTransportInfo = { mode: 'external-uds', target: '/tmp/i.sock' };
 
 let invokeMock: ReturnType<typeof vi.fn>;
-// Transport the middleware's boot-time GET_STATUS fetch reports; kept in sync
+let stopDaemonHealthSaga: (() => void) | undefined;
+// Transport the saga's boot-time GET_STATUS fetch reports; kept in sync
 // with the scenario under test so the boot dispatch can't override it.
 let bootTransport: BackendTransportInfo = sidecarTransport;
 
@@ -58,11 +123,16 @@ function dispatchAndFlush(action: Parameters<typeof appStore.dispatch>[0]) {
 
 async function showOverlay(
   transport: BackendTransportInfo,
-  extras?: { sidecarGaveUp?: boolean; sidecarStartupFailed?: boolean; reason?: string },
+  extras?: {
+    sidecarGaveUp?: boolean;
+    sidecarStartupFailed?: boolean;
+    reason?: string;
+    reconnectAttempts?: number;
+  },
 ) {
   bootTransport = transport;
   dispatchAndFlush(connectionStatusChanged('connected', transport));
-  // Let the middleware's boot-time GET_STATUS fetch settle before the
+  // Let the saga's boot-time GET_STATUS fetch settle before the
   // disconnect, so its late 'connected' dispatch can't cancel the grace timer.
   await vi.advanceTimersByTimeAsync(10);
   dispatchAndFlush(connectionStatusChanged('disconnected', undefined, extras));
@@ -81,12 +151,16 @@ async function showOverlayNeverConnected(
   transport?: BackendTransportInfo,
   extras?: { sidecarGaveUp?: boolean; sidecarStartupFailed?: boolean; reason?: string },
 ) {
+  stopDaemonHealthSaga?.();
   invokeMock.mockImplementation(async (channel: string, ...args: unknown[]) => {
     if (channel === BACKEND.GET_STATUS) {
       return { status: 'disconnected' };
     }
     return mockInvoke(channel, ...args);
   });
+  appStore.init();
+  stopDaemonHealthSaga = appStore.runSaga(daemonHealthSaga);
+  await vi.advanceTimersByTimeAsync(0);
   dispatchAndFlush(connectionStatusChanged('disconnected', transport, extras));
   await vi.advanceTimersByTimeAsync(DAEMON_STOPPED_GRACE_MS + 50);
   await vi.waitFor(() => {
@@ -108,13 +182,19 @@ describe('DaemonStoppedOverlay', () => {
       }
       return mockInvoke(channel, ...args);
     });
-    vi.stubGlobal('electronAPI', { invoke: invokeMock, on: vi.fn(), off: vi.fn() });
+    vi.stubGlobal('electronAPI', {
+      invoke: invokeMock,
+      on: vi.fn(() => 'daemon-status-listener'),
+      offById: vi.fn(),
+    });
     appStore.init();
+    stopDaemonHealthSaga = appStore.runSaga(daemonHealthSaga);
   });
 
   afterEach(() => {
     cleanup();
-    disposeDaemonHealthService();
+    stopDaemonHealthSaga?.();
+    stopDaemonHealthSaga = undefined;
     resetMockIpcRouter();
     // Dispose the store so session latches (hasEverConnected,
     // sidecarStartupFailed) don't leak into the next test.
@@ -131,7 +211,7 @@ describe('DaemonStoppedOverlay', () => {
     expect(overlay()).toBeNull();
   });
 
-  it.each(['/sandbox', '/sandbox/directory-picker', '/test', '/test/component'])(
+  it.each(['/sandbox', '/sandbox/directory-picker', '/test-comments', '/test-mentions/compact'])(
     'stays hidden while the daemon is disconnected on %s',
     async (pathname) => {
       route.pathname = pathname;
@@ -142,7 +222,7 @@ describe('DaemonStoppedOverlay', () => {
     },
   );
 
-  it.each(['/sandboxed', '/testimonials'])(
+  it.each(['/sandboxed', '/testimonials', '/test'])(
     'shows the overlay for non-sandbox path %s',
     async (pathname) => {
       route.pathname = pathname;
@@ -183,19 +263,74 @@ describe('DaemonStoppedOverlay', () => {
     expect(overlay()!.textContent).toContain('restarting it automatically');
   });
 
-  it('offers the sidecar fallback with the data-dir caveat in external mode', async () => {
+  it('offers the sidecar fallback with the local-instead-of-remote caveat in external mode (#1750)', async () => {
     render(DaemonStoppedOverlay);
     await showOverlay(externalTransport);
     expect(screen.getByTestId('daemon-stopped-spawn-sidecar')).toBeTruthy();
     expect(overlay()!.textContent).toContain('external intentd daemon was lost');
-    expect(overlay()!.textContent).toContain('may use a different data directory');
+    // External mode gets the "local intentd instead of the remote server" note,
+    // not the local data-dir caveat.
+    expect(overlay()!.textContent).toContain('instead of the remote server');
+    expect(overlay()!.textContent).not.toContain('may use a different data directory');
   });
 
-  it('hides the spawn button in external-ws mode (the UDS sidecar would never be reached)', async () => {
+  it('offers the local sidecar fallback in external-ws mode', async () => {
     render(DaemonStoppedOverlay);
     await showOverlay({ mode: 'external-ws', target: 'ws://127.0.0.1:5181/ws' });
-    expect(screen.queryByTestId('daemon-stopped-spawn-sidecar')).toBeNull();
+    expect(screen.getByTestId('daemon-stopped-spawn-sidecar')).toBeTruthy();
     expect(overlay()!.textContent).toContain('external intentd daemon was lost');
+  });
+
+  it('shows the lost connection details from the active connection record (#1750)', async () => {
+    const remote: ConnectionRecord = {
+      id: 'conn-1',
+      label: '192.168.1.20:5181',
+      host: '192.168.1.20',
+      port: 5181,
+      fingerprint: 'ab:cd',
+      hostname: 'studio.local',
+      isLocal: false,
+    };
+    render(DaemonStoppedOverlay);
+    appStore.dispatch(connectionsListReceived({ connections: [remote], activeId: 'conn-1' }));
+    await showOverlay({ mode: 'external-ws', target: 'wss:192.168.1.20:5181' });
+    const details = screen.getByTestId('daemon-stopped-connection-details');
+    expect(details.textContent).toContain('Lost connection to studio.local (192.168.1.20:5181)');
+  });
+
+  it('falls back to the transport target for the details line when no remote record is active (#1750)', async () => {
+    render(DaemonStoppedOverlay);
+    await showOverlay(externalTransport);
+    // external-uds adoption: the active connection is the local entry, so the
+    // socket path from the transport is the best available target detail.
+    const details = screen.getByTestId('daemon-stopped-connection-details');
+    expect(details.textContent).toContain('Lost connection to /tmp/i.sock');
+  });
+
+  it('hides the connection-details line in sidecar mode', async () => {
+    render(DaemonStoppedOverlay);
+    await showOverlay(sidecarTransport);
+    expect(screen.queryByTestId('daemon-stopped-connection-details')).toBeNull();
+  });
+
+  it('shows the reconnect attempt count in the retrying line (#1750)', async () => {
+    render(DaemonStoppedOverlay);
+    await showOverlay(externalTransport, { reconnectAttempts: 14 });
+    expect(screen.getByTestId('daemon-stopped-retrying').textContent).toContain(
+      'Retrying connection… (attempt 14)',
+    );
+
+    // A later status push with a higher count updates the line live.
+    dispatchAndFlush(connectionStatusChanged('connecting', undefined, { reconnectAttempts: 15 }));
+    expect(screen.getByTestId('daemon-stopped-retrying').textContent).toContain('(attempt 15)');
+  });
+
+  it('omits the attempt count before the first retry', async () => {
+    render(DaemonStoppedOverlay);
+    await showOverlay(sidecarTransport);
+    const retrying = screen.getByTestId('daemon-stopped-retrying').textContent!;
+    expect(retrying).toContain('Retrying connection');
+    expect(retrying).not.toContain('attempt');
   });
 
   it('shows the crash-loop posture after the supervisor gave up, with distinct copy and the reason', async () => {
@@ -315,7 +450,7 @@ describe('DaemonStoppedOverlay', () => {
     expect(overlay()!.textContent).not.toContain('was lost');
     // Buttons follow the same transport-mode rules as the lost-connection posture.
     expect(screen.getByTestId('daemon-stopped-spawn-sidecar').textContent).toContain(
-      'Start app-managed sidecar',
+      'Start local intentd',
     );
   });
 
@@ -331,12 +466,12 @@ describe('DaemonStoppedOverlay', () => {
     });
     // Pending until the reconnect status lands.
     await vi.waitFor(() => {
-      expect((screen.getByTestId('daemon-stopped-spawn-sidecar') as HTMLButtonElement).disabled).toBe(
-        true,
-      );
+      expect(
+        (screen.getByTestId('daemon-stopped-spawn-sidecar') as HTMLButtonElement).disabled,
+      ).toBe(true);
     });
     expect(screen.getByTestId('daemon-stopped-spawn-sidecar').textContent).toContain(
-      'Starting sidecar',
+      'Starting intentd',
     );
 
     // Reconnect (backend:status 'connected' via RESUB-1 main-side flow) dismisses.
@@ -361,7 +496,7 @@ describe('DaemonStoppedOverlay', () => {
     dispatchAndFlush(connectionStatusChanged('disconnected', sidecarTransport));
     const button = screen.getByTestId('daemon-stopped-spawn-sidecar') as HTMLButtonElement;
     expect(button.disabled).toBe(true);
-    expect(button.textContent).toContain('Starting sidecar');
+    expect(button.textContent).toContain('Starting intentd');
   });
 
   it('shows the spawn error and re-enables the button when the spawn fails', async () => {
@@ -384,9 +519,139 @@ describe('DaemonStoppedOverlay', () => {
         'intentd binary not found',
       );
     });
-    expect(
-      (screen.getByTestId('daemon-stopped-spawn-sidecar') as HTMLButtonElement).disabled,
-    ).toBe(false);
+    expect((screen.getByTestId('daemon-stopped-spawn-sidecar') as HTMLButtonElement).disabled).toBe(
+      false,
+    );
+  });
+
+  describe('auth-rejected posture (token rejected by the active remote backend)', () => {
+    const REMOTE = {
+      id: 'remote-1',
+      label: 'Studio Mac',
+      host: '10.0.0.5',
+      port: 8443,
+      fingerprint: 'AB:CD',
+      isLocal: false,
+    };
+    const LOCAL = {
+      id: LOCAL_CONNECTION_ID,
+      label: 'This machine (local)',
+      host: null,
+      port: null,
+      fingerprint: null,
+      isLocal: true,
+    };
+    const wsTransport: BackendTransportInfo = {
+      mode: 'external-ws',
+      target: 'wss://10.0.0.5:8443/ws',
+    };
+
+    function activateRemote() {
+      dispatchAndFlush(
+        connectionsListReceived({ connections: [LOCAL, REMOTE], activeId: REMOTE.id }),
+      );
+    }
+
+    function rejectAuth(statusCode: number) {
+      dispatchAndFlush(
+        authRejectedReceived({ id: REMOTE.id, host: REMOTE.host, port: REMOTE.port, statusCode }),
+      );
+    }
+
+    it('swaps the generic overlay for the actionable token-rejected state on 401', async () => {
+      render(DaemonStoppedOverlay);
+      await showOverlay(wsTransport);
+      activateRemote();
+      rejectAuth(401);
+
+      expect(overlay()!.textContent).toContain('Authentication rejected');
+      expect(overlay()!.textContent).toContain('rejected the stored access token (HTTP 401)');
+      expect(overlay()!.textContent).toContain('10.0.0.5:8443');
+      // Retrying with the same token cannot succeed — no misleading spinner.
+      expect(screen.queryByTestId('daemon-stopped-retrying')).toBeNull();
+      expect(screen.getByTestId('daemon-stopped-repair').textContent).toContain(
+        'Re-pair with a new token',
+      );
+    });
+
+    it('hides the connection-details line and attempt counter in the token-rejected state (#957)', async () => {
+      render(DaemonStoppedOverlay);
+      await showOverlay(wsTransport, { reconnectAttempts: 3 });
+      activateRemote();
+      // Before the rejection latches, the external posture shows the lost
+      // connection details for the active remote.
+      expect(screen.getByTestId('daemon-stopped-connection-details')).toBeTruthy();
+
+      rejectAuth(401);
+
+      // The auth-rejected copy already names host:port; the generic external
+      // details line and the retrying/attempt counter would be misleading.
+      expect(screen.queryByTestId('daemon-stopped-connection-details')).toBeNull();
+      expect(screen.queryByTestId('daemon-stopped-retrying')).toBeNull();
+    });
+
+    it('explains the disabled WS API on 403', async () => {
+      render(DaemonStoppedOverlay);
+      await showOverlay(wsTransport);
+      activateRemote();
+      rejectAuth(403);
+
+      expect(overlay()!.textContent).toContain('Authentication rejected');
+      expect(overlay()!.textContent).toContain('WebSocket API is disabled');
+      expect(overlay()!.textContent).toContain('(HTTP 403)');
+    });
+
+    it('keeps the switch-backend fail-over list visible in the token-rejected state', async () => {
+      const OTHER = { ...REMOTE, id: 'remote-2', label: 'Other Mac', host: '10.0.0.6' };
+      render(DaemonStoppedOverlay);
+      await showOverlay(wsTransport);
+      dispatchAndFlush(
+        connectionsListReceived({ connections: [LOCAL, REMOTE, OTHER], activeId: REMOTE.id }),
+      );
+      rejectAuth(401);
+
+      expect(screen.getByTestId('daemon-stopped-known-backends')).toBeTruthy();
+    });
+
+    it('ignores a rejection latched for a non-active connection', async () => {
+      render(DaemonStoppedOverlay);
+      await showOverlay(wsTransport);
+      dispatchAndFlush(
+        connectionsListReceived({ connections: [LOCAL, REMOTE], activeId: LOCAL_CONNECTION_ID }),
+      );
+      rejectAuth(401);
+
+      expect(overlay()!.textContent).not.toContain('Authentication rejected');
+      expect(screen.queryByTestId('daemon-stopped-repair')).toBeNull();
+      expect(screen.getByTestId('daemon-stopped-retrying')).toBeTruthy();
+    });
+
+    it('returns to the generic posture when a new connect operation clears the latch', async () => {
+      render(DaemonStoppedOverlay);
+      await showOverlay(wsTransport);
+      activateRemote();
+      rejectAuth(401);
+      expect(screen.getByTestId('daemon-stopped-repair')).toBeTruthy();
+
+      dispatchAndFlush(connectOperationStarted());
+
+      expect(overlay()!.textContent).not.toContain('Authentication rejected');
+      expect(screen.queryByTestId('daemon-stopped-repair')).toBeNull();
+    });
+
+    it('opens the re-pair modal with host and port prefilled', async () => {
+      render(DaemonStoppedOverlay);
+      await showOverlay(wsTransport);
+      activateRemote();
+      rejectAuth(401);
+
+      await fireEvent.click(screen.getByTestId('daemon-stopped-repair'));
+
+      const hostInput = (await screen.findByLabelText(/host/i)) as HTMLInputElement;
+      const portInput = screen.getByLabelText(/port/i) as HTMLInputElement;
+      expect(hostInput.value).toBe('10.0.0.5');
+      expect(portInput.value).toBe('8443');
+    });
   });
 
   it('issues no daemon wire requests itself (reconnect resubscription is RESUB-1 main-side)', async () => {
@@ -413,7 +678,8 @@ describe('DaemonStoppedOverlay', () => {
     expect(subscribeCalls.filter(([c]) => c === BACKEND.SUBSCRIBE)).toHaveLength(0);
     expect(
       wireCalls.filter(
-        ([, payload]) => (payload as { method?: string } | undefined)?.method === 'events.subscribe',
+        ([, payload]) =>
+          (payload as { method?: string } | undefined)?.method === 'events.subscribe',
       ),
     ).toHaveLength(0);
   });

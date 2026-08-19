@@ -1,133 +1,71 @@
 /**
- * Chat read service — the sanctioned post-saga on-demand transcript-load
- * mechanism, sibling to `agent-read-service.ts`.
- *
- * `ChatPanel.svelte` dispatches `initializeChatRequested(agentId, { wsId,
- * options })` on mount and on workspace rebind, but its saga was removed when the
- * saga runtime went away — so the dispatch became a no-op and a real agent's
- * conversation never hydrated, showing an empty transcript. This restores the
- * read path WITHOUT re-adding a saga and WITHOUT changing the dispatch site:
- * `createChatReadMiddleware()` observes every dispatched action and, on
- * `initializeChatRequested`, runs `loadChatTranscript(agentId)` — which fetches
- * the session (`appClient.agents.get`) AND the FULL transcript by paging through
- * `agent.getConversation` (PROTOCOL §5.5, up to 200 messages per page, looping
- * on `nextToken` until the complete conversation is assembled). The daemon's
+ * Reusable on-demand transcript read seam used by the daemon event router
+ * (reconnect / event-driven refetches). `loadChatTranscript(agentId)` fetches
+ * the session (`appClient.agents.get`) AND the transcript by paging through
+ * `agent.getConversation` (PROTOCOL §5.5, 50 messages per page, looping
+ * on `nextToken`). Paging walks from the newest page backwards and stops once
+ * `MAX_MESSAGES_PER_AGENT` messages have accumulated — the agent-session slice
+ * prunes to that same cap anyway, so pages past it would be fetched only
+ * to be discarded (intent-hq/monorepo#2627). The daemon's
  * AgentLite projection (from `agents.get`) returns only message COUNTS, so
  * `getConversation` is the sole source of the actual message content.
  * `bulkUpsertSessions` populates the agent-session slice (`byAgentId` + messages
  * = the conversation), and `upsertSession` registers the agent id in the
  * workspace-agents index.
  *
- * PAIRING WITH THE STANDING SUBSCRIPTION (chat-subscribe-service): the same
- * `initializeChatRequested` also opens a standing `chat.subscribe` whose seq-0
- * snapshot covers the newest page + live-turn slot. This read pages the FULL
- * history (the snapshot is only the newest page); the standing stream owns
- * the in-flight message and reconciles live deltas after hydration.
- *
- * ONE guard that ownership split requires: `agent.getConversation` returns
- * PERSISTED rows only (PROTOCOL §5.5) — the live partial turn exists solely
- * in the subscription's snapshot/deltas (§7.1). When this read completes
- * AFTER the seq-0 snapshot landed (the common mid-turn re-entry ordering),
- * its full-list upsert would clobber the snapshot-delivered in-flight
- * assistant message with a list that cannot contain it. So the hydrate keeps
- * any stream-owned message (`isStreaming: true`) already in the store whose
- * id is absent from the fetched pages — but ONLY while the freshly fetched
- * session reports a turn in flight. When the daemon says the agent is idle,
- * a store-resident stream-owned row the fetched pages lack is a renderer-
- * local ghost the daemon never persisted (e.g. a daemon crash mid-turn) and
- * is dropped. A turn that FINALIZED during the read is not covered by that
- * guard (the persisted row is no longer stream-owned), so the subscription
- * re-asserts its last reconciled transcript on this module's
- * `transcriptHydrationSettled` dispatch — a fetch whose pages predate the
- * finalize cannot silently drop the finalized row.
- *
  * READ-ONLY: this module never invokes an agent mutation (no create/send/stop).
  *
- * Loads are coalesced per agent via an in-flight map: a request arriving while
- * a load is already in flight shares the in-flight read. Post-hydration
- * convergence is owned by the standing subscription — its settle-time
- * re-apply plus its delta reconcile — so no follow-up rerun is scheduled.
+ * Loads are coalesced per agent via an in-flight map. A request arriving while
+ * a load is already in flight marks a single pending RERUN instead of silently
+ * sharing the (possibly already stale) in-flight read (monorepo#1019): when the
+ * current load settles, exactly one follow-up load runs. Multiple mid-flight
+ * requests collapse into that one rerun, so there is no unbounded loop.
  *
  * Errors are swallowed (logged only) so a failed read leaves any prior session
  * intact rather than clobbering it with an empty transcript. If `agents.get`
  * returns null we skip entirely (do not fabricate a session).
  *
  * Dependency-light per src/store AGENTS.md: imports only the AppClient seam, the
- * configured store, the slice actions, and the logger (NOT selectors — importing
- * them would evaluate `store.createSelector` while the store module is still
- * mid-initialization through the middleware chain).
+ * configured store, the slice actions (plus its shared prune-cap constant), and
+ * the logger.
  */
-import type { StoreMiddleware } from "$lib/store-shim/types";
-import type { AgentMessage, AgentSession } from "$shared/types";
-import { appClient } from "$lib/client";
-import { store as appStore } from "$store/renderer/store";
+import type { AgentMessage } from '$shared/types';
+import { appClient } from '$lib/client';
+import { store as appStore } from '$store/renderer/store';
 import {
-  initializeChatRequested,
   transcriptHydrationStarted,
   transcriptHydrationSettled,
-} from "$store/renderer/slices/chat-state/chat-state-slice";
+} from '$store/renderer/slices/chat-state/chat-state-slice';
 import {
+  MAX_MESSAGES_PER_AGENT,
   bulkUpsertSessions,
   upsertSession,
-} from "$store/renderer/slices/agent-session/agent-session-slice";
-import { createLogger } from "$lib/utils/client-logger";
-import { isAgentDeletionPending } from "./utils/pending-agent-deletions";
-import { staleRuntimeFlagClearUpsertOptions } from "./utils/stale-runtime-flag-clear";
+} from '$store/renderer/slices/agent-session/agent-session-slice';
+import { deduplicateAgentMessages } from '$shared/utils/message-dedup';
+import { createLogger } from '$lib/utils/client-logger';
+import { isAgentDeletionPending } from './utils/pending-agent-deletions';
 
-const logger = createLogger("ChatReadService");
+const logger = createLogger('ChatReadService');
 
 /** In-flight loads keyed by agent id; coalesces concurrent requests. */
 const inFlight = new Map<string, Promise<void>>();
 
-/**
- * Keep stream-owned messages the persisted read cannot see: any message
- * already in the store with `isStreaming: true` whose id is absent from the
- * fetched pages was delivered by the standing chat.subscribe snapshot/deltas
- * (the daemon's live-turn slot, never persisted mid-turn) and must survive
- * this full-list hydrate. Fetched rows win on id collision — a finalized
- * turn persists under the same message id.
- *
- * Preservation is gated on the FRESH session reporting a turn in flight
- * (`turnInFlight` / `isResponding` / `isStreaming` — the same derivation as
- * live-chat-client's snapshot overlay). If the daemon says the agent is
- * idle, a stream-owned store row absent from the persisted pages is a stale
- * renderer-local ghost (e.g. the daemon crashed mid-turn and never persisted
- * the partial) — the fetched list is returned as-is so the ghost is evicted.
- * `turnInFlight` is a PROTOCOL §5.5 additive AgentLite field not declared on
- * the TS type, so it is read defensively off the raw session.
- *
- * State is read directly off `appStore.state` (dependency-light per
- * src/store AGENTS.md — no selector imports in middleware-adjacent
- * services).
- */
-function withPreservedStreamOwnedMessages(
-  agentId: string,
-  fetched: AgentMessage[],
-  session: AgentSession,
-): AgentMessage[] {
-  const turnInFlight =
-    (session as { turnInFlight?: unknown }).turnInFlight === true ||
-    session.isResponding === true ||
-    session.isStreaming === true;
-  if (!turnInFlight) return fetched;
+/** Pending follow-up loads keyed by agent id; at most one rerun per in-flight load. */
+const pendingRerun = new Map<string, Promise<void>>();
+
+/** Dependency-light one-time read of the store's current transcript (no selector import). */
+function readCurrentMessages(agentId: string): AgentMessage[] {
   const state = appStore.state as {
     agentSessions?: { byAgentId: Record<string, { messages?: AgentMessage[] }> };
   };
-  const existingMessages = state.agentSessions?.byAgentId[agentId]?.messages;
-  if (!existingMessages || existingMessages.length === 0) return fetched;
-  const fetchedIds = new Set(fetched.map((message) => message.id));
-  const streamOwned = existingMessages.filter(
-    (message) => message.isStreaming === true && !fetchedIds.has(message.id),
-  );
-  if (streamOwned.length === 0) return fetched;
-  return [...fetched, ...streamOwned];
+  return state.agentSessions?.byAgentId[agentId]?.messages ?? [];
 }
 
 /**
  * Fetch a single agent's session AND its FULL transcript from the seam, then
  * hydrate the store with `{ ...session, messages }`. Pages through
- * agent.getConversation to assemble the complete transcript (the daemon
- * returns up to 200 messages per page). Errors are swallowed (logged only) so
+ * agent.getConversation to assemble the complete transcript (50 messages per
+ * page). Errors are swallowed (logged only) so
  * a failed read never clears an existing transcript. Concurrent calls for the
  * same agent share one fetch.
  */
@@ -138,10 +76,22 @@ export async function loadChatTranscript(agentId: string): Promise<void> {
   if (isAgentDeletionPending(agentId)) return;
   const pending = inFlight.get(agentId);
   if (pending) {
-    // Share the in-flight read. Post-hydration convergence (a turn finalizing
-    // after paging began, live growth during the read) is owned by the
-    // standing chat.subscribe delta reconcile, so no rerun is scheduled.
-    return pending;
+    // A request arriving mid-load means the in-flight read may already be
+    // stale (e.g. the turn finalized after paging began). Returning the
+    // pending promise as-is swallowed the refetch (monorepo#1019); instead,
+    // schedule exactly ONE follow-up load after the current one settles.
+    // Further mid-flight requests coalesce into that same rerun. The rerun
+    // clears its map entry before starting, so a request arriving DURING the
+    // rerun schedules at most one more — reruns only run when requested,
+    // never in an unbounded loop.
+    const scheduledRerun = pendingRerun.get(agentId);
+    if (scheduledRerun) return scheduledRerun;
+    const rerun = pending.then(() => {
+      pendingRerun.delete(agentId);
+      return loadChatTranscript(agentId);
+    });
+    pendingRerun.set(agentId, rerun);
+    return rerun;
   }
 
   // Create a placeholder promise that we'll resolve once the actual work is done
@@ -152,6 +102,18 @@ export async function loadChatTranscript(agentId: string): Promise<void> {
 
   // Register in inFlight BEFORE dispatching to prevent re-entrant calls
   inFlight.set(agentId, runPromise);
+
+  // BASELINE snapshot (monorepo#1019): identity set (id + appMessageId) of the
+  // store's messages at the moment this read begins. The merge guard below
+  // retains only store-only messages ABSENT from this baseline — i.e. exactly
+  // the ones the live stream appended DURING the read. Pre-read rows the fetch
+  // dropped (BE truncation via edit/regenerate or agent.replaceMessages, from
+  // this or any other client) converge to BE state instead of becoming ghosts.
+  const baselineIds = new Set<string>();
+  for (const message of readCurrentMessages(agentId)) {
+    if (typeof message.id === 'string') baselineIds.add(message.id);
+    if (typeof message.appMessageId === 'string') baselineIds.add(message.appMessageId);
+  }
 
   // Dispatch loading status synchronously now that we're registered
   // Wrap in try/catch to ensure cleanup if dispatch throws
@@ -167,30 +129,26 @@ export async function loadChatTranscript(agentId: string): Promise<void> {
   // Actually perform the work
   (async () => {
     try {
-      // Capture BEFORE the fetch (monorepo#1250): a both-true runtime-flag
-      // pair that already exists when this read begins is either a genuinely
-      // live turn (the fresh session will report it in flight) or a stale
-      // leftover from a daemon crash mid-turn (the fresh session reports
-      // idle). A pair set DURING the fetch — chatSendStarted racing this
-      // read — is never cleared; that is the slice pair-guard's designed case.
-      const storedBefore = appStore.state.agentSessions?.byAgentId[agentId];
-      const hadInFlightPairBeforeFetch =
-        storedBefore?.isStreaming === true && storedBefore?.isProcessing === true;
       const session = await appClient.agents.get(agentId);
       if (!session) return;
+      // Skip rows carrying the daemon's delete-grace-window deadline (PROTOCOL
+      // §5.5 `pendingDeleteAt`, v6.7+) — a deletion scheduled by another
+      // window/client (or before an FE restart) is not in the local registry.
+      if (session.pendingDeleteAt) return;
       // Re-check after the fetch: a deletion may have become pending while
       // `agent.get` was in flight; hydrating now would resurrect the
       // soft-hidden session (and paging the transcript would be wasted work).
       if (isAgentDeletionPending(agentId)) return;
 
-      // Fetch the FULL transcript by paging through agent.getConversation.
-      // Request 200 messages per page (daemon max) and loop on nextToken.
-      // This fixes the flicker/truncation bug where chat.subscribeSnapshot
-      // (which returns only the newest ~50 messages) was used for initial
-      // load, causing transcripts with > 50 messages to be truncated.
+      // Fetch the transcript by paging through agent.getConversation.
+      // Request 50 messages per page and loop on nextToken.
+      // Paging walks newest→oldest, so stopping at MAX_MESSAGES_PER_AGENT keeps
+      // exactly the newest messages the store's prune cap would retain —
+      // older pages would be fetched only to be sliced off by the
+      // agent-session slice (intent-hq/monorepo#2627).
       const allMessages: AgentMessage[] = [];
       let nextToken: string | null = null;
-      const pageLimit = 200;
+      const pageLimit = 50;
 
       do {
         const page = await appClient.agents.getConversation(
@@ -198,57 +156,60 @@ export async function loadChatTranscript(agentId: string): Promise<void> {
           pageLimit,
           nextToken || undefined,
         );
-        // getConversation returns oldest→newest within each page, so prepend
-        // each page to maintain overall newest-first order when accumulating.
+        // getConversation returns oldest→newest within each page and pages
+        // walk newest→oldest, so prepend each page to keep the accumulated
+        // list in overall oldest→newest order.
         allMessages.unshift(...page.messages);
         nextToken = page.nextToken;
-      } while (nextToken !== null);
+      } while (nextToken !== null && allMessages.length < MAX_MESSAGES_PER_AGENT);
 
-      // Final re-check before the store upserts: the deletion may have become
+      // Final re-check before any side effects: the deletion may have become
       // pending during transcript paging above.
       if (isAgentDeletionPending(agentId)) return;
 
-      // The live-turn slot and any messages that arrive during/after this
-      // read are owned by the standing chat.subscribe stream
-      // (chat-subscribe-service): its seq-0 snapshot covers the in-flight
-      // message and its deltas reconcile subsequent growth.
-      //
-      // Guard (mid-turn re-entry regression): this read fetched PERSISTED
-      // rows only, so it can never contain the live partial turn. If the
-      // snapshot already hydrated a stream-owned message (`isStreaming:
-      // true`) that the fetched pages lack, keep it — replacing the list
-      // wholesale would blank the already-streamed text until the next
-      // delta. A turn that finalized during the read persists under the
-      // SAME id, so the fetched (final) copy wins and nothing stale stays.
-      // Preservation only applies while the fresh session reports a turn in
-      // flight: on an idle session such a row is a renderer-local ghost the
-      // daemon never persisted (daemon crash mid-turn) and is dropped.
-      //
+      // NOTE: no in-flight assistant merge here — the standing
+      // `chat.subscribe` subscription (chat-subscribe saga) is the sole
+      // source of the live-turn slot: its seq-0 snapshot carries the CS-0 D5
+      // merged in-flight message, it seeds the bridge stream accumulator,
+      // and its transcriptHydrationSettled re-apply restores the in-flight
+      // row immediately after this hydration settles. Event-router callers
+      // (agent:message self-heal, reconnect refresh) don't dispatch that
+      // action, so a mid-stream refetch on those paths can drop the
+      // in-flight partial until the next delta emit re-applies it — an
+      // ACCEPTED flicker window bounded by chunk cadence (and the reconnect
+      // path re-registers the subscription, serving a fresh snapshot).
+      const finalMessages = allMessages;
+
+      // STALE-HYDRATION MERGE GUARD (monorepo#1019): a store message absent
+      // from the fetched set AND from the pre-read baseline was appended by
+      // the live stream AFTER this hydration read began; replacing the list
+      // wholesale would wipe it. Merge those post-baseline messages with the
+      // fetched set by message id (fetched copies win for shared ids).
+      // Baseline messages missing from the fetch are deliberately DROPPED so
+      // BE-side truncations (edit/regenerate refetch convergence, iOS
+      // editAndRegenerate, daemon agent.replaceMessages) still shrink the
+      // transcript instead of leaving permanent ghost rows.
+      const appendedDuringRead = readCurrentMessages(agentId).filter(
+        (m) =>
+          !(
+            (typeof m.id === 'string' && baselineIds.has(m.id)) ||
+            (typeof m.appMessageId === 'string' && baselineIds.has(m.appMessageId))
+          ),
+      );
+      const mergedMessages =
+        appendedDuringRead.length === 0
+          ? finalMessages
+          : deduplicateAgentMessages([...finalMessages, ...appendedDuringRead]);
+
       // Render BE state as-is: the daemon is the single source of truth for
       // streaming/responding flags. If a chat opens with "Thinking", that is
       // because the daemon snapshot actually reports a turn is in-flight;
-      // orphan/stale healing belongs in the daemon — the ONE exception is
-      // the ghost eviction above, which concerns a renderer-local row the
-      // daemon never saw and therefore can never heal.
-      const mergedMessages = withPreservedStreamOwnedMessages(
-        agentId,
-        allMessages,
-        session,
-      );
+      // any orphan/stale healing belongs in the daemon, not the renderer.
       const sessionWithMessages = { ...session, messages: mergedMessages };
-      // Stale-pair convergence (monorepo#1250): when the in-flight flag pair
-      // predates this fetch and the daemon authoritatively reports the
-      // session idle, the snapshot's explicit-false runtime flags win over
-      // the pair-guard — a crash-orphaned pair has no clearing event left.
-      appStore.dispatch(
-        bulkUpsertSessions(
-          [sessionWithMessages],
-          staleRuntimeFlagClearUpsertOptions(hadInFlightPairBeforeFetch, session),
-        ),
-      );
+      appStore.dispatch(bulkUpsertSessions([sessionWithMessages]));
       appStore.dispatch(upsertSession(sessionWithMessages));
     } catch (error) {
-      logger.error("Failed to load agent conversation transcript", error);
+      logger.error('Failed to load agent conversation transcript', error);
       // Errors are swallowed (don't reject the promise)
     } finally {
       // Always mark as settled, whether success or error (errors are swallowed)
@@ -264,25 +225,4 @@ export async function loadChatTranscript(agentId: string): Promise<void> {
   })();
 
   return runPromise;
-}
-
-/**
- * Middleware that gives `initializeChatRequested` a real handler: after the
- * action passes through the reducer, it kicks off a (deduped) transcript load
- * for the target agent. Fire-and-forget — dispatch stays synchronous and never
- * throws. The action payload is `{ agentId, wsId, options }`.
- */
-export function createChatReadMiddleware(): StoreMiddleware {
-  return () => (next) => (action) => {
-    const result = next(action);
-    if (action && action.type === initializeChatRequested.type) {
-      const payload = action.payload as { agentId?: unknown } | undefined;
-      const agentId =
-        payload && typeof payload === "object" ? payload.agentId : undefined;
-      if (typeof agentId === "string" && agentId.length > 0) {
-        void loadChatTranscript(agentId);
-      }
-    }
-    return result;
-  };
 }

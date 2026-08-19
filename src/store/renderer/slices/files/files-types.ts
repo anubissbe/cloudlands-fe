@@ -1,4 +1,4 @@
-import type { Collection } from '$lib/store-shim/utils/collections/collection-utils';
+import type { Collection } from '@augmentcode/themis/utils/collections/collection-utils';
 
 export type FileContentSource = 'agent' | 'external' | 'user';
 
@@ -13,6 +13,11 @@ export type FileContentEntry = {
   error: string | null;
   isBinary: boolean;
   truncated: boolean;
+  /**
+   * Suffix-resolution candidates recorded when a read failed with not-found
+   * (`[]` = resolution attempted, no matches; `null`/absent = not attempted).
+   */
+  notFoundCandidates?: string[] | null;
 };
 
 export type FileContentReadOptions = {

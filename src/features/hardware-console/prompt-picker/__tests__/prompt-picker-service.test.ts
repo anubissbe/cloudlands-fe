@@ -1,14 +1,26 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { runSaga, stdChannel, type Task } from 'redux-saga';
+import { select } from 'typed-redux-saga';
 import type { HardwareConsoleManager, HardwareConsoleStatus } from '../../device/device-manager';
 
 const mockState = {
-  hardwareConsole: { promptUsage: [] as unknown[], promptPickerLimit: 8 },
+  hardwareConsole: {
+    promptUsage: [] as unknown[],
+    promptPickerLimit: 8,
+    isConsoleOwner: true,
+  },
 };
 
 const storeDispatched: { type: string; payload?: unknown }[] = [];
 
 vi.mock('$store/renderer/store', () => ({
   store: {
+    createSelector: (selector: (state: typeof mockState, ...args: never[]) => unknown) => {
+      const readable = (...args: never[]) => selector(mockState, ...args);
+      readable.select = (state: typeof mockState, ...args: never[]) => selector(state, ...args);
+      readable.effect = (...args: never[]) => select(selector, ...args);
+      return readable;
+    },
     get state() {
       return mockState;
     },
@@ -39,12 +51,15 @@ vi.mock('../../instance', () => ({
 }));
 
 import { appClient } from '$lib/client';
+import { store as appStore } from '$store/renderer/store';
 import {
-  createHardwareConsolePromptPickerMiddleware,
   DEFAULT_CENTER_DWELL_MS,
   extractSubmittedPromptText,
   installHardwareConsolePromptPickerJoystick,
+  persistHardwareConsolePromptPickerLimit,
+  persistHardwareConsolePromptUsage,
 } from '../prompt-picker-service';
+import { promptPickerSaga } from '$store/renderer/slices/hardware-console/sagas/prompt-picker-saga';
 import {
   radialCancelSector,
   radialPromptTurn,
@@ -104,10 +119,36 @@ const PROMPTS = ['p0', 'p1', 'p2', 'p3', 'p4', 'p5', 'p6', 'p7'];
 
 beforeEach(() => {
   storeDispatched.length = 0;
-  mockState.hardwareConsole = { promptUsage: [], promptPickerLimit: 8 };
+  mockState.hardwareConsole = { promptUsage: [], promptPickerLimit: 8, isConsoleOwner: true };
   vi.clearAllMocks();
   (appClient.settings.update as ReturnType<typeof vi.fn>).mockResolvedValue([]);
 });
+
+const runningTasks: Task[] = [];
+
+afterEach(() => {
+  for (const task of runningTasks.splice(0)) task.cancel();
+});
+
+function invokePromptPickerSaga(manager = makeFakeManager('unavailable')) {
+  const channel = stdChannel();
+  runningTasks.push(
+    runSaga(
+      {
+        channel,
+        dispatch: (action) => appStore.dispatch(action as never),
+        getState: () => mockState,
+      },
+      promptPickerSaga,
+      { manager: manager as unknown as HardwareConsoleManager },
+    ),
+  );
+  return (action: { type: string; payload?: unknown }) => {
+    appStore.dispatch(action as never);
+    channel.put(action);
+    return action;
+  };
+}
 
 describe('radial layout', () => {
   it('adds one Cancel sector after the prompt sectors', () => {
@@ -224,15 +265,13 @@ describe('extractSubmittedPromptText', () => {
   });
 });
 
-describe('createHardwareConsolePromptPickerMiddleware limit persistence', () => {
+describe('promptPickerSaga limit persistence', () => {
   it('persists promptPickerLimit read-modify-write, preserving sibling fields', async () => {
     (appClient.settings.get as ReturnType<typeof vi.fn>).mockResolvedValue({
       path: 'hardwareConsole.state',
       value: { keyPins: ['ws-1'], promptUsage: [], actionMapping: [], promptPickerLimit: 8 },
     });
-    const middleware = createHardwareConsolePromptPickerMiddleware();
-    const next = vi.fn((action) => action);
-    const invoke = middleware({} as never)(next);
+    const invoke = invokePromptPickerSaga();
 
     invoke({ type: 'any/action' });
     await vi.waitFor(() => {
@@ -256,5 +295,35 @@ describe('createHardwareConsolePromptPickerMiddleware limit persistence', () => 
         },
       ]);
     });
+  });
+});
+
+describe('prompt persist helpers on a failed bag read', () => {
+  it('persistHardwareConsolePromptUsage rejects and does not write', async () => {
+    (appClient.settings.get as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+    await expect(persistHardwareConsolePromptUsage([])).rejects.toThrow('hardwareConsole.state');
+    expect(appClient.settings.update).not.toHaveBeenCalled();
+  });
+
+  it('persistHardwareConsolePromptPickerLimit rejects and does not write', async () => {
+    (appClient.settings.get as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+    await expect(persistHardwareConsolePromptPickerLimit(8)).rejects.toThrow(
+      'hardwareConsole.state',
+    );
+    expect(appClient.settings.update).not.toHaveBeenCalled();
+  });
+
+  it('writes the merged bag preserving sibling fields on a successful read', async () => {
+    (appClient.settings.get as ReturnType<typeof vi.fn>).mockResolvedValue({
+      path: 'hardwareConsole.state',
+      value: { keyPins: ['ws-1'], enabled: false },
+    });
+    await persistHardwareConsolePromptUsage([]);
+    expect(appClient.settings.update).toHaveBeenCalledWith([
+      {
+        path: 'hardwareConsole.state',
+        value: { keyPins: ['ws-1'], enabled: false, promptUsage: [] },
+      },
+    ]);
   });
 });

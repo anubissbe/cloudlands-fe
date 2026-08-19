@@ -6,12 +6,6 @@
   import Fa from 'svelte-fa';
   import BranchSelector, { type BranchListInfo, type BranchStatus } from './BranchSelector.svelte';
   import RepoSelector from './RepoSelector.svelte';
-  import {
-    isolationNoun,
-    resolveEffectiveIsolationMode,
-    type IsolationMode,
-  } from './isolation-mode';
-  import { selectWorkspaceItems } from '$store/renderer/slices/workspace/workspace-selectors';
   import { m } from '$shared/paraglide/messages.js';
 
   type RepoSelectorHandle = {
@@ -108,17 +102,6 @@
 
   const isMetadataPresentation = $derived(presentation === 'metadata');
 
-  // Effective isolated-checkout mode (worktree vs CoW clone) for creation copy.
-  // Re-resolves when workspace items hydrate (cowSupported is read off them).
-  const workspaceItemsForIsolation$ = selectWorkspaceItems();
-  let isolationMode = $state<IsolationMode>('worktree');
-  $effect(() => {
-    void resolveEffectiveIsolationMode($workspaceItemsForIsolation$).then(
-      (mode) => (isolationMode = mode),
-    );
-  });
-  const isolationLabel = $derived(isolationNoun(isolationMode));
-
   // Whole-sentence messages split around the widget slots ('\u0000') so
   // translators control word order; chunks render in the existing spans
   // (spacing comes from CSS, hence the trim).
@@ -137,9 +120,8 @@
   );
   const cloneRepoParts = $derived(
     sentenceParts(
-      m.workspace_repoAndBranchPicker_cloneRepoAndCreateOffBranch_label({
+      m.workspace_repoAndBranchPicker_cloneRepoAndWorkOffBranch_label({
         repo: SLOT,
-        isolationLabel,
         branch: SLOT,
       }),
     ),
@@ -160,14 +142,16 @@
       ? 'block w-full min-w-0 text-sm text-foreground'
       : 'flex items-center flex-wrap gap-y-1',
   );
+  const metadataTriggerSurfaceClass =
+    'rounded-md bg-muted/40! shadow-none! outline-none! hover:bg-muted/60! active:bg-muted/70! data-[state=open]:bg-muted/70! data-[state=open]:text-foreground focus-visible:bg-muted/70! focus-visible:text-foreground focus-visible:outline-none! focus-visible:outline-offset-0! focus-visible:ring-0! focus-visible:ring-offset-0! focus-visible:shadow-none! disabled:bg-muted/50! disabled:text-muted-foreground disabled:hover:bg-muted/50! forced-colors:border forced-colors:border-[ButtonText] forced-colors:bg-[ButtonFace] forced-colors:text-[ButtonText]'; // i18n-ignore (Tailwind class list)
   const repoTriggerClass = $derived(
     isMetadataPresentation
-      ? 'group/metadata-trigger min-w-0 rounded-md px-2! py-1! text-sm leading-5 font-normal text-foreground bg-transparent! hover:bg-muted/40! focus-visible:bg-muted/40 focus-visible:ring-1 focus-visible:ring-ring focus-visible:ring-offset-0!' // i18n-ignore (Tailwind class list)
+      ? `group/metadata-trigger min-w-0 px-2! py-1! text-sm leading-5 font-normal text-foreground ${metadataTriggerSurfaceClass}`
       : 'pl-2.5 pr-1.5 font-medium bg-background! py-1.25! rounded-none ml-1', // i18n-ignore (Tailwind class list)
   );
   const branchTriggerClass = $derived(
     isMetadataPresentation
-      ? 'group/metadata-trigger w-full min-w-0 rounded-md px-2! py-1! text-sm leading-5 font-normal text-foreground bg-transparent! hover:bg-muted/40! focus-visible:bg-muted/40 focus-visible:ring-1 focus-visible:ring-ring focus-visible:ring-offset-0! overflow-hidden' // i18n-ignore (Tailwind class list)
+      ? `group/metadata-trigger w-full min-w-0 px-2! py-1! text-sm leading-5 font-normal text-foreground overflow-hidden ${metadataTriggerSurfaceClass}`
       : 'pl-2.5 pr-1.5 font-medium bg-background! py-1.25! rounded-none overflow-hidden', // i18n-ignore (Tailwind class list)
   );
   const metadataChevronClass = 'h-2.5 w-2.5 shrink-0 text-ghost opacity-70';
@@ -375,9 +359,9 @@
       triggerChevronClass={metadataChevronClass}
     />
     {#if isMetadataPresentation ? repoOffBranchParts[1] : cloneRepoParts[1]}
-      <span class="text-sm text-subtle whitespace-nowrap shrink-0 ml-1">
-        {isMetadataPresentation ? repoOffBranchParts[1] : cloneRepoParts[1]}
-      </span>
+      <span class="text-sm text-subtle whitespace-nowrap shrink-0 mx-1 ml-2"
+        >{isMetadataPresentation ? repoOffBranchParts[1] : cloneRepoParts[1]}</span
+      >
     {/if}
     <BranchSelector
       variant="ghost"
@@ -401,9 +385,9 @@
       onchange={handleBranchChange}
     />
     {#if isMetadataPresentation ? repoOffBranchParts[2] : cloneRepoParts[2]}
-      <span class="text-sm text-subtle whitespace-nowrap shrink-0 ml-1">
-        {isMetadataPresentation ? repoOffBranchParts[2] : cloneRepoParts[2]}
-      </span>
+      <span class="text-sm text-subtle whitespace-nowrap shrink-0 mx-1"
+        >{isMetadataPresentation ? repoOffBranchParts[2] : cloneRepoParts[2]}</span
+      >
     {/if}
   {:else if repoType === 'remote' && remoteSetup && isMetadataPresentation}
     <RepoSelector

@@ -5,7 +5,12 @@
  * Safe to import from any process (renderer, main, shared, preload).
  */
 
-import type { IconDefinition } from "@fortawesome/fontawesome-common-types";
+/** Serializable icon descriptor understood by the renderer's icon adapter. */
+export interface PanelTabIcon {
+  iconName: string;
+  prefix?: string;
+  icon?: readonly [number, number, readonly string[], string, string | readonly string[]];
+}
 
 // ============================================================================
 // Core Panel Types
@@ -13,28 +18,29 @@ import type { IconDefinition } from "@fortawesome/fontawesome-common-types";
 
 /** Types of content that can be displayed in a panel tab */
 export type PanelTabType =
-  | "note"
-  | "file"
-  | "diff"
-  | "changes"
-  | "local-changes"
-  | "chat-changes"
-  | "agent"
-  | "terminal"
-  | "settings"
-  | "overview"
-  | "browser"
-  | "activity"
-  | "activity-changes"
-  | "code-review"
-  | "agent-overview";
+  | 'note'
+  | 'file'
+  | 'diff'
+  | 'changes'
+  | 'local-changes'
+  | 'chat-changes'
+  | 'agent'
+  | 'terminal'
+  | 'settings'
+  | 'overview'
+  | 'browser'
+  | 'hook-script'
+  | 'activity'
+  | 'activity-changes'
+  | 'code-review'
+  | 'agent-overview';
 
 /** A single tab within a panel */
 export interface PanelTab {
   id: string;
   type: PanelTabType;
   title: string;
-  icon?: IconDefinition;
+  icon?: PanelTabIcon;
   closable: boolean;
   hasUnsavedChanges?: boolean;
 
@@ -44,8 +50,23 @@ export interface PanelTab {
   filePath?: string;
   agentId?: string;
   terminalId?: string;
+  hookId?: string;
   diffPath?: string;
   browserUrl?: string;
+  /**
+   * Original URL as requested before the loopback/tunnel rewrite (e.g.
+   * `http://daemon.localhost:3000/`); present only when `browserUrl` was
+   * produced by a rewrite. Persisted so a restored tab can re-run the
+   * rewrite and land on a live tunnel instead of a dead ephemeral forward
+   * port (intent-hq/monorepo#2789).
+   */
+  browserRequestedUrl?: string;
+  /**
+   * Agent owning this browser tab (monorepo#2857); absent for user-opened
+   * (unowned) tabs. Persisted with the layout so ownership survives restart;
+   * main's ownership registry rehydrates from it.
+   */
+  ownerAgentId?: string;
   faviconUrl?: string;
   contextItemId?: string;
 
@@ -58,14 +79,18 @@ export interface PanelState {
   id: string;
   tabs: PanelTab[];
   activeTabId: string | null;
+  /** True for an untouched reusable blank panel that the next user item can consume. */
+  pristine?: boolean;
+  /** Pinned panels are preserved when reusable-panel mode collapses the layout. */
+  pinned?: boolean;
 }
 
 /** Node in the panel layout tree - either a panel or a split container */
 export type PanelLayoutNode =
-  | { type: "panel"; panelId: string }
+  | { type: 'panel'; panelId: string }
   | {
-      type: "split";
-      direction: "horizontal" | "vertical";
+      type: 'split';
+      direction: 'horizontal' | 'vertical';
       children: PanelLayoutNode[];
       /** Percentage sizes of children (should sum to 100) */
       sizes: number[];
@@ -76,8 +101,18 @@ export interface WorkspacePanelLayout {
   root: PanelLayoutNode;
   panels: Record<string, PanelState>;
   focusedPanelId: string | null;
+  /** User-resized intrinsic horizontal canvas width; null/absent uses automatic sizing. */
+  canvasWidth?: number | null;
+  /** Identifies a width that must survive restore; absent is a legacy automatic width. */
+  canvasWidthSource?: import('./panel-layout-width-provenance').PanelCanvasWidthSource | null;
   /** Tab ID that should receive focus when it mounts (consumed when focus is applied) */
   pendingFocusTabId?: string | null;
+  /** Persisted one-shot lifecycle for a workspace created by the compact initializer. */
+  newWorkspaceLifecycle?: NewWorkspacePanelLifecycle | null;
+  /** Compatibility guard used while the seeded Spec is intentionally empty. */
+  deferSpecTab?: boolean;
+  /** One-shot request to reveal a reused panel without stealing DOM focus. */
+  pendingPanelReveal?: PanelRevealRequest | null;
   detachedPanels?: Record<
     string,
     {
@@ -89,7 +124,25 @@ export interface WorkspacePanelLayout {
   >;
 }
 
-export type PanelLayoutRestoreStatus = "idle" | "pending" | "restored" | "empty" | "invalid";
+export interface NewWorkspacePanelLifecycle {
+  /** Coordinator creation fills the seeded reusable panel when Spec is first written. */
+  coordinator?: boolean;
+  initialAgentId: string | null;
+  initialAgentPending: boolean;
+  spec: {
+    noteId: string;
+    generation: string | null;
+    state: 'deferred' | 'revealed';
+  };
+}
+
+export interface PanelRevealRequest {
+  panelId: string;
+  tabId: string | null;
+  requestId: string;
+}
+
+export type PanelLayoutRestoreStatus = 'idle' | 'pending' | 'restored' | 'empty' | 'invalid';
 
 // ============================================================================
 // Internal State Types
@@ -107,6 +160,9 @@ export interface LayoutSnapshot {
   root: PanelLayoutNode;
   panels: Record<string, PanelState>;
   focusedPanelId: string | null;
+  /** Optional for backward compatibility with existing persisted history. */
+  canvasWidth?: number | null;
+  canvasWidthSource?: import('./panel-layout-width-provenance').PanelCanvasWidthSource | null;
   timestamp: number;
 }
 
@@ -132,8 +188,12 @@ export interface WorkspacePanelLayoutState {
   root: PanelLayoutNode;
   panels: Record<string, PanelState>;
   focusedPanelId: string | null;
+  /** Current horizontal panel canvas width in pixels; null uses the default column width. */
+  canvasWidth: number | null;
+  canvasWidthSource: import('./panel-layout-width-provenance').PanelCanvasWidthSource | null;
   restoreStatus: PanelLayoutRestoreStatus;
   pendingFocusTabId: string | null;
+  pendingPanelReveal?: PanelRevealRequest | null;
   recentlyClosed: RecentlyClosedTab[];
   layoutHistory: LayoutSnapshot[];
   historyIndex: number;
@@ -142,8 +202,19 @@ export interface WorkspacePanelLayoutState {
   focusHistoryIndex: number;
   expandedPanelId: string | null;
   savedSizesBeforeExpand: SavedExpandSizes[];
+  /** Exact pre-expand canvas width; `null` preserves automatic-width provenance. */
+  savedCanvasWidthBeforeExpand?: number | null;
+  /** Exact pre-expand width source; preserved across transient expanded-state resizes. */
+  savedCanvasWidthSourceBeforeExpand?:
+    import('./panel-layout-width-provenance').PanelCanvasWidthSource | null;
   deferSpecTab: boolean;
+  newWorkspaceLifecycle: NewWorkspacePanelLifecycle | null;
 }
+
+export type PanelDragLayoutSnapshot = Pick<
+  WorkspacePanelLayoutState,
+  'root' | 'focusedPanelId' | 'layoutHistory' | 'historyIndex'
+>;
 
 /** Top-level panel layout slice state */
 export type PanelLayoutSliceState = {
@@ -154,10 +225,8 @@ export type PanelLayoutSliceState = {
 // Constants
 // ============================================================================
 
-export const PANEL_LAYOUT_STORAGE_KEY_PREFIX = "panel-layout-";
+export const PANEL_LAYOUT_STORAGE_KEY_PREFIX = 'panel-layout-';
 export const MAX_RECENTLY_CLOSED = 20;
 export const MAX_LAYOUT_HISTORY = 50;
 export const MAX_FOCUS_HISTORY = 100;
 export const HISTORY_PERSIST_DEBOUNCE_MS = 2000;
-export const EXPANDED_SHARE = 80;
-

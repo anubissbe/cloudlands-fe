@@ -12,19 +12,16 @@
 
   import { fade } from 'svelte/transition';
   import type { ChatFileChange } from '$lib/utils/get-file-changes-from-messages';
-  import {
-  ChangeStage,
-  type TrackedChange,
-} from '$features/file-tracking/types';
-  import { selectActiveWorkspaceId } from '$store/renderer/slices/workspace/workspace-selectors';
+  import { ChangeStage, type TrackedChange } from '$features/file-tracking/types';
   import { selectDiffSideBySide } from '$store/renderer/slices/ui-layout/ui-layout-selectors';
   import Fa from 'svelte-fa';
   import { faArrowPointer } from '@fortawesome/free-solid-svg-icons';
-  import { TrackedChangeDiffViewer } from '$lib/components/ui/diff';
+  import { TrackedChangeDiffViewer } from '$features/file-tracking/components/diff';
   import type { LocalFileChange } from './types';
   import { m } from '$shared/paraglide/messages.js';
+  import { getWorkspaceRouteContext } from '$lib/utils/workspace-route-context';
 
-  const activeWorkspaceId = selectActiveWorkspaceId();
+  const workspaceId = getWorkspaceRouteContext()?.workspaceId ?? undefined;
 
   interface Props {
     change: ChatFileChange | LocalFileChange;
@@ -48,6 +45,14 @@
      * file diffs from a single virtualizer instance.
      */
     virtualizer?: import('@pierre/diffs').Virtualizer;
+    /**
+     * Secondary git root scoping the content fetches (multi git root
+     * tracking, v6.15). Forwarded to `TrackedChangeDiffViewer` together with
+     * `gitRootPath`; absent → primary-root behavior.
+     */
+    gitRootId?: string;
+    /** The secondary root's canonical path, used for path resolution. */
+    gitRootPath?: string;
   }
 
   let {
@@ -64,6 +69,8 @@
     // eslint-disable-next-line @typescript-eslint/no-unused-vars
     onOpenCommit,
     virtualizer,
+    gitRootId = undefined,
+    gitRootPath = undefined,
   }: Props = $props();
 
   const sideBySide = selectDiffSideBySide();
@@ -147,6 +154,9 @@
     const isStaged = 'staged' in change && change.staged === true;
     const category = 'category' in change ? (change.category as string) : undefined;
     const commitHash = 'commitHash' in change ? (change.commitHash as string) : undefined;
+    // Submodule (gitlink) marking from git.status — routes the viewer to the
+    // pin presentation and suppresses file reads (#1739).
+    const gitlink = 'gitlink' in change ? (change.gitlink as TrackedChange['gitlink']) : undefined;
     // Check if this is full file content from git:diff (vs snippet content from tool calls)
     // Snippet content should NOT be editable because saving would overwrite the full file
     const isFullFileContent =
@@ -171,6 +181,7 @@
       relativePath: filePath,
       stage,
       commitHash,
+      gitlink,
       stats: {
         additions,
         deletions,
@@ -191,13 +202,11 @@
     };
   });
 
-  let workspaceId = $derived($activeWorkspaceId);
   const lineOffset = $derived.by(() => {
     if (change.isFullFileContent) return 1;
     const firstChunkLine = 'chunks' in change ? change.chunks?.[0]?.newStart : undefined;
     return firstChunkLine ?? change.startLineNumber ?? 1;
   });
-
 </script>
 
 <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
@@ -225,6 +234,8 @@
       useProvidedContent={true}
       {lineOffset}
       {virtualizer}
+      {gitRootId}
+      {gitRootPath}
     />
 
     <!-- Scroll hint overlay -->

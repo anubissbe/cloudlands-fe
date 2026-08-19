@@ -6,28 +6,23 @@
    * This is the app-wide palette, not the inline slash-command suggester used
    * in text inputs.
    */
-  import {
-  onMount,
-  untrack,
-} from 'svelte';
+  import { onMount, untrack } from 'svelte';
   import { writable } from 'svelte/store';
   import { goto } from '$app/navigation';
   import { fly } from 'svelte/transition';
   import { navigateToSettings } from '$lib/utils/workspace-navigation';
   import Fa from 'svelte-fa';
   import {
-  faSearch,
-  faFile,
-  faCog,
-  faFolderOpen,
-  faTerminal,
-  faCommentDots,
-  faFileAlt,
-  faCodeBranch,
-  faPlus,
-  faGlobe,
-  faPlay,
-} from '@fortawesome/free-solid-svg-icons';
+    faSearch,
+    faFile,
+    faFolderOpen,
+    faTerminal,
+    faCommentDots,
+    faFileAlt,
+    faCodeBranch,
+    faPlus,
+    faGlobe,
+  } from '@fortawesome/free-solid-svg-icons';
   import { backendRequest } from '$lib/client/live/backend-transport';
   import { openMessage } from '$lib/utils/open-message';
   import { createTranscriptQuery } from '$lib/utils/palette-transcript-search';
@@ -36,55 +31,68 @@
 
   import { selectBrowserRecentUrls } from '$store/renderer/slices/browser/browser-selectors';
   import { initBrowserWorkspace } from '$store/renderer/slices/browser/browser-slice';
-  import { selectResolvedLocale } from '$store/renderer/slices/user-preferences/user-preferences-selectors';
   import { selectWorkspaceItems } from '$store/renderer/slices/workspace/workspace-selectors';
   import { createAgentRequested } from '$store/renderer/slices/workspace-agents/workspace-agents-slice';
   import { createTerminalRequested } from '$store/renderer/slices/terminals/terminals-slice';
   import { createNoteRequested } from '$store/renderer/slices/note-read-tracking/note-read-tracking-slice';
   import { dispatchWindowEvent } from '$lib/utils/window-events';
+  import { invoke } from '$lib/electron-bridge';
+  import { IPC_CHANNELS } from '$shared/ipc-registry';
+  import { togglePanelOpenMode } from '$store/renderer/slices/user-preferences/user-preferences-slice';
   import {
-  openWorkspaceBrowser,
-  openWorkspaceNote,
-} from '$store/renderer/slices/workspace-navigation/workspace-navigation-slice';
+    openWorkspaceBrowser,
+    openWorkspaceNote,
+  } from '$store/renderer/slices/workspace-navigation/workspace-navigation-slice';
   import {
-  commandPaletteNewFileRequested,
-  openAgentTabRequested,
-  openTerminalTabRequested,
-} from '$store/renderer/slices/app-layout/app-layout-slice';
-  import { resetOnboarding } from '$store/renderer/slices/onboarding/onboarding-slice';
-  import { setShowCreateModal } from '$store/renderer/slices/sidebar-nav/sidebar-nav-slice';
+    commandPaletteNewFileRequested,
+    openAgentTabRequested,
+    openTerminalTabRequested,
+  } from '$store/renderer/slices/app-layout/app-layout-slice';
   import {
-  type PaletteFilter,
-  type WorkspaceObject,
-  FILTER_PREFIXES,
-  fuzzyScore,
-  formatRelativeTime,
-  parseQueryFilter,
-  buildNoteBreadcrumbs,
-  buildRecentItems,
-} from '$store/renderer/slices/command-palette/command-palette-utils';
+    resetOnboarding,
+    setOnboardingFullFlowRequested,
+  } from '$store/renderer/slices/onboarding/onboarding-slice';
   import {
-  recordPaletteFileMru,
-  recordPaletteMruItem,
-} from '$store/renderer/slices/palette/palette-slice';
+    setShowCreateModal,
+    setStatsOverlayOpen,
+  } from '$store/renderer/slices/sidebar-nav/sidebar-nav-slice';
   import {
-  selectPaletteFileMru,
-  selectPaletteMruEntries,
-} from '$store/renderer/slices/palette/palette-selectors';
+    type PaletteFilter,
+    type WorkspaceObject,
+    FILTER_PREFIXES,
+    fuzzyScore,
+    formatRelativeTime,
+    parseQueryFilter,
+    buildNoteBreadcrumbs,
+    buildRecentItems,
+  } from '$store/renderer/slices/command-palette/command-palette-utils';
+  import {
+    recordPaletteFileMru,
+    recordPaletteMruItem,
+  } from '$store/renderer/slices/palette/palette-slice';
+  import {
+    selectPaletteFileMru,
+    selectPaletteMruEntries,
+  } from '$store/renderer/slices/palette/palette-selectors';
   import { computeResults } from '$store/renderer/slices/command-palette/command-palette-results';
   import { Skeleton } from './ui/skeleton';
+  import CommandPaletteItemTitle from './CommandPaletteItemTitle.svelte';
+  import { COMMAND_PALETTE_COMMANDS } from './command-palette-commands';
+  import IntentNavigationIcon from '$lib/icons/IntentNavigationIcon.svelte';
   import { selectAllWorkspaceAgents } from '$store/renderer/slices/workspace-agents/workspace-agents-selectors';
   import { selectAllNotes } from '$store/renderer/slices/workspace-notes/workspace-notes-selectors';
   import { selectCurrentChanges } from '$store/renderer/slices/changes/changes-selectors';
   import { terminalManager } from '$features/terminal/terminal-manager.svelte';
   import { terminalHistoryTracker } from '$features/terminal/terminal-history-tracker';
-  import AuggieAvatar from '$lib/components/ui/auggie-avatar/AuggieAvatar.svelte';
+  import AgentAvatar from '$features/agent/components/agent-avatar/AgentAvatar.svelte';
   import { extractContentFromBlocks } from '$shared/types/agent-message.conversion';
   import {
-  compareWorkspaceActivityDisplayTimeDesc,
-  getWorkspaceActivityDisplayTime,
-} from '$shared/utils/workspace-activity-time';
+    compareWorkspaceActivityDisplayTimeDesc,
+    getWorkspaceActivityDisplayTime,
+  } from '$shared/utils/workspace-activity-time';
   import { store as appStore } from '$store/renderer/store';
+  import { selectWorkspaceViewMode } from '$store/renderer/slices/tab-state/tab-state-selectors';
+  import { toggleWorkspaceViewModeWithTransition } from '$features/workspace/workspace-view-mode-action';
 
   const logger = createLogger('CommandPalette');
 
@@ -112,14 +120,12 @@
 
   let searchQuery = $state('');
   const workspaceItems = selectWorkspaceItems();
-  const currentChanges$ = selectCurrentChanges();
+  const workspaceViewMode$ = selectWorkspaceViewMode();
+  let commands = $derived(COMMAND_PALETTE_COMMANDS($workspaceViewMode$));
+  const currentChanges$ = selectCurrentChanges(workspaceIdStore);
   const workspaceAgents$ = selectAllWorkspaceAgents(workspaceIdStore);
   const allNotes$ = selectAllNotes(workspaceIdStore);
   const browserRecentUrls$ = selectBrowserRecentUrls(workspaceIdStore);
-  // The palette lives outside +layout.svelte's {#key $resolvedLocale$} block,
-  // so the terminal-loading effect below must track the locale itself to
-  // refresh localized metadata titles after a runtime language switch.
-  const resolvedLocale$ = selectResolvedLocale();
   let selectedIndex = $state(0);
   let searchResults: any[] = $state([]);
   const paletteMruEntries$ = selectPaletteMruEntries();
@@ -207,8 +213,8 @@
       description: `+${c.stats.additions || 0} -${c.stats.deletions || 0}`,
       icon: faCodeBranch,
       path: c.relativePath,
-      timestamp: new Date(c.attribution.timestamp).getTime(),
-      _time: formatRelativeTime(new Date(c.attribution.timestamp).toISOString()),
+      timestamp: c.attribution.timestamp || 0,
+      _time: formatRelativeTime(c.attribution.timestamp),
     }));
   });
   let terminals: WorkspaceObject[] = $state([]);
@@ -237,87 +243,12 @@
   );
   let recentItems: WorkspaceObject[] = $derived(
     workspaceId
-      ? buildRecentItems([...agents, ...notes, ...changes, ...terminals, ...browserUrls], $paletteMruEntries$)
+      ? buildRecentItems(
+          [...agents, ...notes, ...changes, ...terminals, ...browserUrls],
+          $paletteMruEntries$,
+        )
       : [],
   );
-
-  // Commands available in command mode
-  const commands = [
-    {
-      id: 'new-workspace',
-      get label() {
-        return m.lib_commandPalette_newWorkspace_command();
-      },
-      get pillLabel() {
-        return m.lib_commandPalette_workspace_pill();
-      },
-      icon: faFolderOpen,
-      shortcut: '⌘T',
-    },
-    {
-      id: 'settings',
-      get label() {
-        return m.lib_commandPalette_settings_command();
-      },
-      icon: faCog,
-      shortcut: '⌘,',
-    },
-    {
-      id: 'new-agent',
-      get label() {
-        return m.lib_commandPalette_newAgentChat_command();
-      },
-      get pillLabel() {
-        return m.lib_commandPalette_agentChat_pill();
-      },
-      icon: faCommentDots,
-    },
-    {
-      id: 'new-terminal',
-      get label() {
-        return m.lib_commandPalette_newTerminal_command();
-      },
-      get pillLabel() {
-        return m.lib_commandPalette_terminal_pill();
-      },
-      icon: faTerminal,
-    },
-    {
-      id: 'new-note',
-      get label() {
-        return m.lib_commandPalette_newNote_command();
-      },
-      get pillLabel() {
-        return m.lib_commandPalette_note_pill();
-      },
-      icon: faFileAlt,
-    },
-    {
-      id: 'new-file',
-      get label() {
-        return m.lib_commandPalette_newFile_command();
-      },
-      get pillLabel() {
-        return m.lib_commandPalette_file_pill();
-      },
-      icon: faFile,
-      shortcut: '⌘N',
-    },
-    {
-      id: 'open-url',
-      get label() {
-        return m.lib_commandPalette_openUrl_command();
-      },
-      icon: faGlobe,
-    },
-    {
-      id: 'show-onboarding',
-      get label() {
-        return m.lib_commandPalette_showOnboarding_command();
-      },
-      icon: faPlay,
-    },
-  ];
 
   // Localized "Show N more …" labels per palette item type.
   function showMoreLabel(count: number, itemType: string): string {
@@ -341,11 +272,11 @@
   // FILTER_PREFIXES, and WorkspaceObject types are now imported from
   // '$store/renderer/slices/command-palette/command-palette-utils'
 
-  // Load workspace objects when workspace or locale changes (terminal metadata
-  // titles are localized at read time, so a runtime language switch must re-run
-  // this — the palette is mounted outside the layout's {#key $resolvedLocale$}).
+  // Load workspace objects when the workspace changes. Terminal metadata
+  // titles are localized at read time; a runtime language switch remounts the
+  // palette via the root +layout.svelte {#key $resolvedLocale$} block, which
+  // re-runs this effect, so no explicit locale tracking is needed here.
   $effect(() => {
-    void $resolvedLocale$;
     if (!workspaceId) {
       untrack(() => {
         terminals = [];
@@ -413,23 +344,21 @@
       const q = (pattern || '').trim();
       if (q) {
         const mru = getMRUMap();
-        return (
-          (mapped as any[])
-            .map((m: any) => ({
-              ...m,
-              _score: fuzzyScore(`${m.label} ${m.description || m.path}`, q),
-              _mru: m.path ? mru.get(m.path) || 0 : 0,
-            }))
-            .filter((m: any) => m._score !== -Infinity)
-            .sort(
-              (a: any, b: any) =>
-                (b._score as number) - (a._score as number) ||
-                (b._mru as number) - (a._mru as number),
-            )
+        return (mapped as any[])
+          .map((m: any) => ({
+            ...m,
+            _score: fuzzyScore(`${m.label} ${m.description || m.path}`, q),
+            _mru: m.path ? mru.get(m.path) || 0 : 0,
+          }))
+          .filter((m: any) => m._score !== -Infinity)
+          .sort(
+            (a: any, b: any) =>
+              (b._score as number) - (a._score as number) ||
+              (b._mru as number) - (a._mru as number),
+          )
 
-            .map(({ _score, _mru, ...rest }: any) => rest)
-            .slice(0, 8)
-        );
+          .map(({ _score, _mru, ...rest }: any) => rest)
+          .slice(0, 8);
       } else {
         return rankByMRU(mapped).slice(0, 8);
       }
@@ -780,9 +709,7 @@
           break;
         case 'note':
           if (workspaceId) {
-            appStore.dispatch(
-              openWorkspaceNote(workspaceId, item.id, { openInAdjacentPanel }),
-            );
+            appStore.dispatch(openWorkspaceNote(workspaceId, item.id, { openInAdjacentPanel }));
           }
           break;
         case 'change':
@@ -792,9 +719,7 @@
           break;
         case 'terminal':
           if (workspaceId) {
-            appStore.dispatch(
-              openTerminalTabRequested(workspaceId, { terminalId: item.id }),
-            );
+            appStore.dispatch(openTerminalTabRequested(workspaceId, { terminalId: item.id }));
           }
           break;
         case 'browser':
@@ -857,8 +782,32 @@
         }
         return true;
       case 'show-onboarding':
+        // Explicit restart: request the full flow so OnboardingPage's
+        // initial-step decision never skips ahead on setup state.
+        appStore.dispatch(setOnboardingFullFlowRequested(true));
         appStore.dispatch(resetOnboarding());
         goto('/workspace/new');
+        return true;
+      case 'enhance-prompt':
+        dispatchWindowEvent('chat:enhance-prompt');
+        return true;
+      case 'attach-context':
+        dispatchWindowEvent('chat:attach-context');
+        return true;
+      case 'attach-files':
+        dispatchWindowEvent('chat:attach-files');
+        return true;
+      case 'open-hud':
+        void invoke(IPC_CHANNELS.WINDOW.OPEN_NEW, { route: '/hud' });
+        return true;
+      case 'open-usage-stats':
+        appStore.dispatch(setStatsOverlayOpen(true));
+        return true;
+      case 'workspace-view-mode':
+        void toggleWorkspaceViewModeWithTransition();
+        return true;
+      case 'toggle-panel-open-mode':
+        appStore.dispatch(togglePanelOpenMode());
         return true;
       default:
         return true;
@@ -1004,7 +953,9 @@
                 >
               </button>
             {:else}
-              <p class="text-[13px] text-subtle px-3">{m.lib_commandPalette_invalidLine_message()}</p>
+              <p class="text-[13px] text-subtle px-3">
+                {m.lib_commandPalette_invalidLine_message()}
+              </p>
             {/if}
           </div>
         </div>
@@ -1063,7 +1014,7 @@
                   <span>{item._groupLabel}</span>
                   {#if item._shortcutKey}
                     <kbd
-                      class="text-ui px-1.5 py-0.5 rounded bg-foreground/[0.04] text-foreground/30 font-mono normal-case"
+                      class="text-ui px-1.5 py-0.5 rounded bg-foreground/[0.04] text-foreground/30 normal-case"
                     >
                       {item._shortcutKey}
                     </kbd>
@@ -1094,32 +1045,21 @@
                 <!-- Icon or Avatar -->
                 {#if item.type === 'agent'}
                   <div class="flex-none mt-0.5">
-                    <AuggieAvatar agentId={item.id} size={18} />
+                    <AgentAvatar agentId={item.id} size={18} />
                   </div>
+                {:else if item.navigationIcon}
+                  <IntentNavigationIcon
+                    name={item.navigationIcon}
+                    size={16}
+                    class="text-ghost flex-none mt-0.5"
+                  />
                 {:else}
                   <Fa icon={item.icon} class="text-[15px] text-foreground/25 flex-none mt-0.5" />
                 {/if}
 
                 <div class="flex-1 min-w-0 flex flex-col gap-0.5">
                   <!-- First line: label and time -->
-                  <div class="flex items-center gap-2.5">
-                    <span class="text-[14px] font-medium text-foreground truncate"
-                      >{item.label}</span
-                    >
-                    {#if item.type === 'message' && item.workspaceName}
-                      <span class="text-xs text-subtle truncate">
-                        <span aria-hidden="true">·</span>
-                        {item.workspaceName}
-                        {#if item.repoLabel}
-                          <span aria-hidden="true">·</span>
-                          {item.repoLabel}
-                        {/if}
-                      </span>
-                    {/if}
-                    {#if item._time}
-                      <span class="text-ui text-subtle flex-none ml-auto">{item._time}</span>
-                    {/if}
-                  </div>
+                  <CommandPaletteItemTitle {item} />
 
                   <!-- Second line: description or breadcrumbs -->
                   {#if item.description || item.breadcrumbs || item.path}
@@ -1162,7 +1102,9 @@
         </div>
       {:else if searchQuery && !isLoadingFiles && !isLoadingMessages}
         <div class="px-3 py-6 text-center">
-          <p class="text-[13px] text-subtle">{m.lib_commandPalette_noResults_message({ query: searchQuery })}</p>
+          <p class="text-[13px] text-subtle">
+            {m.lib_commandPalette_noResults_message({ query: searchQuery })}
+          </p>
         </div>
       {:else if !searchQuery}
         <div class="px-3 py-6 text-center">

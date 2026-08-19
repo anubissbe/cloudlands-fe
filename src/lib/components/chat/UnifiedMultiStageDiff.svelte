@@ -9,21 +9,15 @@
    * in Monaco diff mode. The diff shows all changes merged together.
    */
 
-  import {
-  ChangeStage,
-  type TrackedChange,
-} from '$features/file-tracking/types';
-  import { selectActiveWorkspaceId } from '$store/renderer/slices/workspace/workspace-selectors';
+  import { ChangeStage, type TrackedChange } from '$features/file-tracking/types';
   import type { ChangePart } from './types';
-  import {
-  mergeChangeParts,
-  buildContentFromMergedHunks,
-} from './unified-diff-merger';
-  import { TrackedChangeDiffViewer } from '$lib/components/ui/diff';
+  import { mergeChangeParts, buildContentFromMergedHunks } from './unified-diff-merger';
+  import { TrackedChangeDiffViewer } from '$features/file-tracking/components/diff';
   import { selectDiffSideBySide } from '$store/renderer/slices/ui-layout/ui-layout-selectors';
   import { m } from '$shared/paraglide/messages.js';
+  import { getWorkspaceRouteContext } from '$lib/utils/workspace-route-context';
 
-  const activeWorkspaceId = selectActiveWorkspaceId();
+  const workspaceId = getWorkspaceRouteContext()?.workspaceId ?? undefined;
 
   interface Props {
     /** The change parts to display (staged, unstaged, committed) */
@@ -53,6 +47,7 @@
   }: Props = $props();
 
   // Silence unused variable warnings (onOpenCommit not yet implemented for merged view)
+  // svelte-ignore state_referenced_locally -- one-shot read purely to silence the unused-variable lint.
   void _onOpenCommit;
 
   const sideBySide = selectDiffSideBySide();
@@ -95,8 +90,6 @@
       },
     };
   });
-
-  const workspaceId = $derived($activeWorkspaceId);
 </script>
 
 {#if mergedHunks.length === 0}

@@ -1,38 +1,46 @@
 <script lang="ts">
   import ModelPicker from '$lib/components/chat/input/ModelPicker.svelte';
-  import AuggieAvatar from '$lib/components/ui/auggie-avatar/AuggieAvatar.svelte';
+  import AgentAvatar from '$features/agent/components/agent-avatar/AgentAvatar.svelte';
 
   import {
-  selectSpecialists,
-  selectCustomSpecialistsLoaded,
-  selectFileSpecialistsLoaded,
-  filterPickableSpecialists,
-} from '$store/renderer/slices/specialists/specialists-selectors';
+    selectSpecialists,
+    selectCustomSpecialistsLoaded,
+    selectFileSpecialistsLoaded,
+    filterPickableSpecialists,
+  } from '$store/renderer/slices/specialists/specialists-selectors';
 
-  import { selectSelectedModel } from '$store/renderer/slices/model/model-selectors';
+  import {
+    selectAvailableModels,
+    selectAvailableModelsProviderId,
+    selectModelEffortLevels,
+    selectSelectedModel,
+  } from '$store/renderer/slices/model/model-selectors';
   import { selectWorkspaceInitializerHydrated } from '$store/renderer/slices/workspace-initializer/workspace-initializer-selectors';
   import { navigateToSettings } from '$lib/utils/workspace-navigation';
-  import {
-  faPlus,
-  faChevronDown,
-} from '@fortawesome/free-solid-svg-icons';
+  import { faPlus, faChevronDown } from '@fortawesome/free-solid-svg-icons';
   import Fa from 'svelte-fa';
   import { onMount } from 'svelte';
   import {
-  getProviderAvailability,
-  type ProviderAvailabilityResult,
-} from '$features/providers/provider-availability.client';
+    getProviderAvailability,
+    type ProviderAvailabilityResult,
+  } from '$features/providers/provider-availability.client';
   import { parseCompoundModelId } from '$shared/utils/compound-model-id';
   import {
-  selectEffectiveDefaultProviderId,
-  selectProviderCatalogEntries,
-} from '$store/renderer/slices/provider-catalog/provider-catalog-selectors';
+    selectEffectiveDefaultProviderId,
+    selectNormalizedProviderId,
+    selectProviderCatalogEntries,
+  } from '$store/renderer/slices/provider-catalog/provider-catalog-selectors';
+  import {
+    selectProviderModelsCacheEntry,
+    selectProviderModelsCacheMap,
+  } from '$store/renderer/slices/provider-models/provider-models-selectors';
   import { selectActiveProviderId } from '$store/renderer/slices/provider-settings/provider-settings-selectors';
   import { appClient } from '$lib/client';
   import { createLogger } from '$lib/utils/client-logger';
   import DropdownMenu from '$lib/components/ui/dropdown-menu.svelte';
   import { selectGitHubAuthIsAuthenticated } from '$store/renderer/slices/github-auth/github-auth-selectors';
   import { m } from '$shared/paraglide/messages.js';
+  import { store as appStore } from '$store/renderer/store';
 
   const logger = createLogger('InitialAgentPicker');
   const defaultProviderId$ = selectEffectiveDefaultProviderId();
@@ -47,6 +55,9 @@
   const initializerHydrated$ = selectWorkspaceInitializerHydrated();
   const activeProviderId$ = selectActiveProviderId();
   const selectedModel$ = selectSelectedModel();
+  const availableModels$ = selectAvailableModels();
+  const availableModelsProviderId$ = selectAvailableModelsProviderId();
+  const providerModelsCacheMap$ = selectProviderModelsCacheMap();
 
   interface Props {
     /** Selected specialist ID - null means blank agent */
@@ -55,6 +66,8 @@
     selectedModel?: string | undefined;
     /** Whether the user explicitly overrode the model (vs using specialist default) */
     modelWasOverridden?: boolean;
+    /** Explicit reasoning effort for the initial agent, or undefined to inherit */
+    selectedReasoningEffort?: string | undefined;
     /** Whether team work mode is selected (spec-writer orchestrates) */
     isTeamMode?: boolean;
     /** Selected provider ID (auto-selected from first available) */
@@ -63,6 +76,8 @@
     onSpecialistChange?: (specialistId: string | null) => void;
     /** Callback when model changes */
     onModelChange?: (model: string | undefined) => void;
+    /** Callback when reasoning effort changes */
+    onReasoningEffortChange?: (effort: string | undefined) => void;
     /** Callback when team mode changes */
     onTeamModeChange?: (isTeamMode: boolean) => void;
     /** Callback when provider changes (called when auto-selected) */
@@ -73,38 +88,77 @@
     selectedSpecialist = $bindable<string | null>('spec-writer'),
     selectedModel = $bindable<string | undefined>(undefined),
     modelWasOverridden = $bindable<boolean>(false),
+    selectedReasoningEffort = $bindable<string | undefined>(undefined),
     isTeamMode = $bindable<boolean>(true),
     selectedProvider = $bindable<string>($activeProviderId$ || $defaultProviderId$),
     onSpecialistChange,
     onModelChange,
+    onReasoningEffortChange,
     onTeamModeChange,
     onProviderChange,
   }: Props = $props();
 
+  function updateReasoningEffort(effort: string | undefined) {
+    if (selectedReasoningEffort === effort) return;
+    selectedReasoningEffort = effort;
+    onReasoningEffortChange?.(effort);
+  }
+
+  function reconcileReasoningEffort(model: string | undefined) {
+    void $availableModels$;
+    if (!selectedReasoningEffort || !model) return;
+    let levels = selectModelEffortLevels.select(appStore.state, model);
+    if (levels === undefined) {
+      const { providerId, modelId } = parseCompoundModelId(model, $defaultProviderId$);
+      const normalizedProviderId = selectNormalizedProviderId.select(appStore.state, providerId);
+      const cachedModels = selectProviderModelsCacheEntry.select(
+        appStore.state,
+        normalizedProviderId,
+      )?.models;
+      levels = cachedModels?.find(
+        (row) => row.value === model || row.value === modelId,
+      )?.effortLevels;
+    }
+    if (levels === undefined) return;
+    if (!levels.includes(selectedReasoningEffort)) updateReasoningEffort(undefined);
+  }
+
+  function handleReasoningChange(effort: string | null) {
+    updateReasoningEffort(effort ?? undefined);
+    return true;
+  }
+
   // Provider availability state (for auto-selection only, no UI picker)
   let providerAvailability = $state<ProviderAvailabilityResult | null>(null);
 
+  // Map provider IDs to keys used in ProviderAvailabilityResult
+  const providerAvailabilityKeyMap: Record<
+    string,
+    keyof ProviderAvailabilityResult['providers']
+  > = {
+    auggie: 'auggie',
+    'claude-code': 'claudeCode',
+    codex: 'codex',
+    mock: 'mock',
+    opencode: 'opencode',
+    droid: 'droid',
+    grok: 'grok',
+    unsloth: 'unsloth',
+    cortex: 'cortex',
+    pi: 'pi',
+  };
+
+  // The availability entry for a provider, or undefined when the check has
+  // not completed or the result carries no entry for it (unknown provider).
+  function providerAvailabilityEntry(providerId: string) {
+    if (!providerAvailability) return undefined;
+    const key = providerAvailabilityKeyMap[providerId];
+    return key ? providerAvailability.providers[key] : undefined;
+  }
+
   // Helper to get provider availability from result (handles different key formats)
   function getProviderAvailable(providerId: string): boolean {
-    if (!providerAvailability) return false;
-    // Map provider IDs to keys used in ProviderAvailabilityResult
-    const keyMap: Record<string, keyof typeof providerAvailability.providers> = {
-      auggie: 'auggie',
-      'claude-code': 'claudeCode',
-      codex: 'codex',
-      mock: 'mock',
-      opencode: 'opencode',
-      droid: 'droid',
-      grok: 'grok',
-      unsloth: 'unsloth',
-      cortex: 'cortex',
-      pi: 'pi',
-    };
-    const key = keyMap[providerId];
-    if (key && providerAvailability.providers[key]) {
-      return providerAvailability.providers[key].available;
-    }
-    return false;
+    return providerAvailabilityEntry(providerId)?.available ?? false;
   }
 
   // Available providers derived from availability check - dynamically from the catalog
@@ -121,9 +175,11 @@
     if (providerAvailability && availableProviders.length > 0) {
       const isSelectedAvailable = availableProviders.some((p) => p.id === selectedProvider);
       if (!isSelectedAvailable) {
-        // Check if this is the user's explicit choice from the provider store
+        // Check if this is the user's explicit choice from the provider store.
+        // '' (unresolved — settings not hydrated / providers.active unset) is
+        // never an explicit choice, so it must not block the auto-select.
         const userExplicitChoice = $activeProviderId$;
-        if (selectedProvider === userExplicitChoice) {
+        if (selectedProvider && selectedProvider === userExplicitChoice) {
           // User explicitly selected this provider - don't override even if availability check fails
           logger.debug('Keeping user-selected provider despite availability check:', {
             selectedProvider,
@@ -173,6 +229,8 @@
         });
         selectedModel = undefined;
         modelWasOverridden = false;
+        onModelChange?.(undefined);
+        reconcileReasoningEffort(resolveEffectiveModel(selectedSpecialist));
       }
     }
   });
@@ -210,8 +268,12 @@
       // Custom specialist was deleted, reset to team mode
       isTeamMode = true;
       selectedSpecialist = 'spec-writer';
+      selectedModel = undefined;
+      modelWasOverridden = false;
       onTeamModeChange?.(true);
       onSpecialistChange?.('spec-writer');
+      onModelChange?.(undefined);
+      reconcileReasoningEffort(resolveEffectiveModel('spec-writer'));
     }
   });
 
@@ -274,16 +336,68 @@
   // Effective model for the single-agent card (based on displayedSpecialist to preserve across mode switches)
   const singleAgentModel = $derived.by(() => resolveEffectiveModel(displayedSpecialist));
 
-  // Clear stale model overrides restored from saved state.
-  // When the user changes specialist defaults in Settings (e.g., spec-writer → sonnet4.5),
-  // the form may still have a saved selectedModel (e.g., "opus4.6") marked as overridden
-  // from a previous session when that was the default. This runs reactively (not onMount)
-  // so it waits until file specialists and the parent's persisted form state are
-  // loaded — comparing before then is meaningless — and re-runs if hydration
-  // re-applies a stale override after mount. A persisted "override" that matches the
-  // current specialist default is not a real override; one that differs is stale. Either
-  // way it is cleared so the daemon-resolved default drives the picker (and a no-model
-  // create). Overrides the user made in this session are never cleared.
+  const activeModelForReasoning = $derived(
+    modelWasOverridden && selectedModel
+      ? selectedModel
+      : isTeamMode
+        ? teamModeModel
+        : singleAgentModel,
+  );
+
+  // Keep the parent-owned effort valid as async default-model previews settle.
+  // For a non-default provider, wait for that provider's specialist preview so
+  // the fallback store view cannot clear a level the new default supports.
+  $effect(() => {
+    void $availableModels$;
+    if (!selectedReasoningEffort) return;
+    const defaultPreviewReady =
+      modelWasOverridden ||
+      !selectedSpecialist ||
+      selectedProvider === $defaultProviderId$ ||
+      selectedProvider in resolvedModelsByProvider;
+    if (defaultPreviewReady) reconcileReasoningEffort(activeModelForReasoning);
+  });
+
+  // Known model catalog for a provider: the session-lifetime provider-models
+  // cache first, else the global availableModels catalog when it was loaded
+  // for that provider. A LOADED catalog counts as evidence even when empty —
+  // a successful models.list response with zero models means the provider
+  // has no models, so any override for it is invalid. `undefined` means no
+  // catalog has been loaded for the provider yet (no evidence). Reads the
+  // reactive cache-map readable so the clearing $effect re-runs when a
+  // catalog lands after its last run.
+  function knownModelsForProvider(providerId: string): Array<{ value: string }> | undefined {
+    const normalizedProviderId = selectNormalizedProviderId.select(appStore.state, providerId);
+    const cachedModels = $providerModelsCacheMap$[normalizedProviderId]?.models;
+    if (cachedModels) return cachedModels;
+    if ($availableModelsProviderId$ === normalizedProviderId) {
+      return $availableModels$;
+    }
+    return undefined;
+  }
+
+  // Whether a restored override is provably invalid: its provider carries an
+  // availability entry reporting it unavailable, or a loaded catalog for its
+  // provider lacks the model (e.g. it was retired). With no evidence either
+  // way (availability check pending, provider absent from the availability
+  // result, no catalog loaded for the provider) the override is kept.
+  function isRestoredOverrideInvalid(model: string): boolean {
+    const { providerId, modelId } = parseCompoundModelId(model, $defaultProviderId$);
+    if (providerAvailabilityEntry(providerId)?.available === false) return true;
+    const knownModels = knownModelsForProvider(providerId);
+    if (!knownModels) return false;
+    return !knownModels.some((row) => row.value === model || row.value === modelId);
+  }
+
+  // Clear invalid model overrides restored from saved state
+  // (intent-hq/monorepo#2678). A persisted override is cleared only on
+  // positive evidence it is invalid (see isRestoredOverrideInvalid) — a valid
+  // restored override survives hydration so an explicit pick persists across
+  // sessions and is submitted as the initial agent's model. This runs
+  // reactively (not onMount) so it waits until file specialists and the
+  // parent's persisted form state are loaded — comparing before then is
+  // meaningless — and re-runs if hydration re-applies a stale override after
+  // mount. Overrides the user made in this session are never cleared.
   $effect(() => {
     const dataReady = $fileSpecialistsLoaded$ && $initializerHydrated$;
     if (!dataReady || modelOverriddenThisSession) return;
@@ -295,15 +409,13 @@
       onModelChange?.(undefined);
       return;
     }
-    if (modelWasOverridden && selectedModel) {
-      logger.debug('Clearing stale persisted model override:', { selectedModel });
+    if (modelWasOverridden && selectedModel && isRestoredOverrideInvalid(selectedModel)) {
+      logger.debug('Clearing invalid persisted model override:', { selectedModel });
       selectedModel = undefined;
       modelWasOverridden = false;
       onModelChange?.(undefined);
     }
   });
-
-
 
   // Specialist dropdown state
   let specialistDropdownOpen = $state(false);
@@ -349,7 +461,8 @@
     currentSpecialistInfo?.name ?? m.workspace_initialAgentPicker_general_label(),
   );
   const specialistDisplayDescription = $derived(
-    currentSpecialistInfo?.description ?? m.workspace_initialAgentPicker_noSpecializedBehavior_description(),
+    currentSpecialistInfo?.description ??
+      m.workspace_initialAgentPicker_noSpecializedBehavior_description(),
   );
 
   function selectTeamMode() {
@@ -374,6 +487,7 @@
       onModelChange?.(selectedModel);
       onProviderChange?.(selectedProvider);
     }
+    reconcileReasoningEffort(selectedModel ?? teamModeModel);
   }
 
   function selectSingleAgentMode() {
@@ -398,6 +512,7 @@
         onModelChange?.(selectedModel);
         onProviderChange?.(selectedProvider);
       }
+      reconcileReasoningEffort(selectedModel ?? singleAgentModel);
     }
     // If already in single-agent mode, do nothing (specialist dropdown handles changes)
   }
@@ -417,24 +532,30 @@
     }
     onTeamModeChange?.(false);
     onSpecialistChange?.(specialistId);
+    onModelChange?.(undefined);
+    reconcileReasoningEffort(resolveEffectiveModel(specialistId));
     specialistDropdownOpen = false;
   }
 
   function handleModelChange(model: string | undefined) {
-    selectedModel = model;
-    modelWasOverridden = true;
-    modelOverriddenThisSession = true;
+    const explicitModel = model || undefined;
+    selectedModel = explicitModel;
+    modelWasOverridden = !!explicitModel;
+    modelOverriddenThisSession = !!explicitModel;
 
     // Update provider to match the selected model's provider
-    if (model) {
-      const { providerId } = parseCompoundModelId(model, $defaultProviderId$);
+    if (explicitModel) {
+      const { providerId } = parseCompoundModelId(explicitModel, $defaultProviderId$);
       if (providerId !== selectedProvider) {
         selectedProvider = providerId;
         onProviderChange?.(providerId);
       }
     }
 
-    onModelChange?.(model);
+    reconcileReasoningEffort(
+      explicitModel ?? resolveEffectiveModel(isTeamMode ? selectedSpecialist : displayedSpecialist),
+    );
+    onModelChange?.(explicitModel);
   }
 
   async function openSpecialistSettings() {
@@ -444,19 +565,32 @@
 </script>
 
 <!-- Agent mode cards -->
-<div class="grid grid-cols-[1fr_1fr] gap-px overflow-hidden">
+<div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
   <!-- Team orchestration card -->
-  <button
-    type="button"
-    class="agent-card min-w-0 {isTeamMode ? 'agent-card-selected' : 'grayscale opacity-50'}"
+  <!-- svelte-ignore a11y_no_static_element_interactions -->
+  <div
+    class="agent-card min-w-0 {isTeamMode
+      ? 'border-input bg-accent/60'
+      : 'border-border bg-card hover:bg-muted/50'}"
     onclick={selectTeamMode}
+    onkeydown={(event) => {
+      if (event.key === 'Enter' || event.key === ' ') {
+        event.preventDefault();
+        selectTeamMode();
+      }
+    }}
+    role="button"
+    tabindex="0"
+    aria-pressed={isTeamMode}
   >
-    <div class="text-sm font-medium text-foreground">{m.workspace_initialAgentPicker_teamMode_label()}</div>
+    <div class="text-sm font-medium text-foreground">
+      {m.workspace_initialAgentPicker_teamMode_label()}
+    </div>
     <div class="flex items-center gap-1 py-1.5">
-      <AuggieAvatar seed="blank" size={22} specialist="spec-writer" />
+      <AgentAvatar agentId="blank" size={22} specialist="spec-writer" />
       <span class="text-subtle text-xs mx-0.5">→</span>
-      <AuggieAvatar seed="blank" size={22} specialist="implementor" />
-      <AuggieAvatar seed="blank" size={22} specialist="verifier" />
+      <AgentAvatar agentId="blank" size={22} specialist="implementor" />
+      <AgentAvatar agentId="blank" size={22} specialist="verifier" />
     </div>
     <div class="text-sm text-subtle leading-snug">
       {m.workspace_initialAgentPicker_teamMode_description()}
@@ -464,6 +598,8 @@
     <div
       class="model-picker-row {isTeamMode ? '' : 'opacity-0 pointer-events-none'}"
       inert={!isTeamMode}
+      onclick={(event) => event.stopPropagation()}
+      onkeydown={(event) => event.stopPropagation()}
     >
       <span class="text-sm text-subtle">{m.workspace_initialAgentPicker_using_before()}</span>
       {#key teamModeModel}
@@ -472,26 +608,44 @@
           onModelChange={handleModelChange}
           variant="ghost-light"
           size="xs"
-          triggerClass="inline-flex items-center bg-sidebar px-1.5 py-0.5 cursor-pointer text-sm font-medium text-subtle rounded-none"
+          showReasoning
+          reasoningEffort={selectedReasoningEffort ?? null}
+          onReasoningChange={handleReasoningChange}
           showManageLink={true}
           defaultModelId={teamModeModel}
           defaultModelLabel={m.chat_modelPicker_providerDefault_label()}
+          fallbackToCatalogDefault
+          fallbackProviderId={selectedProvider}
+          noticeClass="basis-full w-full max-w-full mt-1.5"
           silentFallback
+          portal={false}
+          modalAware={true}
+          collisionBoundary="[data-model-picker-collision-boundary]"
         />
       {/key}
     </div>
-  </button>
+  </div>
 
   <!-- Single agent card -->
   <!-- svelte-ignore a11y_no_static_element_interactions -->
   <div
-    class="agent-card min-w-0 {!isTeamMode ? 'agent-card-selected' : 'grayscale opacity-50'}"
+    class="agent-card min-w-0 {!isTeamMode
+      ? 'border-input bg-accent/60'
+      : 'border-border bg-card hover:bg-muted/50'}"
     onclick={selectSingleAgentMode}
-    onkeydown={(e) => e.key === 'Enter' && selectSingleAgentMode()}
+    onkeydown={(event) => {
+      if (event.key === 'Enter' || event.key === ' ') {
+        event.preventDefault();
+        selectSingleAgentMode();
+      }
+    }}
     role="button"
     tabindex="0"
+    aria-pressed={!isTeamMode}
   >
-    <div class="text-sm font-medium text-foreground">{m.workspace_initialAgentPicker_singleAgent_label()}</div>
+    <div class="text-sm font-medium text-foreground">
+      {m.workspace_initialAgentPicker_singleAgent_label()}
+    </div>
     <!-- Specialist selector dropdown -->
     <!-- svelte-ignore a11y_click_events_have_key_events -->
     <!-- svelte-ignore a11y_no_static_element_interactions -->
@@ -508,8 +662,9 @@
         side="bottom"
         contentClass="p-0!"
       >
-        {#snippet trigger({ toggle }: { toggle: () => void })}
+        {#snippet trigger({ props })}
           <button
+            {...isTeamMode ? {} : props}
             type="button"
             tabindex={isTeamMode ? -1 : 0}
             onclick={(e) => {
@@ -518,12 +673,12 @@
                 return;
               }
               e.stopPropagation();
-              toggle();
+              (props.onclick as ((event: MouseEvent) => void) | undefined)?.(e);
             }}
             class="specialist-trigger"
           >
-            <AuggieAvatar
-              seed="blank"
+            <AgentAvatar
+              agentId="blank"
               size={20}
               specialist={currentSpecialistInfo ? displayedSpecialist : null}
             />
@@ -550,10 +705,14 @@
                 : ''}"
               onclick={() => handleSpecialistSelect(null)}
             >
-              <AuggieAvatar seed="blank" size={20} />
+              <AgentAvatar agentId="blank" size={20} />
               <div class="flex flex-col min-w-0">
-                <span class="font-medium text-foreground text-sm">{m.workspace_initialAgentPicker_general_label()}</span>
-                <span class="text-xs text-subtle">{m.workspace_initialAgentPicker_noSpecializedBehavior_description()}</span>
+                <span class="font-medium text-foreground text-sm"
+                  >{m.workspace_initialAgentPicker_general_label()}</span
+                >
+                <span class="text-xs text-subtle"
+                  >{m.workspace_initialAgentPicker_noSpecializedBehavior_description()}</span
+                >
               </div>
             </button>
 
@@ -568,11 +727,7 @@
                     : ''}"
                   onclick={() => handleSpecialistSelect(specialist.id)}
                 >
-                  <AuggieAvatar
-                    seed="blank"
-                    size={20}
-                    specialist={specialist.id}
-                  />
+                  <AgentAvatar agentId="blank" size={20} specialist={specialist.id} />
                   <div class="flex flex-col min-w-0">
                     <span class="font-medium text-foreground text-sm">{specialist.name}</span>
                     <span class="text-xs text-subtle truncate">{specialist.description}</span>
@@ -588,7 +743,8 @@
               onclick={openSpecialistSettings}
             >
               <Fa icon={faPlus} class="ml-0.5 mr-0.5 opacity-60" size={10} />
-              <span class="text-sm">{m.workspace_initialAgentPicker_manageSpecialists_label()}</span>
+              <span class="text-sm">{m.workspace_initialAgentPicker_manageSpecialists_label()}</span
+              >
             </button>
           </div>
         {/snippet}
@@ -602,6 +758,8 @@
     <div
       class="model-picker-row {!isTeamMode ? '' : 'opacity-0 pointer-events-none'}"
       inert={isTeamMode}
+      onclick={(event) => event.stopPropagation()}
+      onkeydown={(event) => event.stopPropagation()}
     >
       <span class="text-sm text-subtle">{m.workspace_initialAgentPicker_using_before()}</span>
       {#key singleAgentModel}
@@ -610,11 +768,19 @@
           onModelChange={handleModelChange}
           variant="ghost-light"
           size="xs"
-          triggerClass="inline-flex items-center bg-sidebar px-1.5 py-0.5 cursor-pointer text-sm font-medium text-subtle rounded-none"
+          showReasoning
+          reasoningEffort={selectedReasoningEffort ?? null}
+          onReasoningChange={handleReasoningChange}
           showManageLink={true}
           defaultModelId={singleAgentModel}
           defaultModelLabel={m.chat_modelPicker_providerDefault_label()}
+          fallbackToCatalogDefault
+          fallbackProviderId={selectedProvider}
+          noticeClass="basis-full w-full max-w-full mt-1.5"
           silentFallback
+          portal={false}
+          modalAware={true}
+          collisionBoundary="[data-model-picker-collision-boundary]"
         />
       {/key}
     </div>
@@ -627,22 +793,30 @@
     flex-direction: column;
     align-items: flex-start;
     gap: 0.5rem;
-    padding: 0.875rem 1rem;
-    border: none;
+    min-height: 9.75rem;
+    padding: 1rem;
+    border-width: 1px;
+    border-style: solid;
+    border-radius: var(--radius-lg);
     cursor: pointer;
     text-align: left;
+    transition:
+      background-color var(--motion-fast),
+      border-color var(--motion-fast),
+      box-shadow var(--motion-fast);
   }
 
-  .agent-card:hover {
-    /* background: var(--color-sidebar, hsl(var(--sidebar))); */
-  }
-
-  .agent-card-selected {
-    background: var(--color-background, hsl(var(--popover)));
+  .agent-card:focus-visible {
+    outline: none;
+    border-color: var(--color-foreground);
+    background: color-mix(in srgb, var(--color-accent) 72%, var(--color-card));
   }
 
   .model-picker-row {
     display: flex;
+    /* Wrap so ModelPicker's provider notice lands on its own full-width line
+       below the "using <picker>" row instead of inline next to the trigger. */
+    flex-wrap: wrap;
     align-items: center;
     gap: 0.25rem;
     margin-top: auto;
@@ -656,12 +830,21 @@
     gap: 0.5rem;
     width: 100%;
     padding: 0.375rem 0.5rem;
-    background: var(--color-sidebar, hsl(var(--sidebar)));
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-md);
+    background: var(--color-background);
     cursor: pointer;
     text-align: left;
   }
 
   .specialist-trigger:hover {
+    background: var(--color-muted);
+  }
+
+  .specialist-trigger:focus-visible {
+    outline: none;
+    border-color: var(--color-foreground);
+    background: var(--color-muted);
   }
 
   .specialist-option {
@@ -680,6 +863,24 @@
 
   .specialist-option:hover {
     background: color-mix(in srgb, var(--color-muted, hsl(var(--muted))) 60%, transparent);
+  }
+
+  .specialist-option:focus-visible {
+    outline: none;
+    background: color-mix(in srgb, var(--color-muted, hsl(var(--muted))) 75%, transparent);
+  }
+
+  @media (forced-colors: active) {
+    .agent-card:focus-visible,
+    .specialist-trigger:focus-visible {
+      border-color: Highlight;
+      background: Canvas;
+    }
+
+    .specialist-option:focus-visible {
+      background: Highlight;
+      color: HighlightText;
+    }
   }
 
   .specialist-option-selected {

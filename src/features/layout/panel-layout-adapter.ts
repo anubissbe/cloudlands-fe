@@ -12,7 +12,7 @@ import { store as appStore } from '$store/renderer/store';
 import { m } from '$shared/paraglide/messages.js';
 import {
   openTab,
-  openTabInAdjacentOrSplit,
+  openTabWithPanelModeRequested,
   closeTab,
   closeActiveTab,
   closeTabsByType,
@@ -32,8 +32,10 @@ import {
   focusPanel,
   splitPanel,
   closePanel,
+  movePanel,
   updateSizes,
   updateSplitSizes,
+  resizePanelLayoutAtHorizontalPanel,
   toggleExpandPanel,
   resetLayout,
   goBack,
@@ -78,16 +80,31 @@ export type { PanelTab, PanelTabType, PanelState, PanelLayoutNode, WorkspacePane
 export class PanelLayoutAdapter {
   constructor(public readonly workspaceId: string) {}
 
-  private get state() { return appStore.state; }
-  private dispatch(action: any) { appStore.dispatch(action); }
+  private get state() {
+    return appStore.state;
+  }
+  // TODO(themis-migration): narrow to `unknown` and guard, see monorepo#1170
+  private dispatch(action: any) {
+    appStore.dispatch(action);
+  }
+
+  private getEmptyTargetPanelId(sourcePanelId?: string): string | undefined {
+    const panels = selectPanels.select(this.state, this.workspaceId);
+    const panelId = sourcePanelId ?? selectFocusedPanelId.select(this.state, this.workspaceId);
+    return panelId && panels[panelId]?.tabs.length === 0 ? panelId : undefined;
+  }
 
   // --- Imperative read methods (for event handlers / one-time reads only) ---
 
   /** Get all panel IDs. One-time read — not reactive. */
-  getPanelIds(): string[] { return selectPanelIds.select(this.state, this.workspaceId); }
+  getPanelIds(): string[] {
+    return selectPanelIds.select(this.state, this.workspaceId);
+  }
 
   /** Get all tabs across all panels. One-time read — not reactive. */
-  getAllTabs(): PanelTab[] { return selectAllTabs.select(this.state, this.workspaceId); }
+  getAllTabs(): PanelTab[] {
+    return selectAllTabs.select(this.state, this.workspaceId);
+  }
 
   /** Get a specific panel by ID. One-time read — not reactive. */
   getPanel(panelId: string): PanelState | null {
@@ -103,78 +120,224 @@ export class PanelLayoutAdapter {
   }
 
   // --- Tab operations ---
-  openTab(tab: Omit<PanelTab, 'id'>, panelId?: string) { this.dispatch(openTab(this.workspaceId, tab, panelId)); }
-  openTabInAdjacentOrSplit(tab: Omit<PanelTab, 'id'>, sourcePanelId?: string, options?: { animated?: boolean }) {
-    this.dispatch(openTabInAdjacentOrSplit(this.workspaceId, tab, sourcePanelId, options));
+  openTab(tab: Omit<PanelTab, 'id'>, panelId?: string) {
+    const targetPanelId = panelId ?? this.getEmptyTargetPanelId();
+    if (targetPanelId) {
+      this.dispatch(openTab(this.workspaceId, tab, targetPanelId));
+      return;
+    }
+    this.dispatch(openTabWithPanelModeRequested(this.workspaceId, tab));
   }
-  openBrowserPanel(url?: string, contextItemId?: string): void {
-    this.openTab({
+  /** User opens bypass Spec deferral and consume a pristine coordinator placeholder first. */
+  openUserTab(tab: Omit<PanelTab, 'id'>, panelId?: string) {
+    const panels = selectPanels.select(this.state, this.workspaceId);
+    const placeholder = Object.values(panels).find(
+      (panel) => panel.pristine === true && panel.tabs.length === 0,
+    );
+    if (panelId || placeholder) {
+      this.dispatch(openTab(this.workspaceId, tab, panelId ?? placeholder?.id, undefined, true));
+      return;
+    }
+    this.dispatch(openTabWithPanelModeRequested(this.workspaceId, tab, { force: true }));
+  }
+  openTabInAdjacentOrSplit(
+    tab: Omit<PanelTab, 'id'>,
+    sourcePanelId?: string,
+    options?: { animated?: boolean; force?: boolean; allowDuplicate?: boolean },
+  ) {
+    const targetPanelId = this.getEmptyTargetPanelId(sourcePanelId);
+    if (targetPanelId) {
+      this.dispatch(openTab(this.workspaceId, tab, targetPanelId, undefined, options?.force));
+      return;
+    }
+    this.dispatch(
+      openTabWithPanelModeRequested(this.workspaceId, tab, {
+        force: options?.force,
+        allowDuplicate: options?.allowDuplicate,
+      }),
+    );
+  }
+  openBrowserPanel(
+    url?: string,
+    contextItemId?: string,
+    sourcePanelId?: string,
+    requestedUrl?: string,
+  ): void {
+    const tab: Omit<PanelTab, 'id'> = {
       type: 'browser',
       title: m.layout_tabTypes_browser_title(),
-      browserUrl: url ?? 'https://google.com',
+      browserUrl: url ?? 'about:blank',
+      // Pre-rewrite URL persisted with the tab so a restart can re-run the
+      // loopback/tunnel rewrite (intent-hq/monorepo#2789).
+      ...(requestedUrl === undefined ? {} : { browserRequestedUrl: requestedUrl }),
       contextItemId,
       closable: true,
-    });
+    };
+    this.openTabInAdjacentOrSplit(tab, sourcePanelId);
   }
-  closeTab(tabId: string, panelId?: string) { this.dispatch(closeTab(this.workspaceId, tabId, panelId)); }
-  closeActiveTab(panelId?: string) { this.dispatch(closeActiveTab(this.workspaceId, panelId)); }
+  closeTab(tabId: string, panelId?: string) {
+    this.dispatch(closeTab(this.workspaceId, tabId, panelId));
+  }
+  closeActiveTab(panelId?: string) {
+    this.dispatch(closeActiveTab(this.workspaceId, panelId));
+  }
   closeTabsByType(tabType: PanelTabType, matchField?: string, matchValue?: string) {
     this.dispatch(closeTabsByType(this.workspaceId, tabType, matchField, matchValue));
   }
-  closeTabsByAgentId(agentId: string) { this.dispatch(closeTabsByAgentId(this.workspaceId, agentId)); }
-  reopenClosedTab() { this.dispatch(reopenClosedTab(this.workspaceId)); }
-  setActiveTab(tabId: string, panelId?: string) { this.dispatch(setActiveTab(this.workspaceId, tabId, panelId)); }
-  selectNextTab(panelId?: string) { this.dispatch(selectNextTab(this.workspaceId, panelId)); }
-  selectPreviousTab(panelId?: string) { this.dispatch(selectPreviousTab(this.workspaceId, panelId)); }
-  reorderTabs(panelId: string, fromIndex: number, toIndex: number) { this.dispatch(reorderTabs(this.workspaceId, panelId, fromIndex, toIndex)); }
+  closeTabsByAgentId(agentId: string) {
+    this.dispatch(closeTabsByAgentId(this.workspaceId, agentId));
+  }
+  reopenClosedTab() {
+    this.dispatch(reopenClosedTab(this.workspaceId));
+  }
+  setActiveTab(tabId: string, panelId?: string) {
+    this.dispatch(setActiveTab(this.workspaceId, tabId, panelId));
+  }
+  selectNextTab(panelId?: string) {
+    this.dispatch(selectNextTab(this.workspaceId, panelId));
+  }
+  selectPreviousTab(panelId?: string) {
+    this.dispatch(selectPreviousTab(this.workspaceId, panelId));
+  }
+  reorderTabs(panelId: string, fromIndex: number, toIndex: number) {
+    this.dispatch(reorderTabs(this.workspaceId, panelId, fromIndex, toIndex));
+  }
   moveTabToPanel(tabId: string, fromPanelId: string, toPanelId: string, insertIndex?: number) {
     this.dispatch(moveTabToPanel(this.workspaceId, tabId, fromPanelId, toPanelId, insertIndex));
   }
-  moveTabToSplit(tabId: string, fromPanelId: string, targetPanelId: string, zone: 'top' | 'bottom' | 'left' | 'right') {
+  moveTabToSplit(
+    tabId: string,
+    fromPanelId: string,
+    targetPanelId: string,
+    zone: 'top' | 'bottom' | 'left' | 'right',
+  ) {
     this.dispatch(moveTabToSplit(this.workspaceId, tabId, fromPanelId, targetPanelId, zone));
   }
-  moveTabToSplitLevel(tabId: string, fromPanelId: string, splitPath: number[], position: 'before' | 'after', direction: 'horizontal' | 'vertical') {
-    this.dispatch(moveTabToSplitLevel(this.workspaceId, tabId, fromPanelId, splitPath, position, direction));
+  moveTabToSplitLevel(
+    tabId: string,
+    fromPanelId: string,
+    splitPath: number[],
+    position: 'before' | 'after',
+    direction: 'horizontal' | 'vertical',
+  ) {
+    this.dispatch(
+      moveTabToSplitLevel(this.workspaceId, tabId, fromPanelId, splitPath, position, direction),
+    );
   }
-  closeOtherTabs(tabId: string, panelId?: string) { this.dispatch(closeOtherTabs(this.workspaceId, tabId, panelId)); }
-  closeTabsToRight(tabId: string, panelId?: string) { this.dispatch(closeTabsToRight(this.workspaceId, tabId, panelId)); }
-  closeAllTabs(panelId?: string) { this.dispatch(closeAllTabs(this.workspaceId, panelId)); }
+  closeOtherTabs(tabId: string, panelId?: string) {
+    this.dispatch(closeOtherTabs(this.workspaceId, tabId, panelId));
+  }
+  closeTabsToRight(tabId: string, panelId?: string) {
+    this.dispatch(closeTabsToRight(this.workspaceId, tabId, panelId));
+  }
+  closeAllTabs(panelId?: string) {
+    this.dispatch(closeAllTabs(this.workspaceId, panelId));
+  }
   closeAllOthersEverywhere(tabId: string, panelId?: string) {
     this.dispatch(closeAllOthersEverywhere(this.workspaceId, tabId, panelId));
   }
-  updateTabTitle(tabId: string, title: string) { this.dispatch(updateTabTitle(this.workspaceId, tabId, title)); }
-  updateTabBrowserUrl(tabId: string, url: string) { this.dispatch(updateTabBrowserUrl(this.workspaceId, tabId, url)); }
-  updateTabFavicon(tabId: string, url: string) { this.dispatch(updateTabFavicon(this.workspaceId, tabId, url)); }
-  updateFileTabPath(oldPath: string, newPath: string) { this.dispatch(updateFileTabPath(this.workspaceId, oldPath, newPath)); }
+  updateTabTitle(tabId: string, title: string) {
+    this.dispatch(updateTabTitle(this.workspaceId, tabId, title));
+  }
+  updateTabBrowserUrl(tabId: string, url: string) {
+    this.dispatch(updateTabBrowserUrl(this.workspaceId, tabId, url));
+  }
+  updateTabFavicon(tabId: string, url: string) {
+    this.dispatch(updateTabFavicon(this.workspaceId, tabId, url));
+  }
+  updateFileTabPath(oldPath: string, newPath: string) {
+    this.dispatch(updateFileTabPath(this.workspaceId, oldPath, newPath));
+  }
 
   // --- Panel operations ---
-  focusPanel(panelId: string) { this.dispatch(focusPanel(this.workspaceId, panelId)); }
-  splitPanel(panelId: string, direction: 'horizontal' | 'vertical', options?: { animated?: boolean }) {
+  focusPanel(panelId: string) {
+    this.dispatch(focusPanel(this.workspaceId, panelId));
+  }
+  splitPanel(
+    panelId: string,
+    direction: 'horizontal' | 'vertical',
+    options?: { animated?: boolean },
+  ) {
     this.dispatch(splitPanel(this.workspaceId, panelId, direction, options));
   }
-  closePanel(panelId: string) { this.dispatch(closePanel(this.workspaceId, panelId)); }
-  updateSizes(nodePath: number[], sizes: number[]) { this.dispatch(updateSizes(this.workspaceId, nodePath, sizes)); }
-  updateSplitSizes(sizes: number[], splitPath?: number[]) { this.dispatch(updateSplitSizes(this.workspaceId, sizes, splitPath)); }
-  toggleExpandPanel(panelId: string) { this.dispatch(toggleExpandPanel(this.workspaceId, panelId)); }
-  resetLayout() { this.dispatch(resetLayout(this.workspaceId)); }
+  closePanel(panelId: string) {
+    this.dispatch(closePanel(this.workspaceId, panelId));
+  }
+  movePanel(
+    panelId: string,
+    targetPanelId: string,
+    position: 'before' | 'after' | 'above' | 'below',
+  ) {
+    this.dispatch(movePanel(this.workspaceId, panelId, targetPanelId, position));
+  }
+  updateSizes(nodePath: number[], sizes: number[]) {
+    this.dispatch(updateSizes(this.workspaceId, nodePath, sizes));
+  }
+  updateSplitSizes(sizes: number[], splitPath?: number[]) {
+    this.dispatch(updateSplitSizes(this.workspaceId, sizes, splitPath));
+  }
+  growCanvasAtHorizontalPanel(
+    previousWidth: number,
+    nextWidth: number,
+    panelIndex: number,
+    nextCanvasWidth: number,
+    previousPanelWidths: readonly number[],
+  ) {
+    this.dispatch(
+      resizePanelLayoutAtHorizontalPanel(
+        this.workspaceId,
+        previousWidth,
+        nextWidth,
+        panelIndex,
+        nextCanvasWidth,
+        previousPanelWidths,
+      ),
+    );
+  }
+  toggleExpandPanel(panelId: string) {
+    this.dispatch(toggleExpandPanel(this.workspaceId, panelId));
+  }
+  resetLayout() {
+    this.dispatch(resetLayout(this.workspaceId));
+  }
   applyPreset(preset: 'single' | 'split-horizontal' | 'split-vertical' | 'three-column') {
     this.dispatch(applyPreset(this.workspaceId, preset));
   }
 
   // --- History ---
-  goBack() { this.dispatch(goBack(this.workspaceId)); }
-  goForward() { this.dispatch(goForward(this.workspaceId)); }
-  goBackInFocusHistory() { this.dispatch(goBackInFocusHistory(this.workspaceId)); }
-  goForwardInFocusHistory() { this.dispatch(goForwardInFocusHistory(this.workspaceId)); }
+  goBack() {
+    this.dispatch(goBack(this.workspaceId));
+  }
+  goForward() {
+    this.dispatch(goForward(this.workspaceId));
+  }
+  goBackInFocusHistory() {
+    this.dispatch(goBackInFocusHistory(this.workspaceId));
+  }
+  goForwardInFocusHistory() {
+    this.dispatch(goForwardInFocusHistory(this.workspaceId));
+  }
 
   // --- Misc ---
-  setDeferSpecTab(value: boolean) { this.dispatch(setDeferSpecTab(this.workspaceId, value)); }
-  consumePendingFocus(tabId: string) { this.dispatch(consumePendingFocus(this.workspaceId, tabId)); }
-  reconcileStaleAgentTabs(validAgentIds: string[] | Set<string>, replacementAgentId: string, replacementTitle: string) {
-    const ids = Array.isArray(validAgentIds) ? validAgentIds : Array.from(validAgentIds);
-    this.dispatch(reconcileStaleAgentTabs(this.workspaceId, ids, replacementAgentId, replacementTitle));
+  setDeferSpecTab(value: boolean) {
+    this.dispatch(setDeferSpecTab(this.workspaceId, value));
   }
-  clearLayout() { this.dispatch(clearPanelLayout(this.workspaceId)); }
+  consumePendingFocus(tabId: string) {
+    this.dispatch(consumePendingFocus(this.workspaceId, tabId));
+  }
+  reconcileStaleAgentTabs(
+    validAgentIds: string[] | Set<string>,
+    replacementAgentId: string,
+    replacementTitle: string,
+  ) {
+    const ids = Array.isArray(validAgentIds) ? validAgentIds : Array.from(validAgentIds);
+    this.dispatch(
+      reconcileStaleAgentTabs(this.workspaceId, ids, replacementAgentId, replacementTitle),
+    );
+  }
+  clearLayout() {
+    this.dispatch(clearPanelLayout(this.workspaceId));
+  }
 
   // --- Grid & Batch ---
   createGridLayout(panelCount: number): string[] {
@@ -190,7 +353,7 @@ export class PanelLayoutAdapter {
   }
 
   // --- Initialization ---
-  initializeLayout(layout?: Pick<any, 'root' | 'panels' | 'focusedPanelId'>) {
+  initializeLayout(layout?: Pick<any, 'root' | 'panels' | 'focusedPanelId' | 'canvasWidth'>) {
     const l = layout ?? createDefaultLayout();
     this.dispatch(initializeLayout(this.workspaceId, l));
   }
@@ -225,7 +388,7 @@ export function getPanelLayoutManager(workspaceId: string): PanelLayoutAdapter {
 }
 
 /** Check if a layout adapter exists (always true — adapters are created on demand) */
- 
+
 export function hasPanelLayoutManager(_workspaceId: string): boolean {
   return true; // Adapters are lazy; state lives in Redux
 }

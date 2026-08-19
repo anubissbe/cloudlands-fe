@@ -5,6 +5,7 @@
   import { writable } from 'svelte/store';
 
   import { backendRequest } from '$lib/client/live/backend-transport';
+  import { Button } from '$lib/components/ui/button';
   import { ScrollArea } from '$lib/components/ui/scroll-area';
   import { Skeleton } from '$lib/components/ui/skeleton';
   import { getFileTypeIconSvg } from '$lib/utils/file-type-icons';
@@ -41,6 +42,9 @@
   import { store as appStore } from '$store/renderer/store';
   import { m } from '$shared/paraglide/messages.js';
   import type { FlattenedFileNode } from '$store/renderer/slices/file-explorer/file-explorer-types';
+  import type { PanelTab } from '$store/renderer/slices/panel-layout/panel-layout-types';
+  import { getPanelTabOpenState } from '$store/renderer/slices/panel-layout/panel-layout-selectors';
+  import OpenPanelIndicator from '$lib/components/workspace/sidebar/OpenPanelIndicator.svelte';
 
   // Search result type mapped from daemon search.fileNames (PROTOCOL §5.15)
   interface SearchResult {
@@ -62,6 +66,8 @@
     isLoading?: boolean; // External loading state (e.g., from parent workspace page)
     showOnlyChanged?: boolean; // Filter to show only files with git changes
     searchQuery?: string; // External search query for filtering files
+    openPanelTabs?: PanelTab[];
+    activePanelTab?: PanelTab | null;
   }
 
   let {
@@ -75,13 +81,16 @@
     isLoading: externalLoading = false,
     showOnlyChanged = false,
     searchQuery = '',
+    openPanelTabs = [],
+    activePanelTab,
   }: Props = $props();
 
-  const ftStagedChanges$ = selectCurrentStagedWorkingChanges();
-  const ftUnstagedChanges$ = selectCurrentUnstagedWorkingChanges();
-
   // Writable store for workspace ID, used as reactive arg for selectors
+  // svelte-ignore state_referenced_locally - intentional initial capture; the $effect below syncs later changes
   const wsIdStore = writable(workspaceId);
+
+  const ftStagedChanges$ = selectCurrentStagedWorkingChanges(wsIdStore);
+  const ftUnstagedChanges$ = selectCurrentUnstagedWorkingChanges(wsIdStore);
 
   // Selector subscriptions at component init time
   const rootNode$ = selectFileExplorerRootNode(wsIdStore);
@@ -106,6 +115,14 @@
   // Effective workspace id used for dispatches. Derived so it reacts to prop
   // changes without requiring a separate mutable ref.
   const effectiveWsId = $derived(workspaceId);
+
+  function getFilePanelState(filePath: string) {
+    return getPanelTabOpenState(openPanelTabs, activePanelTab, workspaceId, {
+      type: 'file',
+      filePath,
+      workspaceId,
+    });
+  }
 
   function toggleFlattenedDirectory(nodePath: string, flatNode?: FlattenedFileNode) {
     if (flatNode?.isExpanded && flatNode.compactedExpandedPaths?.length) {
@@ -239,14 +256,12 @@
         });
 
         // Map daemon workspace-relative paths into search results
-        let files: SearchResult[] = (Array.isArray(resp?.files) ? resp.files : []).map(
-          (path) => ({
-            name: path.split('/').pop() || path,
-            path,
-            relativePath: path,
-            type: 'file' as const,
-          }),
-        );
+        let files: SearchResult[] = (Array.isArray(resp?.files) ? resp.files : []).map((path) => ({
+          name: path.split('/').pop() || path,
+          path,
+          relativePath: path,
+          type: 'file' as const,
+        }));
 
         // Filter to only changed files if showOnlyChanged is enabled
         const gitStatusRec = $gitStatusRecord$;
@@ -425,6 +440,16 @@
     }
   }
 
+  function retryInitialization() {
+    const initializationInputs = selectFileExplorerInitializationInputs.select(
+      appStore.state,
+      effectiveWsId,
+    );
+    pendingInitializationKey = undefined;
+    initialized = false;
+    initializeForWorkspace(initializationInputs.workspacePath, effectiveWsId);
+  }
+
   // Effect to handle mount, remount, workspace ID/path changes, and cleared Redux state.
   // Environment-config changes are observed by the file-explorer saga.
   $effect(() => {
@@ -560,7 +585,14 @@
        (bits-ui ScrollArea adds overflow-y:scroll on its Viewport) which breaks
        virtualization by giving the inner scroll container an unconstrained height. -->
   <div class="flex-1 min-h-0 overflow-hidden">
-    {#if $feIsLoading$ || externalLoading || !$feIsInitialized$}
+    {#if $feError$}
+      <div class="flex flex-col items-center gap-2 px-3 py-6 text-center">
+        <p class="text-xs text-error-foreground">{$feError$}</p>
+        <Button variant="outline" size="xs" onclick={retryInitialization}
+          >{m.fileExplorer_treeView_retry_label()}</Button
+        >
+      </div>
+    {:else if $feIsLoading$ || externalLoading || !$feIsInitialized$}
       <!-- Skeleton loaders for file tree -->
       <ScrollArea class="h-full">
         <div class="space-y-1 py-2 px-2">
@@ -572,10 +604,6 @@
           {/each}
         </div>
       </ScrollArea>
-    {:else if $feError$}
-      <div class="text-xs text-destructive-foreground py-2">
-        {$feError$}
-      </div>
     {:else if searchQuery && searchQuery.trim()}
       <!-- Search results - flat list -->
       {#if isSearching}
@@ -596,6 +624,7 @@
           <div bind:this={searchResultsContainerRef}>
             <ListContainer spacing="compact">
               {#each searchResults as result, i (result.path)}
+                {@const panelState = getFilePanelState(result.path)}
                 <div data-file-path={result.path} data-search-result-index={i}>
                   <ListItem
                     active={selectedFile === result.path}
@@ -613,6 +642,7 @@
                         {@html getFileTypeIconSvg(result.name)}
                       </span>
                     {/snippet}
+                    <OpenPanelIndicator count={panelState.count} active={panelState.isActive} />
                   </ListItem>
                 </div>
               {/each}
@@ -636,6 +666,8 @@
         {onRenameFile}
         {onSelectAgent}
         {getGitStatusColor}
+        {openPanelTabs}
+        {activePanelTab}
         {onExternalFilesDrop}
       />
     {:else}

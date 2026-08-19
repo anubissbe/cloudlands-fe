@@ -2,36 +2,42 @@
  * Live workspaces domain backed by the intentd daemon.
  *
  * Reads resolve via `workspace.list` / `workspace.get` over the JSON-RPC bridge.
- * `subscribe` emits an initial snapshot, then converges via the typed global
- * `workspace.subscribe` channel (PROTOCOL §6.9) on liveState daemons —
- * snapshot/delta `subscription.push` frames, archived-INCLUSIVE like the
- * legacy fetch — and refetches on legacy `workspace:*` `events.event`
- * notifications otherwise. Mutations
+ * `subscribe` converges via the typed global `workspace.subscribe` channel
+ * (PROTOCOL §6.9) — snapshot/delta `subscription.push` frames, archived-
+ * INCLUSIVE — the sole data path (intent-hq/monorepo#1697); there is no
+ * legacy `workspace:*` events-driven refetch. Mutations
  * (`workspace.create/update/delete/archive/unarchive`, §5.1) forward to the
  * daemon and fold outcomes into `MutationResult`.
  */
-import { WorkspaceStatus, createWorkspaceId } from "$shared/types";
+import { WorkspaceStatus, createWorkspaceId } from '$shared/types';
 import type {
   CreateWorkspaceRequest,
   UpdateWorkspaceRequest,
   Workspace,
   WorkspaceDiskUsage,
-} from "$shared/types";
-import type { TokenUsage } from "$features/token-usage/token-usage-types";
-import type { ContextItem } from "$features/context/types";
+} from '$shared/types';
+import type { TokenUsage } from '$features/token-usage/token-usage-types';
+import type { ContextItem } from '$features/context/types';
 import type {
   MutationResult,
   SubscriptionHandler,
   Unsubscribe,
+  WorkspaceCancelDeleteResult,
   WorkspaceCreateResult,
+  WorkspaceDeleteResult,
   WorkspaceDiskUsageResult,
   WorkspacesClient,
   WorkspaceUpdateResult,
-} from "../app-client";
-import { BackendError } from "./backend-transport-types";
-import { backendRequest } from "./backend-transport";
-import { createDeltaSubscription } from "./delta-subscription";
-import { extractConflict, newIdempotencyKey, runMutation } from "./live-support";
+} from '../app-client';
+import { BackendError } from './backend-transport-types';
+import { backendRequest } from './backend-transport';
+import { createDeltaSubscription } from './delta-subscription';
+import {
+  extractConflict,
+  mutationErrorMessage,
+  newIdempotencyKey,
+  runMutation,
+} from './live-support';
 
 /**
  * Transport timeout for `workspace.delete` (PROTOCOL §5.1). Longer than the
@@ -56,11 +62,11 @@ const CREATE_TIMEOUT_MS = 120_000;
 /** Daemon status strings → renderer WorkspaceStatus enum. */
 function toWorkspaceStatus(value: unknown): WorkspaceStatus {
   switch (String(value).toLowerCase()) {
-    case "inactive":
+    case 'inactive':
       return WorkspaceStatus.Inactive;
-    case "archived":
+    case 'archived':
       return WorkspaceStatus.Archived;
-    case "deleted":
+    case 'deleted':
       return WorkspaceStatus.Deleted;
     default:
       return WorkspaceStatus.Active;
@@ -70,17 +76,17 @@ function toWorkspaceStatus(value: unknown): WorkspaceStatus {
 /** Coerce a raw daemon workspace object into the renderer `Workspace` shape. */
 function normalizeWorkspace(raw: Record<string, unknown>): Workspace {
   const now = new Date().toISOString();
-  const id = String(raw.id ?? raw.workspaceId ?? "");
+  const id = String(raw.id ?? raw.workspaceId ?? '');
   return {
     ...(raw as Partial<Workspace>),
     id: createWorkspaceId(id),
     title: String(raw.title ?? raw.name ?? id),
-    branch: String(raw.branch ?? ""),
+    branch: String(raw.branch ?? ''),
     status: toWorkspaceStatus(raw.status),
-    changesets: Array.isArray(raw.changesets) ? (raw.changesets as Workspace["changesets"]) : [],
-    timeline: Array.isArray(raw.timeline) ? (raw.timeline as Workspace["timeline"]) : [],
+    changesets: Array.isArray(raw.changesets) ? (raw.changesets as Workspace['changesets']) : [],
+    timeline: Array.isArray(raw.timeline) ? (raw.timeline as Workspace['timeline']) : [],
     conversationInfo: Array.isArray(raw.conversationInfo)
-      ? (raw.conversationInfo as Workspace["conversationInfo"])
+      ? (raw.conversationInfo as Workspace['conversationInfo'])
       : [],
     createdAt: String(raw.createdAt ?? now),
     updatedAt: String(raw.updatedAt ?? now),
@@ -95,18 +101,11 @@ function normalizeWorkspace(raw: Record<string, unknown>): Workspace {
  * `create` to surface codes such as `"base-ref-unresolvable"` (monorepo#761).
  */
 function extractErrorCode(error: unknown): string | undefined {
-  if (!error || typeof error !== "object") return undefined;
+  if (!error || typeof error !== 'object') return undefined;
   const data = (error as { data?: unknown }).data;
-  if (!data || typeof data !== "object") return undefined;
+  if (!data || typeof data !== 'object') return undefined;
   const code = (data as { code?: unknown }).code;
-  return typeof code === "string" && code.length > 0 ? code : undefined;
-}
-
-function isWorkspaceEvent(method: string, params: unknown): boolean {
-  if (method !== "events.event") return false;
-  const type = (params as { type?: unknown } | undefined)?.type;
-  // Refetch on any workspace-scoped event; if the type is absent, refetch too.
-  return typeof type !== "string" || type.startsWith("workspace");
+  return typeof code === 'string' && code.length > 0 ? code : undefined;
 }
 
 /**
@@ -118,35 +117,52 @@ function isWorkspaceEvent(method: string, params: unknown): boolean {
  * and let provider-specific fields round-trip verbatim per §5.1.
  */
 function isContextItem(item: unknown): item is ContextItem {
-  if (!item || typeof item !== "object") return false;
+  if (!item || typeof item !== 'object') return false;
   const record = item as { id?: unknown; type?: unknown };
   return (
-    typeof record.id === "string" &&
+    typeof record.id === 'string' &&
     record.id.length > 0 &&
-    typeof record.type === "string" &&
+    typeof record.type === 'string' &&
     record.type.length > 0
   );
 }
 
 export class LiveWorkspacesClient implements WorkspacesClient {
-  async list(options?: { includeArchived?: boolean }): Promise<Workspace[]> {
-    const result = await backendRequest<{ workspaces?: unknown[] }>(
-      "workspace.list",
-      options?.includeArchived ? { includeArchived: true } : undefined,
-    );
-    const workspaces = Array.isArray(result?.workspaces) ? result.workspaces : [];
-    return workspaces.map((w) => normalizeWorkspace(w as Record<string, unknown>));
+  private readonly listRequests = new Map<boolean, Promise<Workspace[]>>();
+
+  list(options?: { includeArchived?: boolean }): Promise<Workspace[]> {
+    const includeArchived = options?.includeArchived === true;
+    const existing = this.listRequests.get(includeArchived);
+    if (existing) return existing;
+
+    const request = backendRequest<{ workspaces?: unknown[] }>(
+      'workspace.list',
+      includeArchived ? { includeArchived: true } : undefined,
+    ).then((result) => {
+      const workspaces = Array.isArray(result?.workspaces) ? result.workspaces : [];
+      return workspaces.map((workspace) =>
+        normalizeWorkspace(workspace as Record<string, unknown>),
+      );
+    });
+    this.listRequests.set(includeArchived, request);
+    const clearRequest = () => {
+      if (this.listRequests.get(includeArchived) === request) {
+        this.listRequests.delete(includeArchived);
+      }
+    };
+    void request.then(clearRequest, clearRequest);
+    return request;
   }
 
   async get(id: string): Promise<Workspace | null> {
-    const result = await backendRequest<{ workspace?: unknown } | unknown>("workspace.get", {
+    const result = await backendRequest<{ workspace?: unknown } | unknown>('workspace.get', {
       workspaceId: id,
     });
     const raw =
-      result && typeof result === "object" && "workspace" in result
+      result && typeof result === 'object' && 'workspace' in result
         ? (result as { workspace?: unknown }).workspace
         : result;
-    if (!raw || typeof raw !== "object") return null;
+    if (!raw || typeof raw !== 'object') return null;
     return normalizeWorkspace(raw as Record<string, unknown>);
   }
 
@@ -174,7 +190,7 @@ export class LiveWorkspacesClient implements WorkspacesClient {
   async create(request: CreateWorkspaceRequest): Promise<WorkspaceCreateResult> {
     try {
       const result = await backendRequest<{ workspace?: unknown; initialAgent?: unknown }>(
-        "workspace.create",
+        'workspace.create',
         {
           ...request,
           idempotencyKey: newIdempotencyKey(),
@@ -190,18 +206,18 @@ export class LiveWorkspacesClient implements WorkspacesClient {
         // malformed projection is a wire divergence — fail loudly instead of
         // masking it as "no initialAgent".
         if (
-          typeof rawAgent !== "object" ||
-          typeof (rawAgent as { id?: unknown }).id !== "string" ||
-          ((rawAgent as { id: string }).id.length === 0)
+          typeof rawAgent !== 'object' ||
+          typeof (rawAgent as { id?: unknown }).id !== 'string' ||
+          (rawAgent as { id: string }).id.length === 0
         ) {
           return {
             success: false,
-            error: "workspace.create returned an initialAgent without a valid daemon-assigned id",
+            error: 'workspace.create returned an initialAgent without a valid daemon-assigned id',
           };
         }
         initialAgent = rawAgent as { id: string } & Record<string, unknown>;
       }
-      return raw && typeof raw === "object"
+      return raw && typeof raw === 'object'
         ? {
             success: true,
             workspace: normalizeWorkspace(raw as Record<string, unknown>),
@@ -228,12 +244,12 @@ export class LiveWorkspacesClient implements WorkspacesClient {
   async update(request: UpdateWorkspaceRequest): Promise<WorkspaceUpdateResult> {
     const { id, ...fields } = request;
     try {
-      const result = await backendRequest<{ workspace?: unknown }>("workspace.update", {
+      const result = await backendRequest<{ workspace?: unknown }>('workspace.update', {
         workspaceId: id,
         ...fields,
       });
       const raw = result?.workspace;
-      return raw && typeof raw === "object"
+      return raw && typeof raw === 'object'
         ? { success: true, workspace: normalizeWorkspace(raw as Record<string, unknown>) }
         : { success: true };
     } catch (error) {
@@ -244,26 +260,53 @@ export class LiveWorkspacesClient implements WorkspacesClient {
     }
   }
 
-  async delete(id: string): Promise<MutationResult> {
-    return runMutation("workspace.delete", { workspaceId: id }, { timeoutMs: DELETE_TIMEOUT_MS });
+  /** Schedule or immediately commit a workspace deletion (§5.1). */
+  async delete(id: string, options?: { undoDelayMs?: number }): Promise<WorkspaceDeleteResult> {
+    const undoDelayMs = options?.undoDelayMs;
+    try {
+      const result = await backendRequest<{ scheduled?: unknown; deleteAt?: unknown }>(
+        'workspace.delete',
+        undoDelayMs && undoDelayMs > 0 ? { workspaceId: id, undoDelayMs } : { workspaceId: id },
+        { timeoutMs: DELETE_TIMEOUT_MS },
+      );
+      const scheduled = result?.scheduled === true;
+      const deleteAt = typeof result?.deleteAt === 'string' ? result.deleteAt : undefined;
+      return scheduled && deleteAt
+        ? { success: true, scheduled: true, deleteAt }
+        : { success: true };
+    } catch (error) {
+      return { success: false, error: mutationErrorMessage(error) };
+    }
+  }
+
+  /** Cancel a daemon-owned workspace delete grace window (§5.1). */
+  async cancelDelete(id: string): Promise<WorkspaceCancelDeleteResult> {
+    try {
+      const result = await backendRequest<{ cancelled?: unknown }>('workspace.cancelDelete', {
+        workspaceId: id,
+      });
+      return { success: true, cancelled: result?.cancelled === true };
+    } catch (error) {
+      return { success: false, error: mutationErrorMessage(error) };
+    }
   }
 
   async archive(id: string): Promise<MutationResult> {
-    return runMutation("workspace.archive", { workspaceId: id });
+    return runMutation('workspace.archive', { workspaceId: id });
   }
 
   async unarchive(id: string): Promise<MutationResult> {
-    return runMutation("workspace.unarchive", { workspaceId: id });
+    return runMutation('workspace.unarchive', { workspaceId: id });
   }
 
   // `workspace.markSeen` (§5.1) clears the unread `attention` flag only; the
   // daemon's `workspace:attention-changed` event drives the reactive clear.
   async markSeen(id: string): Promise<MutationResult> {
-    return runMutation("workspace.markSeen", { workspaceId: id });
+    return runMutation('workspace.markSeen', { workspaceId: id });
   }
 
   async setActive(id: string): Promise<MutationResult> {
-    return runMutation("workspace.setActive", { workspaceId: id });
+    return runMutation('workspace.setActive', { workspaceId: id });
   }
 
   // Recency is renderer/daemon state not yet exposed by the daemon; empty for now.
@@ -278,12 +321,11 @@ export class LiveWorkspacesClient implements WorkspacesClient {
    * `workspace:tokenUsage-changed` event handled in `daemon-events-bridge`.
    */
   async getTokenUsage(workspaceId: string): Promise<TokenUsage | null> {
-    const result = await backendRequest<{ tokenUsage?: TokenUsage }>(
-      "workspace.getTokenUsage",
-      { workspaceId },
-    );
+    const result = await backendRequest<{ tokenUsage?: TokenUsage }>('workspace.getTokenUsage', {
+      workspaceId,
+    });
     const usage = result?.tokenUsage;
-    return usage && typeof usage === "object" ? usage : null;
+    return usage && typeof usage === 'object' ? usage : null;
   }
 
   /**
@@ -297,15 +339,15 @@ export class LiveWorkspacesClient implements WorkspacesClient {
       const result = await backendRequest<{
         diskUsage?: WorkspaceDiskUsage;
         refreshing?: boolean;
-      }>("workspace.diskUsage", { workspaceId });
+      }>('workspace.diskUsage', { workspaceId });
       const usage = result?.diskUsage;
       const poll: WorkspaceDiskUsageResult = { refreshing: result?.refreshing === true };
-      if (usage && typeof usage === "object") poll.diskUsage = usage;
+      if (usage && typeof usage === 'object') poll.diskUsage = usage;
       return poll;
     } catch (error) {
       if (
         error instanceof BackendError &&
-        (error.rpcCode === -32601 || error.code === "METHOD_NOT_FOUND")
+        (error.rpcCode === -32601 || error.code === 'METHOD_NOT_FOUND')
       ) {
         return null;
       }
@@ -320,10 +362,9 @@ export class LiveWorkspacesClient implements WorkspacesClient {
    * verbatim; the FE keeps its `ContextItem` union as the source of truth.
    */
   async getContext(workspaceId: string): Promise<ContextItem[]> {
-    const result = await backendRequest<{ items?: unknown[] }>(
-      "workspace.getContext",
-      { workspaceId },
-    );
+    const result = await backendRequest<{ items?: unknown[] }>('workspace.getContext', {
+      workspaceId,
+    });
     const items = Array.isArray(result?.items) ? result.items : [];
     return items.filter(isContextItem);
   }
@@ -335,27 +376,23 @@ export class LiveWorkspacesClient implements WorkspacesClient {
    * convergence path; the return value is surfaced for callers that need it.
    */
   async updateContext(workspaceId: string, items: ContextItem[]): Promise<ContextItem[]> {
-    const result = await backendRequest<{ items?: unknown[] }>(
-      "workspace.updateContext",
-      { workspaceId, items },
-    );
+    const result = await backendRequest<{ items?: unknown[] }>('workspace.updateContext', {
+      workspaceId,
+      items,
+    });
     const next = Array.isArray(result?.items) ? result.items : [];
     return next.filter(isContextItem);
   }
 
   subscribe(handler: SubscriptionHandler<Workspace[]>): Unsubscribe {
     return createDeltaSubscription<Workspace>({
-      eventTypes: ["workspace:created", "workspace:updated", "workspace:deleted"],
       // Typed §6.9 channel — the one GLOBAL channel (no workspaceId). Its
-      // seq-0 snapshot includes archived workspaces (intentd#521), matching
-      // the legacy `includeArchived: true` fetch below.
+      // seq-0 snapshot includes archived workspaces (intentd#521).
       channel: {
-        subscribeMethod: "workspace.subscribe",
-        unsubscribeMethod: "workspace.unsubscribe",
+        subscribeMethod: 'workspace.subscribe',
+        unsubscribeMethod: 'workspace.unsubscribe',
       },
-      matchLegacyEvent: (method, params) => isWorkspaceEvent(method, params),
-      fetchAll: () => this.list({ includeArchived: true }),
-      getId: (raw) => String(raw.id ?? raw.workspaceId ?? ""),
+      getId: (raw) => String(raw.id ?? raw.workspaceId ?? ''),
       normalize: (raw) => normalizeWorkspace(raw),
       handler,
     });

@@ -3,12 +3,15 @@ import type { StoreState } from '../../types';
 import { emptyChatAgentState } from './chat-state-slice';
 import type {
   ChatAgentState,
+  HydratedBlockEntry,
   StatusEvent,
   LastAttemptedMessage,
   LiveStreamPhase,
   ModelUnavailableInfo,
   TranscriptHydrationStatus,
+  TranscriptSnapshotMeta,
 } from './chat-state-types';
+import { hydratedBlockKey } from './chat-state-types';
 
 // ============================================================================
 // Helpers
@@ -122,12 +125,124 @@ export const selectTranscriptHydration = store.createSelector(
 );
 
 /**
+ * True once transcript hydration has settled at least once for the agent.
+ * Gates ChatPanel's indeterminate first-hydration skeleton: until the first
+ * hydration settles, partial messages must not render as a complete
+ * transcript; after that, refresh re-hydrations keep the messages visible.
+ */
+export const selectTranscriptHydratedOnce = store.createSelector(
+  (state, agentId: string): boolean =>
+    getAgentChatState(state, agentId).transcriptHydratedOnce === true,
+);
+
+/**
  * Select the standing `chat.subscribe` lifecycle phase for the agent, or
  * null when no subscription is open. Drives the pre-live hydration indicator.
  */
 export const selectChatLiveStreamPhase = store.createSelector(
   (state, agentId: string): LiveStreamPhase | null =>
     getAgentChatState(state, agentId).liveStreamPhase ?? null,
+);
+
+/**
+ * Select the metadata of the last applied seq-0 snapshot from the standing
+ * subscription, or undefined when none has arrived yet (single-transfer
+ * hydration; consumed by the chat-read saga).
+ */
+export const selectTranscriptSnapshotMeta = store.createSelector(
+  (state, agentId: string): TranscriptSnapshotMeta | undefined =>
+    getAgentChatState(state, agentId).transcriptSnapshot,
+);
+
+// --- Scrollback paging (on-demand history segment fetches) ---
+
+/** True while an on-demand older-history scrollback page fetch is in flight. */
+export const selectFetchingOlderHistory = store.createSelector(
+  (state, agentId: string): boolean =>
+    getAgentChatState(state, agentId).fetchingOlderHistory,
+);
+
+/** True while an on-demand gap-refill scrollback page fetch is in flight. */
+export const selectFetchingGapFill = store.createSelector(
+  (state, agentId: string): boolean =>
+    getAgentChatState(state, agentId).fetchingGapFill,
+);
+
+/** True while an `aroundIndex` far-flick seek fetch is in flight. */
+export const selectFetchingHistorySeek = store.createSelector(
+  (state, agentId: string): boolean =>
+    getAgentChatState(state, agentId).fetchingHistorySeek,
+);
+
+/**
+ * True once the daemon rejected `aroundIndex` (INVALID_PARAMS) — a daemon
+ * predating the param. Far-flick seeks fall back to the serial walk.
+ */
+export const selectHistorySeekUnsupported = store.createSelector(
+  (state, agentId: string): boolean =>
+    getAgentChatState(state, agentId).historySeekUnsupported,
+);
+
+/**
+ * True once the older scrollback walk hydrated the conversation's true first
+ * message. Reads the history segment's `oldestReached` (agent-session slice)
+ * so exhaustion lives and dies with the segment itself — a cleared segment
+ * (chat reset, §7.1 `resumed: false` rehydration) is never falsely exhausted.
+ */
+export const selectHistoryExhausted = store.createSelector(
+  (state, agentId: string): boolean =>
+    state.agentSessions?.historySegmentsByAgentId?.[agentId]?.oldestReached === true,
+);
+
+/**
+ * Switch-back transcript reveal gate: true while the viewed conversation is
+ * awaiting a fresh seq-0 snapshot from its (re)opening standing subscription.
+ * ChatPanel defers the transcript reveal while set (see
+ * `shouldDeferTranscriptReveal` in chat-panel-visibility.ts).
+ */
+export const selectAwaitingSwitchBackSnapshot = store.createSelector(
+  (state, agentId: string): boolean =>
+    getAgentChatState(state, agentId).awaitingSwitchBackSnapshot === true,
+);
+
+/**
+ * Utility-footer reveal gate: true while the transcript reveal is holding for
+ * the footer data sources (agent subscriptions, background hooks, monitored
+ * PRs) to settle, so transcript and footer flip in the same paint. Cleared by
+ * the subscribe saga when `isUtilityFooterReady` composes true, by its
+ * bounded fallback, or on subscription teardown (see
+ * `shouldDeferTranscriptReveal` in chat-panel-visibility.ts).
+ */
+export const selectAwaitingUtilityFooter = store.createSelector(
+  (state, agentId: string): boolean =>
+    getAgentChatState(state, agentId).awaitingUtilityFooter === true,
+);
+
+/**
+ * Select one lazily hydrated content block entry (§5.5 slim projection →
+ * v7.2 `agent.getMessageBlock`), or undefined when never requested. Keyed by
+ * `{messageId}|{blockId}` via `hydratedBlockKey`.
+ */
+export const selectHydratedBlock = store.createSelector(
+  (
+    state,
+    agentId: string,
+    messageId: string,
+    blockId: string,
+  ): HydratedBlockEntry | undefined =>
+    getAgentChatState(state, agentId).hydratedBlocks?.[hydratedBlockKey(messageId, blockId)],
+);
+
+/**
+ * Select the agent's whole hydrated-block cache (keys `{messageId}|{blockId}`
+ * via `hydratedBlockKey`), or undefined when nothing was ever hydrated.
+ * Components subscribe to this map at init (agentId is stable per instance)
+ * and look blocks up reactively with `$derived` — block ids can appear after
+ * init (streaming), which a per-block selector readable could not track.
+ */
+export const selectHydratedBlocks = store.createSelector(
+  (state, agentId: string): Record<string, HydratedBlockEntry> | undefined =>
+    getAgentChatState(state, agentId).hydratedBlocks,
 );
 
 

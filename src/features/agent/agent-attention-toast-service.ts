@@ -17,12 +17,14 @@
  * focuses) the agent's conversation tab in that workspace's panel layout.
  *
  * Dependency-light per AGENTS.md middleware conventions (this module is
- * reachable from the daemon-events bridge middleware): no selector imports;
- * the toast lib, the Svelte component, and the SvelteKit navigation helper
- * are imported lazily.
+ * reachable from the daemon-events bridge middleware): no static selector
+ * imports (selectors are imported lazily at call time only); the toast lib,
+ * the Svelte component, and the SvelteKit navigation helper are also
+ * imported lazily.
  */
 import { store as appStore } from '$store/renderer/store';
 import { openAgentTabRequested } from '$store/renderer/slices/app-layout/app-layout-slice';
+import { openWorkspaceTab } from '$store/renderer/slices/tab-state/tab-state-slice';
 import { createLogger } from '$lib/utils/client-logger';
 import { m } from '$shared/paraglide/messages.js';
 
@@ -71,12 +73,12 @@ function getToast() {
 
 /** Lazily pull the toast component (kept out of the static module graph). */
 let toastComponentPromise: Promise<
-  (typeof import('$lib/components/ui/toast/AgentAttentionToast.svelte'))['default']
+  (typeof import('$lib/components/ui/toast'))['AgentAttentionToast']
 > | null = null;
 function getToastComponent() {
   if (!toastComponentPromise) {
-    toastComponentPromise = import('$lib/components/ui/toast/AgentAttentionToast.svelte').then(
-      (module) => module.default,
+    toastComponentPromise = import('$lib/components/ui/toast').then(
+      (module) => module.AgentAttentionToast,
     );
   }
   return toastComponentPromise;
@@ -117,16 +119,15 @@ function truncate(text: string, maxChars: number): string {
 }
 
 /**
- * "Switch To": dismiss the toast, navigate to the reporting workspace (a
- * cross-workspace `goto`), then open/focus the agent's conversation tab via
- * `openAgentTabRequested` — session hydration and tab dedup stay in the
- * app-layout navigation middleware. The tab dispatch runs even if the goto
- * fails (e.g. already on the page): panel-layout state is per-workspace, so
- * the tab is focused whenever that workspace is (next) shown.
+ * "Switch To": dismiss the toast, activate the reporting workspace, navigate
+ * to it, then open/focus the agent's conversation tab. Explicit tab activation
+ * is required in columns view: route navigation alone does not update
+ * `currentTabId`, whose change scrolls the target column into view.
  */
 export async function switchToAttentionAgent(workspaceId: string, agentId: string): Promise<void> {
   const toast = await getToast();
   toast.dismiss(agentAttentionToastId(agentId));
+  appStore.dispatch(openWorkspaceTab(workspaceId));
   try {
     const { navigateToRoute } = await import('$lib/utils/navigation.client');
     await navigateToRoute(`/workspace/${workspaceId}`);
@@ -172,4 +173,53 @@ export async function showAgentAttentionToast(request: AgentAttentionRequest): P
 export async function dismissAgentAttentionToast(agentId: string): Promise<void> {
   const toast = await getToast();
   toast.dismiss(agentAttentionToastId(agentId));
+}
+
+/**
+ * Payload for the transient workspace auto-unarchive toast — the daemon's
+ * `workspace:updated` unarchive delta carrying the additive `autoUnarchive`
+ * stamp (an agent turn start unarchived the workspace).
+ */
+export interface WorkspaceAutoUnarchiveNotice {
+  workspaceId: string;
+  agentId: string;
+  agentName: string;
+}
+
+/**
+ * Transient (default-duration) toast for a daemon-initiated auto-unarchive:
+ * "<title> was unarchived — <agent> became active", with the same "Switch To"
+ * routing as the attention toast. Fires for ANY workspace (no focused-
+ * workspace gating), like the attention toast. The workspace title is
+ * resolved from the store at toast time and degrades to the generic space
+ * fallback when the entity is unknown. No undo/re-archive affordance by
+ * design — the toast id is stable per workspace so bursts update in place.
+ */
+export async function showWorkspaceAutoUnarchiveToast(
+  notice: WorkspaceAutoUnarchiveNotice,
+): Promise<void> {
+  const { workspaceId, agentId, agentName } = notice;
+  const toast = await getToast();
+  let title: string | undefined;
+  try {
+    const { selectWorkspaceById } = await import(
+      '$store/renderer/slices/workspace/workspace-selectors'
+    );
+    title = selectWorkspaceById.select(appStore.state, workspaceId)?.title;
+  } catch (error) {
+    logger.warn('Workspace title resolution failed — toast uses fallback', { workspaceId, error });
+  }
+  toast.info(
+    m.workspace_autoUnarchive_toast({
+      title: title || m.workspace_page_space_title(),
+      name: agentName,
+    }),
+    {
+      id: `workspace-auto-unarchive:${workspaceId}`,
+      action: {
+        label: m.workspace_autoUnarchive_switchTo_label(),
+        onClick: () => void switchToAttentionAgent(workspaceId, agentId),
+      },
+    },
+  );
 }

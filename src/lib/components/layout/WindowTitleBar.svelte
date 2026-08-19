@@ -11,54 +11,95 @@
 
   import { page } from '$app/state';
   import { m } from '$shared/paraglide/messages.js';
-  import { faSearch } from '@fortawesome/free-solid-svg-icons';
-  import Fa from 'svelte-fa';
-  import SidebarIcon from '$lib/components/icons/SidebarIcon.svelte';
   import { onMount } from 'svelte';
   import { SvelteMap } from 'svelte/reactivity';
 
   import { invoke } from '$lib/electron-bridge';
   import { IPC_CHANNELS } from '$shared/ipc-registry';
   import { Tooltip } from '$lib/components/ui/tooltip';
+  import { Button } from '$lib/components/ui/button';
   import { cn } from '$lib/utils';
-  import { openPalette } from '$store/renderer/slices/palette/palette-slice';
-  import { getPanelLayoutManager } from '$features/layout/panel-layout-adapter';
-  import { applyContentPreset } from '$features/layout/preset-executor';
-  import {
-  selectPanelLayoutRoot,
-  selectCanGoBack,
-  selectCanGoForward,
-  selectActiveTab,
-} from '$store/renderer/slices/panel-layout/panel-layout-selectors';
-  import { PanelLayoutControls } from '$lib/components/layout/panel-system';
-  import type { LayoutPresetId } from '$lib/components/layout/panel-system/types';
+  import { selectActiveTab } from '$store/renderer/slices/panel-layout/panel-layout-selectors';
   import { activeStreamsTracker } from '$features/agent/services/active-streams-tracker';
   import { selectWorkspaceItems } from '$store/renderer/slices/workspace/workspace-selectors';
 
   import { writable } from 'svelte/store';
   import { WorkspaceStatusEnum } from '$shared/types';
+  import { getLineStats, type LineStats } from '$features/file-tracking/file-tracking.client';
   import {
-  getLineStats,
-  type LineStats,
-} from '$features/file-tracking/file-tracking.client';
+    selectZoomFactor,
+    selectCounterScale,
+  } from '$store/renderer/slices/user-preferences/user-preferences-selectors';
+  import { navigateBackFromSettings, navigateToSettings } from '$lib/utils/workspace-navigation';
+  import IntentNavigationIcon from '$lib/icons/IntentNavigationIcon.svelte';
+  import { selectWorkspaceViewMode } from '$store/renderer/slices/tab-state/tab-state-selectors';
   import {
-  selectZoomFactor,
-  selectCounterScale,
-} from '$store/renderer/slices/user-preferences/user-preferences-selectors';
-  import { toggleSidebar } from '$store/renderer/slices/ui-layout/ui-layout-slice';
-
-  import { selectOnboardingActive } from '$store/renderer/slices/sidebar-nav/sidebar-nav-selectors';
-  import { selectSidebarSide } from '$store/renderer/slices/ui-layout/ui-layout-selectors';
-  import { store as appStore } from '$store/renderer/store';
+    TITLEBAR_NAVIGATION_CONTROL_CLASS,
+    TITLEBAR_NAVIGATION_GLYPH_CLASS,
+  } from './titlebar-navigation';
+  import { getCounterScaledTitlebarHeight, WINDOW_TITLEBAR_HEIGHT_PX } from './titlebar-geometry';
   import DaemonStatusIndicator from './DaemonStatusIndicator.svelte';
+  import WorkspaceTabStrip from './WorkspaceTabStrip.svelte';
+  import WorkspaceRepoLauncher from './WorkspaceRepoLauncher.svelte';
+  import WorkspaceViewModeToggle from './WorkspaceViewModeToggle.svelte';
+  import SidebarNav from './sidebar-nav/SidebarNav.svelte';
+  import {
+    selectOnboardingActive,
+    selectPanelItem,
+    selectPanelWidth,
+  } from '$store/renderer/slices/sidebar-nav/sidebar-nav-selectors';
 
   interface Props {
     workspaceId?: string;
+    overlayWorkspaceColumns?: boolean;
   }
 
-  let { workspaceId }: Props = $props();
+  let { workspaceId, overlayWorkspaceColumns = false }: Props = $props();
+  let activeTabBounds = $state<{ left: number; width: number } | null>(null);
+  let activeTabTracking = $state(false);
+  const routedWorkspaceId = $derived(
+    page.url.pathname.startsWith('/workspace/') && page.params.id !== 'new'
+      ? (page.params.id ?? null)
+      : null,
+  );
+  const panelItem$ = selectPanelItem();
+  const panelWidth$ = selectPanelWidth();
+  const workspaceViewMode$ = selectWorkspaceViewMode();
+  const onboardingActive$ = selectOnboardingActive();
 
-  const sidebarSide$ = selectSidebarSide();
+  // Where the workspace controls naturally start (left edge, titlebar coords).
+  // Measured from the fixed controls (SidebarNav) so the margin below can align
+  // the tabs with the sidebar panel's right edge rather than a fixed offset.
+  const SIDEBAR_PANEL_LEFT_INSET = 8; // pl-2 on .workspace-frame-row
+  const CONTROLS_GAP = 4; // gap-1 between titlebar control groups
+  let fixedControlsEl = $state<HTMLDivElement | null>(null);
+  let controlsBaseLeft = $state(0);
+
+  $effect(() => {
+    const el = fixedControlsEl;
+    if (!el) return;
+    const measure = () => {
+      controlsBaseLeft = el.offsetLeft + el.offsetWidth + CONTROLS_GAP;
+    };
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(el);
+    return () => observer.disconnect();
+  });
+
+  // Align the workspace controls (tabs) with the left panel's right edge
+  // when a sidebar panel is open; tracks the panel width live.
+  const panelOffset = $derived(
+    $panelItem$ ? Math.max(0, $panelWidth$ + SIDEBAR_PANEL_LEFT_INSET - controlsBaseLeft) : 0,
+  );
+
+  function handleActiveTabBoundsChange(bounds: { left: number; width: number } | null) {
+    activeTabBounds = bounds ? { left: bounds.left - panelOffset, width: bounds.width } : null;
+  }
+
+  function handleActiveTabTrackingChange(tracking: boolean) {
+    activeTabTracking = tracking;
+  }
 
   // Zoom selectors
   const zoomFactor = selectZoomFactor();
@@ -118,29 +159,20 @@
     }
   }
 
-  // Check if we're on a workspace page
-  const isWorkspacePage = $derived(page.url.pathname.startsWith('/workspace/'));
-  const onboardingActive$ = selectOnboardingActive();
-  const isWorkspaceVisible = $derived(isWorkspacePage && workspaceId && !$onboardingActive$);
-
   // Get workspace data
   const workspace = $derived(
     $workspaceItems.find((candidate) => candidate.id === workspaceId) ?? null,
   );
 
   // Reactive writable store for workspaceId so Redux selectors re-evaluate
+  // (initial value only; the $effect below keeps it in sync)
+  // svelte-ignore state_referenced_locally
   const workspaceIdStore = writable(workspaceId ?? '');
   $effect(() => {
     workspaceIdStore.set(workspaceId ?? '');
   });
 
-  // Get panel layout manager for this workspace (action methods only)
-  const layoutManager = $derived(workspaceId ? getPanelLayoutManager(workspaceId) : null);
-
-  // Reactive selector subscriptions for panel layout state
-  const layoutRoot$ = selectPanelLayoutRoot(workspaceIdStore);
-  const canGoBack$ = selectCanGoBack(workspaceIdStore);
-  const canGoForward$ = selectCanGoForward(workspaceIdStore);
+  // Reactive selector subscription for the active panel title.
   const focusedTab$ = selectActiveTab(workspaceIdStore);
 
   // Get focused tab info
@@ -216,107 +248,122 @@
     });
   });
 
-  function handleSearchClick() {
-    appStore.dispatch(openPalette());
-  }
-
-  async function handleApplyPreset(presetId: LayoutPresetId) {
-    if (!layoutManager || !workspaceId) return;
-    await applyContentPreset(presetId, layoutManager, {
-      workspaceId,
-      containerWidth: window.innerWidth,
-      containerHeight: window.innerHeight,
-    });
+  async function handleSettings() {
+    if (page.url.pathname.startsWith('/settings')) {
+      await navigateBackFromSettings();
+    } else {
+      await navigateToSettings();
+    }
   }
 </script>
+
+{#snippet titlebarUtilities(showDaemonStatus: boolean)}
+  {#if showDaemonStatus}
+    <DaemonStatusIndicator />
+  {/if}
+  <Tooltip content={m.layout_sidebarNav_settings_label()} side="bottom" delayDuration={300}>
+    <Button
+      variant="ghost"
+      size="icon"
+      iconOnly
+      class={TITLEBAR_NAVIGATION_CONTROL_CLASS}
+      onclick={() => void handleSettings()}
+      aria-label={m.layout_sidebarNav_settings_label()}
+      aria-current={page.url.pathname.startsWith('/settings') ? 'page' : undefined}
+      data-titlebar-settings
+    >
+      <span class={TITLEBAR_NAVIGATION_GLYPH_CLASS} data-titlebar-navigation-glyph>
+        <IntentNavigationIcon name="settings" size={16} class="pointer-events-none size-4!" />
+      </span>
+    </Button>
+  </Tooltip>
+{/snippet}
 
 <!-- Counter-scale wrapper to maintain fixed position relative to macOS traffic lights -->
 <div
   class="window-title-bar-wrapper"
-  style:height="{35 / $zoomFactor}px"
+  class:workspace-columns-titlebar={overlayWorkspaceColumns}
+  style:height="{getCounterScaledTitlebarHeight($zoomFactor)}px"
   aria-label={m.layout_titleBar_ariaLabel()}
 >
+  <!-- app-drag-region scopes the layout rule in +layout.svelte that marks
+       interactive descendants as no-drag so they stay clickable. -->
   <div
     class={cn(
       'window-title-bar app-drag-region',
       isMac ? 'window-title-bar-mac' : 'window-title-bar-windows',
     )}
+    style:height="{WINDOW_TITLEBAR_HEIGHT_PX}px"
     style:transform="scale({$counterScale})"
     style:transform-origin="top left"
     style:width="{100 * $zoomFactor}%"
   >
     <!-- Left column -->
-    <div class="flex items-center min-w-0">
-      {#if isWorkspaceVisible && $sidebarSide$ === 'left'}
-        <Tooltip side="bottom" delayDuration={300}>
-          {#snippet content()}
-            <span>{m.layout_titleBar_sidebar_tooltip()}</span>
-            <span class="text-subtle ml-1.5">⌘B</span>
-          {/snippet}
-          <button
-            class="p-2 rounded hover:bg-muted/50 transition-colors text-muted-foreground hover:text-foreground cursor-pointer"
-            onclick={() => appStore.dispatch(toggleSidebar())}
-            aria-label={m.layout_titleBar_toggleSidebar_ariaLabel()}
-          >
-            <SidebarIcon size={16} side="left" />
-          </button>
-        </Tooltip>
-      {/if}
-    </div>
-
-    <!-- Center: Search bar (workspace pages only, hidden during onboarding) -->
-    {#if isWorkspaceVisible}
-      <div class="flex items-center justify-center px-4 gap-1" style="-webkit-app-region: no-drag">
-        <!-- Search bar -->
-        <button class="search-bar" onclick={handleSearchClick} type="button">
-          <!-- Search icon -->
-          <Fa icon={faSearch} size="sm" class="text-ghost shrink-0" />
-
-          <!-- Display text -->
-          <span class="text-sm text-subtle truncate flex-1 px-2">
-            {displayText || m.layout_titleBar_search_placeholder()}
-          </span>
-
-          <!-- Shortcut hint -->
-          <span class="text-ui text-subtle font-medium shrink-0">{isMac ? '⌘' : 'Ctrl+'}K</span>
-        </button>
+    <div
+      class="titlebar-left-drag-surface flex min-w-0 self-stretch items-center gap-1 overflow-hidden"
+      data-title-bar-navigation
+    >
+      <div
+        class="titlebar-left-drag-handle w-4 shrink-0 self-stretch"
+        data-titlebar-left-drag-handle
+        aria-hidden="true"
+      ></div>
+      <div
+        class="flex min-w-0 items-center gap-1"
+        bind:this={fixedControlsEl}
+        data-titlebar-fixed-controls
+      >
+        <SidebarNav />
       </div>
-    {:else}
-      <div></div>
-    {/if}
-
-    <!-- Right column: Layout controls + daemon status + sidebar toggle (when sidebar is on right) -->
-    <div class="flex items-center justify-end pr-4 gap-1">
-      <!-- Daemon status indicator (always visible, not workspace-gated) -->
-      <DaemonStatusIndicator />
-
-      {#if isWorkspaceVisible && layoutManager}
-        <PanelLayoutControls
-          layoutRoot={$layoutRoot$}
-          canGoBack={$canGoBack$}
-          canGoForward={$canGoForward$}
-          workspaceId={workspaceId!}
-          onGoBack={() => layoutManager.goBack()}
-          onGoForward={() => layoutManager.goForward()}
-          onApplyPreset={handleApplyPreset}
-        />
-      {/if}
-      {#if isWorkspaceVisible && $sidebarSide$ === 'right'}
-        <Tooltip side="bottom" delayDuration={300}>
-          {#snippet content()}
-            <span>{m.layout_titleBar_sidebar_tooltip()}</span>
-            <span class="text-subtle ml-1.5">⌘B</span>
-          {/snippet}
-          <button
-            class="p-2 rounded hover:bg-muted/50 transition-colors text-muted-foreground hover:text-foreground cursor-pointer"
-            onclick={() => appStore.dispatch(toggleSidebar())}
-            aria-label={m.layout_titleBar_toggleSidebar_ariaLabel()}
-          >
-            <SidebarIcon size={16} side="right" />
-          </button>
-        </Tooltip>
-      {/if}
+      <div
+        class={cn(
+          'flex min-w-0 items-center gap-1 transition-[margin-left] duration-200 ease-[cubic-bezier(0.215,0.61,0.355,1)] motion-reduce:transition-none',
+          $workspaceViewMode$ === 'columns' ? 'self-center' : 'self-end',
+        )}
+        style:margin-left={`${$workspaceViewMode$ === 'columns' ? 0 : panelOffset}px`}
+        data-titlebar-workspace-controls
+      >
+        {#if !$onboardingActive$}
+          <WorkspaceViewModeToggle />
+        {/if}
+        {#if $workspaceViewMode$ === 'single'}
+          <WorkspaceTabStrip
+            onActiveTabBoundsChange={handleActiveTabBoundsChange}
+            onActiveTabTrackingChange={handleActiveTabTrackingChange}
+            activeWorkspaceId={routedWorkspaceId}
+          />
+          {#if !$onboardingActive$}
+            <WorkspaceRepoLauncher />
+          {/if}
+        {/if}
+        {#if $workspaceViewMode$ === 'columns'}
+          {@render titlebarUtilities(false)}
+        {/if}
+      </div>
+      <div
+        class="titlebar-drag-handle min-w-12 flex-1 self-stretch"
+        data-titlebar-drag-handle
+      ></div>
     </div>
+
+    <!-- Right column: global status and settings -->
+    {#if $workspaceViewMode$ === 'single'}
+      <div class="app-no-drag flex items-center justify-end pr-4 gap-1">
+        {@render titlebarUtilities(true)}
+      </div>
+    {/if}
+    {#if activeTabBounds && $workspaceViewMode$ === 'single'}
+      <div
+        class="pointer-events-none absolute -bottom-px z-[60] h-px bg-sidebar motion-reduce:transition-none"
+        style:left={`${activeTabBounds.left + panelOffset - 6}px`}
+        style:width={`${Math.max(0, activeTabBounds.width + 13)}px`}
+        style:transition={activeTabTracking
+          ? 'none'
+          : 'left 200ms cubic-bezier(0.215, 0.61, 0.355, 1)'}
+        data-active-tab-border-mask
+        aria-hidden="true"
+      ></div>
+    {/if}
   </div>
 </div>
 
@@ -324,15 +371,32 @@
   .window-title-bar-wrapper {
     position: relative;
     z-index: 50;
-    overflow: hidden;
+    overflow: visible;
+    background: transparent;
+    -webkit-app-region: drag;
   }
 
   .window-title-bar {
-    height: 35px;
+    background: transparent;
+  }
+
+  .window-title-bar-wrapper.workspace-columns-titlebar {
+    position: absolute;
+    inset: 0 0 auto;
+    width: 100%;
+    pointer-events: none;
+  }
+
+  .workspace-columns-titlebar [data-titlebar-fixed-controls],
+  .workspace-columns-titlebar [data-titlebar-workspace-controls] {
+    pointer-events: auto;
+  }
+
+  .window-title-bar {
+    box-sizing: border-box;
     display: grid;
-    grid-template-columns: 1fr auto 1fr;
+    grid-template-columns: minmax(0, 1fr) auto;
     align-items: center;
-    background: hsl(var(--app-background) / 0.8);
     /* border-bottom: 1px solid hsl(var(--border) / 0.5); */
     position: relative;
     z-index: 50;
@@ -341,33 +405,30 @@
   }
 
   .window-title-bar:global(.window-title-bar-mac) {
-    padding-left: 70px; /* Space for macOS traffic lights */
+    padding-left: 60px; /* Space for macOS traffic lights */
   }
 
   .window-title-bar:global(.window-title-bar-windows) {
     padding-left: 8px; /* Minimal padding for Windows */
   }
 
-  .search-bar {
-    display: flex;
-    align-items: center;
-    max-width: 400px;
-    width: 100%;
-    height: 26px;
-    padding: 0 8px;
-    background: hsl(var(--background) / 0.5);
-    border-radius: 6px;
-    cursor: pointer;
-    transition: all 0.15s ease;
+  .titlebar-drag-handle {
+    -webkit-app-region: drag;
   }
 
-  .search-bar:hover {
-    background: hsl(var(--background) / 1);
+  .titlebar-left-drag-surface,
+  .titlebar-left-drag-handle {
+    -webkit-app-region: drag;
+  }
+
+  /* Track the panel width directly (no easing) while it is being resized */
+  :global(body.panel-resizing) [data-titlebar-workspace-controls] {
+    transition: none;
   }
 
   /* Current workspace tab - connects to sidebar below */
   .current-workspace-tab {
-    background: hsl(var(--sidebar));
+    background: hsl(var(--background));
     border-top-left-radius: 0.375rem;
     border-top-right-radius: 0.375rem;
     border-bottom-left-radius: 0;

@@ -20,8 +20,8 @@
  * `headers` secrets (redacted on the wire) are preserved; an *edited* server is
  * replaced wholesale per §5.22 semantics.
  *   - `providers.active` / `providers.enabled`            ↔ provider settings
- *   - `backgroundAgents.defaultModel` / `.typeOverrides` /
- *     `.providerSettings`                                 ↔ background agents
+ *   - `quickActions.defaultModel` / `.typeOverrides` /
+ *     `.providerSettings`                                 ↔ quick actions
  *   - `git.autoCommit`                                    ↔ workspace settings
  *
  * Sensitive entries return a redacted placeholder (§5.12); the client surfaces
@@ -42,7 +42,10 @@ import type {
   Unsubscribe,
   UserRuleState,
 } from "../app-client";
-import type { McpServerConfig } from "$store/renderer/slices/mcp-settings/mcp-settings-types";
+import type {
+  McpServerConfig,
+  McpServerRuntimeStatus,
+} from "$store/renderer/slices/mcp-settings/mcp-settings-types";
 import type { SingleWorkspaceSettings } from "$store/renderer/slices/workspace-settings/workspace-settings-slice";
 import type { BackgroundAgentSettingsState } from "$store/renderer/slices/background-agent-settings/background-agent-settings-slice";
 import type { UserPreferencesState } from "$store/renderer/slices/user-preferences/user-preferences-slice";
@@ -193,6 +196,23 @@ export class LiveSettingsClient implements SettingsClient {
     return wire.flatMap((server) => fromWireMcpConfig(server) ?? []);
   }
 
+  async getMcpServerStatuses(serverIds: string[]): Promise<McpServerRuntimeStatus[]> {
+    const statuses = await Promise.all(
+      serverIds.map(async (serverId): Promise<McpServerRuntimeStatus | null> => {
+        try {
+          const result = await backendRequest<{ status?: WireMcpServerStatus }>(
+            "mcp.servers.getStatus",
+            { serverId },
+          );
+          return fromWireMcpStatus(serverId, result?.status);
+        } catch {
+          return null;
+        }
+      }),
+    );
+    return statuses.filter((status): status is McpServerRuntimeStatus => status !== null);
+  }
+
   async setMcpServers(servers: McpServerConfig[]): Promise<MutationResult> {
     try {
       const existing = await listWireMcpServers();
@@ -267,11 +287,11 @@ export class LiveSettingsClient implements SettingsClient {
 
   async getBackgroundAgentSettings(): Promise<BackgroundAgentSettingsState | null> {
     const settings = await this.list();
-    const defaultModel = readString(settings, "backgroundAgents.defaultModel");
-    const typeOverrides = readObject(settings, "backgroundAgents.typeOverrides") as
+    const defaultModel = readString(settings, "quickActions.defaultModel");
+    const typeOverrides = readObject(settings, "quickActions.typeOverrides") as
       | BackgroundAgentSettingsState["typeOverrides"]
       | null;
-    const providerSettings = readObject(settings, "backgroundAgents.providerSettings") as
+    const providerSettings = readObject(settings, "quickActions.providerSettings") as
       | BackgroundAgentSettingsState["providerSettings"]
       | null;
     if (defaultModel === null && typeOverrides === null && providerSettings === null) {
@@ -290,9 +310,9 @@ export class LiveSettingsClient implements SettingsClient {
   ): Promise<MutationResult> {
     return runMutation("settings.update", {
       changes: changesFrom({
-        "backgroundAgents.defaultModel": settings.defaultModel,
-        "backgroundAgents.typeOverrides": settings.typeOverrides,
-        "backgroundAgents.providerSettings": settings.providerSettings,
+        "quickActions.defaultModel": settings.defaultModel,
+        "quickActions.typeOverrides": settings.typeOverrides,
+        "quickActions.providerSettings": settings.providerSettings,
       }),
     });
   }
@@ -318,6 +338,39 @@ interface WireMcpServerConfig {
   headers?: Record<string, string>;
   enabled?: boolean;
   scope?: string;
+}
+
+/** Wire `McpServerStatus` (PROTOCOL §5.22) — the daemon's runtime status shape. */
+interface WireMcpServerStatus {
+  serverId?: string;
+  state?: string;
+  lastError?: string;
+}
+
+/**
+ * Map a wire status (§5.22) to the FE runtime-status shape; `null` when
+ * malformed. Keyed by the *requested* serverId — a conforming daemon echoes
+ * the same id back (§5.22), so correlation must not depend on the echo; a
+ * mismatched echo is dropped rather than mis-correlated.
+ */
+function fromWireMcpStatus(
+  serverId: string,
+  wire: WireMcpServerStatus | undefined,
+): McpServerRuntimeStatus | null {
+  if (typeof wire?.serverId === "string" && wire.serverId && wire.serverId !== serverId) {
+    return null;
+  }
+  if (
+    wire?.state !== "stopped" &&
+    wire?.state !== "starting" &&
+    wire?.state !== "running" &&
+    wire?.state !== "error"
+  ) {
+    return null;
+  }
+  const status: McpServerRuntimeStatus = { serverId, state: wire.state };
+  if (typeof wire.lastError === "string" && wire.lastError) status.lastError = wire.lastError;
+  return status;
 }
 
 /** `mcp.servers.list` (§5.22) — sensitive `env`/`headers` values arrive redacted. */

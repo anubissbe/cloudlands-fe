@@ -17,9 +17,6 @@ import {
   chatStopCompleted,
   chatReset,
   chatStreamingReconciled,
-  streamActivityReceived,
-  streamEnded,
-  streamFailed,
   chatModelUnavailableCleared,
   chatRebindStarted,
   chatRebindEnded,
@@ -34,17 +31,33 @@ import {
   chatQueuedRetryRecordUpdated,
   chatQueuedRetryRecordsCleared,
   chatLiveStreamPhaseChanged,
+  chatTranscriptSnapshotApplied,
+  scrollbackFetchStarted,
+  scrollbackSeekSettled,
+  scrollbackContinuationReset,
+  chatSwitchBackRevealTimedOut,
+  chatUtilityFooterReady,
+  messageBlockHydrationRequested,
+  messageBlockHydrated,
+  messageBlockHydrationFailed,
 } from './chat-state-slice';
+import { MAX_HYDRATED_BLOCKS } from './chat-state-types';
+import { markAgentAsViewed } from '../unread-tracking/unread-tracking-slice';
+import { agentStreamUpdateReceived } from '../workspace-agents/workspace-agents-stream-slice';
 import {
   removeQueuedMessageFromAgentQueue,
   replaceAgentQueue,
 } from '../agent-queue/agent-queue-slice';
 import type { QueuedMessage } from '$shared/types';
 import {
+  selectAwaitingSwitchBackSnapshot,
+  selectAwaitingUtilityFooter,
   selectChatAgentState,
   selectChatError,
   selectChatLastMessageTime,
   selectChatLiveStreamPhase,
+  selectHydratedBlock,
+  selectTranscriptHydratedOnce,
   selectTranscriptHydration,
 } from './chat-state-selectors';
 import { workspaceDeleted } from '../workspace-lifecycle/workspace-lifecycle-slice';
@@ -55,6 +68,39 @@ import type {
 } from '$features/events/types';
 
 const AGENT = 'agent-1';
+
+const streamEnded = (agentId: string, stopReason?: string) =>
+  agentStreamUpdateReceived({
+    agentId,
+    workspaceId: 'ws-1',
+    handlerSessionId: agentId,
+    source: 'sendMessage',
+    eventType: 'complete',
+    ...(stopReason ? { stopReason } : {}),
+  });
+
+const streamFailed = (agentId: string) =>
+  agentStreamUpdateReceived({
+    agentId,
+    workspaceId: 'ws-1',
+    handlerSessionId: agentId,
+    source: 'sendMessage',
+    eventType: 'error',
+  });
+
+const streamActivityReceived = (
+  agentId: string,
+  isTextChunk: boolean,
+  timestamp = Date.now(),
+) =>
+  agentStreamUpdateReceived({
+    agentId,
+    workspaceId: 'ws-1',
+    handlerSessionId: agentId,
+    source: 'sendMessage',
+    eventType: isTextChunk ? 'chunk' : 'content-blocks',
+    timestamp,
+  });
 
 function asStoreState(chatState: ReturnType<typeof chatStateReducer>): StoreState {
   return { chatState } as unknown as StoreState;
@@ -186,6 +232,41 @@ describe('chatStateReducer', () => {
     const agent = s2.byAgentId[AGENT];
     expect(agent.streamingStartTime).toBeNull();
     expect(agent.receivedFirstChunk).toBe(false);
+  });
+
+  it('a complete payload carrying an abnormal finishReason is NOT a stream failure — no error banner', () => {
+    // `finishReason` is the open union of abnormal ACP stop reasons (PROTOCOL
+    // §7.3); the timeout failure banner is scoped to eventType === 'timeout',
+    // so even a hypothetical future reason spelled "timeout" stays a clean end.
+    const s1 = chatStateReducer(initialState, chatSendStarted(AGENT));
+    const abnormalComplete = (finishReason: string) =>
+      agentStreamUpdateReceived({
+        agentId: AGENT,
+        workspaceId: 'ws-1',
+        handlerSessionId: AGENT,
+        source: 'sendMessage',
+        eventType: 'complete',
+        finishReason,
+      });
+    for (const finishReason of ['refusal', 'max_tokens', 'max_turn_requests', 'timeout']) {
+      const s2 = chatStateReducer(s1, abnormalComplete(finishReason));
+      expect(s2.byAgentId[AGENT].error).toBeNull();
+    }
+  });
+
+  it('eventType timeout still surfaces the timeout failure banner', () => {
+    const s1 = chatStateReducer(initialState, chatSendStarted(AGENT));
+    const s2 = chatStateReducer(
+      s1,
+      agentStreamUpdateReceived({
+        agentId: AGENT,
+        workspaceId: 'ws-1',
+        handlerSessionId: AGENT,
+        source: 'sendMessage',
+        eventType: 'timeout',
+      }),
+    );
+    expect(s2.byAgentId[AGENT].error).not.toBeNull();
   });
 
   it('chatLastAttemptedMessageSet records the retry payload (#941)', () => {
@@ -673,7 +754,7 @@ describe('chatStateReducer', () => {
     const s2 = chatStateReducer(s1, action);
     const agent = s2.byAgentId[AGENT];
     expect(agent.receivedFirstChunk).toBe(true);
-    expect(agent.lastChunkReceivedAt).toBe(action.payload[2]);
+    expect(agent.lastChunkReceivedAt).toBe(action.payload[0].timestamp);
     expect(agent.statusEvents).toHaveLength(1);
     expect(agent.statusEvents[0]).toMatchObject({ phase: 'streaming' });
   });
@@ -685,7 +766,7 @@ describe('chatStateReducer', () => {
     const agent = s2.byAgentId[AGENT];
     expect(agent.receivedFirstChunk).toBe(false);
     expect(agent.statusEvents).toHaveLength(0);
-    expect(agent.lastChunkReceivedAt).toBe(action.payload[2]);
+    expect(agent.lastChunkReceivedAt).toBe(action.payload[0].timestamp);
   });
 
   it('repeated streamActivityReceived pings (throttled cadence) refresh timestamps without duplicate status entries', () => {
@@ -1065,6 +1146,24 @@ describe('chatState selectors', () => {
     expect(selectTranscriptHydration.select(asStoreState(initialState), AGENT)).toBeUndefined();
   });
 
+  // First-hydration latch (transcriptHydratedOnce)
+  it('selectTranscriptHydratedOnce is false by default and while the first hydration loads', () => {
+    expect(selectTranscriptHydratedOnce.select(asStoreState(initialState), AGENT)).toBe(false);
+    const loading = chatStateReducer(initialState, transcriptHydrationStarted(AGENT));
+    expect(selectTranscriptHydratedOnce.select(asStoreState(loading), AGENT)).toBe(false);
+  });
+
+  it('transcriptHydrationSettled latches transcriptHydratedOnce across later re-hydrations', () => {
+    let state = chatStateReducer(initialState, transcriptHydrationStarted(AGENT));
+    state = chatStateReducer(state, transcriptHydrationSettled(AGENT));
+    expect(selectTranscriptHydratedOnce.select(asStoreState(state), AGENT)).toBe(true);
+
+    // A refresh re-hydration flips status back to loading, but the latch holds.
+    state = chatStateReducer(state, transcriptHydrationStarted(AGENT));
+    expect(selectTranscriptHydration.select(asStoreState(state), AGENT)).toBe('loading');
+    expect(selectTranscriptHydratedOnce.select(asStoreState(state), AGENT)).toBe(true);
+  });
+
   // Live stream phase tests
   it('selectChatLiveStreamPhase returns null by default', () => {
     expect(selectChatLiveStreamPhase.select(asStoreState(initialState), AGENT)).toBeNull();
@@ -1101,6 +1200,329 @@ describe('chatState selectors', () => {
     const state = chatStateReducer(initialState, chatLiveStreamPhaseChanged(AGENT, null));
     expect(state.byAgentId[AGENT]).toBeUndefined();
     expect(state).toBe(initialState);
+  });
+
+  it('chatTranscriptSnapshotApplied records meta and bumps seq; teardown clears it', () => {
+    let state = chatStateReducer(
+      initialState,
+      chatTranscriptSnapshotApplied(AGENT, {
+        truncated: true,
+        totalMessages: 7,
+        oldestMessageId: 'm-old',
+      }),
+    );
+    expect(state.byAgentId[AGENT]?.transcriptSnapshot).toMatchObject({
+      truncated: true,
+      totalMessages: 7,
+      oldestMessageId: 'm-old',
+      seq: 1,
+    });
+
+    state = chatStateReducer(
+      state,
+      chatTranscriptSnapshotApplied(AGENT, { truncated: false, totalMessages: 2 }),
+    );
+    expect(state.byAgentId[AGENT]?.transcriptSnapshot?.seq).toBe(2);
+
+    // Subscription teardown (phase null) drops the metadata: it belongs to
+    // the closed subscription, and a reopen must wait for a fresh snapshot.
+    state = chatStateReducer(state, chatLiveStreamPhaseChanged(AGENT, null));
+    expect(state.byAgentId[AGENT]?.transcriptSnapshot).toBeUndefined();
+  });
+
+  describe('far-flick seek state (aroundIndex)', () => {
+    it('initial state carries the seek flags off', () => {
+      expect(emptyChatAgentState.fetchingHistorySeek).toBe(false);
+      expect(emptyChatAgentState.historySeekUnsupported).toBe(false);
+    });
+
+    it('scrollbackFetchStarted seek direction sets only fetchingHistorySeek', () => {
+      const state = chatStateReducer(initialState, scrollbackFetchStarted(AGENT, 'seek'));
+      const agent = state.byAgentId[AGENT];
+      expect(agent.fetchingHistorySeek).toBe(true);
+      expect(agent.fetchingOlderHistory).toBe(false);
+      expect(agent.fetchingGapFill).toBe(false);
+    });
+
+    it('scrollbackSeekSettled clears the flag and persists BOTH landing cursors', () => {
+      let state = chatStateReducer(initialState, scrollbackFetchStarted(AGENT, 'seek'));
+      state = chatStateReducer(
+        state,
+        scrollbackSeekSettled(AGENT, { nextToken: 'older-1', prevToken: 'newer-1' }),
+      );
+      const agent = state.byAgentId[AGENT];
+      expect(agent.fetchingHistorySeek).toBe(false);
+      expect(agent.scrollbackOlderToken).toBe('older-1');
+      expect(agent.scrollbackGapToken).toBe('newer-1');
+      expect(agent.historySeekUnsupported).toBe(false);
+    });
+
+    it('scrollbackSeekSettled with unsupported latches historySeekUnsupported', () => {
+      const state = chatStateReducer(
+        initialState,
+        scrollbackSeekSettled(AGENT, { nextToken: null, prevToken: null }, true),
+      );
+      expect(state.byAgentId[AGENT].historySeekUnsupported).toBe(true);
+    });
+
+    it('scrollbackContinuationReset clears the seek fetching flag but keeps the unsupported latch', () => {
+      let state = chatStateReducer(
+        initialState,
+        scrollbackSeekSettled(AGENT, { nextToken: 'a', prevToken: 'b' }, true),
+      );
+      state = chatStateReducer(state, scrollbackFetchStarted(AGENT, 'seek'));
+      state = chatStateReducer(state, scrollbackContinuationReset(AGENT));
+      const agent = state.byAgentId[AGENT];
+      expect(agent.fetchingHistorySeek).toBe(false);
+      expect(agent.scrollbackOlderToken).toBeNull();
+      expect(agent.scrollbackGapToken).toBeNull();
+      expect(agent.historySeekUnsupported).toBe(true);
+    });
+  });
+
+  // Switch-back transcript reveal gate (awaitingSwitchBackSnapshot)
+  describe('switch-back transcript reveal gate', () => {
+    /** Hydrated-once agent whose subscription closed (transcriptSnapshot dropped). */
+    function switchedAwayState() {
+      let state = chatStateReducer(initialState, transcriptHydrationStarted(AGENT));
+      state = chatStateReducer(state, transcriptHydrationSettled(AGENT));
+      state = chatStateReducer(
+        state,
+        chatTranscriptSnapshotApplied(AGENT, { truncated: false, totalMessages: 2 }),
+      );
+      return chatStateReducer(state, chatLiveStreamPhaseChanged(AGENT, null));
+    }
+
+    it('arms on markAgentAsViewed for a hydrated agent with no current-subscription snapshot', () => {
+      const state = chatStateReducer(switchedAwayState(), markAgentAsViewed(AGENT));
+      expect(selectAwaitingSwitchBackSnapshot.select(asStoreState(state), AGENT)).toBe(true);
+    });
+
+    it('never arms for an agent whose chat was never opened (no entry materialized)', () => {
+      const state = chatStateReducer(initialState, markAgentAsViewed(AGENT));
+      expect(state).toBe(initialState);
+      expect(state.byAgentId[AGENT]).toBeUndefined();
+    });
+
+    it('never arms during the first hydration (transcriptHydratedOnce false)', () => {
+      const loading = chatStateReducer(initialState, transcriptHydrationStarted(AGENT));
+      const state = chatStateReducer(loading, markAgentAsViewed(AGENT));
+      expect(selectAwaitingSwitchBackSnapshot.select(asStoreState(state), AGENT)).toBe(false);
+    });
+
+    it('never arms while a snapshot from the current subscription exists (live view)', () => {
+      let state = chatStateReducer(initialState, transcriptHydrationSettled(AGENT));
+      state = chatStateReducer(
+        state,
+        chatTranscriptSnapshotApplied(AGENT, { truncated: false, totalMessages: 1 }),
+      );
+      state = chatStateReducer(state, markAgentAsViewed(AGENT));
+      expect(selectAwaitingSwitchBackSnapshot.select(asStoreState(state), AGENT)).toBe(false);
+    });
+
+    it('never arms for other (non-viewed) agents', () => {
+      const state = chatStateReducer(switchedAwayState(), markAgentAsViewed('agent-other'));
+      expect(selectAwaitingSwitchBackSnapshot.select(asStoreState(state), AGENT)).toBe(false);
+    });
+
+    it('clears when a fresh snapshot applies', () => {
+      let state = chatStateReducer(switchedAwayState(), markAgentAsViewed(AGENT));
+      state = chatStateReducer(
+        state,
+        chatTranscriptSnapshotApplied(AGENT, { truncated: false, totalMessages: 3 }),
+      );
+      expect(selectAwaitingSwitchBackSnapshot.select(asStoreState(state), AGENT)).toBe(false);
+    });
+
+    it('clears when the subscription closes (phase null) — background panels keep retained transcripts', () => {
+      let state = chatStateReducer(switchedAwayState(), markAgentAsViewed(AGENT));
+      state = chatStateReducer(state, chatLiveStreamPhaseChanged(AGENT, null));
+      expect(selectAwaitingSwitchBackSnapshot.select(asStoreState(state), AGENT)).toBe(false);
+    });
+
+    it('clears on the bounded fallback timeout', () => {
+      let state = chatStateReducer(switchedAwayState(), markAgentAsViewed(AGENT));
+      state = chatStateReducer(state, chatSwitchBackRevealTimedOut(AGENT));
+      expect(selectAwaitingSwitchBackSnapshot.select(asStoreState(state), AGENT)).toBe(false);
+    });
+
+    it('timeout is a no-op when the gate is not armed', () => {
+      const before = switchedAwayState();
+      const state = chatStateReducer(before, chatSwitchBackRevealTimedOut(AGENT));
+      expect(state).toBe(before);
+    });
+
+    it('clears on chatReset', () => {
+      let state = chatStateReducer(switchedAwayState(), markAgentAsViewed(AGENT));
+      state = chatStateReducer(state, chatReset(AGENT));
+      expect(selectAwaitingSwitchBackSnapshot.select(asStoreState(state), AGENT)).toBe(false);
+    });
+
+    it('re-view while already armed keeps state identity (no churn)', () => {
+      const armed = chatStateReducer(switchedAwayState(), markAgentAsViewed(AGENT));
+      const again = chatStateReducer(armed, markAgentAsViewed(AGENT));
+      expect(again).toBe(armed);
+    });
+  });
+
+  // Utility-footer reveal gate (awaitingUtilityFooter): transcript and footer
+  // flip in the same paint on first open AND switch-back.
+  describe('utility-footer reveal gate', () => {
+    const footerArmed = (state: ReturnType<typeof chatStateReducer>) =>
+      selectAwaitingUtilityFooter.select(asStoreState(state), AGENT);
+
+    it('arms on the FIRST hydration settle only (refresh re-settles never re-arm)', () => {
+      let state = chatStateReducer(initialState, transcriptHydrationStarted(AGENT));
+      expect(footerArmed(state)).toBe(false);
+      state = chatStateReducer(state, transcriptHydrationSettled(AGENT));
+      expect(footerArmed(state)).toBe(true);
+
+      state = chatStateReducer(state, chatUtilityFooterReady(AGENT));
+      expect(footerArmed(state)).toBe(false);
+      state = chatStateReducer(state, transcriptHydrationStarted(AGENT));
+      state = chatStateReducer(state, transcriptHydrationSettled(AGENT));
+      expect(footerArmed(state)).toBe(false);
+    });
+
+    it('arms alongside the snapshot gate on markAgentAsViewed (switch-back)', () => {
+      let state = chatStateReducer(initialState, transcriptHydrationStarted(AGENT));
+      state = chatStateReducer(state, transcriptHydrationSettled(AGENT));
+      state = chatStateReducer(state, chatUtilityFooterReady(AGENT));
+      state = chatStateReducer(
+        state,
+        chatTranscriptSnapshotApplied(AGENT, { truncated: false, totalMessages: 2 }),
+      );
+      state = chatStateReducer(state, chatLiveStreamPhaseChanged(AGENT, null));
+      expect(footerArmed(state)).toBe(false);
+      state = chatStateReducer(state, markAgentAsViewed(AGENT));
+      expect(footerArmed(state)).toBe(true);
+      expect(selectAwaitingSwitchBackSnapshot.select(asStoreState(state), AGENT)).toBe(true);
+    });
+
+    it('chatUtilityFooterReady clears the footer gate without touching the snapshot gate', () => {
+      let state = chatStateReducer(initialState, transcriptHydrationStarted(AGENT));
+      state = chatStateReducer(state, transcriptHydrationSettled(AGENT));
+      state = chatStateReducer(state, chatLiveStreamPhaseChanged(AGENT, null));
+      state = chatStateReducer(state, markAgentAsViewed(AGENT));
+      state = chatStateReducer(state, chatUtilityFooterReady(AGENT));
+      expect(footerArmed(state)).toBe(false);
+      expect(selectAwaitingSwitchBackSnapshot.select(asStoreState(state), AGENT)).toBe(true);
+    });
+
+    it('chatUtilityFooterReady is a no-op when the gate is not armed', () => {
+      let before = chatStateReducer(initialState, transcriptHydrationStarted(AGENT));
+      before = chatStateReducer(before, transcriptHydrationSettled(AGENT));
+      before = chatStateReducer(before, chatUtilityFooterReady(AGENT));
+      const state = chatStateReducer(before, chatUtilityFooterReady(AGENT));
+      expect(state).toBe(before);
+    });
+
+    it('the shared bounded fallback timeout clears BOTH gates', () => {
+      let state = chatStateReducer(initialState, transcriptHydrationStarted(AGENT));
+      state = chatStateReducer(state, transcriptHydrationSettled(AGENT));
+      state = chatStateReducer(state, chatLiveStreamPhaseChanged(AGENT, null));
+      state = chatStateReducer(state, markAgentAsViewed(AGENT));
+      state = chatStateReducer(state, chatSwitchBackRevealTimedOut(AGENT));
+      expect(footerArmed(state)).toBe(false);
+      expect(selectAwaitingSwitchBackSnapshot.select(asStoreState(state), AGENT)).toBe(false);
+    });
+
+    it('the fallback timeout clears a footer-only hold (first open)', () => {
+      let state = chatStateReducer(initialState, transcriptHydrationStarted(AGENT));
+      state = chatStateReducer(state, transcriptHydrationSettled(AGENT));
+      expect(footerArmed(state)).toBe(true);
+      state = chatStateReducer(state, chatSwitchBackRevealTimedOut(AGENT));
+      expect(footerArmed(state)).toBe(false);
+    });
+
+    it('clears when the subscription closes (phase null) — no pending reveal on a backgrounded panel', () => {
+      let state = chatStateReducer(initialState, transcriptHydrationStarted(AGENT));
+      state = chatStateReducer(state, transcriptHydrationSettled(AGENT));
+      expect(footerArmed(state)).toBe(true);
+      state = chatStateReducer(state, chatLiveStreamPhaseChanged(AGENT, null));
+      expect(footerArmed(state)).toBe(false);
+    });
+  });
+
+  describe('lazy block hydration (§5.5 slim → v7.2 agent.getMessageBlock)', () => {
+    const MSG = 'msg-1';
+    const BLOCK = 'msg-1:2';
+    const entry = (state: ReturnType<typeof chatStateReducer>) =>
+      selectHydratedBlock.select(asStoreState(state), AGENT, MSG, BLOCK);
+
+    it('hydration request parks a loading entry keyed {messageId}|{blockId}', () => {
+      const state = chatStateReducer(
+        initialState,
+        messageBlockHydrationRequested(AGENT, MSG, BLOCK),
+      );
+      expect(entry(state)).toMatchObject({ status: 'loading' });
+    });
+
+    it('a re-request while loading is a no-op (single-flight)', () => {
+      const first = chatStateReducer(
+        initialState,
+        messageBlockHydrationRequested(AGENT, MSG, BLOCK),
+      );
+      const second = chatStateReducer(first, messageBlockHydrationRequested(AGENT, MSG, BLOCK));
+      expect(second).toBe(first);
+    });
+
+    it('a re-request after load is a no-op (read-through cache: no refetch marker)', () => {
+      let state = chatStateReducer(initialState, messageBlockHydrationRequested(AGENT, MSG, BLOCK));
+      state = chatStateReducer(
+        state,
+        messageBlockHydrated(AGENT, MSG, BLOCK, {
+          type: 'tool_result',
+          id: BLOCK,
+          output: 'full body',
+        }),
+      );
+      const after = chatStateReducer(state, messageBlockHydrationRequested(AGENT, MSG, BLOCK));
+      expect(after).toBe(state);
+      expect(entry(after)).toMatchObject({ status: 'loaded', block: { output: 'full body' } });
+    });
+
+    it('a failed fetch records the error and the next request retries', () => {
+      let state = chatStateReducer(initialState, messageBlockHydrationRequested(AGENT, MSG, BLOCK));
+      state = chatStateReducer(state, messageBlockHydrationFailed(AGENT, MSG, BLOCK, 'boom'));
+      expect(entry(state)).toMatchObject({ status: 'error', error: 'boom' });
+      state = chatStateReducer(state, messageBlockHydrationRequested(AGENT, MSG, BLOCK));
+      expect(entry(state)).toMatchObject({ status: 'loading' });
+    });
+
+    it('caps cached entries at MAX_HYDRATED_BLOCKS, evicting oldest settled first', () => {
+      let state = initialState;
+      for (let i = 0; i < MAX_HYDRATED_BLOCKS + 5; i++) {
+        const blockId = `msg-x:${i}`;
+        state = chatStateReducer(state, messageBlockHydrationRequested(AGENT, 'msg-x', blockId));
+        state = chatStateReducer(
+          state,
+          messageBlockHydrated(AGENT, 'msg-x', blockId, { type: 'text', text: `t${i}` }),
+        );
+      }
+      const cached = state.byAgentId[AGENT].hydratedBlocks!;
+      expect(Object.keys(cached).length).toBeLessThanOrEqual(MAX_HYDRATED_BLOCKS);
+      // Newest entry survives; the very first was evicted.
+      expect(cached[`msg-x|msg-x:${MAX_HYDRATED_BLOCKS + 4}`]).toBeDefined();
+      expect(cached['msg-x|msg-x:0']).toBeUndefined();
+    });
+
+    it('never evicts in-flight loading entries', () => {
+      let state = initialState;
+      // Park MAX_HYDRATED_BLOCKS loading entries, then settle one more.
+      for (let i = 0; i < MAX_HYDRATED_BLOCKS; i++) {
+        state = chatStateReducer(
+          state,
+          messageBlockHydrationRequested(AGENT, 'msg-y', `msg-y:${i}`),
+        );
+      }
+      state = chatStateReducer(state, messageBlockHydrationRequested(AGENT, 'msg-y', 'msg-y:last'));
+      const cached = state.byAgentId[AGENT].hydratedBlocks!;
+      for (let i = 0; i < MAX_HYDRATED_BLOCKS; i++) {
+        expect(cached[`msg-y|msg-y:${i}`]).toMatchObject({ status: 'loading' });
+      }
+      expect(cached['msg-y|msg-y:last']).toMatchObject({ status: 'loading' });
+    });
   });
 
 });

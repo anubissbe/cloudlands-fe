@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { createCollection } from '$lib/store-shim/utils/collections/collection-utils';
+import { createCollection } from '@augmentcode/themis/utils/collections/collection-utils';
 import { m } from '$shared/paraglide/messages.js';
 import type { Workspace } from '$shared/types';
 import { QUESTION_RESOURCE_MIME_TYPE } from '$shared/types/question-resource';
@@ -18,6 +18,14 @@ vi.mock('../../voice/voice-setup-toast', () => ({
   showVoiceSetupToast: vi.fn(),
 }));
 
+vi.mock('$features/layout/panel-layout-adapter', () => ({
+  getPanelLayoutManager: vi.fn((workspaceId: string) => ({ workspaceId })),
+}));
+
+vi.mock('$features/layout/preset-executor', () => ({
+  applyContentPreset: vi.fn(async () => true),
+}));
+
 import { isVoiceRecordingSupported } from '../../voice/voice-recorder';
 import {
   handleVoiceKeyDown,
@@ -25,6 +33,7 @@ import {
   isPttRecordingActive,
 } from '../../voice/ptt-controller';
 import { showVoiceSetupToast } from '../../voice/voice-setup-toast';
+import { applyContentPreset } from '$features/layout/preset-executor';
 import {
   ACTION_KEY_REGISTRY,
   actionSlotIcons,
@@ -55,7 +64,7 @@ function makeSession(
 }
 
 interface StateOptions {
-  activeWorkspaceId?: string | null;
+  currentWorkspaceId?: string | null;
   workspaces?: string[];
   agentsByWorkspace?: Record<
     string,
@@ -65,11 +74,14 @@ interface StateOptions {
   sessionOverrides?: Record<string, Record<string, unknown>>;
   unreadWorkspaceIds?: string[];
   selectedTabs?: Record<string, string[]>;
+  showCreateModal?: boolean;
   cycleScopes?: Partial<Record<CycleScopeFamilyId, CycleScope>>;
   voiceSettings?: Partial<ActionKeyState['voiceSettings']>;
 }
 
-function makeState(options: StateOptions = {}): ActionKeyState {
+type TestActionKeyState = ActionKeyState & { currentWorkspaceId: string | null };
+
+function makeState(options: StateOptions = {}): TestActionKeyState {
   const workspaceIds = options.workspaces ?? ['ws-1'];
   const byWorkspaceId: ActionKeyState['workspaceAgents']['byWorkspaceId'] = {};
   const byAgentId: ActionKeyState['agentSessions']['byAgentId'] = {};
@@ -89,9 +101,9 @@ function makeState(options: StateOptions = {}): ActionKeyState {
     }
   }
   return {
+    currentWorkspaceId:
+      options.currentWorkspaceId === undefined ? 'ws-1' : options.currentWorkspaceId,
     workspace: {
-      activeWorkspaceId:
-        options.activeWorkspaceId === undefined ? 'ws-1' : options.activeWorkspaceId,
       workspaces: createCollection(
         'id',
         workspaceIds.map((id) =>
@@ -107,6 +119,7 @@ function makeState(options: StateOptions = {}): ActionKeyState {
     sidebarNav: {
       multiSelectTabOrder: [],
       multiSelectSelectedTabIdsByWorkspaceId: options.selectedTabs ?? {},
+      showCreateModal: options.showCreateModal ?? false,
     },
     voiceSettings: {
       isLoading: false,
@@ -142,12 +155,19 @@ function questionMessage(messageId: string) {
   } as never;
 }
 
-function makeContext(state: ActionKeyState) {
+function makeContext(state: TestActionKeyState) {
   const dispatch = vi.fn();
   const navigate = vi.fn(() => Promise.resolve());
   const focusComposer = vi.fn();
   const showHint = vi.fn();
-  const context: ActionKeyContext = { state, dispatch, navigate, focusComposer, showHint };
+  const context: ActionKeyContext = {
+    state,
+    workspaceId: state.currentWorkspaceId,
+    dispatch,
+    navigate,
+    focusComposer,
+    showHint,
+  };
   return { context, dispatch, navigate, focusComposer, showHint };
 }
 
@@ -179,7 +199,7 @@ describe('ACTION_KEY_REGISTRY', () => {
 
 describe('availability', () => {
   it('workspace-scoped actions are unavailable without an active workspace', () => {
-    const { context } = makeContext(makeState({ activeWorkspaceId: null }));
+    const { context } = makeContext(makeState({ currentWorkspaceId: null }));
     for (const id of [
       'stop-agent',
       'see-spec',
@@ -472,7 +492,10 @@ describe('cycle-unread-agents HUD remaining count', () => {
     ]);
   });
 
-  it('counts an attention agent in the visited unread workspace as its own stop', () => {
+  it('counts 0 remaining when the visited attention agent shares the unread workspace', () => {
+    // The attention agent is visited first (attention precedes unread) and
+    // visiting it clears its own workspace's unread flag, so the unread
+    // stop of that same workspace is not a further stop.
     const state = makeState({
       agentsByWorkspace: { 'ws-1': { ids: ['a-1', 'a-2'], activeAgentId: null } },
       unreadWorkspaceIds: ['ws-1'],
@@ -480,8 +503,9 @@ describe('cycle-unread-agents HUD remaining count', () => {
     });
     const { context, dispatch } = makeContext(state);
     getActionKeyDefinition('cycle-unread-agents').execute(context);
+    expect(activeAgentDispatches(dispatch)).toEqual([['ws-1', 'a-2']]);
     expect(hudDispatches(dispatch)).toEqual([
-      [m.hardwareConsole_actionKey_cycleUnreadAgents_hudRemaining_one({ count: 1 })],
+      [m.hardwareConsole_actionKey_cycleUnreadAgents_label()],
     ]);
   });
 
@@ -499,6 +523,22 @@ describe('cycle-unread-agents HUD remaining count', () => {
     expect(showHint).not.toHaveBeenCalled();
     expect(hudDispatches(dispatch)).toEqual([
       [m.hardwareConsole_actionKey_cycleUnreadAgents_label()],
+    ]);
+  });
+
+  it('counts one remaining stop per other unread workspace regardless of its agent count', () => {
+    const state = makeState({
+      workspaces: ['ws-1', 'ws-2'],
+      agentsByWorkspace: {
+        'ws-1': { ids: ['a-1', 'a-2'], activeAgentId: null },
+        'ws-2': { ids: ['b-1', 'b-2'], activeAgentId: null },
+      },
+      unreadWorkspaceIds: ['ws-1', 'ws-2'],
+    });
+    const { context, dispatch } = makeContext(state);
+    getActionKeyDefinition('cycle-unread-agents').execute(context);
+    expect(hudDispatches(dispatch)).toEqual([
+      [m.hardwareConsole_actionKey_cycleUnreadAgents_hudRemaining_one({ count: 1 })],
     ]);
   });
 
@@ -556,7 +596,8 @@ describe('cycle-unread-agents union (unread workspaces + attention requests)', (
 
   it('unions unread-workspace agents with attention agents without duplicates', () => {
     // a-1 sits in an unread workspace AND requests attention — it must
-    // appear once; the walk alternates between it and the attention-only b-1.
+    // appear once, at its attention position; the walk alternates between
+    // the blocker b-1 (highest bucket) and the discussion a-1.
     const state = makeState({
       workspaces: ['ws-1', 'ws-2'],
       agentsByWorkspace: {
@@ -575,9 +616,103 @@ describe('cycle-unread-agents union (unread workspaces + attention requests)', (
     definition.execute(context);
     definition.execute(context);
     expect(activeAgentDispatches(dispatch)).toEqual([
-      ['ws-1', 'a-1'],
       ['ws-2', 'b-1'],
       ['ws-1', 'a-1'],
+      ['ws-2', 'b-1'],
+    ]);
+  });
+
+  it('walks blocker → question → discussion → unread regardless of workspace order', () => {
+    // Workspace order is deliberately the reverse of the priority order.
+    const state = makeState({
+      workspaces: ['ws-u', 'ws-d', 'ws-q', 'ws-b'],
+      agentsByWorkspace: {
+        'ws-u': { ids: ['u-1'], activeAgentId: null },
+        'ws-d': { ids: ['d-1'], activeAgentId: null },
+        'ws-q': { ids: ['q-1'], activeAgentId: null },
+        'ws-b': { ids: ['b-1'], activeAgentId: null },
+      },
+      unreadWorkspaceIds: ['ws-u'],
+      sessionOverrides: {
+        'd-1': { attentionRequestKind: 'discussion' },
+        'q-1': { messages: [questionMessage('msg-1')] },
+        'b-1': { attentionRequestKind: 'blocker' },
+      },
+    });
+    const { context, dispatch } = makeContext(state);
+    const definition = getActionKeyDefinition('cycle-unread-agents');
+    definition.execute(context);
+    definition.execute(context);
+    definition.execute(context);
+    definition.execute(context);
+    definition.execute(context);
+    expect(activeAgentDispatches(dispatch)).toEqual([
+      ['ws-b', 'b-1'],
+      ['ws-q', 'q-1'],
+      ['ws-d', 'd-1'],
+      ['ws-u', 'u-1'],
+      ['ws-b', 'b-1'],
+    ]);
+  });
+
+  it('agents in the same bucket keep the workspace walk order', () => {
+    // Two blockers and two questions across workspaces: priority groups
+    // them (blockers first), and inside each bucket the workspace order
+    // (ws-1, ws-2, ...) is preserved — never re-sorted.
+    const state = makeState({
+      workspaces: ['ws-1', 'ws-2', 'ws-3', 'ws-4'],
+      agentsByWorkspace: {
+        'ws-1': { ids: ['q-1'], activeAgentId: null },
+        'ws-2': { ids: ['b-1'], activeAgentId: null },
+        'ws-3': { ids: ['q-2'], activeAgentId: null },
+        'ws-4': { ids: ['b-2'], activeAgentId: null },
+      },
+      sessionOverrides: {
+        'q-1': { messages: [questionMessage('msg-1')] },
+        'b-1': { attentionRequestKind: 'blocker' },
+        'q-2': { messages: [questionMessage('msg-2')] },
+        'b-2': { attentionRequestKind: 'blocker' },
+      },
+    });
+    const { context, dispatch } = makeContext(state);
+    const definition = getActionKeyDefinition('cycle-unread-agents');
+    definition.execute(context);
+    definition.execute(context);
+    definition.execute(context);
+    definition.execute(context);
+    expect(activeAgentDispatches(dispatch)).toEqual([
+      ['ws-2', 'b-1'],
+      ['ws-4', 'b-2'],
+      ['ws-1', 'q-1'],
+      ['ws-3', 'q-2'],
+    ]);
+  });
+
+  it('an agent with several attention signals classifies at its highest bucket', () => {
+    // dq-1 (discussion + question) walks in the question bucket — after the
+    // blocker+question bq-1 (blocker wins) and before the discussion-only d-1.
+    const state = makeState({
+      workspaces: ['ws-1', 'ws-2', 'ws-3'],
+      agentsByWorkspace: {
+        'ws-1': { ids: ['d-1'], activeAgentId: null },
+        'ws-2': { ids: ['dq-1'], activeAgentId: null },
+        'ws-3': { ids: ['bq-1'], activeAgentId: null },
+      },
+      sessionOverrides: {
+        'd-1': { attentionRequestKind: 'discussion' },
+        'dq-1': { attentionRequestKind: 'discussion', messages: [questionMessage('msg-1')] },
+        'bq-1': { attentionRequestKind: 'blocker', messages: [questionMessage('msg-2')] },
+      },
+    });
+    const { context, dispatch } = makeContext(state);
+    const definition = getActionKeyDefinition('cycle-unread-agents');
+    definition.execute(context);
+    definition.execute(context);
+    definition.execute(context);
+    expect(activeAgentDispatches(dispatch)).toEqual([
+      ['ws-3', 'bq-1'],
+      ['ws-2', 'dq-1'],
+      ['ws-1', 'd-1'],
     ]);
   });
 
@@ -616,6 +751,190 @@ describe('cycle-unread-agents union (unread workspaces + attention requests)', (
       ['ws-1', 'a-1'],
       ['ws-1', 'a-1'],
     ]);
+  });
+});
+
+describe('cycle-unread-agents last-active pick (intent-hq/monorepo#1779)', () => {
+  it('opens the last active top-level agent of an unread workspace, not the first in order', () => {
+    const state = makeState({
+      workspaces: ['ws-1', 'ws-2'],
+      agentsByWorkspace: {
+        'ws-1': { ids: ['a-1'], activeAgentId: 'a-1' },
+        'ws-2': { ids: ['b-1', 'b-2', 'b-3'], activeAgentId: null },
+      },
+      unreadWorkspaceIds: ['ws-2'],
+      sessionOverrides: {
+        'b-1': { lastActivity: '2026-08-01T08:00:00.000Z' },
+        'b-2': { stopReasonTimestamp: '2026-08-01T12:00:00.000Z' },
+        'b-3': { lastActivity: '2026-08-01T10:00:00.000Z' },
+      },
+    });
+    const { context, dispatch, navigate } = makeContext(state);
+    getActionKeyDefinition('cycle-unread-agents').execute(context);
+    expect(navigate).toHaveBeenCalledWith('/workspace/ws-2');
+    expect(activeAgentDispatches(dispatch)).toEqual([['ws-2', 'b-2']]);
+  });
+
+  it('falls back to the first foreground agent when no recency signal exists', () => {
+    const state = makeState({
+      workspaces: ['ws-1', 'ws-2'],
+      agentsByWorkspace: {
+        'ws-1': { ids: ['a-1'], activeAgentId: 'a-1' },
+        'ws-2': { ids: ['b-1', 'b-2'], activeAgentId: null },
+      },
+      unreadWorkspaceIds: ['ws-2'],
+    });
+    const { context, dispatch } = makeContext(state);
+    getActionKeyDefinition('cycle-unread-agents').execute(context);
+    expect(activeAgentDispatches(dispatch)).toEqual([['ws-2', 'b-1']]);
+  });
+
+  it('each unread workspace contributes exactly one stop — siblings are never visited', () => {
+    const state = makeState({
+      workspaces: ['ws-1', 'ws-2'],
+      agentsByWorkspace: {
+        'ws-1': { ids: ['a-1', 'a-2'], activeAgentId: null },
+        'ws-2': { ids: ['b-1', 'b-2'], activeAgentId: null },
+      },
+      unreadWorkspaceIds: ['ws-1', 'ws-2'],
+      sessionOverrides: {
+        'a-2': { lastActivity: '2026-08-01T10:00:00.000Z' },
+        'b-1': { lastActivity: '2026-08-01T11:00:00.000Z' },
+      },
+    });
+    const { context, dispatch } = makeContext(state);
+    const definition = getActionKeyDefinition('cycle-unread-agents');
+    definition.execute(context);
+    definition.execute(context);
+    definition.execute(context);
+    definition.execute(context);
+    expect(activeAgentDispatches(dispatch)).toEqual([
+      ['ws-1', 'a-2'],
+      ['ws-2', 'b-1'],
+      ['ws-1', 'a-2'],
+      ['ws-2', 'b-1'],
+    ]);
+  });
+});
+
+describe('cycle-unread-agents unhydrated workspaces (intent-hq/monorepo#2438)', () => {
+  /** The hydrateAgentsRequested workspace ids dispatched, in order. */
+  function hydrateDispatches(dispatch: ReturnType<typeof vi.fn>): unknown[] {
+    return dispatch.mock.calls
+      .map(([action]) => action as { type: string; payload: unknown })
+      .filter((action) => action.type === 'workspaceAgents/hydrateAgentsRequested')
+      .map((action) => action.payload);
+  }
+
+  it('is available when the only unread workspace has no hydrated sessions', () => {
+    const state = makeState({
+      workspaces: ['ws-1', 'ws-2'],
+      agentsByWorkspace: { 'ws-1': { ids: ['a-1'], activeAgentId: 'a-1' } },
+      unreadWorkspaceIds: ['ws-2'],
+    });
+    const { context } = makeContext(state);
+    expect(getActionKeyDefinition('cycle-unread-agents').isAvailable(context)).toBe(true);
+  });
+
+  it('steps to the unhydrated workspace: navigates, hydrates, and focuses no agent', () => {
+    const state = makeState({
+      workspaces: ['ws-1', 'ws-2'],
+      agentsByWorkspace: { 'ws-1': { ids: ['a-1'], activeAgentId: 'a-1' } },
+      unreadWorkspaceIds: ['ws-2'],
+    });
+    const { context, dispatch, navigate, focusComposer } = makeContext(state);
+    getActionKeyDefinition('cycle-unread-agents').execute(context);
+    expect(navigate).toHaveBeenCalledWith('/workspace/ws-2');
+    expect(hydrateDispatches(dispatch)).toEqual([['ws-2']]);
+    expect(activeAgentDispatches(dispatch)).toEqual([]);
+    expect(focusComposer).not.toHaveBeenCalled();
+  });
+
+  it('walks hydrated and unhydrated unread workspaces alternately without sticking', () => {
+    const state = makeState({
+      workspaces: ['ws-1', 'ws-2'],
+      agentsByWorkspace: { 'ws-1': { ids: ['a-1'], activeAgentId: null } },
+      unreadWorkspaceIds: ['ws-1', 'ws-2'],
+    });
+    const { context, dispatch, navigate } = makeContext(state);
+    const definition = getActionKeyDefinition('cycle-unread-agents');
+    definition.execute(context);
+    definition.execute(context);
+    definition.execute(context);
+    expect(activeAgentDispatches(dispatch)).toEqual([
+      ['ws-1', 'a-1'],
+      ['ws-1', 'a-1'],
+    ]);
+    expect(hydrateDispatches(dispatch)).toEqual([['ws-2']]);
+    expect(navigate.mock.calls).toEqual([['/workspace/ws-2']]);
+  });
+
+  it('counts an unhydrated unread workspace as one remaining stop in the HUD', () => {
+    const state = makeState({
+      workspaces: ['ws-1', 'ws-2'],
+      agentsByWorkspace: { 'ws-1': { ids: ['a-1'], activeAgentId: null } },
+      unreadWorkspaceIds: ['ws-1', 'ws-2'],
+    });
+    const { context, dispatch } = makeContext(state);
+    getActionKeyDefinition('cycle-unread-agents').execute(context);
+    const hud = dispatch.mock.calls
+      .map(([action]) => action as { type: string; payload: unknown })
+      .filter((action) => action.type === 'hardwareConsole/actionHudShown')
+      .map((action) => action.payload);
+    expect(hud).toEqual([
+      [m.hardwareConsole_actionKey_cycleUnreadAgents_hudRemaining_one({ count: 1 })],
+    ]);
+  });
+
+  it('shows the single-candidate hint when the only stop is the active agent-less workspace', () => {
+    const state = makeState({
+      currentWorkspaceId: 'ws-2',
+      workspaces: ['ws-1', 'ws-2'],
+      agentsByWorkspace: { 'ws-1': { ids: ['a-1'], activeAgentId: null } },
+      unreadWorkspaceIds: ['ws-2'],
+    });
+    const { context, dispatch, navigate, showHint } = makeContext(state);
+    getActionKeyDefinition('cycle-unread-agents').execute(context);
+    expect(showHint).toHaveBeenCalledWith(
+      m.hardwareConsole_actionKey_noOtherUnreadAgents_message(),
+    );
+    expect(navigate).not.toHaveBeenCalled();
+    // Still re-requests hydration so the press converges the session cache
+    // even if the route-mount hydration failed.
+    expect(hydrateDispatches(dispatch)).toEqual([['ws-2']]);
+  });
+
+  it('resumes the walk when a workspace-level cursor hydrates before the next press', () => {
+    const before = makeState({
+      workspaces: ['ws-1', 'ws-2', 'ws-3'],
+      agentsByWorkspace: {
+        'ws-1': { ids: ['a-1'], activeAgentId: null },
+        'ws-3': { ids: ['c-1'], activeAgentId: null },
+      },
+      unreadWorkspaceIds: ['ws-1', 'ws-2', 'ws-3'],
+    });
+    const definition = getActionKeyDefinition('cycle-unread-agents');
+    const first = makeContext(before);
+    definition.execute(first.context); // -> ws-1/a-1
+    definition.execute(first.context); // -> ws-2 workspace-level stop
+    expect(activeAgentDispatches(first.dispatch)).toEqual([['ws-1', 'a-1']]);
+    expect(hydrateDispatches(first.dispatch)).toEqual([['ws-2']]);
+
+    // ws-2 hydrates before the next press while still unread: its stop now
+    // keys by agent id, so the stored workspace-level cursor resumes from
+    // that workspace's stop instead of restarting the walk at ws-1.
+    const after = makeState({
+      workspaces: ['ws-1', 'ws-2', 'ws-3'],
+      agentsByWorkspace: {
+        'ws-1': { ids: ['a-1'], activeAgentId: null },
+        'ws-2': { ids: ['b-1'], activeAgentId: null },
+        'ws-3': { ids: ['c-1'], activeAgentId: null },
+      },
+      unreadWorkspaceIds: ['ws-1', 'ws-2', 'ws-3'],
+    });
+    const second = makeContext(after);
+    definition.execute(second.context);
+    expect(activeAgentDispatches(second.dispatch)).toEqual([['ws-3', 'c-1']]);
   });
 });
 
@@ -794,7 +1113,7 @@ describe('round-robin across presses', () => {
 
   it('cycle-workspace-agents works without an active workspace (global)', () => {
     const state = makeState({
-      activeWorkspaceId: null,
+      currentWorkspaceId: null,
       workspaces: ['ws-1'],
       agentsByWorkspace: { 'ws-1': { ids: ['a-1'] } },
     });
@@ -966,23 +1285,109 @@ describe('execute dispatch', () => {
     );
   });
 
-  it('new-workspace opens the create-workspace modal', () => {
-    const { context, dispatch } = makeContext(makeState({ activeWorkspaceId: null }));
+  it('new-workspace opens the create-workspace modal when it is closed', () => {
+    const state = makeState({ currentWorkspaceId: null });
+    const { context, dispatch } = makeContext(state);
+    expect(getActionKeyDefinition('new-workspace').isAvailable(context)).toBe(true);
     getActionKeyDefinition('new-workspace').execute(context);
     expect(dispatch).toHaveBeenCalledWith(
       expect.objectContaining({ type: 'sidebarNav/setShowCreateModal', payload: [true] }),
     );
   });
 
-  it('switch-window-layouts cycles through the layout presets per workspace', () => {
-    const { context, dispatch } = makeContext(makeState());
+  it('new-workspace closes the create-workspace modal when it is already open', () => {
+    const state = makeState({ currentWorkspaceId: null, showCreateModal: true });
+    const { context, dispatch } = makeContext(state);
+    expect(getActionKeyDefinition('new-workspace').isAvailable(context)).toBe(true);
+    getActionKeyDefinition('new-workspace').execute(context);
+    expect(dispatch).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'sidebarNav/setShowCreateModal', payload: [false] }),
+    );
+  });
+
+  it('switch-window-layouts cycles through the content presets per workspace', async () => {
+    const applyContentPresetMock = applyContentPreset as ReturnType<typeof vi.fn>;
+    applyContentPresetMock.mockClear();
+    const { context } = makeContext(makeState({ agentsByWorkspace: { 'ws-1': { ids: ['a-1'] } } }));
     getActionKeyDefinition('switch-window-layouts').execute(context);
+    await vi.waitFor(() => {
+      expect(applyContentPresetMock).toHaveBeenCalledTimes(1);
+    });
     getActionKeyDefinition('switch-window-layouts').execute(context);
-    const presets = dispatch.mock.calls
-      .map(([action]) => action as { type: string; payload: { preset?: string } })
-      .filter((action) => action.type === 'panelLayout/applyPreset')
-      .map((action) => action.payload.preset);
-    expect(presets).toEqual(['single', 'split-horizontal']);
+    await vi.waitFor(() => {
+      expect(applyContentPresetMock).toHaveBeenCalledTimes(2);
+    });
+    const presets = applyContentPresetMock.mock.calls.map(([presetId]) => presetId);
+    expect(presets).toEqual(['planning', 'agents-row']);
+    expect(applyContentPresetMock.mock.calls[0][1]).toEqual(
+      expect.objectContaining({ workspaceId: 'ws-1' }),
+    );
+    expect(applyContentPresetMock.mock.calls[0][2]).toEqual(
+      expect.objectContaining({ workspaceId: 'ws-1' }),
+    );
+  });
+
+  it('switch-window-layouts walks all four presets when the workspace has agents', async () => {
+    const applyContentPresetMock = applyContentPreset as ReturnType<typeof vi.fn>;
+    applyContentPresetMock.mockClear();
+    const { context } = makeContext(makeState({ agentsByWorkspace: { 'ws-1': { ids: ['a-1'] } } }));
+    for (let press = 1; press <= 5; press++) {
+      getActionKeyDefinition('switch-window-layouts').execute(context);
+      await vi.waitFor(() => {
+        expect(applyContentPresetMock).toHaveBeenCalledTimes(press);
+      });
+    }
+    expect(applyContentPresetMock.mock.calls.map(([presetId]) => presetId)).toEqual([
+      'planning',
+      'agents-row',
+      'changes',
+      'review',
+      'planning',
+    ]);
+  });
+
+  it('switch-window-layouts skips agents-row when the workspace has no agents', async () => {
+    const applyContentPresetMock = applyContentPreset as ReturnType<typeof vi.fn>;
+    applyContentPresetMock.mockClear();
+    const { context, showHint } = makeContext(makeState());
+    for (let press = 1; press <= 4; press++) {
+      getActionKeyDefinition('switch-window-layouts').execute(context);
+      await vi.waitFor(() => {
+        expect(applyContentPresetMock).toHaveBeenCalledTimes(press);
+      });
+    }
+    // No dead press: the cycle is planning → changes → review → planning.
+    expect(applyContentPresetMock.mock.calls.map(([presetId]) => presetId)).toEqual([
+      'planning',
+      'changes',
+      'review',
+      'planning',
+    ]);
+    expect(showHint).not.toHaveBeenCalled();
+  });
+
+  it('switch-window-layouts hints when the preset resolves false (race fallback)', async () => {
+    const applyContentPresetMock = applyContentPreset as ReturnType<typeof vi.fn>;
+    applyContentPresetMock.mockClear();
+    applyContentPresetMock.mockResolvedValueOnce(false);
+    const { context, showHint } = makeContext(makeState());
+    getActionKeyDefinition('switch-window-layouts').execute(context);
+    await vi.waitFor(() => {
+      expect(showHint).toHaveBeenCalledExactlyOnceWith(
+        m.hardwareConsole_actionKey_switchWindowLayouts_notApplicable_hint(),
+      );
+    });
+  });
+
+  it('switch-window-layouts catches and logs a rejected preset application', async () => {
+    const applyContentPresetMock = applyContentPreset as ReturnType<typeof vi.fn>;
+    applyContentPresetMock.mockClear();
+    applyContentPresetMock.mockRejectedValueOnce(new Error('boom'));
+    const { context } = makeContext(makeState());
+    expect(() => getActionKeyDefinition('switch-window-layouts').execute(context)).not.toThrow();
+    await vi.waitFor(() => {
+      expect(applyContentPresetMock).toHaveBeenCalledTimes(1);
+    });
   });
 
   it('none executes as a no-op', () => {

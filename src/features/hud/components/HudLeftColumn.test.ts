@@ -5,20 +5,37 @@
  * the ATTENTION bucket > 0, FAILED blinks red when the FAILED bucket > 0.
  * No blink at zero, and a failed fleet never pulses ATTENTION.
  */
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { cleanup, render, screen } from '@testing-library/svelte';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { cleanup, render, screen, waitFor } from '@testing-library/svelte';
 import { flushSync } from 'svelte';
 
 import { store as appStore } from '$store/renderer/store';
-import { setWorkspaceEntity } from '$store/renderer/slices/workspace/workspace-slice';
+import {
+  resetWorkspaceState,
+  setWorkspaceEntity,
+} from '$store/renderer/slices/workspace/workspace-slice';
 import { hudActivated } from '$store/renderer/slices/hud/hud-slice';
 import { bulkUpsertSessions } from '$store/renderer/slices/agent-session/agent-session-slice';
+import { workspaceDeleted } from '$store/renderer/slices/workspace-lifecycle/workspace-lifecycle-slice';
 import type { AgentSession, Workspace, WorkspaceId } from '$shared/types';
 import { WorkspaceStatus } from '$shared/types';
 
 import HudLeftColumn from './HudLeftColumn.svelte';
 
 const NOW_MS = Date.parse('2026-07-30T12:00:00Z');
+
+beforeAll(() => appStore.init());
+afterAll(() => appStore.dispose());
+
+beforeEach(() => {
+  appStore.dispatch(resetWorkspaceState());
+  for (const [workspaceId, agentIds] of Object.entries(appStore.state.agentSessions.agentIdsByWorkspace)) {
+    appStore.dispatch(workspaceDeleted(workspaceId, agentIds));
+  }
+  appStore.dispatch(hudActivated());
+});
+
+afterEach(cleanup);
 
 interface SummaryAgent {
   id: string;
@@ -78,15 +95,6 @@ function blinks(row: HTMLElement): boolean {
 }
 
 describe('HudLeftColumn WORKSPACES-BY-STATE blink gating', () => {
-  beforeEach(() => {
-    appStore.init();
-    appStore.dispatch(hudActivated());
-  });
-  afterEach(() => {
-    cleanup();
-    appStore.dispose();
-  });
-
   it('blinks neither row at zero counts (no attention, no failures)', () => {
     render(HudLeftColumn, { props: { nowMs: NOW_MS } });
 
@@ -99,7 +107,7 @@ describe('HudLeftColumn WORKSPACES-BY-STATE blink gating', () => {
     expect(blinks(failedRow())).toBe(false);
   });
 
-  it('blinks only ATTENTION for an attention-only fleet (FAILED stays static)', () => {
+  it('blinks only ATTENTION for an attention-only fleet (FAILED stays static)', async () => {
     render(HudLeftColumn, { props: { nowMs: NOW_MS } });
 
     appStore.dispatch(
@@ -108,23 +116,23 @@ describe('HudLeftColumn WORKSPACES-BY-STATE blink gating', () => {
       ),
     );
     trackSession('a-0', { attentionRequestKind: 'discussion' });
-    flushSync();
-
-    expect(blinks(attnRow())).toBe(true);
+    await waitFor(() => {
+      flushSync();
+      expect(blinks(attnRow())).toBe(true);
+    });
     expect(blinks(failedRow())).toBe(false);
   });
 
-  it('blinks only FAILED for a failed-only fleet (ATTENTION stays static)', () => {
+  it('blinks only FAILED for a failed-only fleet (ATTENTION stays static)', async () => {
     render(HudLeftColumn, { props: { nowMs: NOW_MS } });
 
     appStore.dispatch(
-      setWorkspaceEntity(
-        workspaceWithAgents('ws-1', [{ id: 'a-0', status: 'error' }], 'failed'),
-      ),
+      setWorkspaceEntity(workspaceWithAgents('ws-1', [{ id: 'a-0', status: 'error' }], 'failed')),
     );
-    flushSync();
-
-    expect(blinks(failedRow())).toBe(true);
+    await waitFor(() => {
+      flushSync();
+      expect(blinks(failedRow())).toBe(true);
+    });
     expect(blinks(attnRow())).toBe(false);
   });
 
@@ -146,16 +154,47 @@ describe('HudLeftColumn WORKSPACES-BY-STATE blink gating', () => {
   });
 });
 
-describe('HudLeftColumn AGENTS-BY-STATE rows', () => {
-  beforeEach(() => {
-    appStore.init();
-    appStore.dispatch(hudActivated());
-  });
-  afterEach(() => {
-    cleanup();
-    appStore.dispose();
+describe('HudLeftColumn WORKSPACES-BY-STATE waiting row', () => {
+  function waitingRow(): HTMLElement {
+    return screen.getByTestId('hud-workspace-bar-waiting');
+  }
+
+  it('renders the orthogonal WAITING row and counts flagged workspaces (no blink)', async () => {
+    render(HudLeftColumn, { props: { nowMs: NOW_MS } });
+
+    appStore.dispatch(
+      setWorkspaceEntity({
+        ...workspaceWithAgents('ws-1', [{ id: 'a-0', status: 'active' }]),
+        waiting: true,
+      }),
+    );
+    appStore.dispatch(
+      setWorkspaceEntity(workspaceWithAgents('ws-2', [{ id: 'b-0', status: 'active' }])),
+    );
+    await waitFor(() => {
+      flushSync();
+      expect(waitingRow().textContent).toContain('1');
+    });
+
+    const row = waitingRow();
+    expect(row.textContent).toContain('WAITING');
+    // Waiting is informational, never a call to action — no blink at any count.
+    expect(blinks(row)).toBe(false);
   });
 
+  it('shows zero when no workspace carries the flag', () => {
+    render(HudLeftColumn, { props: { nowMs: NOW_MS } });
+
+    appStore.dispatch(
+      setWorkspaceEntity(workspaceWithAgents('ws-1', [{ id: 'a-0', status: 'active' }])),
+    );
+    flushSync();
+
+    expect(waitingRow().textContent).toContain('0');
+  });
+});
+
+describe('HudLeftColumn AGENTS-BY-STATE rows', () => {
   it('renders only the RUNNING / FAILED / IDLE bars (no NEEDS ATTENTION or DONE)', () => {
     render(HudLeftColumn, { props: { nowMs: NOW_MS } });
 

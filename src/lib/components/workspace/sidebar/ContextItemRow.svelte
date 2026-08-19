@@ -6,18 +6,20 @@
    * Supports nested display for items under notes.
    */
   import type { ContextItem } from '$features/context/types';
-  import ProviderIcon from '$lib/components/icons/ProviderIcon.svelte';
+  import ProviderIcon from '$features/context/components/ContextProviderIcon.svelte';
   import Fa from 'svelte-fa';
   import {
-  faExternalLink,
-  faChevronRight,
-  faTrash,
-  faArrowUpRightFromSquare,
-} from '@fortawesome/free-solid-svg-icons';
+    faExternalLink,
+    faChevronRight,
+    faTrash,
+    faArrowUpRightFromSquare,
+  } from '@fortawesome/free-solid-svg-icons';
   import { Tooltip } from '$lib/components/ui/tooltip';
   import SidebarContextMenu from '$lib/components/ui/sidebar-context-menu/SidebarContextMenu.svelte';
   import type { SidebarMenuEntry } from '$lib/components/ui/sidebar-context-menu/types';
   import { m } from '$shared/paraglide/messages.js';
+  import OpenPanelIndicator from './OpenPanelIndicator.svelte';
+  import ResourceIconTile from '$lib/components/shared/ResourceIconTile.svelte';
 
   interface Props {
     item: ContextItem;
@@ -27,6 +29,7 @@
     onClick?: (item: ContextItem) => void;
     onExternalOpen?: (item: ContextItem) => void;
     onDelete?: (item: ContextItem) => void;
+    openPanelCount?: number;
   }
 
   let {
@@ -37,6 +40,7 @@
     onClick,
     onExternalOpen,
     onDelete,
+    openPanelCount = 0,
   }: Props = $props();
 
   // Display text based on item type
@@ -78,7 +82,6 @@
     e.preventDefault();
     onExternalOpen?.(item);
   }
-
 
   // Can delete non-note items
   const canDelete = $derived(item.type !== 'note');
@@ -154,22 +157,25 @@
   oncontextmenu={handleContextMenu}
   role="button"
   tabindex="0"
+  aria-current={isActive ? 'page' : undefined}
 >
   <!-- Provider Icon -->
-  <div class="w-5 h-5 rounded flex items-center justify-center shrink-0">
-    <ProviderIcon
-      provider={item.provider}
-      size={12}
-      class={isSelected ? 'text-primary' : isActive ? 'text-foreground' : 'opacity-70'}
-    />
-  </div>
+  {#if item.type === 'note'}
+    <ResourceIconTile kind="note" />
+  {:else}
+    <div class="w-5 h-5 rounded flex items-center justify-center shrink-0">
+      <ProviderIcon
+        provider={item.provider}
+        size={12}
+        class={isSelected ? 'text-primary' : isActive ? 'text-foreground' : 'opacity-70'}
+      />
+    </div>
+  {/if}
 
   <!-- Content -->
   <div class="flex-1 flex items-baseline gap-1.5 min-w-0">
     <div class="w-full min-w-0 flex items-center gap-1.5">
-      <span class="text-ui truncate {isSelected ? 'text-primary' : ''}"
-        >{displayTitle()}</span
-      >
+      <span class="text-ui truncate {isSelected ? 'text-primary' : ''}">{displayTitle()}</span>
       {#if item.type === 'note' && item.isSpec}
         <span class="text-xs px-1 py-0.5 rounded bg-primary/10 text-primary font-medium"
           >{m.workspace_contextItem_spec_label()}</span
@@ -180,6 +186,8 @@
       <div class="text-xs text-subtle truncate">{subtitle()}</div>
     {/if}
   </div>
+
+  <OpenPanelIndicator count={openPanelCount} active={isActive} />
 
   <!-- Action buttons -->
   <div
@@ -203,7 +211,7 @@
           class="p-1 rounded hover:bg-destructive/10 transition-colors cursor-pointer"
           onclick={handleDeleteClick}
         >
-          <Fa icon={faTrash} size="xs" class="text-ghost hover:text-destructive-foreground" />
+          <Fa icon={faTrash} size="xs" class="text-ghost hover:text-error-foreground" />
         </button>
       </Tooltip>
     {/if} -->

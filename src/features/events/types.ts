@@ -60,6 +60,27 @@ export interface CanonicalAgentStatusFields {
    * the wire) and on older daemons.
    */
   sessionCorrupted?: boolean;
+  /**
+   * Idle-visibility for hook-owning agents (PROTOCOL §3.1, within v3.1,
+   * additive): light metadata for the agent's ACTIVE (`scheduled`/`running`)
+   * background hooks (§5.40) — omitted when empty (absent, never `[]`) — so
+   * a parent or client can tell a hook-waiting idle agent from a stalled
+   * one. Rendered verbatim.
+   */
+  waitingOnHooks?: Array<{ hookId: string; name: string; nextRunAt?: string; expiresAt?: string }>;
+  /**
+   * Idle-visibility for PR-monitor-owning agents — the `waitingOnHooks`
+   * companion for centralized PR monitoring (§5.42): light metadata for the
+   * agent's active PR monitors, omitted when empty (absent, never `[]`), so
+   * a parent or client can tell a PR-monitor-waiting idle agent from a
+   * stalled one. Rendered verbatim.
+   */
+  waitingOnPrMonitors?: Array<{
+    monitorId: string;
+    repo: string;
+    prNumber: number;
+    title?: string;
+  }>;
 }
 
 // ============================================================================
@@ -149,6 +170,10 @@ export const WorkspaceEventType = {
   // Terminal events
   TerminalCommand: 'terminal:command',
 
+  // Script events (PROTOCOL §6.5)
+  ScriptState: 'script:state',
+  ScriptOutput: 'script:output',
+
   // Test events
   TestStarted: 'test:started',
   TestCompleted: 'test:completed',
@@ -164,6 +189,7 @@ export const WorkspaceEventType = {
   Opened: 'workspace:opened',
   Closed: 'workspace:closed',
   Activity: 'workspace:activity',
+  DisplayStatusChanged: 'workspace:displayStatus-changed',
 
   // Spec events
   SpecUpdated: 'spec:updated',
@@ -478,6 +504,8 @@ export interface AgentIdleEvent extends WorkspaceEventBase {
     specialist?: string;
     /** Whether this is a background agent (not user-facing) */
     isBackground?: boolean;
+    /** Whether the agent's workspace is archived; additive — absent on older daemons (treat absent as not archived) */
+    workspaceArchived?: boolean;
     /** Whether the agent is awaiting delegated sub-agents (pending completion watches); absent on older daemons */
     isWaitingForOtherAgents?: boolean;
     /** Explicit completion report set by the agent via report_to_parent tool */
@@ -765,9 +793,18 @@ export interface AgentQueueStaleMessageEvent extends WorkspaceEventBase {
 }
 
 /**
- * Emitted when an agent spawn is queued waiting for a free process slot
- * (all slots active). Self-sufficient payload carries `{ agentId, used, cap }`
- * so clients can render the cap-saturation state without polling.
+ * Machine-readable admission constraint stamped on `agent:process:*` events
+ * (intent-hq/intentd#1196): `"slots"` — the concurrency slot cap;
+ * `"memory-budget"` — the aggregate memory budget (`agents.memoryBudgetMb`).
+ * Absent on older daemons (treated as `"slots"`).
+ */
+export type AgentProcessEventReason = 'slots' | 'memory-budget';
+
+/**
+ * Emitted when an agent spawn is queued waiting for admission — a free
+ * process slot (all slots active) or memory headroom, named by `reason`.
+ * Self-sufficient payload carries `{ agentId, used, cap, reason }` so
+ * clients can render the cap-saturation state without polling.
  */
 export interface AgentProcessQueuedEvent extends WorkspaceEventBase {
   type: 'agent:process:queued';
@@ -775,12 +812,14 @@ export interface AgentProcessQueuedEvent extends WorkspaceEventBase {
     agentId: string;
     used: number;
     cap: number;
+    reason?: AgentProcessEventReason;
   };
 }
 
 /**
- * Emitted when a queued agent spawn resumes (a slot freed).
- * Self-sufficient payload carries `{ agentId, used, cap }`.
+ * Emitted when a queued agent spawn resumes (a slot freed / memory freed).
+ * Self-sufficient payload carries `{ agentId, used, cap, reason }`; `reason`
+ * echoes the constraint the spawn originally queued under.
  */
 export interface AgentProcessResumedEvent extends WorkspaceEventBase {
   type: 'agent:process:resumed';
@@ -788,12 +827,13 @@ export interface AgentProcessResumedEvent extends WorkspaceEventBase {
     agentId: string;
     used: number;
     cap: number;
+    reason?: AgentProcessEventReason;
   };
 }
 
 /**
  * Emitted when the process registry evicts the LRU idle process.
- * Self-sufficient payload carries `{ agentId, used, cap }`.
+ * Self-sufficient payload carries `{ agentId, used, cap, reason }`.
  * No UI rendering required per task scope.
  */
 export interface AgentProcessEvictedEvent extends WorkspaceEventBase {
@@ -802,6 +842,7 @@ export interface AgentProcessEvictedEvent extends WorkspaceEventBase {
     agentId: string;
     used: number;
     cap: number;
+    reason?: AgentProcessEventReason;
   };
 }
 
@@ -882,6 +923,8 @@ export interface AgentUserMessageSentEvent extends WorkspaceEventBase {
     appMessageId?: string;
     content: string;
     imageBlocks?: any[];
+    /** Attachment-reference file blocks attached to the message (PROTOCOL §5.9). */
+    fileBlocks?: any[];
   };
 }
 
@@ -1405,6 +1448,8 @@ export interface AgentIdlePayload extends CanonicalAgentStatusFields {
   lastResponseSummary?: string;
   taskNoteId?: string;
   isBackground?: boolean;
+  /** Whether the agent's workspace is archived; additive — absent on older daemons (treat absent as not archived) */
+  workspaceArchived?: boolean;
   isWaitingForOtherAgents?: boolean;
   completionReport?: string;
   parentAgentId?: string;
@@ -1665,15 +1710,7 @@ export type DomainEvent =
   | 'git:op-started'
   | 'git:op-progress'
   | 'git:op-completed'
-  | 'git:op-failed'
-  // Log events
-  | 'log:events-updated'
-  // Script events
-  | 'script:started'
-  | 'script:stopped'
-  | 'script:output'
-  | 'script:error'
-  | 'script:url-detected';
+  | 'git:op-failed';
 
 /**
  * Domain event data payloads
@@ -1864,40 +1901,5 @@ export interface DomainEventPayloads {
     operationType: 'commit' | 'push' | 'create-pr' | 'auto-commit';
     error: string;
     metadata?: { message?: string; prTitle?: string; agentId?: string; agentName?: string };
-  };
-
-  'log:events-updated': { workspaceId: WorkspaceId; events: any };
-
-  'script:started': {
-    workspaceId: WorkspaceId;
-    scriptId: string;
-    scriptName: string;
-    pid?: number;
-    startedAt?: string;
-  };
-  'script:stopped': {
-    workspaceId: WorkspaceId;
-    scriptId: string;
-    scriptName: string;
-    exitCode?: number | null;
-    signal?: string | null;
-    stoppedAt?: string;
-  };
-  'script:output': {
-    workspaceId: WorkspaceId;
-    scriptId: string;
-    lines: Array<{ text: string; stream: 'stdout' | 'stderr'; timestamp: string }>;
-  };
-  'script:error': {
-    workspaceId: WorkspaceId;
-    scriptId: string;
-    scriptName: string;
-    error: string;
-  };
-  'script:url-detected': {
-    workspaceId: WorkspaceId;
-    scriptId: string;
-    scriptName: string;
-    url: string;
   };
 }

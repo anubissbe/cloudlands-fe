@@ -11,11 +11,11 @@
   import { Button } from '$lib/components/ui/button';
   import { selectEffectiveFileExplorerWorkspacePath } from '$store/renderer/slices/file-explorer/file-explorer-selectors';
   import {
-  faXmark,
-  faFileAlt,
-  faExclamationCircle,
-  faSpinner,
-} from '@fortawesome/free-solid-svg-icons';
+    faXmark,
+    faFileAlt,
+    faExclamationCircle,
+    faSpinner,
+  } from '@fortawesome/free-solid-svg-icons';
   import { createLogger } from '$lib/utils/client-logger';
   import { m } from '$shared/paraglide/messages.js';
 
@@ -28,6 +28,7 @@
 
   let { workspaceId = '', initialFile }: Props = $props();
 
+  // svelte-ignore state_referenced_locally - intentional initial capture; the $effect below syncs later changes
   const workspaceIdStore = writable(workspaceId);
   const fileExplorerWorkspacePath = selectEffectiveFileExplorerWorkspacePath(workspaceIdStore);
 
@@ -37,6 +38,7 @@
 
   // State for open files
   let openFiles = $state<Map<string, { content: string; modified: boolean }>>(new Map());
+  // svelte-ignore state_referenced_locally - intentional: prop seeds the initial selection; user selection owns it afterwards
   let selectedFile: string = $state(initialFile || '');
   let currentFileContent: string = $state('');
   let isLoading = $state(false);
@@ -60,7 +62,7 @@
     error = null;
 
     try {
-      const result = (await invoke('file:open', { path: filePath })) as any;
+      const result = (await invoke('file:open', { path: filePath, workspaceId })) as any;
       if (result?.success) {
         const fileData = { content: result.content, modified: false };
         openFiles.set(filePath, fileData);
@@ -82,7 +84,11 @@
     if (!fileData || !fileData.modified) return;
 
     try {
-      const result = (await invoke('file:save', { filePath, content: fileData.content })) as any;
+      const result = (await invoke('file:save', {
+        filePath,
+        content: fileData.content,
+        workspaceId,
+      })) as any;
       if (result?.success) {
         fileData.modified = false;
         openFiles.set(filePath, fileData);
@@ -212,11 +218,7 @@
 </script>
 
 <Sidebar.Provider>
-  <FileExplorerSidebar
-    {workspaceId}
-    onFileSelect={handleFileSelect}
-    bind:selectedFile
-  />
+  <FileExplorerSidebar {workspaceId} onFileSelect={handleFileSelect} bind:selectedFile />
 
   <Sidebar.Inset>
     <!-- Header with breadcrumb and tabs -->
@@ -279,7 +281,7 @@
       {#if error}
         <div class="flex items-center justify-center h-full">
           <div class="flex flex-col items-center gap-4 text-center">
-            <Fa icon={faExclamationCircle} size="2x" class="w-12 h-12 text-destructive-foreground" />
+            <Fa icon={faExclamationCircle} size="2x" class="w-12 h-12 text-error-foreground" />
             <p class="text-sm text-subtle">{error}</p>
           </div>
         </div>

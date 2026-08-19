@@ -20,7 +20,7 @@ import {
   getAgentStopReasonTimestamp,
 } from '$shared/utils/agent-attention';
 import { derivePendingQuestions } from '$lib/components/chat/questions/pending-questions';
-import { getItems, type Collection } from '$lib/store-shim/utils/collections/collection-utils';
+import { getItems, type Collection } from '@augmentcode/themis/utils/collections/collection-utils';
 import type { StoredAgentSession } from '$store/renderer/slices/agent-session/agent-session-types';
 import { isKeyAssignableWorkspace } from '../assignment/key-assignment';
 import type { CycleScope } from './cycle-scope';
@@ -37,10 +37,34 @@ export interface AgentCycleState {
   agentSessions: { byAgentId: Record<string, StoredAgentSession> };
 }
 
-/** One cyclable agent: its workspace plus its id. */
-export interface CycleAgentEntry {
+/**
+ * One cycle stop: a workspace plus, usually, a specific agent. A `null`
+ * agentId is a workspace-level stop — an unread workspace with no hydrated
+ * agent sessions (unread is BE-owned on the workspace entity, so it must
+ * yield a stop regardless of the local session cache,
+ * intent-hq/monorepo#2438). Stepping to it navigates to the workspace
+ * without focusing a specific agent.
+ */
+export interface CycleStopEntry {
   wsId: string;
+  agentId: string | null;
+}
+
+/** One cyclable agent: its workspace plus its id. */
+export interface CycleAgentEntry extends CycleStopEntry {
   agentId: string;
+}
+
+/** Key prefix marking a workspace-level stop in `cycleStopKey` values. */
+export const WORKSPACE_STOP_KEY_PREFIX = 'workspace:';
+
+/**
+ * Stable cursor/dedup key for a stop. Agent stops key by agent id;
+ * workspace-level stops key by a `workspace:`-prefixed workspace id, which
+ * cannot collide with an agent id.
+ */
+export function cycleStopKey(entry: CycleStopEntry): string {
+  return entry.agentId ?? `${WORKSPACE_STOP_KEY_PREFIX}${entry.wsId}`;
 }
 
 /** Local mirror of the "agent turn active" gate (no selector imports). */
@@ -97,13 +121,31 @@ function hasPendingQuestion(session: StoredAgentSession): boolean {
   return !(typeof dismissedId === 'string' && dismissedId === pending.messageId);
 }
 
+/** Attention priority buckets, highest urgency first. */
+export type SessionAttentionPriority = 'blocker' | 'question' | 'discussion';
+
+/**
+ * Classify a session's attention priority: a pending blocker report beats a
+ * pending wizard question beats a pending discussion request; `null` when
+ * the session needs no attention. Consistent with `sessionNeedsAttention` —
+ * a session needs attention iff its priority is non-null.
+ */
+export function sessionAttentionPriority(
+  session: StoredAgentSession | undefined,
+): SessionAttentionPriority | null {
+  if (!session || session.status === AgentStatus.Deleted) return null;
+  const kind = getAgentAttentionRequest(session)?.kind ?? null;
+  if (kind === 'blocker') return 'blocker';
+  if (hasPendingQuestion(session)) return 'question';
+  return kind === 'discussion' ? 'discussion' : null;
+}
+
 /**
  * Attention = pending attention request (discussion/blocker) or pending
  * wizard question — the LED engine's attention definition (led/snapshot.ts).
  */
 export function sessionNeedsAttention(session: StoredAgentSession | undefined): boolean {
-  if (!session || session.status === AgentStatus.Deleted) return false;
-  return getAgentAttentionRequest(session) !== null || hasPendingQuestion(session);
+  return sessionAttentionPriority(session) !== null;
 }
 
 /** Failed = error status — the LED engine's failed definition. */
@@ -148,6 +190,27 @@ export function compareLastIdleDesc(a: StoredAgentSession, b: StoredAgentSession
 }
 
 /**
+ * Reduce a walk to one entry per workspace: the entry whose session was most
+ * recently active (`getLastIdleTime`). Ties — including the no-recency-signal
+ * case where every time is 0 — keep the earliest entry, so the deterministic
+ * fallback is that workspace's first entry in walk order (the first
+ * foreground agent for a top-level walk). Workspaces keep the order of their
+ * first occurrence in `entries`.
+ */
+export function pickLastActivePerWorkspace(
+  state: Pick<AgentCycleState, 'agentSessions'>,
+  entries: readonly CycleAgentEntry[],
+): CycleAgentEntry[] {
+  const bestByWsId = new Map<string, { entry: CycleAgentEntry; time: number }>();
+  for (const entry of entries) {
+    const time = getLastIdleTime(state.agentSessions.byAgentId[entry.agentId]);
+    const best = bestByWsId.get(entry.wsId);
+    if (!best || time > best.time) bestByWsId.set(entry.wsId, { entry, time });
+  }
+  return [...bestByWsId.values()].map((item) => item.entry);
+}
+
+/**
  * Collect matching agents across all key-assignable workspaces (the chief
  * virtual workspace and archived/deleted workspaces are skipped), in
  * workspace order. Scope picks the walked list per workspace: `top-level`
@@ -177,4 +240,29 @@ export function collectCycleAgents(
   }
   if (compare) entries.sort((a, b) => compare(a.session, b.session));
   return entries.map((item) => item.entry);
+}
+
+/**
+ * One stop per unread key-assignable workspace, in workspace order (unread
+ * is workspace-level, BE-owned `workspace.attention`). When the workspace
+ * has hydrated cyclable top-level sessions, the stop is its last active
+ * agent (`getLastIdleTime` recency, falling back to the first foreground
+ * agent — intent-hq/monorepo#1779). When none are hydrated yet (sessions
+ * hydrate lazily), the stop is workspace-level (`agentId: null`) so the
+ * walk never misses an unread workspace (intent-hq/monorepo#2438).
+ */
+export function collectUnreadWorkspaceStops(state: AgentCycleState): CycleStopEntry[] {
+  const unreadWorkspaceIds: string[] = getItems(state.workspace.workspaces)
+    .filter((workspace) => workspace.attention === 'unread' && isKeyAssignableWorkspace(workspace))
+    .map((workspace) => workspace.id);
+  const unreadIdSet = new Set(unreadWorkspaceIds);
+  const hydratedByWsId = new Map(
+    pickLastActivePerWorkspace(
+      state,
+      collectCycleAgents(state, isSessionCyclable).filter((entry) => unreadIdSet.has(entry.wsId)),
+    ).map((entry) => [entry.wsId, entry] as const),
+  );
+  return unreadWorkspaceIds.map(
+    (wsId) => hydratedByWsId.get(wsId) ?? ({ wsId, agentId: null } satisfies CycleStopEntry),
+  );
 }

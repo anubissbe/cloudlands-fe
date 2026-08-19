@@ -8,32 +8,35 @@
   import { Skeleton } from '$lib/components/ui/skeleton';
   import { Badge } from '$lib/components/ui/badge';
 
-  import { selectActiveWorkspace } from '$store/renderer/slices/workspace/workspace-selectors';
+  import { selectWorkspaceById } from '$store/renderer/slices/workspace/workspace-selectors';
   import { updateWorkspaceEntity } from '$store/renderer/slices/workspace/workspace-slice';
 
   import {
-  faCodePullRequest,
-  faExclamationCircle,
-  faCircleCheck,
-  faMagic,
-  faPaperPlane,
-  faSpinner,
-  faCodeBranch,
-  faXmark,
-} from '@fortawesome/free-solid-svg-icons';
+    faCodePullRequest,
+    faExclamationCircle,
+    faCircleCheck,
+    faMagic,
+    faPaperPlane,
+    faSpinner,
+    faCodeBranch,
+    faXmark,
+  } from '@fortawesome/free-solid-svg-icons';
   import Fa from 'svelte-fa';
   import { PullRequestStatus, type PullRequestInfo } from '$shared/types';
   import { WorkspaceId } from '$shared/types/branded-ids';
   import { store as appStore } from '$store/renderer/store';
   import { m } from '$shared/paraglide/messages.js';
+  import { toStore } from 'svelte/store';
 
   interface Props {
+    workspaceId?: WorkspaceId | null;
     onClose?: () => void;
     onCreated?: (pr: PullRequestInfo) => void;
   }
 
-  let { onClose, onCreated }: Props = $props();
-  const activeWorkspace = selectActiveWorkspace();
+  let { workspaceId, onClose, onCreated }: Props = $props();
+  const workspaceId$ = toStore(() => workspaceId ?? '');
+  const workspace$ = selectWorkspaceById(workspaceId$);
 
   // Form state
   let generatingContent = $state(false);
@@ -51,7 +54,7 @@
   let autoCreatePending = $state(false);
 
   async function generatePRContent() {
-    const workspace = selectActiveWorkspace.select(appStore.state);
+    const workspace = selectWorkspaceById.select(appStore.state, workspaceId ?? '');
     if (!workspace) return;
 
     generatingContent = true;
@@ -92,7 +95,7 @@
   }
 
   async function createPullRequest() {
-    const workspace = selectActiveWorkspace.select(appStore.state);
+    const workspace = selectWorkspaceById.select(appStore.state, workspaceId ?? '');
     if (!workspace) return;
     if (!formData.title.value) {
       error = m.workspace_prCreator_titleRequired_error();
@@ -159,15 +162,20 @@
     <div class="flex items-center gap-3">
       <Fa icon={faCodePullRequest} size="lg" />
       <h2 class="text-lg font-semibold">{m.workspace_prCreator_title()}</h2>
-      {#if $activeWorkspace?.branch}
+      {#if $workspace$?.branch}
         <Badge variant="secondary" class="text-xs">
           <Fa icon={faCodeBranch} size="xs" class="mr-1" />
-          {$activeWorkspace.branch}
+          {$workspace$.branch}
         </Badge>
       {/if}
     </div>
     {#if onClose}
-      <Button variant="ghost" size="icon-sm" onclick={onClose}>
+      <Button
+        variant="ghost"
+        size="icon-sm"
+        onclick={onClose}
+        aria-label={m.workspace_prCreator_close_ariaLabel()}
+      >
         <Fa icon={faXmark} size="sm" />
       </Button>
     {/if}
@@ -177,7 +185,7 @@
   <div class="flex-1 overflow-y-auto">
     <div class="max-w-4xl mx-auto p-6 space-y-6">
       {#if error}
-        <div class="flex items-start gap-2 p-3 bg-destructive/10 text-destructive-foreground rounded-lg">
+        <div class="flex items-start gap-2 p-3 bg-destructive/10 text-error-foreground rounded-lg">
           <Fa icon={faExclamationCircle} size="sm" class="mt-0.5" />
           <span class="text-sm">{error}</span>
         </div>
@@ -191,7 +199,9 @@
       {:else}
         <!-- Title Field -->
         <div class="space-y-2">
-          <label for="pr-title" class="text-sm font-medium">{m.workspace_prCreator_titleField_label()}</label>
+          <label for="pr-title" class="text-sm font-medium"
+            >{m.workspace_prCreator_titleField_label()}</label
+          >
           {#if formData.title.loading}
             <Skeleton class="h-10 w-full" />
           {:else}
@@ -206,7 +216,9 @@
 
         <!-- Description Field -->
         <div class="space-y-2">
-          <label for="pr-description" class="text-sm font-medium">{m.workspace_prCreator_descriptionField_label()}</label>
+          <label for="pr-description" class="text-sm font-medium"
+            >{m.workspace_prCreator_descriptionField_label()}</label
+          >
           {#if formData.description.loading}
             <div class="space-y-2">
               <Skeleton class="h-4 w-full" />

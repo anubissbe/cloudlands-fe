@@ -10,9 +10,8 @@ import { render, cleanup } from '@testing-library/svelte';
 import { describe, it, expect, vi, afterEach } from 'vitest';
 
 vi.mock('$store/renderer/store', async () => {
-  const { createAppStoreMockModule } = await import(
-    '$store/renderer/utils/test-helpers/store-mock'
-  );
+  const { createAppStoreMockModule } =
+    await import('$store/renderer/utils/test-helpers/store-mock');
   return createAppStoreMockModule({ state: () => ({}), dispatch: vi.fn() });
 });
 
@@ -36,8 +35,8 @@ vi.mock('../AgentCard.svelte', async () => ({
   default: (await import('./mocks/SlotOnly.svelte')).default,
 }));
 
-vi.mock('$lib/components/ui/auggie-avatar/AuggieAvatar.svelte', async () => ({
-  default: (await import('./mocks/AuggieAvatar.svelte')).default,
+vi.mock('$features/agent/components/agent-avatar/AgentAvatar.svelte', async () => ({
+  default: (await import('./mocks/AgentAvatar.svelte')).default,
 }));
 
 import ToolDetails from '../ToolDetails.svelte';
@@ -58,11 +57,11 @@ describe('ToolDetails error display', () => {
       },
     });
 
-    expect(container.textContent).toContain(
+    expect(container.textContent).toContain('Tool workspace_api_workspace-mcp not found.');
+    expect(container.querySelector('pre')?.textContent).toBe(
       'Tool workspace_api_workspace-mcp not found.',
     );
-    // The nested string is extracted, not shown as a JSON blob
-    expect(container.textContent).not.toContain('"output"');
+    expect(container.querySelector('details')).toBeNull();
     expect(container.textContent).not.toContain('No error details available');
   });
 
@@ -91,12 +90,12 @@ describe('ToolDetails error display', () => {
     });
 
     expect(container.textContent).toContain('Error: exploded while running');
-    // The text item is extracted, not shown as a JSON blob
-    expect(container.textContent).not.toContain('"type"');
+    expect(container.querySelector('pre')?.textContent).toBe('Error: exploded while running');
+    expect(container.querySelector('details')).toBeNull();
     expect(container.textContent).not.toContain('No error details available');
   });
 
-  it('renders object results without an output string as pretty-printed JSON', () => {
+  it('renders an object error message with its raw payload inline', () => {
     const { container } = render(ToolDetails, {
       props: {
         input: {},
@@ -106,7 +105,11 @@ describe('ToolDetails error display', () => {
       },
     });
 
-    expect(container.textContent).toContain('"message": "Method not found"');
+    expect(container.querySelector('pre')?.textContent).toBe('Method not found');
+    expect(container.querySelector('details')).toBeNull();
+    expect(container.querySelector('[data-tool-detail-section="output"]')?.textContent).toContain(
+      '"message": "Method not found"',
+    );
     expect(container.textContent).not.toContain('No error details available');
   });
 

@@ -1,5 +1,5 @@
-import { createAction } from "$lib/store-shim/utils/store/create-action";
-import { createReducer } from "$lib/store-shim/utils/store/create-reducer";
+import { createAction } from "@augmentcode/themis/utils/store/create-action";
+import { createReducer } from "@augmentcode/themis/utils/store/create-reducer";
 import type {
   ApplyProposalRequest,
   ProposalApplyResult,
@@ -28,14 +28,6 @@ export const proposalApplySucceeded = createAction<
   [payload: { proposalId: string; completedAt: number; result?: ProposalApplyResult }]
 >('proposalLifecycle/proposalApplySucceeded');
 
-export const proposalUndoStarted = createAction<
-  [payload: { proposalId: string; startedAt: number }]
->('proposalLifecycle/proposalUndoStarted');
-
-export const proposalUndoSucceeded = createAction<
-  [payload: { proposalId: string; completedAt: number }]
->('proposalLifecycle/proposalUndoSucceeded');
-
 export const proposalFailed = createAction<
   [
     payload: {
@@ -49,14 +41,6 @@ export const proposalFailed = createAction<
   ]
 >('proposalLifecycle/proposalFailed');
 
-export const clearProposalLifecycle = createAction<[proposalId: string]>(
-  'proposalLifecycle/clearProposalLifecycle',
-);
-
-export const hydrateProposalLifecycle = createAction<[entries: ProposalLifecycleState]>(
-  'proposalLifecycle/hydrateProposalLifecycle',
-);
-
 export function pruneAppliedProposalLifecycleEntries(
   entries: ProposalLifecycleState,
   now: number,
@@ -69,8 +53,8 @@ export function pruneAppliedProposalLifecycleEntries(
   );
 }
 
-export const proposalLifecycleReducer = createReducer<ProposalLifecycleState>(initialState)
-  .with(proposalApplyStarted, (state, { payload: [{ proposalId, startedAt }] }) => {
+export const proposalLifecycleReducer = createReducer<ProposalLifecycleState>(initialState);
+proposalLifecycleReducer.with(proposalApplyStarted, (state, { payload: [{ proposalId, startedAt }] }) => {
     const current = state[proposalId];
     if (
       current?.status === 'applying' ||
@@ -83,8 +67,8 @@ export const proposalLifecycleReducer = createReducer<ProposalLifecycleState>(in
       ...state,
       [proposalId]: { status: 'applying', startedAt, lastAction: 'apply' },
     };
-  })
-  .with(proposalApplySucceeded, (state, { payload: [{ proposalId, completedAt, result }] }) => ({
+  });
+proposalLifecycleReducer.with(proposalApplySucceeded, (state, { payload: [{ proposalId, completedAt, result }] }) => ({
     ...state,
     [proposalId]: {
       ...state[proposalId],
@@ -95,40 +79,8 @@ export const proposalLifecycleReducer = createReducer<ProposalLifecycleState>(in
       lastAction: 'apply',
       ...(result !== undefined ? { result } : {}),
     },
-  }))
-  .with(proposalUndoStarted, (state, { payload: [{ proposalId, startedAt }] }) => {
-    const current = state[proposalId];
-    if (
-      current?.status === 'undoing' ||
-      current?.status === 'applying' ||
-      current?.status === 'idle'
-    ) {
-      return state;
-    }
-    return {
-      ...state,
-      [proposalId]: {
-        ...current,
-        status: 'undoing',
-        error: undefined,
-        errorCode: undefined,
-        startedAt,
-        lastAction: 'undo',
-      },
-    };
-  })
-  .with(proposalUndoSucceeded, (state, { payload: [{ proposalId, completedAt }] }) => ({
-    ...state,
-    [proposalId]: {
-      ...state[proposalId],
-      status: 'idle',
-      error: undefined,
-      errorCode: undefined,
-      completedAt,
-      lastAction: 'undo',
-    },
-  }))
-  .with(
+  }));
+proposalLifecycleReducer.with(
     proposalFailed,
     (state, { payload: [{ proposalId, error, errorCode, completedAt, lastAction }] }) => ({
       ...state,
@@ -141,10 +93,4 @@ export const proposalLifecycleReducer = createReducer<ProposalLifecycleState>(in
         lastAction,
       },
     }),
-  )
-  .with(clearProposalLifecycle, (state, { payload: [proposalId] }) => {
-    if (!(proposalId in state)) return state;
-    const { [proposalId]: _removed, ...rest } = state;
-    return rest;
-  })
-  .with(hydrateProposalLifecycle, (_state, { payload: [entries] }) => entries);
+  );

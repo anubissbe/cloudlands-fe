@@ -16,7 +16,7 @@ import {
   expect,
   it,
 } from "vitest";
-import { getItem } from "$lib/store-shim/utils/collections/collection-utils";
+import { getItem } from "@augmentcode/themis/utils/collections/collection-utils";
 import {
   bulkUpdateWorkspaceEntities,
   clearWorkspacePendingDeletion,
@@ -108,7 +108,6 @@ describe("workspace archive race conditions", () => {
     state = workspaceReducer(state, removeWorkspaceEntity("ws-1"));
 
     expect(getItem(state.workspaces, "ws-1")).toBeUndefined();
-    expect(state.activeWorkspaceId).toBeNull();
   });
 
   it("delete + immediate re-list filters out pending-deletion workspace from visible list", () => {

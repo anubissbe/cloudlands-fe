@@ -36,16 +36,27 @@ const FEATURE_PATHS = [
   'agentFeatures.richChatBlocks',
   'agentFeatures.structuredQuestions',
   'agentFeatures.attentionRequests',
+  'agentFeatures.stateSnapshot',
+  'agentFeatures.prMonitor',
+  'agentFeatures.taskGraph',
 ];
 
-// PROTOCOL §5.12 settings.list response with all eight agentFeatures.* entries
+// PROTOCOL §5.12 settings.list response with all eleven agentFeatures.* entries
+// plus the prMonitor.debounceSeconds number (§6.9)
 function listResponse() {
   return {
-    settings: FEATURE_PATHS.map((path) => ({
-      path,
-      value: true,
-      definition: { path, type: 'boolean', scope: 'user' },
-    })),
+    settings: [
+      ...FEATURE_PATHS.map((path) => ({
+        path,
+        value: true,
+        definition: { path, type: 'boolean', scope: 'user' },
+      })),
+      {
+        path: 'prMonitor.debounceSeconds',
+        value: 60,
+        definition: { path: 'prMonitor.debounceSeconds', type: 'number', scope: 'user' },
+      },
+    ],
   };
 }
 
@@ -97,6 +108,134 @@ describe('AgentFeaturesSettings wire contract (PROTOCOL §5.12)', () => {
       expect(updateCall).toBeDefined();
       expect(updateCall![1]).toEqual({
         changes: [{ path: 'agentFeatures.backgroundHooks', value: false }],
+      });
+    });
+  });
+
+  it('issues settings.update for agentFeatures.stateSnapshot when its toggle changes', async () => {
+    mocks.mockBackendRequest.mockImplementation(async (method: string) => {
+      if (method === 'settings.list') return listResponse();
+      if (method === 'settings.update') {
+        return { applied: [{ path: 'agentFeatures.stateSnapshot', value: false }] };
+      }
+      throw new Error(`Unexpected method: ${method}`);
+    });
+
+    render(AgentFeaturesSettings);
+
+    const toggle = await screen.findByRole('switch', { name: 'State snapshot' });
+    await fireEvent.click(toggle);
+
+    await waitFor(() => {
+      const updateCall = vi
+        .mocked(mocks.mockBackendRequest)
+        .mock.calls.find((call) => call[0] === 'settings.update');
+      expect(updateCall).toBeDefined();
+      expect(updateCall![1]).toEqual({
+        changes: [{ path: 'agentFeatures.stateSnapshot', value: false }],
+      });
+    });
+  });
+
+  it('renders taskGraph off when settings.list omits it and sends the exact toggle-on payload', async () => {
+    mocks.mockBackendRequest.mockImplementation(async (method: string) => {
+      if (method === 'settings.list') {
+        // Older daemon: agentFeatures.taskGraph is not registered
+        const response = listResponse();
+        return {
+          settings: response.settings.filter((s) => s.path !== 'agentFeatures.taskGraph'),
+        };
+      }
+      if (method === 'settings.update') {
+        return { applied: [{ path: 'agentFeatures.taskGraph', value: true }] };
+      }
+      throw new Error(`Unexpected method: ${method}`);
+    });
+
+    render(AgentFeaturesSettings);
+
+    const toggle = await screen.findByRole('switch', { name: 'Task graph coordination' });
+    await waitFor(() => {
+      expect(toggle.getAttribute('aria-checked')).toBe('false');
+    });
+    await fireEvent.click(toggle);
+
+    await waitFor(() => {
+      const updateCall = vi
+        .mocked(mocks.mockBackendRequest)
+        .mock.calls.find((call) => call[0] === 'settings.update');
+      expect(updateCall).toBeDefined();
+      expect(updateCall![1]).toEqual({
+        changes: [{ path: 'agentFeatures.taskGraph', value: true }],
+      });
+    });
+    expect(toggle.getAttribute('aria-checked')).toBe('true');
+  });
+
+  it('reverts taskGraph to off when the daemon rolls back a toggle-on', async () => {
+    mocks.mockBackendRequest.mockImplementation(async (method: string) => {
+      if (method === 'settings.list') {
+        const response = listResponse();
+        return {
+          settings: response.settings.map((s) =>
+            s.path === 'agentFeatures.taskGraph' ? { ...s, value: false } : s,
+          ),
+        };
+      }
+      if (method === 'settings.update') {
+        // Daemon rejected the change and rolled back to the default-off value
+        return { applied: [{ path: 'agentFeatures.taskGraph', value: false }] };
+      }
+      throw new Error(`Unexpected method: ${method}`);
+    });
+
+    render(AgentFeaturesSettings);
+
+    const toggle = await screen.findByRole('switch', { name: 'Task graph coordination' });
+    await waitFor(() => {
+      expect(toggle.getAttribute('aria-checked')).toBe('false');
+    });
+    await fireEvent.click(toggle);
+
+    await waitFor(() => {
+      const updateCall = vi
+        .mocked(mocks.mockBackendRequest)
+        .mock.calls.find((call) => call[0] === 'settings.update');
+      expect(updateCall).toBeDefined();
+    });
+    await waitFor(() => {
+      expect(toggle.getAttribute('aria-checked')).toBe('false');
+    });
+  });
+
+  it('issues settings.update for prMonitor.debounceSeconds when the debounce is saved (§6.9)', async () => {
+    mocks.mockBackendRequest.mockImplementation(async (method: string) => {
+      if (method === 'settings.list') return listResponse();
+      if (method === 'settings.update') {
+        return { applied: [{ path: 'prMonitor.debounceSeconds', value: 90 }] };
+      }
+      throw new Error(`Unexpected method: ${method}`);
+    });
+
+    render(AgentFeaturesSettings);
+
+    const input = await screen.findByRole('spinbutton', {
+      name: 'PR monitor change debounce in seconds',
+    });
+    await waitFor(() => {
+      expect((input as HTMLInputElement).value).toBe('60');
+    });
+    await fireEvent.input(input, { target: { value: '90' } });
+    const save = await screen.findByRole('button', { name: 'Save' });
+    await fireEvent.click(save);
+
+    await waitFor(() => {
+      const updateCall = vi
+        .mocked(mocks.mockBackendRequest)
+        .mock.calls.find((call) => call[0] === 'settings.update');
+      expect(updateCall).toBeDefined();
+      expect(updateCall![1]).toEqual({
+        changes: [{ path: 'prMonitor.debounceSeconds', value: 90 }],
       });
     });
   });

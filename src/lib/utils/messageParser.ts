@@ -994,24 +994,159 @@ function mergeConsecutiveTextBlocks(blocks: ParsedContent[]): ParsedContent[] {
   return merged;
 }
 
-// Combined pattern to find any group tag (open or close) in a single pass
-// Note: Group name capture uses [^>\n<]+ to avoid capturing across newlines or into
-// nested tags like <think> that may appear immediately after the group name.
-// The second alternative (<group:([^<\n]+)\n) handles malformed tags without closing >
-// (e.g., "<group:Prepping\n<think>..." where the model omits the closing bracket).
-
 // Combined pattern to find group tags AND think tags in a single pass.
+// Group name captures use [^>\n<]+ to avoid capturing across newlines or into
+// nested tags like <think> that may appear immediately after the group name.
 // Think tags are used by some external providers (e.g., opencode) that embed
 // model thinking directly in text rather than as separate thinking content blocks.
 // Supports both <think>/<thinking> variants (different models use different tags).
 // Pattern priority (left to right):
 //   1. <group:Name> — standard group open
-//   2. <group:Name\n — malformed group open (missing closing >)
-//   3. </group:Name> or </group> — group close
-//   4. <think> or <thinking> — think open
-//   5. </think> or </thinking> — think close
+//   2. <group:Name\n — malformed group open (missing closing >); the name
+//      capture excludes `>` so a literal like `<group:>` never opens a group
+//      that swallows the rest of the line as its name
+//   3. <group:Name at end of block — malformed group open (missing both > and \n)
+//   4. <group:Name</group:> or <group:Name</group> — fused open+close glitch
+//      (the model finishes the open tag with a close-tag suffix instead of >);
+//      consumed as a single match and treated as a group OPEN named "Name"
+//   5. </group:Name>, </group:> or </group> — group close (empty name allowed)
+//   6. <think> or <thinking> — think open
+//   7. </think> or </thinking> — think close
 const GROUP_AND_THINK_TAG_REGEX =
-  /<group:([^>\n<]+)>|<group:([^\n<]+)\n|<\/group(?::([^>\n<]+))?>|<think(?:ing)?>|<\/think(?:ing)?>/g;
+  /<group:([^>\n<]+)>|<group:([^>\n<]+)\n|<group:([^>\n<]+)$|<group:([^>\n<]+)<\/group(?::[^>\n<]*)?>|<\/group(?::([^>\n<]*))?>|<think(?:ing)?>|<\/think(?:ing)?>/g;
+
+/** A [start, end) offset range within a text block that is code formatting. */
+interface CodeRegion {
+  start: number;
+  end: number;
+}
+
+/**
+ * Fence detection for code regions: like FENCE_LINE_REGEX but accepts ANY
+ * leading indentation. CommonMark would demote a 4+-space-indented "fence" to
+ * an indented code block, but this pipeline never applies that rule:
+ * processRegularContent deliberately renders ``` / ~~~ fences at any
+ * indentation as fenced code blocks (e.g. fences nested inside list items),
+ * so what the renderer displays as one code block must be one code region
+ * here — otherwise tag literals inside it get scanned as real tags
+ * (intent-hq/monorepo#2713). The indent class is \s* to match
+ * processRegularContent's fence regexes exactly (tabs, Unicode spaces, etc.).
+ */
+const CODE_REGION_FENCE_LINE_REGEX = /^\s*(`{3,}|~{3,})(.*)$/;
+
+/**
+ * Find the offsets of code regions in a text block: fenced code blocks
+ * (``` / ~~~, line-based, same fence-pairing rules as findSuggestedPromptsBlocks
+ * but at any indentation — see CODE_REGION_FENCE_LINE_REGEX) and inline code
+ * spans (backtick runs paired per CommonMark: a run of N backticks closes at
+ * the next run of exactly N backticks; an unpaired run stays literal; spans
+ * do not cross blank lines).
+ *
+ * Group/think tag syntax inside these regions is a literal *mention* of the
+ * syntax (documentation, quoted output), not a real tag, and must not be
+ * consumed by the group/think scanner (intent-hq/monorepo#2689).
+ */
+function findCodeRegions(text: string): CodeRegion[] {
+  const regions: CodeRegion[] = [];
+  const lines = text.split('\n');
+
+  // Pass 1: fenced code blocks. Track the gaps between them for pass 2.
+  const gaps: CodeRegion[] = [];
+  let offset = 0;
+  let gapStart = 0;
+  let fence: { char: string; length: number; start: number } | null = null;
+  for (const line of lines) {
+    const lineStart = offset;
+    offset += line.length + 1;
+    const fenceMatch = line.match(CODE_REGION_FENCE_LINE_REGEX);
+    if (!fenceMatch) continue;
+    const marker = fenceMatch[1];
+    if (!fence) {
+      fence = { char: marker[0], length: marker.length, start: lineStart };
+      if (lineStart > gapStart) gaps.push({ start: gapStart, end: lineStart });
+    } else if (
+      marker[0] === fence.char &&
+      marker.length >= fence.length &&
+      fenceMatch[2].trim() === ''
+    ) {
+      regions.push({ start: fence.start, end: Math.min(offset, text.length) });
+      gapStart = Math.min(offset, text.length);
+      fence = null;
+    }
+  }
+  if (fence) {
+    // An unclosed fence consumes the rest of the block (processRegularContent
+    // renders everything after it as code).
+    regions.push({ start: fence.start, end: text.length });
+  } else if (gapStart < text.length) {
+    gaps.push({ start: gapStart, end: text.length });
+  }
+
+  // Pass 2: inline code spans in the text outside fenced blocks.
+  const paragraphBreakRegex = /\n[ \t]*\n/g;
+  const backtickRunRegex = /`+/g;
+  for (const gap of gaps) {
+    const segment = text.slice(gap.start, gap.end);
+    const paragraphs: CodeRegion[] = [];
+    let paragraphStart = 0;
+    paragraphBreakRegex.lastIndex = 0;
+    let breakMatch;
+    while ((breakMatch = paragraphBreakRegex.exec(segment)) !== null) {
+      paragraphs.push({ start: paragraphStart, end: breakMatch.index });
+      paragraphStart = breakMatch.index + breakMatch[0].length;
+    }
+    paragraphs.push({ start: paragraphStart, end: segment.length });
+
+    for (const paragraph of paragraphs) {
+      const runs: Array<{ pos: number; len: number }> = [];
+      backtickRunRegex.lastIndex = paragraph.start;
+      let runMatch;
+      while (
+        (runMatch = backtickRunRegex.exec(segment)) !== null &&
+        runMatch.index < paragraph.end
+      ) {
+        runs.push({ pos: runMatch.index, len: runMatch[0].length });
+      }
+      for (let i = 0; i < runs.length; i++) {
+        const closer = runs.findIndex((run, j) => j > i && run.len === runs[i].len);
+        if (closer === -1) continue;
+        regions.push({
+          start: gap.start + runs[i].pos,
+          end: gap.start + runs[closer].pos + runs[closer].len,
+        });
+        i = closer;
+      }
+    }
+  }
+
+  regions.sort((a, b) => a.start - b.start);
+  return regions;
+}
+
+// Trailing prefix of any tag GROUP_AND_THINK_TAG_REGEX scans for, i.e. one a
+// streamed text block can pause on. Anchored to the end of the block, so it
+// only ever matches a fragment that could still grow into a real tag: `<`,
+// `<g`…`<group`, `<group:`, `<group:Name`, `<t`…`<think`…`<thinking` (and the
+// `</group…` / `</think…` close-tag equivalents). The nesting is a prefix trie
+// over the tag names — each letter only opens the next one. A `<` followed by
+// anything that is not a tag prefix (e.g. `<group without closing bracket`, or
+// the `<thing` that `<thin` turned out to be) does not match and stays literal
+// text.
+const TRAILING_PARTIAL_TAG_REGEX =
+  /<\/?(?:g(?:r(?:o(?:u(?:p(?::[^>\n<]*)?)?)?)?)?|t(?:h(?:i(?:n(?:k(?:i(?:n(?:g)?)?)?)?)?)?)?)?$/;
+
+/**
+ * While a message is streaming, the last text block ends mid-delta: a group or
+ * think tag arrives one character at a time, so every tag passes through prefix
+ * states (`<`, `<gro`, `<group:Investigating auto-c…`, `<thin`) that are not yet
+ * matchable. Withhold that trailing fragment from render instead of flashing raw
+ * tag syntax into the transcript. Once the block settles the fragment reappears —
+ * either as a real tag (grouping / thinking), or as literal text if it never
+ * became one.
+ */
+function stripTrailingPartialTag(text: string): string {
+  return text.replace(TRAILING_PARTIAL_TAG_REGEX, '');
+}
 
 /**
  * Post-processing step: extract group markers from text blocks.
@@ -1198,9 +1333,16 @@ export function groupContentBlocks(
     }
   }
 
-  for (const block of blocks) {
+  for (const [blockIndex, block] of blocks.entries()) {
     // Only scan text blocks for group tags and think tags
-    const blockText = block.type === 'text' ? (block.text ?? block.content ?? '') : '';
+    const rawBlockText = block.type === 'text' ? (block.text ?? block.content ?? '') : '';
+    // Only the final block of a streaming message can end mid-delta, so that is
+    // the only place a trailing tag fragment needs withholding.
+    const blockText =
+      isStreaming && blockIndex === blocks.length - 1
+        ? stripTrailingPartialTag(rawBlockText)
+        : rawBlockText;
+    const withheldPartialTag = blockText !== rawBlockText;
 
     if (block.type !== 'text' || !blockText) {
       // Non-text block or empty text block — pass through into current context
@@ -1222,10 +1364,24 @@ export function groupContentBlocks(
     let match;
     let hasTags = insideThink; // if we're continuing a think from a previous block, mark as having tags
 
+    // Tag syntax inside code formatting (fences / inline code spans) is a
+    // literal mention, not a real tag — skip those matches entirely
+    // (intent-hq/monorepo#2689). Regex matches advance monotonically, so a
+    // single pointer walks the sorted regions.
+    const codeRegions = findCodeRegions(blockText);
+    let regionIndex = 0;
+
     while ((match = GROUP_AND_THINK_TAG_REGEX.exec(blockText)) !== null) {
       const matchStart = match.index;
       const matchEnd = match.index + match[0].length;
       const matchStr = match[0];
+
+      while (regionIndex < codeRegions.length && codeRegions[regionIndex].end <= matchStart) {
+        regionIndex++;
+      }
+      if (regionIndex < codeRegions.length && codeRegions[regionIndex].start < matchEnd) {
+        continue;
+      }
 
       if (matchStr === '<think>' || matchStr === '<thinking>') {
         hasTags = true;
@@ -1257,9 +1413,16 @@ export function groupContentBlocks(
       } else if (insideThink) {
         // Inside a think block — group/close-group tags are part of thinking content, skip them
         continue;
-      } else if (match[1] !== undefined || match[2] !== undefined) {
-        // Open tag: <group:Name> (match[1]) or malformed <group:Name\n (match[2])
-        const groupName = (match[1] || match[2] || '').trim();
+      } else if (
+        match[1] !== undefined ||
+        match[2] !== undefined ||
+        match[3] !== undefined ||
+        match[4] !== undefined
+      ) {
+        // Open tag: <group:Name> (match[1]), malformed <group:Name\n (match[2]),
+        // malformed <group:Name at end of a settled block (match[3]),
+        // or fused <group:Name</group:> treated as an open (match[4])
+        const groupName = (match[1] || match[2] || match[3] || match[4] || '').trim();
         hasTags = true;
         if (matchStart > lastIndex) {
           addTextIfNonEmpty(blockText.slice(lastIndex, matchStart));
@@ -1277,7 +1440,7 @@ export function groupContentBlocks(
         };
         lastIndex = matchEnd;
       } else {
-        // Close tag: </group:Name> or </group>
+        // Close tag: </group:Name>, </group:> or </group>
         hasTags = true;
         if (matchStart > lastIndex) {
           addTextIfNonEmpty(blockText.slice(lastIndex, matchStart));
@@ -1298,7 +1461,7 @@ export function groupContentBlocks(
       lastIndex = blockText.length;
     }
 
-    if (!hasTags) {
+    if (!hasTags && !withheldPartialTag) {
       // No group/think tags in this text block — pass through as-is
       addBlock(block);
     } else {
@@ -1331,6 +1494,25 @@ export function groupContentBlocks(
   }
 
   return result;
+}
+
+/**
+ * Remove thinking blocks from grouped render output, both at the top level
+ * and inside content_group children.
+ *
+ * This must run AFTER groupContentBlocks: legacy <think>…</think> text is
+ * only converted into thinking blocks during grouping, so a pre-grouping
+ * filter would miss them (the showReasoningBlocks preference would be
+ * ineffective for external-provider or older messages).
+ */
+export function stripThinkingBlocks(blocks: RenderContentBlock[]): RenderContentBlock[] {
+  return blocks
+    .filter((block) => block.type !== 'thinking')
+    .map((block) =>
+      block.type === 'content_group'
+        ? { ...block, children: block.children.filter((child) => child.type !== 'thinking') }
+        : block,
+    );
 }
 
 /**
@@ -1726,6 +1908,14 @@ const SUGGESTED_PROMPTS_OPENER_REGEX = /<!--[ \t]*suggested-prompts[ \t]*$/;
  */
 const SUGGESTED_PROMPTS_CLOSER_REGEX = /^[ \t]*-->[ \t]*$/;
 
+/**
+ * Lenient closer: a line whose non-empty remainder ends in `-->` (models
+ * sometimes fuse the last prompt with the closer). The remainder becomes the
+ * final body line and still passes through the body-text gate, so a `-->`
+ * embedded mid-line (Mermaid edge `A --> B`) never closes a block.
+ */
+const SUGGESTED_PROMPTS_TRAILING_CLOSER_REGEX = /^(.*\S)[ \t]*-->$/;
+
 /** Opening/closing markdown fence (backtick or tilde), optionally indented. */
 const FENCE_LINE_REGEX = /^ {0,3}(`{3,}|~{3,})(.*)$/;
 
@@ -1762,9 +1952,10 @@ interface SuggestedPromptsBlock {
  *
  * A block is accepted only when all of the following hold:
  * - its opener ends its own line and sits outside any fenced code region;
- * - it is closed by a `-->` standing alone on its own line, also outside any
- *   fenced code region (fence state is tracked across the whole scan, so a
- *   `-->` inside a fenced example after an opener cannot close the block);
+ * - it is closed by a `-->` standing alone on its own line — or ending a line
+ *   whose remainder becomes the final body line — also outside any fenced
+ *   code region (fence state is tracked across the whole scan, so a `-->`
+ *   inside a fenced example after an opener cannot close the block);
  * - none of its captured lines looks like response body text.
  *
  * Blocks that fail any of these are not returned at all, so callers never
@@ -1822,6 +2013,22 @@ function findSuggestedPromptsBlocks(content: string): SuggestedPromptsBlock[] {
       continue;
     }
 
+    const trailingCloserMatch = line.match(SUGGESTED_PROMPTS_TRAILING_CLOSER_REGEX);
+    // An opener-shaped remainder (e.g. `<!-- suggested-prompts -->`) must not
+    // close the block: closing would strip real body text as prompts. Fall
+    // through to the second-opener rescan instead.
+    if (trailingCloserMatch && !SUGGESTED_PROMPTS_OPENER_REGEX.test(trailingCloserMatch[1])) {
+      // The remainder before the trailing `-->` is the final body line; the
+      // body-text gate runs on the remainder, not the raw line (the raw line
+      // always matches the Mermaid-edge pattern).
+      const body = [...lines.slice(openerIndex + 1, i), trailingCloserMatch[1]];
+      if (!body.some((bodyLine) => looksLikeBodyText(bodyLine.trim()))) {
+        blocks.push({ start: openerStart, end: offsets[i] + lines[i].length, body });
+      }
+      openerIndex = -1;
+      continue;
+    }
+
     // A second opener means the first one was never closed.
     const reopenMatch = line.match(SUGGESTED_PROMPTS_OPENER_REGEX);
     if (reopenMatch) {
@@ -1860,9 +2067,9 @@ function looksLikeBodyText(line: string): boolean {
  * Label|delay:30|Check build results
  * -->
  *
- * Only accepted blocks count: the opener and the standalone `-->` closer must
- * both sit outside any code fence, and no captured line may look like response
- * body text. A block that fails any of these is left untouched in
+ * Only accepted blocks count: the opener and the `-->` closer (standalone, or
+ * trailing a final body line) must both sit outside any code fence, and no
+ * captured line may look like response body text. A block that fails any of these is left untouched in
  * `cleanedContent` rather than stripped, so a Mermaid diagram or table can
  * neither surface as prompt chips nor disappear from the rendered message. The
  * last accepted block wins.

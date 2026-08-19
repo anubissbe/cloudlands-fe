@@ -1,22 +1,35 @@
 <script lang="ts">
   import { logger } from '$lib/utils/client-logger';
 
-  import {
-  onMount,
-  onDestroy,
-} from 'svelte';
+  import { onMount, onDestroy } from 'svelte';
   import { terminalManager } from '$features/terminal/terminal-manager.svelte';
   import type { TerminalAdapter } from '$features/terminal/TerminalAdapter';
+  import { selectCodeFontFamilyCSS } from '$store/renderer/slices/user-preferences/user-preferences-selectors';
+  import { store as appStore } from '$store/renderer/store';
   import TerminalSearchBar from './TerminalSearchBar.svelte';
 
   interface Props {
     terminalId: string;
     workspaceId: string;
+    visible?: boolean;
     class?: string;
     onStatusChange?: (status: { isConnected: boolean; isExecuting: boolean }) => void;
   }
 
-  let { terminalId, workspaceId, class: className = '', onStatusChange }: Props = $props();
+  let {
+    terminalId,
+    workspaceId,
+    visible = true,
+    class: className = '',
+    onStatusChange,
+  }: Props = $props();
+
+  // Canonical code-font preference: captured at component init and forwarded
+  // to the adapter after `getOrCreateTerminal` resolves (covers both new and
+  // reattached/cached adapters). Later changes flow through the same readable
+  // to the adapter's imperative `updateFontFamily` — no adapter/xterm/PTY
+  // recreation.
+  const codeFontFamilyCSS = selectCodeFontFamilyCSS();
 
   let container: HTMLDivElement;
   let terminal: TerminalAdapter | null = null;
@@ -47,6 +60,24 @@
     }
   });
 
+  $effect(() => {
+    const isVisible = visible;
+    if (!terminal) return;
+    terminal.setVisible(isVisible);
+    if (isVisible) requestAnimationFrame(() => terminal?.focus());
+  });
+
+  // Forward code-font preference changes to the mounted adapter without
+  // recreating the adapter, XTerm instance, or PTY. When no adapter is
+  // attached (yet) the initial value is applied inside `loadTerminal` after
+  // getOrCreateTerminal resolves.
+  $effect(() => {
+    const fontFamily = $codeFontFamilyCSS;
+    if (terminal) {
+      terminal.updateFontFamily(fontFamily);
+    }
+  });
+
   // Toggle the search bar in response to the per-terminal callback
   // wired up in loadTerminal(). The callback is invoked by TerminalAdapter
   // when Cmd+F is pressed inside the matching terminal.
@@ -54,7 +85,12 @@
     if (searchOpen) {
       handleSearchClose();
     } else {
-      searchSeedQuery = terminal?.getSelection().replace(/\u00a0/g, ' ').replace(/[\t\r\n]+/g, ' ').trim() ?? '';
+      searchSeedQuery =
+        terminal
+          ?.getSelection()
+          .replace(/\u00a0/g, ' ')
+          .replace(/[\t\r\n]+/g, ' ')
+          .trim() ?? '';
       searchOpen = true;
       searchFocusTrigger += 1;
     }
@@ -92,9 +128,7 @@
           onReady: () => {
             isConnected = true;
             // Auto-focus the terminal when it's ready
-            requestAnimationFrame(() => {
-              terminal?.focus();
-            });
+            if (visible) requestAnimationFrame(() => terminal?.focus());
           },
           onCommandStart: () => {
             isExecuting = true;
@@ -111,6 +145,12 @@
         },
         false, // Never force new - let the manager decide based on whether it exists
       );
+
+      // Apply the current code-font preference after the adapter resolves.
+      // Covers both freshly created and cached/reattached adapters — the
+      // latter may have been created with a stale value while detached.
+      terminal.updateFontFamily(selectCodeFontFamilyCSS.select(appStore.state));
+      terminal.setVisible(visible);
     } catch (error) {
       logger.error('Failed to load terminal:', error);
     }
@@ -139,7 +179,7 @@
     currentMatchIndex = -1;
     totalMatches = 0;
     terminal?.clearSearch();
-    terminal?.focus();
+    if (visible) terminal?.focus();
   }
 
   onMount(() => {

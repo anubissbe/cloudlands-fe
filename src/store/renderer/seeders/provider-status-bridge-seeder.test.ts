@@ -1,9 +1,9 @@
 /**
  * Wire-contract tests for the provider status bridge seeder.
  *
- * Asserts `providers:get-availability`, `providers:check-single`, and
- * `auggie:status` forward to the canonical daemon probes (`host.checkAuggie`,
- * `host.toolAvailability`, `host.findBinary`, `host.checkGit`,
+ * Asserts `providers:get-availability` and `providers:check-single` forward
+ * to the canonical daemon probes (`host.checkAuggie`,
+ * `host.toolAvailability`, `host.findBinary`,
  * `host.providerAuthStatus` — PROTOCOL §5.14 / intent-hq/intentd#339) and
  * derive HONEST status from the responses: uninstalled / unauthenticated
  * states surface as-is, no mock@example.com fake positives, and the FE never
@@ -39,7 +39,6 @@ vi.mock("$store/renderer/store", async () => {
 import { backendRequest } from "$lib/client/live/backend-transport";
 import { mockInvoke } from "$shared/ipc-mock-router";
 import { AUGGIE_CHANNELS, PROVIDERS_CHANNELS } from "$shared/ipc/channels";
-import { MINIMUM_AUGGIE_VERSION } from "$shared/constants/auggie";
 import { CLAUDE_CODE_NPX_MISSING_WARNING } from "$shared/constants/claude-code";
 import { CODEX_ADAPTER_MISSING_WARNING } from "$shared/constants/codex";
 import type { ProviderAvailabilityResult } from "$shared/types/provider-availability";
@@ -61,6 +60,7 @@ const NO_TOOLS = {
   tools: {
     claude: { available: false },
     codex: { available: false },
+    cortex: { available: false },
     opencode: { available: false },
     pi: { available: false },
     droid: { available: false },
@@ -131,6 +131,7 @@ describe("provider-status-bridge-seeder", () => {
         tools: [
           "claude",
           "codex",
+          "cortex",
           "opencode",
           "pi",
           "droid",
@@ -147,17 +148,16 @@ describe("provider-status-bridge-seeder", () => {
       expect(response.data?.hasAnyProvider).toBe(false);
       expect(response.data?.providers.auggie).toEqual({ available: false });
       expect(response.data?.providers.mock).toEqual({ available: false });
-      // Feature-code / env-var gated providers stay hidden (default-deny).
-      expect(response.data?.hiddenProviders).toEqual(
-        expect.arrayContaining(["cortex", "mock"]),
-      );
+      // Env-var gated providers stay hidden (default-deny).
+      expect(response.data?.hiddenProviders).toEqual(expect.arrayContaining(["mock"]));
+      expect(response.data?.hiddenProviders).not.toContain("cortex");
       // The FE never runs auth-check commands itself.
       expect(mockedRequest).not.toHaveBeenCalledWith("host.exec", expect.anything());
     });
 
     it("derives auggie auth from the daemon's providerAuthStatus sweep when installed", async () => {
       routeDaemon({
-        "host.checkAuggie": { available: true, path: "/usr/local/bin/auggie", version: "0.14.0" },
+        "host.checkAuggie": { available: true, path: "/usr/local/bin/auggie" },
         "host.toolAvailability": NO_TOOLS,
         "host.providerAuthStatus": authSweep({ auggie: true }),
       });
@@ -174,7 +174,7 @@ describe("provider-status-bridge-seeder", () => {
 
     it("surfaces a logged-out auggie as authenticated:false (actionable, not fake-positive)", async () => {
       routeDaemon({
-        "host.checkAuggie": { available: true, path: "/usr/local/bin/auggie", version: "0.14.0" },
+        "host.checkAuggie": { available: true, path: "/usr/local/bin/auggie" },
         "host.toolAvailability": NO_TOOLS,
         "host.providerAuthStatus": authSweep({ auggie: false }),
       });
@@ -189,15 +189,14 @@ describe("provider-status-bridge-seeder", () => {
       });
     });
 
-    it("folds daemon RPC failures to all-unavailable (honest degradation, never an error banner)", async () => {
+    it("propagates daemon RPC failures as an explicit failure (never a fabricated all-unavailable result)", async () => {
       mockedRequest.mockRejectedValue(new Error("transport down"));
 
       const response = await mockInvoke<Envelope<ProviderAvailabilityResult>>(
         PROVIDERS_CHANNELS.GET_AVAILABILITY,
       );
 
-      expect(response.success).toBe(true);
-      expect(response.data?.hasAnyProvider).toBe(false);
+      expect(response).toEqual({ success: false, error: "transport down" });
     });
 
     it("attaches per-provider verdicts from one sweep — claude-code in, codex out", async () => {
@@ -333,7 +332,7 @@ describe("provider-status-bridge-seeder", () => {
 
     it("degrades auth to unknown when only the providerAuthStatus RPC fails", async () => {
       routeDaemon({
-        "host.checkAuggie": { available: true, path: "/usr/local/bin/auggie", version: "0.14.0" },
+        "host.checkAuggie": { available: true, path: "/usr/local/bin/auggie" },
         "host.toolAvailability": NO_TOOLS,
         "host.providerAuthStatus": () => {
           throw new Error("transport down");
@@ -468,7 +467,7 @@ describe("provider-status-bridge-seeder", () => {
   describe("providers:check-single → host.checkAuggie / host.findBinary + host.providerAuthStatus", () => {
     it("rechecks auggie (string arg) with a forced single-provider auth verdict", async () => {
       routeDaemon({
-        "host.checkAuggie": { available: true, path: "/usr/local/bin/auggie", version: "0.14.0" },
+        "host.checkAuggie": { available: true, path: "/usr/local/bin/auggie" },
         "host.providerAuthStatus": authOne("auggie", true),
       });
 
@@ -489,7 +488,7 @@ describe("provider-status-bridge-seeder", () => {
 
     it("rides the daemon auth cache when the request carries force:false", async () => {
       routeDaemon({
-        "host.checkAuggie": { available: true, path: "/usr/local/bin/auggie", version: "0.14.0" },
+        "host.checkAuggie": { available: true, path: "/usr/local/bin/auggie" },
         "host.providerAuthStatus": authOne("auggie", true),
       });
 
@@ -806,6 +805,25 @@ describe("provider-status-bridge-seeder", () => {
       });
     });
 
+    it("resolves cortex presence via host.findBinary without an auth probe (ungated)", async () => {
+      routeDaemon({
+        "host.findBinary": { available: true, path: "/usr/local/bin/cortex" },
+      });
+
+      const response = await mockInvoke(PROVIDERS_CHANNELS.CHECK_SINGLE, "cortex");
+
+      expect(mockedRequest).toHaveBeenCalledWith("host.findBinary", { name: "cortex" });
+      expect(mockedRequest).not.toHaveBeenCalledWith(
+        "host.providerAuthStatus",
+        expect.anything(),
+      );
+      expect(response).toEqual({
+        success: true,
+        providerId: "cortex",
+        data: { available: true },
+      });
+    });
+
     it("degrades auth to unknown when the providerAuthStatus RPC fails", async () => {
       routeDaemon({
         "host.findBinary": { available: true, path: "/usr/local/bin/opencode" },
@@ -972,119 +990,6 @@ describe("provider-status-bridge-seeder", () => {
     });
   });
 
-  describe("auggie:status → host.checkAuggie + host.findBinary(node) + host.checkGit + host.providerAuthStatus", () => {
-    type AuggieStatus = {
-      installed: boolean;
-      authenticated: boolean;
-      version?: string;
-      versionOk: boolean;
-      minimumVersion: string;
-      authDetails?: string;
-      nodeVersion?: string;
-      nodeVersionOk: boolean;
-      gitInstalled: boolean;
-      gitVersion?: string;
-      binaryInstallAvailable: boolean;
-      managedBinaryInstalled: boolean;
-    };
-
-    it("reports uninstalled auggie honestly while still surfacing node/git host facts", async () => {
-      routeDaemon({
-        "host.checkAuggie": { available: false },
-        "host.findBinary": { available: true, path: "/usr/local/bin/node", version: "v22.4.1" },
-        "host.checkGit": { available: true, version: "git version 2.43.0", path: "/usr/bin/git" },
-      });
-
-      const response = await mockInvoke<Envelope<AuggieStatus>>(AUGGIE_CHANNELS.STATUS);
-
-      expect(mockedRequest).toHaveBeenCalledWith("host.findBinary", { name: "node" });
-      expect(mockedRequest).toHaveBeenCalledWith("host.checkGit");
-      expect(response.success).toBe(true);
-      expect(response.data).toMatchObject({
-        installed: false,
-        authenticated: false,
-        versionOk: false,
-        minimumVersion: MINIMUM_AUGGIE_VERSION,
-        nodeVersion: "22.4.1",
-        nodeVersionOk: true,
-        gitInstalled: true,
-        gitVersion: "git version 2.43.0",
-        binaryInstallAvailable: false,
-        managedBinaryInstalled: false,
-      });
-      // No auth verdict is fetched for an uninstalled CLI.
-      expect(mockedRequest).not.toHaveBeenCalledWith(
-        "host.providerAuthStatus",
-        expect.anything(),
-      );
-    });
-
-    it("marks below-minimum versions versionOk:false and skips the auth verdict", async () => {
-      routeDaemon({
-        "host.checkAuggie": { available: true, path: "/usr/local/bin/auggie", version: "0.10.0" },
-        "host.findBinary": { available: false },
-        "host.checkGit": { available: false },
-      });
-
-      const response = await mockInvoke<Envelope<AuggieStatus>>(AUGGIE_CHANNELS.STATUS);
-
-      expect(response.success).toBe(true);
-      expect(response.data).toMatchObject({
-        installed: true,
-        version: "0.10.0",
-        versionOk: false,
-        authenticated: false,
-      });
-      expect(mockedRequest).not.toHaveBeenCalledWith(
-        "host.providerAuthStatus",
-        expect.anything(),
-      );
-    });
-
-    it("derives authenticated:true from the daemon verdict WITHOUT fabricating authDetails", async () => {
-      routeDaemon({
-        "host.checkAuggie": { available: true, path: "/usr/local/bin/auggie", version: "0.14.0" },
-        "host.findBinary": { available: true, path: "/usr/local/bin/node", version: "v22.4.1" },
-        "host.checkGit": { available: true, version: "git version 2.43.0" },
-        "host.providerAuthStatus": authOne("auggie", true),
-      });
-
-      const response = await mockInvoke<Envelope<AuggieStatus>>(AUGGIE_CHANNELS.STATUS);
-
-      expect(mockedRequest).toHaveBeenCalledWith("host.providerAuthStatus", {
-        providerId: "auggie",
-        force: true,
-      });
-      expect(mockedRequest).not.toHaveBeenCalledWith("host.exec", expect.anything());
-      expect(response.data).toMatchObject({
-        installed: true,
-        version: "0.14.0",
-        versionOk: true,
-        authenticated: true,
-      });
-      // No daemon user-info surface — never invent an identity string.
-      expect(response.data?.authDetails).toBeUndefined();
-    });
-
-    it("surfaces a checkAuggie RPC failure as success:false WITH the partial status payload", async () => {
-      routeDaemon({
-        "host.checkAuggie": () => {
-          throw new Error("transport down");
-        },
-        "host.findBinary": { available: true, path: "/usr/local/bin/node", version: "v22.4.1" },
-        "host.checkGit": { available: true, version: "git version 2.43.0" },
-      });
-
-      const response = await mockInvoke<Envelope<AuggieStatus>>(AUGGIE_CHANNELS.STATUS);
-
-      expect(response.success).toBe(false);
-      expect(response.error).toContain("transport down");
-      // ProviderSelector reads `data` regardless of success so node/git
-      // warnings still render.
-      expect(response.data).toMatchObject({ installed: false, nodeVersionOk: true });
-    });
-  });
-
   describe("*:check-availability → host.findBinary", () => {
     it("resolves each provider's binary and reports presence honestly", async () => {
       routeDaemon({
@@ -1107,12 +1012,18 @@ describe("provider-status-bridge-seeder", () => {
       expect(mockedRequest).toHaveBeenCalledWith("host.findBinary", { name: "claude" });
     });
 
-    it("default-denies cortex (feature-code gated) without touching the daemon", async () => {
+    it("probes the cortex CLI via host.findBinary (no longer feature-code gated)", async () => {
+      routeDaemon({
+        "host.findBinary": (params: unknown) => ({
+          available: (params as { name: string }).name === "cortex",
+          path: "/usr/local/bin/cortex",
+        }),
+      });
       await expect(mockInvoke("cortex:check-availability")).resolves.toEqual({
         success: true,
-        available: false,
+        available: true,
       });
-      expect(mockedRequest).not.toHaveBeenCalled();
+      expect(mockedRequest).toHaveBeenCalledWith("host.findBinary", { name: "cortex" });
     });
 
     it("propagates daemon RPC failures (callers fold the rejection to false + warn)", async () => {
@@ -1138,7 +1049,7 @@ describe("provider-status-bridge-seeder", () => {
 
     it("resolves authenticated:true when the daemon verdict passes", async () => {
       routeDaemon({
-        "host.checkAuggie": { available: true, path: "/usr/local/bin/auggie", version: "0.14.0" },
+        "host.checkAuggie": { available: true, path: "/usr/local/bin/auggie" },
         "host.providerAuthStatus": authOne("auggie", true),
       });
       const response = await mockInvoke<Envelope<{ authenticated?: boolean }>>(
@@ -1154,7 +1065,7 @@ describe("provider-status-bridge-seeder", () => {
 
     it("returns `auggie login` instructions when installed but logged out", async () => {
       routeDaemon({
-        "host.checkAuggie": { available: true, path: "/usr/local/bin/auggie", version: "0.14.0" },
+        "host.checkAuggie": { available: true, path: "/usr/local/bin/auggie" },
         "host.providerAuthStatus": authOne("auggie", false),
       });
       const response = await mockInvoke<

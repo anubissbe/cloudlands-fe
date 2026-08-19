@@ -1,5 +1,5 @@
-import { createAction } from "$lib/store-shim/utils/store/create-action";
-import { createReducer } from "$lib/store-shim/utils/store/create-reducer";
+import { createAction } from "@augmentcode/themis/utils/store/create-action";
+import { createReducer } from "@augmentcode/themis/utils/store/create-reducer";
 import { resolveProviderEnabled } from "$shared/provider-catalog";
 import { providerCatalogLoaded } from "../provider-catalog/provider-catalog-slice";
 
@@ -12,6 +12,19 @@ export type ProviderSettingsState = {
    * `canBeDisabled: false`.
    */
   nonDisableableProviderIds: string[];
+  /**
+   * Local enablement intent not yet confirmed by the daemon: providerId →
+   * enabled, recorded by `setProviderEnabled` / `toggleProvider` and merged
+   * over every `loadEnabledProvidersFromStorage` hydration so a stale boot
+   * snapshot racing a fresh click cannot clobber the entry (monorepo#1986).
+   * An entry is cleared once a hydration carries the same value (the daemon
+   * confirmed the write); a conflicting hydration keeps the newer local
+   * intent until then. When the daemon REJECTS the enablement write, the
+   * persistence saga dispatches `enablementPersistRejected` to retire the
+   * entry, so a rejected click cannot mask later daemon-originated changes
+   * for that provider for the rest of the session.
+   */
+  pendingEnablementOverrides: Record<string, boolean>;
 };
 
 export const ACTIVE_PROVIDER_STORAGE_KEY = "workspaces-active-provider";
@@ -22,6 +35,7 @@ export const initialState: ProviderSettingsState = {
   activeProviderId: "",
   enabledProviders: {},
   nonDisableableProviderIds: [],
+  pendingEnablementOverrides: {},
 };
 
 function canBeDisabled(state: ProviderSettingsState, providerId: string): boolean {
@@ -59,8 +73,18 @@ export const loadEnabledProvidersFromStorage = createAction<
   [providers: Record<string, boolean>]
 >("providerSettings/loadEnabledProvidersFromStorage");
 
-export const providerSettingsReducer = createReducer<ProviderSettingsState>(initialState)
-  .with(providerCatalogLoaded, (state, { payload: [catalog] }) => ({
+/**
+ * Dispatched by the persistence saga when the daemon rejects an enablement
+ * write (structured error response — not a transient transport failure).
+ * Retires the provider's pending override so the renderer re-converges to
+ * daemon state on the next hydration; the local map is left as-is until then.
+ */
+export const enablementPersistRejected = createAction<[providerId: string]>(
+  "providerSettings/enablementPersistRejected"
+);
+
+export const providerSettingsReducer = createReducer<ProviderSettingsState>(initialState);
+providerSettingsReducer.with(providerCatalogLoaded, (state, { payload: [catalog] }) => ({
     ...state,
     nonDisableableProviderIds: catalog.providers
       .filter((provider) => provider.canBeDisabled === false)
@@ -68,36 +92,42 @@ export const providerSettingsReducer = createReducer<ProviderSettingsState>(init
     // The registry carries no default designation; the active provider is
     // user-derived (settings hydration / onboarding pick). Before those land
     // it stays '' — never silently adopted from the catalog.
-  }))
-  .with(setActiveProvider, (state, { payload: [providerId] }) => ({
+  }));
+providerSettingsReducer.with(setActiveProvider, (state, { payload: [providerId] }) => ({
     ...state,
     activeProviderId: providerId,
-  }))
-  .with(hydrateActiveProvider, (state, { payload: [providerId] }) => ({
+  }));
+providerSettingsReducer.with(hydrateActiveProvider, (state, { payload: [providerId] }) => ({
     ...state,
     activeProviderId: providerId,
-  }))
-  .with(
+  }));
+providerSettingsReducer.with(
     setProviderEnabled,
     (state, { payload: [{ providerId, enabled }] }) => {
       if (!canBeDisabled(state, providerId)) return state;
       return {
         ...state,
         enabledProviders: { ...state.enabledProviders, [providerId]: enabled },
+        pendingEnablementOverrides: {
+          ...state.pendingEnablementOverrides,
+          [providerId]: enabled,
+        },
       };
     }
-  )
-  .with(toggleProvider, (state, { payload: [providerId] }) => {
+  );
+providerSettingsReducer.with(toggleProvider, (state, { payload: [providerId] }) => {
     if (!canBeDisabled(state, providerId)) return state;
+    const enabled = !resolveProviderEnabled(state.enabledProviders, providerId);
     return {
       ...state,
-      enabledProviders: {
-        ...state.enabledProviders,
-        [providerId]: !resolveProviderEnabled(state.enabledProviders, providerId),
+      enabledProviders: { ...state.enabledProviders, [providerId]: enabled },
+      pendingEnablementOverrides: {
+        ...state.pendingEnablementOverrides,
+        [providerId]: enabled,
       },
     };
-  })
-  .with(ensureEnabledIfUnset, (state, { payload: [providerId] }) => {
+  });
+providerSettingsReducer.with(ensureEnabledIfUnset, (state, { payload: [providerId] }) => {
     if (state.enabledProviders[providerId] !== undefined) {
       return state;
     }
@@ -105,8 +135,24 @@ export const providerSettingsReducer = createReducer<ProviderSettingsState>(init
       ...state,
       enabledProviders: { ...state.enabledProviders, [providerId]: true },
     };
-  })
-  .with(loadEnabledProvidersFromStorage, (state, { payload: [providers] }) => ({
-    ...state,
-    enabledProviders: providers,
-  }));
+  });
+providerSettingsReducer.with(enablementPersistRejected, (state, { payload: [providerId] }) => {
+    if (!(providerId in state.pendingEnablementOverrides)) return state;
+    const pending = { ...state.pendingEnablementOverrides };
+    delete pending[providerId];
+    return { ...state, pendingEnablementOverrides: pending };
+  });
+providerSettingsReducer.with(loadEnabledProvidersFromStorage, (state, { payload: [providers] }) => {
+    // Hydration (boot snapshot or settings:changed) never clobbers newer
+    // local intent: still-pending overrides win over the incoming map, and a
+    // matching incoming value confirms (retires) the override.
+    const pending: Record<string, boolean> = {};
+    for (const [providerId, enabled] of Object.entries(state.pendingEnablementOverrides)) {
+      if (providers[providerId] !== enabled) pending[providerId] = enabled;
+    }
+    return {
+      ...state,
+      enabledProviders: { ...providers, ...pending },
+      pendingEnablementOverrides: pending,
+    };
+  });

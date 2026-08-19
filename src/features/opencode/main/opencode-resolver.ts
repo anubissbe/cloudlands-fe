@@ -9,6 +9,7 @@ import * as os from 'os';
 import * as path from 'path';
 import {
   findBinary,
+  findBinaryStrict,
   getCommonNpmPaths,
 } from '../../../shared/main/find-binary';
 
@@ -77,7 +78,6 @@ async function findNpxPath(): Promise<string | null> {
 
   const result = await findBinary('npx', {
     commonPaths: [...NPX_PATHS, ...getCommonNpmPaths('npx')],
-    cache: false,
     timeout: 3000,
     useEnhancedPath: false,
     useLoginShell: false,
@@ -91,16 +91,16 @@ async function findNpxPath(): Promise<string | null> {
 }
 
 /**
- * Find the opencode executable path
+ * Find the opencode executable path. `strict` keeps probe failures distinct
+ * from "not found" (the lookup rejects instead of resolving null).
  */
-async function findOpenCodePath(): Promise<string | null> {
+async function findOpenCodePath(strict = false): Promise<string | null> {
   if (cachedOpenCodePath) {
     return cachedOpenCodePath;
   }
 
-  const result = await findBinary('opencode', {
+  const result = await (strict ? findBinaryStrict : findBinary)('opencode', {
     commonPaths: [...OPENCODE_PATHS, ...getCommonNpmPaths('opencode')],
-    cache: false,
     timeout: 3000,
     useEnhancedPath: false,
     useLoginShell: false,
@@ -116,9 +116,11 @@ async function findOpenCodePath(): Promise<string | null> {
 /**
  * Check if opencode is directly installed (not via npx fallback).
  * Used for accurate status detection in the provider status panel.
+ * Rejects when the probe itself fails (daemon RPC error) — a failed probe
+ * proves nothing about availability, so callers must not fold it to false.
  */
 export async function isOpenCodeInstalled(): Promise<boolean> {
-  const opencodePath = await findOpenCodePath();
+  const opencodePath = await findOpenCodePath(true);
   return opencodePath !== null;
 }
 

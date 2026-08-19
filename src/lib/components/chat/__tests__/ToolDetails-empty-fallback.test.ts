@@ -3,16 +3,15 @@
  *
  * ToolDetails must never expand to an empty container: when parsedResult is
  * rich-typed (e.g. 'confirmation') but has no renderable content, it must fall
- * back to the input details + raw result view (or "Completed" when there is
- * no result payload at all).
+ * back to sanitized input/output under the parent disclosure, without adding a
+ * redundant completion state or nested disclosure.
  */
 import { render, cleanup } from '@testing-library/svelte';
 import { describe, it, expect, vi, afterEach } from 'vitest';
 
 vi.mock('$store/renderer/store', async () => {
-  const { createAppStoreMockModule } = await import(
-    '$store/renderer/utils/test-helpers/store-mock'
-  );
+  const { createAppStoreMockModule } =
+    await import('$store/renderer/utils/test-helpers/store-mock');
   return createAppStoreMockModule({ state: () => ({}), dispatch: vi.fn() });
 });
 
@@ -36,8 +35,8 @@ vi.mock('../AgentCard.svelte', async () => ({
   default: (await import('./mocks/SlotOnly.svelte')).default,
 }));
 
-vi.mock('$lib/components/ui/auggie-avatar/AuggieAvatar.svelte', async () => ({
-  default: (await import('./mocks/AuggieAvatar.svelte')).default,
+vi.mock('$features/agent/components/agent-avatar/AgentAvatar.svelte', async () => ({
+  default: (await import('./mocks/AgentAvatar.svelte')).default,
 }));
 
 import ToolDetails from '../ToolDetails.svelte';
@@ -48,7 +47,7 @@ afterEach(() => {
 });
 
 describe('ToolDetails empty rich-result fallback', () => {
-  it('falls back to input details + raw result when confirmation has no content', () => {
+  it('renders fallback input and output inline under the parent disclosure', () => {
     const { container } = render(ToolDetails, {
       props: {
         input: {
@@ -61,14 +60,19 @@ describe('ToolDetails empty rich-result fallback', () => {
       },
     });
 
-    // Input details are visible
-    expect(container.textContent).toContain('summary');
-    expect(container.textContent).toContain('Ask the user a clarifying question');
-    // Raw result payload is visible
-    expect(container.textContent).toContain('Question queued');
+    expect(container.textContent).not.toContain('Completed');
+    expect(container.textContent).not.toContain('Raw');
+    expect(container.querySelector('details')).toBeNull();
+    expect(container.querySelector('summary')).toBeNull();
+    expect(container.querySelector('[data-tool-detail-section="input"]')?.textContent).toContain(
+      'Ask the user a clarifying question',
+    );
+    expect(container.querySelector('[data-tool-detail-section="output"]')?.textContent).toContain(
+      'Question queued',
+    );
   });
 
-  it('shows input details and "Completed" when confirmation has no content and no result', () => {
+  it('shows input details without a redundant completion label', () => {
     const { container } = render(ToolDetails, {
       props: {
         input: {
@@ -82,7 +86,8 @@ describe('ToolDetails empty rich-result fallback', () => {
     });
 
     expect(container.textContent).toContain('Ask the user');
-    expect(container.textContent).toContain('Completed');
+    expect(container.querySelector('[data-tool-detail-section="input"]')).toBeTruthy();
+    expect(container.textContent).not.toContain('Completed');
   });
 
   it('never renders an empty details container for a rich-typed parsedResult', () => {
@@ -95,7 +100,8 @@ describe('ToolDetails empty rich-result fallback', () => {
       },
     });
 
-    expect(container.textContent).toContain('Completed');
+    expect(container.querySelector('details')).toBeNull();
+    expect(container.textContent).not.toContain('Completed');
   });
 
   it('falls back to input details + raw result for a bare browser parsedResult', () => {
@@ -144,5 +150,137 @@ describe('ToolDetails empty rich-result fallback', () => {
     });
 
     expect(container.textContent).toContain('Question queued for the user');
+  });
+});
+
+describe('ToolDetails pending (running) rendering', () => {
+  it('shows the full multiline command for a pending terminal call without a result section', () => {
+    const command = 'cd packages/cloudlands-fe && \\\n  pnpm vitest run \\\n  src/lib/tests';
+    const { container } = render(ToolDetails, {
+      props: {
+        input: { command },
+        result: undefined,
+        parsedResult: null,
+        isError: false,
+        pending: true,
+        isTerminal: true,
+      },
+    });
+
+    const pre = container.querySelector('pre');
+    expect(pre?.textContent).toBe(command);
+    expect(container.textContent).not.toContain('Result');
+    expect(container.textContent).not.toContain('No output');
+  });
+
+  it('shows all input fields for a pending non-terminal call carrying a command field', () => {
+    // str-replace-editor is classified file-write but sends command: "str_replace";
+    // without the terminal gate its pending view would collapse to "$ str_replace"
+    const { container } = render(ToolDetails, {
+      props: {
+        input: {
+          command: 'str_replace',
+          path: 'src/lib/components/chat/ToolDetails.svelte',
+          old_str_1: 'before text',
+          new_str_1: 'after text',
+        },
+        result: undefined,
+        parsedResult: null,
+        isError: false,
+        pending: true,
+      },
+    });
+
+    expect(container.textContent).toContain('Input');
+    expect(container.textContent).toContain('str_replace');
+    expect(container.textContent).toContain('src/lib/components/chat/ToolDetails.svelte');
+    expect(container.textContent).toContain('before text');
+    expect(container.textContent).toContain('after text');
+    expect(container.textContent).not.toContain('$ str_replace');
+    expect(container.textContent).not.toContain('Result');
+  });
+
+  it('shows sanitized JSON input for a pending non-terminal call without a result section', () => {
+    const { container } = render(ToolDetails, {
+      props: {
+        input: { path: '/repo/src/file.ts', view_range: [1, 120] },
+        result: undefined,
+        parsedResult: null,
+        isError: false,
+        pending: true,
+      },
+    });
+
+    expect(container.textContent).toContain('Input');
+    expect(container.textContent).toContain('/repo/src/file.ts');
+    expect(container.textContent).not.toContain('Result');
+  });
+
+  it('redacts secrets in a pending command while preserving line structure', () => {
+    const { container } = render(ToolDetails, {
+      props: {
+        input: { command: 'export API_KEY=abc123 && \\\n  ./deploy.sh' },
+        result: undefined,
+        parsedResult: null,
+        isError: false,
+        pending: true,
+        isTerminal: true,
+      },
+    });
+
+    const pre = container.querySelector('pre');
+    expect(pre?.textContent).toContain('API_KEY=[redacted]');
+    expect(pre?.textContent).toContain('\n  ./deploy.sh');
+    expect(pre?.textContent).not.toContain('abc123');
+  });
+});
+
+describe('ToolDetails batch delegate rendering', () => {
+  it('renders a disposition summary instead of the "Agent spawned" label', () => {
+    const { container } = render(ToolDetails, {
+      props: {
+        input: {
+          code: 'return await ws.agent.delegate({ tasks: ["n-1", "n-2", "n-3"] })',
+          summary: 'Delegate batch',
+        },
+        result: '{"ok":true,"tasks":[]}',
+        parsedResult: {
+          type: 'delegate-task' as const,
+          delegateBatch: {
+            started: 2,
+            held: 1,
+            skipped: 1,
+            errors: 0,
+            startedRows: [
+              { agentId: 'agent-1', agentName: 'Implementor #1' },
+              { agentId: 'agent-2', agentName: 'Implementor #2' },
+            ],
+          },
+        },
+        isError: false,
+      },
+    });
+
+    expect(container.textContent).toContain('2 started');
+    expect(container.textContent).toContain('1 held');
+    expect(container.textContent).toContain('1 skipped');
+    expect(container.textContent).not.toContain('failed');
+    expect(container.textContent).not.toContain('Agent spawned');
+  });
+
+  it('keeps the single-agent fallback label when no agent id was parsed', () => {
+    const { container } = render(ToolDetails, {
+      props: {
+        input: {
+          code: 'return await ws.agent.delegate({ taskNoteId: "n-1" })',
+          summary: 'Delegate task',
+        },
+        result: 'ok',
+        parsedResult: { type: 'delegate-task' as const, content: 'ok' },
+        isError: false,
+      },
+    });
+
+    expect(container.textContent).toContain('Agent spawned');
   });
 });

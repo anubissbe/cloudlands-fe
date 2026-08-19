@@ -1,5 +1,5 @@
-import { createAction } from "$lib/store-shim/utils/store/create-action";
-import { createReducer } from "$lib/store-shim/utils/store/create-reducer";
+import { createAction } from "@augmentcode/themis/utils/store/create-action";
+import { createReducer } from "@augmentcode/themis/utils/store/create-reducer";
 
 // ============================================================================
 // Types
@@ -31,11 +31,6 @@ export const initialState: FeatureCodesState = {
 /** Trigger fetch of active features (saga handles IPC) */
 export const fetchFeatures = createAction("featureCodes/fetchFeatures");
 
-/** Set active features on successful fetch */
-export const fetchFeaturesSuccess = createAction<[features: string[]]>(
-  "featureCodes/fetchFeaturesSuccess"
-);
-
 /** Request to deactivate a feature (triggers saga) */
 export const deactivateFeature = createAction<[featureId: string]>(
   "featureCodes/deactivateFeature"
@@ -48,14 +43,8 @@ export const toggleFeatureCodeDialog = createAction("featureCodes/toggleFeatureC
 // Reducer
 // ============================================================================
 
-export const featureCodesReducer = createReducer<FeatureCodesState>(initialState)
-  .with(fetchFeaturesSuccess, (state, { payload: [features] }) => ({
-    ...state,
-    activeFeatures: features,
-    initialized: true,
-  }))
-  .with(toggleFeatureCodeDialog, (state) => ({
-    ...state,
-    dialogOpen: !state.dialogOpen,
-  }));
-
+export const featureCodesReducer = createReducer<FeatureCodesState>(initialState);
+featureCodesReducer.with(toggleFeatureCodeDialog, (state) => ({
+  ...state,
+  dialogOpen: !state.dialogOpen,
+}));

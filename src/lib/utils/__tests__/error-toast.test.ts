@@ -1,17 +1,12 @@
-import {
-  beforeEach,
-  describe,
-  expect,
-  it,
-  vi,
-} from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const {
   dismissMock,
   dispatchMock,
   generateReportMock,
   appStoreFactoryMock,
-  selectCurrentWorkspaceMock,
+  selectWorkspaceByIdMock,
+  selectCurrentWorkspaceTabIdMock,
   selectSelectedModelMock,
   toastCustomMock,
 } = vi.hoisted(() => ({
@@ -19,7 +14,8 @@ const {
   dispatchMock: vi.fn(),
   generateReportMock: vi.fn(),
   appStoreFactoryMock: vi.fn(),
-  selectCurrentWorkspaceMock: vi.fn(),
+  selectWorkspaceByIdMock: vi.fn(),
+  selectCurrentWorkspaceTabIdMock: vi.fn(),
   selectSelectedModelMock: vi.fn(),
   toastCustomMock: vi.fn(),
 }));
@@ -37,7 +33,8 @@ vi.mock('$lib/components/ui/toast/ErrorToast.svelte', () => ({
 }));
 
 vi.mock('$store/renderer/store', async () => {
-  const { createAppStoreMockModule } = await import('$store/renderer/utils/test-helpers/store-mock');
+  const { createAppStoreMockModule } =
+    await import('$store/renderer/utils/test-helpers/store-mock');
 
   return createAppStoreMockModule({
     state: () => appStoreFactoryMock()?.getState?.() ?? {},
@@ -50,7 +47,11 @@ vi.mock('$store/renderer/slices/model/model-selectors', () => ({
 }));
 
 vi.mock('$store/renderer/slices/workspace/workspace-selectors', () => ({
-  selectCurrentWorkspace: { select: selectCurrentWorkspaceMock },
+  selectWorkspaceById: { select: selectWorkspaceByIdMock },
+}));
+
+vi.mock('$store/renderer/slices/tab-state/tab-state-selectors', () => ({
+  selectCurrentWorkspaceTabId: { select: selectCurrentWorkspaceTabIdMock },
 }));
 
 vi.mock('$lib/utils/error-handler.svelte', () => ({
@@ -77,7 +78,8 @@ describe('showErrorToast', () => {
     vi.clearAllMocks();
     generateReportMock.mockReturnValue({ agentPrompt: 'diagnostic context' });
     appStoreFactoryMock.mockReturnValue({ getState: () => legacyState, dispatch: dispatchMock });
-    selectCurrentWorkspaceMock.mockReturnValue({ id: 'ws-1' });
+    selectWorkspaceByIdMock.mockReturnValue({ id: 'ws-1' });
+    selectCurrentWorkspaceTabIdMock.mockReturnValue('ws-1');
     selectSelectedModelMock.mockReturnValue('selector-global-model');
   });
 
@@ -119,8 +121,8 @@ describe('showErrorToast', () => {
   // Content-only component — the severity tint rides the wrapper class.
   it.each([
     ['error', '!border-destructive/50'],
-    ['warning', '!border-amber-500/50'],
-    ['info', '!border-blue-500/50'],
+    ['warning', '!border-warning/50'],
+    ['info', '!border-info/50'],
   ])('passes the %s severity wrapper border class', (type, expectedClass) => {
     showErrorToast({
       id: `error-${type}`,

@@ -10,27 +10,20 @@
    * Disconnected cards use grey (muted).
    */
   import { onMount } from 'svelte';
-  import { invoke } from '$lib/electron-bridge';
   import {
-  selectEffectiveDefaultProviderId,
-  selectProviderCatalogEntries,
-} from '$store/renderer/slices/provider-catalog/provider-catalog-selectors';
-  import { AUGGIE_CHANNELS } from '$shared/ipc/channels';
+    selectEffectiveDefaultProviderId,
+    selectProviderCatalogEntries,
+  } from '$store/renderer/slices/provider-catalog/provider-catalog-selectors';
   import ProviderCard from './ProviderCard.svelte';
   import type { ProviderBrandColors } from './ProviderCard.svelte';
+  import { commitOnboardingProviderSelection } from '../utils/commit-onboarding-provider-selection';
   import { resolveOnboardingSelectedProvider } from '../utils/resolve-onboarding-selected-provider';
   import { isOnboardingProviderVisible } from '../utils/is-onboarding-provider-visible';
   import { orderOnboardingProviders } from '../utils/order-onboarding-providers';
+  import { stableShuffleOrder, type StableShuffleCache } from '../utils/stable-shuffle-order';
 
   import { selectIsFeatureEnabled } from '$store/renderer/slices/feature-codes/feature-codes-selectors';
   import { selectActiveProviderId } from '$store/renderer/slices/provider-settings/provider-settings-selectors';
-  import {
-    setActiveProvider,
-    setProviderEnabled,
-  } from '$store/renderer/slices/provider-settings/provider-settings-slice';
-  import { reloadModelsForProvider } from '$store/renderer/slices/model/model-slice';
-
-  import { createLogger } from '$lib/utils/client-logger';
 
   import {
     selectProviderStatusMap,
@@ -90,16 +83,6 @@
   };
 
   const DEFAULT_BRAND: ProviderBrandColors = { color1: '#555', color2: '#555' };
-
-  /** Fisher-Yates shuffle for provider list randomization */
-  function shuffleArray<T>(array: T[]): T[] {
-    const shuffled = [...array];
-    for (let i = shuffled.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
-    }
-    return shuffled;
-  }
 
   /** Short descriptions for each provider */
   const PROVIDER_DESCRIPTIONS: Record<string, string> = {};
@@ -164,10 +147,21 @@
   const catalogEntries$ = selectProviderCatalogEntries();
   const defaultProviderId$ = selectEffectiveDefaultProviderId();
 
-  /** Randomized provider order — shuffled once when the catalog rows land
-   *  (rows are static per daemon connection, so this is once per mount in
-   *  practice). */
-  const randomizedProviderOrder = $derived.by(() => shuffleArray($catalogEntries$));
+  /** Cache carrying the per-mount shuffled id order across catalog
+   *  re-emissions. Deliberately non-reactive: it is bookkeeping for
+   *  `stableShuffleOrder`, not render state. */
+  let shuffleCache: StableShuffleCache | null = null;
+
+  /** Randomized provider order — shuffled once per catalog id set. The
+   *  catalog selector emits fresh array references (and fully re-hydrates on
+   *  every daemon reconnect), so the shuffle is keyed on the id set: same-id
+   *  re-emissions map the current entry objects into the cached shuffled
+   *  order; only an added/removed provider id draws a new shuffle. */
+  const randomizedProviderOrder = $derived.by(() => {
+    const result = stableShuffleOrder($catalogEntries$, shuffleCache);
+    shuffleCache = result.cache;
+    return result.entries;
+  });
 
   /** Visible providers (not hidden by env var / feature code gates),
    *  tier-ordered (confirmed-logged-in → installed-not-logged-in-or-unknown →
@@ -192,6 +186,7 @@
       .map((p) => {
         const meta = PROVIDER_METADATA[p.id];
         const status = statusMap[p.id];
+        const inFlight = loadingMap[p.id];
         return {
           id: p.id,
           name: p.displayName,
@@ -199,10 +194,11 @@
           /** Whether the user is authenticated. undefined = not checked yet. */
           authenticated: status?.authenticated,
           /** Whether the availability check is still in-flight for this provider.
+           *  No loading entry yet → loading until the first sweep has run.
            *  Once we have a cached status for the provider, don't flip back to
            *  "loading" on background refreshes — avoids visual jitter where the
            *  card briefly shows "Checking…" every poll cycle. */
-          statusLoading: (loadingMap[p.id] && !status) ?? !hasCheckedOnce,
+          statusLoading: inFlight === undefined ? !hasCheckedOnce : inFlight && !status,
           /**
            * User identity extracted from the provider's CLI (email / username).
            * Only set when the provider is authenticated AND we could parse
@@ -220,14 +216,12 @@
       });
   });
 
-  /** A provider is ready when installed, not explicitly unauthenticated
+  /** A provider is ready when installed and not explicitly unauthenticated
    *  (unknown auth verdicts count as ready, matching settings'
-   *  `isProviderReadyForUse` for non-Auggie providers), and (for Auggie) on
-   *  a supported version. Matches ProviderCard's own `ready` derivation and
-   *  is the gate for both "clickable to select" and "counts as available". */
+   *  `isProviderReadyForUse`). Matches ProviderCard's own `ready` derivation
+   *  and is the gate for both "clickable to select" and "counts as available". */
   function isProviderReady(p: (typeof visibleProviders)[number]): boolean {
     if (!p.available || p.statusLoading) return false;
-    if (p.id === 'auggie' && auggieNeedsUpdate) return false;
     return p.authenticated !== false;
   }
 
@@ -251,39 +245,39 @@
   });
 
   async function handleSelectProvider(providerId: string) {
-    appStore.dispatch(setProviderEnabled({ providerId, enabled: true }));
-    appStore.dispatch(setActiveProvider(providerId));
-    appStore.dispatch(reloadModelsForProvider());
+    // Same dispatch path as the advance commit below; `recommitActive`
+    // preserves the click's historical behavior of re-committing (and
+    // reloading models for) an already-active card.
+    commitOnboardingProviderSelection({
+      selectedProviderId: providerId,
+      activeProviderId: selectActiveProviderId.select(appStore.state),
+      recommitActive: true,
+      dispatch: (action) => appStore.dispatch(action),
+    });
     onProviderSelected?.(providerId);
   }
 
-  // Auggie version gate: AUGGIE_CHANNELS.STATUS drives the "Update needed"
-  // badge. Users complete install/login in their own terminal (the card links
-  // out to the docs); the focus/visibility listeners below re-run detection
-  // when they return to the app.
-  const logger = createLogger('AgentGrid');
-
-  let auggieVersionOk = $state<boolean | undefined>(undefined);
-  let auggieNeedsUpdate = $derived(auggieVersionOk === false);
-
-  /** Fetch auggie version status from AUGGIE_CHANNELS.STATUS. */
-  async function checkAuggieVersion() {
-    try {
-      const result = await invoke<{
-        success: boolean;
-        data?: { versionOk: boolean; version?: string; minimumVersion?: string };
-      }>(AUGGIE_CHANNELS.STATUS);
-      if (result.data) {
-        auggieVersionOk = result.data.versionOk;
-      }
-    } catch (err) {
-      logger.debug('Failed to check auggie version', { error: err });
-    }
+  /**
+   * Commit the currently resolved selection as if the user had clicked its
+   * card. Called by the parent when the user explicitly advances from the
+   * welcome step (button or ⌘↵) so the visually-selected provider becomes
+   * enabled + active (decision D1(B): commit only on an explicit user
+   * action, never on mere render/detection). No-ops when nothing is ready
+   * or the selection is already the active provider.
+   */
+  export function commitSelection(): string | undefined {
+    return commitOnboardingProviderSelection({
+      selectedProviderId,
+      activeProviderId: selectActiveProviderId.select(appStore.state),
+      dispatch: (action) => appStore.dispatch(action),
+    });
   }
 
+  // Users complete install/login in their own terminal (the card links out to
+  // the docs); the focus/visibility listeners below re-run detection when they
+  // return to the app.
   onMount(() => {
     appStore.dispatch(ensureProvidersCheckedAction());
-    checkAuggieVersion();
 
     // Re-check all provider statuses on window focus/visibility
     // (user may have finished the manual install/login in their terminal)
@@ -317,7 +311,6 @@
         brand={PROVIDER_BRAND_COLORS[provider.id] ?? DEFAULT_BRAND}
         selected={provider.id === selectedProviderId}
         npxStatus={$npxStatus$}
-        {auggieNeedsUpdate}
         onSelect={handleSelectProvider}
       />
     </div>

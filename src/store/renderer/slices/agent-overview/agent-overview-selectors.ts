@@ -35,7 +35,7 @@ import {
   extractTaskChangesFromMessages,
   extractDelegationBatchMap,
 } from "$lib/components/agent-overview/graph-helpers";
-import { getItems } from "$lib/store-shim/utils/collections/collection-utils";
+import { getItems } from "@augmentcode/themis/utils/collections/collection-utils";
 import type { AgentSession,
   Note } from "$shared/types";
 import { selectAllWorkspaceAgents } from "$store/renderer/slices/workspace-agents/workspace-agents-selectors";
@@ -186,7 +186,7 @@ function computeGraphState(
       nodeStatus = 'waiting';
     } else if (isResponding) {
       nodeStatus = 'responding';
-    } else if (nodeStatus === 'idle' && (streamingState.activeToolName || streamingState.streamingText)) {
+    } else if (nodeStatus === 'idle' && streamingState.activeToolName) {
       nodeStatus = 'responding';
     }
 
@@ -202,7 +202,6 @@ function computeGraphState(
       parentAgentId: parentId,
       createdAt: String(session.createdAt || currentTime),
       waitingForAgentIds,
-      streamingText: streamingState.streamingText,
       activeToolName: streamingState.activeToolName,
       activeToolInput: streamingState.activeToolInput,
       lastResponse: streamingState.lastResponse,

@@ -13,6 +13,8 @@
   import { getQuestionsDismissedNotice } from './questions-dismissed-notice';
   import { fade } from 'svelte/transition';
   import { m } from '$shared/paraglide/messages.js';
+  import { getPresentedUserMessageText } from '$lib/utils/user-message-presentation';
+  import { extractSearchableContent } from './chat-search';
 
   interface Props {
     messages?: AgentMessage[];
@@ -64,7 +66,7 @@
 
     const lowerQuery = searchQuery.toLowerCase();
     const result = messages.filter((msg) => {
-      const content = extractAllContent(msg);
+      const content = extractSearchableContent(msg);
       return content.toLowerCase().includes(lowerQuery);
     });
 
@@ -126,7 +128,7 @@
              regardless of the exact role the daemon persists. -->
         <QuestionsDismissedNotice title={extractAllContent(message) || undefined} />
       {:else if message.role === 'user'}
-        <ChatMessage {message} onCopy={() => handleCopy(extractAllContent(message))} />
+        <ChatMessage {message} onCopy={() => handleCopy(getPresentedUserMessageText(message))} />
       {:else if message.role === 'assistant'}
         <div class="assistant-message-container">
           {#if isStreaming && index === messages.length - 1}
@@ -190,7 +192,7 @@
   }
 
   .message-wrapper.highlighted {
-    background-color: var(--color-highlight);
+    background-color: hsl(var(--warning) / 0.2);
     border-radius: 0.5rem;
     padding: 0.5rem;
     transition: background-color 0.3s ease;
@@ -219,7 +221,7 @@
     display: flex;
     justify-content: center;
     padding: 1rem;
-    background: var(--color-surface-secondary);
+    background: hsl(var(--muted));
     border-radius: 0.5rem;
     margin: 1rem 0;
   }
@@ -228,15 +230,15 @@
     display: flex;
     align-items: center;
     gap: 0.75rem;
-    color: var(--color-text-secondary);
+    color: hsl(var(--muted-foreground));
     font-size: 0.875rem;
   }
 
   .status-spinner {
     width: 1rem;
     height: 1rem;
-    border: 2px solid var(--color-border);
-    border-top-color: var(--color-primary);
+    border: 2px solid hsl(var(--border));
+    border-top-color: hsl(var(--primary));
     border-radius: 50%;
     animation: spin 1s linear infinite;
   }
@@ -246,7 +248,7 @@
     justify-content: center;
     align-items: center;
     height: 100%;
-    color: var(--color-text-secondary);
+    color: hsl(var(--muted-foreground));
     font-style: italic;
   }
 
@@ -277,7 +279,7 @@
       background-color: transparent;
     }
     50% {
-      background-color: var(--color-highlight);
+      background-color: hsl(var(--warning) / 0.2);
     }
   }
 </style>

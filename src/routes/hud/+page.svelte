@@ -78,7 +78,7 @@
     <div class="hud-scan-band"></div>
   </div>
 
-  <HudHeader {nowMs}>
+  <HudHeader {nowMs} {isFullScreen}>
     {#snippet controls()}
       {#if isFullScreen}
         <button
@@ -128,14 +128,14 @@
     position: relative;
     display: flex;
     flex-direction: column;
-    height: 100%;
+    height: 100vh;
     width: 100%;
     min-width: 1280px;
     min-height: 720px;
     overflow: hidden;
     user-select: none;
     -webkit-user-select: none;
-    background: hsl(var(--app-background));
+    background: hsl(var(--background));
     color: hsl(var(--foreground));
     font-family: Inter, system-ui, sans-serif;
     /* Mock's NEEDS INPUT / attention color: the design-system YELLOW warning
@@ -192,7 +192,7 @@
       600 10px 'JetBrains Mono',
       monospace;
     letter-spacing: 0.15em;
-    color: hsl(var(--text-subtle));
+    color: hsl(var(--muted-foreground));
     text-transform: uppercase;
   }
   .hud-fullscreen-btn:hover {

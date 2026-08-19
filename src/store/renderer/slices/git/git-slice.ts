@@ -5,8 +5,8 @@
  * Replaces the deprecated git.store.svelte.ts.
  */
 
-import { createAction } from "$lib/store-shim/utils/store/create-action";
-import { createReducer } from "$lib/store-shim/utils/store/create-reducer";
+import { createAction } from "@augmentcode/themis/utils/store/create-action";
+import { createReducer } from "@augmentcode/themis/utils/store/create-reducer";
 import { createWorkspaceScopedHelpers } from "../../utils/workspace-scoped";
 import { workspaceUnmounted } from "../workspace-lifecycle/workspace-lifecycle-slice";
 import type {
@@ -16,11 +16,10 @@ import type {
   GitOperationFailedEvent,
   GitOperationFlagName,
   GitOperationFlags,
-  AutoCommitHookFailureEvent,
   PostMergeState,
 } from "./git-types";
 export type { GitOperationCompletedEvent, GitOperationFailedEvent, AutoCommitHookFailureEvent } from "./git-types";
-import type { GitStatus, DiffChunk } from "$shared/types";
+import type { GitStatus } from "$shared/types";
 
 export const defaultGitOperationFlags: GitOperationFlags = {
   isPushing: false,
@@ -63,31 +62,10 @@ export const loadGitStatus = createAction<[wsId: string, forceRefresh?: boolean]
   "git/loadStatus"
 );
 
-/** Set loading state for a workspace */
-export const setGitLoading = createAction<[wsId: string, loading: boolean]>(
-  "git/setLoading"
-);
-
 /** Set git status result */
 export const setGitStatus = createAction(
   "git/setStatus",
   (wsId: string, status: GitStatus) => ({ wsId, status })
-);
-
-/** Set git error */
-export const setGitError = createAction<[wsId: string, error: string]>(
-  "git/setError"
-);
-
-/** Clear git error */
-export const clearGitError = createAction<[wsId: string]>(
-  "git/clearError"
-);
-
-/** Set diffs result */
-export const setGitDiffs = createAction(
-  "git/setDiffs",
-  (wsId: string, diffs: DiffChunk[]) => ({ wsId, diffs })
 );
 
 // ── Git Operation Event Actions ──
@@ -99,10 +77,6 @@ export const setLastGitOperation = createAction<[event: GitOperationCompletedEve
 export const setLastGitError = createAction<[event: GitOperationFailedEvent]>(
   "git/setLastGitError"
 );
-
-export const setLastAutoCommitHookFailure = createAction<[
-  event: AutoCommitHookFailureEvent,
-]>("git/setLastAutoCommitHookFailure");
 
 // ── Sidebar git operation actions (moved from transient-ui) ──
 
@@ -119,60 +93,39 @@ export const setGitOperationFlag = createAction<[
 
 // ── Reducer ──
 
-export const gitReducer = createReducer<GitState>(initialState)
-  .with(setGitLoading, (state, { payload: [wsId, loading] }) => {
-    const ws = getWorkspaceState(state, wsId);
-    return setWorkspaceState(state, wsId, { ...ws, loading });
-  })
-  .with(setGitStatus, (state, action) => {
-    const { wsId, status } = action.payload;
-    const ws = getWorkspaceState(state, wsId);
-    return setWorkspaceState(state, wsId, {
-      ...ws,
-      status,
-      loading: false,
-      error: null,
-      branch: status.branch || null,
-      ahead: status.ahead || 0,
-      behind: status.behind || 0,
-    });
-  })
-  .with(setGitError, (state, { payload: [wsId, error] }) => {
-    const ws = getWorkspaceState(state, wsId);
-    return setWorkspaceState(state, wsId, { ...ws, error, loading: false });
-  })
-  .with(clearGitError, (state, { payload: [wsId] }) => {
-    const ws = getWorkspaceState(state, wsId);
-    if (ws.error === null) return state;
-    return setWorkspaceState(state, wsId, { ...ws, error: null });
-  })
-  .with(setGitDiffs, (state, action) => {
-    const { wsId, diffs } = action.payload;
-    const ws = getWorkspaceState(state, wsId);
-    return setWorkspaceState(state, wsId, { ...ws, diffs, loading: false });
-  })
-  .with(workspaceUnmounted, (state, { payload: [wsId] }) => clearWorkspaceState(state, wsId))
-  .with(setLastGitOperation, (state, { payload: [event] }) => ({
-    ...state,
-    lastGitOperation: event,
-  }))
-  .with(setLastGitError, (state, { payload: [event] }) => ({
-    ...state,
-    lastGitError: event,
-  }))
-  .with(setLastAutoCommitHookFailure, (state, { payload: [event] }) => ({
-    ...state,
-    lastAutoCommitHookFailure: event,
-  }))
-  .with(setPostMergeState, (state, { payload: [wsId, postMergeState] }) => {
-    const ws = getWorkspaceState(state, wsId);
-    return setWorkspaceState(state, wsId, { ...ws, postMergeState });
-  })
-  .with(setGitOperationFlag, (state, { payload: [wsId, flag, value] }) => {
-    const ws = getWorkspaceState(state, wsId);
-    return setWorkspaceState(state, wsId, {
-      ...ws,
-      gitOperations: { ...ws.gitOperations, [flag]: value },
-    });
+export const gitReducer = createReducer<GitState>(initialState);
+gitReducer.with(setGitStatus, (state, action) => {
+  const { wsId, status } = action.payload;
+  const ws = getWorkspaceState(state, wsId);
+  return setWorkspaceState(state, wsId, {
+    ...ws,
+    status,
+    loading: false,
+    error: null,
+    branch: status.branch || null,
+    ahead: status.ahead || 0,
+    behind: status.behind || 0,
   });
-
+});
+gitReducer.with(workspaceUnmounted, (state, { payload: [wsId] }) =>
+  clearWorkspaceState(state, wsId),
+);
+gitReducer.with(setLastGitOperation, (state, { payload: [event] }) => ({
+  ...state,
+  lastGitOperation: event,
+}));
+gitReducer.with(setLastGitError, (state, { payload: [event] }) => ({
+  ...state,
+  lastGitError: event,
+}));
+gitReducer.with(setPostMergeState, (state, { payload: [wsId, postMergeState] }) => {
+  const ws = getWorkspaceState(state, wsId);
+  return setWorkspaceState(state, wsId, { ...ws, postMergeState });
+});
+gitReducer.with(setGitOperationFlag, (state, { payload: [wsId, flag, value] }) => {
+  const ws = getWorkspaceState(state, wsId);
+  return setWorkspaceState(state, wsId, {
+    ...ws,
+    gitOperations: { ...ws.gitOperations, [flag]: value },
+  });
+});

@@ -10,9 +10,12 @@
  * `forceRefresh: true` makes the daemon skip its cache read and await a fresh
  * probe — the returned promise resolves only when the probe completes, so
  * callers (the picker's per-group ↻ button) get honest spinner semantics.
+ * Since the daemon serves its cached catalog indefinitely (re-probing only on
+ * a cache miss or an adapter version-key change), this is the only
+ * client-driven way to re-probe a cached provider.
  *
- * An empty `data` with a `warning` is an honest terminal state (e.g. cortex
- * feature-gated, droid not signed in) and resolves to `{ models: [], warning }`;
+ * An empty `data` with a `warning` is an honest terminal state (e.g. droid
+ * not signed in) and resolves to `{ models: [], warning }`;
  * only `success: false` (daemon unreachable) or transport failure throws.
  */
 

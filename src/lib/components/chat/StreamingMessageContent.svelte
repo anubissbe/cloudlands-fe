@@ -5,17 +5,26 @@
     ToolResultBlock,
     Proposal,
     ProposalActionDetail,
+    MessageRole,
   } from '$shared/types';
-  import { isProposal } from '$shared/types';
+  import {
+    dedupeAgentVideoContentBlocks,
+    isProposal,
+    normalizeAgentVideoContentBlocks,
+  } from '$shared/types';
   import {
     buildToolResultsMap,
     findToolResult,
     getToolResultPayload,
     getToolResultText,
   } from './tool-result-pairing';
+  import { isHydrationPending, mergeHydratedContent } from './block-hydration';
+  import { messageBlockHydrationRequested } from '$store/renderer/slices/chat-state/chat-state-slice';
+  import { selectHydratedBlocks } from '$store/renderer/slices/chat-state/chat-state-selectors';
   import { getProposalFromResourceBlock } from '$shared/types/proposal-resource';
   import { isQuestionResourceBlock } from '$shared/types/question-resource';
   import { dedupeResourceBlocks } from '$shared/types/resource-block-identity';
+  import { getContentBlockText } from '$shared/utils/content-block-helpers';
   import { resolveCard, type ResolvedCard } from './cards/card-registry';
   import type { DiagramPrimitive } from '$shared/types/notes-primitives';
   import ToolCall from './ToolCall.svelte';
@@ -26,13 +35,14 @@
   import DetectedScriptsCard from './DetectedScriptsCard.svelte';
   import ChatDiffViewer from './ChatDiffViewer.svelte';
   import ChatWorkspaceCard from './ChatWorkspaceCard.svelte';
+  import ChatImageBlock from './ChatImageBlock.svelte';
+  import ChatVideoBlock from './ChatVideoBlock.svelte';
   import ChatReferenceBlock from './ChatReferenceBlock.svelte';
-  import { PatchBlockContent } from '$lib/components/ui/diff';
+  import { PatchBlockContent } from '$features/file-tracking/components/diff';
   import DiagramRenderer from '$lib/components/diagrams/DiagramRenderer.svelte';
   import MermaidRenderer from '$lib/components/markdown/MermaidRenderer.svelte';
-  import Fa from 'svelte-fa';
-  import { faRobot } from '@fortawesome/free-solid-svg-icons';
   import ChatCliBlock from './ChatCliBlock.svelte';
+  import ChatAgentActionBlock from './ChatAgentActionBlock.svelte';
   import SetupScriptCard from './SetupScriptCard.svelte';
   import ThinkingBlock from './ThinkingBlock.svelte';
   import ProposalCard from './proposals/ProposalCard.svelte';
@@ -54,6 +64,15 @@
     type RenderContentBlock,
   } from '$lib/utils/messageParser';
   import ResponseGroup from './ResponseGroup.svelte';
+  import {
+    getOperationalClusterSpacingClass,
+    isAdjacentOperationalClusterRow,
+    isOperationalClusterBlock,
+    OPERATIONAL_ASSISTANT_PROSE_INSET_CLASS,
+    OPERATIONAL_GROUP_CHILD_CONTENT_CLASS,
+    OPERATIONAL_GROUP_CHILD_ROW_CLASS,
+  } from './operational-disclosure-row';
+  import { dedupeKeys, getResponseGroupBlockKeys } from './response-group-blocks';
   import { AuggieTextParser } from '$lib/utils/auggie-text-parser';
   import { createLogger } from '$lib/utils/client-logger';
   import { m } from '$shared/paraglide/messages.js';
@@ -66,6 +85,7 @@
   } from '$store/renderer/slices/workspace-navigation/workspace-navigation-slice';
   import { applyWorkspaceProposal } from '$store/renderer/slices/workspace-operations/workspace-operations-slice';
   import { store as appStore } from '$store/renderer/store';
+  import { CHIEF_WORKSPACE_ID } from '$shared/types/branded-ids';
 
   const logger = createLogger('StreamingMessageContent');
 
@@ -75,6 +95,11 @@
     hideToolCalls?: boolean;
     hideSetupScripts?: boolean;
     workspaceId?: string;
+    role?: MessageRole;
+    /** Agent session id; with `messageId`, enables lazy block hydration (§5.5). */
+    agentId?: string;
+    /** Persisted message id owning `content` (hydration fetch/merge key). */
+    messageId?: string;
     onSetupScriptGenerated?: (script: {
       name: string;
       description: string;
@@ -88,8 +113,32 @@
     hideToolCalls = false,
     hideSetupScripts = false,
     workspaceId,
+    role = 'assistant',
+    agentId,
+    messageId,
     onSetupScriptGenerated,
   }: Props = $props();
+
+  // Lazy full-block hydration (§5.5 slim projection → v7.2
+  // agent.getMessageBlock): substitute cached full blocks for slim-truncated
+  // ones before any downstream derivation. Init-time subscription (agentId is
+  // stable per component instance); under-budget content passes through with
+  // referential identity intact — live-streamed blocks are never truncated,
+  // so the merge is a no-op mid-turn.
+  // svelte-ignore state_referenced_locally -- intentional initial snapshot; keyed component identity is fixed.
+  const hydratedBlocks$ = selectHydratedBlocks(agentId ?? '');
+  const hydratedContent = $derived(
+    mergeHydratedContent(content || [], messageId, $hydratedBlocks$),
+  );
+
+  function hydrateImageBlock(blockId: string | undefined) {
+    if (!agentId || !messageId || !blockId) return;
+    appStore.dispatch(messageBlockHydrationRequested(agentId, messageId, blockId));
+  }
+
+  function imageHydrationLoading(blockId: string | undefined): boolean {
+    return blockId ? isHydrationPending($hydratedBlocks$, messageId, [blockId]) : false;
+  }
 
   // OPTIMIZATION: Use $derived instead of $effect to avoid triggering re-renders
   let cleanupFunctions: Array<() => void> = [];
@@ -142,9 +191,9 @@
     // renders per resource, preferring the daemon-canonical variant.
     // Agent Q&A questions are wizard-only: they never render in the
     // transcript (pending or resolved), so strip them up front.
-    const rawBlocks = dedupeResourceBlocks(content || []).filter(
-      (block) => !isQuestionResourceBlock(block),
-    );
+    const rawBlocks = dedupeAgentVideoContentBlocks(
+      normalizeAgentVideoContentBlocks(dedupeResourceBlocks(hydratedContent), role),
+    ).filter((block) => !isQuestionResourceBlock(block));
 
     // DEBUG: Log content block types for tool call visibility debugging
     if (isStreaming) {
@@ -186,8 +235,8 @@
           }
 
           const resultBlock = block as ToolResultBlock;
-          if (typeof resultBlock.content === 'string') {
-            const contentStr = resultBlock.content;
+          if (typeof resultBlock.output === 'string') {
+            const contentStr = resultBlock.output;
             // i18n-ignore (wire-content sniffing of tool result payloads, not rendered)
             if (contentStr.includes('\u001b[') || contentStr.includes('🔧 Tool call:')) {
               return false;
@@ -234,10 +283,8 @@
     });
   });
 
-  // Group content blocks by <group:Name> tags at the ContentBlock level
-  let groupedBlocks = $derived.by(() => {
-    return groupContentBlocks(blocks, isStreaming);
-  });
+  // Group content blocks by <group:Name> tags at the ContentBlock level.
+  let groupedBlocks = $derived(groupContentBlocks(blocks, isStreaming));
 
   // Track tool states
   let toolStates = $state<Map<string, 'running' | 'completed' | 'error'>>(new Map());
@@ -549,20 +596,27 @@
   }
 
   // Pre-compute block keys for stable iteration, ensuring uniqueness
-  let blockKeys = $derived.by(() => {
-    const keys = groupedBlocks.map((block, index) => getBlockKey(block, index));
-    // Ensure uniqueness by appending index if duplicates exist
-    const seen = new Map<string, number>();
-    return keys.map((key, index) => {
-      const count = seen.get(key) || 0;
-      seen.set(key, count + 1);
-      // If this key was seen before, make it unique by appending the index
-      return count > 0 ? `${key}-dup-${index}` : key;
-    });
-  });
+  let blockKeys = $derived(
+    dedupeKeys(groupedBlocks.map((block, index) => getBlockKey(block, index))),
+  );
+
+  function isVisibleTopLevelBlock(block: RenderContentBlock): boolean {
+    if (block.type === 'content_group') return true;
+    const contentBlock = block as ContentBlock;
+    return Boolean(
+      isNavLinkBlock(contentBlock) ||
+      resolveCard(contentBlock, cardHandlers) ||
+      getProposalFromBlock(contentBlock) ||
+      ['text', 'tool_use', 'thinking', 'image', 'video'].includes(contentBlock.type),
+    );
+  }
 </script>
 
-{#snippet renderParsedContentBlock(parsedBlock: ParsedContent, blockIndex: number)}
+{#snippet renderParsedContentBlock(
+  parsedBlock: ParsedContent,
+  blockIndex: number,
+  insetProse = false,
+)}
   {#if parsedBlock.type === 'augment_code_snippet'}
     <AugmentCodeSnippet
       code={parsedBlock.content}
@@ -577,8 +631,10 @@
     <ChatDiffViewer diff={parsedBlock.content} filePath={parsedBlock.metadata?.path} />
   {:else if parsedBlock.type === 'commit_message'}
     <div class="commit-message-block p-3 my-2 rounded-md bg-background border border-border">
-      <div class="text-xs font-medium text-subtle mb-1.5">{m.chat_messageContent_generatedCommitMessage_label()}</div>
-      <div class="font-mono text-sm whitespace-pre-wrap text-foreground">
+      <div class="type-caption mb-1.5 font-medium text-subtle">
+        {m.chat_messageContent_generatedCommitMessage_label()}
+      </div>
+      <div class="type-code whitespace-pre-wrap text-foreground">
         {parsedBlock.content}
       </div>
     </div>
@@ -608,39 +664,49 @@
     <NavLink
       target={parsedBlock.metadata.navLinkData.target}
       label={parsedBlock.metadata.navLinkData.label}
+      {workspaceId}
     />
   {:else if parsedBlock.type === 'reference' && parsedBlock.metadata?.referenceData}
-    <ChatReferenceBlock reference={parsedBlock.metadata.referenceData} onOpenFile={handleOpenFile} />
+    <ChatReferenceBlock
+      reference={parsedBlock.metadata.referenceData}
+      onOpenFile={handleOpenFile}
+    />
   {:else if parsedBlock.type === 'cli' && parsedBlock.metadata?.cliData}
     {@const cliData = parsedBlock.metadata.cliData}
     <ChatCliBlock command={cliData.command} />
   {:else if parsedBlock.type === 'agent_action' && parsedBlock.metadata?.agentActionData}
-    {@const actionData = parsedBlock.metadata.agentActionData}
-    <div class="my-1.5 flex items-center gap-2">
-      <Fa icon={faRobot} size="sm" class="text-ghost flex-none" />
-      <span class="text-sm text-subtle flex-1 min-w-0 truncate">
-        {actionData.goal}
-      </span>
-    </div>
+    <ChatAgentActionBlock goal={parsedBlock.metadata.agentActionData.goal} />
   {:else if parsedBlock.type === 'code'}
     <CodeBlock
       code={parsedBlock.content || ''}
       language={parsedBlock.metadata?.language || 'plaintext'}
     />
   {:else if parsedBlock.type === 'text'}
-    <MarkdownViewer
-      content={parsedBlock.content || ''}
-      isStreaming={isStreaming && blockIndex === groupedBlocks.length - 1}
-      taskBlockRenderMode="content"
-      onFileClick={(path) => handleOpenFile({ path })}
-    />
+    <div
+      class={insetProse ? OPERATIONAL_ASSISTANT_PROSE_INSET_CLASS : undefined}
+      data-assistant-prose={insetProse ? 'streaming-markdown' : undefined}
+    >
+      <MarkdownViewer
+        content={parsedBlock.content || ''}
+        isStreaming={isStreaming && blockIndex === groupedBlocks.length - 1}
+        {workspaceId}
+        taskBlockRenderMode="content"
+        onFileClick={(path, options) => handleOpenFile({ path, ...options })}
+      />
+    </div>
   {:else}
-    <MarkdownViewer
-      content={parsedBlock.content || ''}
-      isStreaming={isStreaming && blockIndex === groupedBlocks.length - 1}
-      taskBlockRenderMode="content"
-      onFileClick={(path) => handleOpenFile({ path })}
-    />
+    <div
+      class={insetProse ? OPERATIONAL_ASSISTANT_PROSE_INSET_CLASS : undefined}
+      data-assistant-prose={insetProse ? 'streaming-fallback' : undefined}
+    >
+      <MarkdownViewer
+        content={parsedBlock.content || ''}
+        isStreaming={isStreaming && blockIndex === groupedBlocks.length - 1}
+        {workspaceId}
+        taskBlockRenderMode="content"
+        onFileClick={(path, options) => handleOpenFile({ path, ...options })}
+      />
+    </div>
   {/if}
 {/snippet}
 
@@ -649,10 +715,16 @@
   <Card {...card.props} />
 {/snippet}
 
-{#snippet renderContentBlock(block: ContentBlock, parsedKey: string, blockIndex: number)}
+{#snippet renderContentBlock(
+  block: ContentBlock,
+  parsedKey: string,
+  blockIndex: number,
+  nested = false,
+  adjacentOperationalRow = false,
+)}
   {#if isNavLinkBlock(block)}
     <div class="w-full">
-      <NavLink target={block.target} label={block.label} />
+      <NavLink target={block.target} label={block.label} {workspaceId} />
     </div>
   {:else if resolveCard(block, cardHandlers)}
     <!-- §7.1 standalone resource block with a registered card (MIME-keyed
@@ -667,7 +739,12 @@
     {@const proposal = getProposalFromBlock(block)}
     {#if proposal}
       <div class="w-full">
-        <ProposalCard {proposal} onApply={handleProposalApply} onUndo={handleProposalUndo} />
+        <ProposalCard
+          {proposal}
+          neutralBorder={workspaceId === CHIEF_WORKSPACE_ID}
+          onApply={handleProposalApply}
+          onUndo={handleProposalUndo}
+        />
       </div>
     {/if}
   {:else if block.type === 'text' && (block.text || (block as any).content)}
@@ -688,19 +765,25 @@
       {/if}
       {#if parsedResult.blocks.length > 0}
         {#each parsedResult.blocks as renderBlock, parsedBlockIndex (`${parsedKey}-parsed-${parsedBlockIndex}`)}
-          {@render renderParsedContentBlock(renderBlock as ParsedContent, blockIndex)}
+          {@render renderParsedContentBlock(renderBlock as ParsedContent, blockIndex, !nested)}
         {/each}
       {:else}
         <!-- Only render fallback if text has content after stripping suggested prompts -->
         <!-- (suggested prompts are rendered separately; empty blocks should be hidden) -->
         {@const cleanedText = parseSuggestedPrompts(textContent).cleanedContent}
         {#if cleanedText.trim()}
-          <MarkdownViewer
-            content={cleanedText}
-            isStreaming={isStreaming && blockIndex === groupedBlocks.length - 1}
-            taskBlockRenderMode="content"
-            onFileClick={(path) => handleOpenFile({ path })}
-          />
+          <div
+            class={nested ? undefined : OPERATIONAL_ASSISTANT_PROSE_INSET_CLASS}
+            data-assistant-prose={nested ? undefined : 'streaming-plain'}
+          >
+            <MarkdownViewer
+              content={cleanedText}
+              isStreaming={isStreaming && blockIndex === groupedBlocks.length - 1}
+              {workspaceId}
+              taskBlockRenderMode="content"
+              onFileClick={(path, options) => handleOpenFile({ path, ...options })}
+            />
+          </div>
         {/if}
       {/if}
     </div>
@@ -713,31 +796,79 @@
         toolUse={toolBlock}
         toolState={toolStates.get(toolBlock.id) || 'running'}
         result={resultContent}
+        resultBlock={toolResultBlock}
         {workspaceId}
+        {adjacentOperationalRow}
+        {agentId}
+        {messageId}
       />
+      {#if Array.isArray(resultContent)}
+        {#each resultContent as nestedBlock, nestedIndex (`${toolBlock.id}-image-${nestedIndex}`)}
+          {#if nestedBlock?.type === 'image' && typeof nestedBlock.data === 'string' && typeof nestedBlock.mimeType === 'string'}
+            <ChatImageBlock
+              data={nestedBlock.data}
+              mimeType={nestedBlock.mimeType}
+              alt={m.chat_chatMessage_attachedImage_alt({ number: String(nestedIndex + 1) })}
+            />
+          {:else if nestedBlock?.type === 'video' && nestedBlock.source}
+            <ChatVideoBlock
+              source={nestedBlock.source}
+              name={nestedBlock.fileName}
+              poster={typeof nestedBlock.metadata?.poster === 'string'
+                ? nestedBlock.metadata.poster
+                : undefined}
+            />
+          {/if}
+        {/each}
+      {/if}
     </div>
   {:else if block.type === 'tool_result'}
     <!-- Tool results are handled by associating them with their tool_use blocks -->
     <!-- We don't render them separately as they're shown within the ToolCall component -->
   {:else if block.type === 'thinking'}
+    <!-- Daemon-emitted thinking blocks carry `text` (PROTOCOL §7.1); the legacy
+         <think>-tag parser path in messageParser emits `content`. -->
     <ThinkingBlock
-      content={block.content || m.chat_shared_processing_fallback()}
+      content={getContentBlockText(block) || m.chat_shared_processing_fallback()}
       isStreaming={isStreaming && blockIndex === groupedBlocks.length - 1}
+      {workspaceId}
+      {adjacentOperationalRow}
+    />
+  {:else if block.type === 'image' && (block.data || block.dataTruncated) && block.mimeType}
+    <ChatImageBlock
+      data={block.data}
+      mimeType={block.mimeType}
+      dataTruncated={block.dataTruncated === true}
+      dataIsThumbnail={block.dataIsThumbnail === true}
+      hydrationLoading={imageHydrationLoading(block.id)}
+      onHydrate={agentId && messageId && block.id ? () => hydrateImageBlock(block.id) : undefined}
+    />
+  {:else if block.type === 'video' && block.source}
+    <ChatVideoBlock
+      source={block.source}
+      name={block.fileName}
+      poster={typeof block.metadata?.poster === 'string' ? block.metadata.poster : undefined}
     />
   {/if}
 {/snippet}
 
 <div
-  class="flex flex-col gap-1.5 relative"
+  class="relative flex flex-col gap-0"
   class:streaming={isStreaming}
   style="contain: layout style paint;"
   data-tool-executing={[...toolStates.values()].some((s) => s === 'running')}
+  data-operational-stack
 >
   {#each groupedBlocks as block, blockIndex (blockKeys[blockIndex])}
     {#if block.type === 'content_group'}
       {@const group = block as ContentBlockGroup}
       <div
-        class="content-block content-block--group my-1.25"
+        class="content-block content-block--group {getOperationalClusterSpacingClass(
+          groupedBlocks,
+          blockIndex,
+          isVisibleTopLevelBlock,
+        )}"
+        data-message-content-block="content_group"
         use:animateIn={{ animate: isStreaming, key: blockKeys[blockIndex] }}
       >
         <ResponseGroup
@@ -745,15 +876,40 @@
           isStreaming={group.isStreaming}
           isLast={blockIndex === groupedBlocks.length - 1}
           blocks={group.children}
+          adjacentOperationalRow={isAdjacentOperationalClusterRow(
+            groupedBlocks,
+            blockIndex,
+            isVisibleTopLevelBlock,
+          )}
         >
           {#snippet children()}
-            {#each group.children as childBlock, childIndex (`${blockIndex}-group-${childIndex}`)}
+            {@const childKeys = getResponseGroupBlockKeys(group.children)}
+            {#each group.children as childBlock, childIndex (childKeys[childIndex])}
               {#if childBlock.type !== 'tool_result'}
-                <div class="content-block content-block--{childBlock.type} my-1.25">
+                <div
+                  class="content-block content-block--{childBlock.type} {getOperationalClusterSpacingClass(
+                    group.children,
+                    childIndex,
+                    (candidate) => candidate.type !== 'tool_result',
+                  )} {isOperationalClusterBlock(childBlock)
+                    ? OPERATIONAL_GROUP_CHILD_ROW_CLASS
+                    : OPERATIONAL_GROUP_CHILD_CONTENT_CLASS}"
+                  style:padding-left={isOperationalClusterBlock(childBlock)
+                    ? undefined
+                    : 'calc(var(--operational-row-inline-padding) + var(--operational-leading-slot-size) + var(--operational-leading-gap))'}
+                  data-message-content-block={childBlock.type}
+                  data-response-group-child
+                >
                   {@render renderContentBlock(
                     childBlock,
                     `${blockIndex}-${childIndex}`,
                     blockIndex,
+                    true,
+                    isAdjacentOperationalClusterRow(
+                      group.children,
+                      childIndex,
+                      (candidate) => candidate.type !== 'tool_result',
+                    ),
                   )}
                 </div>
               {/if}
@@ -761,7 +917,7 @@
           {/snippet}
         </ResponseGroup>
       </div>
-    {:else if isNavLinkBlock(block as ContentBlock) || resolveCard(block, cardHandlers) || getProposalFromBlock(block as ContentBlock) || ['text', 'tool_use', 'thinking'].includes(block.type)}
+    {:else if isNavLinkBlock(block as ContentBlock) || resolveCard(block, cardHandlers) || getProposalFromBlock(block as ContentBlock) || ['text', 'tool_use', 'thinking', 'image', 'video'].includes(block.type)}
       <div
         class="content-block content-block--{isNavLinkBlock(block as ContentBlock)
           ? 'nav-link'
@@ -769,32 +925,38 @@
             ? 'card'
             : getProposalFromBlock(block as ContentBlock)
               ? 'proposal'
-              : block.type} my-1.25"
+              : block.type} {getOperationalClusterSpacingClass(
+          groupedBlocks,
+          blockIndex,
+          isVisibleTopLevelBlock,
+        )}"
+        data-operational-cluster-row={isOperationalClusterBlock(block) ? block.type : undefined}
+        data-message-content-block={block.type}
         use:animateIn={{ animate: isStreaming, key: blockKeys[blockIndex] }}
       >
-        {@render renderContentBlock(block as ContentBlock, String(blockIndex), blockIndex)}
+        {@render renderContentBlock(
+          block as ContentBlock,
+          String(blockIndex),
+          blockIndex,
+          false,
+          isAdjacentOperationalClusterRow(groupedBlocks, blockIndex, isVisibleTopLevelBlock),
+        )}
       </div>
     {/if}
   {/each}
 
   <!-- Show streaming cursor if streaming but no content yet -->
   {#if isStreaming && groupedBlocks.length === 0}
-    <div class="w-full">
-      <MarkdownViewer content="" isStreaming={true} taskBlockRenderMode="content" />
+    <div
+      class="w-full {OPERATIONAL_ASSISTANT_PROSE_INSET_CLASS}"
+      data-assistant-prose="streaming-empty"
+    >
+      <MarkdownViewer content="" isStreaming={true} {workspaceId} taskBlockRenderMode="content" />
     </div>
   {/if}
 </div>
 
 <style>
-  /* Adjacent tool_use blocks should have reduced spacing */
-  .content-block--tool_use + .content-block--tool_use {
-    margin-top: -0.5rem;
-  }
-  /* Adjacent tool_use blocks should have reduced spacing */
-  .content-block--group + .content-block--group {
-    margin-top: -0.5rem;
-  }
-
   /* PERF: Content blocks use containment for rendering isolation */
   .content-block {
     contain: layout style;

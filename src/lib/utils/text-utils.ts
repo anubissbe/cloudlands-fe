@@ -4,13 +4,16 @@
 
 // Re-export stripMarkdownFormatting from shared utils
 export { stripMarkdownFormatting } from '$shared/utils-client';
+import { stripInternalDeliveryNotes } from './user-message-presentation';
 
 /**
- * Strip `<group:Name>` and `</group>` (or `</group:Name>`) tags from text.
+ * Strip `<group:Name>` and `</group>` (or `</group:Name>` / `</group:>`) tags
+ * from text, including the fused malformed form `<group:Name</group:>` (which
+ * the open alternative consumes whole, since `[^>]` also matches `<`).
  * These are internal markers used for response grouping and should never be
  * shown to the user in previews, agent cards, or other plain-text contexts.
  */
-const GROUP_TAG_STRIP_REGEX = /<group:[^>]+>|<\/group(?::[^>]+)?>/g;
+const GROUP_TAG_STRIP_REGEX = /<group:[^>]+>|<\/group(?::[^>]*)?>/g;
 export function stripGroupTags(text: string): string {
   if (!text) return text;
   return text.replace(GROUP_TAG_STRIP_REGEX, '').trim();
@@ -75,7 +78,7 @@ export function getLastMeaningfulLine(text: string): string {
  * Shared by the AgentCard footer preview and the HUD card agent line.
  */
 export function stripUserMessagePrefixes(text: string): string {
-  return text
+  return stripInternalDeliveryNotes(text)
     .replace(/^(\[.*?\]\s*)+/, '')
     .replace(/@context\[[^\]]*\]/g, '')
     .trim();
@@ -91,6 +94,12 @@ export interface AgentPreviewLineFields {
   isResponding?: boolean;
   /** `agent.reportToParent` report (session `metadata.completionReport`). */
   completionReport?: string | null;
+  /**
+   * Persisted tool-call preview (AgentLite `lastToolUse`, §5.5 — also carried
+   * on `agent:last-message`): the newest message's last `tool_use` block.
+   * Only `name` is read (wire/agent content).
+   */
+  lastToolUse?: { name: string } | null;
 }
 
 /**
@@ -105,7 +114,9 @@ export interface AgentPreviewLineFields {
  *      (push-applied ~1s by `agent:stream:activity`);
  *   3. the digest / completion-report summary;
  *   4. the persisted `lastAgentResponse` (idle agents);
- *   5. the last user message as a final fallback.
+ *   5. the persisted `lastToolUse` name (tool-only stretches with no
+ *      response text — mirrors the card's last-response > last-tool order);
+ *   6. the last user message as a final fallback.
  * Returns null when no source has text.
  */
 export function deriveAgentPreviewLine(fields: AgentPreviewLineFields): string | null {
@@ -124,6 +135,8 @@ export function deriveAgentPreviewLine(fields: AgentPreviewLineFields): string |
     ? getLastMeaningfulLine(fields.lastAgentResponse)
     : '';
   if (lastResponse) return lastResponse;
+  const toolName = fields.lastToolUse?.name?.trim();
+  if (toolName) return toolName;
   return userFirstLine || null;
 }
 

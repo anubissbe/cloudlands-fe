@@ -21,6 +21,7 @@ import {
   fetchGitHubRepoConfigSetupScript,
   fetchRepoConfigSetupScript,
   parseRepoConfigSetupScript,
+  resolveSetupScriptParam,
   toRepoConfigSubset,
   REPO_CONFIG_SCRIPT_NAME,
 } from './repo-config';
@@ -211,5 +212,63 @@ describe('chooseDefaultSetupScript', () => {
       genericTemplate: undefined,
     });
     expect(choice).toEqual({ content: '', name: 'Custom' });
+  });
+});
+
+describe('resolveSetupScriptParam (monorepo#1862)', () => {
+  const base = {
+    setupScript: 'echo default',
+    setupScriptName: 'Copy config files only',
+    repoPath: '/repo/a',
+    repoConfigScript: null as string | null,
+    repoConfigScriptRepo: null as string | null,
+  };
+
+  it('sends the shown script (trimmed), touched or not', () => {
+    expect(resolveSetupScriptParam(base)).toBe('echo default');
+    expect(resolveSetupScriptParam({ ...base, setupScript: 'echo edited\n' })).toBe('echo edited');
+  });
+
+  it('omits an empty/blank script', () => {
+    expect(resolveSetupScriptParam({ ...base, setupScript: '  \n ' })).toBeUndefined();
+    expect(resolveSetupScriptParam({ ...base, setupScript: '' })).toBeUndefined();
+  });
+
+  it('omits the unedited repo-config script', () => {
+    expect(
+      resolveSetupScriptParam({
+        ...base,
+        setupScript: 'echo repo-config\n',
+        setupScriptName: REPO_CONFIG_SCRIPT_NAME,
+        repoConfigScript: 'echo repo-config',
+        repoConfigScriptRepo: '/repo/a',
+      }),
+    ).toBeUndefined();
+  });
+
+  it('sends an edited repo-config script', () => {
+    expect(
+      resolveSetupScriptParam({
+        ...base,
+        setupScript: 'echo repo-config && echo edited',
+        setupScriptName: REPO_CONFIG_SCRIPT_NAME,
+        repoConfigScript: 'echo repo-config',
+        repoConfigScriptRepo: '/repo/a',
+      }),
+    ).toBe('echo repo-config && echo edited');
+  });
+
+  it("does not treat another repo's cached config script as the repo-config default", () => {
+    // Same content but cached for a different repo — the "unedited repo
+    // config" carve-out does not apply, so the script is sent.
+    expect(
+      resolveSetupScriptParam({
+        ...base,
+        setupScript: 'echo repo-config',
+        setupScriptName: REPO_CONFIG_SCRIPT_NAME,
+        repoConfigScript: 'echo repo-config',
+        repoConfigScriptRepo: '/repo/b',
+      }),
+    ).toBe('echo repo-config');
   });
 });

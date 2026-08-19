@@ -1,17 +1,5 @@
-import {
-  afterEach,
-  beforeEach,
-  describe,
-  expect,
-  it,
-  vi,
-} from 'vitest';
-import {
-  cleanup,
-  render,
-  screen,
-  waitFor,
-} from '@testing-library/svelte';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { cleanup, render, screen, waitFor } from '@testing-library/svelte';
 
 const mockState = vi.hoisted(() => {
   type Subscriber<T> = (value: T) => void;
@@ -60,7 +48,9 @@ vi.mock('svelte-fa', async () => ({
 }));
 vi.mock('@fortawesome/free-solid-svg-icons', () => ({
   faCheck: { iconName: 'check' },
+  faCircleInfo: { iconName: 'circle-info' },
   faCopy: { iconName: 'copy' },
+  faSliders: { iconName: 'sliders' },
   faTrash: { iconName: 'trash' },
 }));
 vi.mock('$lib/icons/faNote', () => ({ faNote: { iconName: 'note' } }));
@@ -74,7 +64,8 @@ vi.mock('$features/agent/browser', () => ({
   },
 }));
 vi.mock('$store/renderer/store', async () => {
-  const { createAppStoreMockModule } = await import('$store/renderer/utils/test-helpers/store-mock');
+  const { createAppStoreMockModule } =
+    await import('$store/renderer/utils/test-helpers/store-mock');
 
   return createAppStoreMockModule({
     state: () => ({ agents: mockState.agents.get() }),
@@ -139,17 +130,31 @@ vi.mock('$store/renderer/slices/model/model-selectors', () => ({
   selectSelectedModel: () => mockState.defaultModel,
 }));
 vi.mock('$store/renderer/slices/user-preferences/user-preferences-selectors', () => ({
+  selectAgentFontStyle: () => ({
+    subscribe: (run: (value: string) => void) => (run('sans'), () => {}),
+  }),
   selectAgentFontStyleLabel: () => ({
     subscribe: (run: (value: string) => void) => (run('Default'), () => {}),
   }),
   selectIsAgentMonospace: () => ({
     subscribe: (run: (value: boolean) => void) => (run(false), () => {}),
   }),
+  selectShowReasoningBlocks: () => ({
+    subscribe: (run: (value: boolean) => void) => (run(false), () => {}),
+  }),
 }));
-vi.mock('$store/renderer/slices/user-preferences/user-preferences-slice', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('$store/renderer/slices/user-preferences/user-preferences-slice')>()),
-  cycleFontStyle: () => ({ type: 'userPreferences/cycleFontStyle' }),
-}));
+vi.mock(
+  '$store/renderer/slices/user-preferences/user-preferences-slice',
+  async (importOriginal) => ({
+    ...(await importOriginal<
+      typeof import('$store/renderer/slices/user-preferences/user-preferences-slice')
+    >()),
+    setAgentFontStyle: (style: string) => ({
+      type: 'fontSettings/setAgentFontStyle',
+      payload: [style],
+    }),
+  }),
+);
 vi.mock('$store/renderer/slices/specialists/specialists-selectors', () => ({
   selectSpecialists: () => ({
     subscribe: (run: (value: unknown[]) => void) => (run([]), () => {}),
@@ -157,7 +162,9 @@ vi.mock('$store/renderer/slices/specialists/specialists-selectors', () => ({
   selectSpecialistName: { select: () => undefined },
 }));
 vi.mock('$store/renderer/slices/panel-layout/panel-layout-slice', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('$store/renderer/slices/panel-layout/panel-layout-slice')>()),
+  ...(await importOriginal<
+    typeof import('$store/renderer/slices/panel-layout/panel-layout-slice')
+  >()),
   closeTab: () => ({ type: 'panelLayout/closeTab' }),
 }));
 vi.mock('$lib/utils/workspace-navigation', () => ({ navigateToNote: vi.fn() }));

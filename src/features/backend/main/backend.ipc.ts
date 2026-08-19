@@ -23,32 +23,377 @@
  * (RESUB-1). Main-process consumers observe the same signal directly via
  * `onBackendReconnected(handler)`.
  */
+import { EventEmitter } from 'node:events';
 import { app, BrowserWindow, ipcMain } from 'electron';
 import { Logger } from '$shared/logger';
 import { IPC_CHANNELS } from '$shared/ipc-registry';
-import { resolveBackendConfig } from './backend-connection';
+import { cancelInflightHostExecStreamsForBackendSwitch } from '$shared/main/host-exec-stream';
 import {
-  JsonRpcClient,
-  type ConnectionStatus,
-  type JsonRpcNotification,
-} from './json-rpc-client';
+  AuthRejectedError,
+  captureFingerprint,
+  PinMismatchError,
+  resolveBackendConfig,
+  type BackendConnectionConfig,
+} from './backend-connection';
+import { JsonRpcClient, type ConnectionStatus, type JsonRpcNotification } from './json-rpc-client';
+import {
+  disposeAllTransferConnections,
+  requestOverTransferConnection,
+  shouldUseTransferConnection,
+} from './transfer-connections';
 import { JsonRpcError } from './json-rpc-errors';
 import { getOrCreateClientId, persistClientId } from './client-identity';
 import { formatTransportInfo } from './transport-info';
+import { readPinnedVersion } from './intentd-version-pin';
 import {
+  getLocalDaemonProtocolVersion,
   getSidecarRunLog,
   getSidecarStartupFailure,
   onSidecarGaveUp,
   onSidecarStartupFailed,
   spawnSidecarOnDemand,
 } from './intentd-sidecar';
+import {
+  getOrphanedSidecarInfo,
+  setDaemonVersionInfo,
+  setOrphanedSidecarInfo,
+} from './connection-mode';
+import { detectOrphanedSidecar } from './intentd-orphan';
+import { defaultKill, restartOrphanedSidecar } from './orphan-recovery';
+import * as connectionsStore from './connections-store';
 import { registerBrowserExecReverseHandler } from '../../browser/main/browser-exec-reverse';
+import { LOCAL_CONNECTION_ID } from '../../../shared/types/connections';
+import type {
+  AddConnectionResult,
+  CaptureFingerprintResult,
+  ConnectionAuthRejectedEvent,
+  ConnectionBootFallbackEvent,
+  ConnectionCertMismatchEvent,
+  ConnectionProtocolMismatchEvent,
+  ConnectionsChangedEvent,
+  ConnectionsListResult,
+  ForgetConnectionResult,
+  SwitchConnectionResult,
+} from '../../../shared/types/connections';
+import { compareProtocolMajor } from './protocol-compat';
+import {
+  ConnectionsAddSchema,
+  ConnectionsCaptureFingerprintSchema,
+  ConnectionsForgetSchema,
+  ConnectionsListSchema,
+  ConnectionsSwitchSchema,
+} from '../../../main/ipc-schemas';
+import { createValidatedHandler } from '../../../main/ipc-validation-middleware';
 
 const logger = new Logger('Backend-IPC');
 const BACKEND = IPC_CHANNELS.BACKEND;
+const CONNECTIONS = IPC_CHANNELS.CONNECTIONS;
 
 let client: JsonRpcClient | null = null;
 let handlersRegistered = false;
+
+/**
+ * Lazily-read intentd.version pin, injected into every transport payload so
+ * the renderer can compare the connected daemon's version against the pin in
+ * any connection mode. Cached: the pin file cannot change while running.
+ */
+let pinnedVersionCache: string | null | undefined;
+function getPinnedVersion(): string | null {
+  if (pinnedVersionCache === undefined) {
+    pinnedVersionCache = readPinnedVersion({
+      isPackaged: app.isPackaged,
+      resourcesPath: process.resourcesPath,
+    });
+  }
+  return pinnedVersionCache;
+}
+
+/**
+ * Stable/persistent reconnect forwarder (T8). Main-process services
+ * (terminal registry, notification.service,
+ * app-settings, ACP terminal) attach their reconnect/resubscribe handlers via
+ * {@link onBackendReconnected} exactly ONCE at registration time. Historically
+ * those handlers were attached directly to the live JsonRpcClient instance — so
+ * after a {@link switchBackend} disposed that client and built a new one, the
+ * handlers were stranded on the dead client and never re-attached, and a
+ * post-switch daemon reconnect would silently fail to replay their
+ * subscriptions.
+ *
+ * The forwarder is a single long-lived emitter that outlives every client swap.
+ * Each freshly constructed client's `reconnected` event is piped into it, and
+ * {@link switchBackend} emits one `reconnected` through it right after building
+ * the new client so registered services re-subscribe against the new target
+ * (a fresh client's FIRST connect is a plain `connected`, not a `reconnected`,
+ * so without this nudge the swap would not trigger a resubscribe).
+ */
+const backendReconnectForwarder = new EventEmitter();
+// One listener per main-process service; the default cap of 10 is comfortable
+// today but raise the ceiling so adding services never trips a false leak warn.
+backendReconnectForwarder.setMaxListeners(50);
+
+/**
+ * Stable/persistent notification forwarder (T9). Same rationale as
+ * {@link backendReconnectForwarder}, applied to the daemon `notification`
+ * stream: long-lived main-process services (terminal registry,
+ * notification.service, app-settings, ACP terminal)
+ * attach their notification listener exactly ONCE via
+ * {@link onBackendNotification}. Historically each attached directly to the
+ * live JsonRpcClient instance, so after a {@link switchBackend} disposed that
+ * client the listener was stranded on the dead client — every daemon
+ * `events.event` on the new client (terminal output/exit, script state/output,
+ * `agent:idle`, `settings:changed`) was silently dropped for the rest of the
+ * session. The forwarder outlives every client swap; each freshly built
+ * client's `notification` event is piped into it.
+ */
+const backendNotificationForwarder = new EventEmitter();
+backendNotificationForwarder.setMaxListeners(50);
+
+/**
+ * Stable/persistent status forwarder (T9). Mirrors
+ * {@link backendNotificationForwarder} for the `status` stream that the
+ * app-settings / notification.service `armStatusRetry` connect-retry hooks
+ * need: a `status` listener attached to the live client would be stranded by a
+ * switch, so it registers here instead and observes the new client's
+ * transitions.
+ */
+const backendStatusForwarder = new EventEmitter();
+backendStatusForwarder.setMaxListeners(50);
+
+/**
+ * Connection target for the NEXT `getBackendClient()` construction. `null`
+ * means "resolve the local/env default" (startup + switch-back-to-local); a
+ * non-null value is the pinned `wss` target selected by the last
+ * {@link switchBackend}. The live client is always rebuilt from this after a
+ * {@link disposeBackendClient}, so the active transport follows the switch.
+ */
+let currentConfig: BackendConnectionConfig | null = null;
+
+/**
+ * Identity of the remote connection the live client is pinned to, carried onto
+ * the {@link ConnectionCertMismatchEvent} when {@link PinMismatchError} fires.
+ * `null` while connected to the local sidecar (UDS has no cert to mismatch).
+ */
+let activeConnectionMeta: { id: string; host: string; port: number } | null = null;
+
+/**
+ * One-shot guard so a pinned-cert mismatch surfaces a single failure event per
+ * client — the reconnect loop re-raises {@link PinMismatchError} on every retry
+ * against an unchanged cert, but the renderer only needs one blocking modal.
+ * Reset whenever a fresh client is constructed.
+ */
+let certMismatchNotified = false;
+
+/**
+ * One-shot guard so a WSS auth rejection (HTTP 401/403) surfaces a single
+ * failure event per client — the reconnect loop re-raises
+ * {@link AuthRejectedError} on every retry against an unchanged token, but the
+ * renderer only needs one notice. Reset whenever a fresh client is constructed
+ * (parallels {@link certMismatchNotified}).
+ */
+let authRejectedNotified = false;
+
+/**
+ * The LOCAL intentd's `protocolVersion`, learned from the `client.hello`
+ * handshake against the local sidecar (`activeConnectionMeta === null`). Used
+ * as the baseline for the protocol-compatibility check when the FE later
+ * switches to a remote (T15). `null` until the first local handshake resolves.
+ *
+ * This is only ONE of two baseline sources: it is populated by the disposable
+ * local renderer client, so a fast switch to a remote before the local hello
+ * resolves would dispose that client and leave this `null`. The stable fallback
+ * is the sidecar manager's startup handshake probe
+ * ({@link getLocalDaemonProtocolVersion}), which survives client disposal — see
+ * {@link resolveLocalProtocolBaseline} (cloudlands-fe#823).
+ */
+let localProtocolVersion: string | null = null;
+
+/**
+ * One-shot guard so a remote's protocol mismatch surfaces a single non-blocking
+ * warning per client — the reconnect loop re-runs `client.hello` on every
+ * retry, but the renderer only needs one notice. Reset whenever a fresh client
+ * is constructed (parallels {@link certMismatchNotified}).
+ */
+let protocolMismatchNotified = false;
+
+/**
+ * Sticky protocol-mismatch for the CURRENTLY active backend, or `null` when the
+ * active backend matches local (or is local). Persisted here in main and
+ * replayed on {@link listConnections} so a renderer that registered its
+ * `connections:protocol-mismatch` listener AFTER the one-shot broadcast fired
+ * still surfaces the advisory modal + menu warning (cloudlands-fe#823).
+ *
+ * A backend switch destroys the initiating renderer and creates a new window;
+ * a fast remote can broadcast the mismatch before the new renderer subscribes,
+ * so the one-shot event alone is lossy. This latched copy closes that race.
+ * Cleared whenever a fresh client is constructed (see {@link getBackendClient})
+ * — the next `client.hello` re-detects a mismatch for a mismatching remote and
+ * leaves it null for a matching/local backend.
+ */
+let activeProtocolMismatch: ConnectionProtocolMismatchEvent | null = null;
+
+/**
+ * Origin of the flow that pinned the CURRENT client to a remote, stamped onto
+ * any protocol-mismatch payload it latches (`ConnectionProtocolMismatchEvent.origin`).
+ * `'boot'` while {@link reconcileActiveConnectionOnBoot} restores a persisted
+ * remote — the renderer can then suppress the advisory modal (menu warning
+ * only) since the user did not just initiate a switch. `'switch'` for an
+ * explicit {@link switchBackend} — modal-worthy, current behavior. Reset to
+ * `'switch'` on every {@link disposeBackendClient} (each explicit switch
+ * disposes before rebuilding), so only the boot path re-tags it.
+ */
+let protocolMismatchOrigin: 'boot' | 'switch' = 'switch';
+
+/**
+ * Sticky auth-rejection for the CURRENTLY active backend, or `null` when its
+ * auth is good (or it is local). Persisted here in main and replayed on
+ * {@link listConnections} so a renderer/window created or reloaded AFTER the
+ * one-shot `connections:auth-rejected` broadcast fired (including the boot
+ * path) still surfaces the actionable "authentication rejected" state —
+ * exactly the {@link activeProtocolMismatch} pattern. Cleared whenever a fresh
+ * client is constructed (a re-pair or switch builds a new client whose own
+ * connect re-detects any rejection).
+ */
+let activeAuthRejected: ConnectionAuthRejectedEvent | null = null;
+
+/**
+ * Sticky boot-time backend-restore fallback notice (T19), or `null`. Set by
+ * {@link reconcileActiveConnectionOnBoot} when a persisted remote `activeId` was
+ * unreachable at boot and the FE fell back to local. Replayed on
+ * {@link listConnections} (the initial `connections:list` fetch) so the renderer
+ * surfaces the non-blocking notice — the fallback happens before any window
+ * exists, so a live broadcast alone would be lost. Cleared once consumed by
+ * that first list fetch so it never re-pops on a later refresh.
+ */
+let bootFallbackNotice: ConnectionBootFallbackEvent | null = null;
+
+/**
+ * Bounded timeout for the boot reconnect attempt against a persisted remote
+ * (T19). Long enough to ride out a slow-but-reachable LAN handshake, short
+ * enough that an unreachable remote never stalls startup — on timeout the FE
+ * falls back to the always-available local sidecar.
+ */
+let bootReconnectTimeoutMs = 4_000;
+
+/**
+ * Window-teardown seam for a backend switch (T4). Two split hooks, called
+ * around the client swap so the outgoing backend's layout is captured while its
+ * windows are still live and the incoming backend's windows only open once the
+ * new client is connecting:
+ *   - `captureAndClose(fromId)` — persist the outgoing backend's workspace/HUD
+ *     windows under `fromId`, then destroy them all.
+ *   - `restore(toId)` — restore `toId`'s saved sessions, or open a fresh window.
+ * Injectable so switch-orchestration unit tests never pull in the Electron
+ * window module.
+ */
+interface BackendWindowHooks {
+  captureAndClose(fromBackendId: string): Promise<void>;
+  restore(toBackendId: string): void | Promise<void>;
+}
+const defaultWindowHooks: BackendWindowHooks = {
+  async captureAndClose(fromBackendId) {
+    const mod = (await import('../../../main/window')) as unknown as {
+      captureAndCloseWindowsForBackendSwitch: (id: string) => Promise<void>;
+    };
+    await mod.captureAndCloseWindowsForBackendSwitch(fromBackendId);
+  },
+  async restore(toBackendId) {
+    const mod = (await import('../../../main/window')) as unknown as {
+      restoreWindowsForBackend: (id: string) => void;
+    };
+    mod.restoreWindowsForBackend(toBackendId);
+  },
+};
+let windowHooks: BackendWindowHooks = defaultWindowHooks;
+
+/** @internal Test seam: override the window-teardown hooks. */
+export function __setBackendWindowHooksForTesting(hooks: BackendWindowHooks | null): void {
+  windowHooks = hooks ?? defaultWindowHooks;
+}
+
+/**
+ * @internal Test seams for the protocol-compat + sticky-mismatch flow (#823).
+ * These poke the module-level baseline/active-mismatch state directly so the
+ * early-switch and sticky-replay behaviors can be exercised without standing up
+ * a live JsonRpcClient/transport.
+ */
+export function __setActiveConnectionMetaForTesting(
+  meta: { id: string; host: string; port: number } | null,
+): void {
+  activeConnectionMeta = meta;
+}
+/** @internal Test seam: read the connection identity the live client is pinned to. */
+export function __getActiveConnectionMetaForTesting(): {
+  id: string;
+  host: string;
+  port: number;
+} | null {
+  return activeConnectionMeta;
+}
+export function __setLocalProtocolVersionForTesting(version: string | null): void {
+  localProtocolVersion = version;
+}
+export function __handleHelloProtocolVersionForTesting(protocolVersion: string | null): void {
+  handleHelloProtocolVersion(protocolVersion);
+}
+export function __getActiveProtocolMismatchForTesting(): ConnectionProtocolMismatchEvent | null {
+  return activeProtocolMismatch;
+}
+export function __listConnectionsForTesting(): Promise<ConnectionsListResult> {
+  return listConnections();
+}
+export function __resetBackendProtocolStateForTesting(): void {
+  localProtocolVersion = null;
+  protocolMismatchNotified = false;
+  activeProtocolMismatch = null;
+  protocolMismatchOrigin = 'switch';
+  activeConnectionMeta = null;
+  bootFallbackNotice = null;
+  activeAuthRejected = null;
+}
+/** @internal Test seam: read the latched auth-rejection for the active backend. */
+export function __getActiveAuthRejectedForTesting(): ConnectionAuthRejectedEvent | null {
+  return activeAuthRejected;
+}
+/** @internal Test seam: poke the latched auth-rejection directly. */
+export function __setActiveAuthRejectedForTesting(event: ConnectionAuthRejectedEvent | null): void {
+  activeAuthRejected = event;
+}
+/** @internal Test seam: shorten the T19 boot-reconnect timeout. */
+export function __setBootReconnectTimeoutForTesting(ms: number): void {
+  bootReconnectTimeoutMs = ms;
+}
+/** @internal Test seam: read the latched T19 boot-fallback notice. */
+export function __getBootFallbackNoticeForTesting(): ConnectionBootFallbackEvent | null {
+  return bootFallbackNotice;
+}
+
+/**
+ * Whether the live client is pinned to a REMOTE backend (a `wss` target
+ * selected by {@link switchBackend}) rather than the local sidecar/env default.
+ *
+ * `activeConnectionMeta` is the discriminator: `null` for local (UDS has no
+ * remote identity), set to the remote's identity after a switch. Read-only and
+ * dependency-light so the quit flow can ask "does a second, local daemon still
+ * need checking?" without pulling in connection state it does not own.
+ */
+export function isRemoteBackendActive(): boolean {
+  return activeConnectionMeta !== null;
+}
+
+/**
+ * Whether the live client targets a daemon that is guaranteed to run on THIS
+ * host: no saved remote is active AND the resolved transport is UDS (a UDS
+ * socket is same-host by construction). False for saved remotes and for the
+ * env/dev transports (`INTENTD_WS_URL`, `INTENTD_TCP`, dev loopback WS), which
+ * may point at a daemon on another machine — callers gating platform-dependent
+ * daemon capabilities (e.g. the win32 stack-sampling menu gate, #1889) must
+ * not assume those share the FE's platform.
+ */
+export function isSameHostBackendActive(): boolean {
+  if (activeConnectionMeta !== null) return false;
+  const config = currentConfig ?? resolveBackendConfig(process.env, { isDev: !app.isPackaged });
+  return config.transport === 'uds';
+}
 
 /** Liveness heartbeat interval; reconnect-on-close cannot detect half-open sockets. */
 const HEARTBEAT_INTERVAL_MS = 30_000;
@@ -56,12 +401,21 @@ const HEARTBEAT_INTERVAL_MS = 30_000;
 /** Lazily create, wire, and start the shared main-process JSON-RPC client. */
 export function getBackendClient(): JsonRpcClient {
   if (client) return client;
-  // Dev (unpackaged) builds default to the loopback WebSocket transport; the
-  // packaged app stays on UDS. Env overrides (`INTENTD_SOCKET`, `INTENTD_WS_URL`)
-  // win either way — see `resolveBackendConfig`.
+  // A fresh client starts with clean cert- and protocol-mismatch guards. The
+  // incoming backend's own `client.hello` re-detects any mismatch.
+  certMismatchNotified = false;
+  authRejectedNotified = false;
+  protocolMismatchNotified = false;
+  activeProtocolMismatch = null;
+  activeAuthRejected = null;
+  // Local and packaged builds default to UDS. Explicit transport overrides
+  // (`INTENTD_SOCKET`, `INTENTD_WS_URL`, `INTENTD_TCP`) win either way — see
+  // `resolveBackendConfig`. After a switch to a remote
+  // backend, `currentConfig` pins the `wss` target selected by `switchBackend`;
+  // it is `null` for the local sidecar (startup + switch-back-to-local).
   const isDev = !app.isPackaged;
   const instance = new JsonRpcClient({
-    config: resolveBackendConfig(process.env, { isDev }),
+    config: currentConfig ?? resolveBackendConfig(process.env, { isDev }),
     // Enable a liveness heartbeat: reconnect-on-close alone misses a silently
     // half-open socket. `host.status` is the transport-agnostic capability
     // probe (PROTOCOL.md §5.14) — answered on BOTH UDS and WSS — so it works
@@ -69,6 +423,11 @@ export function getBackendClient(): JsonRpcClient {
     // picked. `system.status` (PROTOCOL.md §5.7) is intentionally UDS-only.
     // A transport timeout/failure trips a reconnect.
     heartbeatIntervalMs: HEARTBEAT_INTERVAL_MS,
+    // One slow control response does not prove that a live socket is dead. The
+    // shared daemon can briefly exceed the request bound under dev load, so wait
+    // for one confirming failure. Socket close/error events still reconnect
+    // immediately in JsonRpcClient.
+    healthCheckFailureThreshold: 2,
     healthCheck: async () => {
       await instance.request('host.status');
     },
@@ -77,21 +436,40 @@ export function getBackendClient(): JsonRpcClient {
     // survives app restarts and renderer reloads.
     helloParams: async () => ({ clientId: await getOrCreateClientId() }),
     onHelloResult: (result) => {
-      const clientId =
+      const obj =
         result && typeof result === 'object'
-          ? (result as { clientId?: unknown }).clientId
+          ? (result as { clientId?: unknown; protocolVersion?: unknown })
           : undefined;
+      const clientId = obj?.clientId;
       if (typeof clientId === 'string' && clientId.length > 0) {
         void persistClientId(clientId);
       }
+      // T15: `protocolVersion` from the handshake feeds the protocol-compat
+      // check — record it for local, compare it against local for a remote.
+      handleHelloProtocolVersion(
+        typeof obj?.protocolVersion === 'string' ? obj.protocolVersion : null,
+      );
     },
   });
-  instance.on('notification', (notification: JsonRpcNotification) =>
-    broadcast(BACKEND.NOTIFICATION, notification),
-  );
+  instance.on('notification', (notification: JsonRpcNotification) => {
+    broadcast(BACKEND.NOTIFICATION, notification);
+    // Pipe the live client's notifications through the stable forwarder so
+    // main-process services (attached once via onBackendNotification) keep
+    // receiving daemon events regardless of how many client swaps have
+    // happened since they registered. See `backendNotificationForwarder`.
+    backendNotificationForwarder.emit('notification', notification);
+  });
   instance.on('status', (status: ConnectionStatus) => {
-    const transport = formatTransportInfo(instance.getConfig());
-    broadcast(BACKEND.STATUS, { status, transport });
+    const transport = formatTransportInfo(instance.getConfig(), getPinnedVersion());
+    // `reconnectAttempts` counts retries since the last successful connect so
+    // the daemon-loss overlay can show live retry progress (#1750).
+    broadcast(BACKEND.STATUS, {
+      status,
+      transport,
+      reconnectAttempts: instance.getReconnectAttempts(),
+    });
+    // Same stable-forwarder pipe for `status`; see `backendStatusForwarder`.
+    backendStatusForwarder.emit('status', status);
   });
   // On reconnect the daemon has already dropped every in-memory subscription
   // (see intentd's event-bus lifecycle); broadcast a distinct `{ status:
@@ -100,12 +478,71 @@ export function getBackendClient(): JsonRpcClient {
   // coarse state. This piggybacks on the existing `backend:status` channel to
   // avoid growing the preload allow-list surface. See RESUB-1.
   instance.on('reconnected', () => {
-    const transport = formatTransportInfo(instance.getConfig());
-    broadcast(BACKEND.STATUS, { status: 'connected', reconnected: true, transport });
+    const transport = formatTransportInfo(instance.getConfig(), getPinnedVersion());
+    broadcast(BACKEND.STATUS, {
+      status: 'connected',
+      reconnected: true,
+      transport,
+      reconnectAttempts: instance.getReconnectAttempts(),
+    });
+    // Pipe the live client's reconnect through the stable forwarder so
+    // main-process services (attached once via onBackendReconnected) replay
+    // their subscriptions — regardless of how many client swaps have happened
+    // since they registered. See `backendReconnectForwarder`.
+    backendReconnectForwarder.emit('reconnected');
   });
-  instance.on('error', (error: Error) =>
-    logger.warn('Backend transport error', { error: error.message }),
-  );
+  instance.on('error', (error: Error) => {
+    // A pinned-cert mismatch (PROTOCOL §1.2) is NOT a transient transport blip:
+    // the remote presented a certificate whose fingerprint differs from the one
+    // captured at trust-on-first-use time. Surface a single blocking failure
+    // event to the renderer instead of silently reconnecting into a changed
+    // cert (spec "Trust-on-first-use flow", no silent re-trust).
+    if (error instanceof PinMismatchError) {
+      if (!certMismatchNotified && activeConnectionMeta) {
+        certMismatchNotified = true;
+        const payload: ConnectionCertMismatchEvent = {
+          id: activeConnectionMeta.id,
+          host: activeConnectionMeta.host,
+          port: activeConnectionMeta.port,
+          expectedFingerprint: error.expected,
+          actualFingerprint: error.actual,
+        };
+        broadcast(CONNECTIONS.CERT_MISMATCH, payload);
+      }
+      logger.warn('Backend certificate fingerprint mismatch', {
+        host: activeConnectionMeta?.host,
+      });
+      return;
+    }
+    // A 401/403 WebSocket-upgrade rejection (PROTOCOL §2.1: bad/rotated token,
+    // or the WS API is disabled) is NOT a transient transport blip either:
+    // reconnecting with the same token will keep failing. Surface a single
+    // machine-readable auth-rejected event per client instead of a generic
+    // transport error.
+    if (error instanceof AuthRejectedError) {
+      if (!authRejectedNotified && activeConnectionMeta) {
+        authRejectedNotified = true;
+        const payload: ConnectionAuthRejectedEvent = {
+          id: activeConnectionMeta.id,
+          host: activeConnectionMeta.host,
+          port: activeConnectionMeta.port,
+          statusCode: error.statusCode,
+        };
+        // Latch BEFORE broadcasting so a renderer that fetches
+        // `connections:list` between the broadcast and its own listener
+        // registration still replays it (same ordering as the sticky
+        // protocol mismatch).
+        activeAuthRejected = payload;
+        broadcast(CONNECTIONS.AUTH_REJECTED, payload);
+      }
+      logger.warn('Backend rejected WebSocket authentication', {
+        host: activeConnectionMeta?.host,
+        statusCode: error.statusCode,
+      });
+      return;
+    }
+    logger.warn('Backend transport error', { error: error.message });
+  });
   // FE-served reverse intents (PROTOCOL §5.14). `browser.exec` is dispatched
   // from the daemon back to us and executed against the ported browser action
   // pipeline. Screenshot assets are round-tripped through `note.saveAsset` via
@@ -120,14 +557,59 @@ export function getBackendClient(): JsonRpcClient {
 
 /**
  * Register a main-process listener for backend reconnects. Fires each time the
- * shared JsonRpcClient re-establishes the connection after a drop so consumers
- * that hold long-lived `events.subscribe` subscriptions (terminal registry,
- * script manager, ACP terminal handler) can re-issue them. Returns a disposer.
+ * shared JsonRpcClient re-establishes the connection after a drop — AND once
+ * per {@link switchBackend} — so consumers that hold long-lived
+ * `events.subscribe` subscriptions (terminal registry, script manager,
+ * notification/app-settings services, ACP terminal handler) can re-issue them.
+ * Returns a disposer.
+ *
+ * The handler is attached to the stable {@link backendReconnectForwarder}, NOT
+ * to the live client instance, so it survives client swaps: a service registers
+ * once and keeps replaying subscriptions against whatever client is current,
+ * even across an arbitrary number of backend switches.
  */
 export function onBackendReconnected(handler: () => void): () => void {
-  const instance = getBackendClient();
-  instance.on('reconnected', handler);
-  return () => instance.off('reconnected', handler);
+  // Ensure the shared client exists (and is wired into the forwarder) so a
+  // reconnect against the current transport actually reaches this handler.
+  getBackendClient();
+  backendReconnectForwarder.on('reconnected', handler);
+  return () => backendReconnectForwarder.off('reconnected', handler);
+}
+
+/**
+ * Register a main-process listener for daemon JSON-RPC notifications
+ * (`events.event` and friends). Fires for every notification on whatever client
+ * is currently live. Returns a disposer.
+ *
+ * Like {@link onBackendReconnected}, the handler is attached to the stable
+ * {@link backendNotificationForwarder}, NOT to the live client instance, so it
+ * survives client swaps: a service registers once and keeps receiving daemon
+ * events against whatever client is current, even across an arbitrary number of
+ * backend switches.
+ */
+export function onBackendNotification(
+  handler: (notification: JsonRpcNotification) => void,
+): () => void {
+  // Ensure the shared client exists (and is wired into the forwarder) so
+  // notifications on the current transport actually reach this handler.
+  getBackendClient();
+  backendNotificationForwarder.on('notification', handler);
+  return () => backendNotificationForwarder.off('notification', handler);
+}
+
+/**
+ * Register a main-process listener for backend connection-status transitions
+ * (the same values broadcast on `backend:status`). Fires for every status
+ * change on whatever client is currently live. Returns a disposer.
+ *
+ * Attached to the stable {@link backendStatusForwarder}, so a connect-retry
+ * `status` listener (app-settings / notification.service `armStatusRetry`)
+ * survives client swaps instead of stranding on the disposed client.
+ */
+export function onBackendStatus(handler: (status: ConnectionStatus) => void): () => void {
+  getBackendClient();
+  backendStatusForwarder.on('status', handler);
+  return () => backendStatusForwarder.off('status', handler);
 }
 
 /** Broadcast a payload to every live renderer window. */
@@ -146,6 +628,66 @@ function broadcast(channel: string, payload: unknown): void {
   }
 }
 
+/**
+ * Consume a `protocolVersion` from a `client.hello` handshake (T15).
+ *
+ * The live client's identity discriminates local vs remote: `activeConnectionMeta`
+ * is `null` for the local sidecar (UDS/env default) and set to the remote's
+ * identity after a {@link switchBackend} to a remote.
+ *   - Local handshake → record the value as the baseline `localProtocolVersion`.
+ *   - Remote handshake → compare its **major** against the local baseline (see
+ *     {@link resolveLocalProtocolBaseline}); on a mismatch latch it as the
+ *     sticky {@link activeProtocolMismatch} AND broadcast a single non-blocking
+ *     `connections:protocol-mismatch` notice (the connection still proceeds —
+ *     warn-but-allow). An unknown/absent version on either side surfaces
+ *     nothing.
+ */
+function handleHelloProtocolVersion(protocolVersion: string | null): void {
+  const meta = activeConnectionMeta;
+  if (!meta) {
+    // Local sidecar / env default: remember the baseline protocolVersion.
+    if (protocolVersion) localProtocolVersion = protocolVersion;
+    return;
+  }
+  if (protocolMismatchNotified) return;
+  const localBaseline = resolveLocalProtocolBaseline();
+  if (compareProtocolMajor(localBaseline, protocolVersion) !== 'mismatch') return;
+  protocolMismatchNotified = true;
+  const payload: ConnectionProtocolMismatchEvent = {
+    id: meta.id,
+    host: meta.host,
+    port: meta.port,
+    // Both are non-null: `compareProtocolMajor` only returns 'mismatch' when both parse.
+    localProtocolVersion: localBaseline as string,
+    remoteProtocolVersion: protocolVersion as string,
+    // 'boot' when this client was pinned by boot restore (suppresses the
+    // renderer modal), 'switch' for an explicit backend switch.
+    origin: protocolMismatchOrigin,
+  };
+  // Latch BEFORE broadcasting so a renderer that fetches `connections:list`
+  // between the broadcast and its own listener registration still replays it.
+  activeProtocolMismatch = payload;
+  logger.warn('Remote backend protocol version differs from local (warn-only)', {
+    id: meta.id,
+    localProtocolVersion: localBaseline,
+    remoteProtocolVersion: protocolVersion,
+  });
+  broadcast(CONNECTIONS.PROTOCOL_MISMATCH, payload);
+}
+
+/**
+ * Resolve the local intentd protocolVersion baseline for the compat check.
+ *
+ * Prefers the local renderer client's own `client.hello` value
+ * ({@link localProtocolVersion}) when available, and falls back to the sidecar
+ * manager's stable startup-probe value ({@link getLocalDaemonProtocolVersion})
+ * — which survives client disposal — so a switch to a remote before the local
+ * hello resolved still has a baseline to compare against (cloudlands-fe#823).
+ */
+function resolveLocalProtocolBaseline(): string | null {
+  return localProtocolVersion ?? getLocalDaemonProtocolVersion();
+}
+
 /** Normalize a thrown error into a serializable IPC error payload. */
 function toErrorPayload(error: unknown): {
   code: string;
@@ -156,6 +698,648 @@ function toErrorPayload(error: unknown): {
   if (error instanceof JsonRpcError) return error.toErrorPayload();
   const message = error instanceof Error ? error.message : String(error);
   return { code: 'TRANSPORT_ERROR', message, data: { code: 'TRANSPORT_ERROR' } };
+}
+
+// ============================================================================
+// Multi-backend connect: switch orchestration + connections registry IPC.
+// ============================================================================
+
+/**
+ * Restore the last-used backend at boot, with a graceful fallback to local
+ * (T19). The persisted `activeId` records whichever backend was active when the
+ * app last closed. On launch:
+ *   - **Local (or no remote):** nothing to do — the shared client builds from
+ *     the local/env default lazily, which already matches the persisted id.
+ *   - **A remote:** pin the live client to that remote and attempt to connect
+ *     with a **bounded timeout** ({@link bootReconnectTimeoutMs}). The connect
+ *     goes through the normal pinned-cert/token contract, so a changed cert
+ *     still routes to the existing mismatch failure modal (via the client's
+ *     `error` handler) rather than silently re-trusting.
+ *       - **Reachable:** stay on it — the persisted `activeId` already agrees
+ *         with the live transport, so `connections:list` reports the remote.
+ *       - **Unreachable / timed out:** dispose the remote client, fall back to
+ *         the always-running local sidecar (reset `activeId = local`), and latch
+ *         a non-blocking {@link bootFallbackNotice} ("Couldn't reach <label>;
+ *         using this machine") for the renderer to surface on its first
+ *         `connections:list` fetch. No hang — the timeout bounds the wait.
+ *
+ * This reverses the earlier T8 "always reset to local at boot" behavior. The
+ * local sidecar is started before this runs (see main/index.ts) so local is
+ * always available to fall back to.
+ *
+ * Fail-soft: any unexpected error (store read/write, config build) falls back to
+ * local and must never block app startup.
+ *
+ * Post-condition / boot seam (T21): once this promise resolves,
+ * `connectionsStore.getActiveId()` reflects the ACTUALLY-connected backend — the
+ * restored remote when it was reachable, otherwise `local`. Every path that
+ * flips the active id (all fallbacks `await setActiveId(local)`) is awaited
+ * before returning, and the reachable-remote path leaves the already-correct
+ * persisted id untouched. Boot code in main/index.ts must run this to
+ * completion BEFORE window-session restore so restore keys off the real backend.
+ */
+export async function reconcileActiveConnectionOnBoot(): Promise<void> {
+  let activeId: string;
+  try {
+    activeId = await connectionsStore.getActiveId();
+  } catch (error) {
+    logger.warn('Failed to read persisted active backend at boot', {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return; // Nothing built yet; the lazy local client is the safe default.
+  }
+  if (activeId === LOCAL_CONNECTION_ID) return; // Already local — no-op.
+
+  // Resolve the remote's config + label BEFORE building anything, so a bad
+  // record (forgotten remote, missing token) falls back cleanly to local.
+  let config: BackendConnectionConfig;
+  let meta: { id: string; host: string; port: number } | null;
+  let label: string;
+  try {
+    ({ config, meta } = await buildConfigForConnection(activeId));
+    label = await resolveConnectionLabel(activeId);
+  } catch (error) {
+    logger.warn('Cannot restore persisted remote backend at boot; falling back to local', {
+      id: activeId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    await fallBackToLocalOnBoot(activeId, activeId);
+    return;
+  }
+
+  // Pin the live client to the remote and attempt a bounded connect. The
+  // handshake-labeled `host.status` probe (the same call the heartbeat uses,
+  // answered on both transports) resolves once the pinned socket is connected.
+  //
+  // Dispose any client an EARLIER consumer already lazily built from the
+  // local/env default before we got here (the About-panel provider-catalog task
+  // races reconciliation and calls `getBackendClient()`). `currentConfig` only
+  // steers the NEXT construction — it does not re-target a live client — so
+  // without this dispose `getBackendClient()` below would return that stale LOCAL
+  // client, the probe would hit local (reporting the remote "reachable" while the
+  // live transport is actually local), and `activeId` would stay remote: a split
+  // between `getActiveId()` and the real transport. Disposing first forces a
+  // fresh client pinned to the remote, making this reconciliation authoritative —
+  // it truly swaps the live transport onto the resolved backend.
+  disposeBackendClient();
+  currentConfig = meta ? config : null;
+  activeConnectionMeta = meta;
+  // Any protocol mismatch this boot-pinned client's hello latches is boot-origin
+  // (advisory only — no modal); a later explicit switch disposes the client,
+  // which resets the origin back to 'switch'.
+  protocolMismatchOrigin = 'boot';
+  logger.info('Restoring last-used remote backend at boot', { id: activeId });
+  const reachable = await probeBackendReachable(getBackendClient(), bootReconnectTimeoutMs);
+  if (reachable) {
+    logger.info('Restored last-used remote backend at boot', { id: activeId });
+    // Post-connect candidate-host refresh (#1746); fire-and-forget/fail-soft.
+    void refreshRemoteHosts(activeId);
+    // The initial application menu was built before reconciliation (local
+    // assumed) — rebuild menu items gated on the active backend (#1889).
+    app.emit('backend-connection-changed');
+    return;
+  }
+
+  // Unreachable/timed out: tear the remote client down and fall back to local.
+  // A pinned-cert mismatch already surfaced its own blocking modal via the
+  // client `error` handler (certMismatchNotified) — skip the redundant notice.
+  const certMismatch = certMismatchNotified;
+  logger.warn('Last-used remote backend unreachable at boot; falling back to local', {
+    id: activeId,
+    certMismatch,
+  });
+  disposeBackendClient();
+  currentConfig = null;
+  activeConnectionMeta = null;
+  await fallBackToLocalOnBoot(activeId, label, certMismatch);
+}
+
+/**
+ * Fall back to the local sidecar during boot reconciliation: persist
+ * `activeId = local` and, unless a cert-mismatch modal already fired, latch the
+ * non-blocking boot-fallback notice for the renderer's first list fetch. The
+ * store write is fail-soft — a failure must never block startup.
+ */
+async function fallBackToLocalOnBoot(
+  id: string,
+  label: string,
+  certMismatch = false,
+): Promise<void> {
+  try {
+    await connectionsStore.setActiveId(LOCAL_CONNECTION_ID);
+  } catch (error) {
+    logger.warn('Failed to persist local active backend at boot fallback', {
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+  if (!certMismatch) {
+    bootFallbackNotice = { id, label };
+  }
+}
+
+/**
+ * Human label for a connection id, for the boot-fallback notice copy. Prefers
+ * the stored hostname, then the label, then `host:port`, then the raw id.
+ * Fail-soft: any store error yields the id.
+ */
+async function resolveConnectionLabel(id: string): Promise<string> {
+  try {
+    const record = (await connectionsStore.list()).find((c) => c.id === id);
+    if (!record) return id;
+    return record.hostname || record.label || (record.host ? `${record.host}:${record.port}` : id);
+  } catch {
+    return id;
+  }
+}
+
+/**
+ * Resolve whether a freshly-pinned client can reach its backend within a bounded
+ * timeout (T19 boot restore). Issues `host.status` — the transport-agnostic
+ * capability probe answered on both UDS and WSS — and races it against the
+ * timeout so an unreachable/black-hole remote can never hang boot. Resolves
+ * `true` only on a successful response; `false` on rejection or timeout.
+ */
+function probeBackendReachable(client: JsonRpcClient, timeoutMs: number): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
+    let settled = false;
+    const done = (value: boolean): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(value);
+    };
+    const timer = setTimeout(() => done(false), timeoutMs);
+    client.request('host.status', undefined, { timeoutMs }).then(
+      () => done(true),
+      () => done(false),
+    );
+  });
+}
+
+/**
+ * Pull the hostname out of a `host.status` result (PROTOCOL §5.14 — returns
+ * `{ hostname, os, arch, ... }`). Returns a trimmed non-empty hostname, else
+ * `null` so callers keep the `host:port` fallback.
+ */
+function extractHostname(result: unknown): string | null {
+  if (result && typeof result === 'object') {
+    const value = (result as { hostname?: unknown }).hostname;
+    if (typeof value === 'string' && value.trim().length > 0) {
+      return value.trim();
+    }
+  }
+  return null;
+}
+
+/**
+ * Label a freshly-connected remote by its hostname (T14). Reuses the live
+ * client's `host.status` capability probe — the same call the heartbeat issues —
+ * to read the remote machine's hostname, persists it on the connection record,
+ * and re-broadcasts the list so the menu upgrades `host:port` to
+ * `hostname (host:port)`.
+ *
+ * Fire-and-forget by design: it must never block or fail a switch. The
+ * `host.status` request queues until the fresh socket connects, so awaiting it
+ * inline would stall the switch on a slow/unreachable remote — instead the
+ * label upgrades asynchronously once the hostname arrives. Any failure
+ * (unreachable, malformed result, store write error) is swallowed with a warn;
+ * the connection keeps its `host:port` label. Results that arrive after the
+ * active connection has switched away are discarded (monorepo#2221).
+ */
+async function captureRemoteHostname(id: string): Promise<void> {
+  try {
+    // Snapshot the live client for symmetry with `refreshRemoteHosts` (where
+    // awaits precede the request, so the snapshot matters). Here the request
+    // is issued synchronously anyway; the real protection against a stale
+    // capture is switch serialization plus the id guard below.
+    const client = getBackendClient();
+    const result = await client.request('host.status');
+    const hostname = extractHostname(result);
+    // Drop the result when the active connection changed mid-flight — the
+    // snapshot client may have answered just before its disposal.
+    if (hostname && activeConnectionMeta?.id === id) {
+      await connectionsStore.setHostname(id, hostname);
+      await broadcastConnectionsChanged();
+    }
+  } catch (error) {
+    logger.warn('Failed to capture remote hostname for connection label', {
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
+/**
+ * Pull the local-IP list out of a `server.pairingInfo` result (PROTOCOL §2 —
+ * returns `{ token, certFingerprint, port, path, localIps, hostname }`).
+ * Returns the non-empty string entries, else `null` when the shape is absent
+ * or malformed.
+ */
+function extractLocalIps(result: unknown): string[] | null {
+  if (result && typeof result === 'object') {
+    const value = (result as { localIps?: unknown }).localIps;
+    if (Array.isArray(value)) {
+      const ips = value.filter((ip): ip is string => typeof ip === 'string' && ip.trim() !== '');
+      if (ips.length > 0) return ips;
+    }
+  }
+  return null;
+}
+
+/**
+ * Refresh a remote connection's candidate-host list from the live backend's
+ * `server.pairingInfo` (#1746). Skipped when the record's "detect all backend
+ * IPs" option is off. Fire-and-forget / fail-soft by design — the daemon
+ * currently answers `server.pairingInfo` only on LOCAL (UDS) connections and
+ * rejects remote callers with -32001 ("server.* methods are local-only"), so
+ * until the daemon relaxes that gating this refresh quietly no-ops; the stored
+ * host list keeps whatever candidates it already has, and the multi-host
+ * reconnect racing still applies. When the daemon does answer, the persisted
+ * list tracks the backend's current interfaces on every connect.
+ */
+async function refreshRemoteHosts(id: string): Promise<void> {
+  try {
+    // Snapshot the live client BEFORE the first await: a concurrent switch
+    // replaces the mutable global client, and querying the NEW backend here
+    // would persist another backend's IPs under this record.
+    const client = getBackendClient();
+    if (!(await connectionsStore.getDetectHosts(id))) return;
+    const result = await client.request('server.pairingInfo');
+    const ips = extractLocalIps(result);
+    // Drop the result when the active connection changed mid-flight — the
+    // snapshot client may have answered just before its disposal.
+    if (ips && activeConnectionMeta?.id === id) {
+      await connectionsStore.setHosts(id, ips);
+      await broadcastConnectionsChanged();
+    }
+  } catch (error) {
+    logger.debug('Could not refresh candidate hosts from server.pairingInfo (fail-soft)', {
+      id,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
+/** The connections list + active selection, as surfaced to the renderer. */
+async function listConnections(): Promise<ConnectionsListResult> {
+  const [connections, activeId] = await Promise.all([
+    connectionsStore.list(),
+    connectionsStore.getActiveId(),
+  ]);
+  // Replay any sticky protocol mismatch / auth rejection for the active
+  // backend so a renderer that missed the one-shot broadcast (e.g. a window
+  // created by a switch after the remote handshake already fired, or a boot
+  // into a rejecting remote) still surfaces the advisory / actionable state
+  // (cloudlands-fe#823 pattern).
+  return {
+    connections,
+    activeId,
+    protocolMismatch: activeProtocolMismatch,
+    authRejected: activeAuthRejected,
+  };
+}
+
+/** Broadcast the current list + active selection to every window. */
+async function broadcastConnectionsChanged(): Promise<void> {
+  const payload: ConnectionsChangedEvent = await listConnections();
+  broadcast(CONNECTIONS.CHANGED, payload);
+}
+
+/**
+ * Resolve the transport config + cert-mismatch identity for a connection id.
+ * `local` maps to the env/UDS default (no pinned cert); a remote id builds the
+ * pinned `wss` config from its stored host/port/fingerprint + decrypted token.
+ * Throws for an unknown/incomplete connection or a missing token — the caller
+ * runs this BEFORE any teardown so a bad target never disrupts the live backend.
+ *
+ * Exported for the workspace-transfer relay, which builds a second,
+ * short-lived JsonRpcClient to the chosen target while the active client
+ * stays pinned to the source.
+ */
+export async function buildConfigForConnection(id: string): Promise<{
+  config: BackendConnectionConfig;
+  meta: { id: string; host: string; port: number } | null;
+}> {
+  if (id === LOCAL_CONNECTION_ID) {
+    return { config: resolveBackendConfig(process.env, { isDev: !app.isPackaged }), meta: null };
+  }
+  const record = (await connectionsStore.list()).find((c) => c.id === id && !c.isLocal);
+  if (!record || record.host == null || record.port == null || record.fingerprint == null) {
+    throw new Error(`Unknown or incomplete connection: ${id}`);
+  }
+  const token = await connectionsStore.getDecryptedToken(id);
+  if (!token) {
+    throw new Error(`No stored token for connection: ${id}`);
+  }
+  return {
+    config: {
+      transport: 'wss',
+      host: record.host,
+      hosts: record.hosts ?? [record.host],
+      port: record.port,
+      token,
+      fingerprint: record.fingerprint,
+    },
+    meta: { id, host: record.host, port: record.port },
+  };
+}
+
+/**
+ * Tail of the switch-serialization queue: every switch-affecting operation
+ * chains onto it via {@link enqueueSwitchOperation}, so switches run strictly
+ * one at a time. {@link performSwitchBackend} has several await points (store
+ * reads/writes, window hooks) with module state mutated across them (`client`,
+ * `currentConfig`, `activeConnectionMeta`); two interleaved switches could
+ * leave the live client pinned to one backend while `activeId` names another,
+ * and mislabel records via `captureRemoteHostname` (monorepo#2221). Always a
+ * settled-or-pending promise that never rejects — a failed switch must not
+ * poison subsequent switches.
+ */
+let switchQueue: Promise<void> = Promise.resolve();
+
+/**
+ * Run `fn` serialized with every backend switch (monorepo#2228). Beyond plain
+ * switches, the `connections:forget` / `connections:add` handlers and
+ * {@link switchToLocalAndSpawn} make read-decide-switch decisions on
+ * `getActiveId()`; reading the active id OUTSIDE the queue and then
+ * conditionally switching was a TOCTOU — a concurrent switch could land
+ * between the read and the enqueued switch, making the decision stale (e.g.
+ * forget's fall-back-to-local disconnecting a backend the user just selected).
+ * Enqueuing the whole read-decide-switch sequence makes the decision atomic
+ * with respect to switches.
+ *
+ * Inside `fn`, perform switches by calling `performSwitchBackend` DIRECTLY —
+ * anything that enqueues (calling {@link switchBackend},
+ * {@link switchToLocalAndSpawn}, or a nested `enqueueSwitchOperation`) would
+ * chain onto the queue tail behind the currently-running `fn` and
+ * self-deadlock. The returned promise settles with `fn`'s outcome; a rejection
+ * propagates to the caller but never poisons the queue (the tail swallows it).
+ */
+function enqueueSwitchOperation<T>(fn: () => Promise<T>): Promise<T> {
+  const result = switchQueue.then(fn);
+  switchQueue = result.then(
+    () => undefined,
+    () => undefined,
+  );
+  return result;
+}
+
+/**
+ * Switch the live backend to `id` with a clean full teardown + reload:
+ *   1. Resolve+validate the target config first (throws early on a bad id/token,
+ *      leaving the current backend untouched).
+ *   2. **Dispose the previous client and all its subscriptions BEFORE** the new
+ *      target connects — no leaked socket/timers/listeners (spec acceptance:
+ *      "fully disconnects the old daemon ... before connecting the new one").
+ *   3. Capture + close the outgoing backend's windows while they are still live
+ *      (T4 `captureAndClose`), then flip the store's active id and build+start
+ *      the new client so every `getBackendClient()` caller and the status menu
+ *      see the new target.
+ *   4. Restore the incoming backend's windows (T4 `restore`) — after the client
+ *      swap, so restored windows reconnect to the new daemon (or open fresh).
+ *   5. Broadcast the changed list/active selection.
+ *
+ * Invocations are serialized through {@link enqueueSwitchOperation}: each
+ * switch runs to completion before the next begins, so overlapping switches
+ * (e.g. the user clicks a slow backend, then quickly clicks another) can never
+ * interleave across the await points above. Serialization covers every entry
+ * point — the `connections:switch` handler, the `connections:forget`
+ * fall-back-to-local, the `connections:add` switch-to-itself, and
+ * {@link switchToLocalAndSpawn} — the latter three enqueue their whole
+ * read-decide-switch sequence so the `getActiveId()` decision cannot go stale
+ * behind an in-flight switch (monorepo#2228).
+ */
+export function switchBackend(id: string): Promise<SwitchConnectionResult> {
+  return enqueueSwitchOperation(() => performSwitchBackend(id));
+}
+
+/**
+ * The actual switch orchestration; only ever entered from within a serialized
+ * {@link enqueueSwitchOperation} critical section (via {@link switchBackend}
+ * or an enqueued read-decide-switch sequence).
+ */
+async function performSwitchBackend(id: string): Promise<SwitchConnectionResult> {
+  const fromId = await connectionsStore.getActiveId();
+  // (1) Validate + resolve BEFORE any teardown.
+  const { config, meta } = await buildConfigForConnection(id);
+
+  // (2) Capture + close the outgoing backend's windows while they're still live.
+  await windowHooks.captureAndClose(fromId);
+
+  // (2.5) Cancel + notify any in-flight `host.execStream` while the old client is
+  // still connected. Its per-call subscription is bound to the client we are
+  // about to dispose (it could not be migrated onto a stable forwarder like the
+  // T8/T9 long-lived listeners), so without this the consumer's `done` would
+  // hang on remaining output and an exit frame that can never arrive. This
+  // best-effort cancels on the old daemon, then hands each consumer a terminal
+  // cancelled-by-backend-switch frame — issue #1616. Runs BEFORE dispose.
+  await cancelInflightHostExecStreamsForBackendSwitch();
+
+  // (3) Dispose the previous client + subscriptions before connecting the new one.
+  disposeBackendClient();
+
+  // (4) Persist the new active target and build the new client.
+  await connectionsStore.setActiveId(id);
+  currentConfig = meta ? config : null; // null => local/env default on next build
+  activeConnectionMeta = meta;
+  getBackendClient(); // constructs, wires, and starts the new client
+
+  // The new client's first connect is a plain `connected`, not a `reconnected`,
+  // so its own `reconnected` event will not fire on this initial connect. Nudge
+  // the stable forwarder once here so main-process services (attached via
+  // onBackendReconnected) replay their `events.subscribe` calls against the new
+  // client — their requests queue until the fresh socket connects (T8).
+  backendReconnectForwarder.emit('reconnected');
+
+  // (4.5) Label the remote by its hostname once it connects (T14). Reuses the
+  // live client's `host.status`; fire-and-forget so a slow/unreachable remote
+  // never stalls the switch — the label upgrades from `host:port` to
+  // `hostname (host:port)` asynchronously. Skipped for the local sidecar (UDS
+  // has no remote hostname to show; its label is fixed). The candidate-host
+  // refresh (#1746) piggybacks on the same post-connect window, equally
+  // fire-and-forget/fail-soft.
+  if (meta) {
+    void captureRemoteHostname(id);
+    void refreshRemoteHosts(id);
+  }
+
+  // (5) Restore the incoming backend's windows (now targeting the new daemon).
+  await windowHooks.restore(id);
+
+  // (6) Notify the renderer, and the main process (menu items gated on the
+  // active backend, e.g. Help ▸ Sample intentd Process on win32 — #1889).
+  await broadcastConnectionsChanged();
+  app.emit('backend-connection-changed');
+  return { activeId: id };
+}
+
+/**
+ * Spawn the app-managed sidecar on demand (#439 fallback). Probes the live
+ * client's transport first — the on-demand sidecar always binds the local UDS
+ * socket, so a WS/TCP client would keep reconnecting to its original target and
+ * never reach the daemon we spawned, stranding the renderer on a pending spawn.
+ * On a successful spawn, re-broadcast the current status so the reconnect UI
+ * updates while the JsonRpcClient's ≤5s reconnect loop picks up the new socket.
+ *
+ * Extracted from the `backend:spawn-sidecar` handler so {@link switchToLocalAndSpawn}
+ * can reuse the exact same spawn semantics after flipping the active backend to
+ * local (the switch makes the transport `uds`, so the guard then passes).
+ */
+async function performSpawnSidecar(): Promise<{
+  ok: boolean;
+  spawned: boolean;
+  reason?: string;
+  error?: unknown;
+}> {
+  try {
+    const transport = getBackendClient().getConfig().transport;
+    if (transport !== 'uds') {
+      return {
+        ok: false,
+        spawned: false,
+        reason: `connection target is not a local socket (transport: ${transport})`,
+      };
+    }
+    const result = await spawnSidecarOnDemand(
+      process.env,
+      app.isPackaged,
+      process.resourcesPath,
+      process.cwd(),
+    );
+    if (result.ok) {
+      // The daemon-loss modal resolves as soon as the spawn kicked off; the
+      // JsonRpcClient's ≤5s reconnect loop picks up the socket once the
+      // daemon is serving and broadcasts `backend:status` as usual.
+      const client = getBackendClient();
+      broadcast(BACKEND.STATUS, {
+        status: client.getStatus(),
+        transport: formatTransportInfo(client.getConfig(), getPinnedVersion()),
+        reconnectAttempts: client.getReconnectAttempts(),
+      });
+    }
+    return result;
+  } catch (error) {
+    return { ok: false, spawned: false, error: toErrorPayload(error) };
+  }
+}
+
+interface RestartOrphanedSidecarIpcResult {
+  ok: boolean;
+  spawned: boolean;
+  cancelled?: boolean;
+  reason?: string;
+  error?: unknown;
+}
+
+/**
+ * In-flight orphan recovery; concurrent invocations (toast double-click, a
+ * second window) share the same promise so the verify/confirm/kill sequence
+ * runs at most once at a time (mirrors `spawnOnDemandInFlight`).
+ */
+let restartOrphanInFlight: Promise<RestartOrphanedSidecarIpcResult> | null = null;
+
+/**
+ * Kill-and-restart recovery for an orphaned sidecar (#2444): the user accepted
+ * the renderer's offer to replace the adopted leftover daemon (executable
+ * inside our own bundle) with the bundled sidecar. Wires the real main-process
+ * collaborators into {@link restartOrphanedSidecar}: agent-safety via the live
+ * client's `isResponding` flags, a native confirmation dialog when agents
+ * would be interrupted, and the existing on-demand spawn path (which re-probes
+ * the socket and never runs two daemons side by side). On success the new
+ * transport posture is re-broadcast.
+ */
+function performRestartOrphanedSidecar(): Promise<RestartOrphanedSidecarIpcResult> {
+  if (restartOrphanInFlight) return restartOrphanInFlight;
+  restartOrphanInFlight = doPerformRestartOrphanedSidecar().finally(() => {
+    restartOrphanInFlight = null;
+  });
+  return restartOrphanInFlight;
+}
+
+async function doPerformRestartOrphanedSidecar(): Promise<RestartOrphanedSidecarIpcResult> {
+  try {
+    const [{ dialog }, { listRespondingAgents }, { buildOrphanRestartDialogOptions }] =
+      await Promise.all([
+        import('electron'),
+        import('../../../main/running-agents'),
+        import('../../../main/orphan-restart-dialog'),
+      ]);
+    const result = await restartOrphanedSidecar({
+      getOrphanedSidecarInfo,
+      clearOrphanState: () => {
+        setOrphanedSidecarInfo(null);
+        setDaemonVersionInfo(null);
+      },
+      detectOrphan: () => detectOrphanedSidecar(process.env, process.resourcesPath),
+      listRespondingAgents: () => listRespondingAgents(getBackendClient()),
+      confirmInterrupt: async (agents) => {
+        const focused = BrowserWindow.getFocusedWindow();
+        const options = buildOrphanRestartDialogOptions(agents);
+        const outcome = focused
+          ? await dialog.showMessageBox(focused, options)
+          : await dialog.showMessageBox(options);
+        return outcome.response === 0;
+      },
+      kill: defaultKill,
+      spawnSidecar: () =>
+        spawnSidecarOnDemand(process.env, app.isPackaged, process.resourcesPath, process.cwd()),
+      sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    });
+    if (result.ok) {
+      const client = getBackendClient();
+      broadcast(BACKEND.STATUS, {
+        status: client.getStatus(),
+        transport: formatTransportInfo(client.getConfig(), getPinnedVersion()),
+        reconnectAttempts: client.getReconnectAttempts(),
+      });
+    }
+    return result;
+  } catch (error) {
+    return { ok: false, spawned: false, error: toErrorPayload(error) };
+  }
+}
+
+/**
+ * Atomic "Start local intentd" recovery from external/remote mode (T22 review):
+ * switch the active backend to local AND spawn the app-managed sidecar in a
+ * SINGLE main-process action.
+ *
+ * Why this must live wholly in main: {@link switchBackend} captures-and-closes
+ * every window (destroying the renderer that initiated recovery) BEFORE the
+ * switch IPC resolves, so a renderer that switched-to-local and then separately
+ * dispatched the spawn could be torn down before the second step ran — leaving
+ * the user on a fresh local window with intentd never started. Keeping both steps
+ * here makes recovery independent of the initiating renderer's survival.
+ *
+ * Order matters: switch to local FIRST so the live transport becomes the local
+ * UDS socket, THEN spawn — {@link performSpawnSidecar}'s uds guard only passes
+ * once the switch has re-targeted the client. Already-local is a no-op switch
+ * (just spawn), mirroring the renderer's prior guard. The active-id read and
+ * the conditional switch are enqueued as ONE critical section so the no-op
+ * decision cannot go stale behind a concurrent switch (monorepo#2228); the
+ * spawn itself stays outside the queue.
+ */
+export async function switchToLocalAndSpawn(): Promise<{
+  ok: boolean;
+  spawned: boolean;
+  reason?: string;
+  error?: unknown;
+}> {
+  try {
+    await enqueueSwitchOperation(async () => {
+      const activeId = await connectionsStore.getActiveId();
+      if (activeId !== LOCAL_CONNECTION_ID) {
+        await performSwitchBackend(LOCAL_CONNECTION_ID);
+      }
+    });
+  } catch (error) {
+    // A switch failure still lets us attempt the spawn (main may already be
+    // targeting local); surface nothing here — performSpawnSidecar reports its
+    // own outcome and the connections slice carries any switch error.
+    logger.warn('Switch to local before sidecar spawn failed; attempting spawn anyway', {
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+  return performSpawnSidecar();
 }
 
 /** Register the backend bridge IPC handlers (idempotent). */
@@ -176,7 +1360,22 @@ export function registerBackendHandlers(): void {
       // structured `{ok:false}` result wins over a transport timeout.
       const timeoutMs = typeof payload?.timeoutMs === 'number' ? payload.timeoutMs : undefined;
       try {
-        const result = await getBackendClient().request(method, payload?.params, { timeoutMs });
+        const client = getBackendClient();
+        // Bulk attachment transfers on a remote backend ride their own
+        // short-lived connection so a slow-draining 20+ MiB frame never
+        // head-of-line-blocks the main channel (its heartbeat and unrelated
+        // RPCs stay unaffected) — monorepo#2458. The local UDS sidecar keeps
+        // the single socket: no uplink to saturate, same-host bandwidth.
+        if (shouldUseTransferConnection(method, client.getConfig())) {
+          const result = await requestOverTransferConnection(
+            client.getConfig(),
+            method,
+            payload?.params,
+            { timeoutMs },
+          );
+          return { ok: true, result };
+        }
+        const result = await client.request(method, payload?.params, { timeoutMs });
         return { ok: true, result };
       } catch (error) {
         return { ok: false, error: toErrorPayload(error) };
@@ -204,7 +1403,7 @@ export function registerBackendHandlers(): void {
 
   ipcMain.handle(BACKEND.GET_STATUS, async () => {
     const client = getBackendClient();
-    const transport = formatTransportInfo(client.getConfig());
+    const transport = formatTransportInfo(client.getConfig(), getPinnedVersion());
     // Boot-time startup failures fire before this module registers its
     // `onSidecarStartupFailed` listener and before any window exists, so the
     // broadcast alone is lossy. Expose the latched failure here so the
@@ -215,48 +1414,26 @@ export function registerBackendHandlers(): void {
       return {
         status: client.getStatus(),
         transport,
+        reconnectAttempts: client.getReconnectAttempts(),
         sidecarStartupFailed: true as const,
         sidecarStartupFailedReason: startupFailure.reason,
       };
     }
-    return { status: client.getStatus(), transport };
+    return {
+      status: client.getStatus(),
+      transport,
+      reconnectAttempts: client.getReconnectAttempts(),
+    };
   });
 
-  ipcMain.handle(BACKEND.SPAWN_SIDECAR, async () => {
-    try {
-      // The on-demand sidecar always binds the local UDS socket. A WS/TCP
-      // client keeps reconnecting to its original target and would never
-      // reach the daemon we spawned, stranding the renderer on a pending
-      // spawn — refuse instead.
-      const transport = getBackendClient().getConfig().transport;
-      if (transport !== 'uds') {
-        return {
-          ok: false,
-          spawned: false,
-          reason: `connection target is not a local socket (transport: ${transport})`,
-        };
-      }
-      const result = await spawnSidecarOnDemand(
-        process.env,
-        app.isPackaged,
-        process.resourcesPath,
-        process.cwd(),
-      );
-      if (result.ok) {
-        // The daemon-loss modal resolves as soon as the spawn kicked off; the
-        // JsonRpcClient's ≤5s reconnect loop picks up the socket once the
-        // daemon is serving and broadcasts `backend:status` as usual.
-        const client = getBackendClient();
-        broadcast(BACKEND.STATUS, {
-          status: client.getStatus(),
-          transport: formatTransportInfo(client.getConfig()),
-        });
-      }
-      return result;
-    } catch (error) {
-      return { ok: false, spawned: false, error: toErrorPayload(error) };
-    }
-  });
+  ipcMain.handle(BACKEND.SPAWN_SIDECAR, async () => performSpawnSidecar());
+
+  // Kill-and-restart recovery for an orphaned sidecar (#2444).
+  ipcMain.handle(BACKEND.RESTART_ORPHANED_SIDECAR, async () => performRestartOrphanedSidecar());
+
+  // Atomic recovery: switch active → local AND spawn the sidecar in one main-side
+  // action so it survives the initiating window's teardown during the switch.
+  ipcMain.handle(BACKEND.SWITCH_LOCAL_AND_SPAWN, async () => switchToLocalAndSpawn());
 
   // Per-run sidecar log capture: the renderer's daemon-loss dialog offers to
   // show the captured stdout/stderr tail from the last sidecar run. The
@@ -273,7 +1450,8 @@ export function registerBackendHandlers(): void {
       status: instance.getStatus(),
       sidecarStartupFailed: true,
       reason,
-      transport: formatTransportInfo(instance.getConfig()),
+      transport: formatTransportInfo(instance.getConfig(), getPinnedVersion()),
+      reconnectAttempts: instance.getReconnectAttempts(),
     });
   });
 
@@ -291,15 +1469,139 @@ export function registerBackendHandlers(): void {
       status: instance.getStatus(),
       sidecarGaveUp: true,
       reason,
-      transport: formatTransportInfo(instance.getConfig()),
+      transport: formatTransportInfo(instance.getConfig(), getPinnedVersion()),
+      reconnectAttempts: instance.getReconnectAttempts(),
     });
   });
+
+  registerConnectionsHandlers();
 
   logger.info('Backend bridge IPC handlers registered');
 }
 
-/** Dispose the shared client (used on shutdown). */
+/**
+ * Register the multi-backend connections registry IPC handlers (part of
+ * {@link registerBackendHandlers}). Each channel validates its params against
+ * the T0 Zod schema before touching the store/transport. The bearer token
+ * crosses renderer→main only at capture/add time (the user just typed it); it
+ * is consumed here and never echoed onto any returned connection shape.
+ */
+function registerConnectionsHandlers(): void {
+  // List all connections (local first, then remotes) + the active selection.
+  ipcMain.handle(
+    CONNECTIONS.LIST,
+    createValidatedHandler(ConnectionsListSchema, async () => listConnections(), CONNECTIONS.LIST),
+  );
+
+  // Trust-on-first-use: open a `wss` connection, read the presented cert's
+  // fingerprint for the user to confirm, then close. On a structured capture
+  // failure (timeout / connect-failed / no-certificate) reject so the renderer
+  // surfaces the reason; on success return the fingerprint (no token) plus
+  // whether the daemon accepted the token on the capture upgrade, so a bad or
+  // stale token surfaces during pairing instead of after the entry is stored.
+  ipcMain.handle(
+    CONNECTIONS.CAPTURE_FINGERPRINT,
+    createValidatedHandler(
+      ConnectionsCaptureFingerprintSchema,
+      async (_event, params) => {
+        const result = await captureFingerprint(params);
+        if (!result.ok) {
+          throw new Error(result.error);
+        }
+        return {
+          fingerprint: result.fingerprint,
+          tokenValid: result.tokenValid,
+          ...(result.statusCode !== undefined ? { statusCode: result.statusCode } : {}),
+        } satisfies CaptureFingerprintResult;
+      },
+      CONNECTIONS.CAPTURE_FINGERPRINT,
+    ),
+  );
+
+  // Add a remote connection (token encrypted at rest by the store). The store
+  // upserts by host:port, so re-adding an existing target refreshes its
+  // token/fingerprint/label in place. If the upserted record is the ACTIVE
+  // backend, rebuild the live client via a switch to itself so the refreshed
+  // token takes effect immediately (the switch broadcasts the changed list)
+  // and report `switched: true` so the caller skips its own follow-up switch;
+  // otherwise just broadcast so every window reflects the entry. The whole
+  // add + active-id read + conditional switch is ONE enqueued critical
+  // section (monorepo#2228): a stale pre-queue read could re-switch back to
+  // this record after the user had already selected another backend.
+  ipcMain.handle(
+    CONNECTIONS.ADD,
+    createValidatedHandler(
+      ConnectionsAddSchema,
+      async (_event, params) =>
+        enqueueSwitchOperation(async () => {
+          const connection = await connectionsStore.add(params);
+          const activeId = await connectionsStore.getActiveId();
+          if (connection.id === activeId) {
+            await performSwitchBackend(connection.id);
+            return { connection, switched: true } satisfies AddConnectionResult;
+          }
+          await broadcastConnectionsChanged();
+          return { connection, switched: false } satisfies AddConnectionResult;
+        }),
+      CONNECTIONS.ADD,
+    ),
+  );
+
+  // Forget a remote connection. If it was the live backend, fall back to a full
+  // switch to local (teardown + reload) rather than stranding the FE on a
+  // connection that no longer exists; otherwise just broadcast the new list.
+  // The active-id read + forget + conditional fallback is ONE enqueued
+  // critical section (monorepo#2228): a stale pre-queue read could take the
+  // fall-back-to-local after a concurrent switch had already landed on another
+  // backend, disconnecting the backend the user just selected.
+  ipcMain.handle(
+    CONNECTIONS.FORGET,
+    createValidatedHandler(
+      ConnectionsForgetSchema,
+      async (_event, { id }) =>
+        enqueueSwitchOperation(async () => {
+          const wasActive = (await connectionsStore.getActiveId()) === id;
+          await connectionsStore.forget(id); // rejects the reserved local id
+          if (wasActive) {
+            await performSwitchBackend(LOCAL_CONNECTION_ID);
+          } else {
+            await broadcastConnectionsChanged();
+          }
+          return { id } satisfies ForgetConnectionResult;
+        }),
+      CONNECTIONS.FORGET,
+    ),
+  );
+
+  // Switch the live backend (full teardown + reload; see `switchBackend`).
+  ipcMain.handle(
+    CONNECTIONS.SWITCH,
+    createValidatedHandler(
+      ConnectionsSwitchSchema,
+      async (_event, { id }) => switchBackend(id),
+      CONNECTIONS.SWITCH,
+    ),
+  );
+
+  // Pull the one-shot boot-restore fallback notice (T19), consume-once. The
+  // renderer fetches this once on mount and surfaces a non-blocking toast; the
+  // fallback happens before any window exists, so the notice is latched at boot
+  // and delivered here on demand rather than pushed live. No params.
+  ipcMain.handle(CONNECTIONS.GET_BOOT_FALLBACK, async () => {
+    const bootFallback = bootFallbackNotice;
+    bootFallbackNotice = null;
+    return { bootFallback };
+  });
+}
+
+/** Dispose the shared client (used on shutdown and backend switch). */
 export function disposeBackendClient(): void {
+  // In-flight per-transfer connections target the same (outgoing) backend as
+  // the shared client, so they can no longer complete — tear them down too.
+  disposeAllTransferConnections();
+  // The next client is switch-origin unless the boot-restore path re-tags it
+  // (see {@link protocolMismatchOrigin}).
+  protocolMismatchOrigin = 'switch';
   client?.dispose();
   client = null;
 }

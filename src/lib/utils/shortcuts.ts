@@ -99,6 +99,12 @@ export const SHORTCUTS = {
       return m.ui_shortcuts_settings_label();
     },
   },
+  NEW_SPACE_TAB: {
+    key: 'mod+n',
+    get label() {
+      return m.workspace_page_newSpace_title();
+    },
+  },
   NEW_TAB: {
     key: 'mod+t',
     get label() {
@@ -135,10 +141,30 @@ export const SHORTCUTS = {
       return m.ui_shortcuts_goToTab_label();
     },
   },
+  NEXT_SPACE: {
+    key: 'ctrl+tab',
+    get label() {
+      return m.ui_shortcuts_nextSpace_label();
+    },
+  },
+  PREVIOUS_SPACE: {
+    key: 'ctrl+shift+tab',
+    get label() {
+      return m.ui_shortcuts_prevSpace_label();
+    },
+  },
+  MOVE_SPACE_TAB_LEFT: { key: 'alt+shift+left', label: 'Move Space Tab Left' },
+  MOVE_SPACE_TAB_RIGHT: { key: 'alt+shift+right', label: 'Move Space Tab Right' },
   SEARCH: {
     key: 'mod+f',
     get label() {
       return m.ui_shortcuts_search_label();
+    },
+  },
+  WORKSPACE_VIEW_MODE: {
+    key: 'mod+shift+l',
+    get label() {
+      return m.ui_shortcuts_workspaceViewMode_label();
     },
   },
 
@@ -146,7 +172,7 @@ export const SHORTCUTS = {
   // Dock / Agent Navigation
   // ============================================================================
   NEW_AGENT: {
-    key: 'mod+n',
+    key: 'mod+t',
     get label() {
       return m.ui_shortcuts_newAgent_label();
     },
@@ -442,6 +468,21 @@ export function getShortcutDisplay(shortcutKey: keyof typeof SHORTCUTS): string 
   return formatShortcut(shortcut.key);
 }
 
+export function getShortcutChord(
+  shortcutKey: keyof typeof SHORTCUTS,
+  mac = isMac,
+): { key: string; meta: boolean; ctrl: boolean; shift: boolean; alt: boolean } {
+  const parts = SHORTCUTS[shortcutKey].key.toLowerCase().split('+');
+  const key = parts.at(-1) ?? '';
+  return {
+    key,
+    meta: parts.includes('meta') || parts.includes('cmd') || (mac && parts.includes('mod')),
+    ctrl: parts.includes('ctrl') || (!mac && parts.includes('mod')),
+    shift: parts.includes('shift'),
+    alt: parts.includes('alt') || parts.includes('option'),
+  };
+}
+
 /**
  * Check if the current platform is Mac
  */
@@ -513,9 +554,16 @@ export const SHORTCUT_CATEGORIES: Record<
         contexts: ['global'],
       },
       {
+        key: SHORTCUTS.WORKSPACE_VIEW_MODE.key,
+        get label() {
+          return SHORTCUTS.WORKSPACE_VIEW_MODE.label;
+        },
+        contexts: ['global'],
+      },
+      {
         key: 'mod+n',
         get label() {
-          return m.ui_shortcuts_newAgent_label();
+          return m.workspace_page_newSpace_title();
         },
         contexts: ['global'],
       },

@@ -7,6 +7,7 @@ import {
 import {
   initialState as userPreferencesInitialState,
   setAgentFontStyle,
+  setGithubLinkDefaultAction,
   setVolume,
 } from '$store/renderer/slices/user-preferences/user-preferences-slice';
 import {
@@ -26,7 +27,7 @@ import {
   providerCatalogReducer,
 } from '$store/renderer/slices/provider-catalog/provider-catalog-slice';
 import { MOCK_PROVIDER_CATALOG } from '../../../../test/fixtures/provider-catalog.fixture';
-import { createCollection } from '$lib/store-shim/utils/collections/collection-utils';
+import { createCollection } from '@augmentcode/themis/utils/collections/collection-utils';
 import type { StoreState } from '$lib/store/types';
 
 const providerCatalog = providerCatalogReducer(
@@ -78,7 +79,7 @@ function makeState(overrides: Partial<StoreState> = {}): StoreState {
 }
 
 function makeProposal(
-  path = 'backgroundAgents.defaultModel',
+  path = 'quickActions.defaultModel',
   value: unknown = 'claude-sonnet',
 ): Proposal {
   return {
@@ -126,7 +127,7 @@ describe('settings-proposal-actions', () => {
     expect(mocks.dispatch).toHaveBeenCalledWith(setDefaultModel('claude-sonnet'));
     expect(result.reverseChanges).toEqual([
       {
-        path: 'backgroundAgents.defaultModel',
+        path: 'quickActions.defaultModel',
         value: 'old-model',
         apply: { kind: 'redux-action', action: 'backgroundAgentSettings/setDefaultModel' },
       },
@@ -141,6 +142,21 @@ describe('settings-proposal-actions', () => {
     expect(mocks.dispatch).toHaveBeenCalledWith(setAgentFontStyle('monospace'));
   });
 
+  it('applies and reverses the GitHub link default action preference', async () => {
+    const proposal = makeProposal('githubLinks.defaultAction', 'copy-link');
+
+    const result = await applySettingsProposalWork(makeDetail(proposal));
+
+    expect(mocks.dispatch).toHaveBeenCalledWith(setGithubLinkDefaultAction('copy-link'));
+    expect(result.reverseChanges).toEqual([
+      {
+        path: 'githubLinks.defaultAction',
+        value: 'show-choices',
+        apply: { kind: 'redux-action', action: 'userPreferences/setGithubLinkDefaultAction' },
+      },
+    ]);
+  });
+
   it('falls back to the proposal value when a numeric edit is invalid', async () => {
     const proposal = makeProposal('notifications.volume', 0.75);
     const detail = makeDetail(proposal);
@@ -152,13 +168,25 @@ describe('settings-proposal-actions', () => {
     expect(mocks.dispatch).not.toHaveBeenCalledWith(setVolume(NaN));
   });
 
+  it('rejects an invalid update-channel value instead of reporting success', async () => {
+    const proposal = makeProposal('preferences.updateChannel', 'nightly');
+
+    await expect(applySettingsProposalWork(makeDetail(proposal))).rejects.toThrow(
+      'Invalid value for setting "preferences.updateChannel": "nightly"',
+    );
+
+    expect(mocks.dispatch).not.toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'userPreferences/setUpdateChannel' }),
+    );
+  });
+
   it('rolls back applied settings when a later apply write fails', async () => {
     const proposal: Proposal = {
       kind: 'settings-change',
       applyToolCallId: 'tool-settings',
       payload: {
         changes: [
-          { path: 'backgroundAgents.defaultModel', value: 'new-model' },
+          { path: 'quickActions.defaultModel', value: 'new-model' },
           { path: 'mcp.enableUserServers', value: true },
         ],
       },
@@ -180,7 +208,7 @@ describe('settings-proposal-actions', () => {
   it('undo work reapplies reverse changes through the injected dispatch', async () => {
     await undoSettingsProposalWork([
       {
-        path: 'backgroundAgents.defaultModel',
+        path: 'quickActions.defaultModel',
         value: 'old-model',
         apply: { kind: 'redux-action', action: 'backgroundAgentSettings/setDefaultModel' },
       },
@@ -207,7 +235,7 @@ describe('settings-proposal-actions', () => {
     await expect(
       undoSettingsProposalWork([
         {
-          path: 'backgroundAgents.defaultModel',
+          path: 'quickActions.defaultModel',
           value: 'old-model',
           apply: { kind: 'redux-action', action: 'backgroundAgentSettings/setDefaultModel' },
         },

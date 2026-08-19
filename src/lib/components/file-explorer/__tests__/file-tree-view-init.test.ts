@@ -1,7 +1,7 @@
 /**
  * @vitest-environment jsdom
  */
-import { cleanup, render, waitFor } from '@testing-library/svelte';
+import { cleanup, fireEvent, render, waitFor } from '@testing-library/svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import FileTreeView from '../file-tree-view.svelte';
 import { warmImport } from '../../../../test/warm-import';
@@ -10,6 +10,7 @@ const {
   appStore,
   createReadable,
   dispatchMock,
+  error$,
   initializationInputs$,
   initializeFileExplorerMock,
   loadGitStatusMock,
@@ -50,12 +51,14 @@ const {
     isInitialized: false,
   };
   const initializationInputs$ = createReadable(initialInputs);
+  const error$ = createReadable<string | null>(null);
   const workspacePath$ = createReadable('/repo');
 
   return {
     appStore: { state: {}, dispatch: vi.fn() },
     createReadable,
     dispatchMock: vi.fn(),
+    error$,
     initializeFileExplorerMock: vi.fn((...payload: unknown[]) => ({
       type: 'fileExplorer/initializeFileExplorer',
       payload,
@@ -77,6 +80,14 @@ vi.mock('../VirtualizedFileTree.svelte', async () => ({
   default: (await import('../../chat/__tests__/mocks/SlotOnly.svelte')).default,
 }));
 vi.mock('$store/renderer/slices/git/git-slice', () => ({ loadGitStatus: loadGitStatusMock }));
+vi.mock('$store/renderer/slices/panel-layout/panel-layout-selectors', () => ({
+  getPanelTabOpenState: () => ({
+    count: 0,
+    isOpen: false,
+    isActive: false,
+    isOpenElsewhere: false,
+  }),
+}));
 vi.mock('$store/renderer/slices/git/git-selectors', () => ({
   selectGitStatus: { select: vi.fn(() => null) },
 }));
@@ -97,28 +108,37 @@ vi.mock('$store/renderer/slices/file-explorer/file-explorer-selectors', () => ({
   selectFileExplorerRootNode: () => createReadable(null),
   selectFileExplorerIsLoading: () => createReadable(false),
   selectFileExplorerIsInitialized: () => createReadable(true),
-  selectFileExplorerError: () => createReadable(null),
+  selectFileExplorerError: () => error$,
   selectFileExplorerGitStatus: () => createReadable({}),
   selectFlattenedNodes: () => createReadable([]),
   selectHasExpandedDirectories: { select: vi.fn(() => false) },
-  selectEffectiveFileExplorerWorkspacePath: Object.assign(vi.fn(() => workspacePath$), {
-    select: vi.fn(() => workspacePath$.value),
-  }),
-  selectFileExplorerInitializationInputs: Object.assign(vi.fn(() => initializationInputs$), {
-    select: vi.fn(() => initializationInputs$.value),
-  }),
+  selectEffectiveFileExplorerWorkspacePath: Object.assign(
+    vi.fn(() => workspacePath$),
+    {
+      select: vi.fn(() => workspacePath$.value),
+    },
+  ),
+  selectFileExplorerInitializationInputs: Object.assign(
+    vi.fn(() => initializationInputs$),
+    {
+      select: vi.fn(() => initializationInputs$.value),
+    },
+  ),
   selectShouldInitializeFileExplorerForWorkspace: {
     select: vi.fn(() => shouldInitializeState.value),
   },
 }));
 
 function initializationDispatches() {
-  return dispatchMock.mock.calls.filter(([action]) => action.type === 'fileExplorer/initializeFileExplorer');
+  return dispatchMock.mock.calls.filter(
+    ([action]) => action.type === 'fileExplorer/initializeFileExplorer',
+  );
 }
 
 async function renderTree() {
-  render(FileTreeView, { props: { workspaceId: 'ws-1' } });
+  const view = render(FileTreeView, { props: { workspaceId: 'ws-1' } });
   await waitFor(() => expect(initializationDispatches()).toHaveLength(1));
+  return view;
 }
 
 async function markInitializationSettled() {
@@ -141,6 +161,7 @@ describe('FileTreeView initialization trigger', () => {
     dispatchMock.mockReset();
     appStore.dispatch = dispatchMock;
     shouldInitializeState.value = true;
+    error$.set(null);
     initializationInputs$.set({
       workspacePath: '/repo',
       currentWorkspacePath: '',
@@ -175,6 +196,17 @@ describe('FileTreeView initialization trigger', () => {
     await waitFor(() => expect(initializationDispatches()).toHaveLength(1));
   });
 
+  it('shows a retryable error and dispatches initialization again when Retry is clicked', async () => {
+    const view = await renderTree();
+
+    error$.set('Unable to load files.');
+    const retry = await view.findByRole('button', { name: 'Retry' });
+    await fireEvent.click(retry);
+
+    expect(view.getByText('Unable to load files.')).toBeTruthy();
+    expect(initializationDispatches()).toHaveLength(2);
+  });
+
   it.each([
     [
       'cleared state',
@@ -185,16 +217,13 @@ describe('FileTreeView initialization trigger', () => {
         isInitialized: false,
       },
     ],
-  ])(
-    'dispatches when %s makes the internal gate true again',
-    async (_caseName, nextInputs) => {
-      await renderTree();
-      await markInitializationSettled();
+  ])('dispatches when %s makes the internal gate true again', async (_caseName, nextInputs) => {
+    await renderTree();
+    await markInitializationSettled();
 
-      shouldInitializeState.value = true;
-      initializationInputs$.set(nextInputs);
+    shouldInitializeState.value = true;
+    initializationInputs$.set(nextInputs);
 
-      await waitFor(() => expect(initializationDispatches()).toHaveLength(2));
-    },
-  );
+    await waitFor(() => expect(initializationDispatches()).toHaveLength(2));
+  });
 });

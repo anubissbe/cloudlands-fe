@@ -116,6 +116,34 @@ export async function fetchGitHubRepoConfigSetupScript(
   }
 }
 
+/**
+ * Resolve the `setupScript` param for `workspace.create` (monorepo#1862).
+ *
+ * The script shown in the form is what runs: any trimmed non-empty script is
+ * sent, EXCEPT the unedited repo-config script — the daemon executes the
+ * param without persisting it (intentd#1066), and the committed
+ * `.intent/config.json` already holds this script, so sending it is
+ * redundant; it executes identically via the daemon's worktree-first read.
+ *
+ * Returns the trimmed script to send, or undefined to omit the param.
+ */
+export function resolveSetupScriptParam(options: {
+  setupScript: string;
+  setupScriptName: string;
+  repoPath: string | null;
+  /** Cached repo-config script and the repo it was fetched for. */
+  repoConfigScript: string | null;
+  repoConfigScriptRepo: string | null;
+}): string | undefined {
+  const script = options.setupScript.trim();
+  if (!script) return undefined;
+  const isUneditedRepoConfigScript =
+    options.setupScriptName === REPO_CONFIG_SCRIPT_NAME &&
+    options.repoConfigScriptRepo === options.repoPath &&
+    script === (options.repoConfigScript ?? '').trim();
+  return isUneditedRepoConfigScript ? undefined : script;
+}
+
 /** A resolved default setup script selection for the initializer. */
 export interface SetupScriptChoice {
   content: string;

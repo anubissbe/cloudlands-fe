@@ -67,9 +67,6 @@ vi.mock('$store/renderer/slices/specialists/specialists-selectors', () => ({
   selectUserOverrides: { select: vi.fn(() => ({ modelOverrides: {} })) },
 }));
 
-vi.mock('$store/renderer/slices/setup-scripts/setup-scripts-selectors', () => ({
-  selectLastUsedScriptForRepo: { select: vi.fn(() => undefined) },
-}));
 
 vi.mock('$features/setup-scripts', () => ({
   SETUP_SCRIPT_TEMPLATES: [],
@@ -81,8 +78,10 @@ vi.mock('$features/setup-scripts', () => ({
   repoIdentityKey: vi.fn((identity: { path: string | null }) => identity.path),
   createRepoConfigProbeScheduler: vi.fn(() => ({
     onSelectionChange: vi.fn(),
+    settled: vi.fn(async () => {}),
     dispose: vi.fn(),
   })),
+  resolveSetupScriptParam: vi.fn(() => undefined),
   REPO_CONFIG_SCRIPT_NAME: 'Repo config',
 }));
 

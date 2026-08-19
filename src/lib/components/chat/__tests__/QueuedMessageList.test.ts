@@ -1,7 +1,7 @@
 /**
  * @vitest-environment jsdom
  */
-import { fireEvent, render, screen } from '@testing-library/svelte';
+import { fireEvent, render, screen, waitFor } from '@testing-library/svelte';
 import { tick } from 'svelte';
 import { describe, expect, it, vi } from 'vitest';
 import type { QueuedMessage } from '$shared/types';
@@ -10,15 +10,8 @@ vi.mock('../../ui/button/button.svelte', async () => ({
   default: (await import('./mocks/Button.svelte')).default,
 }));
 
-vi.mock('$lib/components/ui/auggie-avatar/AuggieAvatar.svelte', async () => ({
-  default: (await import('./mocks/AuggieAvatar.svelte')).default,
-}));
-
 import QueuedMessageList from '../QueuedMessageList.svelte';
-
-const WAKE_TEXT =
-  '[WORKSPACE EVENTS] You have been woken up by 1 subscribed event(s):\n\n' +
-  '1. [agent:idle] Agent "Foo" is now idle {{agentId:agent-foo-1}}';
+import QueuedMessageEditMotionHost from './QueuedMessageEditMotionHost.svelte';
 
 function queued(overrides: Partial<QueuedMessage>): QueuedMessage {
   return {
@@ -28,6 +21,14 @@ function queued(overrides: Partial<QueuedMessage>): QueuedMessage {
     position: 0,
     ...overrides,
   };
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
 }
 
 function buttonTooltips(container: HTMLElement): string[] {
@@ -49,275 +50,84 @@ describe('QueuedMessageList', () => {
     expect(tooltips.some((t) => t.startsWith('Send now'))).toBe(true);
   });
 
-  it('renders an event wake (messageMetadata) as a compact system row without Edit', () => {
-    const message = queued({
-      content: WAKE_TEXT,
-      messageMetadata: {
-        type: 'event_notification',
-        eventCount: 1,
-        eventTypes: ['agent:idle'],
-        events: [
-          {
-            type: 'agent:idle',
-            timestamp: '2026-01-01T00:00:00.000Z',
-            data: {
-              agentId: 'agent-foo-1',
-              agentName: 'Foo',
-              completionReport: 'Implemented the feature and ran tests.',
-            },
-          },
-        ],
-      },
-    });
-    const { container } = render(QueuedMessageList, { props: { messages: [message] } });
-
-    // Compact label + report preview instead of the raw prefixed text
-    expect(screen.getByText('Child agent Foo completed')).toBeTruthy();
-    expect(screen.getByText(/Implemented the feature and ran tests\./)).toBeTruthy();
-    expect(screen.queryByText(WAKE_TEXT)).toBeNull();
-
-    // No Edit affordance; Remove and Send now stay
-    const tooltips = buttonTooltips(container);
-    expect(tooltips).not.toContain('Edit');
-    expect(tooltips).toContain('Remove');
-    expect(tooltips.some((t) => t.startsWith('Send now'))).toBe(true);
-  });
-
-  it('falls back to the [WORKSPACE EVENTS] prefix when metadata is absent', () => {
-    const { container } = render(QueuedMessageList, {
-      props: { messages: [queued({ content: WAKE_TEXT })] },
-    });
-
-    expect(screen.getByText('Child agent Foo completed')).toBeTruthy();
-    expect(screen.queryByText(WAKE_TEXT)).toBeNull();
-    expect(buttonTooltips(container)).not.toContain('Edit');
-  });
-
-  it('falls back to text parsing when messageMetadata has an unexpected shape', () => {
-    const { container } = render(QueuedMessageList, {
-      props: {
-        messages: [
-          queued({
-            content: WAKE_TEXT,
-            messageMetadata: { type: 'event_notification', events: 'not-an-array' },
-          }),
-        ],
-      },
-    });
-
-    expect(screen.getByText('Child agent Foo completed')).toBeTruthy();
-    expect(buttonTooltips(container)).not.toContain('Edit');
-  });
-
-  it('falls back to text parsing when metadata events items are malformed', () => {
+  it('reserves the three-action lane before hover and keyboard focus', () => {
     render(QueuedMessageList, {
-      props: {
-        messages: [
-          queued({
-            content: WAKE_TEXT,
-            // events is an array, but its items lack the expected `data` object
-            messageMetadata: { type: 'event_notification', events: ['agent:idle'] },
-          }),
-        ],
-      },
+      props: { messages: [queued({ content: 'A long queued message that stays on one line' })] },
     });
 
-    expect(screen.getByText('Child agent Foo completed')).toBeTruthy();
+    const content = screen.getByTestId('queued-message-content');
+    const text = screen.getByTestId('queued-message-text');
+    const actions = screen.getByTestId('queued-message-actions');
+    expect(actions.children).toHaveLength(3);
+    expect(actions.className).toContain('absolute');
+    expect(actions.className).toContain('pointer-events-none');
+    expect(actions.className).toContain('group-hover:pointer-events-auto');
+    expect(actions.className).toContain('group-focus-within:pointer-events-auto');
+    expect(content.className).toContain('pr-24');
+    expect(content.className).not.toContain('group-hover:pr-24');
+    expect(content.className).not.toContain('group-focus-within:pr-24');
+    expect(content.className).not.toContain('transition-[padding-right]');
+    expect(text.className).toContain('truncate');
   });
 
-  it('renders a reportToParent wake as a completion with the report as preview', () => {
-    const message = queued({
-      content:
-        '[WORKSPACE EVENTS] Child agent Foo (agent-foo-1) completed. Report: Opened PR #410 and all checks pass.',
-      messageMetadata: {
-        type: 'event_notification',
-        eventCount: 1,
-        eventTypes: ['agent:reportToParent'],
-        events: [
-          {
-            type: 'agent:reportToParent',
-            timestamp: '2026-01-01T00:00:00.000Z',
-            data: {
-              agentId: 'agent-foo-1',
-              agentName: 'Foo',
-              report: 'Opened PR #410 and all checks pass.',
-            },
-          },
-        ],
-      },
-    });
-    const { container } = render(QueuedMessageList, { props: { messages: [message] } });
+  describe('queue disclosure', () => {
+    it('starts expanded and exposes the controlled queue content', () => {
+      render(QueuedMessageList, { props: { messages: [queued({})] } });
 
-    expect(screen.getByText('Child agent Foo completed')).toBeTruthy();
-    expect(screen.getByText(/Opened PR #410 and all checks pass\./)).toBeTruthy();
-    expect(buttonTooltips(container)).not.toContain('Edit');
-  });
-
-  it('reads the legacy data.report key as the preview for agent:idle wakes', () => {
-    render(QueuedMessageList, {
-      props: {
-        messages: [
-          queued({
-            content: WAKE_TEXT,
-            messageMetadata: {
-              type: 'event_notification',
-              eventCount: 1,
-              eventTypes: ['agent:idle'],
-              events: [
-                {
-                  type: 'agent:idle',
-                  timestamp: '2026-01-01T00:00:00.000Z',
-                  data: {
-                    agentId: 'agent-foo-1',
-                    agentName: 'Foo',
-                    report: 'Fixed the flaky test and reran the suite.',
-                  },
-                },
-              ],
-            },
-          }),
-        ],
-      },
+      const disclosure = screen.getByTestId('queued-messages-disclosure');
+      const content = screen.getByTestId('queued-messages-content');
+      const container = screen.getByTestId('queued-messages-container');
+      const label = screen.getByTestId('queued-messages-label');
+      const chevron = screen.getByTestId('queued-messages-chevron').querySelector('svg')!;
+      expect(disclosure.getAttribute('aria-expanded')).toBe('true');
+      expect(disclosure.getAttribute('aria-controls')).toBe(content.id);
+      expect(chevron.classList.contains('rotate-90')).toBe(false);
+      expect(label.textContent?.trim()).toBe('1 queued message');
+      expect(container.className).toContain('pb-2');
+      expect(screen.getAllByTestId('queued-message-row')).toHaveLength(1);
     });
 
-    expect(screen.getByText('Child agent Foo completed')).toBeTruthy();
-    expect(screen.getByText(/Fixed the flaky test and reran the suite\./)).toBeTruthy();
-  });
+    it('keeps focus and updates the live count while collapsed', async () => {
+      const view = render(QueuedMessageList, { props: { messages: [queued({})] } });
+      const disclosure = screen.getByTestId('queued-messages-disclosure');
+      disclosure.focus();
 
-  it('strips the [WORKSPACE EVENTS] prefix as the preview for single-line wakes without metadata', () => {
-    render(QueuedMessageList, {
-      props: {
-        messages: [
-          queued({
-            content:
-              '[WORKSPACE EVENTS] Child agent Foo (agent-foo-1) completed. Report: Did the thing.',
-            messageMetadata: { type: 'event_notification', eventCount: 1 },
-          }),
-        ],
-      },
+      await fireEvent.click(disclosure);
+      await tick();
+      expect(disclosure.getAttribute('aria-expanded')).toBe('false');
+      expect(
+        screen
+          .getByTestId('queued-messages-chevron')
+          .querySelector('svg')
+          ?.classList.contains('rotate-90'),
+      ).toBe(true);
+      expect(screen.queryByTestId('queued-messages-content')).toBeNull();
+      expect(screen.queryByTestId('queued-message-row')).toBeNull();
+      expect(document.activeElement).toBe(disclosure);
+
+      await view.rerender({
+        messages: [queued({}), queued({ id: 'q-2', content: 'second', position: 1 })],
+      });
+      expect(screen.getByTestId('queued-messages-label').textContent?.trim()).toBe(
+        '2 queued messages',
+      );
+      expect(disclosure.getAttribute('aria-expanded')).toBe('false');
+      expect(screen.queryByTestId('queued-message-row')).toBeNull();
+
+      await fireEvent.click(disclosure);
+      await tick();
+      expect(disclosure.getAttribute('aria-expanded')).toBe('true');
+      expect(screen.getAllByTestId('queued-message-row')).toHaveLength(2);
+      expect(document.activeElement).toBe(disclosure);
     });
-
-    expect(screen.getByText('1 workspace event')).toBeTruthy();
-    expect(
-      screen.getByText(/Child agent Foo \(agent-foo-1\) completed\. Report: Did the thing\./),
-    ).toBeTruthy();
   });
 
-  it('labels a non-agent event wake with categories derived from eventTypes', () => {
-    const { container } = render(QueuedMessageList, {
-      props: {
-        messages: [
-          queued({
-            content: '[WORKSPACE EVENTS] You have been woken up by 3 subscribed event(s):',
-            messageMetadata: {
-              type: 'event_notification',
-              eventCount: 3,
-              eventTypes: ['file:modified', 'task:updated', 'note:updated'],
-            },
-          }),
-        ],
-      },
-    });
-
-    expect(screen.getByText('file changes · task updates · note changes')).toBeTruthy();
-    expect(buttonTooltips(container)).not.toContain('Edit');
-  });
-
-  it('combines agent labels with non-agent categories for mixed event wakes', () => {
-    render(QueuedMessageList, {
-      props: {
-        messages: [
-          queued({
-            content: WAKE_TEXT,
-            messageMetadata: {
-              type: 'event_notification',
-              eventCount: 2,
-              eventTypes: ['agent:idle', 'file:modified'],
-              events: [
-                {
-                  type: 'agent:idle',
-                  timestamp: '2026-01-01T00:00:00.000Z',
-                  data: { agentId: 'agent-foo-1', agentName: 'Foo' },
-                },
-              ],
-            },
-          }),
-        ],
-      },
-    });
-
-    expect(screen.getByText('Child agent Foo completed · file changes')).toBeTruthy();
-  });
-
-  it('falls back to an event count when no categories can be derived', () => {
-    render(QueuedMessageList, {
-      props: {
-        messages: [
-          queued({
-            content: '[WORKSPACE EVENTS] You have been woken up by 4 subscribed event(s):',
-            messageMetadata: {
-              type: 'event_notification',
-              eventCount: 4,
-              eventTypes: ['mystery:thing', 'other:thing'],
-            },
-          }),
-        ],
-      },
-    });
-
-    expect(screen.getByText('4 workspace events')).toBeTruthy();
-    expect(screen.queryByText('Workspace events')).toBeNull();
-  });
-
-  it('shows a content-derived preview for legacy no-metadata wakes', () => {
-    render(QueuedMessageList, {
-      props: {
-        messages: [
-          queued({
-            content:
-              '[WORKSPACE EVENTS] You have been woken up by 2 subscribed event(s):\n\n' +
-              '1. [file:modified] src/lib/foo.ts changed\n' +
-              '2. [file:created] src/lib/bar.ts created',
-          }),
-        ],
-      },
-    });
-
-    expect(screen.getByText('2 workspace events')).toBeTruthy();
-    expect(screen.getByText(/\[file:modified\] src\/lib\/foo\.ts changed/)).toBeTruthy();
-  });
-
-  it('keeps the requeued-after-failure indicator on event wake rows', () => {
-    const { container } = render(QueuedMessageList, {
-      props: { messages: [queued({ content: WAKE_TEXT, requeuedAfterFailure: true })] },
-    });
-
-    expect(screen.getByText('Child agent Foo completed')).toBeTruthy();
-    expect(container.querySelector('[title="Failed — will retry"]')).toBeTruthy();
-  });
-
-  it('keeps regular messages unchanged when mixed with an event wake', () => {
-    const { container } = render(QueuedMessageList, {
-      props: {
-        messages: [
-          queued({ id: 'q-1', content: 'normal message', position: 0 }),
-          queued({ id: 'q-2', content: WAKE_TEXT, position: 1 }),
-        ],
-      },
-    });
-
-    expect(screen.getByText('normal message')).toBeTruthy();
-    expect(screen.getByText('Child agent Foo completed')).toBeTruthy();
-    // Exactly one Edit button (the normal message's)
-    expect(buttonTooltips(container).filter((t) => t === 'Edit')).toHaveLength(1);
-  });
-
-  it('editLastMessage() skips a trailing event wake and edits the last user message', async () => {
+  it('editLastMessage() starts editing the last queued message', async () => {
     const { component, container } = render(QueuedMessageList, {
       props: {
         messages: [
-          queued({ id: 'q-1', content: 'normal message', position: 0 }),
-          queued({ id: 'q-2', content: WAKE_TEXT, position: 1 }),
+          queued({ id: 'q-1', content: 'first message', position: 0 }),
+          queued({ id: 'q-2', content: 'second message', position: 1 }),
         ],
       },
     });
@@ -327,12 +137,12 @@ describe('QueuedMessageList', () => {
 
     const textarea = container.querySelector('textarea');
     expect(textarea).toBeTruthy();
-    expect(textarea?.value).toBe('normal message');
+    expect(textarea?.value).toBe('second message');
   });
 
-  it('editLastMessage() returns false when the queue only holds event wakes', async () => {
+  it('editLastMessage() returns false when the queue is empty', async () => {
     const { component, container } = render(QueuedMessageList, {
-      props: { messages: [queued({ content: WAKE_TEXT })] },
+      props: { messages: [] },
     });
 
     expect(component.editLastMessage()).toBe(false);
@@ -341,175 +151,305 @@ describe('QueuedMessageList', () => {
     expect(container.querySelector('textarea')).toBeNull();
   });
 
-  describe('agent-to-agent messages (messageMetadata.type === "agent_message")', () => {
-    const AGENT_MESSAGE_METADATA = {
-      type: 'agent_message',
-      fromAgentId: 'agent-sender-1',
-      fromAgentName: 'Builder',
-    };
+  describe('editing lifecycle', () => {
+    async function beginEdit(
+      props: Parameters<typeof render<typeof QueuedMessageList>>[1]['props'],
+    ) {
+      const view = render(QueuedMessageList, { props });
+      const row = view.container.querySelector<HTMLElement>('[data-testid="queued-message-row"]')!;
+      await fireEvent.click(
+        view.container.querySelector<HTMLElement>('[data-testid="queued-message-content"]')!,
+      );
+      const textarea = await waitFor(() => view.container.querySelector('textarea'));
+      return { ...view, row, textarea: textarea as HTMLTextAreaElement };
+    }
 
-    it('renders avatar + sender name attribution without Edit, keeping Remove and Send now', () => {
-      const { container } = render(QueuedMessageList, {
-        props: {
-          messages: [
-            queued({ content: 'please review my PR', messageMetadata: AGENT_MESSAGE_METADATA }),
-          ],
-        },
-      });
-
-      expect(screen.getByText('Builder')).toBeTruthy();
-      expect(screen.getByText(/please review my PR/)).toBeTruthy();
-      const avatar = screen.getByTestId('auggie-avatar');
-      expect(avatar.getAttribute('data-agent-id')).toBe('agent-sender-1');
-
-      const tooltips = buttonTooltips(container);
-      expect(tooltips).not.toContain('Edit');
-      expect(tooltips).toContain('Remove');
-      expect(tooltips.some((t) => t.startsWith('Send now'))).toBe(true);
+    it('saves with Enter once and keeps Shift+Enter for a newline', async () => {
+      const onedit = vi.fn().mockResolvedValue({ success: true });
+      const { textarea } = await beginEdit({ messages: [queued({})], onedit });
+      await fireEvent.input(textarea, { target: { value: 'hello\nagain' } });
+      await fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: true });
+      expect(onedit).toHaveBeenCalledTimes(1);
+      await fireEvent.keyDown(textarea, { key: 'Enter' });
+      await waitFor(() => expect(onedit).toHaveBeenCalledTimes(2));
+      expect(onedit).toHaveBeenLastCalledWith('q-1', 'hello\nagain', false);
+      expect(screen.queryByTestId('queued-message-edit-mode')).toBeNull();
     });
 
-    it('falls back to "Agent" when fromAgentName is absent', () => {
-      render(QueuedMessageList, {
-        props: {
-          messages: [
-            queued({
-              content: 'hello',
-              messageMetadata: { type: 'agent_message', fromAgentId: 'agent-sender-2' },
-            }),
-          ],
-        },
+    it('cancels with Escape and releases the daemon hold with original content', async () => {
+      const onedit = vi.fn().mockResolvedValue({ success: true });
+      const { textarea } = await beginEdit({
+        messages: [queued({ content: 'original' })],
+        onedit,
       });
-
-      expect(screen.getByText('Agent')).toBeTruthy();
+      await fireEvent.input(textarea, { target: { value: 'changed' } });
+      await fireEvent.keyDown(textarea, { key: 'Escape' });
+      await waitFor(() => expect(screen.queryByTestId('queued-message-edit-mode')).toBeNull());
+      expect(onedit).toHaveBeenLastCalledWith('q-1', 'original', false);
     });
 
-    it('renders as a normal editable message when metadata is malformed', () => {
-      const { container } = render(QueuedMessageList, {
-        props: {
-          messages: [
-            queued({
-              content: 'hello',
-              // agent_message without a usable fromAgentId
-              messageMetadata: { type: 'agent_message', fromAgentId: 42 },
-            }),
-          ],
-        },
-      });
-
-      expect(screen.getByText('hello')).toBeTruthy();
-      expect(screen.queryByTestId('queued-agent-message-avatar')).toBeNull();
-      expect(buttonTooltips(container)).toContain('Edit');
+    it('saves on blur without a second save from the save action', async () => {
+      const onedit = vi.fn().mockResolvedValue({ success: true });
+      const { textarea, container } = await beginEdit({ messages: [queued({})], onedit });
+      await fireEvent.input(textarea, { target: { value: 'blurred' } });
+      await fireEvent.blur(textarea);
+      await waitFor(() => expect(onedit).toHaveBeenCalledTimes(2));
+      const save = Array.from(container.querySelectorAll('button')).find(
+        (button) => button.getAttribute('tooltip') === 'Save',
+      );
+      if (save) await fireEvent.click(save);
+      expect(onedit).toHaveBeenCalledTimes(2);
     });
 
-    it('editLastMessage() skips a trailing agent message and edits the last user message', async () => {
-      const { component, container } = render(QueuedMessageList, {
-        props: {
-          messages: [
-            queued({ id: 'q-1', content: 'normal message', position: 0 }),
-            queued({
-              id: 'q-2',
-              content: 'agent says hi',
-              position: 1,
-              messageMetadata: AGENT_MESSAGE_METADATA,
-            }),
-          ],
-        },
-      });
+    it('stays in edit mode when hold, save, or cancel release fails', async () => {
+      const holdFailure = vi.fn().mockResolvedValue({ success: false, error: 'gone' });
+      const first = await beginEdit({ messages: [queued({})], onedit: holdFailure });
+      await waitFor(() => expect(first.container.querySelector('textarea')).toBeNull());
+      first.unmount();
 
-      expect(component.editLastMessage()).toBe(true);
+      const saveFailure = vi
+        .fn()
+        .mockResolvedValueOnce({ success: true })
+        .mockResolvedValue({ success: false, error: 'offline' });
+      const second = await beginEdit({
+        messages: [queued({ id: 'q-2' })],
+        onedit: saveFailure,
+      });
+      await fireEvent.keyDown(second.textarea, { key: 'Enter' });
+      await waitFor(() => expect(second.container.querySelector('textarea')).toBe(second.textarea));
+      const cancel = Array.from(second.container.querySelectorAll('button')).find(
+        (button) => button.getAttribute('tooltip') === 'Cancel',
+      )!;
+      await fireEvent.pointerDown(cancel);
+      await fireEvent.click(cancel);
+      await waitFor(() => expect(saveFailure).toHaveBeenCalledTimes(3));
+      expect(second.container.querySelector('textarea')).toBe(second.textarea);
+    });
+
+    it('keeps a new edit focused when a removed row pending cancel settles', async () => {
+      const cancel = deferred<{ success: boolean }>();
+      const onedit = vi.fn((id: string, _content: string, editing: boolean) => {
+        if (id === 'q-1' && !editing) return cancel.promise;
+        return Promise.resolve({ success: true });
+      });
+      const messages = [
+        queued({ id: 'q-1', content: 'first', position: 0 }),
+        queued({ id: 'q-2', content: 'second', position: 1 }),
+      ];
+      const view = render(QueuedMessageList, { props: { messages, onedit } });
+
+      await fireEvent.click(view.container.querySelector('[data-message-id="q-1"] button')!);
+      const firstTextarea = await waitFor(() => view.container.querySelector('textarea'));
+      await waitFor(() => expect(onedit).toHaveBeenCalledWith('q-1', 'first', true));
+      await fireEvent.keyDown(firstTextarea!, { key: 'Escape' });
+      await waitFor(() => expect(onedit).toHaveBeenCalledWith('q-1', 'first', false));
+
+      await view.rerender({ messages: [messages[1]] });
+      await waitFor(() => expect(view.container.querySelector('textarea')).toBeNull());
+      await fireEvent.click(view.container.querySelector('[data-message-id="q-2"] button')!);
+      const secondTextarea = await waitFor(() => view.container.querySelector('textarea'));
+      expect((secondTextarea as HTMLTextAreaElement).value).toBe('second');
+      await waitFor(() => expect(document.activeElement).toBe(secondTextarea));
+
+      cancel.resolve({ success: true });
       await tick();
-
-      const textarea = container.querySelector('textarea');
-      expect(textarea).toBeTruthy();
-      expect(textarea?.value).toBe('normal message');
+      await waitFor(() => expect(view.container.querySelector('textarea')).toBe(secondTextarea));
+      expect(document.activeElement).toBe(secondTextarea);
     });
 
-    it('keeps the requeued-after-failure indicator on agent message rows', () => {
-      const { container } = render(QueuedMessageList, {
-        props: {
-          messages: [
-            queued({
-              content: 'hello',
-              messageMetadata: AGENT_MESSAGE_METADATA,
-              requeuedAfterFailure: true,
-            }),
-          ],
-        },
-      });
+    it.each(['start', 'save'] as const)(
+      'ignores a removed row pending %s result after another row starts editing',
+      async (pendingAction) => {
+        const pending = deferred<{ success: boolean; error?: string }>();
+        const onedit = vi.fn((id: string, _content: string, editing: boolean) => {
+          const isPendingStart = pendingAction === 'start' && id === 'q-1' && editing;
+          const isPendingSave = pendingAction === 'save' && id === 'q-1' && !editing;
+          if (isPendingStart || isPendingSave) return pending.promise;
+          return Promise.resolve({ success: true });
+        });
+        const messages = [
+          queued({ id: 'q-1', content: 'first', position: 0 }),
+          queued({ id: 'q-2', content: 'second', position: 1 }),
+        ];
+        const view = render(QueuedMessageList, { props: { messages, onedit } });
 
-      expect(screen.getByText('Builder')).toBeTruthy();
-      expect(container.querySelector('[title="Failed — will retry"]')).toBeTruthy();
+        await fireEvent.click(view.container.querySelector('[data-message-id="q-1"] button')!);
+        const firstTextarea = await waitFor(() => view.container.querySelector('textarea'));
+        if (pendingAction === 'save') {
+          await waitFor(() => expect(onedit).toHaveBeenCalledWith('q-1', 'first', true));
+          await fireEvent.input(firstTextarea!, { target: { value: 'changed' } });
+          await fireEvent.keyDown(firstTextarea!, { key: 'Enter' });
+          await waitFor(() => expect(onedit).toHaveBeenCalledWith('q-1', 'changed', false));
+        } else {
+          await waitFor(() => expect(onedit).toHaveBeenCalledWith('q-1', 'first', true));
+        }
+
+        await view.rerender({ messages: [messages[1]] });
+        await waitFor(() => expect(view.container.querySelector('textarea')).toBeNull());
+        await fireEvent.click(view.container.querySelector('[data-message-id="q-2"] button')!);
+        const secondTextarea = await waitFor(() => view.container.querySelector('textarea'));
+        expect((secondTextarea as HTMLTextAreaElement).value).toBe('second');
+        await waitFor(() => expect(document.activeElement).toBe(secondTextarea));
+
+        pending.resolve(
+          pendingAction === 'start' ? { success: false, error: 'removed' } : { success: true },
+        );
+        await tick();
+        await waitFor(() => expect(view.container.querySelector('textarea')).toBe(secondTextarea));
+        expect(document.activeElement).toBe(secondTextarea);
+      },
+    );
+
+    it('auto-resizes multiline content', async () => {
+      const { textarea } = await beginEdit({ messages: [queued({})] });
+      Object.defineProperty(textarea, 'scrollHeight', { configurable: true, value: 84 });
+      await fireEvent.input(textarea, { target: { value: 'one\ntwo\nthree' } });
+      expect(textarea.style.height).toBe('84px');
+    });
+
+    it('keeps row, textarea, focus, and selection through refresh and reorder', async () => {
+      const onedit = vi.fn().mockResolvedValue({ success: true });
+      const messages = [
+        queued({ id: 'q-1', content: 'first', position: 0 }),
+        queued({ id: 'q-2', content: 'second', position: 1 }),
+      ];
+      const view = render(QueuedMessageList, { props: { messages, onedit } });
+      const rows = Array.from(view.container.querySelectorAll<HTMLElement>('[data-message-id]'));
+      await fireEvent.click(rows[0].querySelector('[data-testid="queued-message-content"]')!);
+      const textarea = await waitFor(() => view.container.querySelector('textarea'));
+      await waitFor(() => expect(document.activeElement).toBe(textarea));
+      await waitFor(() => expect(onedit).toHaveBeenCalledTimes(1));
+      textarea!.setSelectionRange(2, 4);
+
+      const rowList = rows[0].parentElement!;
+      let didBlurDuringMove = false;
+      const blurDuringMove = new MutationObserver(() => {
+        didBlurDuringMove = true;
+        textarea!.blur();
+      });
+      blurDuringMove.observe(rowList, { childList: true });
+      await view.rerender({ messages: [messages[1], { ...messages[0], editing: true }] });
+      blurDuringMove.disconnect();
+      await tick();
+      expect(didBlurDuringMove).toBe(true);
+      expect(view.container.querySelector('[data-message-id="q-1"]')).toBe(rows[0]);
+      expect(view.container.querySelector('textarea')).toBe(textarea);
+      await waitFor(() => expect(document.activeElement).toBe(textarea));
+      expect([textarea!.selectionStart, textarea!.selectionEnd]).toEqual([2, 4]);
+      expect(onedit).toHaveBeenCalledTimes(1);
+
+      const outside = document.createElement('button');
+      document.body.append(outside);
+      outside.focus();
+      await waitFor(() => expect(onedit).toHaveBeenCalledTimes(2));
+      expect(onedit).toHaveBeenLastCalledWith('q-1', 'first', false);
+      outside.remove();
+    });
+
+    it('handles rapid reorder and removal before a stale save settles', async () => {
+      const save = deferred<{ success: boolean }>();
+      const onedit = vi
+        .fn()
+        .mockResolvedValueOnce({ success: true })
+        .mockImplementationOnce(() => save.promise)
+        .mockResolvedValue({ success: true });
+      const messages = [
+        queued({ id: 'q-1', content: 'first', position: 0 }),
+        queued({ id: 'q-2', content: 'second', position: 1 }),
+      ];
+      const view = render(QueuedMessageList, { props: { messages, onedit } });
+      await fireEvent.click(view.container.querySelector('[data-message-id="q-1"] button')!);
+      const firstTextarea = await waitFor(() => view.container.querySelector('textarea'));
+      await fireEvent.input(firstTextarea!, { target: { value: 'changed' } });
+      await fireEvent.keyDown(firstTextarea!, { key: 'Enter' });
+      await waitFor(() => expect(onedit).toHaveBeenCalledWith('q-1', 'changed', false));
+
+      await view.rerender({ messages: [messages[1], messages[0]] });
+      await view.rerender({ messages: [messages[1]] });
+      await waitFor(() => expect(view.container.querySelector('textarea')).toBeNull());
+      await fireEvent.click(view.container.querySelector('[data-message-id="q-2"] button')!);
+      const secondTextarea = await waitFor(() => view.container.querySelector('textarea'));
+      await waitFor(() => expect(document.activeElement).toBe(secondTextarea));
+
+      save.resolve({ success: true });
+      await tick();
+      await waitFor(() => expect(view.container.querySelector('textarea')).toBe(secondTextarea));
+      expect((secondTextarea as HTMLTextAreaElement).value).toBe('second');
+    });
+
+    it('removes an editing row without residual shell state', async () => {
+      const view = render(QueuedMessageList, { props: { messages: [queued({})] } });
+      await fireEvent.click(screen.getByTestId('queued-message-content'));
+      await waitFor(() => expect(view.container.querySelector('textarea')).toBeTruthy());
+      await view.rerender({ messages: [] });
+      await waitFor(() => expect(view.container.querySelector('[data-message-id]')).toBeNull());
+      expect(view.container.querySelector('[style*="height"]')).toBeNull();
+    });
+
+    it('rapidly reverses on Escape without remounting the row or overlapping modes', async () => {
+      const view = render(QueuedMessageList, { props: { messages: [queued({})] } });
+      const row = screen.getByTestId('queued-message-row');
+      await fireEvent.click(screen.getByTestId('queued-message-content'));
+      const textarea = await waitFor(() => view.container.querySelector('textarea'));
+      await fireEvent.keyDown(textarea!, { key: 'Escape' });
+      await waitFor(() => expect(view.container.querySelector('textarea')).toBeNull());
+      expect(screen.getByTestId('queued-message-row')).toBe(row);
+      expect(row.querySelectorAll('[data-mode="display"]')).toHaveLength(1);
+      expect(row.querySelectorAll('[data-testid="queued-message-edit-mode"]')).toHaveLength(0);
+    });
+
+    it('completes mode changes immediately for reduced motion', async () => {
+      const matchMedia = vi.spyOn(window, 'matchMedia').mockReturnValue({
+        matches: true,
+        media: '(prefers-reduced-motion: reduce)',
+        onchange: null,
+        addListener: vi.fn(),
+        removeListener: vi.fn(),
+        addEventListener: vi.fn(),
+        removeEventListener: vi.fn(),
+        dispatchEvent: vi.fn(),
+      });
+      const { row } = await beginEdit({ messages: [queued({})] });
+      expect(row.style.height).toBe('');
+      expect(row.style.overflow).toBe('');
+      matchMedia.mockRestore();
     });
   });
 
-  describe('hook wake messages (messageMetadata.type === "hook_wake")', () => {
-    const HOOK_WAKE_METADATA = {
-      type: 'hook_wake',
-      hookId: 'hook-1',
-      hookName: 'ci-watch',
-      reason: 'dispatched',
-    };
+  it('lets the canonical follow authority pin bottom and preserve an unlocked viewport', async () => {
+    class ResizeObserverStub {
+      observe() {}
+      disconnect() {}
+    }
+    vi.stubGlobal('ResizeObserver', ResizeObserverStub);
+    const view = render(QueuedMessageEditMotionHost);
+    const transcript = screen.getByTestId('queued-edit-transcript');
+    let expandedHeight = 900;
+    Object.defineProperties(transcript, {
+      clientHeight: { configurable: true, value: 200 },
+      scrollHeight: { configurable: true, get: () => expandedHeight },
+    });
+    transcript.scrollTop = 700;
+    expandedHeight = 980;
+    await fireEvent.click(view.container.querySelector('[data-testid="queued-message-content"]')!);
+    await waitFor(() => expect(transcript.scrollTop).toBe(780));
 
-    it('renders bolt + hook name attribution with the prefix stripped, no Edit', () => {
-      const { container } = render(QueuedMessageList, {
-        props: {
-          messages: [
-            queued({
-              content: '[Background hook "ci-watch"] CI is red',
-              messageMetadata: HOOK_WAKE_METADATA,
-            }),
-          ],
-        },
-      });
+    await fireEvent.wheel(transcript, { deltaY: -20 });
+    transcript.scrollTop = 240;
+    expandedHeight = 1060;
+    await fireEvent.click(screen.getByTestId('queued-edit-refresh'));
+    await tick();
+    expect(transcript.scrollTop).toBe(240);
+    vi.unstubAllGlobals();
+  });
 
-      expect(screen.getByText('ci-watch')).toBeTruthy();
-      expect(screen.getByTestId('queued-hook-wake-icon')).toBeTruthy();
-      expect(screen.getByText(/CI is red/)).toBeTruthy();
-      expect(screen.queryByText(/\[Background hook/)).toBeNull();
-
-      const tooltips = buttonTooltips(container);
-      expect(tooltips).not.toContain('Edit');
-      expect(tooltips).toContain('Remove');
-      expect(tooltips.some((t) => t.startsWith('Send now'))).toBe(true);
+  it('keeps the requeued-after-failure indicator on queued rows', () => {
+    const { container } = render(QueuedMessageList, {
+      props: { messages: [queued({ content: 'try again', requeuedAfterFailure: true })] },
     });
 
-    it('falls back to "Hook" when hookName is absent', () => {
-      render(QueuedMessageList, {
-        props: {
-          messages: [
-            queued({
-              content: 'wake up',
-              messageMetadata: { type: 'hook_wake', hookId: 'hook-2' },
-            }),
-          ],
-        },
-      });
-
-      expect(screen.getByText('Hook')).toBeTruthy();
-    });
-
-    it('editLastMessage() skips a trailing hook wake and edits the last user message', async () => {
-      const { component, container } = render(QueuedMessageList, {
-        props: {
-          messages: [
-            queued({ id: 'q-1', content: 'normal message', position: 0 }),
-            queued({
-              id: 'q-2',
-              content: '[Background hook "ci-watch"] CI is red',
-              position: 1,
-              messageMetadata: HOOK_WAKE_METADATA,
-            }),
-          ],
-        },
-      });
-
-      expect(component.editLastMessage()).toBe(true);
-      await tick();
-
-      const textarea = container.querySelector('textarea');
-      expect(textarea).toBeTruthy();
-      expect(textarea?.value).toBe('normal message');
-    });
+    expect(screen.getByText(/try again/)).toBeTruthy();
+    expect(container.querySelector('[title="Failed — will retry"]')).toBeTruthy();
   });
 
   describe('image thumbnails', () => {
@@ -588,31 +528,6 @@ describe('QueuedMessageList', () => {
           /^View attached image \d+ of \d+ full size$/,
         );
       }
-    });
-
-    it('renders thumbnails on agent-to-agent attribution rows', () => {
-      const { container } = render(QueuedMessageList, {
-        props: {
-          messages: [
-            queued({
-              content: 'from an agent',
-              imageBlocks: [IMAGE_BLOCKS[0]],
-              messageMetadata: {
-                type: 'agent_message',
-                fromAgentId: 'agent-sender-1',
-                fromAgentName: 'Builder',
-              },
-            }),
-          ],
-        },
-      });
-
-      expect(screen.getByText('Builder')).toBeTruthy();
-      const buttons = thumbnails(container);
-      expect(buttons).toHaveLength(1);
-      expect(buttons[0].querySelector('img')?.getAttribute('src')).toBe(
-        'data:image/png;base64,AAAA',
-      );
     });
   });
 

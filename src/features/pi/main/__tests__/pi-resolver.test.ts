@@ -1,8 +1,6 @@
 /**
- * Tests for pi-resolver module and provider-config wiring.
- *
- * Mirrors claude-code-resolver tests: covers binary/npx fallback,
- * cache clearing, install detection, and the ACP_PROVIDERS.pi shape.
+ * Tests for pi-resolver module: `pi` engine detection, cache clearing, and
+ * the pi-mcp-adapter install/probe helpers.
  */
 
 import {
@@ -16,6 +14,7 @@ import {
 
 vi.mock('../../../../shared/main/find-binary', () => ({
   findBinary: vi.fn(),
+  findBinaryStrict: vi.fn(),
   getCommonNpmPaths: vi.fn(() => []),
 }));
 
@@ -23,16 +22,14 @@ vi.mock('../../../../shared/main/host-exec', () => ({
   hostExec: vi.fn(),
 }));
 
-import { findBinary } from '../../../../shared/main/find-binary';
+import { findBinary, findBinaryStrict } from '../../../../shared/main/find-binary';
 import { hostExec } from '../../../../shared/main/host-exec';
 import {
-  resolvePiCommand,
   clearPiCache,
   isPiInstalled,
   getPiPath,
   isPiMcpAdapterInstalled,
   installPiMcpAdapter,
-  PI_ACP_NPX_PACKAGE,
 } from '../pi-resolver';
 
 
@@ -42,56 +39,28 @@ describe('pi-resolver', () => {
     clearPiCache();
   });
 
-  describe('resolvePiCommand()', () => {
-    it('always returns npx -y pi-acp@<pinned> when npx is found', async () => {
-      vi.mocked(findBinary).mockImplementation(async (name) => {
-        if (name === 'npx') return '/usr/local/bin/npx';
-        return null;
-      });
-
-      const result = await resolvePiCommand();
-      expect(result).not.toBeNull();
-      expect(result!.usesNpx).toBe(true);
-      expect(result!.command).toBe('/usr/local/bin/npx');
-      expect(result!.argsPrefix).toEqual(['-y', PI_ACP_NPX_PACKAGE]);
-    });
-
-    it('pins the pi-acp npx package to an explicit version', () => {
-      expect(PI_ACP_NPX_PACKAGE).toMatch(/^pi-acp@\d+\.\d+\.\d+$/);
-    });
-
-    it('returns null when npx is not available', async () => {
-      vi.mocked(findBinary).mockResolvedValue(null);
-
-      const result = await resolvePiCommand();
-      expect(result).toBeNull();
-    });
-  });
-
   describe('clearPiCache()', () => {
-    it('clears all cached paths so re-detection uses new values', async () => {
+    it('clears the cached pi path so re-detection uses new values', async () => {
       vi.mocked(findBinary).mockImplementation(async (name) => {
-        if (name === 'npx') return '/first/npx';
+        if (name === 'pi') return '/first/pi';
         return null;
       });
 
-      const first = await resolvePiCommand();
-      expect(first!.command).toBe('/first/npx');
+      expect(await getPiPath()).toBe('/first/pi');
 
       clearPiCache();
       vi.mocked(findBinary).mockImplementation(async (name) => {
-        if (name === 'npx') return '/second/npx';
+        if (name === 'pi') return '/second/pi';
         return null;
       });
 
-      const second = await resolvePiCommand();
-      expect(second!.command).toBe('/second/npx');
+      expect(await getPiPath()).toBe('/second/pi');
     });
   });
 
   describe('isPiInstalled()', () => {
     it('returns true when the pi engine is found', async () => {
-      vi.mocked(findBinary).mockImplementation(async (name) => {
+      vi.mocked(findBinaryStrict).mockImplementation(async (name) => {
         if (name === 'pi') return '/usr/local/bin/pi';
         return null;
       });
@@ -100,8 +69,16 @@ describe('pi-resolver', () => {
     });
 
     it('returns false when the pi engine is not found', async () => {
-      vi.mocked(findBinary).mockResolvedValue(null);
+      vi.mocked(findBinaryStrict).mockResolvedValue(null);
       expect(await isPiInstalled()).toBe(false);
+    });
+
+    it('propagates a probe failure instead of reporting uninstalled', async () => {
+      // A failed daemon RPC proves nothing about availability — the caller
+      // (provider availability check) must see the failure, not false.
+      vi.mocked(findBinaryStrict).mockRejectedValue(new Error('transport down'));
+
+      await expect(isPiInstalled()).rejects.toThrow('transport down');
     });
   });
 

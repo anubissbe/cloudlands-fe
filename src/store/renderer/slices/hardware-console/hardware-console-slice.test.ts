@@ -1,34 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { UNASSIGNED_KEY_PIN } from "$features/hardware-console/assignment/key-assignment";
-import {
-  actionHudHidden,
-  actionHudShown,
-  encoderHudHidden,
-  encoderHudShown,
-  hardwareConsoleReducer,
-  hydrateHardwareConsoleActionMapping,
-  hydrateHardwareConsoleCycleScopes,
-  hydrateHardwareConsoleEnabled,
-  hydrateHardwareConsoleKeyPins,
-  hydrateHardwareConsolePrompts,
-  initialState,
-  keyPinsReconciled,
-  markKeySlotUnassigned,
-  pinWorkspaceToKey,
-  pttRecordingStarted,
-  pttRecordingStopped,
-  setActionKeyMapping,
-  setCycleScope,
-  setHardwareConsoleEnabled,
-  setPromptPickerLimit,
-  promptUsageRecorded,
-  radialPromptPickerClosed,
-  radialPromptPickerOpened,
-  radialPromptPickerSectorChanged,
-  unpinWorkspaceFromKeys,
-  voiceTranscriptionFinished,
-  voiceTranscriptionStarted,
-} from "./hardware-console-slice";
+import { actionHudHidden, actionHudShown, consoleOwnerChanged, encoderHudHidden, encoderHudShown, hardwareConsoleReducer, hydrateHardwareConsoleActionMapping, hydrateHardwareConsoleCycleScopes, hydrateHardwareConsoleEnabled, hydrateHardwareConsoleKeyPins, hydrateHardwareConsolePrompts, initialState, keyPinsReconciled, markKeySlotUnassigned, pinWorkspaceToKey, pttRecordingStarted, pttRecordingStopped, setActionKeyMapping, setCycleScope, setHardwareConsoleEnabled, setPromptPickerLimit, promptUsageRecorded, radialPromptPickerClosed, radialPromptPickerOpened, radialPromptPickerSectorChanged, voiceTranscriptionFinished, voiceTranscriptionStarted } from "./hardware-console-slice";
 
 describe("hardwareConsoleReducer", () => {
   it("returns initial state", () => {
@@ -107,36 +79,6 @@ describe("hardwareConsoleReducer", () => {
     expect(hardwareConsoleReducer(initialState, pinWorkspaceToKey(6, "ws-1"))).toBe(initialState);
   });
 
-  it("unpins a workspace from its slot and excludes it from auto-fill", () => {
-    const pinned = hardwareConsoleReducer(initialState, pinWorkspaceToKey(5, "ws-1"));
-    const state = hardwareConsoleReducer(pinned, unpinWorkspaceFromKeys("ws-1"));
-
-    expect(state.keyPins).toEqual([null, null, null, null, null, null]);
-    expect(state.excludedWorkspaceIds).toEqual(["ws-1"]);
-  });
-
-  it("unpinning an unpinned workspace still records the exclusion", () => {
-    const state = hardwareConsoleReducer(initialState, unpinWorkspaceFromKeys("ws-x"));
-
-    expect(state.keyPins).toEqual(initialState.keyPins);
-    expect(state.excludedWorkspaceIds).toEqual(["ws-x"]);
-  });
-
-  it("returns the same state when unpinning an already-excluded workspace", () => {
-    const excluded = hardwareConsoleReducer(initialState, unpinWorkspaceFromKeys("ws-x"));
-    const state = hardwareConsoleReducer(excluded, unpinWorkspaceFromKeys("ws-x"));
-
-    expect(state).toBe(excluded);
-  });
-
-  it("pinning a workspace clears its auto-fill exclusion", () => {
-    const excluded = hardwareConsoleReducer(initialState, unpinWorkspaceFromKeys("ws-1"));
-    const state = hardwareConsoleReducer(excluded, pinWorkspaceToKey(2, "ws-1"));
-
-    expect(state.keyPins).toEqual([null, null, "ws-1", null, null, null]);
-    expect(state.excludedWorkspaceIds).toEqual([]);
-  });
-
   it("re-pinning to the same slot clears a stale exclusion", () => {
     const pinned = hardwareConsoleReducer(initialState, pinWorkspaceToKey(3, "ws-1"));
     const excluded = { ...pinned, excludedWorkspaceIds: ["ws-1"] };
@@ -197,6 +139,20 @@ describe("hardwareConsoleReducer", () => {
 
     const reenabled = hardwareConsoleReducer(disabled, setHardwareConsoleEnabled(true));
     expect(reenabled.enabled).toBe(true);
+  });
+
+  it("defaults to console owner (web build / bridge-less behavior)", () => {
+    expect(initialState.isConsoleOwner).toBe(true);
+  });
+
+  it("tracks console ownership changes and no-ops on redundant updates", () => {
+    const notOwner = hardwareConsoleReducer(initialState, consoleOwnerChanged(false));
+    expect(notOwner.isConsoleOwner).toBe(false);
+    expect(hardwareConsoleReducer(notOwner, consoleOwnerChanged(false))).toBe(notOwner);
+
+    const ownerAgain = hardwareConsoleReducer(notOwner, consoleOwnerChanged(true));
+    expect(ownerAgain.isConsoleOwner).toBe(true);
+    expect(hardwareConsoleReducer(initialState, consoleOwnerChanged(true))).toBe(initialState);
   });
 
   it("sets the prompt picker limit, clamped to [1, 12]", () => {

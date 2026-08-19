@@ -2,7 +2,7 @@
  * @vitest-environment jsdom
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { cleanup, fireEvent, render, screen } from '@testing-library/svelte';
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/svelte';
 import { tick } from 'svelte';
 import ProviderPathConfig from './ProviderPathConfig.svelte';
 import { warmImport } from '../../../test/warm-import';
@@ -28,9 +28,7 @@ vi.mock('svelte-sonner', () => ({
 }));
 
 vi.mock('svelte-fa', async () => ({
-  default: (
-    await import('../workspace/sidebar/__tests__/mocks/MockSimple.svelte')
-  ).default,
+  default: (await import('../workspace/sidebar/__tests__/mocks/MockSimple.svelte')).default,
 }));
 
 vi.mock('$lib/directory-picker-service', () => ({
@@ -62,7 +60,9 @@ async function openPopup(providerName: string) {
 // Pre-warm the component module graph so the cold dynamic import is not
 // billed to the first test's timeout (intent-hq/monorepo#1464).
 warmImport(() => import('../workspace/sidebar/__tests__/mocks/MockSimple.svelte'));
-warmImport(() => import('$features/onboarding/messages/__tests__/mocks/MockDirectoryPickerModal.svelte'));
+warmImport(
+  () => import('$features/onboarding/messages/__tests__/mocks/MockDirectoryPickerModal.svelte'),
+);
 
 describe('ProviderPathConfig', () => {
   beforeEach(() => {
@@ -73,6 +73,21 @@ describe('ProviderPathConfig', () => {
 
   afterEach(() => {
     cleanup();
+  });
+
+  it('supports a controlled open state without rendering the folder trigger', () => {
+    render(ProviderPathConfig, {
+      props: {
+        providerId: 'claude-code',
+        providerName: 'Claude Code',
+        cliCommand: 'claude-agent-acp',
+        open: true,
+        showTrigger: false,
+      },
+    });
+
+    expect(screen.queryByTitle('Configure Claude Code path')).toBeNull();
+    expect(screen.getByText('Claude Code CLI Path')).toBeTruthy();
   });
 
   it('renders the full auto-detected path wrapped, not truncated', async () => {
@@ -255,6 +270,59 @@ describe('ProviderPathConfig', () => {
       },
     ]);
     expect(onPathChange).toHaveBeenCalledExactlyOnceWith('/Users/me/src');
+  });
+
+  it('keeps the menu and remote picker modal mounted while the picker is open', async () => {
+    // jsdom's zero-size layout makes Floating UI's hide middleware mark the
+    // portaled content visibility:hidden, so "mounted vs dismissed" must be
+    // asserted with visibility-insensitive queries ({ hidden: true }): a
+    // dismissed bits-ui menu is removed from the DOM entirely. The same
+    // zero-size layout makes bits-ui's outside-pointer dismissal a no-op in
+    // jsdom (isClickTrulyOutside needs real rects), so the restored-dismissal
+    // step below uses Escape, which is layout-independent.
+    const queryMenu = () => screen.queryByRole('menu', { hidden: true });
+
+    render(ProviderPathConfig, {
+      props: {
+        providerId: 'claude-code',
+        providerName: 'Claude Code',
+        cliCommand: 'claude-agent-acp',
+        resolvedPath: LONG_PATH,
+        isInstalled: true,
+      },
+    });
+    await openPopup('Claude Code');
+    expect(queryMenu()).toBeTruthy();
+
+    // The service mock routes to openModal (remote case).
+    await fireEvent.click(screen.getByRole('button', { name: 'Choose file' }));
+    await flush();
+    expect(screen.getByTestId('mock-picker-select')).toBeTruthy();
+    expect(queryMenu(), 'menu should survive opening the picker').toBeTruthy();
+
+    // The real modal portals a dialog outside the menu, so its interactions,
+    // Escape keydowns, and focus land "outside" the menu content. The menu
+    // must not dismiss — dismissing unmounts the modal with it.
+    await fireEvent.pointerDown(document.body, { pointerType: 'mouse' });
+    await fireEvent.click(document.body);
+    await fireEvent.keyDown(document.body, { key: 'Escape' });
+    await flush();
+
+    expect(queryMenu(), 'menu should survive outside interactions').toBeTruthy();
+    expect(screen.getByTestId('mock-picker-select')).toBeTruthy();
+
+    // Selecting in the modal still commits the path through savePath.
+    await fireEvent.click(screen.getByTestId('mock-picker-select'));
+    await flush();
+
+    expect(mocks.mockSettingsUpdate).toHaveBeenCalledExactlyOnceWith([
+      { path: 'providers.paths', value: { 'claude-code': '/Users/me/src' } },
+    ]);
+    expect(screen.queryByTestId('mock-picker-select'), 'modal should close on select').toBeNull();
+
+    // With the modal closed, normal menu dismissal is restored.
+    await fireEvent.keyDown(document.body, { key: 'Escape' });
+    await waitFor(() => expect(queryMenu()).toBeNull());
   });
 
   it('clear read-merge-writes an empty override, restoring auto-detection', async () => {

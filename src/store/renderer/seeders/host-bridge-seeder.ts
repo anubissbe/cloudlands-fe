@@ -62,9 +62,11 @@ function asRecord(arg: unknown): Record<string, unknown> {
  *
  * Call sites (e.g. `CompactWorkspaceInitializer.svelte`) read
  * `result.data.available` + `result.data.version`, so we forward the daemon
- * body verbatim under `data`. Any failure folds to `{ available:false }` (the
- * banner-suppressed default) to preserve the prior IPC contract: a missing
- * git binary is never an RPC error.
+ * body verbatim under `data`. Only a daemon-reported probe answer folds to
+ * `{ available:false }`; a transport failure (RPC timeout / daemon
+ * unreachable) folds to `{ available:'unknown' }` so the UI never renders
+ * "Git is not installed" when the check simply couldn't run. Either way a
+ * failed probe is never an RPC error.
  */
 registerMockIpcHandler(IPC_CHANNELS.SYSTEM.CHECK_GIT, async () => {
   try {
@@ -76,7 +78,7 @@ registerMockIpcHandler(IPC_CHANNELS.SYSTEM.CHECK_GIT, async () => {
       data: available ? { available: true, version } : { available: false },
     };
   } catch {
-    return { success: true, data: { available: false } };
+    return { success: true, data: { available: "unknown" } };
   }
 });
 
@@ -138,22 +140,19 @@ registerMockIpcHandler(IPC_CHANNELS.SYSTEM.CHECK_RTK, async () => {
 });
 
 /**
- * `system:check-node` → daemon `host.findBinary` (name `node`).
+ * `system:check-node` → daemon `host.checkNode`.
  *
- * Dedicated lightweight probe for the host-requirements gate (the full
- * `auggie:status` bridge also checks node, but pays for the whole auggie
- * status sweep). `host.findBinary` best-effort version-probes the resolved
- * binary, so one RPC yields `{ available, version? }`; the version is
- * normalized (leading `v` stripped) and compared against
- * MINIMUM_NODE_VERSION. Mirrors `CHECK_GIT`: a missing node binary — or a
- * failed probe — is never an RPC error; it folds to `{ available:false,
- * versionOk:false }`.
+ * Dedicated lightweight probe for the host-requirements gate.
+ * `host.checkNode` is uncached daemon-side (host.checkGit idiom), so a
+ * newly installed node is detected without an app restart; one RPC yields
+ * `{ available, version?, path? }`. The version is normalized (leading `v`
+ * stripped) and compared against MINIMUM_NODE_VERSION. Mirrors `CHECK_GIT`:
+ * a missing node binary — or a failed probe — is never an RPC error; it
+ * folds to `{ available:false, versionOk:false }`.
  */
 registerMockIpcHandler(IPC_CHANNELS.SYSTEM.CHECK_NODE, async () => {
   try {
-    const result = await backendRequest<HostFindBinaryResult>("host.findBinary", {
-      name: "node",
-    });
+    const result = await backendRequest<HostCheckGitResult>("host.checkNode");
     if (result?.available !== true) {
       return { success: true, data: { available: false, versionOk: false } };
     }
@@ -172,20 +171,18 @@ registerMockIpcHandler(IPC_CHANNELS.SYSTEM.CHECK_NODE, async () => {
 });
 
 /**
- * `system:check-gh` → daemon `host.findBinary` (name `gh`).
+ * `system:check-gh` → daemon `host.checkGh`.
  *
  * Informational probe for the host-requirements step: gh presence is
- * surfaced alongside git/node but NEVER gates onboarding. The daemon body
- * folds to `{ available, version? }` under `data` (version forwarded
- * verbatim, CHECK_GIT idiom). Mirrors the sibling probes: a missing gh
- * binary — or a failed probe — is never an RPC error; it folds to
- * `{ available:false }`.
+ * surfaced alongside git/node but NEVER gates onboarding. `host.checkGh`
+ * is uncached daemon-side (host.checkGit idiom); the daemon body folds to
+ * `{ available, version? }` under `data` (version forwarded verbatim).
+ * Mirrors the sibling probes: a missing gh binary — or a failed probe — is
+ * never an RPC error; it folds to `{ available:false }`.
  */
 registerMockIpcHandler(IPC_CHANNELS.SYSTEM.CHECK_GH, async () => {
   try {
-    const result = await backendRequest<HostFindBinaryResult>("host.findBinary", {
-      name: "gh",
-    });
+    const result = await backendRequest<HostCheckGitResult>("host.checkGh");
     const available = result?.available === true;
     const version = typeof result?.version === "string" ? result.version : undefined;
     return {

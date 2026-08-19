@@ -1,6 +1,5 @@
-import type { StoreAction } from '$lib/store-shim/types';
-import { createAction } from '$lib/store-shim/utils/store/create-action';
-import { createReducer } from '$lib/store-shim/utils/store/create-reducer';
+import { createAction } from '@augmentcode/themis/utils/store/create-action';
+import { createReducer } from '@augmentcode/themis/utils/store/create-reducer';
 import { createWorkspaceScopedHelpers } from '../../utils/workspace-scoped';
 import { workspaceUnmounted } from '../workspace-lifecycle/workspace-lifecycle-slice';
 
@@ -47,28 +46,12 @@ const updateWorkspaceState = (
   const workspaceState = getWorkspaceState(state, workspaceId);
   return setWorkspaceState(state, workspaceId, updater(workspaceState));
 };
-
-export const hydrateWorkspaceTransientUi = createAction<
-  [workspaceId: string, workspaceState: TransientUiWorkspaceState]
->('transientUi/hydrateWorkspaceTransientUi');
-export const clearWorkspaceTransientUi = createAction<[workspaceId: string]>(
-  'transientUi/clearWorkspaceTransientUi',
-);
-export const requestPersistWorkspaceTransientUi = createAction<[StoreAction<any>]>(
-  'transientUi/requestPersistWorkspaceTransientUi',
-);
-export const persistWorkspaceTransientUi = createAction<[workspaceId: string]>(
-  'transientUi/persistWorkspaceTransientUi',
-);
 export const setViewedFiles = createAction<
   [workspaceId: string, viewedFiles: Record<string, string>]
 >('transientUi/setViewedFiles');
 export const setSidebarActiveTab = createAction<[workspaceId: string, tab: SidebarTabId]>(
   'transientUi/setSidebarActiveTab',
 );
-export const setRawNoteViewEnabled = createAction<
-  [workspaceId: string, noteId: string, enabled: boolean]
->('transientUi/setRawNoteViewEnabled');
 export const toggleRawNoteView = createAction<[workspaceId: string, noteId: string]>(
   'transientUi/toggleRawNoteView',
 );
@@ -79,41 +62,20 @@ export const clearChatDraft = createAction<[workspaceId: string, agentId: string
   'transientUi/clearChatDraft',
 );
 
-export const transientUiReducer = createReducer<TransientUiState>(initialState)
-  .with(hydrateWorkspaceTransientUi, (state, { payload: [workspaceId, workspaceState] }) =>
-    setWorkspaceState(state, workspaceId, workspaceState),
-  )
-  .with(clearWorkspaceTransientUi, (state, { payload: [workspaceId] }) =>
-    clearWorkspaceState(state, workspaceId),
-  )
-  .with(setViewedFiles, (state, { payload: [workspaceId, viewedFiles] }) =>
+export const transientUiReducer = createReducer<TransientUiState>(initialState);
+transientUiReducer.with(setViewedFiles, (state, { payload: [workspaceId, viewedFiles] }) =>
     updateWorkspaceState(state, workspaceId, (workspaceState) => ({
       ...workspaceState,
       viewedFiles,
     })),
-  )
-  .with(setSidebarActiveTab, (state, { payload: [workspaceId, tab] }) =>
+  );
+transientUiReducer.with(setSidebarActiveTab, (state, { payload: [workspaceId, tab] }) =>
     updateWorkspaceState(state, workspaceId, (workspaceState) => ({
       ...workspaceState,
       sidebarActiveTab: tab,
     })),
-  )
-  .with(setRawNoteViewEnabled, (state, { payload: [workspaceId, noteId, enabled] }) => {
-    const workspaceState = getWorkspaceState(state, workspaceId);
-    const currentEnabled = workspaceState.rawNoteViewByNoteId[noteId] === true;
-    if (currentEnabled === enabled) {
-      return state;
-    }
-
-    const rawNoteViewByNoteId = { ...workspaceState.rawNoteViewByNoteId };
-    if (enabled) {
-      rawNoteViewByNoteId[noteId] = true;
-    } else {
-      delete rawNoteViewByNoteId[noteId];
-    }
-    return setWorkspaceState(state, workspaceId, { ...workspaceState, rawNoteViewByNoteId });
-  })
-  .with(toggleRawNoteView, (state, { payload: [workspaceId, noteId] }) =>
+  );
+transientUiReducer.with(toggleRawNoteView, (state, { payload: [workspaceId, noteId] }) =>
     updateWorkspaceState(state, workspaceId, (workspaceState) => {
       const rawNoteViewByNoteId = { ...workspaceState.rawNoteViewByNoteId };
       if (rawNoteViewByNoteId[noteId] === true) {
@@ -123,8 +85,8 @@ export const transientUiReducer = createReducer<TransientUiState>(initialState)
       }
       return { ...workspaceState, rawNoteViewByNoteId };
     }),
-  )
-  .with(setChatDraft, (state, { payload: [workspaceId, agentId, draft] }) =>
+  );
+transientUiReducer.with(setChatDraft, (state, { payload: [workspaceId, agentId, draft] }) =>
     updateWorkspaceState(state, workspaceId, (workspaceState) => {
       const chatDrafts = { ...workspaceState.chatDrafts };
       if (draft) {
@@ -134,12 +96,12 @@ export const transientUiReducer = createReducer<TransientUiState>(initialState)
       }
       return { ...workspaceState, chatDrafts };
     }),
-  )
-  .with(clearChatDraft, (state, { payload: [workspaceId, agentId] }) =>
+  );
+transientUiReducer.with(clearChatDraft, (state, { payload: [workspaceId, agentId] }) =>
     updateWorkspaceState(state, workspaceId, (workspaceState) => {
       const chatDrafts = { ...workspaceState.chatDrafts };
       delete chatDrafts[agentId];
       return { ...workspaceState, chatDrafts };
     }),
-  )
-  .with(workspaceUnmounted, (state, { payload: [wsId] }) => clearWorkspaceState(state, wsId));
+  );
+transientUiReducer.with(workspaceUnmounted, (state, { payload: [wsId] }) => clearWorkspaceState(state, wsId));

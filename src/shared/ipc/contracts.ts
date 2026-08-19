@@ -182,6 +182,19 @@ export namespace AgentIpc {
     sessionId?: SessionId; // Optional for session tracking
   }
 
+  export interface SetModelRequest {
+    agentId: AgentId;
+    modelId: string;
+    workspaceId: WorkspaceId;
+    providerId?: string; // Explicit provider the picked model belongs to (daemon agent.setModel, PROTOCOL §5.5) — resolves bare ids on cross-provider picks
+  }
+
+  export interface SetModelResponse {
+    success: boolean;
+    modelId?: string;
+    error?: string;
+  }
+
   export interface ActivateResponse {
     success: boolean;
     backendSessionId?: string;
@@ -248,6 +261,34 @@ export namespace FileIpc {
     truncated?: boolean; // Indicates if content was truncated due to size limits
   }
 
+  /** One bounded slice of a host-local file (large-file upload reads). */
+  export interface ReadChunkRequest {
+    path: string;
+    /** Byte offset to start reading from. */
+    offset: number;
+    /** Bytes to read (≤ 16 MiB; the last chunk may return fewer). */
+    length: number;
+  }
+
+  export interface ReadChunkResponse {
+    /** Base64 of the bytes actually read. */
+    content: string;
+    bytesRead: number;
+    /** Total file size at read time. */
+    size: number;
+  }
+
+  export interface HashRequest {
+    path: string;
+  }
+
+  export interface HashResponse {
+    /** Lowercase hex SHA-256 of the full file contents. */
+    sha256: string;
+    /** Total bytes hashed (file size at hash time). */
+    size: number;
+  }
+
   export interface WriteRequest {
     path: string;
     content: string;
@@ -256,6 +297,28 @@ export namespace FileIpc {
 
   export interface WriteResponse {
     bytesWritten: number;
+  }
+
+  export interface DownloadResponse {
+    filePath: string;
+  }
+
+  /**
+   * Save an attachment to a user-chosen location (monorepo#2458). `path` is
+   * the daemon-side workspace-relative attachment path; the main process
+   * owns the save dialog and fetches the bytes (local fs copy, or a
+   * `file.readChunk` loop over a per-transfer connection on remote
+   * backends).
+   */
+  export interface DownloadAttachmentRequest {
+    workspaceId: WorkspaceId;
+    path: string;
+    /** Original attachment file name — the save dialog's default name. */
+    fileName: string;
+  }
+
+  export interface DownloadAttachmentResponse {
+    filePath: string;
   }
 }
 
@@ -294,9 +357,16 @@ export interface IpcContractMap {
   'agent:get': [AgentIpc.GetRequest, AgentIpc.GetResponse];
   'agent:send-message': [AgentIpc.SendMessageRequest, AgentIpc.SendMessageResponse];
   'agent:list': [AgentIpc.ListRequest, AgentIpc.ListResponse];
+  'agent:set-model': [AgentIpc.SetModelRequest, AgentIpc.SetModelResponse];
   'workspace:create': [WorkspaceIpc.CreateRequest, WorkspaceIpc.CreateResponse];
   'workspace:get': [WorkspaceIpc.GetRequest, WorkspaceIpc.GetResponse];
   'file:read': [FileIpc.ReadRequest, FileIpc.ReadResponse];
+  'file:read-chunk': [FileIpc.ReadChunkRequest, FileIpc.ReadChunkResponse];
+  'file:download-attachment': [
+    FileIpc.DownloadAttachmentRequest,
+    FileIpc.DownloadAttachmentResponse,
+  ];
+  'file:hash': [FileIpc.HashRequest, FileIpc.HashResponse];
   'file:write': [FileIpc.WriteRequest, FileIpc.WriteResponse];
   'terminal:create': [TerminalIpc.CreateRequest, TerminalIpc.CreateResponse];
   'terminal:write': [TerminalIpc.WriteRequest, void];

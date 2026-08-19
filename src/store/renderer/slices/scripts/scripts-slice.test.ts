@@ -1,21 +1,5 @@
-import {
-  describe,
-  expect,
-  it,
-} from 'vitest';
-import {
-  MAX_OUTPUT_CHARS,
-  MAX_OUTPUT_CHUNKS,
-  appendScriptOutput,
-  disposeScripts,
-  emptyWorkspaceState,
-  removeScript,
-  scriptsReducer,
-  setScriptOutput,
-  setScriptsData,
-  updateRuntimeState,
-  upsertScript,
-} from './scripts-slice';
+import { describe, expect, it } from 'vitest';
+import { MAX_OUTPUT_CHARS, MAX_OUTPUT_CHUNKS, appendScriptOutput, clearScriptOperations, emptyWorkspaceState, removeScript, restartScriptRequested, scriptOperationFailed, scriptOperationSucceeded, scriptsReducer, setScriptsData, startScriptRequested, stopScriptRequested, updateRuntimeState, upsertScript } from './scripts-slice';
 import type {
   ScriptOutputChunk,
   ScriptRuntimeState,
@@ -28,6 +12,7 @@ import {
   selectScriptRuntime,
   selectScriptsInitialized,
   selectWorkspaceScriptEntries,
+  selectWorkspaceScriptOperations,
   selectWorkspaceScriptRuntime,
   selectWorkspaceScriptsInitialized,
 } from './scripts-selectors';
@@ -69,9 +54,8 @@ function makeChunk(index: number, text = `chunk ${index}\n`): ScriptOutputChunk 
   };
 }
 
-function makeState(scripts: Record<string, any>, activeWorkspaceId: string | null = WS): any {
+function makeState(scripts: Record<string, any>): any {
   return {
-    workspace: { activeWorkspaceId },
     scripts: {
       byWorkspaceId: {
         [WS]: {
@@ -89,6 +73,7 @@ describe('scriptsReducer', () => {
     expect(emptyWorkspaceState).toEqual({
       scripts: {},
       outputBuffers: {},
+      operations: {},
       initialized: false,
       loading: false,
     });
@@ -148,17 +133,44 @@ describe('scriptsReducer', () => {
     });
   });
 
-  it('removes scripts and their output buffers', () => {
-    let state = scriptsReducer(
-      undefined,
-      setScriptsData(WS, [makeScriptEntry({ id: 'script-1' })]),
-    );
-    state = scriptsReducer(state, setScriptOutput(WS, 'script-1', [makeChunk(1)]));
+  it('tracks Shell operations per workspace and suppresses a second pending request', () => {
+    let state = scriptsReducer(undefined, startScriptRequested(WS, 'script-1'));
+    state = scriptsReducer(state, stopScriptRequested(WS, 'script-1'));
+    state = scriptsReducer(state, restartScriptRequested('ws-2', 'script-1'));
 
-    state = scriptsReducer(state, removeScript(WS, 'script-1'));
+    expect(state.byWorkspaceId[WS].operations['script-1']).toEqual({
+      action: 'start',
+      pending: true,
+    });
+    expect(state.byWorkspaceId['ws-2'].operations['script-1']).toEqual({
+      action: 'restart',
+      pending: true,
+    });
 
-    expect(state.byWorkspaceId[WS].scripts['script-1']).toBeUndefined();
-    expect(state.byWorkspaceId[WS].outputBuffers['script-1']).toBeUndefined();
+    state = scriptsReducer(state, scriptOperationFailed(WS, 'script-1', 'start', 'offline'));
+    expect(state.byWorkspaceId[WS].operations['script-1']).toEqual({
+      action: 'start',
+      pending: false,
+      error: 'offline',
+    });
+    expect(
+      selectWorkspaceScriptOperations.select({ scripts: state } as never, 'ws-2')['script-1'],
+    ).toEqual({ action: 'restart', pending: true });
+  });
+
+  it('settles only the matching operation and clears one workspace independently', () => {
+    let state = scriptsReducer(undefined, stopScriptRequested(WS, 'script-1'));
+    state = scriptsReducer(state, scriptOperationSucceeded(WS, 'script-1', 'start'));
+    expect(state.byWorkspaceId[WS].operations['script-1']?.pending).toBe(true);
+
+    state = scriptsReducer(state, scriptOperationSucceeded(WS, 'script-1', 'stop'));
+    expect(state.byWorkspaceId[WS].operations).toEqual({});
+
+    state = scriptsReducer(state, startScriptRequested(WS, 'script-2'));
+    state = scriptsReducer(state, startScriptRequested('ws-2', 'script-2'));
+    state = scriptsReducer(state, clearScriptOperations(WS));
+    expect(state.byWorkspaceId[WS].operations).toEqual({});
+    expect(state.byWorkspaceId['ws-2'].operations['script-2']?.pending).toBe(true);
   });
 
   it('appends raw chunks verbatim — no line splitting, no injected newlines', () => {
@@ -178,20 +190,6 @@ describe('scriptsReducer', () => {
     expect(buffer.chunks.map((c) => c.text).join('')).toBe('partial line, no newline\r\nnext\r');
   });
 
-  it('evicts oldest chunks past the chunk cap and counts them as dropped', () => {
-    let state = scriptsReducer(undefined, upsertScript(WS, makeScript({ id: 'script-1' })));
-    state = scriptsReducer(state, setScriptOutput(WS, 'script-1', [makeChunk(1)]));
-
-    for (let i = 0; i < MAX_OUTPUT_CHUNKS + 1; i++) {
-      state = scriptsReducer(state, appendScriptOutput(WS, 'script-1', makeChunk(i + 2)));
-    }
-
-    const buffer = state.byWorkspaceId[WS].outputBuffers['script-1'];
-    expect(buffer.chunks).toHaveLength(MAX_OUTPUT_CHUNKS);
-    expect(buffer.dropped).toBe(2);
-    expect(buffer.chunks[0].text).toBe('chunk 3\n');
-  });
-
   it('evicts oldest chunks past the char cap but always keeps the newest chunk', () => {
     const big = 'x'.repeat(MAX_OUTPUT_CHARS);
     let state = scriptsReducer(undefined, upsertScript(WS, makeScript({ id: 'script-1' })));
@@ -203,19 +201,6 @@ describe('scriptsReducer', () => {
     expect(buffer.dropped).toBe(1);
     expect(buffer.chunks[0].timestamp).toBe(makeChunk(2).timestamp);
   });
-
-  it('disposes workspace scripts state', () => {
-    let state = scriptsReducer(undefined, upsertScript(WS, makeScript({ id: 'script-1' })));
-    state = scriptsReducer(
-      state,
-      upsertScript('ws-2', makeScript({ id: 'script-2', workspaceId: 'ws-2' })),
-    );
-
-    state = scriptsReducer(state, disposeScripts(WS));
-
-    expect(state.byWorkspaceId[WS]).toBeUndefined();
-    expect(state.byWorkspaceId['ws-2']).toBeDefined();
-  });
 });
 
 describe('scripts selectors', () => {
@@ -224,8 +209,8 @@ describe('scripts selectors', () => {
     const entry = makeScriptEntry({ id: 'script-1' }, runtime);
     const state = makeState({ 'script-1': entry });
 
-    expect(selectScriptEntries.select(state)).toEqual([entry]);
-    expect(selectScriptEntries.select(state)[0]).toBe(entry);
+    expect(selectScriptEntries.select(state, WS)).toEqual([entry]);
+    expect(selectScriptEntries.select(state, WS)[0]).toBe(entry);
     expect(selectWorkspaceScriptEntries.select(state, WS)[0]).toBe(entry);
   });
 
@@ -233,15 +218,14 @@ describe('scripts selectors', () => {
     const legacyEntry = makeScript({ id: 'legacy-1' }) as any;
     const state = makeState({ 'legacy-1': legacyEntry });
 
-    expect(selectScriptRuntime.select(state, 'legacy-1')).toEqual(makeRuntime());
+    expect(selectScriptRuntime.select(state, WS, 'legacy-1')).toEqual(makeRuntime());
     expect(selectWorkspaceScriptRuntime.select(state, WS, 'missing')).toEqual(makeRuntime());
-    expect(selectRunningScripts.select(state)).toEqual([]);
+    expect(selectRunningScripts.select(state, WS)).toEqual([]);
   });
 
   it('selects scripts initialized state', () => {
     // uninitialized state
     const uninitState = {
-      workspace: { activeWorkspaceId: WS },
       scripts: {
         byWorkspaceId: {
           [WS]: {
@@ -252,12 +236,11 @@ describe('scripts selectors', () => {
         },
       },
     };
-    expect(selectScriptsInitialized.select(uninitState)).toBe(false);
+    expect(selectScriptsInitialized.select(uninitState, WS)).toBe(false);
     expect(selectWorkspaceScriptsInitialized.select(uninitState, WS)).toBe(false);
 
     // initialized state
     const initState = {
-      workspace: { activeWorkspaceId: WS },
       scripts: {
         byWorkspaceId: {
           [WS]: {
@@ -268,17 +251,16 @@ describe('scripts selectors', () => {
         },
       },
     };
-    expect(selectScriptsInitialized.select(initState)).toBe(true);
+    expect(selectScriptsInitialized.select(initState, WS)).toBe(true);
     expect(selectWorkspaceScriptsInitialized.select(initState, WS)).toBe(true);
 
     // no workspace state defaults to false
     const noWsState = {
-      workspace: { activeWorkspaceId: WS },
       scripts: {
         byWorkspaceId: {},
       },
     };
-    expect(selectScriptsInitialized.select(noWsState)).toBe(false);
+    expect(selectScriptsInitialized.select(noWsState, WS)).toBe(false);
     expect(selectWorkspaceScriptsInitialized.select(noWsState, WS)).toBe(false);
   });
 });

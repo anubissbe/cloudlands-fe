@@ -1,34 +1,42 @@
 /**
- * Pending agent-deletion registry — soft-hidden deletions awaiting commit.
+ * Pending agent-deletion registry — soft-hidden deletions awaiting the
+ * daemon-owned commit.
  *
- * Agent deletion is soft-hide-then-commit (see agent-mutation-service.ts /
- * AGENTS.md): the session is hidden locally and the real `agent.delete` is
- * deferred for the undo window. During that window the daemon still returns
- * the agent from `agent.list` / `agent.get`, so every rehydration path
- * (lifecycle-read-service `hydrateWorkspaceAgents`, agent-read-service
- * `ensureAgentSession`, chat-read-service `loadChatTranscript`, and the boot
- * agents-seeder) must consult `isAgentDeletionPending()` to avoid resurrecting
- * a soft-hidden agent.
+ * Agent deletion uses the daemon delete grace window (PROTOCOL §5.5, v6.7+):
+ * the session is hidden locally and `agent.delete { undoDelayMs }` is sent
+ * immediately, so the daemon owns the 15s window and commits at the deadline
+ * even if the FE quits. During that window the daemon still returns the agent
+ * from `agent.list` / `agent.get` (carrying `pendingDeleteAt`), so every
+ * rehydration path (lifecycle read saga, agent-read-service
+ * `ensureAgentSession`, and chat-read-service `loadChatTranscript`) must
+ * consult `isAgentDeletionPending()` — and drop wire rows carrying
+ * `pendingDeleteAt` — to avoid resurrecting a soft-hidden agent.
  *
- * Extracted from `agent-mutation-service.ts` (which owns the set/remove
- * lifecycle) so those dependency-light read paths can share the registry.
+ * Shared by the agent mutation saga and dependency-light read paths.
  * Entries are transient, UI-only state (per src/store AGENTS.md) — they never
- * enter Redux. Each entry snapshots the removed session so `undo` can restore
- * it without a wire call, and holds the timer that commits the real
- * `agent.delete` when the undo window elapses.
+ * enter Redux. Each entry snapshots the removed session so `undo`
+ * (`agent.cancelDelete`) can restore it without a refetch. After the daemon
+ * deadline the entry lingers as a tombstone for a grace window so stale
+ * refetch responses cannot resurrect the deleted agent (the owning saga
+ * clears it).
  *
  * Dependency-light per AGENTS.md utils conventions: no stores, services, or
  * wire calls — just a module-level Map with simple accessors and mutators
- * over it (no side effects beyond that Map and its entries' timers).
+ * over it (no side effects beyond that Map).
  */
-import type { AgentSession } from "$shared/types";
+import type { AgentSession } from '$shared/types';
 
-/** A soft-hidden agent deletion awaiting commit. */
+/**
+ * A soft-hidden agent deletion awaiting commit. `snapshot` is absent when the
+ * registering window never hydrated the session (e.g. the events bridge saw
+ * `agent:delete-scheduled` for an agent it only knew from a list row) — the
+ * entry still tombstones the id for read paths; restore then relies on a
+ * refetch instead of the snapshot.
+ */
 export interface PendingAgentDeletion {
   wsId: string;
   agentId: string;
-  snapshot: AgentSession;
-  timer: ReturnType<typeof setTimeout> | null;
+  snapshot?: AgentSession;
 }
 
 const pendingAgentDeletions = new Map<string, PendingAgentDeletion>();
@@ -58,10 +66,7 @@ export function listPendingAgentDeletions(): PendingAgentDeletion[] {
   return [...pendingAgentDeletions.values()];
 }
 
-/** Test-only reset: drop all entries (clearing any armed timers first). */
+/** Test-only reset: drop all entries. */
 export function clearPendingAgentDeletions(): void {
-  for (const entry of pendingAgentDeletions.values()) {
-    if (entry.timer) clearTimeout(entry.timer);
-  }
   pendingAgentDeletions.clear();
 }

@@ -3,21 +3,15 @@ import {
   expect,
   it,
 } from 'vitest';
-import type { StoreState } from '../../types';
-import { selectManagedInstallStatusByProvider } from './agent-availability-selectors';
 import {
   agentAvailabilityReducer,
+  checkAllProvidersComplete,
   checkSingleProviderFailure,
   checkSingleProviderRequested,
   initialState,
   setAllProvidersLoading,
-  setManagedInstallStatus,
 } from './agent-availability-slice';
 import type { AgentAvailabilityState } from './agent-availability-types';
-
-function storeWith(agentAvailability: AgentAvailabilityState): StoreState {
-  return { agentAvailability } as unknown as StoreState;
-}
 
 describe('agentAvailabilityReducer status retention during re-checks', () => {
   // Regression guard for sticky onboarding tiers: ordering in AgentGrid is
@@ -42,75 +36,50 @@ describe('agentAvailabilityReducer status retention during re-checks', () => {
       expect(next.providerStatusMap).toEqual(checkedState.providerStatusMap);
     }
   });
+
+  it('checkSingleProviderFailure clears the loading flag without touching statuses', () => {
+    // A probe failure (unreachable daemon / RPC error) must settle the
+    // in-flight flag — a stuck-true flag leaves the card spinner running and
+    // its refresh button disabled forever — but must NOT fabricate a status
+    // or erase a previously successful one.
+    const loadingState: AgentAvailabilityState = {
+      ...initialState,
+      providerStatusMap: { auggie: { available: true, authenticated: true } },
+      providerLoadingMap: { auggie: true, codex: true },
+    };
+    const next = agentAvailabilityReducer(loadingState, checkSingleProviderFailure('auggie'));
+    expect(next.providerLoadingMap).toEqual({ auggie: false, codex: true });
+    expect(next.providerStatusMap).toBe(loadingState.providerStatusMap);
+    expect(next.providerStatusMap.auggie).toEqual({ available: true, authenticated: true });
+  });
 });
 
-describe('agentAvailabilityReducer managed install status', () => {
-  it('tracks installing then installed managed Codex state', () => {
-    const installing = agentAvailabilityReducer(
-      initialState,
-      setManagedInstallStatus('codex', {
-        managedInstallState: 'installing',
-        version: '0.16.0',
-        downloadProgress: 0.25,
-      }),
-    );
-
-    expect(installing.providerStatusMap.codex).toMatchObject({
-      available: false,
-      managedInstallState: 'installing',
-      version: '0.16.0',
-      downloadProgress: 0.25,
-    });
-
-    const installed = agentAvailabilityReducer(
-      installing,
-      setManagedInstallStatus('codex', {
-        managedInstallState: 'installed',
-        downloadProgress: 1,
-        error: undefined,
-      }),
-    );
-
-    expect(selectManagedInstallStatusByProvider.select(storeWith(installed), 'codex')).toEqual({
-      managedInstallState: 'installed',
-      version: '0.16.0',
-      downloadProgress: 1,
-      error: undefined,
-      usingFallback: undefined,
-    });
+describe('agentAvailabilityReducer hasCheckedOnce honesty', () => {
+  it('does not flip when the sweep landed no statuses (all probes failed)', () => {
+    // An all-probes-failed sweep (daemon unreachable) proves nothing about
+    // availability — presenting it as "checked" would let ModelPicker read
+    // the empty map as "confirmed nothing available".
+    const next = agentAvailabilityReducer(initialState, checkAllProvidersComplete());
+    expect(next).toBe(initialState);
+    expect(next.hasCheckedOnce).toBe(false);
   });
 
-  it('tracks installing then failed managed Codex state', () => {
-    const installing = agentAvailabilityReducer(
-      initialState,
-      setManagedInstallStatus('codex', { managedInstallState: 'installing' }),
-    );
-    const failed = agentAvailabilityReducer(
-      installing,
-      setManagedInstallStatus('codex', {
-        managedInstallState: 'failed',
-        error: 'Integrity mismatch for @agentclientprotocol/codex-acp',
-      }),
-    );
-
-    expect(failed.providerStatusMap.codex).toMatchObject({
-      managedInstallState: 'failed',
-      error: 'Integrity mismatch for @agentclientprotocol/codex-acp',
-    });
+  it('flips once at least one probe landed a status', () => {
+    const state: AgentAvailabilityState = {
+      ...initialState,
+      providerStatusMap: { auggie: { available: false } },
+    };
+    const next = agentAvailabilityReducer(state, checkAllProvidersComplete());
+    expect(next.hasCheckedOnce).toBe(true);
   });
 
-  it('tracks static fallback selection for Codex', () => {
-    const state = agentAvailabilityReducer(
-      initialState,
-      setManagedInstallStatus('codex', {
-        managedInstallState: 'failed',
-        usingFallback: true,
-      }),
-    );
-
-    expect(selectManagedInstallStatusByProvider.select(storeWith(state), 'codex')).toMatchObject({
-      managedInstallState: 'failed',
-      usingFallback: true,
-    });
+  it('stays true once set', () => {
+    const state: AgentAvailabilityState = {
+      ...initialState,
+      providerStatusMap: { auggie: { available: false } },
+      hasCheckedOnce: true,
+    };
+    const next = agentAvailabilityReducer(state, checkAllProvidersComplete());
+    expect(next).toBe(state);
   });
 });

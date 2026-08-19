@@ -12,6 +12,11 @@ import {
 } from './sidebar-nav-types';
 import { getChiefThreadTitle } from './chief-thread-title';
 import { m } from '$shared/paraglide/messages.js';
+import {
+  CHIEF_PROMPT_V2_INTRODUCED_AT,
+  CHIEF_PROMPT_VERSION,
+  CHIEF_SPECIALIST_ID,
+} from '$shared/chief-agent-config';
 
 function getMessageTimestamp(message: AgentMessage | undefined): number {
   const value = message?.timestamp;
@@ -57,6 +62,16 @@ function getChiefSessions(state: StoreState): AgentSession[] {
   return candidates.filter((session) => trackedIdSet.has(String(session.id)));
 }
 
+function hasCurrentChiefIdentity(session: AgentSession): boolean {
+  const createdAt = new Date(session.createdAt).getTime();
+  const introducedAt = new Date(CHIEF_PROMPT_V2_INTRODUCED_AT).getTime();
+  return (
+    session.metadata?.specialist === CHIEF_SPECIALIST_ID &&
+    (session.metadata?.chiefPromptVersion === CHIEF_PROMPT_VERSION ||
+      (Number.isFinite(createdAt) && createdAt >= introducedAt))
+  );
+}
+
 function toChiefThreadPreview(session: AgentSession): ChiefThreadPreview {
   const latestMessage = session.messages.at(-1);
   return {
@@ -85,6 +100,10 @@ export const selectPanelItem = store.createSelector((state) => state.sidebarNav.
 
 export const selectPanelWidth = store.createSelector((state) => state.sidebarNav.panelWidth);
 
+export const selectCombinedPanelSplit = store.createSelector(
+  (state) => state.sidebarNav.combinedPanelSplit,
+);
+
 export const selectOnboardingActive = store.createSelector(
   (state) => state.sidebarNav.onboardingActive,
 );
@@ -97,6 +116,10 @@ export const selectDraftPrompt = store.createSelector((state) => state.sidebarNa
 
 export const selectAllSpacesViewMode = store.createSelector(
   (state) => state.sidebarNav.allSpacesViewMode,
+);
+
+export const selectShowArchivedWorkspaces = store.createSelector(
+  (state) => state.sidebarNav.showArchivedWorkspaces,
 );
 
 export const selectPinnedWorkspaceIds = store.createSelector(
@@ -158,4 +181,24 @@ export const selectChiefThreads = store.createSelector((state): ChiefThreadPrevi
     .slice()
     .sort((a, b) => getSessionTimestamp(b) - getSessionTimestamp(a))
     .map(toChiefThreadPreview),
+);
+
+/** Latest Chief thread created with the current runtime identity contract. */
+export const selectCurrentChiefThread = store.createSelector((state): ChiefThreadPreview | null => {
+  const current = getChiefSessions(state)
+    .filter(hasCurrentChiefIdentity)
+    .sort((a, b) => getSessionTimestamp(b) - getSessionTimestamp(a))[0];
+
+  return current ? toChiefThreadPreview(current) : null;
+});
+
+/** Latest blank Chief thread created with the current prompt identity contract. */
+export const selectReusableChiefThread = store.createSelector(
+  (state): ChiefThreadPreview | null => {
+    const reusable = getChiefSessions(state)
+      .filter((session) => session.messages.length === 0 && hasCurrentChiefIdentity(session))
+      .sort((a, b) => getSessionTimestamp(b) - getSessionTimestamp(a))[0];
+
+    return reusable ? toChiefThreadPreview(reusable) : null;
+  },
 );

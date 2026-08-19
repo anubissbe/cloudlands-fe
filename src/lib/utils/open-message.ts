@@ -11,8 +11,9 @@
  *      dispatches `initializeChatRequested`, whose chat-read-service hydrates
  *      the full transcript into the agent-session slice.
  *   3. Wait for the message to appear in the store. The store prunes to the
- *      newest 500 messages, so a very old message can be absent even after a
- *      full hydrate — once hydration settles without it, seek the page
+ *      newest `MAX_MESSAGES_PER_AGENT` messages, so a very old message can be
+ *      absent even after a full hydrate — once hydration settles without it,
+ *      seek the page
  *      CONTAINING the message via `agent.getConversation`'s `aroundMessageId`
  *      (PROTOCOL §5.5) and `replaceMessages` the session with that page.
  *   4. Hand the DOM work to the mounted ChatPanel through the
@@ -59,7 +60,7 @@ const HYDRATION_TIMEOUT_MS = 15_000;
 const MIN_POLLS_BEFORE_SETTLED = 2;
 /** Retry ladder for the scroll hand-off event (ChatPanel may still be mounting). */
 const SCROLL_DISPATCH_DELAYS_MS = [150, 400, 800, 1500, 3000];
-const SEEK_PAGE_LIMIT = 200;
+const SEEK_PAGE_LIMIT = 50;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -143,10 +144,7 @@ export async function openMessage(options: OpenMessageOptions): Promise<void> {
     messageId,
   });
 
-  if (
-    typeof window !== 'undefined' &&
-    window.location.pathname !== `/workspace/${workspaceId}`
-  ) {
+  if (typeof window !== 'undefined' && window.location.pathname !== `/workspace/${workspaceId}`) {
     try {
       // navigateToRoute no-ops in the HUD pop-out window (never leaves /hud).
       await navigateToRoute(`/workspace/${workspaceId}`);

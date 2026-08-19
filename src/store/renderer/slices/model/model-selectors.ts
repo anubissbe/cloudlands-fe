@@ -1,10 +1,11 @@
-import { store } from "../../store";
+import { store } from '../../store';
 import {
   getItem,
   getItems,
   type Collection,
-} from '$lib/store-shim/utils/collections/collection-utils';
+} from '@augmentcode/themis/utils/collections/collection-utils';
 import type { AuggieModel } from '$features/auggie/auggie-models.client';
+import { getAgentProvider } from '$shared/types/agent-session';
 import { isModelValidForProvider } from '$shared/utils/compound-model-id';
 import {
   selectActiveProviderId,
@@ -12,6 +13,7 @@ import {
 } from '../provider-settings/provider-settings-selectors';
 import { resolveDefaultModel } from './model-selection-utils';
 import type { ModelLoadingState } from './model-types';
+import { selectEffectiveDefaultProviderId } from '../provider-catalog/provider-catalog-selectors';
 
 function getEffectiveProviderId(state: any, providerId?: string): string {
   return providerId ?? selectActiveProviderId.select(state);
@@ -46,7 +48,7 @@ export const selectSelectedModel = store.createSelector((state, providerId?: str
 export const selectHasResolvableModel = store.createSelector(
   (state, providerId?: string): boolean => {
     return selectSelectedModel.select(state, providerId) !== '';
-  }
+  },
 );
 
 const selectAvailableModelsCollection = store.createSelector(
@@ -106,6 +108,24 @@ export const selectAllProviderWarnings = store.createSelector((state): Record<st
   return warnings;
 });
 
+/**
+ * Provider ids whose current `warning` accompanies a last-known-good (stale)
+ * model list rather than a degraded static fallback.
+ */
+export const selectAllProviderStaleFlags = store.createSelector(
+  (state): Record<string, boolean> => {
+    const stale: Record<string, boolean> = {};
+
+    for (const [providerId, loadingState] of Object.entries(state.model.loadingState)) {
+      if (loadingState.stale) {
+        stale[providerId] = true;
+      }
+    }
+
+    return stale;
+  },
+);
+
 export const selectRetryAttempt = store.createSelector((state, providerId?: string): number => {
   return selectProviderLoadingState.select(state, providerId)?.retryAttempt ?? 0;
 });
@@ -117,6 +137,22 @@ export const selectModelsLoadedForProvider = selectModelsLoaded;
 /** Select all provider models */
 export const selectProviderModels = store.createSelector((state): Record<string, string> => {
   return state.model.providerModels;
+});
+
+/**
+ * Effective default provider id mirrored by the model slice for model-id
+ * normalization ('' before hydration). See `ModelState.defaultProviderId`.
+ */
+export const selectDefaultProviderId = store.createSelector((state): string => {
+  return state.model.defaultProviderId;
+});
+
+/**
+ * Default reasoning-effort level paired with the default-model setting
+ * (`model.defaultReasoningEffort`), or '' when unset.
+ */
+export const selectDefaultReasoningEffort = store.createSelector((state): string => {
+  return state.model.defaultReasoningEffort;
 });
 
 export const selectModelPickerCollapsedGroups = store.createSelector((state): string[] => {
@@ -174,13 +210,23 @@ export const selectModelEffortLevels = store.createSelector(
 
 /**
  * Effort levels for the model an agent session currently uses — the
- * session-scoped companion to `selectAgentReasoningEffort`. `undefined` when
- * the session is unknown, uses the provider default model, or the model has
- * no effort support in the loaded catalog.
+ * session-scoped companion to `selectAgentReasoningEffort`. The session's own
+ * daemon-served `effortLevels` (the provider's `thought_level` select
+ * discovered at session open, §5.5) take precedence when present; otherwise
+ * the catalog metadata lookup applies (codex static catalog etc.).
+ * Sessions that inherit their provider model resolve through `selectSelectedModel`.
+ * `undefined` when the session is unknown or neither the session nor the loaded
+ * catalog advertises effort support.
  */
 export const selectAgentModelEffortLevels = store.createSelector(
   (state, agentId: string): string[] | undefined => {
-    const model = state.agentSessions?.byAgentId[agentId]?.model;
+    const session = state.agentSessions?.byAgentId[agentId];
+    if (!session) return undefined;
+    if (Array.isArray(session.effortLevels) && session.effortLevels.length > 0) {
+      return session.effortLevels;
+    }
+    const providerId = getAgentProvider(session, selectEffectiveDefaultProviderId.select(state));
+    const model = session.model ?? selectSelectedModel.select(state, providerId);
     return selectModelEffortLevels.select(state, model);
   },
 );

@@ -6,23 +6,22 @@
    * setup script disclosure, PR branch suggestion, error state, and the
    * "Create workspace" button.
    */
-  import {
-  fly,
-  slide,
-} from 'svelte/transition';
+  import { fly, slide } from 'svelte/transition';
   import { cubicOut } from 'svelte/easing';
   import Fa from 'svelte-fa';
   import {
-  faArrowRight,
-  faPaperclip,
-  faMagicWandSparkles,
-  faArrowsRotate,
-  faCodeBranch,
-} from '@fortawesome/free-solid-svg-icons';
+    faArrowRight,
+    faPaperclip,
+    faMagicWandSparkles,
+    faArrowsRotate,
+    faCodeBranch,
+  } from '@fortawesome/free-solid-svg-icons';
   import { toast } from 'svelte-sonner';
   import { m } from '$shared/paraglide/messages.js';
   import { Button } from '$lib/components/ui/button';
   import RichTextarea from '$lib/components/ui/RichTextarea.svelte';
+  import AttachmentPreview from '$lib/components/chat/AttachmentPreview.svelte';
+  import { hasBlockingAttachments, type ContextItem } from '$lib/components/chat/input/context-api';
   import BranchSelector from '$lib/components/workspace/initializer/BranchSelector.svelte';
   import SetupScriptModal from '$lib/components/modals/SetupScriptModal.svelte';
   import IssueSuggestions from '$lib/components/workspace/initializer/IssueSuggestions.svelte';
@@ -35,6 +34,7 @@
   import { selectActiveProviderId } from '$store/renderer/slices/provider-settings/provider-settings-selectors';
   import { appClient } from '$lib/client';
   import { createLogger } from '$lib/utils/client-logger';
+  import { formatFileSize } from '$lib/utils/file-utils';
 
   const COORDINATOR_SPECIALIST_ID = 'spec-writer';
 
@@ -86,6 +86,14 @@
     visibleSuggestions: string[];
     focusedSuggestionIndex: number;
 
+    /**
+     * Staged attachment context items (non-image files, path-only). Owned by
+     * the parent so the submit path can place them into the created
+     * workspace (`file.placeAttachment`, PROTOCOL §5.9) and reference them
+     * from the first message.
+     */
+    stagedContextItems?: ContextItem[];
+
     // Handlers
     onSubmit: () => void;
     onEnhancePrompt: () => void;
@@ -127,6 +135,7 @@
     onModelChange = () => {},
     visibleSuggestions,
     focusedSuggestionIndex = $bindable(),
+    stagedContextItems = $bindable([]),
     onSubmit,
     onEnhancePrompt,
     enhancePromptAvailable = true,
@@ -148,6 +157,10 @@
   let onboardingRichTextarea: RichTextarea | null = $state(null);
   let onboardingFileInput: HTMLInputElement | null = $state(null);
   let richTextareaWrapper: HTMLDivElement | null = $state(null);
+
+  // Drag and drop state
+  let isDragging = $state(false);
+  let dragCounter = $state(0);
 
   // Daemon-resolved default-model preview for the Coordinator (PROTOCOL
   // §5.11): `specialist.list` with the onboarding provider context returns
@@ -209,22 +222,97 @@
     const target = e.target as HTMLInputElement;
     const files = target.files;
     if (!files || files.length === 0) return;
-    const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
+    await processImageFiles(Array.from(files));
+    target.value = '';
+  }
+
+  /** Process files from file input or drag-and-drop: images inline, other
+   * files staged as path-only context items placed at workspace.create
+   * (`file.placeAttachment`, PROTOCOL §5.9) — never inlined, never dropped. */
+  async function processImageFiles(files: File[]) {
+    const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB (images only — they cross the wire as base64)
     for (const file of files) {
-      if (file.size > MAX_FILE_SIZE) {
-        toast.error(m.onboarding_promptStep_fileTooLarge_error({ name: file.name }));
-        continue;
-      }
       if (file.type.startsWith('image/')) {
+        if (file.size > MAX_FILE_SIZE) {
+          toast.error(m.onboarding_promptStep_fileTooLarge_error({ name: file.name }));
+          continue;
+        }
         const reader = new FileReader();
         reader.onload = () => {
           const dataUrl = reader.result as string;
           onboardingRichTextarea?.insertImage(dataUrl, file.name);
         };
         reader.readAsDataURL(file);
+      } else {
+        // Stage path-only; no resolvable path (e.g. clipboard bytes) is an
+        // immediate failed pill that blocks create until removed.
+        const sourcePath =
+          (
+            window as unknown as { electronAPI?: { getPathForFile?: (f: File) => string } }
+          ).electronAPI?.getPathForFile?.(file) ?? '';
+        const fileName = file.name || `pasted-file-${Date.now()}`;
+        stagedContextItems = [
+          ...stagedContextItems,
+          {
+            id: `staged-file-${Date.now()}-${stagedContextItems.length}`,
+            type: 'file',
+            label: fileName,
+            description: `${file.type || 'file'} • ${formatFileSize(file.size)}`,
+            path: fileName,
+            attachmentMimeType: file.type || undefined,
+            attachmentSize: file.size,
+            sourcePath,
+            placementStatus: sourcePath ? undefined : 'failed',
+          },
+        ];
+        if (!sourcePath) {
+          toast.error(m.onboarding_promptStep_attachmentNoPath_error({ name: fileName }));
+        }
       }
     }
-    target.value = '';
+  }
+
+  function removeStagedItem(id: string) {
+    stagedContextItems = stagedContextItems.filter((item) => item.id !== id);
+  }
+
+  /** Handle drag enter - track drag state with counter for nested elements */
+  function handleDragEnter(e: DragEvent) {
+    e.preventDefault();
+    e.stopPropagation();
+    dragCounter++;
+    if (e.dataTransfer?.types.includes('Files')) {
+      isDragging = true;
+    }
+  }
+
+  /** Handle drag leave - decrement counter and clear drag state when leaving container */
+  function handleDragLeave(e: DragEvent) {
+    e.preventDefault();
+    e.stopPropagation();
+    dragCounter--;
+    if (dragCounter === 0) {
+      isDragging = false;
+    }
+  }
+
+  /** Handle drag over - required to allow drop */
+  function handleDragOver(e: DragEvent) {
+    e.preventDefault();
+    e.stopPropagation();
+  }
+
+  /** Handle drop - process dropped files */
+  async function handleDrop(e: DragEvent) {
+    e.preventDefault();
+    e.stopPropagation();
+    isDragging = false;
+    dragCounter = 0;
+
+    const files = e.dataTransfer?.files;
+    if (!files || files.length === 0) return;
+
+    await processImageFiles(Array.from(files));
   }
 
   /**
@@ -280,7 +368,7 @@
       class="onboarding-creating-state space-y-4"
       in:fly={{ y: 12, duration: 350, easing: cubicOut }}
     >
-      <div class="rounded-xl bg-muted/20 border border-border/30 px-4 py-3">
+      <div class="rounded-xl bg-muted/20 border border-border px-4 py-3">
         <p class="text-sm text-foreground leading-relaxed">
           {onboardingInputValue}
         </p>
@@ -291,7 +379,9 @@
             class="absolute inset-0 rounded-full border-2 border-transparent border-t-primary animate-spin"
           ></div>
         </div>
-        <span class="text-sm text-muted-foreground">{m.onboarding_promptStep_settingUpWorkspace_label()}</span>
+        <span class="text-sm text-muted-foreground"
+          >{m.onboarding_promptStep_settingUpWorkspace_label()}</span
+        >
       </div>
     </div>
   {:else}
@@ -305,12 +395,27 @@
         onchange={handleFileChange}
       />
       <div
-        class="relative rich-input-container flex flex-col bg-background rounded-xl border border-border shadow-xs transition-colors overflow-hidden"
+        class="relative rich-input-container flex flex-col bg-background rounded-xl border shadow-xs transition-colors overflow-hidden {isDragging
+          ? 'border-primary border-dashed'
+          : 'border-border'}"
+        ondragenter={handleDragEnter}
+        ondragleave={handleDragLeave}
+        ondragover={handleDragOver}
+        ondrop={handleDrop}
       >
-        <div
-          class="w-full relative overflow-hidden rounded-t-xl"
-          bind:this={richTextareaWrapper}
-        >
+        <!-- Drop zone overlay -->
+        {#if isDragging}
+          <div
+            class="absolute inset-0 bg-primary/5 z-20 flex items-center justify-center pointer-events-none rounded-xl"
+          >
+            <div class="flex flex-col items-center gap-2 text-primary">
+              <Fa icon={faPaperclip} size={24} />
+              <span class="text-sm font-medium">{m.onboarding_promptStep_dropFiles_label()}</span>
+            </div>
+          </div>
+        {/if}
+
+        <div class="w-full relative overflow-hidden rounded-t-xl" bind:this={richTextareaWrapper}>
           <RichTextarea
             bind:this={onboardingRichTextarea}
             bind:value={onboardingInputValue}
@@ -325,9 +430,7 @@
             class="bg-transparent border-none"
           />
           {#if !onboardingInputValue.trim()}
-            <div
-              class="absolute left-0 right-0 top-[52px] px-4 pointer-events-none"
-            >
+            <div class="absolute left-0 right-0 top-[52px] px-4 pointer-events-none">
               <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
               <div
                 class="flex flex-col gap-0.75 pointer-events-auto"
@@ -355,9 +458,7 @@
                     <Fa
                       icon={faArrowRight}
                       size={12}
-                      class={focusedSuggestionIndex === i
-                        ? 'opacity-100'
-                        : 'opacity-60'}
+                      class={focusedSuggestionIndex === i ? 'opacity-100' : 'opacity-60'}
                     />
                     {suggestion}
                   </button>
@@ -366,11 +467,9 @@
                   type="button"
                   role="option"
                   id="suggestion-shuffle"
-                  aria-selected={focusedSuggestionIndex ===
-                    visibleSuggestions.slice(0, 4).length}
+                  aria-selected={focusedSuggestionIndex === visibleSuggestions.slice(0, 4).length}
                   class="text-left text-xs transition-colors cursor-pointer mt-0.75 inline-flex items-center gap-1.5
-                    {focusedSuggestionIndex ===
-                  visibleSuggestions.slice(0, 4).length
+                    {focusedSuggestionIndex === visibleSuggestions.slice(0, 4).length
                     ? 'text-foreground'
                     : 'text-muted-foreground/30 hover:text-muted-foreground/70'}"
                   onclick={onShuffleSuggestions}
@@ -382,9 +481,7 @@
             </div>
           {/if}
           {#if isOnboardingEnhancing}
-            <div
-              class="absolute inset-0 pointer-events-none overflow-hidden rounded-t-xl"
-            >
+            <div class="absolute inset-0 pointer-events-none overflow-hidden rounded-t-xl">
               <div
                 class="absolute inset-0 bg-gradient-to-r from-transparent via-primary/5 to-transparent animate-pulse"
               ></div>
@@ -392,9 +489,26 @@
           {/if}
         </div>
 
-        <div
-          class="flex items-center gap-2 px-2.5 pt-1 pb-2.5 overflow-x-auto relative"
-        >
+        <!-- Staged non-image attachments: chips with placement state (failed
+             pills block create until removed) -->
+        {#if stagedContextItems.length > 0}
+          <div class="px-2.5 pt-1 pb-1 flex flex-wrap gap-2 items-center">
+            {#each stagedContextItems as item (item.id)}
+              <AttachmentPreview
+                id={item.id}
+                name={item.label}
+                type={item.attachmentMimeType || ''}
+                size={item.attachmentSize}
+                onRemove={removeStagedItem}
+                variant="chip"
+                placementStatus={item.placementStatus}
+                placementError={item.placementError}
+              />
+            {/each}
+          </div>
+        {/if}
+
+        <div class="flex items-center gap-2 px-2.5 pt-1 pb-2.5 overflow-x-auto relative">
           <IssueSuggestions
             onSelect={(text, metadata) => {
               onIssueSelect(text, metadata);
@@ -440,36 +554,34 @@
       </div>
     </div>
 
-    <div class="w-full">
+    <div class="onboarding-metadata-stack flex w-full min-w-0 flex-col gap-2">
       <!-- Branch picker -->
       {#if projectSelection?.type === 'local' && projectSelection?.repoPath}
         <!-- svelte-ignore a11y_click_events_have_key_events -->
         <!-- svelte-ignore a11y_no_static_element_interactions -->
         <div
-          class="flex items-center gap-0.5 text-sm cursor-pointer"
+          class="onboarding-metadata-row flex min-h-8 min-w-0 flex-wrap items-center gap-x-1.5 gap-y-1 text-sm cursor-pointer"
           in:fly={{ y: 10, duration: 200, easing: cubicOut }}
           onclick={(e) => {
             const trigger = e.currentTarget.querySelector('button');
-            if (
-              trigger &&
-              e.target !== trigger &&
-              !trigger.contains(e.target as Node)
-            ) {
+            if (trigger && e.target !== trigger && !trigger.contains(e.target as Node)) {
               trigger.click();
             }
           }}
         >
-          <span class="text-muted-foreground">{m.onboarding_promptStep_branchOffOf_before()}</span>
+          <span class="shrink-0 text-muted-foreground"
+            >{m.onboarding_promptStep_branchOffOf_before()}</span
+          >
           <BranchSelector
             variant="ghost"
-            triggerClass="pl-1 pr-1.5 font-medium bg-card/50 py-1.25 rounded-md border border-border/30"
+            triggerClass="max-w-full pl-1 pr-1.5 font-medium bg-card/50 py-1.25 rounded-md border border-border"
             value={projectSelection?.branch || 'main'}
             repoPath={projectSelection.repoPath}
             repoType="local"
             hasTriggerIcon={false}
             showUncommittedIndicator={true}
             skipIsolation={onboardingSkipIsolation}
-            onSkipIsolationChange={onSkipIsolationChange}
+            {onSkipIsolationChange}
             onBranchStatusChange={(status) => {
               onBranchBehindChange(status.behind);
             }}
@@ -487,30 +599,28 @@
         <!-- svelte-ignore a11y_click_events_have_key_events -->
         <!-- svelte-ignore a11y_no_static_element_interactions -->
         <div
-          class="flex items-center gap-0.5 text-sm cursor-pointer"
+          class="onboarding-metadata-row flex min-h-8 min-w-0 flex-wrap items-center gap-x-1.5 gap-y-1 text-sm cursor-pointer"
           in:fly={{ y: 10, duration: 200, easing: cubicOut }}
           onclick={(e) => {
             const trigger = e.currentTarget.querySelector('button');
-            if (
-              trigger &&
-              e.target !== trigger &&
-              !trigger.contains(e.target as Node)
-            ) {
+            if (trigger && e.target !== trigger && !trigger.contains(e.target as Node)) {
               trigger.click();
             }
           }}
         >
-          <span class="text-muted-foreground">{m.onboarding_promptStep_branchOff_label()}</span>
+          <span class="shrink-0 text-muted-foreground"
+            >{m.onboarding_promptStep_branchOff_label()}</span
+          >
           <BranchSelector
             variant="ghost"
-            triggerClass="pl-1 pr-1.5 font-medium bg-card/50 py-1.25 rounded-md border border-border/30"
+            triggerClass="max-w-full pl-1 pr-1.5 font-medium bg-card/50 py-1.25 rounded-md border border-border"
             value={projectSelection?.branch || 'main'}
             repoPath={projectSelection.repoPath || ''}
             repoType="github"
             githubUrl={projectSelection.githubUrl}
             hasTriggerIcon={false}
             skipIsolation={onboardingSkipIsolation}
-            onSkipIsolationChange={onSkipIsolationChange}
+            {onSkipIsolationChange}
             onBranchStatusChange={(status) => {
               onBranchBehindChange(status.behind);
             }}
@@ -530,25 +640,29 @@
       {#if projectSelection?.repoPath && projectSelection?.type !== 'new'}
         {#if !hideSetupScriptControl}
           <div
-            class="flex items-center gap-0.5 text-sm"
+            class="onboarding-metadata-row flex min-h-8 min-w-0 flex-wrap items-center gap-x-1.5 gap-y-1 text-sm"
             in:fly={{ y: 10, duration: 200, easing: cubicOut }}
           >
             <button
               type="button"
-              class="flex items-center whitespace-nowrap text-sm text-muted-foreground hover:text-foreground transition-colors cursor-pointer"
+              class="flex min-h-8 min-w-0 max-w-full flex-wrap items-center gap-y-1 text-left text-sm text-muted-foreground hover:text-foreground transition-colors cursor-pointer"
               onclick={() => onShowSetupScriptChange(!showSetupScript)}
             >
               <span>{m.onboarding_promptStep_setupEnvWith_before()}</span>
-              <span class="bg-card/50 px-1.5 py-0.5 font-medium"
+              <span
+                class="max-w-full break-words rounded-md border border-border bg-card/50 px-1.5 py-1.25 font-medium text-foreground"
                 >{setupScriptName}</span
               >
-              <span class="text-muted-foreground">{m.onboarding_promptStep_setupEnvWith_after()}</span>
+              <span class="text-muted-foreground"
+                >{m.onboarding_promptStep_setupEnvWith_after()}</span
+              >
             </button>
           </div>
         {/if}
         <SetupScriptModal
           bind:open={showSetupScript}
           repoPath={projectSelection.repoPath}
+          githubUrl={projectSelection.type === 'github' ? projectSelection.githubUrl : null}
           {repoConfigScript}
           bind:value={setupScript}
           bind:scriptName={setupScriptName}
@@ -559,19 +673,23 @@
 
       <!-- Model picker (initial Coordinator agent) -->
       <div
-        class="flex items-center gap-0.5 text-sm"
+        class="onboarding-metadata-row flex min-h-8 min-w-0 flex-wrap items-center gap-x-1.5 gap-y-1 text-sm"
         in:fly={{ y: 10, duration: 200, easing: cubicOut }}
       >
-        <span class="text-muted-foreground">{m.onboarding_promptStep_usingModel_before()}</span>
+        <span class="shrink-0 text-muted-foreground"
+          >{m.onboarding_promptStep_usingModel_before()}</span
+        >
         {#key coordinatorDefaultModel}
           <ModelPicker
             selectedModel={modelWasOverridden ? selectedModel : undefined}
             {onModelChange}
             variant="ghost"
             size="xs"
-            triggerClass="pl-1 pr-1.5 font-medium bg-card/50 py-1.25 rounded-md border border-border/30 text-sm"
+            triggerClass="max-w-full pl-1 pr-1.5 font-medium bg-card/50 py-1.25 rounded-md border border-border text-sm"
             defaultModelId={coordinatorDefaultModel}
             defaultModelLabel={m.chat_modelPicker_providerDefault_label()}
+            fallbackToCatalogDefault
+            fallbackProviderId={onboardingProvider}
             silentFallback
           />
         {/key}
@@ -594,7 +712,10 @@
           }}
         >
           <Fa icon={faCodeBranch} size="sm" class="shrink-0" />
-          <span>{m.onboarding_promptStep_usePrBranch_before()} <strong>{selectedPRBranch}</strong></span>
+          <span
+            >{m.onboarding_promptStep_usePrBranch_before()}
+            <strong>{selectedPRBranch}</strong></span
+          >
         </button>
       </div>
     {/if}
@@ -608,20 +729,18 @@
       />
     {/if}
 
-    <!-- Create button -->
-    <div class="flex items-center gap-3 pt-2">
+    <!-- Create button (blocked while any staged pill is placing/failed) -->
+    <div class="onboarding-create-action flex items-center gap-3 pt-2">
       <Button
         class="group/button"
         size="xl"
         variant={!onboardingInputValue.trim() ? 'outline' : 'default'}
-        disabled={!onboardingInputValue.trim()}
+        disabled={!onboardingInputValue.trim() || hasBlockingAttachments(stagedContextItems)}
         onclick={onSubmit}
       >
         {m.onboarding_promptStep_createWorkspace_label()}
         {#if onboardingInputValue.trim()}
-          <span class="mx-1 opacity-50" in:slide={{ axis: 'x', duration: 200 }}>
-            ⌘↵</span
-          >
+          <span class="mx-1 opacity-50" in:slide={{ axis: 'x', duration: 200 }}> ⌘↵</span>
         {/if}
         <Fa
           icon={faArrowRight}

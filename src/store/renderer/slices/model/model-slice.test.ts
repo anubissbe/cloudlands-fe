@@ -4,30 +4,15 @@ import {
   it,
 } from 'vitest';
 import type { AuggieModel } from '$features/auggie/auggie-models.client';
-import { createCollection } from '$lib/store-shim/utils/collections/collection-utils';
+import { createCollection } from '@augmentcode/themis/utils/collections/collection-utils';
 import { MOCK_PROVIDER_CATALOG } from '../../../../test/fixtures/provider-catalog.fixture';
 import { providerCatalogLoaded } from '../provider-catalog/provider-catalog-slice';
 import {
   hydrateActiveProvider,
   setActiveProvider,
 } from '../provider-settings/provider-settings-slice';
-import {
-  clearModelFallbackInfo,
-  clearLoadingStateForProvider,
-  hydrateModelFallbackInfo,
-  hydrateModelPickerCollapsedGroups,
-  initialState as bareInitialState,
-  loadProviderModelsFromStorage,
-  modelReducer,
-  setModelFallbackInfo,
-  setModelPickerGroupCollapsed,
-  setAvailableModels,
-  setLoadingStateForProvider,
-  setRetryAttempt,
-  setSelectedModel,
-} from './model-slice';
-import { selectAllProviderWarnings } from './model-selectors';
-import type { ModelState } from './model-types';
+import { initialState as bareInitialState, loadDefaultReasoningEffortFromStorage, loadProviderModelsFromStorage, modelReducer, setDefaultReasoningEffort, setAvailableModels, setLoadingStateForProvider, setSelectedModel } from './model-slice';
+import { selectAllProviderStaleFlags, selectAllProviderWarnings } from './model-selectors';
 
 // With nothing user-configured, the first catalog row is the effective default.
 const defaultProviderId = MOCK_PROVIDER_CATALOG.providers[0].id;
@@ -54,6 +39,24 @@ const mockModels: AuggieModel[] = [
 describe('modelReducer', () => {
   it('returns the initial state', () => {
     expect(modelReducer(undefined, { type: '@@INIT' })).toEqual(bareInitialState);
+  });
+
+  it('stores and clears the default reasoning effort', () => {
+    expect(bareInitialState.defaultReasoningEffort).toBe('');
+
+    const picked = modelReducer(bareInitialState, setDefaultReasoningEffort('high'));
+    expect(picked.defaultReasoningEffort).toBe('high');
+
+    const cleared = modelReducer(picked, setDefaultReasoningEffort(''));
+    expect(cleared.defaultReasoningEffort).toBe('');
+  });
+
+  it('hydrates the default reasoning effort from the settings catalog', () => {
+    const hydrated = modelReducer(
+      bareInitialState,
+      loadDefaultReasoningEffortFromStorage('medium'),
+    );
+    expect(hydrated.defaultReasoningEffort).toBe('medium');
   });
 
   it('falls back to the first catalog row at hydration when no active provider was mirrored', () => {
@@ -213,61 +216,55 @@ describe('modelReducer', () => {
     });
   });
 
-  it('clears provider loading state for only the requested provider', () => {
-    const prev: ModelState = {
-      ...initialState,
-      loadingState: {
-        auggie: { status: 'loading', retryAttempt: 0 },
-        codex: { status: 'error', retryAttempt: 1, error: 'boom' },
-      },
-    };
-
-    const state = modelReducer(prev, clearLoadingStateForProvider('codex'));
-
-    expect(state.loadingState).toEqual({
-      auggie: { status: 'loading', retryAttempt: 0 },
-    });
-  });
-
-  it('stores warnings on success and clears them on success without warnings, error, and clear', () => {
-    const warningState = modelReducer(
+  it('tracks the stale flag alongside the warning', () => {
+    // PROTOCOL §5.30 degraded-but-cached response: models + stale + warning.
+    const staleState = modelReducer(
       initialState,
       setLoadingStateForProvider({
         providerId: 'codex',
         status: 'success',
-        warning: 'Codex not installed; using static model list',
+        warning: 'probe timed out; serving last known model list',
+        stale: true,
       }),
     );
-    expect(warningState.loadingState.codex.warning).toBe(
-      'Codex not installed; using static model list',
-    );
+    expect(staleState.loadingState.codex.stale).toBe(true);
+    expect(selectAllProviderStaleFlags.select({ model: staleState })).toEqual({ codex: true });
 
-    const loadingState = modelReducer(
-      warningState,
+    const stillStale = modelReducer(
+      staleState,
       setLoadingStateForProvider({ providerId: 'codex', status: 'loading' }),
     );
-    expect(loadingState.loadingState.codex.warning).toBe(
-      'Codex not installed; using static model list',
-    );
+    expect(stillStale.loadingState.codex.stale).toBe(true);
 
-    const successWithoutWarning = modelReducer(
-      warningState,
+    const freshSuccess = modelReducer(
+      staleState,
       setLoadingStateForProvider({ providerId: 'codex', status: 'success' }),
     );
-    expect(successWithoutWarning.loadingState.codex.warning).toBeUndefined();
+    expect(freshSuccess.loadingState.codex.stale).toBeUndefined();
 
-    const warningAgain = modelReducer(
-      warningState,
-      setLoadingStateForProvider({
-        providerId: 'codex',
-        status: 'error',
-        error: 'boom',
-      }),
+    const errored = modelReducer(
+      staleState,
+      setLoadingStateForProvider({ providerId: 'codex', status: 'error', error: 'boom' }),
     );
-    expect(warningAgain.loadingState.codex.warning).toBeUndefined();
+    expect(errored.loadingState.codex.stale).toBeUndefined();
+  });
 
-    const cleared = modelReducer(warningState, clearLoadingStateForProvider('codex'));
-    expect(cleared.loadingState.codex).toBeUndefined();
+  it('omits providers without a stale flag from the stale selector', () => {
+    const state = {
+      model: {
+        ...initialState,
+        loadingState: {
+          codex: {
+            status: 'success' as const,
+            retryAttempt: 0,
+            warning: 'Codex not installed; using static model list',
+          },
+          auggie: { status: 'success' as const, retryAttempt: 0 },
+        },
+      },
+    };
+
+    expect(selectAllProviderStaleFlags.select(state)).toEqual({});
   });
 
   it('selects provider warnings', () => {
@@ -293,23 +290,6 @@ describe('modelReducer', () => {
     });
   });
 
-  it('updates retry attempt while preserving existing provider status', () => {
-    const prev: ModelState = {
-      ...initialState,
-      loadingState: {
-        codex: { status: 'error', retryAttempt: 1, error: 'boom' },
-      },
-    };
-
-    const state = modelReducer(prev, setRetryAttempt({ providerId: 'codex', attempt: 3 }));
-
-    expect(state.loadingState.codex).toEqual({
-      status: 'error',
-      retryAttempt: 3,
-      error: 'boom',
-    });
-  });
-
   it('normalizes provider models loaded from storage', () => {
     const state = modelReducer(
       initialState,
@@ -322,38 +302,6 @@ describe('modelReducer', () => {
     expect(state.providerModels).toEqual({
       [defaultProviderId]: 'gpt5.4',
       codex: 'codex:gpt-5.3-codex/high',
-    });
-  });
-
-  it('hydrates and toggles model picker collapsed groups', () => {
-    const hydrated = modelReducer(
-      initialState,
-      hydrateModelPickerCollapsedGroups(['auggie', 'codex', 'auggie']),
-    );
-    const expanded = modelReducer(hydrated, setModelPickerGroupCollapsed('auggie', false));
-    const collapsed = modelReducer(expanded, setModelPickerGroupCollapsed('openai', true));
-
-    expect(hydrated.modelPickerCollapsedGroups).toEqual(['auggie', 'codex']);
-    expect(expanded.modelPickerCollapsedGroups).toEqual(['codex']);
-    expect(collapsed.modelPickerCollapsedGroups).toEqual(['codex', 'openai']);
-  });
-
-  it('hydrates, sets, and clears model fallback info by agent', () => {
-    const info = { fromModel: 'old-model', toModel: 'new-model' };
-    const hydrated = modelReducer(initialState, hydrateModelFallbackInfo('agent-1', info));
-    const set = modelReducer(
-      hydrated,
-      setModelFallbackInfo('agent-2', { fromModel: 'missing', toModel: 'fallback' }),
-    );
-    const cleared = modelReducer(set, clearModelFallbackInfo('agent-1'));
-
-    expect(hydrated.fallbackInfoByAgentId).toEqual({ 'agent-1': info });
-    expect(set.fallbackInfoByAgentId['agent-2']).toEqual({
-      fromModel: 'missing',
-      toModel: 'fallback',
-    });
-    expect(cleared.fallbackInfoByAgentId).toEqual({
-      'agent-2': { fromModel: 'missing', toModel: 'fallback' },
     });
   });
 });

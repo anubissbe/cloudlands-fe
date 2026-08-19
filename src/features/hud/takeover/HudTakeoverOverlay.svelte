@@ -22,6 +22,7 @@
   } from '$store/renderer/slices/hud/hud-selectors';
   import { ensureWorkspaceTasksLoaded } from '$store/renderer/slices/workspace-tasks/workspace-tasks-slice';
   import { hydrateTaskAgentAssociationsRequested } from '$store/renderer/slices/task-agent-associations/task-agent-associations-slice';
+  import { microConnectedReadable } from '$features/hardware-console/device/connection-status';
   import { formatHudTimer } from '../utils/hud-format';
   import { watchReducedMotion } from '../right-column/hud-slide.svelte';
   import { onTakeoverTrigger } from './hud-takeover-bus';
@@ -33,16 +34,9 @@
   } from './hud-takeover-queue';
   import { createTakeoverController } from './hud-takeover-controller.svelte';
   import { takeoverFrameStyle } from './hud-takeover-frame';
-  import {
-    bannerScrollDurationS,
-    cellLeft,
-    cellNeedsPan,
-    cellTop,
-    emptyCellCoords,
-    spiralCoords,
-    takeoverPanBounds,
-  } from './hud-takeover-layout';
-  import { createTakeoverMapDrag } from './hud-takeover-drag.svelte';
+  import { bannerScrollDurationS, cellLeft, cellTop } from './hud-takeover-layout';
+  import { createTakeoverMapState } from './hud-takeover-map.svelte';
+  import HudTakeoverEdges from './HudTakeoverEdges.svelte';
   import {
     agentBucketLabel,
     takeoverKindColor,
@@ -50,7 +44,11 @@
     taskCellMeta,
   } from './hud-takeover-meta';
   import HudTakeoverBanner from './HudTakeoverBanner.svelte';
+  import HudTakeoverHeading from './HudTakeoverHeading.svelte';
+  import HudTakeoverZoomControls from './HudTakeoverZoomControls.svelte';
   import { agentBucketColor } from '../grid/hud-card-meta';
+  import { playTakeoverTransitionCues } from '../sound/hud-sound-player';
+  import { createTypewriterCue } from '../sound/hud-typewriter-cue.svelte';
 
   let { nowMs }: { nowMs: number } = $props();
 
@@ -58,6 +56,24 @@
   const reducedMotion = watchReducedMotion();
   const controller = createTakeoverController(() => reducedMotion.current);
   const queue = $derived(controller.queue);
+
+  // ── Sound: cue on queue phase transitions (enable gate lives in the
+  // service; viewers play structural transients only — 'manual' maps to no
+  // kind cue). ──
+  let prevQueueForSound = controller.queue;
+  $effect(() => {
+    const next = controller.queue;
+    playTakeoverTransitionCues(prevQueueForSound, next);
+    prevQueueForSound = next;
+  });
+
+  // ── Sound: banner-typewriter garnish — a timer aligned with the first
+  // banner's wipe-in start (see hud-typewriter-cue.svelte.ts). ──
+  const typewriterCue = createTypewriterCue({
+    queue: () => controller.queue,
+    motion: () => !reducedMotion.current,
+    needsPan: () => needsPan,
+  });
 
   function handleDismiss() {
     controller.dismiss();
@@ -85,6 +101,7 @@
       controller.destroy();
       drag.destroy();
       reducedMotion.cleanup();
+      typewriterCue.destroy();
     };
   });
 
@@ -94,6 +111,9 @@
     activeWorkspaceIdStore.set(queue.active?.workspaceId ?? '');
   });
   const view$ = selectHudTakeoverView(activeWorkspaceIdStore);
+
+  // Hardware-key square gate: same as the grid card (connected + slotted).
+  const microConnected$ = microConnectedReadable();
 
   // Refresh the map's rollups on open (idempotent; the events bridge keeps them fresh).
   $effect(() => {
@@ -105,9 +125,7 @@
 
   // ── Derived choreography state ──
   // The pre-roll blink shows only the card flash — the overlay stays hidden.
-  const visible = $derived(
-    queue.phase !== 'idle' && queue.phase !== 'blinking' && $view$ !== null,
-  );
+  const visible = $derived(queue.phase !== 'idle' && queue.phase !== 'blinking' && $view$ !== null);
   const closing = $derived(queue.phase === 'closing');
   const motion = $derived(!reducedMotion.current);
   const frameStyle = $derived(
@@ -117,32 +135,44 @@
   const primaryTrigger = $derived(activeTakeoverTrigger(queue));
   const countdown = $derived(takeoverCountdownSeconds(queue, nowMs));
 
-  /** Map cells: task list placed on the deterministic spiral. */
-  const mapCells = $derived.by(() => {
-    const view = $view$;
-    if (!view) return [];
-    const coords = spiralCoords(view.tasks.length);
-    return view.tasks.map((task, i) => ({ task, coord: coords[i] }));
+  // ── Task map: dependency-graph placement + edges + zoom-to-fit + camera
+  // (state and derivations live in hud-takeover-map.svelte.ts). ──
+  const map = createTakeoverMapState(() => $view$?.tasks ?? []);
+  const drag = $derived(map.drag);
+
+  // Hovered task cell: the edge layer highlights every edge touching it
+  // (full-strength, thicker stroke). Reset on display/workspace changes so
+  // a cell removed under the pointer never leaves a stale highlight.
+  let hoveredTaskId = $state<string | null>(null);
+  $effect(() => {
+    void visible;
+    void queue.active?.workspaceId;
+    hoveredTaskId = null;
   });
 
-  /** Coord of the changed task (newest trigger), null when none/absent. */
-  const changedCoord = $derived.by(() => {
-    const changedTaskId = primaryTrigger?.changedTaskId;
-    if (!changedTaskId) return null;
-    return mapCells.find((cell) => cell.task.id === changedTaskId)?.coord ?? null;
+  // Measure the map viewport once per display, keyed by workspace PLUS the
+  // controller's display counter: reduced motion chains closing → opening
+  // directly (no idle/blinking reset between displays), so a chained second
+  // takeover for the SAME workspace must still re-key to re-open at 100%
+  // zoom. Idle/blinking resets so the next display re-measures. Unmeasured
+  // viewports (jsdom, pre-layout) stay 1:1.
+  let mapClipEl = $state<HTMLElement | null>(null);
+  $effect(() => {
+    const active = queue.phase !== 'idle' && queue.phase !== 'blinking' && queue.active;
+    map.measure(active ? `${queue.active!.workspaceId}#${controller.displaySeq}` : '', mapClipEl);
   });
 
-  /** Empty dashed cells filling the canvas ring around the occupied grid. */
-  const emptyCells = $derived(emptyCellCoords(mapCells.map((cell) => cell.coord)));
-
-  // Map camera: manual drag-to-pan + the auto-pan to a far changed cell
-  // (mock: 2s after open; reduced motion pans immediately, drags stay live).
-  const panBounds = $derived(takeoverPanBounds(mapCells.map((cell) => cell.coord)));
-  const drag = createTakeoverMapDrag(() => panBounds);
-  const needsPan = $derived(changedCoord !== null && cellNeedsPan(changedCoord));
+  // Auto-pan to a far changed cell (mock: 2s after open; reduced motion
+  // pans immediately, drags stay live) — suppressed when the graph is
+  // entirely visible at the display's 1:1 open zoom. A once-per-display
+  // decision: needsPan ignores the live zoom, so manual zoom never re-keys
+  // syncAutoPan (which would reset the pan / re-schedule the glide) or
+  // flips banner timing mid-display.
+  const needsPan = $derived(map.needsPan(primaryTrigger?.changedTaskId));
   $effect(() => {
     const workspaceId = queue.active?.workspaceId ?? '';
-    drag.syncAutoPan(workspaceId, needsPan ? changedCoord : null, motion ? 2000 : 0);
+    const coord = needsPan ? map.changedCoord(primaryTrigger?.changedTaskId) : null;
+    drag.syncAutoPan(workspaceId, coord, motion ? 2000 : 0);
   });
 
   // ── Banner overflow marquee: measure once per display during 'opening' ──
@@ -210,7 +240,6 @@
     if (!Number.isFinite(startedMs)) return '--:--:--'; // i18n-ignore (digit placeholder)
     return formatHudTimer((nowMs - startedMs) / 1000);
   }
-
 </script>
 
 {#if visible && $view$}
@@ -245,10 +274,11 @@
       <div class="ov-content">
         <!-- Header: title / spec progress / countdown / DISMISS -->
         <div class="ov-header">
-          <div class="ov-heading">
-            <span class="ov-ws-name">{view.title}</span>
-            <span class="ov-ws-repo">{view.repoRef}</span>
-          </div>
+          <HudTakeoverHeading
+            title={view.title}
+            repoRef={view.repoRef}
+            keySlot={$microConnected$ ? view.keySlot : null}
+          />
           <div class="ov-divider"></div>
           <div class="ov-progress">
             <div class="ov-progress-row">
@@ -294,15 +324,24 @@
                 class="ov-map-clip"
                 class:ov-map-dragging={drag.dragging}
                 data-testid="hud-takeover-map"
+                bind:this={mapClipEl}
                 {@attach drag.attach}
+                {@attach map.attachWheel}
               >
                 <div
                   class="ov-map-pan"
-                  style:transform={`translate(${-drag.pan.x}px, ${-drag.pan.y}px)`}
+                  style:transform={map.panTransform}
                   class:ov-map-pan-animate={motion && drag.animate}
                 >
+                  <!-- Dependency edges under the cells (arrowheads point at the dependent). -->
+                  <HudTakeoverEdges edges={map.edges} box={map.edgeBox} {motion} {hoveredTaskId} />
+
                   <!-- Spec cell anchored at (0,0) -->
-                  <div class="ov-cell ov-cell-spec" style:left={cellLeft(0)} style:top={cellTop(0)}>
+                  <div
+                    class="ov-cell ov-cell-spec"
+                    style:left={cellLeft(0, map.pitch)}
+                    style:top={cellTop(0, map.pitch)}
+                  >
                     <div class="ov-spec-tag">{m.hud_takeover_spec_label()}</div>
                     <div class="ov-spec-title">{view.title}</div>
                     <div class="ov-spec-segs">
@@ -318,27 +357,32 @@
                     </div>
                   </div>
 
-                  {#each emptyCells as cell (`${cell.x},${cell.y}`)}
+                  {#each map.emptyCells as cell (`${cell.x},${cell.y}`)}
                     <div
                       class="ov-cell ov-cell-empty"
-                      style:left={cellLeft(cell.x)}
-                      style:top={cellTop(cell.y)}
+                      style:left={cellLeft(cell.x, map.pitch)}
+                      style:top={cellTop(cell.y, map.pitch)}
                     ></div>
                   {/each}
 
-                  {#each mapCells as { task, coord }, i (task.id)}
+                  {#each map.cells as { task, coord }, i (task.id)}
                     {@const meta = taskCellMeta(task.status)}
                     {@const changed = primaryTrigger?.changedTaskId === task.id}
                     <div
                       class="ov-cell ov-cell-task"
                       class:ov-cell-changed={changed}
-                      style:left={cellLeft(coord.x)}
-                      style:top={cellTop(coord.y)}
+                      style:left={cellLeft(coord.x, map.pitch)}
+                      style:top={cellTop(coord.y, map.pitch)}
                       style:border={`1px ${meta.borderStyle} ${changed ? meta.color : meta.borderColor}`}
                       style:background={meta.bg}
                       style:outline-color={changed ? meta.color : 'transparent'}
                       style:animation-delay={motion ? `${(0.9 + i * 0.012).toFixed(2)}s` : '0s'}
                       data-testid="hud-takeover-cell"
+                      role="presentation"
+                      onpointerenter={() => (hoveredTaskId = task.id)}
+                      onpointerleave={() => {
+                        if (hoveredTaskId === task.id) hoveredTaskId = null;
+                      }}
                     >
                       <div class="ov-cell-head">
                         <span
@@ -377,6 +421,11 @@
                 </div>
               </div>
 
+              <!-- Zoom controls: bottom-right cluster OUTSIDE the drag clip,
+                   so button clicks never reach the drag/click-suppression
+                   handlers attached to .ov-map-clip. -->
+              <HudTakeoverZoomControls {map} />
+
               <!-- Banners: one per trigger, typewriter wipe; VIEWER renders none.
                    Rendering (chip/headline/marquee + styles) lives in
                    HudTakeoverBanner.svelte; this overlay measures the
@@ -413,7 +462,9 @@
               </div>
               <div class="ov-panel-body ov-changes">
                 {#if queue.active}
-                  {#each queue.active.triggers.slice().reverse() as change, i (`${change.kind}-${change.raisedAtMs}-${i}`)}
+                  {#each queue.active.triggers
+                    .slice()
+                    .reverse() as change, i (`${change.kind}-${change.raisedAtMs}-${i}`)}
                     <div class="ov-change">
                       <span style:color={takeoverKindColor(change.kind)}>▸</span>
                       <span class="ov-change-text">{changeLine(change)}</span>
@@ -463,9 +514,7 @@
                 {#each view.idleAgents as agent (agent.id)}
                   <div class="ov-agent">
                     <div class="ov-agent-row">
-                      <span
-                        class="ov-agent-dot"
-                        style:background={agentBucketColor(agent.bucket)}
+                      <span class="ov-agent-dot" style:background={agentBucketColor(agent.bucket)}
                       ></span>
                       <span class="ov-agent-name">{agent.name}</span>
                       <span class="ov-agent-state" style:color={agentBucketColor(agent.bucket)}>
@@ -576,7 +625,7 @@
   .ov-backdrop {
     position: absolute;
     inset: 0;
-    background: hsl(var(--app-background) / 0.55);
+    background: hsl(var(--background) / 0.55);
     backdrop-filter: blur(3px);
     animation: ovf 0.3s ease both;
   }
@@ -594,7 +643,7 @@
     position: absolute;
     inset: 0;
     background: hsl(var(--card) / 0.98);
-    box-shadow: 0 24px 80px hsl(var(--app-background) / 0.8);
+    box-shadow: 0 24px 80px hsl(var(--background) / 0.8);
     animation: ovf 0.25s ease 0.12s both;
   }
   .ov-edge-h {
@@ -708,27 +757,6 @@
     border-bottom: 1px solid hsl(var(--border) / 0.8);
     flex: none;
   }
-  .ov-heading {
-    display: flex;
-    flex-direction: column;
-    gap: 2px;
-    min-width: 0;
-  }
-  .ov-ws-name {
-    font:
-      600 16px Inter,
-      system-ui,
-      sans-serif;
-    letter-spacing: -0.02em;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    max-width: 380px;
-  }
-  .ov-ws-repo {
-    font: 500 10px 'JetBrains Mono', monospace;
-    color: hsl(var(--text-subtle));
-  }
   .ov-divider {
     width: 1px;
     height: 30px;
@@ -743,8 +771,10 @@
   .ov-progress-row {
     display: flex;
     justify-content: space-between;
-    font: 500 9px 'JetBrains Mono', monospace;
-    color: hsl(var(--text-ghost));
+    font:
+      500 9px 'JetBrains Mono',
+      monospace;
+    color: hsl(var(--muted-foreground) / 0.55);
   }
   .ov-progress-segs {
     display: flex;
@@ -758,17 +788,21 @@
     flex: 1;
   }
   .ov-return {
-    font: 500 12px 'JetBrains Mono', monospace;
-    color: hsl(var(--text-ghost));
+    font:
+      500 12px 'JetBrains Mono',
+      monospace;
+    color: hsl(var(--muted-foreground) / 0.55);
   }
   .ov-dismiss {
     cursor: pointer;
     border: 1px solid hsl(var(--border));
     background: transparent;
     padding: 6px 12px;
-    font: 600 10px 'JetBrains Mono', monospace;
+    font:
+      600 10px 'JetBrains Mono',
+      monospace;
     letter-spacing: 0.12em;
-    color: hsl(var(--text-subtle));
+    color: hsl(var(--muted-foreground));
     text-transform: uppercase;
   }
   .ov-dismiss:hover {
@@ -794,7 +828,9 @@
     align-items: center;
     gap: 10px;
     padding: 10px 20px 0 22px;
-    font: 500 11px 'JetBrains Mono', monospace;
+    font:
+      500 11px 'JetBrains Mono',
+      monospace;
   }
   .ov-status-tag {
     font:
@@ -802,11 +838,11 @@
       system-ui,
       sans-serif;
     letter-spacing: 0.18em;
-    color: hsl(var(--text-ghost));
+    color: hsl(var(--muted-foreground) / 0.55);
     flex: none;
   }
   .ov-status-text {
-    color: hsl(var(--text-subtle));
+    color: hsl(var(--muted-foreground));
     overflow: hidden;
     display: -webkit-box;
     -webkit-box-orient: vertical;
@@ -850,7 +886,7 @@
     transition: transform 1.3s cubic-bezier(0.16, 1, 0.3, 1);
   }
 
-  /* ── Cells ── */
+  /* ── Cells (edge styles live in HudTakeoverEdges.svelte) ── */
   .ov-cell {
     position: absolute;
     width: 180px;
@@ -879,7 +915,7 @@
       system-ui,
       sans-serif;
     letter-spacing: 0.3em;
-    color: hsl(var(--text-subtle));
+    color: hsl(var(--muted-foreground));
   }
   .ov-spec-title {
     font:
@@ -896,8 +932,10 @@
     width: 80%;
   }
   .ov-spec-prog {
-    font: 500 10px 'JetBrains Mono', monospace;
-    color: hsl(var(--text-ghost));
+    font:
+      500 10px 'JetBrains Mono',
+      monospace;
+    color: hsl(var(--muted-foreground) / 0.55);
   }
   .ov-cell-task {
     display: flex;
@@ -916,7 +954,9 @@
     display: flex;
     align-items: center;
     gap: 6px;
-    font: 600 8px 'JetBrains Mono', monospace;
+    font:
+      600 8px 'JetBrains Mono',
+      monospace;
     letter-spacing: 0.08em;
   }
   .ov-cell-dot {
@@ -967,7 +1007,9 @@
     border: 1px solid hsl(var(--border));
     background: hsl(var(--card) / 0.85);
     padding: 1px 5px;
-    font: 500 8px 'JetBrains Mono', monospace;
+    font:
+      500 8px 'JetBrains Mono',
+      monospace;
     white-space: nowrap;
     overflow: hidden;
   }
@@ -1016,7 +1058,7 @@
       system-ui,
       sans-serif;
     letter-spacing: 0.18em;
-    color: hsl(var(--text-subtle));
+    color: hsl(var(--muted-foreground));
     text-transform: uppercase;
   }
   .ov-panel-rule {
@@ -1025,8 +1067,10 @@
     background: hsl(var(--border) / 0.6);
   }
   .ov-panel-count {
-    font: 500 9px 'JetBrains Mono', monospace;
-    color: hsl(var(--text-ghost));
+    font:
+      500 9px 'JetBrains Mono',
+      monospace;
+    color: hsl(var(--muted-foreground) / 0.55);
   }
   .ov-panel-body {
     display: flex;
@@ -1035,7 +1079,9 @@
   }
   .ov-changes {
     gap: 8px;
-    font: 500 10.5px 'JetBrains Mono', monospace;
+    font:
+      500 10.5px 'JetBrains Mono',
+      monospace;
     line-height: 1.5;
   }
   .ov-change {
@@ -1043,7 +1089,7 @@
     gap: 8px;
   }
   .ov-change-text {
-    color: hsl(var(--text-subtle));
+    color: hsl(var(--muted-foreground));
   }
   .ov-agents {
     gap: 10px;
@@ -1057,7 +1103,9 @@
     display: flex;
     align-items: center;
     gap: 7px;
-    font: 500 11px 'JetBrains Mono', monospace;
+    font:
+      500 11px 'JetBrains Mono',
+      monospace;
   }
   .ov-agent-dot {
     width: 6px;
@@ -1071,15 +1119,17 @@
   }
   .ov-agent-elapsed {
     margin-left: auto;
-    color: hsl(var(--text-ghost));
+    color: hsl(var(--muted-foreground) / 0.55);
     font-size: 9.5px;
   }
   .ov-agent-state {
     font-size: 9.5px;
   }
   .ov-agent-note {
-    font: 500 10px 'JetBrains Mono', monospace;
-    color: hsl(var(--text-subtle));
+    font:
+      500 10px 'JetBrains Mono',
+      monospace;
+    color: hsl(var(--muted-foreground));
     padding-left: 13px;
     overflow: hidden;
     display: -webkit-box;
@@ -1090,9 +1140,11 @@
     flex: 1;
   }
   .ov-side-footer {
-    font: 500 9px 'JetBrains Mono', monospace;
+    font:
+      500 9px 'JetBrains Mono',
+      monospace;
     letter-spacing: 0.12em;
-    color: hsl(var(--text-ghost));
+    color: hsl(var(--muted-foreground) / 0.55);
     display: flex;
     gap: 14px;
   }

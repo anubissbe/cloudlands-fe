@@ -4,33 +4,46 @@
  * The toast seam is faked via `vi.mock('svelte-sonner')` (existing pattern);
  * these tests lock in the stickiness contract (duration: Infinity, stable
  * per-agent id, only close/Switch To dismiss) and the "Switch To" wiring
- * (cross-workspace goto + openAgentTabRequested dispatch).
+ * (workspace activation + cross-workspace goto + agent-tab dispatch).
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const {
   toastCustomMock,
+  toastInfoMock,
   toastDismissMock,
   navigateToRouteMock,
   dispatchMock,
   microStatusMock,
   resolvedKeySlotSelectMock,
+  workspaceByIdSelectMock,
 } = vi.hoisted(() => ({
   toastCustomMock: vi.fn(),
+  toastInfoMock: vi.fn(),
   toastDismissMock: vi.fn(),
   navigateToRouteMock: vi.fn(() => Promise.resolve()),
   dispatchMock: vi.fn(),
   microStatusMock: { value: 'disconnected' },
   resolvedKeySlotSelectMock: vi.fn((_state: unknown, _workspaceId: string): number | null => null),
+  workspaceByIdSelectMock: vi.fn(
+    (_state: unknown, _workspaceId: string): { title?: string } | undefined => undefined,
+  ),
 }));
 
 vi.mock('svelte-sonner', () => ({
   toast: {
     custom: toastCustomMock,
+    info: toastInfoMock,
     dismiss: toastDismissMock,
     error: vi.fn(),
     success: vi.fn(),
   },
+}));
+
+// Fake the lazily imported workspace selector so the auto-unarchive toast's
+// title resolution is observable without the real workspace slice.
+vi.mock('$store/renderer/slices/workspace/workspace-selectors', () => ({
+  selectWorkspaceById: { select: workspaceByIdSelectMock },
 }));
 
 vi.mock('$lib/components/ui/toast/AgentAttentionToast.svelte', () => ({
@@ -43,9 +56,8 @@ vi.mock('$lib/utils/navigation.client', () => ({
 }));
 
 vi.mock('$store/renderer/store', async () => {
-  const { createAppStoreMockModule } = await import(
-    '$store/renderer/utils/test-helpers/store-mock'
-  );
+  const { createAppStoreMockModule } =
+    await import('$store/renderer/utils/test-helpers/store-mock');
   return createAppStoreMockModule({ dispatch: dispatchMock });
 });
 
@@ -61,10 +73,12 @@ vi.mock('$store/renderer/slices/hardware-console/hardware-console-selectors', ()
 }));
 
 import { openAgentTabRequested } from '$store/renderer/slices/app-layout/app-layout-slice';
+import { openWorkspaceTab } from '$store/renderer/slices/tab-state/tab-state-slice';
 import {
   agentAttentionToastId,
   dismissAgentAttentionToast,
   showAgentAttentionToast,
+  showWorkspaceAutoUnarchiveToast,
   switchToAttentionAgent,
 } from '../agent-attention-toast-service';
 
@@ -87,6 +101,7 @@ describe('agent-attention-toast-service', () => {
     vi.clearAllMocks();
     microStatusMock.value = 'disconnected';
     resolvedKeySlotSelectMock.mockImplementation(() => null);
+    workspaceByIdSelectMock.mockImplementation(() => undefined);
   });
 
   afterEach(() => {
@@ -201,20 +216,26 @@ describe('agent-attention-toast-service', () => {
     expect(lastCustomCall().componentProps.reason).toBe('Escalated to a blocker');
   });
 
-  it('Switch To dismisses the toast, navigates to the reporting workspace, and opens the agent tab', async () => {
+  it('Switch To activates the workspace before navigating and opening the agent tab', async () => {
     await switchToAttentionAgent(WS, AGENT);
 
     expect(toastDismissMock).toHaveBeenCalledWith(agentAttentionToastId(AGENT));
     expect(navigateToRouteMock).toHaveBeenCalledWith(`/workspace/${WS}`);
-    expect(dispatchMock).toHaveBeenCalledWith(openAgentTabRequested(WS, { agentId: AGENT }));
+    expect(dispatchMock.mock.calls.map(([action]) => action)).toEqual([
+      openWorkspaceTab(WS),
+      openAgentTabRequested(WS, { agentId: AGENT }),
+    ]);
   });
 
-  it('Switch To still opens the agent tab when navigation rejects', async () => {
+  it('Switch To still activates the workspace and opens the agent tab when navigation rejects', async () => {
     navigateToRouteMock.mockRejectedValueOnce(new Error('nav failed'));
 
     await switchToAttentionAgent(WS, AGENT);
 
-    expect(dispatchMock).toHaveBeenCalledWith(openAgentTabRequested(WS, { agentId: AGENT }));
+    expect(dispatchMock.mock.calls.map(([action]) => action)).toEqual([
+      openWorkspaceTab(WS),
+      openAgentTabRequested(WS, { agentId: AGENT }),
+    ]);
   });
 
   it('explicit dismissal removes the toast by its stable id', async () => {
@@ -263,6 +284,62 @@ describe('agent-attention-toast-service', () => {
     props.onClose();
     await vi.waitFor(() => {
       expect(toastDismissMock).toHaveBeenCalledWith(agentAttentionToastId(AGENT));
+    });
+  });
+
+  describe('showWorkspaceAutoUnarchiveToast', () => {
+    const notice = { workspaceId: WS, agentId: AGENT, agentName: 'Builder' };
+
+    function lastInfoCall(): [string, { id: string; action: { label: string; onClick(): void } }] {
+      const call = toastInfoMock.mock.calls[toastInfoMock.mock.calls.length - 1];
+      expect(call).toBeDefined();
+      return call as [string, { id: string; action: { label: string; onClick(): void } }];
+    }
+
+    it('shows a transient info toast with the resolved workspace title and agent name', async () => {
+      workspaceByIdSelectMock.mockImplementation(() => ({ title: 'My Project' }));
+
+      await showWorkspaceAutoUnarchiveToast(notice);
+
+      expect(workspaceByIdSelectMock).toHaveBeenCalledWith(expect.anything(), WS);
+      const [message, options] = lastInfoCall();
+      expect(message).toBe('My Project was unarchived — Builder became active');
+      // Stable per-workspace id so bursts update in place; transient — no
+      // duration override (sonner default), unlike the sticky attention toast.
+      expect(options.id).toBe(`workspace-auto-unarchive:${WS}`);
+      expect(options).not.toHaveProperty('duration');
+      expect(options.action.label).toBe('Switch To');
+    });
+
+    it('falls back to the generic Space label when the workspace title is unknown', async () => {
+      workspaceByIdSelectMock.mockImplementation(() => undefined);
+
+      await showWorkspaceAutoUnarchiveToast(notice);
+
+      expect(lastInfoCall()[0]).toBe('Space was unarchived — Builder became active');
+    });
+
+    it('still shows the toast (with the fallback title) when title resolution throws', async () => {
+      workspaceByIdSelectMock.mockImplementation(() => {
+        throw new Error('selector boom');
+      });
+
+      await showWorkspaceAutoUnarchiveToast(notice);
+
+      expect(lastInfoCall()[0]).toBe('Space was unarchived — Builder became active');
+    });
+
+    it('Switch To routes to the workspace and opens the agent tab', async () => {
+      await showWorkspaceAutoUnarchiveToast(notice);
+
+      lastInfoCall()[1].action.onClick();
+      await vi.waitFor(() => {
+        expect(navigateToRouteMock).toHaveBeenCalledWith(`/workspace/${WS}`);
+        expect(dispatchMock.mock.calls.map(([action]) => action)).toEqual([
+          openWorkspaceTab(WS),
+          openAgentTabRequested(WS, { agentId: AGENT }),
+        ]);
+      });
     });
   });
 });

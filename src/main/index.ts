@@ -38,17 +38,17 @@ app.setPath('userData', resolveUserDataBasePath(app.getPath('appData')));
 // dev apps (e.g. the reference Intent build's "dev-instance-N" scheme) on the
 // SingletonLock, yielding intent-cloudlands/cloudlands-dev[-PORT] in dev. This must
 // run before setupConsoleLogCapture() so logs go to the correct userData directory.
+import { createAuthorizedIpcHandler } from './ipc-authorization.js';
 const devUserDataSegment = resolveDevUserDataDirName();
 if (devUserDataSegment) {
   const uniqueUserData = path.join(app.getPath('userData'), devUserDataSegment);
   app.setPath('userData', uniqueUserData);
 }
 
-// EARLY: Default the dev daemon's data directory to a per-DEV_PORT dir so a dev instance
-// never adopts the installed app's intentd (and its workspace catalog) on the global
-// socket. This only supplies a default: an inherited INTENTD_DATA_DIR (e.g. the monorepo
-// `make dev` seat) and explicit INTENTD_SOCKET/INTENTD_WS_URL/INTENTD_TCP transports all
-// win and suppress it. Packaged builds are untouched.
+// EARLY: When dev explicitly opts into sidecar spawning, default that daemon's data
+// directory to a per-DEV_PORT dir so parallel instances stay isolated. Connect-only
+// `pnpm run dev` keeps the global socket; otherwise it would target an isolated socket
+// that no process creates. Inherited data dirs and explicit transports still win.
 // Gated on !app.isPackaged — the same signal backend.ipc.ts uses to pick a transport, so
 // isolation and socket resolution cannot disagree (NODE_ENV would: an unpackaged launch
 // without it still resolves a dev UDS socket). Must run before the sidecar spawn and the
@@ -65,9 +65,9 @@ if (shouldIsolateDevIntentdDataDir(process.env, !app.isPackaged)) {
 import { setupConsoleLogCapture } from './logging/console-log-capture.js';
 setupConsoleLogCapture();
 
-// Set app name early - in dev mode, show custom name or "Intent [Dev N]" in dock/menu bar
+// Set the application name early. The same resolved value labels the macOS app menu.
 const isDev = process.env.NODE_ENV === 'development';
-app.setName(resolveAppTitle());
+const appName = setResolvedAppName(app);
 
 // Track registered handlers globally
 const __registeredHandlers = new Set<string>();
@@ -86,9 +86,10 @@ const originalHandle = ipcMain.handle.bind(ipcMain);
 Object.defineProperty(ipcMain, 'handle', {
   value(channel: string, handler: any) {
     __registeredHandlers.add(channel);
-    __ipcHandlerFunctions.set(channel, handler);
+    const authorizedHandler = createAuthorizedIpcHandler(channel, handler);
+    __ipcHandlerFunctions.set(channel, authorizedHandler);
     // Silent - no per-handler logging to reduce noise
-    return originalHandle(channel, handler);
+    return originalHandle(channel, authorizedHandler);
   },
   writable: false,
   configurable: true,
@@ -129,9 +130,15 @@ import { initializeWarningSuppression } from './utils/suppress-warnings';
 import { runWithHardExitTimeout } from './utils/hard-exit-timeout';
 import { setupWebviewSecurity } from './webview-security';
 import { attachAppCommandHistoryNavigation } from './app-command-navigation';
+import { attachSwipeHistoryNavigation } from './swipe-navigation';
 import { setupHardwareConsoleMain } from '../features/hardware-console/main/hardware-console.ipc';
+import { setupConsoleOwnerTracking } from '../features/hardware-console/main/console-owner';
 import { requestHardwareConsoleLightingClear } from '../features/hardware-console/main/clear-lighting-shutdown';
 import { createDebugBundle } from '../features/debug-export/main/debug-bundle.service';
+import {
+  createStackSampleFile,
+  shouldShowStackSampleMenuItem,
+} from '../features/debug-export/main/stack-sample.service';
 
 // No custom protocol needed - we'll use file:// protocol
 import { ipcDebugTracker } from '../shared/main/ipc-debug-tracker';
@@ -261,7 +268,6 @@ import { setupUnslothIPC } from '../features/unsloth/main/unsloth.ipc';
 import { setupFeatureCodesIPC } from '../features/feature-codes/main/feature-codes.ipc';
 import { setupProviderAvailabilityIPC } from '../features/providers/main/provider-availability.service';
 import { setupConfigIPC, getConfigManager } from '../features/config/main/config.ipc';
-import { setupDiffsIPC } from '../features/diffs/main/diffs.ipc';
 
 import { setupEventsIPC } from '../features/events/main/events.ipc';
 import { registerExternalEditorsHandlers } from '../features/external-editors/main/external-editors.ipc';
@@ -280,13 +286,17 @@ import {
   registerBackendHandlers,
   disposeBackendClient,
   getBackendClient,
+  isSameHostBackendActive,
+  reconcileActiveConnectionOnBoot,
 } from '../features/backend/main/backend.ipc';
+import { registerWorkspaceTransferHandlers } from '../features/backend/main/workspace-transfer.ipc';
+import { registerWorkspaceImportHandlers } from '../features/backend/main/workspace-import.ipc';
 import { getConnectionMode } from '../features/backend/main/connection-mode';
+import { getActiveId } from '../features/backend/main/connections-store';
 import { startIntentdSidecar, stopIntentdSidecar } from '../features/backend/main/intentd-sidecar';
+import { startMemoryMonitor, stopMemoryMonitor } from './memory-monitor';
 import { setupUserRulesIPC as setupWorkspaceRulesIPC } from '../features/rules/main/user-rules.ipc';
 
-import { registerScriptsHandlers } from '../features/scripts/main/scripts.ipc';
-import { disposeAllScriptProcessManagers } from '../features/scripts/main/script-process-manager';
 import { registerSetupScriptsHandlers } from '../features/setup-scripts/main/setup-scripts.ipc';
 import {
   setupSystemIPC,
@@ -304,15 +314,21 @@ import { setupFirstVisitStateIPC } from '../features/workspace/main/first-visit-
 import { setupWorkspaceIPC } from '../features/workspace/main/workspace.ipc';
 import { setupWorkspaceSummaryIPC } from '../features/workspace/main/workspace-summary.ipc';
 import { startupMetrics } from '../utils/startup-metrics';
-import { CdpMcpBridge } from './cdp-mcp-bridge';
+import type { CdpMcpBridge } from './cdp-mcp-bridge';
 import { setMainLanguagePreference, getMainLanguagePreference } from './main-locale';
+import { isCdpMcpBridgeEnabled } from './utils/cdp-debug';
 import { confirmQuitWithRunningAgents } from './quit-confirmation';
 import { m } from '../shared/paraglide/messages.js';
+import { sendWorkspaceCommand as sendWorkspaceMenuCommand } from './menu-workspace-command';
+import { toggleWindowDevTools } from './menu-devtools-toggle';
 
 import { registerMissingAgentHandlers } from '../features/agent/main/agent-missing.ipc';
 import { registerVoiceLocalHandlers } from '../features/voice/main/voice-local.ipc';
 import { cleanupStaleTempFiles } from '../shared/main/temp-files';
-import { initSpecialistsService } from '../features/agent/main/specialists.service';
+import {
+  initSpecialistsService,
+  refreshGitHubAuthStatus,
+} from '../features/agent/main/specialists.service';
 import { initAppSettingsService } from '../features/workspace/main/app-settings.service';
 import { workspaceService } from '../features/workspace/main/workspace.service';
 
@@ -323,7 +339,7 @@ import { registerDebugExportHandlers } from '../features/debug-export/main/debug
 import { protocolAdapter } from '../features/protocol/main/protocol-adapter';
 import { registerWorkspacePRHandlers } from '../features/workspace/main/workspace-pr.ipc';
 import { ipcCleanupManager } from './ipc-cleanup-manager';
-import { resolveAppTitle } from './utils/resolve-app-title.js';
+import { setResolvedAppName } from './utils/resolve-app-title.js';
 import { getMainWindow } from './state';
 import {
   captureWindowSessionsSnapshot,
@@ -408,6 +424,11 @@ async function gracefulShutdown() {
 
 async function performGracefulShutdown() {
   try {
+    // Stop memory sampling first: it is pure instrumentation, and clearing its
+    // interval here means no timer survives any of the quit paths (before-quit,
+    // SIGTERM, SIGINT) that funnel through this function.
+    stopMemoryMonitor();
+
     // Ask renderers to clear hardware-console lighting FIRST, while the
     // windows (which own the WebHID connection) are still alive. Bounded
     // (750ms overall ack timeout) and fail-soft — never throws, never delays
@@ -425,18 +446,6 @@ async function performGracefulShutdown() {
     // if the environment is torn down too quickly, the assertion at conpty.cc:110
     // fires. This delay gives those threads time to finish.
     await new Promise((resolve) => setTimeout(resolve, 300));
-
-    // Stop all running workspace scripts (spawned via child_process.spawn)
-    try {
-      await disposeAllScriptProcessManagers();
-      logger.info('All script process managers disposed');
-    } catch (error) {
-      logger.error(
-        // i18n-ignore (developer log message)
-        'Error disposing script process managers:',
-        error instanceof Error ? error : new Error(String(error)),
-      );
-    }
 
     // Dispose the live backend JSON-RPC client (closes the UDS/TCP socket).
     try {
@@ -522,6 +531,21 @@ if (process.env.NODE_ENV === 'development' && process.env.ENABLE_CDP_DEBUG) {
   logger.info(`CDP debugging enabled on port ${cdpPort}`);
 }
 
+/**
+ * Persist window sessions under the CURRENTLY-active backend id (T21). Window
+ * sessions are keyed per-backend; saving under the wrong id (previously the
+ * hard-coded `local` default) leaked a remote's windows into local's slot. All
+ * save triggers — the debounced autosave, before-quit, and the non-macOS
+ * last-window-close flush — route through here so they always key off the live
+ * active backend. `getActiveId()` is fail-soft (falls back to `local` only when
+ * the connections store itself is unreadable), so this never defaults silently
+ * on the happy path.
+ */
+async function saveActiveWindowSessions(): Promise<void> {
+  const backendId = await getActiveId();
+  await saveWindowSessions(backendId);
+}
+
 app.whenReady().then(async () => {
   startupMetrics.start('total');
   logger.info('Setting up critical IPC handlers for fast startup');
@@ -533,6 +557,11 @@ app.whenReady().then(async () => {
   // Work Louder devices) — must be registered before any windows exist.
   setupHardwareConsoleMain(session.defaultSession);
 
+  // Console-owner tracking (single hardware-input owner, #1928) — must attach
+  // its browser-window-created/focus listeners before any windows exist so the
+  // first boot window becomes the initial owner.
+  setupConsoleOwnerTracking();
+
   // Keep window sessions file up-to-date so it's always available on quit/crash.
   // This debounced saver fires on window move/resize/navigate to ensure the sessions
   // file reflects the latest state even when before-quit can't capture windows (e.g.,
@@ -540,7 +569,7 @@ app.whenReady().then(async () => {
   let sessionSaveTimeout: NodeJS.Timeout | null = null;
   const debouncedSaveWindowSessions = () => {
     if (sessionSaveTimeout) clearTimeout(sessionSaveTimeout);
-    sessionSaveTimeout = setTimeout(() => saveWindowSessions(), 1000);
+    sessionSaveTimeout = setTimeout(() => void saveActiveWindowSessions(), 1000);
   };
 
   app.on('browser-window-created', (_event: Electron.Event, window: BrowserWindowType) => {
@@ -557,11 +586,13 @@ app.whenReady().then(async () => {
     // Windows: forward mouse X-button app-commands to the renderer as
     // app:history-navigate IPC events (see src/main/app-command-navigation.ts).
     attachAppCommandHistoryNavigation(window);
+    // macOS: forward swipe gestures (incl. Logi Options+ synthesized swipes
+    // for mouse side buttons) the same way (see src/main/swipe-navigation.ts).
+    attachSwipeHistoryNavigation(window);
   });
 
   // Set application menu with correct app name on macOS
   const { Menu } = require('electron');
-  const appName = resolveAppTitle();
   const isDevMode = process.env.NODE_ENV === 'development';
   const isMacOS = process.platform === 'darwin';
 
@@ -724,10 +755,7 @@ app.whenReady().then(async () => {
         // so the terminal can intercept it when focused
         registerAccelerator: false,
         click: () => {
-          const focusedWindow = BrowserWindow.getFocusedWindow();
-          if (focusedWindow && !focusedWindow.isDestroyed()) {
-            focusedWindow.webContents.send('menu:new-agent');
-          }
+          sendWorkspaceCommand('menu:new-agent');
         },
       },
       {
@@ -735,10 +763,7 @@ app.whenReady().then(async () => {
         accelerator: 'CmdOrCtrl+Alt+N',
         enabled: inWorkspace,
         click: () => {
-          const focusedWindow = BrowserWindow.getFocusedWindow();
-          if (focusedWindow && !focusedWindow.isDestroyed()) {
-            focusedWindow.webContents.send('menu:new-note');
-          }
+          sendWorkspaceCommand('menu:new-note');
         },
       },
       {
@@ -746,10 +771,7 @@ app.whenReady().then(async () => {
         accelerator: 'CmdOrCtrl+Alt+T',
         enabled: inWorkspace,
         click: () => {
-          const focusedWindow = BrowserWindow.getFocusedWindow();
-          if (focusedWindow && !focusedWindow.isDestroyed()) {
-            focusedWindow.webContents.send('menu:new-terminal');
-          }
+          sendWorkspaceCommand('menu:new-terminal');
         },
       },
       {
@@ -757,16 +779,23 @@ app.whenReady().then(async () => {
         accelerator: 'CmdOrCtrl+Alt+B',
         enabled: inWorkspace,
         click: () => {
-          const focusedWindow = BrowserWindow.getFocusedWindow();
-          if (focusedWindow && !focusedWindow.isDestroyed()) {
-            focusedWindow.webContents.send('menu:new-browser');
-          }
+          sendWorkspaceCommand('menu:new-browser');
         },
       },
       { type: 'separator' },
       {
         label: m.menu_open_recent(),
         submenu: recentWorkspacesSubmenu,
+      },
+      { type: 'separator' },
+      {
+        label: m.menu_import_workspace(),
+        click: () => {
+          const focusedWindow = BrowserWindow.getFocusedWindow() ?? getMainWindow();
+          if (focusedWindow && !focusedWindow.isDestroyed()) {
+            focusedWindow.webContents.send('menu:import-workspace');
+          }
+        },
       },
       { type: 'separator' },
     ];
@@ -794,10 +823,7 @@ app.whenReady().then(async () => {
         // Don't register accelerator - let renderer handle Cmd+W first for tabs
         registerAccelerator: false,
         click: () => {
-          const focusedWindow = BrowserWindow.getFocusedWindow();
-          if (focusedWindow && !focusedWindow.isDestroyed()) {
-            focusedWindow.webContents.send('menu:close-tab');
-          }
+          sendWorkspaceCommand('menu:close-tab');
         },
       },
       {
@@ -818,7 +844,7 @@ app.whenReady().then(async () => {
         click: () => {
           const focusedWindow = BrowserWindow.getFocusedWindow();
           if (focusedWindow && !focusedWindow.isDestroyed()) {
-            focusedWindow.webContents.send('menu:reopen-closed-tab');
+            sendWorkspaceCommand('menu:reopen-closed-tab');
           }
         },
       },
@@ -839,6 +865,14 @@ app.whenReady().then(async () => {
     };
   };
 
+  const sendWorkspaceCommand = (channel: string): void => {
+    sendWorkspaceMenuCommand(
+      BrowserWindow.getFocusedWindow(),
+      channel,
+      getFocusedWindowWorkspaceId(),
+    );
+  };
+
   // Function to rebuild and set the application menu
   const rebuildMenu = async () => {
     // Check if focused window is in a workspace (for enabling/disabling tab menu items)
@@ -857,7 +891,7 @@ app.whenReady().then(async () => {
         click: () => {
           const focusedWindow = BrowserWindow.getFocusedWindow();
           if (focusedWindow && !focusedWindow.isDestroyed()) {
-            focusedWindow.webContents.send('menu:select-previous-tab');
+            sendWorkspaceCommand('menu:select-previous-tab');
           }
         },
       },
@@ -868,7 +902,7 @@ app.whenReady().then(async () => {
         click: () => {
           const focusedWindow = BrowserWindow.getFocusedWindow();
           if (focusedWindow && !focusedWindow.isDestroyed()) {
-            focusedWindow.webContents.send('menu:select-next-tab');
+            sendWorkspaceCommand('menu:select-next-tab');
           }
         },
       },
@@ -958,29 +992,21 @@ app.whenReady().then(async () => {
       helpMenuItems.push({
         label: m.menu_check_for_updates(),
         click: async () => {
-          const mainWindow = getMainWindow();
-          logger.info('[Menu] Check for Updates clicked', {
-            isDevMode,
-            hasMainWindow: !!mainWindow,
-          });
+          logger.info('[Menu] Check for Updates clicked', { isDevMode });
 
-          // Signal renderer to show toast immediately for responsive feedback
-          if (mainWindow && !mainWindow.isDestroyed()) {
-            mainWindow.webContents.send('auto-update:show-toast');
-          }
+          const { broadcastToRenderers } =
+            await import('../features/auto-update/main/auto-update-broadcast');
+          // Signal renderers to show toast immediately for responsive feedback
+          broadcastToRenderers('auto-update:show-toast');
 
           if (isDevMode) {
             // In dev mode, auto-updater is not initialized
             // Send "up to date" notification directly
-            if (mainWindow && !mainWindow.isDestroyed()) {
-              logger.info('[Menu] Sending auto-update:up-to-date to renderer');
-              mainWindow.webContents.send('auto-update:up-to-date', {
-                version: app.getVersion(),
-                isDev: true,
-              });
-            } else {
-              logger.warn('[Menu] mainWindow not available for sending up-to-date notification');
-            }
+            logger.info('[Menu] Broadcasting auto-update:up-to-date to renderers');
+            broadcastToRenderers('auto-update:up-to-date', {
+              version: app.getVersion(),
+              isDev: true,
+            });
           } else {
             // In production, use the auto-update service
             try {
@@ -1084,6 +1110,69 @@ app.whenReady().then(async () => {
       },
     });
 
+    // Add Sample intentd Process (daemon-side capture via debug.sampleStacks,
+    // PROTOCOL §5.43). Hidden on a Windows FE whose daemon is same-host (UDS,
+    // no saved remote) — it can never support sampling (#1889); the menu is
+    // rebuilt on 'backend-connection-changed' so the gate tracks switches. Any
+    // other unsupported daemon surfaces its own error through the dialog below.
+    if (shouldShowStackSampleMenuItem(process.platform, isSameHostBackendActive())) {
+      helpMenuItems.push({
+        label: m.menu_sample_intentd_process(),
+        click: async () => {
+          let samplePath: string | undefined;
+          try {
+            // Capture the sample into a temp file (blocks for the sampling window)
+            ({ filePath: samplePath } = await createStackSampleFile());
+
+            // Generate suggested filename with date
+            const now = new Date();
+            const dateStr = now.toISOString().split('T')[0]; // YYYY-MM-DD
+            const timeStr = now.toTimeString().slice(0, 5).replace(':', ''); // HHmm
+            const suggestedFilename = `intentd-sample-${dateStr}-${timeStr}.txt`;
+
+            // Show save dialog
+            const { filePath, canceled } = await dialog.showSaveDialog({
+              defaultPath: suggestedFilename,
+              filters: [{ name: m.dialog_text_files_filter(), extensions: ['txt'] }],
+            });
+
+            if (canceled || !filePath) {
+              // Clean up temp sample
+              try {
+                await fs.promises.unlink(samplePath);
+              } catch {
+                // Ignore cleanup errors
+              }
+              return;
+            }
+
+            // Move sample to final location
+            await fs.promises.copyFile(samplePath, filePath);
+            try {
+              await fs.promises.unlink(samplePath);
+            } catch {
+              // Ignore cleanup errors — the sample was already saved
+            }
+
+            logger.info('intentd stack sample exported successfully', { filePath });
+          } catch (error) {
+            logger.error('Failed to sample intentd process', error as Error);
+            if (samplePath) {
+              try {
+                await fs.promises.unlink(samplePath);
+              } catch {
+                // Ignore cleanup errors
+              }
+            }
+            dialog.showErrorBox(
+              m.dialog_sample_intentd_failed_title(),
+              error instanceof Error ? error.message : m.dialog_sample_intentd_failed_message(),
+            );
+          }
+        },
+      });
+    }
+
     // Build the template based on platform
     const template: Electron.MenuItemConstructorOptions[] = [];
 
@@ -1096,32 +1185,21 @@ app.whenReady().then(async () => {
           {
             label: m.menu_check_for_updates(),
             click: async () => {
-              const mainWindow = getMainWindow();
-              logger.info('[Menu] Check for Updates clicked', {
-                isDevMode,
-                hasMainWindow: !!mainWindow,
-              });
+              logger.info('[Menu] Check for Updates clicked', { isDevMode });
 
-              // Signal renderer to show toast immediately for responsive feedback
-              if (mainWindow && !mainWindow.isDestroyed()) {
-                mainWindow.webContents.send('auto-update:show-toast');
-              }
+              const { broadcastToRenderers } =
+                await import('../features/auto-update/main/auto-update-broadcast');
+              // Signal renderers to show toast immediately for responsive feedback
+              broadcastToRenderers('auto-update:show-toast');
 
               if (isDevMode) {
                 // In dev mode, auto-updater is not initialized
                 // Send "up to date" notification directly
-                if (mainWindow && !mainWindow.isDestroyed()) {
-                  logger.info('[Menu] Sending auto-update:up-to-date to renderer');
-                  mainWindow.webContents.send('auto-update:up-to-date', {
-                    version: app.getVersion(),
-                    isDev: true,
-                  });
-                } else {
-                  logger.warn(
-                    // i18n-ignore (developer log message)
-                    '[Menu] mainWindow not available for sending up-to-date notification',
-                  );
-                }
+                logger.info('[Menu] Broadcasting auto-update:up-to-date to renderers');
+                broadcastToRenderers('auto-update:up-to-date', {
+                  version: app.getVersion(),
+                  isDev: true,
+                });
               } else {
                 // In production, use the auto-update service
                 try {
@@ -1213,7 +1291,17 @@ app.whenReady().then(async () => {
           },
           { role: 'forceReload' },
           { type: 'separator' },
-          { role: 'toggleDevTools' },
+          {
+            label: m.menu_toggle_devtools(),
+            accelerator: isMacOS ? 'Alt+Command+I' : 'Ctrl+Shift+I',
+            // Don't use role: 'toggleDevTools' — it targets
+            // getFocusedWebContents(), which can be a hidden offscreen
+            // keep-alive <webview> guest (intent-hq/monorepo#2844). Always
+            // toggle DevTools for the focused window's own renderer.
+            click: () => {
+              toggleWindowDevTools(BrowserWindow.getFocusedWindow());
+            },
+          },
           { type: 'separator' },
           {
             label: m.menu_actual_size(),
@@ -1223,7 +1311,7 @@ app.whenReady().then(async () => {
               if (!focusedWindow || focusedWindow.isDestroyed()) return;
               // Route zoom to main app or webview based on renderer-tracked panel focus
               if (isFocusedWindowBrowserActive()) {
-                focusedWindow.webContents.send('menu:reset-zoom');
+                sendWorkspaceCommand('menu:reset-zoom');
               } else {
                 focusedWindow.webContents.setZoomLevel(0);
               }
@@ -1236,7 +1324,7 @@ app.whenReady().then(async () => {
               const focusedWindow = BrowserWindow.getFocusedWindow();
               if (!focusedWindow || focusedWindow.isDestroyed()) return;
               if (isFocusedWindowBrowserActive()) {
-                focusedWindow.webContents.send('menu:zoom-in');
+                sendWorkspaceCommand('menu:zoom-in');
               } else {
                 focusedWindow.webContents.setZoomLevel(
                   focusedWindow.webContents.getZoomLevel() + 0.5,
@@ -1251,7 +1339,7 @@ app.whenReady().then(async () => {
               const focusedWindow = BrowserWindow.getFocusedWindow();
               if (!focusedWindow || focusedWindow.isDestroyed()) return;
               if (isFocusedWindowBrowserActive()) {
-                focusedWindow.webContents.send('menu:zoom-out');
+                sendWorkspaceCommand('menu:zoom-out');
               } else {
                 focusedWindow.webContents.setZoomLevel(
                   focusedWindow.webContents.getZoomLevel() - 0.5,
@@ -1295,6 +1383,13 @@ app.whenReady().then(async () => {
   // Rebuild menu when the main-process locale changes (renderer synced a new
   // language preference over app:set-language-preference)
   app.on('main-locale-changed', () => {
+    rebuildMenu();
+  });
+
+  // Rebuild menu when the active backend changes (backend switch or boot
+  // restore of a remote) — the Help ▸ Sample intentd Process item is gated on
+  // win32 + local sidecar (#1889)
+  app.on('backend-connection-changed', () => {
     rebuildMenu();
   });
 
@@ -1374,11 +1469,10 @@ app.whenReady().then(async () => {
   setupDroidIPC(); // Needed for droid:get-models
   setupGrokIPC(); // Needed for grok:get-models
   setupUnslothIPC(); // Needed for unsloth:get-models
-  setupFeatureCodesIPC(); // Feature codes for gating features like Cortex
+  setupFeatureCodesIPC(); // Feature codes for gating experimental features
   setupProviderAvailabilityIPC(); // Needed for providers:get-availability
   setupEventsIPC(); // Needed for events:query
   registerSetupScriptsHandlers(); // Needed for onboarding setup scripts
-  registerScriptsHandlers(); // Needed for workspace script management (CRUD, lifecycle, output)
   registerAcceptChangesHandlers(); // Needed for AcceptChangesPanel on workspace open
 
   setupTerminalIPC(); // Needed for CLI blocks in notes (includes get-buffer handler)
@@ -1398,11 +1492,23 @@ app.whenReady().then(async () => {
   // ensures we don't spawn when an external daemon is already running.
   await startIntentdSidecar(process.env, app.isPackaged, process.resourcesPath, process.cwd());
 
+  // Per-process memory sampling → console-output.log, so a debug bundle can
+  // name the process that grew. Started after the daemon so the very first
+  // sample already sees the sidecar and its agent children.
+  startMemoryMonitor();
+
   // The daemon owns PATH discovery. Seed only after starting/adopting it, and
   // retry briefly while a newly spawned sidecar creates its socket.
   await seedPathFromHostEnv();
 
+  // Boot reconciliation (T8): the live client is built from the local/env
+  // default, so make the persisted active connection agree with it before any
+  // window queries `connections:list`. Reset a stale remote active-id to local.
+  await reconcileActiveConnectionOnBoot();
+
   registerBackendHandlers(); // Needed for live JSON-RPC transport (workspaces domain)
+  registerWorkspaceTransferHandlers(); // Workspace transfer relay (wizard steps 3–4)
+  registerWorkspaceImportHandlers(); // Import Workspace from File (File menu)
 
   // Hydrate the main-process provider catalog cache (non-blocking): the
   // JSON-RPC client queues the request until the daemon socket connects.
@@ -1428,7 +1534,6 @@ app.whenReady().then(async () => {
     registerAgentContextHandlers();
 
     // setupTerminalIPC(); // Already called in critical IPC setup
-    setupDiffsIPC();
     setupLogIPC();
     // setupAuggieIPC(); // Already called in critical IPC setup
     // setupEventsIPC(); // Already called in critical IPC setup
@@ -1454,17 +1559,33 @@ app.whenReady().then(async () => {
       });
     }
 
+    // setupAutoUpdateIPC(); // Already called in critical IPC setup
+    // Initialize auto-updater in production. Runs BEFORE any awaited step in
+    // this task so the GET_STATE boot gate is always settled — a rejection in
+    // a later awaited import must not leave boot-time GET_STATE waiters
+    // hanging. (auto-update.ipc is statically imported above, so this dynamic
+    // import is a cache hit.)
+    const { initializeAutoUpdater, markAutoUpdaterNotInitialized } =
+      await import('../features/auto-update/main/auto-update.ipc');
+    const mainWindow = getMainWindow();
+    if (process.env.NODE_ENV !== 'development' && process.env.TESTING !== 'true') {
+      // Initialize regardless of whether a window exists yet
+      // (intent-hq/monorepo#1848): this setImmediate task can run before
+      // window creation — the outer flow awaits getActiveId() first, which
+      // yields the event loop — and gating on the window used to skip
+      // initialization for the whole session, leaving manual checks to die in
+      // the watchdog timeout. Renderer notifications broadcast to whatever
+      // windows are live at send time.
+      initializeAutoUpdater();
+    } else {
+      // Dev mode: the updater never initializes — unblock boot-time
+      // GET_STATE waiters so they answer the default state.
+      markAutoUpdaterNotInitialized();
+    }
+
     // Setup browser debugger IPC handlers for CDP access to embedded browser tabs
     const { registerBrowserHandlers } = await import('../features/browser/main/browser.ipc');
     registerBrowserHandlers();
-
-    // setupAutoUpdateIPC(); // Already called in critical IPC setup
-    // Initialize auto-updater in production (not needed at startup, depends on mainWindow)
-    const { initializeAutoUpdater } = await import('../features/auto-update/main/auto-update.ipc');
-    const mainWindow = getMainWindow();
-    if (process.env.NODE_ENV !== 'development' && mainWindow) {
-      initializeAutoUpdater(mainWindow);
-    }
 
     // Show this version's release notes on the first launch after an update.
     // Packaged builds only — a dev build's version is never a published tag.
@@ -1484,15 +1605,8 @@ app.whenReady().then(async () => {
     // Event-triggered handlers (message delivery, auto-commit) are now sagas
     // forked from workspaceEventsSaga — no manual registration needed.
 
-    // Migrate workspaces from ~/intent/{id} to ~/intent/workspaces/{id}
-    try {
-      const migrationResult = await protocolAdapter.migrateWorkspacesToCanonicalLocation();
-      if (migrationResult.migrated > 0 || migrationResult.errors > 0) {
-        logger.info('Workspace migration on startup', migrationResult);
-      }
-    } catch (error) {
-      logger.warn('Error migrating workspaces on startup', { error });
-    }
+    // Legacy workspace-location migration removed — the daemon owns workspace
+    // directories (PROTOCOL.md §5.1); the FE no longer moves data on disk.
 
     // Clean up stale temp files from ~/.intent/tmp (from crashed/killed agents)
     try {
@@ -1527,8 +1641,15 @@ app.whenReady().then(async () => {
     // Check for intent:// deep link in process.argv (cold start)
     const intentUrlArg = process.argv.find((arg: string) => arg.startsWith('intent://'));
 
-    // Try to restore saved window sessions (unless we have a deep link to process)
-    const savedSessions = intentUrlArg ? null : loadWindowSessions();
+    // Try to restore saved window sessions (unless we have a deep link to process).
+    // Key off the RESOLVED boot backend (T21): reconcileActiveConnectionOnBoot()
+    // above has already run to completion, so getActiveId() now reflects the
+    // actually-connected backend — the reconnected remote when it was reachable,
+    // otherwise local. Restoring under this id (never the hard-coded local
+    // default) ensures a remote's windows are only restored when we booted back
+    // onto that remote, and local's windows when we fell back to local.
+    const bootBackendId = await getActiveId();
+    const savedSessions = intentUrlArg ? null : loadWindowSessions(bootBackendId);
     if (savedSessions && savedSessions.length > 0) {
       logger.info('Restoring window sessions from previous run', { count: savedSessions.length });
       for (let i = 0; i < savedSessions.length; i++) {
@@ -1541,6 +1662,12 @@ app.whenReady().then(async () => {
 
     startupMetrics.end('createWindow');
   }
+
+  // GitHub-dependent specialist filtering is noncritical for first paint. Start
+  // its daemon-backed refresh only after backend handlers and the first window
+  // are available; the service conservatively hides those specialists until it
+  // completes. Do not await this on the first-window startup path.
+  void refreshGitHubAuthStatus();
 
   // Register intent:// protocol handler with the OS.
   // In production, electron-builder registers the scheme statically (Info.plist / registry),
@@ -1598,10 +1725,12 @@ app.whenReady().then(async () => {
       logger.warn('Failed to end postWindowIPC metric:', error);
     }
 
-    // Start CDP MCP Server (dev-only)
-    if (process.env.NODE_ENV === 'development' && process.env.ENABLE_CDP_DEBUG) {
+    // The legacy self-connecting bridge is opt-in because connecting Electron to
+    // its own CDP endpoint can trigger a native SIGTRAP. External CDP remains enabled.
+    if (isCdpMcpBridgeEnabled(process.env)) {
       startupMetrics.start('cdpMcpServer');
       try {
+        const { CdpMcpBridge } = await import('./cdp-mcp-bridge');
         cdpMcpServer = new CdpMcpBridge();
         await cdpMcpServer.start();
         logger.info('CDP MCP Server started for debugging');
@@ -1640,7 +1769,7 @@ app.on('before-quit', async (event: Electron.Event) => {
     // Save window sessions now that quit is prevented.
     // Must be called AFTER event.preventDefault() because saveWindowSessions is async
     // and preventDefault must be called synchronously within the event handler.
-    await saveWindowSessions();
+    await saveActiveWindowSessions();
 
     // Skip the prompt when quitting to install an update: installUpdate()
     // already ran the confirmation while the windows were still open, so
@@ -1709,7 +1838,7 @@ app.on('window-all-closed', async () => {
     // on next launch. The debounced background saver (1s) is best-effort and
     // may not have captured the final state; always flush synchronously here.
     try {
-      await saveWindowSessions();
+      await saveActiveWindowSessions();
     } catch (err) {
       logger.error(
         // i18n-ignore (developer log message)
@@ -1722,7 +1851,7 @@ app.on('window-all-closed', async () => {
     // isShuttingDown=true internally (so any subsequent before-quit is a
     // no-op), runs the full cleanup ordering — including the items only it
     // performs (cleanupTerminals + settling delay,
-    // disposeAllScriptProcessManagers, cleanupAutoUpdater) — and
+    // cleanupAutoUpdater) — and
     // then calls app.exit(0). Delegating here (instead of running a bespoke
     // partial teardown and calling app.quit()) prevents before-quit re-entry
     // that otherwise showed a second running-agent prompt and ran a duplicate
@@ -1828,7 +1957,7 @@ if (!gotTheLock) {
   });
 }
 
-app.on('activate', () => {
+app.on('activate', async () => {
   if (isSecondInstance) return;
 
   const allWindows = BrowserWindow.getAllWindows().filter(
@@ -1842,8 +1971,11 @@ app.on('activate', () => {
     targetWindow.show();
     targetWindow.focus();
   } else {
-    // No windows at all — restore sessions or create a new one
-    const savedSessions = loadWindowSessions();
+    // No windows at all — restore sessions or create a new one. Key off the
+    // currently-active backend (T21) so a dock-click reopen restores the live
+    // backend's windows, never the hard-coded local default.
+    const backendId = await getActiveId();
+    const savedSessions = loadWindowSessions(backendId);
     if (savedSessions && savedSessions.length > 0) {
       logger.info('Restoring window sessions on activate', { count: savedSessions.length });
       for (let i = 0; i < savedSessions.length; i++) {

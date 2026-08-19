@@ -1,23 +1,20 @@
 /**
  * @vitest-environment jsdom
  *
- * Checkout-mode pill visibility in WorkspaceProgressCard. The pill
- * renders "CoW" / "Worktree" next to the org/repo subtitle in both the full
- * (sidebar) and compact (homepage card) variants, and renders nothing for
- * direct workspaces (`checkoutMode` absent). It must sit outside the
- * copy-on-click repo button so the copy affordance is preserved.
+ * Checkout-mode repository metadata in WorkspaceProgressCard. The second
+ * line stays limited to repository and branch text; checkout mode and disk
+ * usage live in the repository hover card.
  */
-import {
-  describe,
-  it,
-  expect,
-  beforeEach,
-  vi,
-} from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { render, screen } from '@testing-library/svelte';
+import { tick } from 'svelte';
 import type { Note, Workspace } from '$shared/types';
 import { WorkspaceStatusEnum } from '$shared/types';
 import { warmImport } from '../../../../../test/warm-import';
+import {
+  configuredVisualStates,
+  exerciseVisualStates,
+} from '$lib/components/__tests__/helpers/visual-state-characterization';
 
 const mocks = vi.hoisted(() => {
   const dispatch = vi.fn();
@@ -48,7 +45,8 @@ const mocks = vi.hoisted(() => {
 });
 
 vi.mock('$store/renderer/store', async () => {
-  const { createAppStoreMockModule } = await import('$store/renderer/utils/test-helpers/store-mock');
+  const { createAppStoreMockModule } =
+    await import('$store/renderer/utils/test-helpers/store-mock');
 
   return createAppStoreMockModule({
     state: () => ({}),
@@ -68,6 +66,7 @@ vi.mock('$store/renderer/slices/workspace-notes/workspace-notes-selectors', () =
 }));
 
 vi.mock('$store/renderer/slices/workspace-tasks/workspace-tasks-selectors', () => ({
+  selectWorkspaceTasksLoading: mocks.selector(() => false),
   selectWorkspaceTaskProgress: mocks.selector(() => ({
     total: 0,
     completed: 0,
@@ -151,6 +150,9 @@ vi.mock('$lib/components/ui/WorkspaceActionsMenu.svelte', async () => ({
 vi.mock('$lib/components/ui/tooltip/Tooltip.svelte', async () => ({
   default: (await import('./mocks/MockTooltip.svelte')).default,
 }));
+vi.mock('$lib/components/ui/tooltip', async () => ({
+  TooltipRich: (await import('./mocks/MockTooltipRich.svelte')).default,
+}));
 vi.mock('$lib/components/icons/SidebarIcon.svelte', async () => ({
   default: (await import('./mocks/MockSimple.svelte')).default,
 }));
@@ -177,6 +179,15 @@ vi.mock('$lib/components/workspace/shrink-workspace-action', () => ({
   SHRINK_WORKSPACE_PROMPT: '',
 }));
 
+// The pill labels `cow` checkouts "CoW" only while effective CoW agent
+// isolation is active (an async settings read). These tests cover pill
+// placement, not label semantics (CheckoutModePill.test.ts does), so pin
+// the resolver to the active-isolation outcome.
+vi.mock('$lib/components/workspace/initializer/isolation-mode', () => ({
+  isolationNoun: vi.fn(() => ''),
+  resolveEffectiveIsolationMode: vi.fn().mockResolvedValue('cow'),
+}));
+
 async function renderProgressCard(
   overrides: Partial<Workspace> = {},
   props: { compact?: boolean } = {},
@@ -189,9 +200,14 @@ async function renderProgressCard(
     ...overrides,
   } as Workspace;
   const WorkspaceProgressCard = (await import('../WorkspaceProgressCard.svelte')).default;
-  return render(WorkspaceProgressCard, {
+  const result = render(WorkspaceProgressCard, {
     props: { workspaceId: mocks.workspaceEntity.id, ...props },
   });
+  // Flush the pill's async isolation-mode label resolution + re-render.
+  await tick();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  await tick();
+  return result;
 }
 
 // Pre-warm the component module graph so the cold dynamic import is not
@@ -199,10 +215,11 @@ async function renderProgressCard(
 warmImport(() => import('../../../terminal/__tests__/mocks/MockButton.svelte'));
 warmImport(() => import('./mocks/MockSimple.svelte'));
 warmImport(() => import('./mocks/MockTooltip.svelte'));
+warmImport(() => import('./mocks/MockTooltipRich.svelte'));
 warmImport(() => import('./mocks/Fa.svelte'));
 warmImport(() => import('../WorkspaceProgressCard.svelte'));
 
-describe('WorkspaceProgressCard checkout-mode pill', () => {
+describe('WorkspaceProgressCard checkout mode in repository hover card', () => {
   beforeEach(() => {
     mocks.dispatch.mockClear();
     mocks.update.mockReset();
@@ -210,63 +227,59 @@ describe('WorkspaceProgressCard checkout-mode pill', () => {
     mocks.update.mockImplementation(async () => ({ ok: true, data: mocks.workspaceEntity }));
   });
 
-  it('renders "CoW" beside the repo text, outside the copy button (full mode)', async () => {
-    await renderProgressCard({ checkoutMode: 'cow' });
-
-    const pill = screen.getByText('CoW');
-    expect(pill).toBeTruthy();
-
-    const repoButton = screen.getByRole('button', { name: 'augment/intent' });
-    expect(repoButton.contains(pill)).toBe(false);
+  it('affirms repository pill contrast in every required visual state', async () => {
+    const observed = await exerciseVisualStates(async () => {
+      const view = await renderProgressCard({ checkoutMode: 'cow' });
+      const target = view.getByRole('button', { name: 'augment/intent' });
+      return {
+        ...view,
+        target,
+        assertCapability: () => {
+          expect(
+            view.container.querySelector('[data-checkout-mode-details]')?.textContent,
+          ).toContain('Checkout mode: CoW');
+          expect(
+            view.container.querySelector('[data-sidebar-repository-branch-metadata]'),
+          ).toBeTruthy();
+        },
+      };
+    });
+    expect(observed).toEqual(configuredVisualStates);
   });
 
-  it('renders a "·" separator immediately before the pill (full mode)', async () => {
-    await renderProgressCard({ checkoutMode: 'cow' });
+  it.each([
+    ['cow', 'cow', 'CoW'],
+    ['worktree', 'worktree', 'Worktree'],
+    ['direct', 'direct', 'Direct'],
+  ] as const)(
+    'renders %s mode inside the repository hover card',
+    async (checkoutMode, mode, label) => {
+      const { container } = await renderProgressCard({ checkoutMode });
 
-    const pill = screen.getByText('CoW');
-    expect(pill.previousElementSibling?.textContent).toBe('·');
-  });
+      const metadata = container.querySelector('[data-sidebar-repository-branch-metadata]');
+      const repositoryCard = container.querySelector('[data-sidebar-repository-hover-card]');
+      const modeDetails = repositoryCard?.querySelector('[data-checkout-mode-details]');
+      const modeIcon = repositoryCard?.querySelector('[data-checkout-mode-icon]');
 
-  it('renders a "·" separator immediately before the pill (compact mode)', async () => {
-    await renderProgressCard({ checkoutMode: 'cow' }, { compact: true });
+      expect(modeDetails?.textContent).toContain(`Checkout mode: ${label}`);
+      expect(modeIcon?.getAttribute('data-checkout-mode-icon')).toBe(mode);
+      expect(metadata?.querySelector('[data-checkout-mode]')).toBeNull();
+      expect(metadata?.querySelector('[data-sidebar-branch-icon]')).toBeNull();
+      expect(
+        screen.getByRole('button', { name: 'augment/intent' }).contains(modeDetails ?? null),
+      ).toBe(false);
+    },
+  );
 
-    const pill = screen.getByText('CoW');
-    expect(pill.previousElementSibling?.textContent).toBe('·');
-  });
+  it('omits checkout details when checkoutMode is missing', async () => {
+    const { container } = await renderProgressCard({ checkoutMode: undefined });
 
-  it('renders "Worktree" when checkoutMode is worktree (full mode)', async () => {
-    await renderProgressCard({ checkoutMode: 'worktree' });
-
-    expect(screen.getByText('Worktree')).toBeTruthy();
-  });
-
-  it('renders no pill when checkoutMode is undefined (full mode)', async () => {
-    await renderProgressCard({ checkoutMode: undefined });
-
-    expect(screen.queryByText('CoW')).toBeNull();
-    expect(screen.queryByText('Worktree')).toBeNull();
+    expect(container.querySelector('[data-checkout-mode-details]')).toBeNull();
     expect(screen.getByRole('button', { name: 'augment/intent' })).toBeTruthy();
-  });
-
-  it('renders "CoW" beside the repo text, outside the copy button (compact mode)', async () => {
-    await renderProgressCard({ checkoutMode: 'cow' }, { compact: true });
-
-    const pill = screen.getByText('CoW');
-    expect(pill).toBeTruthy();
-
-    const repoButton = screen.getByRole('button', { name: 'augment/intent' });
-    expect(repoButton.contains(pill)).toBe(false);
-  });
-
-  it('renders no pill in compact mode for direct workspaces', async () => {
-    await renderProgressCard({ checkoutMode: undefined }, { compact: true });
-
-    expect(screen.queryByText('CoW')).toBeNull();
-    expect(screen.queryByText('Worktree')).toBeNull();
   });
 });
 
-describe('WorkspaceProgressCard disk-usage tooltip on pill', () => {
+describe('WorkspaceProgressCard disk usage in repository hover flow', () => {
   const diskUsage = {
     bytes: 2_330_000_000,
     fileCount: 10,
@@ -281,24 +294,13 @@ describe('WorkspaceProgressCard disk-usage tooltip on pill', () => {
     mocks.update.mockImplementation(async () => ({ ok: true, data: mocks.workspaceEntity }));
   });
 
-  it('renders no visible size text in the subtitle (full mode)', async () => {
-    await renderProgressCard({ checkoutMode: 'cow', diskUsage });
+  it('keeps size out of the second line and mode details in the repository card', async () => {
+    const { container } = await renderProgressCard({ checkoutMode: 'cow', diskUsage });
 
-    expect(screen.getByText('CoW')).toBeTruthy();
+    const metadata = container.querySelector('[data-sidebar-repository-branch-metadata]');
+    const repositoryCard = container.querySelector('[data-sidebar-repository-hover-card]');
+    expect(metadata?.querySelector('[data-checkout-mode]')).toBeNull();
+    expect(repositoryCard?.textContent).toContain('Checkout mode: CoW');
     expect(screen.queryByText('2.17Gi')).toBeNull();
-  });
-
-  it('renders no visible size text in the subtitle (compact mode)', async () => {
-    await renderProgressCard({ checkoutMode: 'cow', diskUsage }, { compact: true });
-
-    expect(screen.getByText('CoW')).toBeTruthy();
-    expect(screen.queryByText('2.17Gi')).toBeNull();
-  });
-
-  it('keeps the "·" separator before the pill when diskUsage is present', async () => {
-    await renderProgressCard({ checkoutMode: 'cow', diskUsage });
-
-    const pill = screen.getByText('CoW');
-    expect(pill.previousElementSibling?.textContent).toBe('·');
   });
 });

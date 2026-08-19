@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { AgentStatus, type AgentSession, type AgentMessage, type QueuedMessage } from '$shared/types';
+import {
+  AgentStatus,
+  type AgentSession,
+  type AgentMessage,
+  type QueuedMessage,
+} from '$shared/types';
 import { AgentActivationState } from '$shared/types/agent-session';
 import type { AgentSessionState } from './agent-session-types';
 import type { StoreState } from '../../types';
@@ -22,6 +27,8 @@ import {
   updateAgentDigest,
   renameSession,
   renameAgent,
+  setProcessQueueHint,
+  clearProcessQueueHint,
   bulkUpsertSessions,
   removeWorkspaceSessions,
   clearAllSessions,
@@ -29,13 +36,20 @@ import {
   hasCanonicalId,
   isTimestampClose,
   replaceMessageById,
+  HISTORY_SEGMENT_MAX,
+  prependHistoryMessages,
+  appendHistoryMessages,
+  seedHistoryAround,
+  setHistoryOldestReached,
+  clearHistorySegment,
+  MAX_MESSAGES_PER_AGENT,
 } from './agent-session-slice';
 import {
   chatSendFailed,
   chatSendStarted,
   chatInitialized,
-  chatQueueProcessingReceived,
-  streamEnded,
+  chatReset,
+  streamCompleted,
 } from '../chat-state/chat-state-slice';
 import { eventReceived } from '../workspace-events/workspace-events-slice';
 import { workspaceDeleted } from '../workspace-lifecycle/workspace-lifecycle-slice';
@@ -43,13 +57,14 @@ import {
   selectAgentSession,
   selectAgentSessionsByIds,
   selectAgentMessages,
+  selectAgentHistoryMessages,
+  selectHistorySegmentMeta,
   selectAgentMessageById,
   selectAgentSessionExists,
   selectAgentSessionIsProcessing,
   selectAgentSessionIsStreaming,
   selectAgentSessionStreamingContent,
   selectAgentSessionWorkspaceId,
-  selectAgentReasoningEffort,
   selectAgentActivationWaitComplete,
   selectAgentQueuedMessages,
   selectAgentIsResponding,
@@ -112,6 +127,9 @@ function makeAcpAccumulatedAssistantMessage(
     },
   };
 }
+
+const streamEnded = (agentId: string) =>
+  streamCompleted(agentId, { lastAttemptedMessage: null, modelUnavailable: null });
 
 function makeSession(
   id: string,
@@ -304,10 +322,7 @@ describe('agent-session-slice reducer', () => {
     // Attention-request lifecycle: a re-hydration that only raises or clears
     // the attention-request fields must not be swallowed by the no-op guard.
     it('applies an upsert when an attention request is raised on an otherwise-equivalent session', () => {
-      const state = agentSessionReducer(
-        initialState,
-        upsertSession(makeSession('a1', 'ws-1')),
-      );
+      const state = agentSessionReducer(initialState, upsertSession(makeSession('a1', 'ws-1')));
 
       const next = agentSessionReducer(
         state,
@@ -331,10 +346,7 @@ describe('agent-session-slice reducer', () => {
     // swallowed by the no-op guard — the AgentCard preview renders directly
     // off them.
     it('applies an upsert when only lastMessageRole/lastUserMessage change on an otherwise-equivalent session', () => {
-      const state = agentSessionReducer(
-        initialState,
-        upsertSession(makeSession('a1', 'ws-1')),
-      );
+      const state = agentSessionReducer(initialState, upsertSession(makeSession('a1', 'ws-1')));
 
       const next = agentSessionReducer(
         state,
@@ -348,9 +360,91 @@ describe('agent-session-slice reducer', () => {
 
       expect(next).not.toBe(state);
       expect(next.byAgentId['a1'].lastMessageRole).toBe('user');
-      expect(next.byAgentId['a1'].lastUserMessage).toBe(
-        'Please also handle the empty-list case',
+      expect(next.byAgentId['a1'].lastUserMessage).toBe('Please also handle the empty-list case');
+    });
+
+    // Wire lastMessageId + derived hasUnread (monorepo#1597): an upsert whose
+    // only change is the newest-message id (new-message push) or the derived
+    // unread flag flipping (agent:updated seen-marker convergence re-derives
+    // hasUnread at ingest) must not be swallowed by the no-op guard.
+    it('applies an upsert when only the wire lastMessageId changes on an otherwise-equivalent session', () => {
+      const state = agentSessionReducer(
+        initialState,
+        upsertSession(makeSession('a1', 'ws-1', { lastMessageId: 'm-1' })),
       );
+
+      const next = agentSessionReducer(
+        state,
+        upsertSession(makeSession('a1', 'ws-1', { lastMessageId: 'm-2' })),
+      );
+
+      expect(next).not.toBe(state);
+      expect(next.byAgentId['a1'].lastMessageId).toBe('m-2');
+    });
+
+    it('applies an upsert when only hasUnread flips on an otherwise-equivalent session (marker convergence)', () => {
+      const state = agentSessionReducer(
+        initialState,
+        upsertSession(makeSession('a1', 'ws-1', { hasUnread: true })),
+      );
+
+      const next = agentSessionReducer(
+        state,
+        upsertSession(makeSession('a1', 'ws-1', { hasUnread: false })),
+      );
+
+      expect(next).not.toBe(state);
+      expect(next.byAgentId['a1'].hasUnread).toBe(false);
+    });
+
+    // Harness stamp (§5.5): a daemon upgrade backfills harnessVersion on
+    // legacy rows, and first activation materializes harnessFeatures — an
+    // upsert whose only change is one of these must not be swallowed, or the
+    // AgentCard "Harness vX.Y" menu item would never appear for already-loaded
+    // sessions.
+    it('applies an upsert when only harnessVersion appears on an otherwise-equivalent session (backfill)', () => {
+      const state = agentSessionReducer(initialState, upsertSession(makeSession('a1', 'ws-1')));
+
+      const next = agentSessionReducer(
+        state,
+        upsertSession(makeSession('a1', 'ws-1', { harnessVersion: '1.0' })),
+      );
+
+      expect(next).not.toBe(state);
+      expect(next.byAgentId['a1'].harnessVersion).toBe('1.0');
+    });
+
+    it('applies an upsert when only harnessFeatures materializes on an otherwise-equivalent session', () => {
+      const state = agentSessionReducer(
+        initialState,
+        upsertSession(makeSession('a1', 'ws-1', { harnessVersion: '1.0' })),
+      );
+
+      const next = agentSessionReducer(
+        state,
+        upsertSession(
+          makeSession('a1', 'ws-1', {
+            harnessVersion: '1.0',
+            harnessFeatures: { structuredQuestions: true },
+          }),
+        ),
+      );
+
+      expect(next).not.toBe(state);
+      expect(next.byAgentId['a1'].harnessFeatures).toEqual({ structuredQuestions: true });
+    });
+
+    it('returns same state reference when harness fields are unchanged', () => {
+      const seed = () =>
+        makeSession('a1', 'ws-1', {
+          harnessVersion: '1.0',
+          harnessFeatures: { structuredQuestions: true, agentActions: false },
+        });
+      const state = agentSessionReducer(initialState, upsertSession(seed()));
+
+      const next = agentSessionReducer(state, upsertSession(seed()));
+
+      expect(next).toBe(state);
     });
 
     it('applies an upsert when only lastAgentResponse changes on an otherwise-equivalent session', () => {
@@ -361,9 +455,7 @@ describe('agent-session-slice reducer', () => {
 
       const next = agentSessionReducer(
         state,
-        upsertSession(
-          makeSession('a1', 'ws-1', { lastAgentResponse: 'Done — tests pass.' }),
-        ),
+        upsertSession(makeSession('a1', 'ws-1', { lastAgentResponse: 'Done — tests pass.' })),
       );
 
       expect(next).not.toBe(state);
@@ -385,10 +477,7 @@ describe('agent-session-slice reducer', () => {
 
       // The daemon clears the fields on the next user-origin delivery; the
       // re-fetched projection simply omits them.
-      const next = agentSessionReducer(
-        state,
-        upsertSession(makeSession('a1', 'ws-1')),
-      );
+      const next = agentSessionReducer(state, upsertSession(makeSession('a1', 'ws-1')));
 
       expect(next).not.toBe(state);
       expect(next.byAgentId['a1'].attentionRequestKind).toBeUndefined();
@@ -397,10 +486,7 @@ describe('agent-session-slice reducer', () => {
     });
 
     it('registers metadata-carried (AgentLite) attention fields as changes too', () => {
-      const state = agentSessionReducer(
-        initialState,
-        upsertSession(makeSession('a1', 'ws-1')),
-      );
+      const state = agentSessionReducer(initialState, upsertSession(makeSession('a1', 'ws-1')));
 
       const next = agentSessionReducer(
         state,
@@ -422,10 +508,7 @@ describe('agent-session-slice reducer', () => {
     // metadata.completionReport must not be swallowed by the no-op guard —
     // AgentCard's effectiveCompletionReport preview renders directly off it.
     it('applies an upsert when only metadata.completionReport changes on an otherwise-equivalent session', () => {
-      const state = agentSessionReducer(
-        initialState,
-        upsertSession(makeSession('a1', 'ws-1')),
-      );
+      const state = agentSessionReducer(initialState, upsertSession(makeSession('a1', 'ws-1')));
 
       const next = agentSessionReducer(
         state,
@@ -437,16 +520,11 @@ describe('agent-session-slice reducer', () => {
       );
 
       expect(next).not.toBe(state);
-      expect(next.byAgentId['a1'].metadata?.completionReport).toBe(
-        'Done — tests pass, PR ready.',
-      );
+      expect(next.byAgentId['a1'].metadata?.completionReport).toBe('Done — tests pass, PR ready.');
     });
 
     it('applies an upsert when only metadata.dismissedQuestionsMessageId changes (cross-window reconcile)', () => {
-      const state = agentSessionReducer(
-        initialState,
-        upsertSession(makeSession('a1', 'ws-1')),
-      );
+      const state = agentSessionReducer(initialState, upsertSession(makeSession('a1', 'ws-1')));
 
       const next = agentSessionReducer(
         state,
@@ -462,10 +540,7 @@ describe('agent-session-slice reducer', () => {
     });
 
     it('applies an upsert when only metadata.lastSeenMessageId changes (agent:updated convergence)', () => {
-      const state = agentSessionReducer(
-        initialState,
-        upsertSession(makeSession('a1', 'ws-1')),
-      );
+      const state = agentSessionReducer(initialState, upsertSession(makeSession('a1', 'ws-1')));
 
       const next = agentSessionReducer(
         state,
@@ -481,10 +556,7 @@ describe('agent-session-slice reducer', () => {
     });
 
     it('applies an upsert when only metadata.taskNoteId changes (post-creation task assignment)', () => {
-      const state = agentSessionReducer(
-        initialState,
-        upsertSession(makeSession('a1', 'ws-1')),
-      );
+      const state = agentSessionReducer(initialState, upsertSession(makeSession('a1', 'ws-1')));
 
       const next = agentSessionReducer(
         state,
@@ -500,10 +572,7 @@ describe('agent-session-slice reducer', () => {
     });
 
     it('applies an upsert when only the sandbox metadata fields settle (async CoW provisioning)', () => {
-      const state = agentSessionReducer(
-        initialState,
-        upsertSession(makeSession('a1', 'ws-1')),
-      );
+      const state = agentSessionReducer(initialState, upsertSession(makeSession('a1', 'ws-1')));
 
       const next = agentSessionReducer(
         state,
@@ -659,6 +728,83 @@ describe('agent-session-slice reducer', () => {
         { id: 'msg_backend', appMessageId, metadata: { source: 'backend' } },
       ]);
     });
+
+    it('preserves object identity of already-present rows on an older-history prepend', () => {
+      const m1 = makeUniqueMessage('m1', 'assistant', '2024-01-01T00:00:02.000Z');
+      const m2 = makeUniqueMessage('m2', 'assistant', '2024-01-01T00:00:03.000Z');
+      let state = agentSessionReducer(
+        initialState,
+        upsertSession(makeSession('a1', 'ws-1', { messages: [m1, m2] })),
+      );
+      const before = getMsgs(state, 'a1');
+      const older = makeUniqueMessage('m-old', 'assistant', '2024-01-01T00:00:01.000Z');
+      state = agentSessionReducer(
+        state,
+        replaceMessages('a1', [
+          older,
+          { ...m1 },
+          { ...m2, contentBlocks: [...(m2.contentBlocks ?? [])] },
+        ]),
+      );
+      const after = getMsgs(state, 'a1');
+      expect(after.map((m) => m.id)).toEqual(['m-old', 'm1', 'm2']);
+      expect(after[1]).toBe(before[0]);
+      expect(after[2]).toBe(before[1]);
+    });
+
+    it('no-ops entirely when the replacement is structurally equivalent', () => {
+      const m1 = makeUniqueMessage('m1', 'assistant', '2024-01-01T00:00:01.000Z');
+      const m2 = makeUniqueMessage('m2', 'assistant', '2024-01-01T00:00:02.000Z');
+      const state = agentSessionReducer(
+        initialState,
+        upsertSession(makeSession('a1', 'ws-1', { messages: [m1, m2] })),
+      );
+      const next = agentSessionReducer(state, replaceMessages('a1', [{ ...m1 }, { ...m2 }]));
+      expect(next).toBe(state);
+    });
+
+    it('no-ops when a store already at the cap fully prunes a prepend-shaped replacement', () => {
+      const messages: AgentMessage[] = [];
+      for (let i = 0; i < MAX_MESSAGES_PER_AGENT; i++) {
+        const ts = `2024-06-01T${String(Math.floor(i / 3600)).padStart(2, '0')}:${String(Math.floor((i % 3600) / 60)).padStart(2, '0')}:${String(i % 60).padStart(2, '0')}.000Z`;
+        messages.push(makeUniqueMessage(`m-${i}`, 'user', ts));
+      }
+      const state = agentSessionReducer(
+        initialState,
+        upsertSession(makeSession('a1', 'ws-1', { messages })),
+      );
+      expect(getMsgs(state, 'a1')).toHaveLength(MAX_MESSAGES_PER_AGENT);
+      const olderPrepend = [
+        makeUniqueMessage('m-older-1', 'user', '2024-01-01T00:00:01.000Z'),
+        makeUniqueMessage('m-older-2', 'user', '2024-01-01T00:00:02.000Z'),
+      ];
+      const next = agentSessionReducer(
+        state,
+        replaceMessages('a1', [...olderPrepend, ...messages.map((m) => ({ ...m }))]),
+      );
+      expect(next).toBe(state);
+    });
+
+    it('gives a changed row a new identity while unchanged rows keep theirs', () => {
+      const m1 = makeUniqueMessage('m1', 'assistant', '2024-01-01T00:00:01.000Z');
+      const m2 = makeUniqueMessage('m2', 'assistant', '2024-01-01T00:00:02.000Z');
+      let state = agentSessionReducer(
+        initialState,
+        upsertSession(makeSession('a1', 'ws-1', { messages: [m1, m2] })),
+      );
+      const before = getMsgs(state, 'a1');
+      state = agentSessionReducer(
+        state,
+        replaceMessages('a1', [
+          { ...m1 },
+          { ...m2, contentBlocks: [{ type: 'text' as const, text: 'edited' }] },
+        ]),
+      );
+      const after = getMsgs(state, 'a1');
+      expect(after[0]).toBe(before[0]);
+      expect(after[1]).not.toBe(before[1]);
+      expect(after[1].contentBlocks).toEqual([{ type: 'text', text: 'edited' }]);
+    });
   });
 
   describe('updateSession', () => {
@@ -666,56 +812,6 @@ describe('agent-session-slice reducer', () => {
       let state = agentSessionReducer(initialState, upsertSession(makeSession('a1')));
       state = agentSessionReducer(state, updateSession('a1', { name: 'New Name' }));
       expect(state.byAgentId['a1'].name).toBe('New Name');
-    });
-
-    // Live tool preview (§7 `lastToolUse`): pushed by the daemon-events bridge
-    // during a turn, cleared by it at each turn boundary / on stream end.
-    it('applies and clears the pushed lastToolUse', () => {
-      let state = agentSessionReducer(initialState, upsertSession(makeSession('a1')));
-      state = agentSessionReducer(
-        state,
-        updateSession('a1', { lastToolUse: { name: 'launch-process', status: 'started' } }),
-      );
-      expect(state.byAgentId['a1'].lastToolUse).toEqual({
-        name: 'launch-process',
-        status: 'started',
-      });
-
-      state = agentSessionReducer(state, updateSession('a1', { lastToolUse: undefined }));
-      expect(state.byAgentId['a1'].lastToolUse).toBeUndefined();
-    });
-
-    // No hydration payload carries lastToolUse (AgentLite does not project it),
-    // so without a preservation guard any upsert that applies for another
-    // reason would erase the pushed value mid-turn.
-    it('keeps a pushed lastToolUse across a hydration upsert that omits the field', () => {
-      let state = agentSessionReducer(initialState, upsertSession(makeSession('a1')));
-      state = agentSessionReducer(
-        state,
-        updateSession('a1', { lastToolUse: { name: 'launch-process' } }),
-      );
-
-      // An upsert that applies for an unrelated reason (fresh lastAgentResponse)
-      // must not take the tool preview down with it.
-      state = agentSessionReducer(
-        state,
-        upsertSession(makeSession('a1', 'ws-1', { lastAgentResponse: 'Working on it…' })),
-      );
-      expect(state.byAgentId['a1'].lastToolUse).toEqual({ name: 'launch-process' });
-
-      // A snapshot that explicitly carries the key still replaces it (no
-      // hydration path does today; the guard is key-existence, not blanket
-      // preservation).
-      state = agentSessionReducer(
-        state,
-        upsertSession(
-          makeSession('a1', 'ws-1', {
-            lastAgentResponse: 'Done — tests pass.',
-            lastToolUse: { name: 'read_file' },
-          }),
-        ),
-      );
-      expect(state.byAgentId['a1'].lastToolUse).toEqual({ name: 'read_file' });
     });
 
     it('handles messages in updates with normalization and logical dedup', () => {
@@ -738,15 +834,6 @@ describe('agent-session-slice reducer', () => {
         }),
       );
       expect(getMsgs(state, 'a1').map((m) => m.id)).toEqual(['msg_backend']);
-    });
-
-    it('sets and clears the session reasoningEffort (Option B, §5.5)', () => {
-      let state = agentSessionReducer(initialState, upsertSession(makeSession('a1')));
-      state = agentSessionReducer(state, updateSession('a1', { reasoningEffort: 'high' }));
-      expect(state.byAgentId['a1'].reasoningEffort).toBe('high');
-      // Explicit null clears back to the provider default.
-      state = agentSessionReducer(state, updateSession('a1', { reasoningEffort: null }));
-      expect(state.byAgentId['a1'].reasoningEffort).toBeNull();
     });
   });
 
@@ -842,53 +929,6 @@ describe('agent-session-slice reducer', () => {
       expect(state.byAgentId['a1'].waitingForAgentIds).toEqual(['child-1']);
     });
 
-    it('folds reasoningEffort from an agent:session-updated payload (set and clear)', () => {
-      // Option B (§5.5): the daemon echoes the session-level reasoningEffort
-      // on `agent:updated`/`agent:session-updated` convergence payloads — a
-      // string sets it, an explicit null clears it, an absent key leaves the
-      // stored value untouched.
-      let state = agentSessionReducer(
-        initialState,
-        upsertSession(makeSession('a1', 'ws-1', { reasoningEffort: 'medium' } as any)),
-      );
-
-      state = agentSessionReducer(
-        state,
-        eventReceived('ws-1', {
-          id: 'evt-effort-absent',
-          type: 'agent:session-updated',
-          timestamp: '2024-01-01T00:00:00.000Z',
-          workspaceId: 'ws-1',
-          data: { agentId: 'a1', status: 'idle' },
-        } as any),
-      );
-      expect(state.byAgentId['a1'].reasoningEffort).toBe('medium');
-
-      state = agentSessionReducer(
-        state,
-        eventReceived('ws-1', {
-          id: 'evt-effort-set',
-          type: 'agent:session-updated',
-          timestamp: '2024-01-01T00:00:01.000Z',
-          workspaceId: 'ws-1',
-          data: { agentId: 'a1', status: 'idle', reasoningEffort: 'xhigh' },
-        } as any),
-      );
-      expect(state.byAgentId['a1'].reasoningEffort).toBe('xhigh');
-
-      state = agentSessionReducer(
-        state,
-        eventReceived('ws-1', {
-          id: 'evt-effort-clear',
-          type: 'agent:session-updated',
-          timestamp: '2024-01-01T00:00:02.000Z',
-          workspaceId: 'ws-1',
-          data: { agentId: 'a1', status: 'idle', reasoningEffort: null },
-        } as any),
-      );
-      expect(state.byAgentId['a1'].reasoningEffort).toBeNull();
-    });
-
     it('a between-turns active overshoot (isActive false) does not clear the wait', () => {
       // Parked coordinators can carry a lagging `status: "active"` with
       // `isActive: false` — that is not a turn start and must not end the wait.
@@ -939,6 +979,50 @@ describe('agent-session-slice reducer', () => {
       );
 
       expect(state.byAgentId['a1'].isWaitingForOtherAgents).toBe(true);
+    });
+
+    it('folds the agent:idle waitingOnHooks/waitingOnPrMonitors lists onto the session', () => {
+      // §3.1/§5.42: stamped on every idle emit site, so HUD idle-bucketing
+      // (hud-selectors.ts) can read them straight off the live event instead
+      // of waiting on the async agent.list re-hydration.
+      let state = agentSessionReducer(initialState, upsertSession(makeSession('a1')));
+
+      state = agentSessionReducer(
+        state,
+        eventReceived('ws-1', {
+          id: 'evt-idle-hooks',
+          type: 'agent:idle',
+          timestamp: '2024-01-01T00:00:00.000Z',
+          workspaceId: 'ws-1',
+          data: {
+            agentId: 'a1',
+            status: 'idle',
+            waitingOnHooks: [{ hookId: 'h1', name: 'watch-ci' }],
+            waitingOnPrMonitors: [{ monitorId: 'm1', repo: 'o/r', prNumber: 1 }],
+          },
+        } as any),
+      );
+
+      expect(state.byAgentId['a1'].waitingOnHooks).toEqual([{ hookId: 'h1', name: 'watch-ci' }]);
+      expect(state.byAgentId['a1'].waitingOnPrMonitors).toEqual([
+        { monitorId: 'm1', repo: 'o/r', prNumber: 1 },
+      ]);
+
+      // A later idle with no active hooks/monitors clears the stale lists
+      // (the field is stamped on every idle emit site, omitted-when-empty on
+      // the wire but defaulted to [] by canonicalFieldsFromWorkspaceEvent).
+      state = agentSessionReducer(
+        state,
+        eventReceived('ws-1', {
+          id: 'evt-idle-clear',
+          type: 'agent:idle',
+          timestamp: '2024-01-01T00:00:01.000Z',
+          workspaceId: 'ws-1',
+          data: { agentId: 'a1', status: 'idle' },
+        } as any),
+      );
+      expect(state.byAgentId['a1'].waitingOnHooks).toEqual([]);
+      expect(state.byAgentId['a1'].waitingOnPrMonitors).toEqual([]);
     });
 
     it('folds the agent:subscriptions-changed waiting snapshot onto the session', () => {
@@ -1142,10 +1226,7 @@ describe('agent-session-slice reducer', () => {
     it('a hydration with isActive:false or a terminal status closes the sticky liveTurnOpen slot', () => {
       // Snapshot-only close path: if the idle event is missed, the
       // authoritative isActive: false hydration must still end the turn.
-      let state = agentSessionReducer(
-        initialState,
-        upsertSession(makeSession('a1', 'ws-1')),
-      );
+      let state = agentSessionReducer(initialState, upsertSession(makeSession('a1', 'ws-1')));
       state = agentSessionReducer(
         state,
         eventReceived('ws-1', {
@@ -1222,6 +1303,46 @@ describe('agent-session-slice reducer', () => {
       expect(getMsgs(state, 'a1')[0].contentBlocks).toEqual([
         { type: 'text', text: 'Screenshot' },
         { type: 'image', data: 'base64data', mimeType: 'image/png' },
+      ]);
+    });
+
+    it('preserves attachment-reference file blocks from canonical cross-client user message events', () => {
+      let state = agentSessionReducer(initialState, upsertSession(makeSession('a1')));
+      const fileBlocks = [
+        {
+          type: 'file' as const,
+          attachmentId: 'att-uuid-1',
+          fileName: 'dump.har',
+          mimeType: 'application/json',
+          size: 12_582_912,
+        },
+      ];
+
+      state = agentSessionReducer(
+        state,
+        eventReceived('ws-1', {
+          id: 'evt-user-message-file',
+          type: 'agent:user-message:sent',
+          timestamp: '2024-01-01T00:00:02.500Z',
+          workspaceId: 'ws-1',
+          data: {
+            agentId: 'a1',
+            messageId: 'msg-user-file',
+            content: 'See attached',
+            fileBlocks,
+          },
+        } as any),
+      );
+
+      expect(getMsgs(state, 'a1')[0].contentBlocks).toEqual([
+        { type: 'text', text: 'See attached' },
+        {
+          type: 'file',
+          attachmentId: 'att-uuid-1',
+          fileName: 'dump.har',
+          mimeType: 'application/json',
+          size: 12_582_912,
+        },
       ]);
     });
 
@@ -1462,7 +1583,9 @@ describe('agent-session-slice reducer', () => {
     it('maps agent:session-stats-changed into session.stats without touching lifecycle fields', () => {
       let state = agentSessionReducer(
         initialState,
-        upsertSession(makeSession('a1', 'ws-1', { status: 'responding' as any, isStreaming: true })),
+        upsertSession(
+          makeSession('a1', 'ws-1', { status: 'responding' as any, isStreaming: true }),
+        ),
       );
 
       state = agentSessionReducer(
@@ -1903,6 +2026,37 @@ describe('agent-session-slice reducer', () => {
     });
   });
 
+  describe('setProcessQueueHint / clearProcessQueueHint', () => {
+    it('stores the hint with the reason from the event (slots)', () => {
+      let state = agentSessionReducer(initialState, upsertSession(makeSession('a1')));
+      state = agentSessionReducer(state, setProcessQueueHint('a1', 3, 3, 'slots'));
+      expect(state.byAgentId['a1'].processQueueHint).toEqual({
+        waiting: true,
+        used: 3,
+        cap: 3,
+        reason: 'slots',
+      });
+    });
+
+    it('stores the memory-budget reason distinctly', () => {
+      let state = agentSessionReducer(initialState, upsertSession(makeSession('a1')));
+      state = agentSessionReducer(state, setProcessQueueHint('a1', 2, 8, 'memory-budget'));
+      expect(state.byAgentId['a1'].processQueueHint).toEqual({
+        waiting: true,
+        used: 2,
+        cap: 8,
+        reason: 'memory-budget',
+      });
+    });
+
+    it('clearProcessQueueHint removes the hint', () => {
+      let state = agentSessionReducer(initialState, upsertSession(makeSession('a1')));
+      state = agentSessionReducer(state, setProcessQueueHint('a1', 3, 3, 'slots'));
+      state = agentSessionReducer(state, clearProcessQueueHint('a1'));
+      expect(state.byAgentId['a1'].processQueueHint).toBeUndefined();
+    });
+  });
+
   describe('renameSession', () => {
     it('renames session', () => {
       let state = agentSessionReducer(initialState, upsertSession(makeSession('a1')));
@@ -2209,6 +2363,206 @@ describe('agent-session-slice reducer', () => {
     });
   });
 
+  // monorepo#1815 — an agents.list hydrate triggered by a terminal-failure
+  // edge is fetched while the daemon still reports error; it can land AFTER
+  // the live crash-recovery edges (error→pending→active, stopReason:null)
+  // already converged the session onto the redriven turn. Applying that stale
+  // snapshot wholesale regresses status/stopReason and re-renders the
+  // "Response failed" banner (ChatPanel's effectiveError persisted-session
+  // fallback: status === Error → stopReason) over the live turn.
+  describe('stale failure snapshot after crash-recovery edges (monorepo#1815)', () => {
+    const CRASH_ERROR =
+      'internal error: session/prompt transport closed before output: JSON-RPC error 0: agent stdout closed';
+
+    /**
+     * Replays the confirmed wire sequence from monorepo#1815: agent:failed,
+     * the terminal-failure agent:status-changed persisting error, then the
+     * daemon redrive's recovery edges (pending → active, stopReason:null).
+     */
+    function replayCrashRecovery(): AgentSessionState {
+      let state = agentSessionReducer(
+        initialState,
+        upsertSession(makeSession('a1', 'ws-1', { status: 'active' as any, isActive: true })),
+      );
+      state = agentSessionReducer(
+        state,
+        eventReceived('ws-1', {
+          id: 'evt-1815-failed',
+          type: 'agent:failed',
+          timestamp: '2026-08-09T13:33:09.762Z',
+          workspaceId: 'ws-1',
+          data: { agentId: 'a1', error: CRASH_ERROR },
+        } as any),
+      );
+      state = agentSessionReducer(
+        state,
+        eventReceived('ws-1', {
+          id: 'evt-1815-status-error',
+          type: 'agent:status-changed',
+          timestamp: '2026-08-09T13:33:09.763Z',
+          workspaceId: 'ws-1',
+          data: {
+            agentId: 'a1',
+            status: 'error',
+            isActive: false,
+            stopReason: CRASH_ERROR,
+            stopReasonTimestamp: '2026-08-09T13:33:09.763Z',
+          },
+        } as any),
+      );
+      state = agentSessionReducer(
+        state,
+        eventReceived('ws-1', {
+          id: 'evt-1815-status-pending',
+          type: 'agent:status-changed',
+          timestamp: '2026-08-09T13:33:15.367Z',
+          workspaceId: 'ws-1',
+          data: {
+            agentId: 'a1',
+            status: 'pending',
+            isActive: false,
+            stopReason: null,
+            stopReasonTimestamp: null,
+          },
+        } as any),
+      );
+      state = agentSessionReducer(
+        state,
+        eventReceived('ws-1', {
+          id: 'evt-1815-status-active',
+          type: 'agent:status-changed',
+          timestamp: '2026-08-09T13:33:15.377Z',
+          workspaceId: 'ws-1',
+          data: {
+            agentId: 'a1',
+            status: 'active',
+            isActive: true,
+            stopReason: null,
+            stopReasonTimestamp: null,
+          },
+        } as any),
+      );
+      return state;
+    }
+
+    function staleErrorSnapshot(): AgentSession {
+      return makeSession('a1', 'ws-1', {
+        status: 'error' as any,
+        activationState: 'error' as any,
+        isActive: false,
+        stopReason: CRASH_ERROR,
+        stopReasonTimestamp: '2026-08-09T13:33:09.763Z',
+      });
+    }
+
+    it('does not regress a recovered session to error when a stale hydrate snapshot lands late', () => {
+      let state = replayCrashRecovery();
+      expect(state.byAgentId['a1'].status).toBe('active');
+      expect(state.byAgentId['a1'].stopReason).toBeNull();
+      expect(state.byAgentId['a1'].liveTurnOpen).toBe(true);
+      // The live running edge stamps its daemon timestamp as the ordering
+      // signal the guard compares the snapshot's failure against.
+      expect(state.byAgentId['a1'].liveTurnOpenedAt).toBe('2026-08-09T13:33:15.377Z');
+
+      // The stale agents.list snapshot lands after the recovery edges
+      // (hydrateAgents dispatches bulkUpsertSessions with default options).
+      state = agentSessionReducer(state, bulkUpsertSessions([staleErrorSnapshot()]));
+
+      // Banner condition (status === Error → stopReason) must not re-arm.
+      expect(state.byAgentId['a1'].status).toBe('active');
+      expect(state.byAgentId['a1'].stopReason).toBeNull();
+      expect(state.byAgentId['a1'].stopReasonTimestamp).toBeNull();
+      expect(state.byAgentId['a1'].isActive).toBe(true);
+      expect(state.byAgentId['a1'].liveTurnOpen).toBe(true);
+    });
+
+    it('still applies a failure snapshot when no live turn is open (fresh error on load)', () => {
+      let state = agentSessionReducer(initialState, upsertSession(makeSession('a1', 'ws-1')));
+
+      state = agentSessionReducer(state, bulkUpsertSessions([staleErrorSnapshot()]));
+
+      expect(state.byAgentId['a1'].status).toBe('error');
+      expect(state.byAgentId['a1'].stopReason).toBe(CRASH_ERROR);
+    });
+
+    it('still applies a failure snapshot to a session parked in error', () => {
+      let state = agentSessionReducer(
+        initialState,
+        upsertSession(makeSession('a1', 'ws-1', { status: 'active' as any, isActive: true })),
+      );
+      state = agentSessionReducer(
+        state,
+        eventReceived('ws-1', {
+          id: 'evt-1815-parked-error',
+          type: 'agent:status-changed',
+          timestamp: '2026-08-09T13:33:09.763Z',
+          workspaceId: 'ws-1',
+          data: {
+            agentId: 'a1',
+            status: 'error',
+            isActive: false,
+            stopReason: CRASH_ERROR,
+            stopReasonTimestamp: '2026-08-09T13:33:09.763Z',
+          },
+        } as any),
+      );
+
+      state = agentSessionReducer(state, bulkUpsertSessions([staleErrorSnapshot()]));
+
+      expect(state.byAgentId['a1'].status).toBe('error');
+      expect(state.byAgentId['a1'].stopReason).toBe(CRASH_ERROR);
+    });
+
+    // monorepo#1250 convergence path: a daemon crash mid-turn emits NO
+    // terminal edge, so the parked error reaches the FE only via snapshot
+    // (agents.list hydrate after restart). Its stopReasonTimestamp is
+    // recorded AFTER the live running edge, so the ordering signal proves it
+    // is not stale — the guard must let it through.
+    it('applies a genuine post-edge failure snapshot when the terminal event was never emitted (daemon crash)', () => {
+      let state = replayCrashRecovery();
+      expect(state.byAgentId['a1'].status).toBe('active');
+      expect(state.byAgentId['a1'].liveTurnOpenedAt).toBe('2026-08-09T13:33:15.377Z');
+
+      state = agentSessionReducer(
+        state,
+        bulkUpsertSessions([
+          makeSession('a1', 'ws-1', {
+            status: 'error' as any,
+            activationState: 'error' as any,
+            isActive: false,
+            stopReason: CRASH_ERROR,
+            // Recorded after the live edge that opened the turn.
+            stopReasonTimestamp: '2026-08-09T13:35:00.000Z',
+          }),
+        ]),
+      );
+
+      expect(state.byAgentId['a1'].status).toBe('error');
+      expect(state.byAgentId['a1'].stopReason).toBe(CRASH_ERROR);
+      expect(state.byAgentId['a1'].stopReasonTimestamp).toBe('2026-08-09T13:35:00.000Z');
+    });
+
+    it('applies a failure snapshot when the ordering signal is absent (cannot be proven stale)', () => {
+      let state = replayCrashRecovery();
+
+      state = agentSessionReducer(
+        state,
+        bulkUpsertSessions([
+          makeSession('a1', 'ws-1', {
+            status: 'error' as any,
+            activationState: 'error' as any,
+            isActive: false,
+            stopReason: CRASH_ERROR,
+            // No stopReasonTimestamp: staleness unprovable → snapshot wins.
+          }),
+        ]),
+      );
+
+      expect(state.byAgentId['a1'].status).toBe('error');
+      expect(state.byAgentId['a1'].stopReason).toBe(CRASH_ERROR);
+    });
+  });
+
   describe('removeWorkspaceSessions', () => {
     it('removes all sessions for a workspace', () => {
       const s1 = makeSession('a1', 'ws-1');
@@ -2383,6 +2737,25 @@ describe('agent-session selectors', () => {
       expect(selectAgentSessionStreamingContent.select(state, 'a1')).toBe('');
       expect(selectAgentSessionStreamingContent.select(state, 'unknown')).toBe('');
     });
+
+    it('treats metadata.finishReason as terminal — an abnormal-finish row is never the current streaming message', () => {
+      // PROTOCOL §7.3: the daemon only stamps finishReason on finalized rows,
+      // so even while the session-level isStreaming flag is momentarily stale
+      // (between agent:stream:end and agent:idle) the marker row must not be
+      // picked up as live streaming content.
+      const session = makeSession('a1', 'ws-1', {
+        isStreaming: true,
+        messages: [
+          {
+            ...makeUniqueMessage('marker-row', 'assistant'),
+            metadata: { finishReason: 'refusal' },
+          },
+        ],
+      });
+      const state = storeWith({ byAgentId: { a1: session } });
+
+      expect(selectAgentSessionStreamingContent.select(state, 'a1')).toBe('');
+    });
   });
 
   it('selectAgentSessionExists returns whether a session is present for the agent ID', () => {
@@ -2443,73 +2816,6 @@ describe('agent-session selectors', () => {
     expect(selectAgentSessionWorkspaceId.select(state, 'unknown')).toBeUndefined();
   });
 
-  describe('selectAgentReasoningEffort', () => {
-    it('returns the first-class session field verbatim', () => {
-      const session = makeSession('a1', 'ws-1', { reasoningEffort: 'high' } as any);
-      const state = storeWith({ byAgentId: { a1: session } });
-      expect(selectAgentReasoningEffort.select(state, 'a1')).toBe('high');
-      expect(selectAgentReasoningEffort.select(state, 'unknown')).toBeUndefined();
-    });
-
-    it('falls back to the legacy codex compound-id suffix when the field is unset', () => {
-      // Pre-migration sessions may still store `{model}/{effort}` — the
-      // suffix is the effective effort until the daemon splits the id.
-      const session = makeSession('a1', 'ws-1', { model: 'gpt-5.3-codex/xhigh' } as any);
-      const state = storeWith({ byAgentId: { a1: session } });
-      expect(selectAgentReasoningEffort.select(state, 'a1')).toBe('xhigh');
-    });
-
-    it('treats an explicit null as unset (no compound fallback)', () => {
-      // null = user cleared back to provider default; the stale compound
-      // suffix must not resurrect it.
-      const session = makeSession('a1', 'ws-1', {
-        model: 'gpt-5.3-codex/high',
-        reasoningEffort: null,
-      } as any);
-      const state = storeWith({ byAgentId: { a1: session } });
-      expect(selectAgentReasoningEffort.select(state, 'a1')).toBeUndefined();
-    });
-
-    it('returns undefined for a bare model with no effort', () => {
-      const session = makeSession('a1', 'ws-1', { model: 'sonnet4.6' } as any);
-      const state = storeWith({ byAgentId: { a1: session } });
-      expect(selectAgentReasoningEffort.select(state, 'a1')).toBeUndefined();
-    });
-
-    it('never splits a slash-bearing non-codex model id', () => {
-      // HuggingFace-style `org/model` ids must survive intact — mirrors the
-      // daemon migration 0080 guard.
-      const hf = makeSession('a1', 'ws-1', { model: 'unsloth/gpt-oss-120b' } as any);
-      expect(
-        selectAgentReasoningEffort.select(storeWith({ byAgentId: { a1: hf } }), 'a1'),
-      ).toBeUndefined();
-
-      // Effort-looking suffix but no codex evidence: still not split.
-      const lookalike = makeSession('a1', 'ws-1', {
-        model: 'someorg/high',
-        provider: 'opencode',
-      } as any);
-      expect(
-        selectAgentReasoningEffort.select(storeWith({ byAgentId: { a1: lookalike } }), 'a1'),
-      ).toBeUndefined();
-    });
-
-    it('splits an unknown codex base model when the row shows codex evidence', () => {
-      const prefixed = makeSession('a1', 'ws-1', { model: 'codex:gpt-9-codex/high' } as any);
-      expect(
-        selectAgentReasoningEffort.select(storeWith({ byAgentId: { a1: prefixed } }), 'a1'),
-      ).toBe('high');
-
-      const byProvider = makeSession('a1', 'ws-1', {
-        model: 'gpt-9-codex/low',
-        provider: 'codex',
-      } as any);
-      expect(
-        selectAgentReasoningEffort.select(storeWith({ byAgentId: { a1: byProvider } }), 'a1'),
-      ).toBe('low');
-    });
-  });
-
   describe('selectAgentSessionIsProcessing', () => {
     it('returns the raw processing flag without conflating responding or waiting state', () => {
       const processing = makeSession('processing', 'ws-1', { isProcessing: true });
@@ -2536,7 +2842,6 @@ describe('agent-session selectors', () => {
         makeSession('activating', 'ws-1', { activationState: 'activating' as any }),
         makeSession('active-status', 'ws-1', { status: 'active' as any }),
         makeSession('processing-status', 'ws-1', { status: 'Processing' as any }),
-        makeSession('waiting-status', 'ws-1', { status: 'Waiting' as any }),
       ];
       const state = storeWith({
         byAgentId: Object.fromEntries(activeSessions.map((session) => [session.id, session])),
@@ -2546,6 +2851,16 @@ describe('agent-session selectors', () => {
       for (const session of activeSessions) {
         expect(selectAgentIsResponding.select(state, session.id)).toBe(true);
       }
+    });
+
+    it('returns false for an explicit wait after active turn evidence ends', () => {
+      const session = makeSession('waiting-status', 'ws-1', { status: 'Waiting' as any });
+      const state = storeWith({
+        byAgentId: { 'waiting-status': session },
+        agentIdsByWorkspace: {},
+      });
+
+      expect(selectAgentIsResponding.select(state, 'waiting-status')).toBe(false);
     });
 
     it('returns false for a blank idle-created agent session', () => {
@@ -2999,85 +3314,39 @@ describe('agent-session selectors', () => {
   });
 
   describe('selectAgentIsBlockedWaiting', () => {
-    it('returns false for a tool wait inside an in-flight responding turn', () => {
-      const session = makeSession('a1', 'ws-1', {
-        status: 'active' as any,
-        isResponding: true,
-        isWaitingOnTool: true,
-      });
-      const state = storeWith({ byAgentId: { a1: session }, agentIdsByWorkspace: {} });
-
-      expect(selectAgentIsWaiting.select(state, 'a1')).toBe(true);
-      expect(selectAgentIsBlockedWaiting.select(state, 'a1')).toBe(false);
-    });
-
-    it('returns false for a tool wait behind the optimistic send flags', () => {
-      const session = makeSession('a1', 'ws-1', {
-        status: 'active' as any,
-        isStreaming: true,
-        isProcessing: true,
-        isWaitingOnTool: true,
-      });
-      const state = storeWith({ byAgentId: { a1: session }, agentIdsByWorkspace: {} });
-
-      expect(selectAgentIsBlockedWaiting.select(state, 'a1')).toBe(false);
-    });
-
-    it('returns true for a tool wait with no live turn behind it', () => {
-      const session = makeSession('a1', 'ws-1', {
-        status: 'active' as any,
-        isWaitingOnTool: true,
-      });
-      const state = storeWith({ byAgentId: { a1: session }, agentIdsByWorkspace: {} });
-
-      expect(selectAgentIsBlockedWaiting.select(state, 'a1')).toBe(true);
-    });
-
-    it('returns true for explicit Waiting status with no live turn', () => {
-      const session = makeSession('a1', 'ws-1', { status: 'Waiting' as any });
-      const state = storeWith({ byAgentId: { a1: session }, agentIdsByWorkspace: {} });
-
-      expect(selectAgentIsBlockedWaiting.select(state, 'a1')).toBe(true);
-    });
-
-    it('returns false for a stale Waiting status behind a live turn', () => {
-      // A queue drain opens the busy flags before the daemon revises the
-      // coarse status, so a lagging `Waiting` must not hold the hourglass.
-      const session = makeSession('a1', 'ws-1', {
-        status: 'Waiting' as any,
-        isStreaming: true,
-        isProcessing: true,
-      });
-      const state = storeWith({ byAgentId: { a1: session }, agentIdsByWorkspace: {} });
-
-      expect(selectAgentIsBlockedWaiting.select(state, 'a1')).toBe(false);
-    });
-
-    it('returns true while paused on peer agents, even mid-turn', () => {
-      // The dedicated peer-pause flag is daemon-owned with its own clear
-      // paths, so it outranks a live turn.
-      const session = makeSession('a1', 'ws-1', { isWaitingForOtherAgents: true });
-      const state = storeWith({ byAgentId: { a1: session }, agentIdsByWorkspace: {} });
-      const midTurn = storeWith({
-        byAgentId: {
-          a1: makeSession('a1', 'ws-1', { isWaitingForOtherAgents: true, isResponding: true }),
+    it.each([
+      ['responding', { isResponding: true }, false],
+      [
+        'live AgentLite tool payload',
+        {
+          status: 'active',
+          isResponding: true,
+          isWaitingOnTool: true,
+          turnInFlight: true,
+          lastStreamActivityAt: '2026-08-17T12:04:59.000Z',
+          lastToolUse: { name: 'view', status: 'running' },
         },
-        agentIdsByWorkspace: {},
-      });
-
-      expect(selectAgentIsBlockedWaiting.select(state, 'a1')).toBe(true);
-      expect(selectAgentIsBlockedWaiting.select(midTurn, 'a1')).toBe(true);
-    });
-
-    it('returns false for terminal or unknown agents', () => {
-      const session = makeSession('a1', 'ws-1', {
-        status: 'Completed' as any,
-        isWaitingOnTool: true,
-      });
+        false,
+      ],
+      [
+        'tool with transient response flags dropped',
+        { status: 'Waiting', isWaitingOnTool: true },
+        false,
+      ],
+      ['blocked wait', { status: 'Waiting' }, true],
+      [
+        'active orchestration peer wait',
+        { isResponding: true, isWaitingForOtherAgents: true },
+        false,
+      ],
+      ['turn-in-flight peer wait', { turnInFlight: true, isWaitingForOtherAgents: true }, false],
+      ['settled peer wait', { status: 'idle', isWaitingForOtherAgents: true }, true],
+      ['stale Waiting status', { status: 'Waiting', isResponding: true }, false],
+    ] as const)('classifies %s from canonical live flags', (_name, fields, expected) => {
+      const session = makeSession('a1', 'ws-1', fields as any);
       const state = storeWith({ byAgentId: { a1: session }, agentIdsByWorkspace: {} });
 
-      expect(selectAgentIsBlockedWaiting.select(state, 'a1')).toBe(false);
-      expect(selectAgentIsBlockedWaiting.select(state, 'unknown')).toBe(false);
+      expect(selectAgentIsBlockedWaiting.select(state, 'a1')).toBe(expected);
     });
   });
 
@@ -3087,10 +3356,12 @@ describe('agent-session selectors', () => {
         makeSession('streaming', 'ws-1', { isStreaming: true }),
         makeSession('processing-flag', 'ws-1', { isProcessing: true }),
         makeSession('responding', 'ws-1', { isResponding: true }),
+        makeSession('tooling', 'ws-1', { isWaitingOnTool: true }),
+        makeSession('turn-in-flight', 'ws-1', { turnInFlight: true }),
+        makeSession('live-turn-open', 'ws-1', { liveTurnOpen: true } as any),
         makeSession('activating', 'ws-1', { activationState: 'activating' as any }),
         makeSession('status-active', 'ws-1', { status: 'active' as any }),
         makeSession('status-processing', 'ws-1', { status: 'Processing' as any }),
-        makeSession('status-waiting', 'ws-1', { status: 'Waiting' as any }),
       ];
       const state = storeWith({
         byAgentId: Object.fromEntries(activeSessions.map((s) => [s.id, s])),
@@ -3143,11 +3414,20 @@ describe('agent-session selectors', () => {
       expect(selectAgentIsRunning.select(state, 'a1')).toBe(true);
     });
 
-    it('returns true for waiting-for-other-agents relationships', () => {
+    it('returns false for a peer wait after the active turn ends', () => {
       const session = makeSession('a1', 'ws-1', {
         status: 'idle' as any,
         isStreaming: false,
         isProcessing: false,
+        isWaitingForOtherAgents: true,
+      });
+      const state = storeWith({ byAgentId: { a1: session }, agentIdsByWorkspace: {} });
+      expect(selectAgentIsRunning.select(state, 'a1')).toBe(false);
+    });
+
+    it('returns true for an actively responding orchestration turn with peer watches', () => {
+      const session = makeSession('a1', 'ws-1', {
+        isResponding: true,
         isWaitingForOtherAgents: true,
       });
       const state = storeWith({ byAgentId: { a1: session }, agentIdsByWorkspace: {} });
@@ -3314,6 +3594,29 @@ describe('agent-session selectors', () => {
       expect(selectAgentMessageById.select(state, '', 'm1')).toBeUndefined();
       expect(selectAgentMessageById.select(state, 'a1', '')).toBeUndefined();
     });
+
+    it('falls back to the scrollback history segment for paged-in history rows', () => {
+      // Regression: history rows live in historySegmentsByAgentId, not the
+      // tail — without the fallback ChatMessage rendered "Loading..." for
+      // every history row.
+      const tailRow = makeMessage('m-tail');
+      const histRow = makeUniqueMessage('m-hist', 'user', '2024-01-01T00:00:00.000Z');
+      const session = makeSession('a1', 'ws-1', { messages: [tailRow] });
+      const base = storeWith({ byAgentId: { a1: session } });
+      const state = {
+        ...base,
+        agentSessions: {
+          ...base.agentSessions,
+          historySegmentsByAgentId: {
+            a1: { messages: [histRow], gapToTail: false, oldestReached: false },
+          },
+        },
+      } as unknown as StoreState;
+      expect(selectAgentMessageById.select(state, 'a1', 'm-hist')).toEqual(histRow);
+      // Tail rows still win, and unknown ids still miss.
+      expect(selectAgentMessageById.select(state, 'a1', 'm-tail')).toEqual(tailRow);
+      expect(selectAgentMessageById.select(state, 'a1', 'nope')).toBeUndefined();
+    });
   });
 });
 
@@ -3406,67 +3709,6 @@ describe('chatSendStarted — placeholder session (restored workspace regression
 
     expect(state).toBe(initialState);
     expect(state.byAgentId['agent-new']).toBeUndefined();
-  });
-});
-
-describe('chatQueueProcessingReceived — queue-delivery wake opens the turn', () => {
-  it('sets the busy flags on the queue drain start', () => {
-    const existing = makeSession('a1', 'ws-1', {
-      status: 'idle' as any,
-      isProcessing: false,
-      isStreaming: false,
-    });
-    let state = agentSessionReducer(initialState, upsertSession(existing));
-
-    state = agentSessionReducer(state, chatQueueProcessingReceived('a1', 'turn-1'));
-
-    expect(state.byAgentId['a1'].isStreaming).toBe(true);
-    expect(state.byAgentId['a1'].isProcessing).toBe(true);
-    expect(
-      selectAgentIsResponding.select(
-        storeWith({ byAgentId: state.byAgentId as any, agentIdsByWorkspace: {} }),
-        'a1',
-      ),
-    ).toBe(true);
-  });
-
-  it('is a no-op for an unknown agent', () => {
-    const state = agentSessionReducer(initialState, chatQueueProcessingReceived('unknown'));
-
-    expect(state).toBe(initialState);
-  });
-
-  it('is cleared again by the turn-end stream end', () => {
-    const existing = makeSession('a1', 'ws-1', { isProcessing: false, isStreaming: false });
-    let state = agentSessionReducer(initialState, upsertSession(existing));
-    state = agentSessionReducer(state, chatQueueProcessingReceived('a1', 'turn-1'));
-    state = agentSessionReducer(state, streamEnded('a1'));
-
-    expect(state.byAgentId['a1'].isStreaming).toBe(false);
-    expect(state.byAgentId['a1'].isProcessing).toBe(false);
-    expect(state.byAgentId['a1'].isResponding).toBe(false);
-  });
-
-  it('ends a completion-watch wait frozen by the preceding agent:idle', () => {
-    // The previous turn ended waiting on peers, so `agent:idle` froze
-    // isWaitingForOtherAgents: true. Without clearing it here the hourglass
-    // outranks the running dot for the whole re-woken turn.
-    const existing = makeSession('a1', 'ws-1', {
-      status: 'idle' as any,
-      isProcessing: false,
-      isStreaming: false,
-      isWaitingForOtherAgents: true,
-      waitingForAgentIds: ['a2'],
-    });
-    let state = agentSessionReducer(initialState, upsertSession(existing));
-
-    state = agentSessionReducer(state, chatQueueProcessingReceived('a1', 'turn-1'));
-
-    expect(state.byAgentId['a1'].isWaitingForOtherAgents).toBe(false);
-    expect(state.byAgentId['a1'].waitingForAgentIds).toEqual([]);
-    const store = storeWith({ byAgentId: state.byAgentId as any, agentIdsByWorkspace: {} });
-    expect(selectAgentIsBlockedWaiting.select(store, 'a1')).toBe(false);
-    expect(selectAgentIsResponding.select(store, 'a1')).toBe(true);
   });
 });
 
@@ -4153,6 +4395,12 @@ describe('computeMessageContentHash — media blocks', () => {
       contentBlocks: [{ type: 'tool_use', name: 'search', input: { query: 'hi' } }],
     };
     expect(computeMessageContentHash(a)).toBe(computeMessageContentHash(b));
+  });
+});
+
+describe('MAX_MESSAGES_PER_AGENT shared transcript cap', () => {
+  it('is 500 — the prune cap the transcript pagers (chat-read-service, chat-read-saga) import as their fetch bound', () => {
+    expect(MAX_MESSAGES_PER_AGENT).toBe(500);
   });
 });
 
@@ -5303,5 +5551,446 @@ describe('stopReason hydration', () => {
     expect(state.byAgentId['a1'].status).toBe('error');
     expect(state.byAgentId['a1'].stopReason).toBe('JSON-RPC error -32603: invalid argument');
     expect(state.byAgentId['a1'].sessionCorrupted).toBe(true);
+  });
+});
+
+// ===========================================================================
+// Scrollback history segment (bounded, on-demand)
+// ===========================================================================
+
+describe('history segment (scrollback)', () => {
+  const BASE_MS = Date.parse('2024-01-01T00:00:00.000Z');
+  /** ISO timestamp `i` seconds after the base — keeps ordering deterministic. */
+  const ts = (i: number) => new Date(BASE_MS + i * 1000).toISOString();
+  const histMsg = (i: number) => makeUniqueMessage(`hist-${i}`, 'user', ts(i));
+
+  function getHistory(state: AgentSessionState, agentId: string) {
+    return state.historySegmentsByAgentId?.[agentId];
+  }
+
+  function withSession(agentId = 'a1', tail: AgentMessage[] = []) {
+    return agentSessionReducer(
+      initialState,
+      upsertSession(makeSession(agentId, 'ws-1', { messages: tail })),
+    );
+  }
+
+  describe('prependHistoryMessages', () => {
+    it('creates the segment with normalized, sorted, deduplicated rows', () => {
+      let state = withSession();
+      state = agentSessionReducer(
+        state,
+        prependHistoryMessages('a1', [histMsg(2), histMsg(0), histMsg(1), histMsg(1)]),
+      );
+      const segment = getHistory(state, 'a1');
+      expect(segment).toBeDefined();
+      expect(segment!.messages.map((m) => m.id)).toEqual(['hist-0', 'hist-1', 'hist-2']);
+      expect(segment!.gapToTail).toBe(false);
+      expect(segment!.oldestReached).toBe(false);
+    });
+
+    it('never duplicates rows already present in the tail (by id and appMessageId)', () => {
+      const tailRow = makeUniqueMessage('tail-1', 'user', ts(100));
+      const tailRowWithApp = {
+        ...makeUniqueMessage('tail-2', 'assistant', ts(101)),
+        appMessageId: 'app_tail_2',
+      };
+      let state = withSession('a1', [tailRow, tailRowWithApp]);
+      state = agentSessionReducer(
+        state,
+        prependHistoryMessages('a1', [
+          histMsg(0),
+          makeUniqueMessage('tail-1', 'user', ts(100)),
+          { ...makeUniqueMessage('other-id', 'assistant', ts(101)), appMessageId: 'app_tail_2' },
+        ]),
+      );
+      expect(getHistory(state, 'a1')!.messages.map((m) => m.id)).toEqual(['hist-0']);
+    });
+
+    it('prunes from the NEWEST side past the cap and opens the gap', () => {
+      let state = withSession();
+      const firstPage = Array.from({ length: HISTORY_SEGMENT_MAX }, (_, i) => histMsg(i + 100));
+      state = agentSessionReducer(state, prependHistoryMessages('a1', firstPage));
+      expect(getHistory(state, 'a1')!.messages).toHaveLength(HISTORY_SEGMENT_MAX);
+      expect(getHistory(state, 'a1')!.gapToTail).toBe(false);
+
+      const olderPage = Array.from({ length: 100 }, (_, i) => histMsg(i));
+      state = agentSessionReducer(state, prependHistoryMessages('a1', olderPage));
+      const segment = getHistory(state, 'a1')!;
+      expect(segment.messages).toHaveLength(HISTORY_SEGMENT_MAX);
+      // Oldest rows retained; the 100 newest history rows were pruned.
+      expect(segment.messages[0].id).toBe('hist-0');
+      expect(segment.messages[segment.messages.length - 1].id).toBe(
+        `hist-${HISTORY_SEGMENT_MAX - 1}`,
+      );
+      expect(segment.gapToTail).toBe(true);
+      // Serial-walk segment: the pruned rows are counted into the hole so
+      // the virtual extent attributes them below (extent 2x regression).
+      expect(segment.holeRowsEstimate).toBe(100);
+    });
+
+    it('accumulates the hole estimate across successive cap prunes (serial walk)', () => {
+      let state = withSession();
+      const firstPage = Array.from({ length: HISTORY_SEGMENT_MAX }, (_, i) => histMsg(i + 500));
+      state = agentSessionReducer(state, prependHistoryMessages('a1', firstPage));
+      state = agentSessionReducer(
+        state,
+        prependHistoryMessages(
+          'a1',
+          Array.from({ length: 100 }, (_, i) => histMsg(i + 400)),
+        ),
+      );
+      expect(getHistory(state, 'a1')!.holeRowsEstimate).toBe(100);
+      state = agentSessionReducer(
+        state,
+        prependHistoryMessages(
+          'a1',
+          Array.from({ length: 150 }, (_, i) => histMsg(i + 250)),
+        ),
+      );
+      expect(getHistory(state, 'a1')!.holeRowsEstimate).toBe(250);
+    });
+
+    it('does not track a hole estimate on seek-seeded segments (start ordinal anchors the split)', () => {
+      let state = withSession();
+      const landing = Array.from({ length: HISTORY_SEGMENT_MAX }, (_, i) => histMsg(i + 500));
+      state = agentSessionReducer(state, seedHistoryAround('a1', landing, 500));
+      state = agentSessionReducer(
+        state,
+        prependHistoryMessages(
+          'a1',
+          Array.from({ length: 100 }, (_, i) => histMsg(i + 400)),
+        ),
+      );
+      const segment = getHistory(state, 'a1')!;
+      expect(segment.startOrdinalEstimate).toBe(400);
+      expect(segment.holeRowsEstimate).toBeUndefined();
+    });
+
+    it('is a no-op for an unknown agent', () => {
+      const state = agentSessionReducer(
+        initialState,
+        prependHistoryMessages('unknown', [histMsg(0)]),
+      );
+      expect(state).toBe(initialState);
+    });
+
+    it('does not touch the tail', () => {
+      const tail = [makeUniqueMessage('tail-1', 'user', ts(100))];
+      let state = withSession('a1', tail);
+      const tailBefore = state.byAgentId['a1'].messages;
+      state = agentSessionReducer(state, prependHistoryMessages('a1', [histMsg(0)]));
+      expect(state.byAgentId['a1'].messages).toBe(tailBefore);
+    });
+  });
+
+  describe('appendHistoryMessages', () => {
+    it('appends newer rows into the hole and keeps the gap open without tail overlap', () => {
+      let state = withSession('a1', [makeUniqueMessage('tail-1', 'user', ts(1000))]);
+      state = agentSessionReducer(state, prependHistoryMessages('a1', [histMsg(0), histMsg(1)]));
+      // The prepend-past-cap path that opens the gap is exercised above; here
+      // we seed an open gap directly and assert refill semantics.
+      state = {
+        ...state,
+        historySegmentsByAgentId: {
+          ...state.historySegmentsByAgentId,
+          a1: { ...state.historySegmentsByAgentId!.a1, gapToTail: true },
+        },
+      };
+      state = agentSessionReducer(state, appendHistoryMessages('a1', [histMsg(2), histMsg(3)]));
+      const segment = getHistory(state, 'a1')!;
+      expect(segment.messages.map((m) => m.id)).toEqual(['hist-0', 'hist-1', 'hist-2', 'hist-3']);
+      expect(segment.gapToTail).toBe(true);
+    });
+
+    it('closes the gap and drops the overlap when appended rows are present in the tail', () => {
+      const tailRow = makeUniqueMessage('tail-1', 'user', ts(1000));
+      let state = withSession('a1', [tailRow]);
+      state = agentSessionReducer(state, prependHistoryMessages('a1', [histMsg(0), histMsg(1)]));
+      state = {
+        ...state,
+        historySegmentsByAgentId: {
+          ...state.historySegmentsByAgentId,
+          a1: { ...state.historySegmentsByAgentId!.a1, gapToTail: true },
+        },
+      };
+      state = agentSessionReducer(
+        state,
+        appendHistoryMessages('a1', [histMsg(2), makeUniqueMessage('tail-1', 'user', ts(1000))]),
+      );
+      const segment = getHistory(state, 'a1')!;
+      expect(segment.messages.map((m) => m.id)).toEqual(['hist-0', 'hist-1', 'hist-2']);
+      expect(segment.gapToTail).toBe(false);
+    });
+
+    it('a gap refill shrinks the serial-walk hole estimate by the rows moved into history', () => {
+      let state = withSession('a1', [makeUniqueMessage('tail-1', 'user', ts(1000))]);
+      state = agentSessionReducer(state, prependHistoryMessages('a1', [histMsg(0), histMsg(1)]));
+      state = {
+        ...state,
+        historySegmentsByAgentId: {
+          ...state.historySegmentsByAgentId,
+          a1: { ...state.historySegmentsByAgentId!.a1, gapToTail: true, holeRowsEstimate: 5 },
+        },
+      };
+      state = agentSessionReducer(state, appendHistoryMessages('a1', [histMsg(2), histMsg(3)]));
+      const segment = getHistory(state, 'a1')!;
+      expect(segment.holeRowsEstimate).toBe(3);
+      expect(segment.gapToTail).toBe(true);
+    });
+
+    it('closing the hole drops the estimate (floor 0 on over-refill while open)', () => {
+      let state = withSession('a1', [makeUniqueMessage('tail-1', 'user', ts(1000))]);
+      state = agentSessionReducer(state, prependHistoryMessages('a1', [histMsg(0)]));
+      state = {
+        ...state,
+        historySegmentsByAgentId: {
+          ...state.historySegmentsByAgentId,
+          a1: { ...state.historySegmentsByAgentId!.a1, gapToTail: true, holeRowsEstimate: 1 },
+        },
+      };
+      // Over-refill: 3 rows land while the estimate said 1 — floor 0, gap open.
+      state = agentSessionReducer(
+        state,
+        appendHistoryMessages('a1', [histMsg(1), histMsg(2), histMsg(3)]),
+      );
+      expect(getHistory(state, 'a1')!.holeRowsEstimate).toBe(0);
+      // Tail-overlapping refill closes the gap and drops the estimate.
+      state = agentSessionReducer(
+        state,
+        appendHistoryMessages('a1', [histMsg(4), makeUniqueMessage('tail-1', 'user', ts(1000))]),
+      );
+      const segment = getHistory(state, 'a1')!;
+      expect(segment.gapToTail).toBe(false);
+      expect(segment.holeRowsEstimate).toBeUndefined();
+    });
+
+    it('prunes from the OLDEST side past the cap and resets oldestReached', () => {
+      let state = withSession();
+      const page = Array.from({ length: HISTORY_SEGMENT_MAX }, (_, i) => histMsg(i));
+      state = agentSessionReducer(state, prependHistoryMessages('a1', page));
+      state = agentSessionReducer(state, setHistoryOldestReached('a1'));
+      expect(getHistory(state, 'a1')!.oldestReached).toBe(true);
+
+      const newerPage = Array.from({ length: 100 }, (_, i) => histMsg(HISTORY_SEGMENT_MAX + i));
+      state = agentSessionReducer(state, appendHistoryMessages('a1', newerPage));
+      const segment = getHistory(state, 'a1')!;
+      expect(segment.messages).toHaveLength(HISTORY_SEGMENT_MAX);
+      // Newest rows retained; the 100 oldest history rows were pruned.
+      expect(segment.messages[0].id).toBe('hist-100');
+      expect(segment.messages[segment.messages.length - 1].id).toBe(
+        `hist-${HISTORY_SEGMENT_MAX + 99}`,
+      );
+      expect(segment.oldestReached).toBe(false);
+    });
+
+    it('is a no-op for an unknown agent', () => {
+      const state = agentSessionReducer(
+        initialState,
+        appendHistoryMessages('unknown', [histMsg(0)]),
+      );
+      expect(state).toBe(initialState);
+    });
+  });
+
+  describe('seedHistoryAround (far-flick seek landing)', () => {
+    it('REPLACES an existing segment with the landing rows, gap open, start ordinal recorded', () => {
+      let state = withSession('a1', [makeUniqueMessage('tail-1', 'user', ts(1000))]);
+      state = agentSessionReducer(state, prependHistoryMessages('a1', [histMsg(0), histMsg(1)]));
+      state = agentSessionReducer(
+        state,
+        seedHistoryAround('a1', [histMsg(500), histMsg(501)], 500),
+      );
+      const segment = getHistory(state, 'a1')!;
+      expect(segment.messages.map((m) => m.id)).toEqual(['hist-500', 'hist-501']);
+      expect(segment.gapToTail).toBe(true);
+      expect(segment.oldestReached).toBe(false);
+      expect(segment.startOrdinalEstimate).toBe(500);
+    });
+
+    it('landing rows overlapping the tail keep the segment contiguous (no gap)', () => {
+      const tailRow = makeUniqueMessage('tail-1', 'user', ts(1000));
+      let state = withSession('a1', [tailRow]);
+      state = agentSessionReducer(
+        state,
+        seedHistoryAround('a1', [histMsg(998), makeUniqueMessage('tail-1', 'user', ts(1000))], 998),
+      );
+      const segment = getHistory(state, 'a1')!;
+      expect(segment.messages.map((m) => m.id)).toEqual(['hist-998']);
+      expect(segment.gapToTail).toBe(false);
+    });
+
+    it('a landing fully resident in the tail drops the segment', () => {
+      const tailRow = makeUniqueMessage('tail-1', 'user', ts(1000));
+      let state = withSession('a1', [tailRow]);
+      state = agentSessionReducer(state, prependHistoryMessages('a1', [histMsg(0)]));
+      state = agentSessionReducer(
+        state,
+        seedHistoryAround('a1', [makeUniqueMessage('tail-1', 'user', ts(1000))], 999),
+      );
+      expect(getHistory(state, 'a1')).toBeUndefined();
+    });
+
+    it('is a no-op for an unknown agent', () => {
+      const state = agentSessionReducer(
+        initialState,
+        seedHistoryAround('unknown', [histMsg(0)], 0),
+      );
+      expect(state).toBe(initialState);
+    });
+  });
+
+  describe('startOrdinalEstimate maintenance', () => {
+    it('a prepend shifts the estimate down by the rows added before the first row (floor 0)', () => {
+      let state = withSession('a1', [makeUniqueMessage('tail-1', 'user', ts(1000))]);
+      state = agentSessionReducer(state, seedHistoryAround('a1', [histMsg(500)], 500));
+      state = agentSessionReducer(state, prependHistoryMessages('a1', [histMsg(498), histMsg(499)]));
+      expect(getHistory(state, 'a1')!.startOrdinalEstimate).toBe(498);
+      // Overshooting prepend floors at 0.
+      const bigOlderPage = Array.from({ length: 499 }, (_, i) => histMsg(i));
+      state = agentSessionReducer(state, prependHistoryMessages('a1', bigOlderPage));
+      expect(getHistory(state, 'a1')!.startOrdinalEstimate).toBe(0);
+    });
+
+    it('an append pruning the oldest side shifts the estimate up by the pruned count', () => {
+      let state = withSession('a1', [makeUniqueMessage('tail-1', 'user', ts(5000))]);
+      const seed = Array.from({ length: HISTORY_SEGMENT_MAX }, (_, i) => histMsg(i + 100));
+      state = agentSessionReducer(state, seedHistoryAround('a1', seed, 100));
+      state = agentSessionReducer(state, appendHistoryMessages('a1', [histMsg(4000)]));
+      expect(getHistory(state, 'a1')!.startOrdinalEstimate).toBe(101);
+      expect(getHistory(state, 'a1')!.oldestReached).toBe(false);
+    });
+
+    it('serial-walk segments never grow an estimate', () => {
+      let state = withSession();
+      state = agentSessionReducer(state, prependHistoryMessages('a1', [histMsg(0)]));
+      expect(getHistory(state, 'a1')!.startOrdinalEstimate).toBeUndefined();
+      state = agentSessionReducer(state, prependHistoryMessages('a1', [histMsg(1)]));
+      expect(getHistory(state, 'a1')!.startOrdinalEstimate).toBeUndefined();
+    });
+
+    it('oldestReached pins a tracked estimate to exactly 0', () => {
+      let state = withSession('a1', [makeUniqueMessage('tail-1', 'user', ts(1000))]);
+      state = agentSessionReducer(state, seedHistoryAround('a1', [histMsg(5)], 3));
+      state = agentSessionReducer(state, setHistoryOldestReached('a1'));
+      expect(getHistory(state, 'a1')!.startOrdinalEstimate).toBe(0);
+    });
+  });
+
+  describe('setHistoryOldestReached / clearHistorySegment', () => {
+    it('marks oldestReached (default true) and accepts an explicit flag', () => {
+      let state = withSession();
+      state = agentSessionReducer(state, prependHistoryMessages('a1', [histMsg(0)]));
+      state = agentSessionReducer(state, setHistoryOldestReached('a1'));
+      expect(getHistory(state, 'a1')!.oldestReached).toBe(true);
+      state = agentSessionReducer(state, setHistoryOldestReached('a1', false));
+      expect(getHistory(state, 'a1')!.oldestReached).toBe(false);
+    });
+
+    it('clearHistorySegment drops the segment', () => {
+      let state = withSession();
+      state = agentSessionReducer(state, prependHistoryMessages('a1', [histMsg(0)]));
+      state = agentSessionReducer(state, clearHistorySegment('a1'));
+      expect(getHistory(state, 'a1')).toBeUndefined();
+    });
+
+    it('clearHistorySegment is a no-op when no segment exists', () => {
+      const state = withSession();
+      expect(agentSessionReducer(state, clearHistorySegment('a1'))).toBe(state);
+    });
+  });
+
+  describe('cleanup paths', () => {
+    function withHistory(agentId = 'a1') {
+      return agentSessionReducer(
+        withSession(agentId),
+        prependHistoryMessages(agentId, [histMsg(0)]),
+      );
+    }
+
+    it('removeSession drops the history segment', () => {
+      const state = agentSessionReducer(withHistory(), removeSession('a1'));
+      expect(getHistory(state, 'a1')).toBeUndefined();
+    });
+
+    it('removeWorkspaceSessions drops history segments for the workspace agents', () => {
+      const state = agentSessionReducer(withHistory(), removeWorkspaceSessions('ws-1'));
+      expect(getHistory(state, 'a1')).toBeUndefined();
+    });
+
+    it('workspaceDeleted drops history segments for the doomed agents', () => {
+      const state = agentSessionReducer(withHistory(), workspaceDeleted('ws-1', ['a1']));
+      expect(getHistory(state, 'a1')).toBeUndefined();
+    });
+
+    it('clearAllSessions drops all history segments', () => {
+      const state = agentSessionReducer(withHistory(), clearAllSessions());
+      expect(state.historySegmentsByAgentId).toBeUndefined();
+      expect(state).toEqual(initialState);
+    });
+
+    it('chatReset drops the history segment', () => {
+      const state = agentSessionReducer(withHistory(), chatReset('a1'));
+      expect(getHistory(state, 'a1')).toBeUndefined();
+    });
+  });
+
+  describe('selectors', () => {
+    it('selectAgentHistoryMessages returns the segment rows, empty array otherwise', () => {
+      let state = withSession();
+      state = agentSessionReducer(state, prependHistoryMessages('a1', [histMsg(0), histMsg(1)]));
+      const storeState = { agentSessions: state } as unknown as StoreState;
+      expect(selectAgentHistoryMessages.select(storeState, 'a1').map((m) => m.id)).toEqual([
+        'hist-0',
+        'hist-1',
+      ]);
+      expect(selectAgentHistoryMessages.select(storeState, 'missing')).toEqual([]);
+    });
+
+    it('selectHistorySegmentMeta reports gap flag, oldestReached, and counts', () => {
+      const tail = [makeUniqueMessage('tail-1', 'user', ts(1000))];
+      let state = withSession('a1', tail);
+      state = agentSessionReducer(state, prependHistoryMessages('a1', [histMsg(0)]));
+      state = agentSessionReducer(state, setHistoryOldestReached('a1'));
+      const storeState = { agentSessions: state } as unknown as StoreState;
+      expect(selectHistorySegmentMeta.select(storeState, 'a1')).toEqual({
+        gapToTail: false,
+        oldestReached: true,
+        historyCount: 1,
+        tailCount: 1,
+        startOrdinalEstimate: null,
+        holeRowsEstimate: null,
+      });
+      expect(selectHistorySegmentMeta.select(storeState, 'missing')).toEqual({
+        gapToTail: false,
+        oldestReached: false,
+        historyCount: 0,
+        tailCount: 0,
+        startOrdinalEstimate: null,
+        holeRowsEstimate: null,
+      });
+    });
+
+    it('selectHistorySegmentMeta surfaces the seek-seeded start ordinal', () => {
+      let state = withSession('a1', [makeUniqueMessage('tail-1', 'user', ts(1000))]);
+      state = agentSessionReducer(state, seedHistoryAround('a1', [histMsg(500)], 500));
+      const storeState = { agentSessions: state } as unknown as StoreState;
+      expect(selectHistorySegmentMeta.select(storeState, 'a1').startOrdinalEstimate).toBe(500);
+    });
+
+    it('selectHistorySegmentMeta surfaces the serial-walk hole estimate', () => {
+      let state = withSession('a1', [makeUniqueMessage('tail-1', 'user', ts(1000))]);
+      const firstPage = Array.from({ length: HISTORY_SEGMENT_MAX }, (_, i) => histMsg(i + 100));
+      state = agentSessionReducer(state, prependHistoryMessages('a1', firstPage));
+      state = agentSessionReducer(
+        state,
+        prependHistoryMessages(
+          'a1',
+          Array.from({ length: 50 }, (_, i) => histMsg(i)),
+        ),
+      );
+      const storeState = { agentSessions: state } as unknown as StoreState;
+      expect(selectHistorySegmentMeta.select(storeState, 'a1').holeRowsEstimate).toBe(50);
+    });
   });
 });

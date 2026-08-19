@@ -177,6 +177,7 @@ vi.mock('electron', () => {
     isPackaged: false,
     on: vi.fn(),
     once: vi.fn(),
+    emit: vi.fn(),
     whenReady: vi.fn(() => Promise.resolve()),
   };
 
@@ -271,7 +272,6 @@ vi.mock('$shared/main/async-utils', () => ({
   findExecutableAsync: vi.fn(async () => null),
   findVSCodeAsync: vi.fn(async () => null),
   findAuggieAsync: vi.fn(async () => null),
-  getNpmGlobalBinAsync: vi.fn(async () => null),
   writeJsonAsync: vi.fn(async () => undefined),
   readJsonAsync: vi.fn(async () => null),
   VSCODE_COMMON_PATHS: [],

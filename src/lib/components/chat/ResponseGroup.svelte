@@ -7,19 +7,24 @@
   Auto-expands while streaming and auto-collapses when done, with user toggle override.
 -->
 <script lang="ts">
-  import { cubicOut } from 'svelte/easing';
   import Fa from 'svelte-fa';
-  import { faRectangleList } from '@fortawesome/free-solid-svg-icons';
-  import type { IconDefinition } from '@fortawesome/fontawesome-common-types';
   import type { Snippet } from 'svelte';
   import { onDestroy } from 'svelte';
-  import {
-  classifyTool,
-  CATEGORY_ICONS,
-  type ToolCategory,
-} from './tool-classifier';
   import type { ContentBlock } from '$shared/types';
+  import { getContentBlockText } from '$shared/utils/content-block-helpers';
   import CylinderScroller from './CylinderScroller.svelte';
+  import InlineMarkdownSnippet from './InlineMarkdownSnippet.svelte';
+  import { getResponseGroupPreviewBlock } from './response-group-blocks';
+  import { faArrowsInLineVertical, faArrowsOutLineVertical } from '$lib/icons/phosphor-icons';
+  import {
+    OPERATIONAL_GROUP_CONTENT_CLASS,
+    CHAT_OPERATIONAL_ICON_CLASS,
+    getOperationalGroupContentSpacingClass,
+    OPERATIONAL_PRIMARY_CLASS,
+    OPERATIONAL_SECONDARY_CLASS,
+  } from './operational-disclosure-row';
+  import ChatOperationalRow from './ChatOperationalRow.svelte';
+  import { safeDisclosureTransition } from './disclosure-motion';
 
   interface Props {
     name: string;
@@ -28,6 +33,7 @@
     isLast?: boolean;
     children: Snippet;
     blocks?: ContentBlock[];
+    adjacentOperationalRow?: boolean;
     class?: string;
   }
 
@@ -37,52 +43,61 @@
     isLast = false,
     children,
     blocks,
+    adjacentOperationalRow = false,
     class: className = '',
   }: Props = $props();
 
-  // State model: two independent booleans
-  // - isExpanded: user wants full content (no cylinder)
-  // - showCylinder: cylinder preview is visible (during/after streaming).
-  //   For the last group (or while streaming) it stays true on collapse, so
-  //   "collapse" lands on the semi-open preview instead of fully closing.
-  let isExpanded = $state(isLast && !isStreaming);
-  let showCylinder = $state(isLast && !isStreaming);
+  // svelte-ignore state_referenced_locally -- intentional initial seed; the streaming-edge effect below manages transitions.
+  let isExpanded = $state(isStreaming || (isLast && !isStreaming));
+  let isClosing = $state(false);
+  let isInitialized = false;
+  let desiredExpanded = false;
+  let prevStreaming = false;
   let collapseTimer: ReturnType<typeof setTimeout> | null = null;
   let contentEl: HTMLElement | undefined = $state();
-  // Tracks a manual collapse so the streaming-end effect doesn't force the
-  // last group back to fully expanded (non-reactive by design).
+  let triggerEl: HTMLButtonElement | undefined = $state();
+  const instanceId = $props.id();
+  const detailsId = `response-group-details-${instanceId}`;
   let userCollapsed = false;
 
-  // Track previous streaming state to detect streaming→not-streaming edge
-  let prevStreaming = $state(false);
+  function setExpanded(nextExpanded: boolean) {
+    desiredExpanded = nextExpanded;
+    if (nextExpanded) {
+      isClosing = false;
+      isExpanded = true;
+      return;
+    }
+
+    if (!isExpanded) return;
+    if (contentEl?.contains(document.activeElement)) triggerEl?.focus({ preventScroll: true });
+    isClosing = true;
+    isExpanded = false;
+  }
 
   $effect(() => {
     const currentlyStreaming = isStreaming;
+    if (!isInitialized) {
+      isInitialized = true;
+      desiredExpanded = isExpanded;
+      prevStreaming = currentlyStreaming;
+      return;
+    }
 
-    if (currentlyStreaming) {
-      showCylinder = true;
-      prevStreaming = true;
+    if (currentlyStreaming && !prevStreaming) {
+      if (!userCollapsed) setExpanded(true);
       if (collapseTimer) {
         clearTimeout(collapseTimer);
         collapseTimer = null;
       }
     } else if (prevStreaming && !currentlyStreaming) {
-      prevStreaming = false;
-
-      if (isLast) {
-        // Last group can never fully close; if the user collapsed it
-        // mid-stream, land on semi-open instead of force-expanding
-        showCylinder = true;
-        if (!userCollapsed) isExpanded = true;
-      } else {
-        isExpanded = false;
-        // After streaming ends, collapse after delay
+      if (!userCollapsed && !isLast) {
         collapseTimer = setTimeout(() => {
-          showCylinder = false;
+          setExpanded(false);
           collapseTimer = null;
         }, 800);
       }
     }
+    prevStreaming = currentlyStreaming;
   });
 
   onDestroy(() => {
@@ -98,180 +113,89 @@
       collapseTimer = null;
     }
 
-    const el = contentEl;
-    if (el) {
-      // Capture current height before toggle. Guard against non-finite values
-      // (some browser/element states can yield NaN/undefined for these).
-      const startHeight = Number.isFinite(el.offsetHeight) ? el.offsetHeight : 0;
-
-      // Toggle state
-      applyToggle();
-
-      // After Svelte updates the DOM, animate from old height to new height
-      requestAnimationFrame(() => {
-        const endHeight = Number.isFinite(el.scrollHeight) ? el.scrollHeight : 0;
-
-        // Only animate if heights differ significantly and both are finite
-        if (
-          Number.isFinite(startHeight) &&
-          Number.isFinite(endHeight) &&
-          Math.abs(startHeight - endHeight) > 10
-        ) {
-          el.animate(
-            [
-              { height: `${startHeight}px`, overflow: 'hidden' },
-              { height: `${endHeight}px`, overflow: 'hidden' },
-            ],
-            {
-              duration: 250,
-              easing: 'cubic-bezier(0.33, 1, 0.68, 1)',
-              fill: 'none',
-            },
-          );
-        }
-      });
-    } else {
-      applyToggle();
-    }
+    const nextExpanded = !desiredExpanded;
+    userCollapsed = !nextExpanded;
+    setExpanded(nextExpanded);
   }
 
-  function applyToggle() {
-    isExpanded = !isExpanded;
-    userCollapsed = !isExpanded;
-    // Last/streaming groups can never fully close — collapsing them lands
-    // on the semi-open cylinder preview
-    if (!isExpanded) showCylinder = isLast || isStreaming;
-  }
-
-  // Compute stats from blocks
-  const stats = $derived.by(() => {
-    if (!blocks || blocks.length === 0)
-      return { toolCalls: 0, agents: 0, icons: [] as IconDefinition[] };
-
-    let toolCalls = 0;
-    let agents = 0;
-    const categorySet = new Set<ToolCategory>();
-
-    for (const block of blocks) {
-      if (block.type === 'tool_use') {
-        toolCalls++;
-        const display = classifyTool(block.name || '', (block.input as Record<string, any>) || {});
-        categorySet.add(display.category);
-        if (display.category === 'agent') agents++;
-      }
-    }
-
-    const icons = [...categorySet].map((cat) => CATEGORY_ICONS[cat]).filter(Boolean);
-    return { toolCalls, agents, icons };
-  });
-
-  // Custom collapse transition that reads the element's CURRENT offsetHeight
-  // (constrained by the cylinder) instead of the full content height.
-  function collapseFromCurrent(node: HTMLElement, { duration = 300, easing = cubicOut } = {}) {
-    // Coerce any non-finite measurement to 0. parseFloat('') returns NaN,
-    // and offsetHeight can be undefined on non-HTMLElement nodes; either
-    // would otherwise produce `NaNpx` keyframe values.
-    const safe = (n: number): number => (Number.isFinite(n) ? n : 0);
-    const currentHeight = safe(node.offsetHeight);
-    const style = getComputedStyle(node);
-    const paddingTop = safe(parseFloat(style.paddingTop));
-    const paddingBottom = safe(parseFloat(style.paddingBottom));
-    const marginTop = safe(parseFloat(style.marginTop));
-    const marginBottom = safe(parseFloat(style.marginBottom));
-
-    return {
-      duration,
-      easing,
-      css: (t: number) => {
-        const tt = Number.isFinite(t) ? t : 0;
-        return `
-          overflow: hidden;
-          height: ${tt * currentHeight}px;
-          padding-top: ${tt * paddingTop}px;
-          padding-bottom: ${tt * paddingBottom}px;
-          margin-top: ${tt * marginTop}px;
-          margin-bottom: ${tt * marginBottom}px;
-          opacity: ${Math.min(1, tt * 2)};
-        `;
-      },
-    };
-  }
-
-  // Extract snippet from first text block for collapsed preview
+  // Keep the collapsed row to one inert, current inline summary.
   const textSnippet = $derived.by(() => {
-    if (!blocks) return '';
-    const firstText = blocks.find((b) => b.type === 'text' && (b.text || b.content));
-    if (!firstText) return '';
-    const raw = (firstText.text || firstText.content || '').trim();
-    // Strip any HTML/XML-like tags (group tags, markdown artifacts)
-    const cleaned = raw.replace(/<[^>]+>/g, '').trim();
-    // Take first ~80 chars, break at word boundary
-    if (cleaned.length <= 80) return cleaned;
-    const truncated = cleaned.substring(0, 200);
-    const lastSpace = truncated.lastIndexOf(' ');
-    return (lastSpace > 40 ? truncated.substring(0, lastSpace) : truncated) + '…';
+    const previewBlock = getResponseGroupPreviewBlock(blocks);
+    return previewBlock ? getContentBlockText(previewBlock).trim() : '';
   });
+  const accessibleSummary = $derived(textSnippet ? `${name}: ${textSnippet}` : name);
+  const groupContentClass = $derived(
+    `${OPERATIONAL_GROUP_CONTENT_CLASS} ${getOperationalGroupContentSpacingClass(blocks)}`,
+  );
 </script>
 
-<div class={className}>
-  <button
-    type="button"
-    class="flex items-center gap-2.5 w-full py-1 px-1 border-none cursor-pointer text-left text-subtle text-base transition-colors duration-150 rounded-md"
-    onclick={toggle}
-    aria-expanded={isExpanded}
-  >
-    <div
-      class="flex items-center justify-center shrink-0 transition-opacity duration-300 {isStreaming
-        ? 'opacity-70'
-        : ''}"
-    >
-      <Fa icon={faRectangleList} size={12} class="text-ghost" />
-    </div>
-    <!-- Name and snippet share one line box so their text baselines coincide;
-         a flex sibling with `truncate` (overflow: hidden) would synthesize its
-         baseline from the box edge and sit visibly raised. -->
-    <span class="min-w-0 truncate">
-      <span class="font-semibold text-foreground">{name}</span>{#if textSnippet}<span
-          class="text-sm text-subtle ml-2.5">{textSnippet}</span
-        >{/if}
-    </span>
-    <div class="flex items-center gap-1.5 ml-auto shrink-0 opacity-40">
-      {#each stats.icons.slice(0, 5) as icon, i (icon)}
-        <span class="icon-animate-in" style="animation-delay: {i * 50}ms">
-          <Fa {icon} size={10} />
-        </span>
-      {/each}
-    </div>
-  </button>
+{#snippet leading()}
+  <Fa
+    icon={isExpanded ? faArrowsOutLineVertical : faArrowsInLineVertical}
+    size={16}
+    class={CHAT_OPERATIONAL_ICON_CLASS}
+  />
+{/snippet}
 
-  {#if isExpanded || showCylinder}
-    <div
-      bind:this={contentEl}
-      class="pl-4.5 border-l border-muted-foreground/15 ml-2"
-      out:collapseFromCurrent={{ duration: 300 }}
-    >
-      <CylinderScroller isActive={isStreaming && !isExpanded} constrained={!isExpanded}>
-        <div class="flex flex-col gap-1.5">
-          {@render children()}
-        </div>
-      </CylinderScroller>
+{#snippet summary()}
+  <span class="font-normal {OPERATIONAL_PRIMARY_CLASS}" data-testid="response-group-name"
+    >{name}</span
+  >{#if textSnippet && !isExpanded}<InlineMarkdownSnippet
+      content={textSnippet}
+      class="ml-2.5 font-normal {OPERATIONAL_SECONDARY_CLASS}"
+      testId="response-group-snippet"
+    />{/if}
+{/snippet}
+
+{#snippet details()}
+  <CylinderScroller isActive={isStreaming} constrained={false}>
+    <div class="relative flex flex-col gap-0" data-response-group-content>
+      <span
+        class="operational-group-guide pointer-events-none absolute inset-y-0 w-px -translate-x-1/2 bg-border"
+        data-operational-expanded-guide
+        aria-hidden="true"
+      ></span>
+      {@render children()}
     </div>
-  {/if}
-</div>
+  </CylinderScroller>
+{/snippet}
+
+<ChatOperationalRow
+  {leading}
+  {summary}
+  details={isExpanded ? details : undefined}
+  interactive
+  showChevron={false}
+  expanded={isExpanded}
+  controls={detailsId}
+  ariaLabel={accessibleSummary}
+  title={accessibleSummary}
+  summaryTitle={accessibleSummary}
+  onclick={toggle}
+  {detailsId}
+  detailsClass={groupContentClass}
+  detailsTransition={safeDisclosureTransition}
+  detailsMotion="height-opacity-y"
+  detailsInert={isClosing}
+  detailsAriaHidden={isClosing || undefined}
+  bind:triggerElement={triggerEl}
+  bind:detailsElement={contentEl}
+  {adjacentOperationalRow}
+  streaming={isStreaming}
+  testId="response-group"
+  disclosureTestId="response-group-disclosure"
+  summaryTestId="response-group-summary"
+  class={className}
+/>
 
 <style>
-  @keyframes slideInX {
-    from {
-      opacity: 0;
-      transform: translateX(-8px);
-    }
-    to {
-      opacity: 1;
-      transform: translateX(0);
-    }
+  .operational-group-guide {
+    left: calc(var(--operational-row-inline-padding) + var(--operational-leading-half-slot-size));
   }
 
-  .icon-animate-in {
-    animation: slideInX 200ms ease-out both;
+  :global(.operational-group-child-row) {
+    padding-inline-start: calc(
+      var(--operational-leading-half-slot-size) + var(--operational-leading-gap)
+    );
   }
 </style>

@@ -9,6 +9,7 @@
     faCircleExclamation,
   } from '@fortawesome/free-solid-svg-icons';
   import Fa from 'svelte-fa';
+  import { onDestroy } from 'svelte';
   import StreamingMessageContent from './StreamingMessageContent.svelte';
   import MessageActions from './MessageActions.svelte';
   import SimpleRichInput from './input/SimpleRichInput.svelte';
@@ -23,17 +24,23 @@
   import { getModelChangeNotice } from './model-change-notice';
   import { getAttentionNotice } from './attention-notice';
   import { parseStoredMessage } from '$lib/utils/parseStoredMessage';
-  import { slide } from 'svelte/transition';
+  import { safeSlide } from '$lib/utils/animations';
   import type { ContextItem } from './input/context-api';
-  import { navigateToFile, navigateToNote, navigateToSpec } from '$lib/utils/workspace-navigation';
-  import ProviderIcon from '$lib/components/icons/ProviderIcon.svelte';
+  import type { FileBlock, ImageBlock } from '$lib/client/app-client';
+  import { openWorkspaceAttachment } from '$store/renderer/slices/workspace-navigation/workspace-navigation-slice';
+  import { formatFileSize } from '$lib/utils/file-utils';
+  import ProviderIcon from '$features/context/components/ContextProviderIcon.svelte';
   import type { ContextProvider } from '$features/context/types';
   import { handleLink } from '$features/navigation/link-handler';
-  import { selectActiveWorkspaceId } from '$store/renderer/slices/workspace/workspace-selectors';
   import { selectAllNotes } from '$store/renderer/slices/workspace-notes/workspace-notes-selectors';
   import { selectAgentMessageById } from '$store/renderer/slices/agent-session/agent-session-selectors';
   import { shouldShowStoppedIndicator as resolveShouldShowStoppedIndicator } from './message-display-utils';
-  import { isQuestionOnlyContent, resolveStoppedIndicatorLabel } from './message-display-utils';
+  import { USER_MESSAGE_SURFACE_CLASS, USER_MESSAGE_TEXT_CLASS } from './user-message-surface';
+  import {
+    isQuestionOnlyContent,
+    resolveStoppedIndicatorLabel,
+    resolveFinishReasonNotice,
+  } from './message-display-utils';
   import ImageLightbox from '$lib/components/ui/ImageLightbox.svelte';
   import EditRegenerateConfirmDialog from './EditRegenerateConfirmDialog.svelte';
   import { isImageBlock } from '$shared/types/content-block.guards';
@@ -41,9 +48,16 @@
   import AgentMessageAttributionHeader from './AgentMessageAttributionHeader.svelte';
   import { getAgentMessageAttribution } from '$lib/utils/agent-message-attribution';
   import QueuedMessageNoticeHeader from './QueuedMessageNoticeHeader.svelte';
-  import { getQueueInfo, stripDequeueWaitNote } from '$lib/utils/queue-info';
-  import HookWakeAttributionHeader from './HookWakeAttributionHeader.svelte';
-  import { getHookWakeAttribution, stripHookWakePrefix } from '$lib/utils/hook-wake-attribution';
+  import { getQueueInfo } from '$lib/utils/queue-info';
+  import { getPresentedUserMessageText } from '$lib/utils/user-message-presentation';
+  import AutomatedWakeCardHeader from './AutomatedWakeCardHeader.svelte';
+  import { getAutomatedWakePresentation } from './automated-wake-presentation';
+  import {
+    safeSubscriptionSlide,
+    SUBSCRIPTION_CARD_CONTAINMENT_CLASS,
+    SUBSCRIPTION_CARD_SURFACE_CLASS,
+    SUBSCRIPTION_IN_THREAD_CARD_SPACING_CLASS,
+  } from './subscription-disclosure';
   import QuestionsDismissedNotice from './QuestionsDismissedNotice.svelte';
   import { getQuestionsDismissedNotice } from './questions-dismissed-notice';
 
@@ -51,21 +65,47 @@
   import { store as appStore } from '$store/renderer/store';
   import { m } from '$shared/paraglide/messages.js';
   import { formatInteger } from '$lib/i18n/format';
+  import {
+    openWorkspaceFile,
+    openWorkspaceNote,
+  } from '$store/renderer/slices/workspace-navigation/workspace-navigation-slice';
+  import { getWorkspaceRouteContext } from '$lib/utils/workspace-route-context';
 
-  const activeWorkspaceId = selectActiveWorkspaceId();
+  const routeWorkspaceId = getWorkspaceRouteContext()?.workspaceId ?? undefined;
 
+  function getOwningWorkspaceId(): string | undefined {
+    return workspace?.id ? String(workspace.id) : routeWorkspaceId;
+  }
+
+  function getPanelOptions(event?: MouseEvent) {
+    const target = event?.target;
+    const sourcePanelId =
+      target instanceof HTMLElement
+        ? target.closest<HTMLElement>('[data-panel-id]')?.dataset.panelId
+        : undefined;
+    return {
+      openInAdjacentPanel: Boolean(event?.metaKey || event?.ctrlKey),
+      sourcePanelId,
+    };
+  }
+
+  function openChatFile(path: string, event?: MouseEvent) {
+    if (readOnly) return;
+    const workspaceId = getOwningWorkspaceId();
+    if (!workspaceId) return;
+    appStore.dispatch(openWorkspaceFile(workspaceId, path, getPanelOptions(event)));
+  }
+
+  function openChatNote(noteId: string, event?: MouseEvent) {
+    if (readOnly) return;
+    const workspaceId = getOwningWorkspaceId();
+    if (!workspaceId) return;
+    appStore.dispatch(openWorkspaceNote(workspaceId, noteId, getPanelOptions(event)));
+  }
   // Type for parsed context items (pills shown before text)
   interface ContextPill {
     type:
-      | 'file'
-      | 'diff'
-      | 'note'
-      | 'spec'
-      | 'selection'
-      | 'linear'
-      | 'github'
-      | 'sentry'
-      | 'external';
+      'file' | 'diff' | 'note' | 'spec' | 'selection' | 'linear' | 'github' | 'sentry' | 'external';
     label: string;
     icon: typeof faFile;
     /** File path for file/diff pills */
@@ -102,7 +142,6 @@
     }
     return rawUrl;
   }
-
   // Type for inline message segments (text interspersed with mentions)
   type MessageSegment =
     | { type: 'text'; content: string }
@@ -131,14 +170,21 @@
     /** Message id; when paired with `agentId`, enables per-message Redux subscription. */
     messageId?: string;
     isStreaming?: boolean;
-    showTimestamp?: boolean;
     animationDelay?: number;
     hideToolCalls?: boolean;
     sessionMetadata?: any; // Session metadata containing applied rules
     /** Workspace for SimpleRichInput in edit mode */
     workspace?: Workspace | null;
-    /** Called when user wants to edit and resend the message */
-    onEditSubmit?: (newText: string, model?: string) => void;
+    /**
+     * Called when user wants to edit and resend the message. `blocks`
+     * carries the attachment content blocks restored/edited in the edit
+     * strip (PROTOCOL §5.5) so edit/regenerate never drops attachments.
+     */
+    onEditSubmit?: (
+      newText: string,
+      model?: string,
+      blocks?: { imageBlocks?: ImageBlock[]; fileBlocks?: FileBlock[] },
+    ) => void;
     /** Model to pre-select in the model picker when editing */
     editModel?: string | null;
     /** Called when user wants to regenerate the assistant response */
@@ -149,14 +195,20 @@
     onVote?: (vote: 'up' | 'down') => void;
     onCopy?: () => void;
     onRegisterRef?: (element: HTMLDivElement) => void;
-    /** Whether sticky behavior should be enabled for this user message */
-    enableSticky?: boolean;
     /** Called when user wants to scroll to previous user message */
     onScrollToPrevious?: () => void;
+    /** Keeps an edited virtualized turn materialized until edit mode closes. */
+    onEditStateChange?: (isEditing: boolean) => void;
+    isSticky?: boolean;
+    onStickyClick?: () => void;
     /** Backend session ID (auggie ID) for debugging */
     backendSessionId?: string | null;
     /** Hide noisy stopped badges for interrupted automated coordination turns. */
     suppressCoordinationStoppedIndicator?: boolean;
+    /** Disable all outbound actions in isolated catalog and visual-test previews. */
+    readOnly?: boolean;
+    /** False when an outer transcript row owns the canonical message identity attributes. */
+    ownsMessageIdentity?: boolean;
   }
 
   let {
@@ -164,9 +216,6 @@
     agentId,
     messageId,
     isStreaming = false,
-
-    showTimestamp: _showTimestamp = true,
-
     animationDelay: _animationDelay = 0,
     hideToolCalls = false,
     sessionMetadata,
@@ -178,11 +227,14 @@
     onVote,
     onCopy,
     onRegisterRef,
-    // eslint-disable-next-line @typescript-eslint/no-unused-vars
-    enableSticky = false,
     onScrollToPrevious,
+    onEditStateChange,
+    isSticky = false,
+    onStickyClick,
     backendSessionId,
     suppressCoordinationStoppedIndicator = false,
+    readOnly = false,
+    ownsMessageIdentity = true,
   }: Props = $props();
 
   // Per-message Redux subscription. Must be called at component-init time
@@ -190,15 +242,22 @@
   // to `undefined` when either id is empty, so subscribing unconditionally with
   // empty-string fallbacks is safe and avoids a conditional-store gotcha with
   // Svelte's `$store` auto-subscription.
+  // svelte-ignore state_referenced_locally -- intentional initial snapshot; keyed component identity is fixed.
   const storeMessage$ = selectAgentMessageById(agentId ?? '', messageId ?? '');
 
-  // Looked-up message drives ALL downstream $derived values, the `data-message-id`
-  // attribute, and the `{#if !message}` guard. When both ids are provided we use
+  // Looked-up message drives ALL downstream $derived values, the optional identity
+  // attributes, and the `{#if !message}` guard. When both ids are provided we use
   // the selector result (live reference from Redux); otherwise we fall back to
   // the `message` prop to preserve today's behavior for pending/optimistic
   // messages where ids may not be Redux-backed.
   let message = $derived(agentId && messageId ? $storeMessage$ : messageProp);
-
+  let messageCreatedAt = $derived.by(() => {
+    if (!message || !('createdAt' in message)) return undefined;
+    const value = message.createdAt;
+    return typeof value === 'string' || typeof value === 'number' || value instanceof Date
+      ? value
+      : undefined;
+  });
   // Edit mode state
   let isEditing = $state(false);
   let editValue = $state('');
@@ -214,15 +273,13 @@
         : (String(message.role).toLowerCase() as 'user' | 'assistant' | 'system')
       : 'assistant',
   );
-
   // Daemon-persisted model-change transcript row (metadata type "model_changed")
   let modelChangeNotice = $derived(getModelChangeNotice(message));
 
+  let questionsDismissedNotice = $derived(getQuestionsDismissedNotice(message));
+
   // Daemon-persisted attention-request row (meta.kind "discussion-request"/"blocker-report")
   let attentionNotice = $derived(getAttentionNotice(message));
-
-  // Daemon-delivered dismissal notification row (metadata type "questions_dismissed")
-  let questionsDismissedNotice = $derived(getQuestionsDismissedNotice(message));
 
   let shouldShowStoppedIndicator = $derived.by(() => {
     return resolveShouldShowStoppedIndicator({
@@ -245,6 +302,8 @@
         return m.chat_chatMessage_stoppedDaemonRestarted_label();
       case 'agent-stopped':
         return m.chat_chatMessage_stoppedAgentTerminated_label();
+      case 'system-suspend':
+        return m.chat_chatMessage_stoppedSystemSuspend_label();
       case 'stopped':
         return m.chat_chatMessage_stopped_label();
       default: {
@@ -257,37 +316,63 @@
     }
   });
 
+  // Abnormal-finish notice (PROTOCOL §7.3 `metadata.finishReason`): rendered
+  // once the turn is over — live via the `agent:stream:end` finishReason
+  // stamp, and after reload from the persisted row metadata. Suppressed while
+  // streaming so it never flashes mid-turn.
+  let finishReasonNoticeLabel = $derived.by(() => {
+    if (isStreaming) return undefined;
+    const notice = resolveFinishReasonNotice(message);
+    if (!notice) return undefined;
+    switch (notice.kind) {
+      case 'refusal':
+        return m.chat_chatMessage_finishReasonRefusal_label();
+      case 'max-tokens':
+        return m.chat_chatMessage_finishReasonMaxTokens_label();
+      default: {
+        // Compile-time exhaustiveness: a new descriptor kind is a type error
+        // here; at runtime an unknown kind renders no notice.
+        const _exhaustive: never = notice;
+        void _exhaustive;
+        return undefined;
+      }
+    }
+  });
+
   // Sender attribution for agent-to-agent messages (metadata-first, null when
   // metadata is absent or malformed so plain user messages render unchanged).
   let agentAttribution = $derived(
     role === 'user' ? getAgentMessageAttribution(message?.metadata) : null,
   );
+  let isAgentMessageExpanded = $state(false);
+  let agentMessagePreview = $derived(
+    message
+      ? (role === 'user' ? getPresentedUserMessageText(message) : extractAllContent(message)).trim()
+      : '',
+  );
+  let agentMessageBodyId = $derived(`agent-message-body-${message?.id ?? 'pending'}`);
 
   // Queued-delivery info for messages drained from the pending queue
-  // (metadata-first, null when absent/malformed so old transcripts keep
-  // rendering the raw [SYSTEM NOTE] unchanged).
+  // (metadata-first, null when absent/malformed; exact legacy note removal is
+  // owned separately by the immutable user-message presentation boundary).
   let queueInfo = $derived(role === 'user' ? getQueueInfo(message?.metadata) : null);
 
-  // Background-hook wake attribution (PROTOCOL §5.40): the daemon tags the
-  // row's `metadata` AND the persisted text block's `messageMetadata` with
-  // `{ type: 'hook_wake', hookId, hookName, reason }` — check both so older
-  // rows missing one surface still render the chip.
-  let hookWakeAttribution = $derived.by(() => {
-    if (role !== 'user') return null;
-    const fromRow = getHookWakeAttribution(message?.metadata);
-    if (fromRow) return fromRow;
-    const blocks = Array.isArray(message?.contentBlocks) ? message.contentBlocks : [];
-    for (const block of blocks) {
-      if (block.type === 'text') {
-        const fromBlock = getHookWakeAttribution(block.messageMetadata);
-        if (fromBlock) return fromBlock;
-      }
-    }
-    return null;
-  });
+  // Delivered background-hook and PR-monitor wakes share one metadata-first
+  // classifier, including the protocol's legacy text prefixes.
+  let automatedWakePresentation = $derived(
+    role === 'user' ? getAutomatedWakePresentation(message) : null,
+  );
+  let hookWakeAttribution = $derived(
+    automatedWakePresentation?.kind === 'hook' ? automatedWakePresentation.attribution : null,
+  );
+  let prMonitorWakeAttribution = $derived(
+    automatedWakePresentation?.kind === 'pr' ? automatedWakePresentation.attribution : null,
+  );
+  let isAutomatedWakeExpanded = $state(false);
+  let automatedWakeBodyId = $derived(`automated-wake-body-${message?.id ?? 'pending'}`);
 
   // Local state
-  let messageElement: HTMLDivElement;
+  let messageElement = $state<HTMLDivElement>();
   let showRulesInspector = $state(false);
 
   // Lightbox state for sent image attachments
@@ -500,7 +585,7 @@
       } else if (captured.startsWith('note/')) {
         // Note mention: @note/{noteId}
         const noteId = captured.slice(5); // Remove "note/" prefix
-        const wsId = $activeWorkspaceId ?? '';
+        const wsId = getOwningWorkspaceId() ?? '';
         const allNotes = selectAllNotes.select(appStore.state, wsId);
         const matchingNote = allNotes.find((n) => n.id === noteId) ?? null;
         const label = matchingNote?.title || noteId;
@@ -642,9 +727,10 @@
 
   // Handle clicking on a context pill to navigate to the referenced content
   async function handlePillClick(pill: ContextPill, event?: MouseEvent) {
+    if (readOnly) return;
     // Handle external links (Linear, GitHub, Sentry, etc.) via unified link handler
     if (pill.url) {
-      const wsId = $activeWorkspaceId;
+      const wsId = getOwningWorkspaceId();
       if (wsId) {
         await handleLink(pill.url, {
           workspaceId: WorkspaceId(wsId),
@@ -654,24 +740,24 @@
       return;
     }
     if (pill.type === 'spec') {
-      await navigateToSpec();
+      openChatNote('spec', event);
     } else if (pill.type === 'file' && pill.path) {
-      await navigateToFile(pill.path);
+      openChatFile(pill.path, event);
     } else if (pill.type === 'diff' && pill.path) {
       // For diffs, open the file - the diff view would need to be triggered separately
-      await navigateToFile(pill.path);
+      openChatFile(pill.path, event);
     } else if (pill.type === 'note' && pill.noteId) {
       // noteId is actually the note title from the context string
       // Look up the actual note ID from the title
       const noteTitle = pill.noteId;
-      const wsId = $activeWorkspaceId ?? '';
+      const wsId = getOwningWorkspaceId() ?? '';
       const allNotes = selectAllNotes.select(appStore.state, wsId);
       const matchingNote = allNotes.find((n) => n.title === noteTitle) ?? null;
       if (matchingNote) {
-        await navigateToNote(matchingNote.id);
+        openChatNote(matchingNote.id, event);
       }
     } else if (pill.type === 'selection' && pill.path) {
-      await navigateToFile(pill.path);
+      openChatFile(pill.path, event);
     }
   }
 
@@ -697,7 +783,12 @@
   });
 
   // Open image in lightbox
-  function openImageLightbox(imageBlock: ContentBlock & { data: string; mimeType: string }, openerElement: HTMLButtonElement, index: number = 0) {
+  function openImageLightbox(
+    imageBlock: ContentBlock & { data: string; mimeType: string },
+    openerElement: HTMLButtonElement,
+    index: number = 0,
+  ) {
+    if (readOnly) return;
     lightboxImageUrl = `data:${imageBlock.mimeType};base64,${imageBlock.data}`;
     lightboxImageName =
       imageBlock.fileName ||
@@ -706,29 +797,60 @@
     lightboxOpen = true;
   }
 
-  // Extract file blocks from contentBlocks
+  // Extract file blocks from contentBlocks — both the legacy inline-data
+  // variant (data + mimeType) and attachment-reference blocks (attachmentId,
+  // no bytes; PROTOCOL §5.5 v6.12).
   const fileBlocks = $derived.by(() => {
     if (!message?.contentBlocks || !Array.isArray(message.contentBlocks)) {
       return [];
     }
     return message.contentBlocks.filter(
-      (block: any) => block.type === 'file' && block.data && block.fileName,
+      (block: any) => block.type === 'file' && (block.data || block.attachmentId) && block.fileName,
     );
   });
 
+  // Secondary text for a file chip: size and/or mime from the block's inline
+  // metadata; empty string when neither is present.
+  function fileChipSecondaryText(block: ContentBlock): string {
+    const parts: string[] = [];
+    if (typeof block.size === 'number') parts.push(formatFileSize(block.size));
+    if (block.mimeType) parts.push(block.mimeType);
+    return parts.join(' • '); // i18n-ignore (mime type + formatted size separator)
+  }
+
+  // Click on an attachment-reference chip: the workspace-navigation tab saga
+  // resolves the registry row by attachmentId (file.getAttachmentInfo,
+  // PROTOCOL §5.9) and opens the stored workspace-relative path in a file
+  // tab. A missing file (deleted from disk out-of-band) or a failed lookup
+  // surfaces a toast — never a crash.
+  function openAttachmentReference(block: ContentBlock & { attachmentId?: string }) {
+    if (readOnly) return;
+    const wsId = getOwningWorkspaceId();
+    if (!block.attachmentId || !wsId) return;
+    appStore.dispatch(openWorkspaceAttachment(wsId, block.attachmentId, block.fileName ?? ''));
+  }
+
+  // Download a legacy inline-data file block via a data URL.
+  function downloadInlineFileBlock(block: ContentBlock, index: number) {
+    if (readOnly) return;
+    const dataUrl = `data:${block.mimeType || 'application/octet-stream'};base64,${block.data}`;
+    const link = document.createElement('a');
+    link.href = dataUrl;
+    link.download = block.fileName || `file-${index}`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  }
+
   // Parse context and get clean text for user messages
   const parsedMessage = $derived.by(() => {
-    // Display-only strip of the daemon's literal `[Background hook "…"]`
-    // prefix on wake rows — the attribution chip already names the hook.
-    const rawText = hookWakeAttribution
-      ? stripHookWakePrefix(extractTextFromMessage())
-      : extractTextFromMessage();
+    const rawText =
+      automatedWakePresentation?.bodyText ??
+      (role === 'user' && message
+        ? getPresentedUserMessageText(message)
+        : extractTextFromMessage());
     if (role === 'user') {
-      // Hide the daemon's dequeue-wait [SYSTEM NOTE] from the displayed body
-      // when structured queueInfo metadata renders it as a chip instead.
-      const parsed = parseContextFromMessage(
-        queueInfo ? stripDequeueWaitNote(rawText) : rawText,
-      );
+      const parsed = parseContextFromMessage(rawText);
       // Get metadata refs for URL lookup
       const metadataRefs = message?.metadata?.contextReferences;
 
@@ -810,9 +932,14 @@
     const processedToolIds = new Set<string>();
 
     // Extract text and tool blocks from contentBlocks
+    if (role === 'user' && message) {
+      const presentedText = getPresentedUserMessageText(message);
+      if (presentedText.trim()) parts.push(presentedText);
+    }
     if (message?.contentBlocks && Array.isArray(message.contentBlocks)) {
       for (const block of message.contentBlocks) {
         if (block.type === 'text') {
+          if (role === 'user') continue;
           const text = (block as any).text || (block as any).content || '';
           if (text.trim()) {
             parts.push(text);
@@ -883,10 +1010,9 @@
 
   // Handle edit mode
   function handleStartEdit() {
-    // Parse the stored message to extract context and user message; the
-    // dequeue-wait [SYSTEM NOTE] hidden from the body stays out of the edit
-    // box too (it must not be re-sent as user text).
-    const rawText = queueInfo ? stripDequeueWaitNote(getMessageText()) : getMessageText();
+    // Presentation-only delivery notes stay out of edit/retry text while the
+    // canonical stored content remains unchanged.
+    const rawText = message ? getPresentedUserMessageText(message) : getMessageText();
     const parsed = parseStoredMessage(rawText);
     editValue = parsed.userMessage;
 
@@ -905,6 +1031,18 @@
             imageData: block.data,
             imageMimeType: block.mimeType,
           });
+        } else if (block.type === 'file' && block.attachmentId && block.fileName) {
+          // Attachment-reference block: restore as a placed-attachment item
+          // (UUID + metadata only) so the re-send builds the same reference.
+          contextItemsForEdit.push({
+            id: `attachment-${block.attachmentId}`,
+            type: 'file',
+            label: block.fileName,
+            description: block.mimeType || m.chat_shared_file_fallback(),
+            attachmentId: block.attachmentId,
+            attachmentMimeType: block.mimeType,
+            attachmentSize: block.size,
+          });
         } else if (block.type === 'file' && block.data && block.fileName) {
           contextItemsForEdit.push({
             id: `file-${message.id}-${index}`,
@@ -921,23 +1059,55 @@
     editContextItems = contextItemsForEdit;
     editSelectedModel = editModel;
     isEditing = true;
+    onEditStateChange?.(true);
   }
 
   function handleCancelEdit() {
     isEditing = false;
+    onEditStateChange?.(false);
     editValue = '';
     editContextItems = [];
     editSelectedModel = undefined;
   }
 
+  onDestroy(() => {
+    if (isEditing) onEditStateChange?.(false);
+  });
+
   // Editing regenerates from this message onward — a destructive daemon-side
   // truncation (agent.editAndRegenerate, PROTOCOL §5.5) — so gate the dispatch
   // behind an explicit confirmation; cancel keeps edit mode + draft intact.
-  // Confirm sends just the edited text + selected model (context is re-managed
-  // by the chat service on re-send), then handleCancelEdit exits edit mode.
+  // Confirm sends the edited text + selected model plus the attachment blocks
+  // rebuilt from the edit strip's context items (image blocks and
+  // attachment-reference file blocks — §5.5 accepts both on
+  // agent.editAndRegenerate), so attachments survive edit/regenerate; then
+  // handleCancelEdit exits edit mode.
   function handleConfirmEditSubmit() {
     showEditConfirm = false;
-    onEditSubmit?.(editValue, editSelectedModel ?? undefined);
+    const imageBlocks: ImageBlock[] = editContextItems
+      .filter((item) => item.imageData && item.imageMimeType)
+      .map((item) => ({
+        type: 'image' as const,
+        data: item.imageData!,
+        mimeType: item.imageMimeType!,
+      }));
+    const fileBlocks: FileBlock[] = editContextItems
+      .filter((item) => item.attachmentId)
+      .map((item) => ({
+        type: 'file' as const,
+        attachmentId: item.attachmentId!,
+        fileName: item.label,
+        ...(item.attachmentMimeType ? { mimeType: item.attachmentMimeType } : {}),
+        ...(item.attachmentSize !== undefined ? { size: item.attachmentSize } : {}),
+      }));
+    const blocks =
+      imageBlocks.length > 0 || fileBlocks.length > 0
+        ? {
+            ...(imageBlocks.length > 0 ? { imageBlocks } : {}),
+            ...(fileBlocks.length > 0 ? { fileBlocks } : {}),
+          }
+        : undefined;
+    onEditSubmit?.(editValue, editSelectedModel ?? undefined, blocks);
     handleCancelEdit();
   }
 
@@ -995,30 +1165,30 @@
 
 {#if !message}
   <!-- Guard against null message prop -->
-  <div class="text-subtle text-sm p-2">{m.chat_chatMessage_loading_label()}</div>
+  <div class="type-caption p-2 text-subtle">{m.chat_chatMessage_loading_label()}</div>
 {:else if modelChangeNotice}
   <!-- Daemon-persisted model-change notice row - centered inline divider -->
-  <ModelChangeNotice notice={modelChangeNotice} fallbackText={extractAllContent(message) || undefined} />
+  <ModelChangeNotice
+    notice={modelChangeNotice}
+    fallbackText={extractAllContent(message) || undefined}
+  />
 {:else if questionsDismissedNotice}
-  <!-- Daemon-delivered dismissal notification row - compact centered chip -->
   <QuestionsDismissedNotice title={extractAllContent(message) || undefined} />
-{:else if questionOnlyTurn && !shouldShowStoppedIndicator}
+{:else if questionOnlyTurn && !shouldShowStoppedIndicator && !finishReasonNoticeLabel}
   <!-- Agent Q&A is wizard-only: question-only turns render no bubble -->{:else}
   <div
     bind:this={messageElement}
     class="group group/message transition-transform duration-200 ease-out {role === 'user'
       ? 'user-message'
-      : 'relative assistant-message px-2'}"
-    data-message-id={message?.id}
-    data-message-role={role}
+      : 'relative assistant-message'}"
+    data-message-id={ownsMessageIdentity ? message?.id : undefined}
+    data-message-role={ownsMessageIdentity ? role : undefined}
+    inert={readOnly}
   >
     {#if role === 'user'}
-      <!-- User Message: Two-layer approach -->
-      <!-- Layer 1: Sticky compact version - sticks to top when scrolled past -->
-      <!-- Layer 2: Full expanded version - in normal flow, scrolls away, covers sticky when in view -->
       {#if isEditing}
         <!-- Edit mode - use SimpleRichInput for rich editing experience -->
-        <div class="rounded-xs" transition:slide={{ axis: 'y', duration: 200 }}>
+        <div class="rounded-xs" transition:safeSlide={{ axis: 'y', duration: 200 }}>
           <SimpleRichInput
             bind:value={editValue}
             bind:contextItems={editContextItems}
@@ -1033,248 +1203,334 @@
           />
         </div>
       {:else}
-        <!-- Full expanded version - uses negative margin to overlap the sticky header in ChatPanel -->
+        <!-- svelte-ignore a11y_click_events_have_key_events -->
         <!-- svelte-ignore a11y_no_static_element_interactions -->
         <div
-          class="relative bg-sidebar rounded-xs px-2 pt-2 pb-2 {onEditSubmit &&
+          data-testid="user-message-surface"
+          data-conversation-role="user"
+          data-automated-wake-card={automatedWakePresentation ? '' : undefined}
+          data-external-spacing-owner={automatedWakePresentation
+            ? 'automated-wake-card'
+            : undefined}
+          class="{agentAttribution
+            ? `${SUBSCRIPTION_CARD_CONTAINMENT_CLASS} ${SUBSCRIPTION_CARD_SURFACE_CLASS}`
+            : automatedWakePresentation
+              ? `relative ${SUBSCRIPTION_IN_THREAD_CARD_SPACING_CLASS} ${SUBSCRIPTION_CARD_CONTAINMENT_CLASS} ${SUBSCRIPTION_CARD_SURFACE_CLASS}`
+              : USER_MESSAGE_SURFACE_CLASS} {onEditSubmit &&
           !agentAttribution &&
-          !hookWakeAttribution
+          !hookWakeAttribution &&
+          !prMonitorWakeAttribution
             ? 'cursor-pointer'
-            : 'cursor-default'} overflow-hidden z-20"
+            : 'cursor-default'}"
           ondblclick={() =>
-            onEditSubmit && !agentAttribution && !hookWakeAttribution && handleStartEdit()}
+            onEditSubmit &&
+            !agentAttribution &&
+            !hookWakeAttribution &&
+            !prMonitorWakeAttribution &&
+            handleStartEdit()}
         >
           <!-- Actions -->
-          <div
-            class="absolute top-1 right-1 z-10 opacity-0 group-hover:opacity-100 transition-opacity"
-          >
-            <div
-              class="flex items-center gap-0.5 bg-sidebar/95 backdrop-blur-sm rounded-md border border-border"
-            >
-              <MessageActions
-                role="user"
-                onCopy={handleCopy}
-                showOnHover={false}
-                requestId={backendSessionId ?? undefined}
-                {onScrollToPrevious}
-              />
-            </div>
-          </div>
+          {#if (!agentAttribution && !automatedWakePresentation) || isAgentMessageExpanded}
+            <MessageActions
+              role="user"
+              onCopy={handleCopy}
+              requestId={backendSessionId ?? undefined}
+              {onScrollToPrevious}
+              timestamp={message.timestamp}
+              createdAt={messageCreatedAt}
+              class="absolute right-1 z-10 {agentAttribution ? 'bottom-1' : 'top-1'}"
+            />
+          {/if}
 
           <!-- Sender attribution header for agent-to-agent messages -->
           {#if agentAttribution}
-            <AgentMessageAttributionHeader attribution={agentAttribution} class="mb-1.5" />
-          {:else if hookWakeAttribution}
-            <!-- Background-hook wake attribution header (PROTOCOL §5.40) -->
-            <HookWakeAttributionHeader attribution={hookWakeAttribution} class="mb-1.5" />
+            <AgentMessageAttributionHeader
+              attribution={agentAttribution}
+              preview={agentMessagePreview}
+              expanded={isAgentMessageExpanded}
+              controlsId={agentMessageBodyId}
+              ontoggle={() => (isAgentMessageExpanded = !isAgentMessageExpanded)}
+            />
+          {:else if automatedWakePresentation}
+            <AutomatedWakeCardHeader
+              presentation={automatedWakePresentation}
+              expanded={isAutomatedWakeExpanded}
+              controlsId={automatedWakeBodyId}
+              {workspace}
+              ontoggle={() => (isAutomatedWakeExpanded = !isAutomatedWakeExpanded)}
+            />
           {/if}
 
-          <!-- Queued-delivery notice for messages drained from the pending queue -->
-          {#if queueInfo}
-            <QueuedMessageNoticeHeader {queueInfo} class="mb-1.5" />
-          {/if}
-
-          <!-- Message content - line-clamp-6 -->
-          <div
-            class="leading-normal text-subtle select-text line-clamp-6 {onEditSubmit &&
-            !agentAttribution &&
-            !hookWakeAttribution
-              ? 'cursor-pointer'
-              : 'cursor-text'}"
-            onclick={(e) => {
-              if (onEditSubmit && !agentAttribution && !hookWakeAttribution) {
-                e.preventDefault();
-                e.stopPropagation();
-                handleStartEdit();
-              }
-            }}
-          >
-            <!-- Context pills from metadata (e.g., PR references, Linear issues) -->
-            {#each parsedMessage.pills as pill, i (`${pill.type}-${pill.label}-${i}`)}
-              {@const isClickable = !!(
-                pill.path ||
-                pill.noteId ||
-                pill.url ||
-                pill.type === 'spec'
-              )}
-              <button
-                type="button"
-                class="inline-flex items-center gap-1 px-1.5 py-1 bg-muted/60 text-foreground/80 rounded-md text-xs whitespace-nowrap font-medium hover:bg-muted hover:text-foreground transition-colors mx-0.5 align-middle"
-                title={pill.content || pill.path || pill.noteId || pill.label}
-                onclick={(e) => {
-                  e.stopPropagation();
-                  handlePillClick(pill, e);
-                }}
-                disabled={!isClickable}
-              >
-                <Fa icon={pill.icon} size="12" class="opacity-50" />
-                <span class="font-medium truncate max-w-[180px]" title={pill.label}
-                  >{pill.label}</span
-                >
-              </button>
-            {/each}
-            <!-- Render text with inline @mentions as chips -->
-            {#each parsedMessage.segments as segment, i (i)}
-              {#if segment.type === 'text'}
-                <span class="whitespace-pre-wrap">{segment.content}</span>
-              {:else if segment.type === 'mention'}
-                {@const isContextProvider = ['linear', 'github', 'sentry', 'browser'].includes(
-                  segment.mentionType,
-                )}
-                {@const isClickable = !!(
-                  segment.path ||
-                  segment.noteId ||
-                  segment.mentionType === 'spec' ||
-                  segment.url
-                )}
-                <button
-                  type="button"
-                  class="inline-flex items-center gap-1 px-1.5 py-1 bg-muted/60 text-foreground/80 rounded-md text-xs whitespace-nowrap font-medium hover:bg-muted hover:text-foreground transition-colors mx-0.5 align-middle"
-                  title={segment.path ||
-                    segment.noteId ||
-                    (segment.identifier
-                      ? `${segment.identifier}: ${segment.label}`
-                      : segment.label)}
-                  onclick={(e) => {
-                    e.stopPropagation();
-                    if (segment.url) {
-                      const wsId = $activeWorkspaceId;
-                      if (wsId) {
-                        handleLink(segment.url, {
-                          workspaceId: WorkspaceId(wsId),
-                          event: e,
-                        });
-                      }
-                    } else if (segment.path) {
-                      navigateToFile(segment.path);
-                    } else if (segment.noteId) {
-                      if (segment.mentionType === 'spec') {
-                        navigateToNote('spec');
-                      } else {
-                        navigateToNote(segment.noteId);
-                      }
-                    }
-                  }}
-                  disabled={!isClickable}
-                >
-                  {#if isContextProvider}
-                    <ProviderIcon
-                      provider={segment.mentionType as ContextProvider}
-                      size={12}
-                      class="shrink-0 opacity-30"
-                    />
-                  {:else}
-                    <Fa icon={segment.icon} size="12" class="opacity-30" />
-                  {/if}
-                  {#if segment.identifier}
-                    <span class="text-subtle shrink-0">{segment.identifier}</span>
-                  {/if}
-                  <span class="max-w-[180px] truncate" title={segment.label}>{segment.label}</span>
-                </button>
-              {/if}
-            {/each}
-          </div>
-
-          <!-- Attached images -->
-          {#if imageBlocks.length > 0}
-            <div class="flex flex-wrap gap-1.5 mt-2">
-              {#each imageBlocks as imageBlock, i (i)}
-                <button
-                  type="button"
-                  class="relative group/image p-0 border-0 bg-transparent cursor-pointer overflow-hidden w-10 h-10 shrink-0 focus:outline-none focus:ring-2 focus:ring-primary rounded"
-                  onclick={(e) => {
-                    if (isImageBlock(imageBlock)) {
-                      openImageLightbox(imageBlock, e.currentTarget, i);
-                    }
-                  }}
-                  onkeydown={(e) => {
-                    if (e.key === 'Enter' || e.key === ' ') {
-                      e.preventDefault();
-                      e.currentTarget.click();
-                    }
-                  }}
-                  aria-label={m.chat_chatMessage_viewAttachedImage_ariaLabel({
-                    number: formatInteger(i + 1),
-                    total: formatInteger(imageBlocks.length),
-                  })}
-                >
-                  <img
-                    src="data:{imageBlock.mimeType};base64,{imageBlock.data}"
-                    alt={m.chat_chatMessage_attachedImage_alt({ number: formatInteger(i + 1) })}
-                    class="w-full h-full rounded border border-border object-cover hover:opacity-90 transition-opacity"
-                  />
-                </button>
-              {/each}
-            </div>
-          {/if}
-
-          <!-- Attached files -->
-          {#if fileBlocks.length > 0}
-            <div class="flex flex-wrap gap-1.5 mt-2">
-              {#each fileBlocks as fileBlock, i (i)}
-                <button
-                  type="button"
-                  class="flex items-center gap-1.5 px-2 py-1 rounded border border-border bg-muted/50 hover:bg-muted transition-colors text-xs text-muted-foreground hover:text-foreground cursor-pointer"
-                  onclick={() => {
-                    const dataUrl = `data:${fileBlock.mimeType || 'application/octet-stream'};base64,${fileBlock.data}`;
-                    const link = document.createElement('a');
-                    link.href = dataUrl;
-                    link.download = fileBlock.fileName || `file-${i}`;
-                    document.body.appendChild(link);
-                    link.click();
-                    document.body.removeChild(link);
-                  }}
-                  title={m.chat_chatMessage_download_title({ name: `${fileBlock.fileName}` })}
-                >
-                  <Fa icon={faFile} class="w-3 h-3" />
-                  <span class="truncate max-w-[150px]">{fileBlock.fileName}</span>
-                </button>
-              {/each}
-            </div>
-          {/if}
-
-          <!-- Send failure indicator for optimistic user messages -->
-          {#if message?.error}
+          {#if (!agentAttribution || isAgentMessageExpanded) && (!automatedWakePresentation || isAutomatedWakeExpanded)}
             <div
-              class="flex items-center gap-2 text-destructive font-medium text-xs mt-2"
-              title={message.error}
+              id={agentAttribution
+                ? agentMessageBodyId
+                : automatedWakePresentation
+                  ? automatedWakeBodyId
+                  : undefined}
+              class={agentAttribution || automatedWakePresentation
+                ? 'w-full min-w-0 max-w-full overflow-hidden border-t border-border px-3 py-2'
+                : 'contents'}
+              data-testid={agentAttribution
+                ? 'agent-message-expanded-body'
+                : automatedWakePresentation
+                  ? 'automated-wake-details'
+                  : undefined}
+              transition:safeSubscriptionSlide
             >
-              <Fa icon={faCircleExclamation} class="size-2.5 mt-px" />
-              <span>{m.chat_chatMessage_failedToSend_label()}</span>
+              <!-- Queued-delivery notice for messages drained from the pending queue -->
+              {#if queueInfo}
+                <QueuedMessageNoticeHeader {queueInfo} {isSticky} class="mb-1.5" />
+              {/if}
+
+              <div
+                class="type-body select-text text-pretty {agentAttribution ||
+                automatedWakePresentation
+                  ? 'font-medium! text-foreground'
+                  : USER_MESSAGE_TEXT_CLASS} {agentAttribution
+                  ? ''
+                  : isSticky
+                    ? 'line-clamp-2'
+                    : automatedWakePresentation
+                      ? 'max-w-full [overflow-wrap:anywhere]'
+                      : 'line-clamp-6'} {isSticky ||
+                (onEditSubmit &&
+                  !agentAttribution &&
+                  !hookWakeAttribution &&
+                  !prMonitorWakeAttribution)
+                  ? 'cursor-pointer'
+                  : 'cursor-text'}"
+                data-expanded={agentAttribution
+                  ? isAgentMessageExpanded
+                  : automatedWakePresentation
+                    ? isAutomatedWakeExpanded
+                    : undefined}
+                onclick={(e) => {
+                  if (isSticky && onStickyClick) {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    onStickyClick();
+                    return;
+                  }
+                  if (
+                    onEditSubmit &&
+                    !agentAttribution &&
+                    !hookWakeAttribution &&
+                    !prMonitorWakeAttribution
+                  ) {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    handleStartEdit();
+                  }
+                }}
+              >
+                <!-- Context pills from metadata (e.g., PR references, Linear issues) -->
+                {#each parsedMessage.pills as pill, i (`${pill.type}-${pill.label}-${i}`)}
+                  {@const isClickable = !!(
+                    pill.path ||
+                    pill.noteId ||
+                    pill.url ||
+                    pill.type === 'spec'
+                  )}
+                  <button
+                    type="button"
+                    class="type-caption mx-0.5 inline-flex items-center gap-1 whitespace-nowrap rounded-md bg-muted/60 px-1.5 py-1 align-middle font-medium text-foreground/80 transition-colors hover:bg-muted hover:text-foreground"
+                    title={pill.content || pill.path || pill.noteId || pill.label}
+                    onclick={(e) => {
+                      e.stopPropagation();
+                      handlePillClick(pill, e);
+                    }}
+                    disabled={!isClickable}
+                  >
+                    <Fa icon={pill.icon} size="12" class="opacity-50" />
+                    <span class="truncate font-medium" style="max-width: 180px;" title={pill.label}
+                      >{pill.label}</span
+                    >
+                  </button>
+                {/each}
+                <!-- Render text with inline @mentions as chips -->
+                {#each parsedMessage.segments as segment, i (i)}
+                  {#if segment.type === 'text'}
+                    <span class="whitespace-pre-wrap">{segment.content}</span>
+                  {:else if segment.type === 'mention'}
+                    {@const isContextProvider = ['linear', 'github', 'sentry', 'browser'].includes(
+                      segment.mentionType,
+                    )}
+                    {@const isClickable = !!(
+                      segment.path ||
+                      segment.noteId ||
+                      segment.mentionType === 'spec' ||
+                      segment.url
+                    )}
+                    <button
+                      type="button"
+                      class="type-caption mx-0.5 inline-flex items-center gap-1 whitespace-nowrap rounded-md bg-muted/60 px-1.5 py-1 align-middle font-medium text-foreground/80 transition-colors hover:bg-muted hover:text-foreground"
+                      title={segment.path ||
+                        segment.noteId ||
+                        (segment.identifier
+                          ? `${segment.identifier}: ${segment.label}`
+                          : segment.label)}
+                      onclick={(e) => {
+                        e.stopPropagation();
+                        if (segment.url) {
+                          const wsId = getOwningWorkspaceId();
+                          if (wsId) {
+                            handleLink(segment.url, {
+                              workspaceId: WorkspaceId(wsId),
+                              event: e,
+                            });
+                          }
+                        } else if (segment.path) {
+                          openChatFile(segment.path, e);
+                        } else if (segment.noteId) {
+                          if (segment.mentionType === 'spec') {
+                            openChatNote('spec', e);
+                          } else {
+                            openChatNote(segment.noteId, e);
+                          }
+                        }
+                      }}
+                      disabled={!isClickable}
+                    >
+                      {#if isContextProvider}
+                        <ProviderIcon
+                          provider={segment.mentionType as ContextProvider}
+                          size={12}
+                          class="shrink-0 opacity-30"
+                        />
+                      {:else}
+                        <Fa icon={segment.icon} size="12" class="opacity-30" />
+                      {/if}
+                      {#if segment.identifier}
+                        <span class="text-subtle shrink-0">{segment.identifier}</span>
+                      {/if}
+                      <span class="truncate" style="max-width: 180px;" title={segment.label}
+                        >{segment.label}</span
+                      >
+                    </button>
+                  {/if}
+                {/each}
+              </div>
+              <!-- Attached images -->
+              {#if imageBlocks.length > 0 && !isSticky}
+                <div class="flex flex-wrap gap-1.5 mt-2">
+                  {#each imageBlocks as imageBlock, i (i)}
+                    <button
+                      type="button"
+                      class="relative group/image p-0 border-0 bg-transparent cursor-pointer overflow-hidden w-10 h-10 shrink-0 focus:outline-none focus:ring-2 focus:ring-primary rounded"
+                      onclick={(e) => {
+                        if (isImageBlock(imageBlock)) {
+                          openImageLightbox(imageBlock, e.currentTarget, i);
+                        }
+                      }}
+                      onkeydown={(e) => {
+                        if (e.key === 'Enter' || e.key === ' ') {
+                          e.preventDefault();
+                          e.currentTarget.click();
+                        }
+                      }}
+                      aria-label={m.chat_chatMessage_viewAttachedImage_ariaLabel({
+                        number: formatInteger(i + 1),
+                        total: formatInteger(imageBlocks.length),
+                      })}
+                    >
+                      <img
+                        src="data:{imageBlock.mimeType};base64,{imageBlock.data}"
+                        alt={m.chat_chatMessage_attachedImage_alt({ number: formatInteger(i + 1) })}
+                        class="w-full h-full rounded border border-border object-cover hover:opacity-90 transition-opacity"
+                      />
+                    </button>
+                  {/each}
+                </div>
+              {/if}
+
+              <!-- Attached files: attachment-reference chips open the file in a
+               tab (resolved by attachmentId); legacy inline-data chips keep
+               the data-URL download behavior. -->
+              {#if fileBlocks.length > 0 && !isSticky}
+                <div class="flex flex-wrap gap-1.5 mt-2">
+                  {#each fileBlocks as fileBlock, i (i)}
+                    {@const secondary = fileChipSecondaryText(fileBlock)}
+                    <button
+                      type="button"
+                      data-testid="chat-message-file-chip"
+                      class="type-caption flex cursor-pointer items-center gap-1.5 rounded border border-border bg-muted/50 px-2 py-1 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+                      onclick={() => {
+                        if (fileBlock.attachmentId) {
+                          openAttachmentReference(fileBlock);
+                        } else {
+                          downloadInlineFileBlock(fileBlock, i);
+                        }
+                      }}
+                      title={fileBlock.attachmentId
+                        ? m.chat_chatMessage_openAttachment_title({ name: `${fileBlock.fileName}` })
+                        : m.chat_chatMessage_download_title({ name: `${fileBlock.fileName}` })}
+                    >
+                      <Fa icon={faFile} class="w-3 h-3" />
+                      <span class="truncate" style="max-width: 150px;">{fileBlock.fileName}</span>
+                      {#if secondary}
+                        <span class="opacity-60 shrink-0">{secondary}</span>
+                      {/if}
+                    </button>
+                  {/each}
+                </div>
+              {/if}
+
+              <!-- Send failure indicator for optimistic user messages -->
+              {#if message?.error}
+                <div
+                  class="type-caption mt-2 flex items-center gap-2 font-medium text-destructive"
+                  title={message.error}
+                >
+                  <Fa icon={faCircleExclamation} class="size-2.5 mt-px" />
+                  <span>{m.chat_chatMessage_failedToSend_label()}</span>
+                </div>
+              {/if}
             </div>
           {/if}
         </div>
       {/if}
     {:else if role === 'assistant'}
       <!-- Assistant Message -->
-      <div class="text-sm leading-relaxed text-foreground">
+      <div class="type-body text-pretty text-foreground">
         <StreamingMessageContent
           content={combinedContent}
           {isStreaming}
           {hideToolCalls}
           workspaceId={workspace?.id ? String(workspace.id) : undefined}
+          {agentId}
+          messageId={message?.id ?? messageId}
         />
 
         <!-- Stopped indicator for interrupted messages -->
         {#if shouldShowStoppedIndicator}
-          <div class="flex items-center gap-2 text-subtle font-medium text-sm mt-5">
+          <div class="type-caption mt-5 flex items-center gap-2 font-medium text-subtle">
             <Fa icon={faSquare} class="size-2.5 opacity-50 mt-px" />
             <span>{stoppedIndicatorLabel}</span>
           </div>
         {/if}
 
-        <!-- Actions for assistant messages (shown on hover) -->
-        {#if !isStreaming && !questionOnlyTurn}
-          <div class="flex items-center justify-end mt-2">
-            <MessageActions
-              role="assistant"
-              {onRegenerate}
-              {onFork}
-              {onVote}
-              onCopy={handleCopy}
-              requestId={backendSessionId ?? undefined}
-            />
+        <!-- Abnormal-finish notice (refusal / token limit, PROTOCOL §7.3) -->
+        {#if finishReasonNoticeLabel}
+          <div class="type-caption mt-5 flex items-center gap-2 font-medium text-subtle">
+            <Fa icon={faCircleExclamation} class="size-2.5 opacity-50 mt-px" />
+            <span>{finishReasonNoticeLabel}</span>
           </div>
+        {/if}
+
+        <!-- Actions for assistant messages: overlay without shifting content on hover/focus -->
+        {#if !isStreaming && !questionOnlyTurn}
+          <MessageActions
+            role="assistant"
+            {onRegenerate}
+            {onFork}
+            {onVote}
+            onCopy={handleCopy}
+            requestId={backendSessionId ?? undefined}
+            timestamp={message.timestamp}
+            createdAt={messageCreatedAt}
+            class="absolute bottom-0 right-0 z-10"
+          />
         {/if}
       </div>
     {:else if role === 'system'}

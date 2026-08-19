@@ -4,10 +4,7 @@
  * Modular terminal adapter with proper separation of concerns
  */
 
-import {
-  Terminal,
-  IDisposable,
-} from '@xterm/xterm';
+import { Terminal, IDisposable } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { WebLinksAddon } from '@xterm/addon-web-links';
 import { WebglAddon } from '@xterm/addon-webgl';
@@ -18,13 +15,11 @@ import { Logger } from '../../shared/logger';
 import { invoke as invokeIpc } from '../../shared/generated/ipc-client';
 import { appClient as defaultAppClient } from '$lib/client';
 import type { AppClient, TerminalsClient } from '$lib/client';
-import {
-  TerminalStateMachine,
-  TerminalState,
-} from './terminal-state-machine';
+import { TerminalStateMachine, TerminalState } from './terminal-state-machine';
 import { TerminalBufferManager } from './terminal-buffer-manager';
 import { TerminalThemeManager } from './terminal-theme-manager';
 import { terminalHistoryTracker } from './terminal-history-tracker';
+import { disposeXtermAfterViewportSync } from './utils/xterm-lifecycle';
 import { isGitHubUrl } from '$shared/utils/link-helpers';
 import { m } from '$shared/paraglide/messages.js';
 import { sanitizeCommandForDisplay } from '$shared/utils/sanitize-credentials';
@@ -35,6 +30,7 @@ import {
   toggleTerminalOverlay,
 } from '$store/renderer/slices/terminals/terminals-slice';
 import type { TerminalTab } from '$store/renderer/slices/terminals/terminals-slice';
+import { selectCodeFontFamilyCSS } from '$store/renderer/slices/user-preferences/user-preferences-selectors';
 
 const logger = new Logger('TerminalAdapter');
 
@@ -59,6 +55,13 @@ export interface TerminalOptions extends TerminalCallbacks {
    * domain is consumed today.
    */
   appClient?: Pick<AppClient, 'terminals'>;
+  /**
+   * Initial CSS font-family applied to the XTerm instance. When omitted, the
+   * adapter reads the current value of `selectCodeFontFamilyCSS` once at
+   * construction — Redux is never subscribed inside the adapter. Callers own
+   * later updates via {@link TerminalAdapter.updateFontFamily}.
+   */
+  fontFamily?: string;
 }
 
 export interface TerminalInfo {
@@ -96,6 +99,8 @@ export class TerminalAdapter {
   private resizeObserver: ResizeObserver | null = null;
   private visibilityObserver: IntersectionObserver | null = null;
   private wasVisible: boolean = true;
+  private isVisible: boolean = true;
+  private lastFittedSize: { width: number; height: number } | null = null;
   private resizeDebounceTimer: NodeJS.Timeout | null = null;
   private bufferSaveTimer: NodeJS.Timeout | null = null;
   private dataDisposable: IDisposable | null = null;
@@ -164,10 +169,13 @@ export class TerminalAdapter {
     this.bufferManager = new TerminalBufferManager(this.workspaceId, this.terminalId);
     this.themeManager = new TerminalThemeManager(this.container);
 
-    // Initialize XTerm.js with optimized settings
+    // Initialize XTerm.js with optimized settings. Font family follows the
+    // canonical selectCodeFontFamilyCSS preference; caller-provided value wins
+    // when explicitly passed (component captures it at init).
+    const initialFontFamily = options.fontFamily ?? selectCodeFontFamilyCSS.select(appStore.state);
     this.xterm = new Terminal({
       allowProposedApi: true,
-      fontFamily: '"SF Mono", Monaco, Menlo, "Courier New", monospace',
+      fontFamily: initialFontFamily,
       fontSize: 13,
       lineHeight: 1.2,
       letterSpacing: 0,
@@ -300,16 +308,10 @@ export class TerminalAdapter {
       this.themeManager.applyTheme(this.xterm);
 
       // Ensure container has dimensions before fitting
-      const containerRect = container.getBoundingClientRect();
-
-      if (containerRect.width > 0 && containerRect.height > 0) {
-        // Fit to container
-        this.fitAddon.fit();
-      } else {
+      if (!this.fitTerminalToContainer()) {
         logger.warn('Container has no dimensions, delaying fit');
-        // Try fitting after a delay
         setTimeout(() => {
-          this.fitAddon.fit();
+          this.fitTerminalToContainer();
         }, 100);
       }
 
@@ -392,7 +394,7 @@ export class TerminalAdapter {
 
       // Focus the terminal after initialization - use requestAnimationFrame to ensure DOM is ready
       requestAnimationFrame(() => {
-        if (!this.isDisposed) {
+        if (!this.isDisposed && this.isVisible) {
           this.xterm.focus();
         }
       });
@@ -566,8 +568,12 @@ export class TerminalAdapter {
 
       // Cmd+Shift+] / Cmd+Shift+[ - cycle terminal tabs
       // Return false to let the overlay's window keydown handler pick these up
-      if (isMod && event.shiftKey && !event.altKey &&
-          (event.key === ']' || event.key === '}' || event.key === '[' || event.key === '{')) {
+      if (
+        isMod &&
+        event.shiftKey &&
+        !event.altKey &&
+        (event.key === ']' || event.key === '}' || event.key === '[' || event.key === '{')
+      ) {
         return false;
       }
 
@@ -662,7 +668,7 @@ export class TerminalAdapter {
    * Setup resize observer with debouncing
    */
   private setupResizeObserver(): void {
-    if (!this.container) {
+    if (!this.container || !this.isVisible) {
       return;
     }
 
@@ -687,9 +693,7 @@ export class TerminalAdapter {
       }
 
       this.resizeDebounceTimer = setTimeout(() => {
-        if (!this.isDisposed && this.stateMachine?.canAcceptInput()) {
-          this.fitAddon.fit();
-        }
+        this.fitTerminalToContainer();
       }, 100);
     });
 
@@ -723,7 +727,9 @@ export class TerminalAdapter {
 
         if (isVisible && !this.wasVisible) {
           // Container transitioned from hidden → visible
-          logger.debug(`[visibility] Terminal ${this.terminalId} became visible, reconnecting ResizeObserver`);
+          logger.debug(
+            `[visibility] Terminal ${this.terminalId} became visible, reconnecting ResizeObserver`,
+          );
 
           // Reconnect ResizeObserver if it was disconnected
           if (!this.resizeObserver) {
@@ -732,18 +738,14 @@ export class TerminalAdapter {
                 clearTimeout(this.resizeDebounceTimer);
               }
               this.resizeDebounceTimer = setTimeout(() => {
-                if (!this.isDisposed && this.stateMachine?.canAcceptInput()) {
-                  this.fitAddon.fit();
-                }
+                this.fitTerminalToContainer();
               }, 100);
             });
             this.resizeObserver.observe(container);
           }
 
           // Fit immediately to sync PTY dimensions
-          if (!this.isDisposed && this.stateMachine?.canAcceptInput()) {
-            this.fitAddon.fit();
-          }
+          this.fitTerminalToContainer();
         }
 
         this.wasVisible = isVisible;
@@ -807,7 +809,10 @@ export class TerminalAdapter {
 
             try {
               this.loadWebglAddon();
-              logger.info(`[WebGL] Successfully recovered from context loss (attempt ${this.webglRecoveryAttempts})`);
+              logger.info(
+                // i18n-ignore (log message, not user-facing)
+                `[WebGL] Successfully recovered from context loss (attempt ${this.webglRecoveryAttempts})`,
+              );
             } catch (error) {
               logger.warn(
                 // i18n-ignore (log message, not user-facing)
@@ -848,7 +853,6 @@ export class TerminalAdapter {
       this.webglAddon = null;
     }
   }
-
 
   /**
    * Setup theme change listener
@@ -970,12 +974,18 @@ export class TerminalAdapter {
         // This helps filter out false positives from malformed escape code stripping
         const looksLikeCommand = /^[a-zA-Z0-9.\/~]/.test(command);
         if (command.length > 0 && !this.isExecuting && looksLikeCommand) {
-          logger.info(`[TerminalAdapter] Detected command from output: ${sanitizeCommandForDisplay(command)}`);
+          logger.info(
+            // i18n-ignore (log message, not user-facing)
+            `[TerminalAdapter] Detected command from output: ${sanitizeCommandForDisplay(command)}`,
+          );
           terminalHistoryTracker.onCommandStart(this.terminalId, this.workspaceId, command);
           this.isExecuting = true;
           this.callbacks.onCommandStart?.();
         } else if (command.length > 0 && !looksLikeCommand) {
-          logger.debug(`[TerminalAdapter] Skipping suspicious command detection: ${sanitizeCommandForDisplay(command)}`);
+          logger.debug(
+            // i18n-ignore (log message, not user-facing)
+            `[TerminalAdapter] Skipping suspicious command detection: ${sanitizeCommandForDisplay(command)}`,
+          );
         }
       }
 
@@ -988,7 +998,10 @@ export class TerminalAdapter {
           this.isExecuting = false;
           this.callbacks.onCommandFinished?.();
           terminalHistoryTracker.onCommandFinish(this.terminalId, this.workspaceId);
-          logger.debug(`[TerminalAdapter] Command finished, prompt detected: ${sanitizeCommandForDisplay(cleanLine)}`);
+          logger.debug(
+            // i18n-ignore (log message, not user-facing)
+            `[TerminalAdapter] Command finished, prompt detected: ${sanitizeCommandForDisplay(cleanLine)}`,
+          );
         }
         this.isAtPrompt = true;
         this.commandBuffer = '';
@@ -1067,7 +1080,6 @@ export class TerminalAdapter {
       if (lines.length > 0) {
         const lastLine = lines[lines.length - 1];
         const secondLastLine = lines.length > 1 ? lines[lines.length - 2] : '';
-
 
         // Case 1: Complete prompt on one line
         if (promptSymbolPattern.test(lastLine) && userHostPattern.test(lastLine)) {
@@ -1173,14 +1185,13 @@ export class TerminalAdapter {
 
       if (command) {
         // Track the command that's about to be executed
-        terminalHistoryTracker.onCommandStart(
-          this.terminalId,
-          this.workspaceId,
-          command,
-        );
+        terminalHistoryTracker.onCommandStart(this.terminalId, this.workspaceId, command);
         // Mark as executing so we know to finish tracking when prompt appears
         this.isExecuting = true;
-        logger.debug(`Command executed: ${sanitizeCommandForDisplay(command)}${xtermCommand ? ' (from xterm buffer)' : ' (from keystroke buffer)'}`);
+        logger.debug(
+          // i18n-ignore (log message, not user-facing)
+          `Command executed: ${sanitizeCommandForDisplay(command)}${xtermCommand ? ' (from xterm buffer)' : ' (from keystroke buffer)'}`,
+        );
       }
       // Clear the command buffer
       this.commandBuffer = '';
@@ -1236,7 +1247,7 @@ export class TerminalAdapter {
    * Focus the terminal
    */
   focus(): void {
-    if (!this.isDisposed) {
+    if (!this.isDisposed && this.isVisible) {
       this.xterm.focus();
     }
   }
@@ -1247,6 +1258,40 @@ export class TerminalAdapter {
   blur(): void {
     if (!this.isDisposed) {
       this.xterm.blur();
+    }
+  }
+
+  setVisible(visible: boolean): void {
+    if (this.isDisposed || this.isVisible === visible) return;
+    this.isVisible = visible;
+    this.wasVisible = visible;
+    if (!visible) {
+      this.xterm.blur();
+      this.disconnectLayoutObservers();
+      return;
+    }
+    this.setupResizeObserver();
+    requestAnimationFrame(() => this.fitTerminalToContainer());
+  }
+
+  private fitTerminalToContainer(): boolean {
+    if (this.isDisposed || !this.isVisible || !this.container) return false;
+    const { width, height } = this.container.getBoundingClientRect();
+    if (width <= 0 || height <= 0) return false;
+    if (this.lastFittedSize?.width === width && this.lastFittedSize.height === height) return true;
+    this.fitAddon.fit();
+    this.lastFittedSize = { width, height };
+    return true;
+  }
+
+  private disconnectLayoutObservers(): void {
+    this.resizeObserver?.disconnect();
+    this.resizeObserver = null;
+    this.visibilityObserver?.disconnect();
+    this.visibilityObserver = null;
+    if (this.resizeDebounceTimer) {
+      clearTimeout(this.resizeDebounceTimer);
+      this.resizeDebounceTimer = null;
     }
   }
 
@@ -1359,7 +1404,7 @@ export class TerminalAdapter {
 
       // Focus the terminal - use requestAnimationFrame to ensure DOM is ready
       requestAnimationFrame(() => {
-        if (!this.isDisposed) {
+        if (!this.isDisposed && this.isVisible) {
           this.xterm.focus();
         }
       });
@@ -1428,7 +1473,7 @@ export class TerminalAdapter {
 
     // Focus the terminal - use requestAnimationFrame to ensure DOM is ready
     requestAnimationFrame(() => {
-      if (!this.isDisposed) {
+      if (!this.isDisposed && this.isVisible) {
         this.xterm.focus();
       }
     });
@@ -1442,6 +1487,17 @@ export class TerminalAdapter {
    */
   updateCallbacks(callbacks: Partial<TerminalCallbacks>): void {
     Object.assign(this.callbacks, callbacks);
+  }
+
+  /**
+   * Update the XTerm font-family on the live instance. Callers observe the
+   * canonical selectCodeFontFamilyCSS selector and forward changes here; the
+   * adapter itself does not subscribe to Redux. No-op after disposal.
+   */
+  updateFontFamily(fontFamily: string): void {
+    if (this.isDisposed) return;
+    if (this.xterm.options.fontFamily === fontFamily) return;
+    this.xterm.options.fontFamily = fontFamily;
   }
 
   /**
@@ -1501,14 +1557,13 @@ export class TerminalAdapter {
       isExecuting: this.isExecuting,
       stats: bufferStats
         ? {
-          bufferSize: bufferStats.size,
-          lineCount: bufferStats.lineCount,
-          uptime: Date.now() - this.startTime,
-        }
+            bufferSize: bufferStats.size,
+            lineCount: bufferStats.lineCount,
+            uptime: Date.now() - this.startTime,
+          }
         : undefined,
     };
   }
-
 
   /**
    * Start the periodic IPC heartbeat.
@@ -1522,7 +1577,9 @@ export class TerminalAdapter {
       return;
     }
 
-    logger.debug(`[heartbeat] Starting for terminal ${this.terminalId} (every ${TerminalAdapter.HEARTBEAT_INTERVAL_MS}ms)`);
+    logger.debug(
+      `[heartbeat] Starting for terminal ${this.terminalId} (every ${TerminalAdapter.HEARTBEAT_INTERVAL_MS}ms)`,
+    );
 
     this.heartbeatTimer = setInterval(() => {
       this.performHealthCheck();
@@ -1547,7 +1604,11 @@ export class TerminalAdapter {
    */
   private async performHealthCheck(): Promise<void> {
     // Only check while CONNECTED and IPC handlers are set up
-    if (this.isDisposed || !this.ipcCleanup || this.stateMachine.getState() !== TerminalState.CONNECTED) {
+    if (
+      this.isDisposed ||
+      !this.ipcCleanup ||
+      this.stateMachine.getState() !== TerminalState.CONNECTED
+    ) {
       return;
     }
 
@@ -1558,7 +1619,10 @@ export class TerminalAdapter {
       const alive = await Promise.race([
         this.terminalExistsOnBackend(),
         new Promise<never>((_, reject) => {
-          timeoutId = setTimeout(() => reject(new Error('Heartbeat timeout')), TerminalAdapter.HEARTBEAT_TIMEOUT_MS);
+          timeoutId = setTimeout(
+            () => reject(new Error('Heartbeat timeout')),
+            TerminalAdapter.HEARTBEAT_TIMEOUT_MS,
+          );
         }),
       ]);
 
@@ -1578,15 +1642,11 @@ export class TerminalAdapter {
 
       if (this.isDisposed) return;
 
-      logger.warn(
-        `[heartbeat] Terminal ${this.terminalId}: health check failed:`,
-        error,
-      );
+      logger.warn(`[heartbeat] Terminal ${this.terminalId}: health check failed:`, error);
       this.stopHeartbeat();
       this.stateMachine.transition('disconnect');
     }
   }
-
 
   /**
    * Schedule an auto-reconnect attempt with exponential backoff.
@@ -1711,13 +1771,18 @@ export class TerminalAdapter {
 
     // Show error in terminal
     if (!this.isDisposed) {
-      this.xterm.writeln(`\r\n\x1b[31m${m.terminal_adapter_errorLine_label({ message: error.message })}\x1b[0m\r\n`);
+      this.xterm.writeln(
+        `\r\n\x1b[31m${m.terminal_adapter_errorLine_label({ message: error.message })}\x1b[0m\r\n`,
+      );
     }
   }
 
   /**
    * Handle link clicks - open URLs in browser panel instead of popup.
-   * GitHub URLs are always opened in the external browser.
+   * GitHub URLs are always opened in the external browser. Loopback URLs are
+   * resolved through browser:resolve-url (rewrite → probe → tunnel) BEFORE
+   * the browser panel opens, so remote-mode links land on the daemon host or
+   * a tunnel port (the embedded browser never resolves).
    */
   private handleLinkClick(uri: string): void {
     try {
@@ -1731,20 +1796,34 @@ export class TerminalAdapter {
         return;
       }
 
-      // Import and use the panel layout manager to open browser panel
-      import('$features/layout/panel-layout-adapter')
-        .then(({ getPanelLayoutManager }) => {
-          const layoutManager = getPanelLayoutManager(this.workspaceId);
-          layoutManager.openBrowserPanel(uri);
-          logger.debug('Opened URL in browser panel', { uri, workspaceId: this.workspaceId });
-        })
-        .catch((err) => {
-          logger.warn('Failed to open URL in browser panel, falling back to external browser', {
-            uri,
-            error: err,
-          });
-          // Fallback to external browser
-          void invokeIpc('shell:openExternal', { url: uri });
+      // Resolve loopback URLs, then open the browser panel on the result.
+      void import('$lib/utils/browser-link-open')
+        .then(({ resolveBrowserLinkForOpen }) => resolveBrowserLinkForOpen(uri))
+        .catch((): { url: string; requestedUrl?: string } => ({ url: uri }))
+        .then((resolved) => {
+          import('$features/layout/panel-layout-adapter')
+            .then(({ getPanelLayoutManager }) => {
+              const layoutManager = getPanelLayoutManager(this.workspaceId);
+              layoutManager.openBrowserPanel(
+                resolved.url,
+                undefined,
+                undefined,
+                resolved.requestedUrl,
+              );
+              logger.debug('Opened URL in browser panel', {
+                uri,
+                resolvedUrl: resolved.url,
+                workspaceId: this.workspaceId,
+              });
+            })
+            .catch((err) => {
+              logger.warn('Failed to open URL in browser panel, falling back to external browser', {
+                uri,
+                error: err,
+              });
+              // Fallback to external browser
+              void invokeIpc('shell:openExternal', { url: resolved.url });
+            });
         });
     } catch (err) {
       logger.warn('Failed to handle link click', { uri, error: err });
@@ -1985,15 +2064,10 @@ export class TerminalAdapter {
       logger.error('Error disposing state machine:', error);
     }
 
-    // Finally dispose XTerm and its renderer
-    try {
-      // Clear the terminal first
-      this.xterm.clear();
-
-      // Dispose the terminal (this will also dispose the renderer)
-      this.xterm.dispose();
-    } catch (error) {
+    // xterm 5.x leaves a viewport sync timer queued by open()/fit(). Dispose on
+    // the next task so that callback cannot read an already-cleared renderer.
+    disposeXtermAfterViewportSync(this.xterm, (error) => {
       logger.error('Error disposing xterm:', error);
-    }
+    });
   }
 }

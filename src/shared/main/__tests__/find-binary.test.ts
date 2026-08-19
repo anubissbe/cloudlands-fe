@@ -32,8 +32,8 @@ vi.mock('../../logger', () => ({
 }));
 
 import {
-  clearBinaryCache,
   findBinary,
+  findBinaryStrict,
   getCachedHostEnv,
   getCommonNpmPaths,
   getCommonNpxPaths,
@@ -56,13 +56,11 @@ describe('findBinary (host.findBinary wire contract)', () => {
     loggerSpies.info.mockReset();
     loggerSpies.warn.mockReset();
     loggerSpies.error.mockReset();
-    clearBinaryCache();
     process.env = { ...originalEnv };
     setPlatform(originalPlatform);
   });
 
   afterEach(() => {
-    clearBinaryCache();
     process.env = { ...originalEnv };
     setPlatform(originalPlatform);
   });
@@ -70,7 +68,7 @@ describe('findBinary (host.findBinary wire contract)', () => {
   it('sends `host.findBinary` with just the name when no commonPaths are supplied', async () => {
     mockRequest.mockResolvedValue({ available: true, path: '/usr/local/bin/foo' });
 
-    const result = await findBinary('foo', { cache: false });
+    const result = await findBinary('foo');
 
     expect(result).toBe('/usr/local/bin/foo');
     expect(mockRequest).toHaveBeenCalledTimes(1);
@@ -81,7 +79,6 @@ describe('findBinary (host.findBinary wire contract)', () => {
     mockRequest.mockResolvedValue({ available: true, path: '/custom/foo' });
 
     const result = await findBinary('foo', {
-      cache: false,
       commonPaths: ['/custom/foo', '/other/foo', '/custom/foo'],
     });
 
@@ -95,7 +92,7 @@ describe('findBinary (host.findBinary wire contract)', () => {
   it('returns null when the daemon reports the binary as unavailable', async () => {
     mockRequest.mockResolvedValue({ available: false });
 
-    const result = await findBinary('foo', { cache: false });
+    const result = await findBinary('foo');
 
     expect(result).toBeNull();
     expect(mockRequest).toHaveBeenCalledWith('host.findBinary', { name: 'foo' });
@@ -111,59 +108,86 @@ describe('findBinary (host.findBinary wire contract)', () => {
     });
   });
 
-  it('caches resolved paths per (name, commonPaths) so a second lookup is wire-free', async () => {
-    mockRequest.mockResolvedValue({ available: true, path: '/usr/local/bin/foo' });
-
-    const first = await findBinary('foo');
-    const second = await findBinary('foo');
-
-    expect(first).toBe('/usr/local/bin/foo');
-    expect(second).toBe(first);
-    expect(mockRequest).toHaveBeenCalledTimes(1);
-  });
-
-  it('keeps cache entries separate for different commonPaths sets', async () => {
+  it('never caches: every call issues a fresh wire request', async () => {
     mockRequest
-      .mockResolvedValueOnce({ available: true, path: '/usr/local/bin/foo' })
-      .mockResolvedValueOnce({ available: true, path: '/opt/homebrew/bin/foo' });
-
-    const a = await findBinary('foo', { commonPaths: ['/a/foo'] });
-    const b = await findBinary('foo', { commonPaths: ['/b/foo'] });
-
-    expect(a).toBe('/usr/local/bin/foo');
-    expect(b).toBe('/opt/homebrew/bin/foo');
-    expect(mockRequest).toHaveBeenCalledTimes(2);
-  });
-
-  it('clearBinaryCache(name) drops every cached variant for that binary', async () => {
-    mockRequest
-      .mockResolvedValueOnce({ available: true, path: '/first/foo' })
+      .mockResolvedValueOnce({ available: false })
       .mockResolvedValueOnce({ available: true, path: '/refreshed/foo' });
-
-    await findBinary('foo');
-    clearBinaryCache('foo');
-    const refreshed = await findBinary('foo');
-
-    expect(refreshed).toBe('/refreshed/foo');
-    expect(mockRequest).toHaveBeenCalledTimes(2);
-  });
-
-  it('returns null and caches the miss when the daemon request rejects', async () => {
-    mockRequest.mockRejectedValue(new Error('transport down'));
 
     const first = await findBinary('foo');
     const second = await findBinary('foo');
 
     expect(first).toBeNull();
-    expect(second).toBeNull();
-    expect(mockRequest).toHaveBeenCalledTimes(1);
+    expect(second).toBe('/refreshed/foo');
+    expect(mockRequest).toHaveBeenCalledTimes(2);
+  });
+
+  it('returns null when the daemon request rejects, without caching the miss', async () => {
+    mockRequest
+      .mockRejectedValueOnce(new Error('transport down'))
+      .mockResolvedValueOnce({ available: true, path: '/usr/local/bin/foo' });
+
+    const first = await findBinary('foo');
+    const second = await findBinary('foo');
+
+    expect(first).toBeNull();
+    expect(second).toBe('/usr/local/bin/foo');
+    expect(mockRequest).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('findBinaryStrict (strict probe semantics)', () => {
+  beforeEach(() => {
+    mockRequest.mockReset();
+    loggerSpies.warn.mockReset();
+  });
+
+  it('sends the same host.findBinary request and returns the resolved path', async () => {
+    mockRequest.mockResolvedValue({ available: true, path: '/usr/local/bin/foo' });
+
+    const result = await findBinaryStrict('foo', { commonPaths: ['/custom/foo'] });
+
+    expect(result).toBe('/usr/local/bin/foo');
+    expect(mockRequest).toHaveBeenCalledWith('host.findBinary', {
+      name: 'foo',
+      commonPaths: ['/custom/foo'],
+    });
+  });
+
+  it('returns null when the daemon authoritatively reports the binary unavailable', async () => {
+    mockRequest.mockResolvedValue({ available: false });
+
+    expect(await findBinaryStrict('foo')).toBeNull();
+  });
+
+  it('propagates a daemon RPC failure instead of folding it to null', async () => {
+    // A rejected probe proves nothing about availability — strict callers
+    // (availability checks) must be able to distinguish it from "not found".
+    mockRequest.mockRejectedValue(new Error('transport down'));
+
+    await expect(findBinaryStrict('foo')).rejects.toThrow('transport down');
+  });
+
+  it('treats available:true without a path as a probe failure, not "not found"', async () => {
+    // A malformed/proxy-degraded response is not an authoritative
+    // unavailable verdict — it must not fold to null.
+    mockRequest.mockResolvedValue({ available: true });
+
+    await expect(findBinaryStrict('foo')).rejects.toThrow(
+      'available:true without a path',
+    );
+  });
+
+  it('still rejects unsafe binary names locally with null (deterministic, not a probe failure)', async () => {
+    const result = await findBinaryStrict('foo; rm -rf /');
+
+    expect(result).toBeNull();
+    expect(mockRequest).not.toHaveBeenCalled();
   });
 });
 
 describe('initializeHostEnv / getEnhancedPath (host.env wire contract)', () => {
   beforeEach(() => {
     mockRequest.mockReset();
-    clearBinaryCache();
     process.env = { ...originalEnv };
   });
 

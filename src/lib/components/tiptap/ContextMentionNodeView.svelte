@@ -7,21 +7,18 @@
    */
   import type { NodeViewProps } from '@tiptap/core';
   import { NodeViewWrapper } from '$lib/utils/tiptap/svelte-node-view';
-  import ProviderIcon from '$lib/components/icons/ProviderIcon.svelte';
+  import ProviderIcon from '$features/context/components/ContextProviderIcon.svelte';
   import GitBranchIcon from '$lib/components/icons/GitBranchIcon.svelte';
-  import {
-  Tooltip,
-  TooltipRich,
-} from '$lib/components/ui/tooltip';
+  import { Tooltip, TooltipRich } from '$lib/components/ui/tooltip';
   import type { ContextProvider, ContextItemType } from '$features/context/types';
   import type { ContextMentionMetadata } from './ContextMention';
   import { handleLink } from '$features/navigation/link-handler';
   import { formatRelativeTime as formatRelative } from '$lib/i18n/format';
-  import { selectActiveWorkspaceId } from '$store/renderer/slices/workspace/workspace-selectors';
   import { WorkspaceId } from '$shared/types/branded-ids';
   import { m } from '$shared/paraglide/messages.js';
+  import { getWorkspaceRouteContext } from '$lib/utils/workspace-route-context';
 
-  const activeWorkspaceId = selectActiveWorkspaceId();
+  const workspaceId = getWorkspaceRouteContext()?.workspaceId ?? undefined;
 
   let { node, selected, deleteNode }: NodeViewProps = $props();
 
@@ -41,7 +38,10 @@
     document.addEventListener('initializer-branch-updated', handleBranchUpdate as EventListener);
 
     return () => {
-      document.removeEventListener('initializer-branch-updated', handleBranchUpdate as EventListener);
+      document.removeEventListener(
+        'initializer-branch-updated',
+        handleBranchUpdate as EventListener,
+      );
     };
   });
 
@@ -96,17 +96,17 @@
   // Check if this is a GitHub PR with a source branch
   const isGitHubPR = $derived(
     provider === 'github' &&
-    (itemType === 'github-pr' || itemType === 'github-issue') &&
-    prSourceBranch() !== null
+      (itemType === 'github-pr' || itemType === 'github-issue') &&
+      prSourceBranch() !== null,
   );
 
   // Check if branch differs from currently selected branch
   // Only show if we're in a context with the initializer (has received branch update events)
   const branchDiffers = $derived(
     hasInitializerContext &&
-    isGitHubPR &&
-    prSourceBranch() &&
-    prSourceBranch() !== currentSelectedBranch
+      isGitHubPR &&
+      prSourceBranch() &&
+      prSourceBranch() !== currentSelectedBranch,
   );
 
   // Handle switching to the PR's branch
@@ -179,7 +179,7 @@
   function getLevelColor(level: string | undefined): string {
     if (!level) return '';
     const l = level.toLowerCase();
-    if (l === 'error' || l === 'fatal') return 'text-red-500';
+    if (l === 'error' || l === 'fatal') return 'text-error-foreground';
     if (l === 'warning') return 'text-yellow-500';
     return 'text-subtle';
   }
@@ -219,10 +219,9 @@
     e.stopPropagation();
     const targetUrl = url();
     if (targetUrl) {
-      const wsId = $activeWorkspaceId;
-      if (wsId) {
+      if (workspaceId) {
         await handleLink(targetUrl, {
-          workspaceId: WorkspaceId(wsId),
+          workspaceId: WorkspaceId(workspaceId),
           event: e,
         });
       }
@@ -234,7 +233,10 @@
   <!-- Wrap in clickable span to handle clicks outside tooltip -->
   <!-- svelte-ignore a11y_no_static_element_interactions -->
   <!-- svelte-ignore a11y_click_events_have_key_events -->
-  <span class="context-mention-wrapper group/pill relative inline-flex items-center" onclick={handleClick}>
+  <span
+    class="context-mention-wrapper group/pill relative inline-flex items-center"
+    onclick={handleClick}
+  >
     <TooltipRich side="top" align="start" delayDuration={300} interactive={true} maxWidth="20rem">
       {#snippet trigger()}
         <span
@@ -277,9 +279,7 @@
             <div class="flex flex-wrap items-center gap-1.5">
               <!-- State badge -->
               {#if meta.state}
-                <span
-                  class="px-1.5 py-0.5 rounded text-ui font-medium {getStateColor(meta.state)}"
-                >
+                <span class="px-1.5 py-0.5 rounded text-ui font-medium {getStateColor(meta.state)}">
                   {meta.state}
                 </span>
               {/if}
@@ -311,15 +311,12 @@
                 .map((l) => l.trim())
                 .filter(Boolean)
                 .slice(0, 5) as label}
-                <span
-                  class="px-1.5 py-0.5 rounded-full text-ui font-medium bg-muted/50 text-subtle"
+                <span class="px-1.5 py-0.5 rounded-full text-ui font-medium bg-muted/50 text-subtle"
                   >{label}</span
                 >
               {/each}
               {#if meta.labels.split(',').length > 5}
-                <span class="text-ui text-subtle"
-                  >+{meta.labels.split(',').length - 5}</span
-                >
+                <span class="text-ui text-subtle">+{meta.labels.split(',').length - 5}</span>
               {/if}
             </div>
           {/if}
@@ -343,16 +340,17 @@
 
           <!-- Footer: project + timestamps -->
           {#if meta && (meta.project || meta.createdAt || meta.author)}
-            <div class="flex items-center gap-2 pt-1 border-t border-border/30">
+            <div class="flex items-center gap-2 pt-1 border-t border-border">
               {#if meta.project}
                 <span class="text-ui text-subtle">{meta.project}</span>
               {/if}
               {#if meta.author}
-                <span class="text-ui text-subtle">{m.tiptap_contextMention_byAuthor_label({ author: meta.author })}</span>
+                <span class="text-ui text-subtle"
+                  >{m.tiptap_contextMention_byAuthor_label({ author: meta.author })}</span
+                >
               {/if}
               {#if meta.createdAt}
-                <span class="text-ui text-subtle ml-auto"
-                  >{formatRelativeTime(meta.createdAt)}</span
+                <span class="text-ui text-subtle ml-auto">{formatRelativeTime(meta.createdAt)}</span
                 >
               {/if}
             </div>
@@ -385,7 +383,11 @@
 
   <!-- Branch switch button - positioned to the right of the pill -->
   {#if branchDiffers}
-    <Tooltip content={m.tiptap_contextMention_switchBranch_tooltip()} side="top" delayDuration={200}>
+    <Tooltip
+      content={m.tiptap_contextMention_switchBranch_tooltip()}
+      side="top"
+      delayDuration={200}
+    >
       <button
         type="button"
         onclick={handleSwitchToPRBranch}

@@ -1,5 +1,5 @@
 <script lang="ts">
-/* eslint-disable max-lines */
+  /* eslint-disable max-lines */
   /**
    * EcosystemCanvas - Canvas-based organic visualization
    * Uses force simulation for layout and smooth blob shapes for folders
@@ -7,23 +7,13 @@
    */
   import type { FileNode, ProcessedNode, BlobShape, EcosystemSettings } from './types';
   import { DEFAULT_ECOSYSTEM_SETTINGS } from './types';
-  import {
-  processTree,
-  getLeafNodes,
-  findNodeAtPosition,
-} from './tree-processor';
+  import { processTree, getLeafNodes, findNodeAtPosition } from './tree-processor';
   import { runForceSimulation } from './force-simulation';
-  import {
-  computeBlobShapes,
-  drawBlobToCanvas,
-} from './blob-shapes';
-  import {
-  tick,
-  untrack,
-} from 'svelte';
+  import { computeBlobShapes, drawBlobToCanvas } from './blob-shapes';
+  import { tick, untrack } from 'svelte';
   import { tweened } from 'svelte/motion';
   import { cubicOut } from 'svelte/easing';
-  import * as m from '$shared/paraglide/messages.js';
+  import { m } from '$shared/paraglide/messages.js';
 
   // Change type colors matching repo-visualizer
   const CHANGE_COLORS = {
@@ -193,7 +183,7 @@
 
   // CSS colors cache
   let cssColors = $state({
-    border: '#27272a',
+    border: '',
     muted: '#27272a',
     mutedFg: '#a1a1aa',
     fg: '#fafafa',
@@ -533,7 +523,7 @@
     if (!container) return;
     const style = getComputedStyle(container);
     cssColors = {
-      border: style.getPropertyValue('--color-border').trim() || '#27272a',
+      border: style.getPropertyValue('--color-border').trim(),
       muted: style.getPropertyValue('--color-muted').trim() || '#27272a',
       mutedFg: style.getPropertyValue('--color-muted-foreground').trim() || '#a1a1aa',
       fg: style.getPropertyValue('--color-foreground').trim() || '#fafafa',
@@ -1279,7 +1269,7 @@
           </div>
         </div>
         {#if hoveredNode.size > 0 && !hoveredNode.isFolder}
-          <div class="mt-1 pt-1 border-t border-border/50 text-subtle">
+          <div class="mt-1 pt-1 border-t border-border text-subtle">
             {m.ecosystem_canvas_fileSize_label({ size: (hoveredNode.size / 1024).toFixed(1) })}
           </div>
         {/if}
@@ -1390,12 +1380,16 @@
         <button
           class="flex items-center gap-3 px-2.5 py-1.5 rounded text-xs cursor-pointer border {showChangesMode
             ? 'bg-background/95 text-foreground shadow-sm border-border'
-            : 'bg-background/70 text-muted-foreground hover:bg-background/90 border-border/10'}"
+            : 'bg-background/70 text-muted-foreground hover:bg-background/90 border-border'}"
           onclick={() => (showChangesMode = !showChangesMode)}
-          title={showChangesMode ? m.ecosystem_canvas_showFileTypes_tooltip() : m.ecosystem_canvas_highlightChanges_tooltip()}
+          title={showChangesMode
+            ? m.ecosystem_canvas_showFileTypes_tooltip()
+            : m.ecosystem_canvas_highlightChanges_tooltip()}
         >
           <span class="opacity-60"
-            >{showChangesMode ? m.ecosystem_canvas_highlightingChanged_label() : m.ecosystem_canvas_highlightChanged_label()}</span
+            >{showChangesMode
+              ? m.ecosystem_canvas_highlightingChanged_label()
+              : m.ecosystem_canvas_highlightChanged_label()}</span
           >
           {#if filesChanged.length > 0}
             <span class="flex items-center gap-1">
@@ -1408,7 +1402,8 @@
             <span class="flex items-center gap-1">
               <span class="w-2 h-2 rounded-full" style="background-color: {CHANGE_COLORS.committed}"
               ></span>
-              <span>{m.ecosystem_canvas_unpushedCount_label({ count: filesCommitted.length })}</span>
+              <span>{m.ecosystem_canvas_unpushedCount_label({ count: filesCommitted.length })}</span
+              >
             </span>
           {/if}
           {#if filesPR.length > 0}

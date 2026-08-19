@@ -1,36 +1,33 @@
 <script lang="ts">
-/* eslint-disable max-lines */
+  /* eslint-disable max-lines */
   /**
    * ChangeTimeline - Main timeline component
    * Shows changes organized by location: local, branch, remote branch, trunk
    */
-  import {
-  fly,
-  slide,
-} from 'svelte/transition';
+  import { fly, slide } from 'svelte/transition';
   import Fa from 'svelte-fa';
   import {
-  faPlus,
-  faMinus,
-  faCodeCommit,
-  faSpinner,
-  faRobot,
-  faArrowRight,
-  faCodePullRequest,
-  faEye,
-  faChevronRight,
-  faUser,
-  faCheck,
-  faStop,
-  faWandMagicSparkles,
-  faRotateRight,
-  faHistory,
-  faCodeMerge,
-  faRocket,
-  faCheckCircle,
-  faLink,
-  faArrowUpRightFromSquare,
-} from '@fortawesome/free-solid-svg-icons';
+    faPlus,
+    faMinus,
+    faCodeCommit,
+    faSpinner,
+    faRobot,
+    faArrowRight,
+    faCodePullRequest,
+    faEye,
+    faChevronDown,
+    faUser,
+    faCheck,
+    faStop,
+    faWandMagicSparkles,
+    faRotateRight,
+    faHistory,
+    faCodeMerge,
+    faRocket,
+    faCheckCircle,
+    faLink,
+    faArrowUpRightFromSquare,
+  } from '@fortawesome/free-solid-svg-icons';
   import { Button } from '$lib/components/ui/button';
   import { Textarea } from '$lib/components/ui/textarea';
   import { Input } from '$lib/components/ui/input';
@@ -40,12 +37,12 @@
   import CommitNode from './CommitNode.svelte';
   import PRNode from './PRNode.svelte';
   import {
-  type UIFileChange,
-  type PRInfo,
-  groupFilesByAgent,
-  type AgentChangeGroup,
-} from './types';
-  import AuggieAvatar from '$lib/components/ui/auggie-avatar/AuggieAvatar.svelte';
+    type UIFileChange,
+    type PRInfo,
+    groupFilesByAgent,
+    type AgentChangeGroup,
+  } from './types';
+  import AgentAvatar from '$features/agent/components/agent-avatar/AgentAvatar.svelte';
   import { selectAllWorkspaceAgents } from '$store/renderer/slices/workspace-agents/workspace-agents-selectors';
 
   import type { Workspace } from '$shared/types';
@@ -599,7 +596,9 @@
     {/if}
     <div>
       {#if !isStreamingPR}
-        <span class="text-xs text-subtle mb-1 block">{m.fileTracking_changeTimeline_title_label()}</span>
+        <span class="text-xs text-subtle mb-1 block"
+          >{m.fileTracking_changeTimeline_title_label()}</span
+        >
         <Input
           value={prTitle}
           oninput={handlePRTitleInput}
@@ -661,7 +660,7 @@
               <Button
                 variant="ghost"
                 size="icon-xs"
-                class="h-6 w-6 text-muted-foreground hover:text-destructive-foreground"
+                class="h-6 w-6 text-muted-foreground hover:text-error-foreground"
                 onclick={onStopGeneratingPR}
                 tooltip={m.fileTracking_changeTimeline_stopGenerating_tooltip()}
                 tooltipSide="top"
@@ -831,7 +830,7 @@
                     <Button
                       variant="ghost"
                       size="xs"
-                      class="h-5 px-2 text-muted-foreground hover:text-destructive-foreground"
+                      class="h-5 px-2 text-muted-foreground hover:text-error-foreground"
                       onclick={isAutofillAndCreatingPR || backgroundOperation?.type === 'create-pr'
                         ? onStopGeneratingPR
                         : onStopGeneratingMessage}
@@ -978,21 +977,18 @@
                                 onclick={() => toggleAgentGroup(group.agentId)}
                               >
                                 <Fa
-                                  icon={faChevronRight}
-                                  class="h-2.5! w-2.5! text-muted-foreground group-hover/row:text-muted-foreground shrink-0 transition-transform {!isCollapsed &&
+                                  icon={faChevronDown}
+                                  class="h-2.5! w-2.5! text-muted-foreground group-hover/row:text-muted-foreground shrink-0 transition-transform {isCollapsed &&
                                     'rotate-90'}"
                                 />
                                 {#if group.agentId}
-                                  <AuggieAvatar
+                                  <AgentAvatar
                                     class="-mt-1 -mr-0.5"
                                     agentId={group.agentId}
                                     size={18}
                                   />
                                 {:else}
-                                  <Fa
-                                    icon={faUser}
-                                    class="h-3 w-3 text-ghost ml-0.5 mr-0.5"
-                                  />
+                                  <Fa icon={faUser} class="h-3 w-3 text-ghost ml-0.5 mr-0.5" />
                                 {/if}
                                 <span class="text-xs font-medium truncate">
                                   {getAgentDisplayName(group)}
@@ -1151,16 +1147,12 @@
                                 }}
                               >
                                 <Fa
-                                  icon={faChevronRight}
-                                  class="h-2.5! w-2.5! text-muted-foreground group-hover/row:text-muted-foreground shrink-0 transition-transform {!isCollapsed &&
+                                  icon={faChevronDown}
+                                  class="h-2.5! w-2.5! text-muted-foreground group-hover/row:text-muted-foreground shrink-0 transition-transform {isCollapsed &&
                                     'rotate-90'}"
                                 />
                                 {#if group.agentId}
-                                  <AuggieAvatar
-                                    class="-mt-1"
-                                    agentId={group.agentId}
-                                    size={18}
-                                  />
+                                  <AgentAvatar class="-mt-1" agentId={group.agentId} size={18} />
                                 {:else}
                                   <Fa icon={faUser} class="h-3 w-3 text-ghost" />
                                 {/if}
@@ -1288,10 +1280,7 @@
                           </span>
                         {:else}
                           <!-- Generating phase: show spinner -->
-                          <Fa
-                            icon={faSpinner}
-                            class="h-3 w-3 animate-spin text-subtle shrink-0"
-                          />
+                          <Fa icon={faSpinner} class="h-3 w-3 animate-spin text-subtle shrink-0" />
                           <span class="text-subtle truncate flex-1">
                             {#if isAutofillAndCreatingPR || backgroundOperation?.type === 'create-pr'}
                               {generatingPRStatus ||
@@ -1325,7 +1314,7 @@
                           <Button
                             variant="ghost"
                             size="xs"
-                            class="h-5 px-1.5 text-muted-foreground hover:text-destructive-foreground"
+                            class="h-5 px-1.5 text-muted-foreground hover:text-error-foreground"
                             onclick={isAutofillAndCreatingPR ||
                             backgroundOperation?.type === 'create-pr'
                               ? onStopGeneratingPR
@@ -1422,9 +1411,7 @@
                       />
                       {#if isStreamingCommit || commitMessageAgentId}
                         <!-- Subtle streaming indicator / thought process button -->
-                        <div
-                          class="absolute bottom-2 right-2 flex items-center gap-3 text-subtle"
-                        >
+                        <div class="absolute bottom-2 right-2 flex items-center gap-3 text-subtle">
                           {#if isStreamingCommit}
                             <div class="flex gap-1">
                               <span
@@ -1458,7 +1445,7 @@
                             <Button
                               variant="ghost"
                               size="icon-xs"
-                              class="h-6 w-6 text-muted-foreground hover:text-destructive-foreground"
+                              class="h-6 w-6 text-muted-foreground hover:text-error-foreground"
                               onclick={onStopGeneratingMessage}
                               tooltip={m.fileTracking_changeTimeline_stopGenerating_tooltip()}
                               tooltipSide="top"
@@ -1540,7 +1527,7 @@
                           <Button
                             variant="ghost"
                             size="xs"
-                            class="h-5 px-1.5 text-muted-foreground hover:text-destructive-foreground"
+                            class="h-5 px-1.5 text-muted-foreground hover:text-error-foreground"
                             onclick={onStopGeneratingMessage}
                             tooltip={m.fileTracking_changeTimeline_stopGenerating_tooltip()}
                             tooltipSide="left"
@@ -1566,8 +1553,7 @@
                         class="w-full resize-none rounded border border-border bg-background px-2 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-accent"
                         rows="3"
                         placeholder={m.fileTracking_changeTimeline_commitMessage_placeholder()}
-                        bind:value={commitMessage}
-                      ></textarea>
+                        bind:value={commitMessage}></textarea>
                       <div class="flex items-center gap-2 flex-wrap mt-2">
                         <Button
                           variant="default"
@@ -1761,10 +1747,7 @@
                                 {/if}
                               </span>
                             {:else}
-                              <Fa
-                                icon={faSpinner}
-                                class="h-3 w-3 animate-spin text-subtle"
-                              />
+                              <Fa icon={faSpinner} class="h-3 w-3 animate-spin text-subtle" />
                               <span class="flex-1 text-left text-subtle">
                                 {#if isAutofillAndCreatingPR || backgroundOperation?.type === 'create-pr'}
                                   {generatingPRStatus ||
@@ -1779,28 +1762,22 @@
                           {#if backgroundOperation?.phase !== 'executing'}
                             <div class="flex-1 flex items-center gap-2">
                               {#if (isAutofillAndCreatingPR || backgroundOperation?.type === 'create-pr') && generatingPRPreview}
-                                <span
-                                  class="flex-1 text-left text-xs text-subtle truncate"
-                                >
+                                <span class="flex-1 text-left text-xs text-subtle truncate">
                                   {generatingPRPreview.split('\n').pop()?.slice(0, 60) || ''}
                                 </span>
                               {:else if !isAutofillAndCreatingPR && backgroundOperation?.type !== 'create-pr' && generatingMessagePreview}
-                                <span
-                                  class="flex-1 text-left text-xs text-subtle truncate"
-                                >
+                                <span class="flex-1 text-left text-xs text-subtle truncate">
                                   {generatingMessagePreview.split('\n').pop()?.slice(0, 60) || ''}
                                 </span>
                               {:else}
-                                <span
-                                  class="flex-1 text-left text-xs text-subtle italic"
-                                >
+                                <span class="flex-1 text-left text-xs text-subtle italic">
                                   {m.fileTracking_changeTimeline_waitingForResponse_label()}
                                 </span>
                               {/if}
                               <Button
                                 variant="ghost"
                                 size="xs"
-                                class="h-5 px-1.5 text-muted-foreground hover:text-destructive-foreground"
+                                class="h-5 px-1.5 text-muted-foreground hover:text-error-foreground"
                                 onclick={isAutofillAndCreatingPR ||
                                 backgroundOperation?.type === 'create-pr'
                                   ? onStopGeneratingPR
@@ -1852,7 +1829,9 @@
                           </Button>
                           <Button
                             variant="ghost-light"
-                            class="py-0! {isSelectedForAction && prDrawerOpen ? 'bg-background' : ''}"
+                            class="py-0! {isSelectedForAction && prDrawerOpen
+                              ? 'bg-background'
+                              : ''}"
                             size="xs"
                             onclick={() => selectCommitAndToggle(index, 'pr')}
                           >
@@ -2152,7 +2131,9 @@
           </div>
 
           <div class="pl-10 pr-3 pb-3">
-            <div class="border border-border rounded-md overflow-hidden shadow-xs bg-background p-3 space-y-3">
+            <div
+              class="border border-border rounded-md overflow-hidden shadow-xs bg-background p-3 space-y-3"
+            >
               <p class="text-xs text-subtle">
                 {m.fileTracking_changeTimeline_addRemote_description()}
               </p>
@@ -2193,7 +2174,10 @@
                     <Button
                       variant="ghost-light"
                       size="xs"
-                      onclick={() => { connectRemoteOpen = false; connectRemoteUrl = ''; }}
+                      onclick={() => {
+                        connectRemoteOpen = false;
+                        connectRemoteUrl = '';
+                      }}
                     >
                       {m.terminal_sidebar_cancel_label()}
                     </Button>
@@ -2203,7 +2187,13 @@
                     <a
                       href="https://github.com/new"
                       class="text-primary hover:underline inline-flex items-center gap-0.5"
-                      onclick={(e) => { e.preventDefault(); handleLink('https://github.com/new', { workspaceId: workspaceId as WorkspaceId, event: e }); }}
+                      onclick={(e) => {
+                        e.preventDefault();
+                        handleLink('https://github.com/new', {
+                          workspaceId: workspaceId as WorkspaceId,
+                          event: e,
+                        });
+                      }}
                     >
                       {m.fileTracking_changeTimeline_createOnGithub_label()}
                       <Fa icon={faArrowUpRightFromSquare} class="h-2.5 w-2.5 opacity-70" />
@@ -2214,7 +2204,9 @@
                 <Button
                   variant="outline"
                   size="xs"
-                  onclick={() => { connectRemoteOpen = true; }}
+                  onclick={() => {
+                    connectRemoteOpen = true;
+                  }}
                 >
                   <Fa icon={faLink} class="h-3 w-3 opacity-50" />
                   <span>{m.fileTracking_changeTimeline_connectRemoteButton_label()}</span>

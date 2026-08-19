@@ -53,6 +53,14 @@ export interface QueuedMessage {
   contextItems?: QueuedMessageContextItem[];
   /** Optional image blocks attached to the message */
   imageBlocks?: Array<{ type: 'image'; data: string; mimeType: string }>;
+  /** Optional attachment-reference file blocks attached to the message */
+  fileBlocks?: Array<{
+    type: 'file';
+    attachmentId: string;
+    fileName: string;
+    mimeType?: string;
+    size?: number;
+  }>;
   /** Position in queue (0 = next to be sent) */
   position: number;
   /**
@@ -150,6 +158,15 @@ export interface AgentSession {
    */
   reasoningEffort?: string | null;
 
+  /**
+   * Session-advertised reasoning-effort levels (§5.5, additive): the values
+   * the provider's `thought_level` config select advertised at the most
+   * recent session open, discovered and persisted by the daemon. Omitted when
+   * the provider advertised no such option. Takes precedence over the model's
+   * catalog `effortLevels` metadata in the picker gate; rendered verbatim.
+   */
+  effortLevels?: string[];
+
   /** ACP provider ID (e.g., "auggie", "claude-code", "opencode"). Mutable only until first real session use, then locked. */
   provider?: string;
 
@@ -212,11 +229,38 @@ export interface AgentSession {
   currentTurnNumber?: number;
 
   // ========== Unread Tracking ==========
-  /** Whether the agent has unread messages (new responses since last viewed) */
+  /**
+   * Whether the agent has unread messages. FE-derived at wire ingest
+   * (`normalizeAgent`) from the §5.5 AgentLite freshness fields:
+   * `lastMessageRole === 'assistant' && lastMessageId != null &&
+   * lastMessageId !== metadata.lastSeenMessageId` (an absent seen marker
+   * counts as unread). See `deriveAgentHasUnread` and
+   * intent-hq/monorepo#1597. Always `false` for daemons that omit
+   * `lastMessageId`.
+   */
   hasUnread?: boolean;
 
   /** When the user last viewed this agent's messages */
   lastViewedAt?: Date | string;
+
+  /** ISO deadline of an in-memory pending deletion (PROTOCOL §5.5 delete grace
+   *  window, v6.7+). Present only while an `agent.delete { undoDelayMs > 0 }`
+   *  grace window is running; cleared by `agent.cancelDelete` and dropped by a
+   *  daemon restart (the session survives). Rows carrying it are hidden from
+   *  the FE agent list. */
+  pendingDeleteAt?: string;
+
+  /** Harness version stamped at session creation (PROTOCOL §5.5, additive;
+   *  e.g. "1.0" — legacy rows backfill to "1.0"). Immutable creation-time
+   *  stamp — a daemon upgrade never changes it. Omitted by older daemons.
+   *  Rendered verbatim (read-only). */
+  harnessVersion?: string;
+
+  /** Effective agent-feature on/off values captured at session creation
+   *  (PROTOCOL §5.5, additive; camelCase keys per the §5.12 catalog).
+   *  Immutable snapshot; legacy rows without a snapshot project the daemon's
+   *  current settings on read. Omitted by older daemons. */
+  harnessFeatures?: Record<string, boolean>;
 
   // ========== UI State ==========
   /** Current user message being composed */
@@ -229,18 +273,24 @@ export interface AgentSession {
   lastAgentResponse?: string;
 
   /**
-   * Most recent tool call of the in-flight turn (PROTOCOL §7, additive on the
-   * tool-call arm of `agent:stream:activity`). Push-applied by the
-   * daemon-events bridge so a non-viewed agent's preview advances during
-   * tool-only stretches, and cleared by it at each turn boundary and on the
-   * terminal `agent:stream:end` — the field describes a running turn only.
-   * Omitted by older daemons and before the turn's first tool call. Stored
-   * verbatim; only `name` is rendered today (`status` mirrors the wire shape
-   * for the queued footer status indicator).
+   * Most recent tool call preview, from two wire sources sharing this field:
+   * (a) the in-flight turn's live tool signal (PROTOCOL §7, tool-call arm of
+   * `agent:stream:activity`, `{ name, status? }`) — push-applied by the
+   * daemon-events bridge, cleared at each turn boundary and on the terminal
+   * `agent:stream:end`; (b) the PERSISTED `AgentLite.lastToolUse` preview
+   * (PROTOCOL §5.5, additive — `{ name, input?, inputTruncated?, inputBytes? }`,
+   * the newest user/assistant message's last `tool_use` block with `input`
+   * bounded by the slim-projection budget), served on `agent.list`/`agent.get`
+   * and on every user/assistant `agent:last-message` event (§6.5), where its
+   * absence means the preview was just cleared. Omitted by older daemons.
+   * Stored verbatim.
    */
   lastToolUse?: {
     name: string;
     status?: string;
+    input?: Record<string, unknown>;
+    inputTruncated?: boolean;
+    inputBytes?: number;
   };
 
   /**
@@ -252,8 +302,26 @@ export interface AgentSession {
    */
   lastMessageRole?: 'user' | 'assistant';
 
+  /**
+   * Id of the session's newest user/assistant transcript message
+   * (PROTOCOL.md §5.5 `AgentLite` additive field) — the same message
+   * `lastMessageRole` describes. Omitted by older daemons and when the
+   * session has no user/assistant message. Compared against
+   * `metadata.lastSeenMessageId` to derive `hasUnread`.
+   */
+  lastMessageId?: string;
+
   /** Whether the agent is currently responding */
   isResponding?: boolean;
+
+  /**
+   * Daemon-owned turn liveness (PROTOCOL.md §5.5, STAB-125). True while an
+   * active worker is draining a session/prompt turn for this agent.
+   */
+  turnInFlight?: boolean;
+
+  /** Most recent stream activity for the in-flight turn (RFC-3339). */
+  lastStreamActivityAt?: string;
 
   /**
    * Daemon-owned activity flag (PROTOCOL.md §5.5): the in-flight turn has an
@@ -279,15 +347,42 @@ export interface AgentSession {
   waitingForAgentIds?: string[];
 
   /**
+   * Idle-visibility for hook-owning agents (PROTOCOL.md §5.5, within v3.1,
+   * additive): light metadata for the agent's ACTIVE (`scheduled`/`running`)
+   * background hooks (§5.40), omitted when empty (absent, never `[]`) — so
+   * a parent or client can tell a hook-waiting idle agent from a stalled
+   * one. Emitted on `AgentLite` (`agent.list`/`agent.get`), the `agent:idle`
+   * event payload, and `agent.diagnostics` agent rows. Rendered verbatim.
+   */
+  waitingOnHooks?: Array<{ hookId: string; name: string; nextRunAt?: string; expiresAt?: string }>;
+
+  /**
+   * Idle-visibility for PR-monitor-owning agents — the `waitingOnHooks`
+   * companion for centralized PR monitoring (§5.42): light metadata for the
+   * agent's active PR monitors, omitted when empty (absent, never `[]`), so
+   * a parent or client can tell a PR-monitor-waiting idle agent from a
+   * stalled one. Rendered verbatim.
+   */
+  waitingOnPrMonitors?: Array<{
+    monitorId: string;
+    repo: string;
+    prNumber: number;
+    title?: string;
+  }>;
+
+  /**
    * Process queue hint (PROTOCOL §6.5 agent:process:queued/resumed).
-   * Set when the agent is queued for a process slot, cleared when resumed or
-   * transitions to normal running state. UI renders as "Waiting for a free agent
-   * slot (used/cap busy)".
+   * Set when the agent is queued for admission (a process slot or memory
+   * headroom), cleared when resumed or transitions to normal running state.
+   * `reason` names the constraint the spawn queued under
+   * (intent-hq/intentd#1196); an absent wire `reason` (older daemons) is
+   * normalized to `'slots'` at the events bridge.
    */
   processQueueHint?: {
     waiting: boolean;
     used: number;
     cap: number;
+    reason: 'slots' | 'memory-budget';
   };
 
   /** Canonical stop/finish reason from the latest terminal stream/status event */

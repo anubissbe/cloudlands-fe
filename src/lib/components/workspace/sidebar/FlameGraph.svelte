@@ -1,31 +1,28 @@
 <script lang="ts">
   import type { Note, TaskStatus } from '$shared/types';
   import { isSpecNote } from '$shared/constants/notes';
-  import {
-  extractOrderedSpecTaskIds,
-  extractSpecTaskIds,
-} from '$shared/utils/task-stats';
-  import Fa from 'svelte-fa';
-  import { faFileAlt } from '@fortawesome/free-solid-svg-icons';
-  import { Tooltip } from '$lib/components/ui/tooltip';
+  import { extractOrderedSpecTaskIds, extractSpecTaskIds } from '$shared/utils/task-stats';
   import { m } from '$shared/paraglide/messages.js';
-
+  import { formatInteger } from '$lib/i18n/format';
+  import { Tooltip } from '$lib/components/ui/tooltip';
+  import { TASK_STATUS_INDICATOR_CLASSES, TASK_STATUS_LABELS } from '../utils/task-status-display';
+  import TaskStatusProgress from '../TaskStatusProgress.svelte';
   interface Props {
     notes: Note[];
-    onCellClick?: (noteId: string) => void;
-    onCellHover?: (noteId: string | null) => void;
-    onSpecClick?: () => void;
-    hoveredNoteId?: string | null;
-    hasUnreadChanges?: (noteId: string) => boolean;
+    onTaskClick?: (noteId: string) => void;
+    /** Canonical BE-owned completion ratio, from 0 to 1. Undefined while loading. */
+    progress?: number;
+    loading?: boolean;
+    /** Remounts the visual bar so workspace switches replay the entrance animation. */
+    animationKey?: string;
   }
 
   let {
     notes = [],
-    onCellClick,
-    onCellHover,
-    onSpecClick,
-    hoveredNoteId = null,
-    hasUnreadChanges = () => false,
+    onTaskClick,
+    progress,
+    loading = progress === undefined,
+    animationKey,
   }: Props = $props();
 
   // Tree node with computed weight (leaf count)
@@ -34,11 +31,6 @@
     children: TaskTreeNode[];
     weight: number;
     isLeaf: boolean;
-  }
-
-  interface RowCell {
-    node: TaskTreeNode | null;
-    colspan: number;
   }
 
   // Sort notes by their order in the parent's content, falling back to peerOrder/createdAt
@@ -133,8 +125,7 @@
     const specTaskIds = extractSpecTaskIds(specNote?.content);
     const hasSpecLinks = specTaskIds.size > 0;
     const roots = taskNotes.filter(
-      (n) =>
-        isSpecNote(n.parentId as string) && (!hasSpecLinks || specTaskIds.has(n.id as string)),
+      (n) => isSpecNote(n.parentId as string) && (!hasSpecLinks || specTaskIds.has(n.id as string)),
     );
 
     // Sort roots by their order in the spec note content
@@ -143,111 +134,96 @@
     return sortedRoots.map(buildNode);
   }
 
-  function treeToRows(roots: TaskTreeNode[]): RowCell[][] {
-    if (roots.length === 0) return [];
-    // Only return the first depth (root level)
-    const firstRow: RowCell[] = roots.map((node) => ({ node, colspan: 1 }));
-    return [firstRow];
-  }
-
-  function getStatusColor(status: TaskStatus): string {
-    switch (status) {
-      case 'complete':
-        return 'bg-emerald-500';
-      case 'in_progress':
-        return 'bg-sky-400';
-      case 'review_required':
-        return 'bg-blue-500';
-      case 'waiting':
-        return 'bg-muted';
-      default:
-        return 'bg-muted/60';
-    }
+  function flattenTasks(nodes: TaskTreeNode[]): TaskTreeNode[] {
+    return nodes.flatMap((node) => [node, ...flattenTasks(node.children)]);
   }
 
   const taskTree = $derived(buildTaskTree(notes));
-  const flameRows = $derived(treeToRows(taskTree));
-  const hasFocus = $derived(hoveredNoteId !== null);
-  const taskCount = $derived(taskTree.length);
-  const tooltipContent = $derived(() => {
-    const items = flameRows[0]?.filter((c) => c.node?.note.title) || [];
-    const maxItems = 5;
-    const visibleItems = items.slice(0, maxItems);
-    const remaining = items.length - maxItems;
-    const maxTitleLength = 50;
-    const truncateTitle = (title: string) =>
-      title.length > maxTitleLength ? title.slice(0, maxTitleLength) + '…' : title;
-    const itemsList = visibleItems
-      .map((c) => `\n •  ${truncateTitle(c.node?.note.title || '')}`)
-      .join('');
-    const moreText = remaining > 0 ? `\n + ${remaining} more` : '';
-    return `${taskCount} task${taskCount === 1 ? '' : 's'} in the Spec note${itemsList}${moreText}`;
-  });
+  const taskList = $derived(flattenTasks(taskTree));
+  const specNoteId = $derived(
+    notes.find((note) => isSpecNote(note.id as string))?.id as string | undefined,
+  );
+  const taskCount = $derived(taskList.length);
+  const completedCount = $derived(
+    taskList.filter((task) => task.note.metadata?.task?.status === 'complete').length,
+  );
+  const taskStatuses = $derived(
+    taskList.map((task) => task.note.metadata?.task?.status ?? ('not_started' as TaskStatus)),
+  );
 </script>
 
-{#if flameRows.length > 0}
-  <div class="w-full flex items-center gap-1.5">
-    <!-- Doc icon to open spec -->
-    <Tooltip content={tooltipContent()} side="bottom" align="start" sideOffset={4} showArrow>
+{#snippet taskListTooltip()}
+  <div
+    class="flex h-auto min-h-0 max-h-72 w-72 flex-col overflow-x-hidden overflow-y-auto px-2 pt-2"
+  >
+    <button
+      type="button"
+      class="type-caption mb-1 w-full cursor-pointer text-left font-normal text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring/40 disabled:cursor-default"
+      onclick={() => specNoteId && onTaskClick?.(specNoteId)}
+      disabled={!specNoteId || !onTaskClick}
+      aria-label={m.workspace_flameGraph_openSpecProgress_ariaLabel({
+        completed: formatInteger(completedCount),
+        total: formatInteger(taskCount),
+      })}
+    >
+      {m.workspace_flameGraph_tasksComplete_label({
+        completed: formatInteger(completedCount),
+        total: formatInteger(taskCount),
+      })}
+    </button>
+    {#each taskList as task (task.note.id)}
+      {@const status = task.note.metadata?.task?.status ?? 'not_started'}
       <button
         type="button"
-        class="shrink-0 p-0.5 text-muted-foreground hover:text-muted-foreground transition-colors cursor-pointer"
-        onclick={() => onSpecClick?.()}
-        aria-label={m.workspace_flameGraph_openSpec_ariaLabel()}
+        class="flex w-full min-w-0 cursor-pointer items-center gap-2 rounded px-1 py-1 text-left focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring/40"
+        onclick={() => onTaskClick?.(task.note.id as string)}
+        aria-label={m.workspace_flameGraph_openTask_ariaLabel({
+          title: task.note.title,
+          status: TASK_STATUS_LABELS[status],
+        })}
       >
-        <Fa icon={faFileAlt} size="xs" />
+        <span
+          class="size-2 shrink-0 rounded-full {TASK_STATUS_INDICATOR_CLASSES[status]}"
+          aria-hidden="true"
+        ></span>
+        <span class="type-caption min-w-0 flex-1 truncate text-foreground">{task.note.title}</span>
+        <span class="type-caption shrink-0 font-normal! text-subtle"
+          >{TASK_STATUS_LABELS[status]}</span
+        >
       </button>
-    </Tooltip>
-
-    <table class="flex-1 flex">
-      <tbody class="flex-1 flex">
-        {#each flameRows as row, rowIndex (`row-${rowIndex}`)}
-          <tr class="h-3 flex flex-1 justify-end">
-            {#each row as cell, cellIndex (`cell-${rowIndex}-${cellIndex}`)}
-              {#if cell.node}
-                {@const noteId = cell.node.note.id as string}
-                {@const isUnread = hasUnreadChanges(noteId)}
-                {@const isFocused = noteId === hoveredNoteId}
-                {@const status = cell.node.note.metadata?.task?.status ?? 'not_started'}
-                <td
-                  colspan={cell.colspan}
-                  class="flex-1 p-[0.5px] min-w-0.75 relative transition-all duration-150 {cellIndex ===
-                  0
-                    ? 'rounded-l-xs'
-                    : cellIndex === row.length - 1
-                      ? 'rounded-r-xs'
-                      : ''}"
-                  class:opacity-40={hasFocus && !isFocused}
-                  class:scale-y-120={isFocused}
-                  onmouseenter={() => onCellHover?.(noteId)}
-                  onmouseleave={() => onCellHover?.(null)}
-                >
-                  <button
-                    type="button"
-                    class="block w-full h-full min-h-2.5 border-none cursor-pointer px-[0.5px] relative transition-all hover:brightness-110 {cellIndex ===
-                    0
-                      ? 'rounded-l-xs'
-                      : cellIndex === row.length - 1
-                        ? 'rounded-r-xs'
-                        : ''} {getStatusColor(status)}"
-                    style="anchor-name: --task-{noteId}"
-                    onclick={() => onCellClick?.(noteId)}
-                    aria-label={cell.node.note.title}
-                  >
-                    {#if isUnread}
-                      <span
-                        class="absolute top-1/2 -translate-y-1/2 left-1 size-0.75 bg-background rounded-full"
-                      ></span>
-                    {/if}
-                  </button>
-                </td>
-              {:else}
-                <td colspan={cell.colspan} class="bg-transparent"></td>
-              {/if}
-            {/each}
-          </tr>
-        {/each}
-      </tbody>
-    </table>
+    {/each}
   </div>
-{/if}
+{/snippet}
+
+{#key animationKey}
+  {#if loading}
+    <TaskStatusProgress
+      statuses={[]}
+      {progress}
+      loading
+      {animationKey}
+      ariaLabel={m.workspace_flameGraph_taskProgress_ariaLabel()}
+    />
+  {:else}
+    <Tooltip
+      content={taskListTooltip}
+      side="bottom"
+      align="start"
+      sideOffset={6}
+      delayDuration={300}
+      disableHoverableContent={false}
+      contentClass="h-auto! min-h-0! max-w-80 border-foreground/20! bg-secondary! p-0! text-secondary-foreground! shadow-(--elevation-overlay)! ring-1 ring-foreground/10 whitespace-normal"
+      class="w-full {specNoteId && onTaskClick ? 'cursor-pointer' : ''}"
+      onclick={() => specNoteId && onTaskClick?.(specNoteId)}
+      showArrow
+    >
+      <TaskStatusProgress
+        statuses={taskStatuses}
+        {progress}
+        loading={false}
+        {animationKey}
+        ariaLabel={m.workspace_flameGraph_taskProgress_ariaLabel()}
+      />
+    </Tooltip>
+  {/if}
+{/key}

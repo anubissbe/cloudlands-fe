@@ -1,70 +1,64 @@
 <script lang="ts">
   import type { Note, TaskStatus } from '$shared/types';
-  import {
-  ListContainer,
-  ListItem,
-} from '$lib/components/ui/list';
+  import { ListContainer, ListItem } from '$lib/components/ui/list';
   import { Skeleton } from '$lib/components/ui/skeleton';
   import { cn } from '$lib/utils';
   import {
-  getNoteIcon,
-  getNoteTitle,
-  sortNotes,
-  isChildNote,
-  isSpecNote,
-  getChildNotes,
-  getNoteDepth,
-  isHiddenByAnyCollapsedAncestor,
-  parseTaskStats,
-  getNoteIconClass,
-} from './utils';
+    getNoteTitle,
+    sortNotes,
+    isChildNote,
+    isSpecNote,
+    getChildNotes,
+    getNoteDepth,
+    isHiddenByAnyCollapsedAncestor,
+    parseTaskStats,
+  } from './utils';
   import {
-  faChevronDown,
-  faPlus,
-  faArrowUpRightFromSquare,
-  faPencil,
-  faTrash,
-} from '@fortawesome/free-solid-svg-icons';
+    faChevronDown,
+    faPlus,
+    faArrowUpRightFromSquare,
+    faPencil,
+    faTrash,
+  } from '@fortawesome/free-solid-svg-icons';
   import Fa from 'svelte-fa';
   import { m } from '$shared/paraglide/messages.js';
   import { selectUnreadNoteIds } from '$store/renderer/slices/note-read-tracking/note-read-tracking-selectors';
   import TaskStatusIcon from '$lib/components/tiptap/TaskStatusIcon.svelte';
-  import AugieAvatarWithState from '$lib/components/ui/auggie-avatar/AugieAvatarWithState.svelte';
+  import AgentAvatarWithState from '$features/agent/components/agent-avatar/AgentAvatarWithState.svelte';
   import {
-  type AvatarState,
-  getAvatarState,
-} from '$lib/components/ui/auggie-avatar/avatar-state';
+    type AvatarState,
+    getAvatarState,
+  } from '$features/agent/components/agent-avatar/avatar-state';
   import {
-  selectAgentIsResponding,
-  selectAgentIsWaiting,
-  selectAgentSessionsByIds,
-} from '$store/renderer/slices/agent-session/agent-session-selectors';
+    selectAgentIsResponding,
+    selectAgentIsWaiting,
+    selectAgentSessionsByIds,
+  } from '$store/renderer/slices/agent-session/agent-session-selectors';
 
   import { writable } from 'svelte/store';
   import {
-  setWorkspaceNoteOrder,
-  toggleWorkspaceCollapsedNote,
-} from '$store/renderer/slices/sidebar-nav/sidebar-nav-slice';
+    setWorkspaceNoteOrder,
+    toggleWorkspaceCollapsedNote,
+  } from '$store/renderer/slices/sidebar-nav/sidebar-nav-slice';
   import {
-  selectWorkspaceCollapsedNoteIds,
-  selectWorkspaceNoteOrder,
-} from '$store/renderer/slices/sidebar-nav/sidebar-nav-selectors';
+    selectWorkspaceCollapsedNoteIds,
+    selectWorkspaceNoteOrder,
+  } from '$store/renderer/slices/sidebar-nav/sidebar-nav-selectors';
   import { tick } from 'svelte';
   import SidebarContextMenu from '$lib/components/ui/sidebar-context-menu/SidebarContextMenu.svelte';
   import type { SidebarMenuEntry } from '$lib/components/ui/sidebar-context-menu/types';
   import {
-  getPanelLayoutManager,
-  hasPanelLayoutManager,
-} from '$features/layout/panel-layout-adapter';
+    getPanelLayoutManager,
+    hasPanelLayoutManager,
+  } from '$features/layout/panel-layout-adapter';
 
-  import {
-  deleteNote,
-  createNote,
-  updateNoteTitle,
-} from '$features/notes/notes-write-service';
+  import { deleteNote, createNote, updateNoteTitle } from '$features/notes/notes-write-service';
   import { toast } from 'svelte-sonner';
   import { store as appStore } from '$store/renderer/store';
-
+  import type { PanelTab } from '$store/renderer/slices/panel-layout/panel-layout-types';
+  import { getPanelTabOpenState } from '$store/renderer/slices/panel-layout/panel-layout-selectors';
+  import OpenPanelIndicator from './OpenPanelIndicator.svelte';
+  import ResourceIconTile from '$lib/components/shared/ResourceIconTile.svelte';
 
   interface Props {
     notes: Note[];
@@ -77,6 +71,9 @@
     loading?: boolean;
     class?: string;
     indentSize?: number; // Size of each indent level in px (default: 22)
+    flush?: boolean;
+    openPanelTabs?: PanelTab[];
+    activePanelTab?: PanelTab | null;
   }
 
   let {
@@ -90,6 +87,9 @@
     loading = false,
     class: className,
     indentSize = 22,
+    flush = false,
+    openPanelTabs = [],
+    activePanelTab,
   }: Props = $props();
 
   const workspaceIdStore = writable('');
@@ -209,26 +209,23 @@
           void deleteNote(workspaceId, note.id);
           closeContextMenu();
 
-          toast.warning(
-            `Deleted "${noteTitle}"`,
-            {
-              duration: 15000,
-              action: {
-                label: 'Undo',
-                onClick: () => {
-                  // eslint-disable-next-line intent/no-component-async-data-fetch -- sanctioned post-saga notes-write-service seam (dispatches optimistic store updates + AppClient mutation); not a component data fetch.
-                  void createNote(workspaceId, {
-                    title: savedNote.title,
-                    content: savedNote.content,
-                    contentType: savedNote.contentType,
-                    tags: savedNote.tags,
-                    parentId: savedNote.parentId,
-                    visibility: savedNote.visibility,
-                  });
-                },
+          toast.warning(`Deleted "${noteTitle}"`, {
+            duration: 15000,
+            action: {
+              label: 'Undo',
+              onClick: () => {
+                // eslint-disable-next-line intent/no-component-async-data-fetch -- sanctioned post-saga notes-write-service seam (dispatches optimistic store updates + AppClient mutation); not a component data fetch.
+                void createNote(workspaceId, {
+                  title: savedNote.title,
+                  content: savedNote.content,
+                  contentType: savedNote.contentType,
+                  tags: savedNote.tags,
+                  parentId: savedNote.parentId,
+                  visibility: savedNote.visibility,
+                });
               },
             },
-          );
+          });
         },
       });
     }
@@ -276,6 +273,7 @@
   // to avoid duplicate IPC calls from multiple components.
   const unreadNoteIds = selectUnreadNoteIds();
   const relevantAgentIds = $derived(collectAssignedAgentIds(renderedNotes));
+  // svelte-ignore state_referenced_locally - intentional initial capture; the $effect below syncs later changes
   const initialRelevantAgentIds = collectAssignedAgentIds(notes);
   const relevantAgentIdsStore = writable<string[]>(initialRelevantAgentIds);
   let relevantAgentIdsKey = initialRelevantAgentIds.join('\0');
@@ -418,6 +416,14 @@
       onOpenAgent(agentId);
     }
   }
+
+  function getNotePanelState(noteId: string) {
+    return getPanelTabOpenState(openPanelTabs, activePanelTab, workspaceId, {
+      type: 'note',
+      noteId,
+      workspaceId,
+    });
+  }
 </script>
 
 <div class={cn('w-full flex flex-col', className)}>
@@ -443,7 +449,7 @@
       {/each}
     </div>
   {:else}
-    <ListContainer class="w-full">
+    <ListContainer class={cn('w-full', flush && 'px-0')}>
       {#each sortedNotes as note (note.id)}
         {@const depth = getNoteDepth(note, notes)}
         {@const childNotes = getChildNotes(note, notes)}
@@ -469,6 +475,7 @@
               ? 'not_started'
               : undefined}
         {@const isUnread = $unreadNoteIds.includes(note.id as string)}
+        {@const panelState = getNotePanelState(note.id as string)}
         {#if !isHidden}
           <!-- svelte-ignore a11y_no_static_element_interactions -->
           <div
@@ -490,7 +497,7 @@
           >
             {#if editingNoteId === note.id}
               <!-- Inline edit mode - matches ListItem sm size styling with active state -->
-              {@const leftIndent = depth * Math.round(indentSize * 16 / 22)}
+              {@const leftIndent = depth * Math.round((indentSize * 16) / 22)}
               <div
                 class="flex items-center gap-2 py-0.5 px-2 rounded-md border border-border shadow-xs bg-background text-foreground"
                 style="margin-left: {leftIndent}px; width: calc(100% - {leftIndent}px);"
@@ -533,7 +540,7 @@
                     {/if}
                   </svg>
                 {:else}
-                  <Fa icon={getNoteIcon(note)} class={cn('w-3.5 h-3.5', getNoteIconClass(note))} />
+                  <ResourceIconTile kind="note" />
                 {/if}
                 <input
                   bind:this={editInputRef}
@@ -572,6 +579,7 @@
                       title={m.workspace_notesPanel_unreadChanges_tooltip()}
                     ></span>
                   {/if}
+                  <OpenPanelIndicator count={panelState.count} active={panelState.isActive} />
                 </ListItem>
 
                 <!-- Show active agents working on this note -->
@@ -584,13 +592,16 @@
                         onclick={onClick}
                         title={m.workspace_notesPanel_openAgent_tooltip()}
                       >
-                        <AugieAvatarWithState {agentId} size={16} {state} {specialist} />
+                        <AgentAvatarWithState {agentId} size={16} {state} {specialist} />
                       </button>
                     {/each}
                     {#if activeAgents.length > 3}
-                      <div class="text-ui text-subtle ml-1">
+                      <span
+                        class="ml-1! inline-flex w-max flex-none items-center bg-transparent text-xs leading-none text-subtle"
+                        data-agent-avatar-overflow
+                      >
                         +{activeAgents.length - 3}
-                      </div>
+                      </span>
                     {/if}
                   </div>
                 {/if}
@@ -682,14 +693,13 @@
                       title={m.workspace_notesPanel_unreadChanges_tooltip()}
                     ></span>
                   {/if}
+                  <OpenPanelIndicator count={panelState.count} active={panelState.isActive} />
                 </ListItem>
               </div>
             {:else}
               {@const activeAgents = getActiveAgentsForNote(note)}
               <div class="relative flex-1 w-full flex items-center gap-1">
                 <ListItem
-                  icon={getNoteIcon(note)}
-                  iconClass={getNoteIconClass(note)}
                   title={getNoteTitle(note)}
                   active={selectedNoteId === note.id}
                   indent={depth}
@@ -699,12 +709,16 @@
                   onclick={() => onOpenNote?.(note.id)}
                   class="cursor-pointer flex-1"
                 >
+                  {#snippet iconSnippet()}
+                    <ResourceIconTile kind="note" />
+                  {/snippet}
                   {#if isUnread}
                     <span
                       class="absolute top-0 -left-1 w-1.5 h-1.5 bg-background border border-muted-foreground/50 rounded-full"
                       title={m.workspace_notesPanel_unreadChanges_tooltip()}
                     ></span>
                   {/if}
+                  <OpenPanelIndicator count={panelState.count} active={panelState.isActive} />
                 </ListItem>
 
                 <!-- Show active agents working on this note -->
@@ -717,13 +731,16 @@
                         onclick={onClick}
                         title={m.workspace_notesPanel_openAgent_tooltip()}
                       >
-                        <AugieAvatarWithState {agentId} size={16} {state} {specialist} />
+                        <AgentAvatarWithState {agentId} size={16} {state} {specialist} />
                       </button>
                     {/each}
                     {#if activeAgents.length > 3}
-                      <div class="text-ui text-subtle ml-1">
+                      <span
+                        class="ml-1! inline-flex w-max flex-none items-center bg-transparent text-xs leading-none text-subtle"
+                        data-agent-avatar-overflow
+                      >
                         +{activeAgents.length - 3}
-                      </div>
+                      </span>
                     {/if}
                   </div>
                 {/if}

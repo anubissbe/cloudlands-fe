@@ -1,26 +1,12 @@
 import { readFileSync } from 'fs';
 import { join } from 'path';
-import {
-  afterEach,
-  beforeEach,
-  describe,
-  expect,
-  it,
-  vi,
-} from 'vitest';
-import {
-  cleanup,
-  fireEvent,
-  render,
-  screen,
-  waitFor,
-} from '@testing-library/svelte';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/svelte';
 import type { PanelTab } from '$store/renderer/slices/panel-layout/panel-layout-types';
 import { m } from '$shared/paraglide/messages.js';
 
 const {
   actionMocks,
-  writeFileServiceMocks,
   createMockSelector,
   dispatchMock,
   applyExternalFileContentToMockState,
@@ -35,6 +21,7 @@ const {
     error: string | null;
     isBinary: boolean;
     lastUpdated: number;
+    notFoundCandidates?: string[] | null;
   };
 
   type ActiveSelector = { update: () => void };
@@ -142,23 +129,10 @@ const {
 
   const actionMocks = {
     loadFileContentRequested: makeAction('files/loadFileContentRequested'),
-  };
-
-  // The component now delegates content saves to the files-write-service (which
-  // owns the debounce + AppClient seam call). The service is mocked here; its
-  // optimistic local update is simulated so the editor binding + dirty UI still
-  // reflect edits without touching the real store/seam.
-  const writeFileServiceMocks = {
-    writeFileContent: vi.fn(
-      (_wsId: string, path: string, _absolutePath: string, content: string) => {
-        const entry = mockReduxState.files[path];
-        if (entry) {
-          mockReduxState.files[path] = { ...entry, localContent: content };
-          flushMockSelectors();
-        }
-      },
-    ),
-    flushFileContent: vi.fn(),
+    saveFileContentRequested: makeAction('files/saveFileContentRequested'),
+    updateFileContent: makeAction('files/updateFileContent'),
+    removeFileContentEntry: makeAction('files/removeFileContentEntry'),
+    updateFileTabPath: makeAction('panelLayout/updateFileTabPath'),
   };
 
   const dispatchMock = vi.fn((action: { type: string; payload?: unknown[] }) => {
@@ -185,7 +159,6 @@ const {
 
   return {
     actionMocks,
-    writeFileServiceMocks,
     applyExternalFileContentToMockState,
     createMockSelector,
     dispatchMock,
@@ -195,7 +168,8 @@ const {
 });
 
 vi.mock('$store/renderer/store', async () => {
-  const { createAppStoreMockModule } = await import('$store/renderer/utils/test-helpers/store-mock');
+  const { createAppStoreMockModule } =
+    await import('$store/renderer/utils/test-helpers/store-mock');
 
   return createAppStoreMockModule({
     state: () => ({}),
@@ -226,11 +200,13 @@ vi.mock('$store/renderer/slices/files/files-selectors', () => ({
   selectFileLastUpdated: createMockSelector((_wsId: string, path: string | null | undefined) =>
     path ? (mockReduxState.files[path]?.lastUpdated ?? 0) : 0,
   ),
+  selectFileNotFoundCandidates: createMockSelector(
+    (_wsId: string, path: string | null | undefined) =>
+      path ? (mockReduxState.files[path]?.notFoundCandidates ?? null) : null,
+  ),
 }));
 
 vi.mock('$store/renderer/slices/files/files-slice', () => actionMocks);
-
-vi.mock('$features/files/files-write-service', () => writeFileServiceMocks);
 
 vi.mock('$store/renderer/slices/workspace/workspace-selectors', () => ({
   selectWorkspaceById: createMockSelector((wsId: string) =>
@@ -257,6 +233,7 @@ vi.mock('$store/renderer/slices/panel-layout/panel-layout-slice', () => ({
     type: 'panelLayout/closeTab',
     payload: [workspaceId, tabId],
   }),
+  updateFileTabPath: actionMocks.updateFileTabPath,
 }));
 
 vi.mock('$store/renderer/slices/workspace-navigation/workspace-navigation-slice', () => ({
@@ -282,7 +259,7 @@ vi.mock('$lib/components/ui/SaveIndicator.svelte', async () => ({
   default: (await import('./__tests__/mocks/MockSaveIndicator.svelte')).default,
 }));
 
-vi.mock('$lib/components/ui/OpenComboButton.svelte', async () => ({
+vi.mock('$features/external-editors/components/OpenComboButton.svelte', async () => ({
   default: (await import('./__tests__/mocks/MockOpenComboButton.svelte')).default,
 }));
 
@@ -326,6 +303,30 @@ describe('FileTabType Redux integration', () => {
     });
   }
 
+  it('groups editor presentation toggles into one view settings menu', async () => {
+    renderFileTab();
+
+    await fireEvent.click(await screen.findByRole('button', { name: 'Panel actions' }));
+
+    expect(screen.getByRole('menuitemcheckbox', { name: 'Wrap lines' })).toBeTruthy();
+    expect(screen.getByRole('menuitemcheckbox', { name: 'Diff indicators' })).toBeTruthy();
+    expect(
+      screen.queryByRole('button', { name: m.layout_diffHeader_wrappingOn_tooltip() }),
+    ).toBeNull();
+
+    await fireEvent.click(screen.getByRole('menuitemcheckbox', { name: 'Wrap lines' }));
+    expect(dispatchMock).toHaveBeenCalledWith({
+      type: 'uiLayout/toggleLineWrapping',
+      payload: [],
+    });
+
+    await fireEvent.click(screen.getByRole('menuitemcheckbox', { name: 'Diff indicators' }));
+    expect(dispatchMock).toHaveBeenCalledWith({
+      type: 'uiLayout/toggleDiffIndicators',
+      payload: [],
+    });
+  });
+
   it.each([
     ['src/main.js', 'main.js', 'javascript'],
     ['src/App.jsx', 'App.jsx', 'javascript'],
@@ -361,6 +362,28 @@ describe('FileTabType Redux integration', () => {
       expect(editor.getAttribute('data-language')).toBe(expectedLanguage);
     },
   );
+
+  it('loads a relative file before the workspace root has hydrated', async () => {
+    mockReduxState.workspace = {
+      id: 'other-workspace',
+      worktreePath: '/other-repo',
+      repositoryPath: '/other-repo',
+    };
+
+    renderFileTab();
+
+    await waitFor(() =>
+      expect(actionMocks.loadFileContentRequested).toHaveBeenCalledWith(
+        'ws-1',
+        'src/main.ts',
+        'src/main.ts',
+      ),
+    );
+    expect(dispatchMock).toHaveBeenCalledWith({
+      type: 'files/loadFileContentRequested',
+      payload: ['ws-1', 'src/main.ts', 'src/main.ts'],
+    });
+  });
 
   it('keeps markdown files in the markdown preview instead of CodeEditor by default', async () => {
     mockReduxState.files['README.md'] = {
@@ -490,32 +513,30 @@ describe('FileTabType Redux integration', () => {
     });
 
     dispatchMock.mockClear();
-    writeFileServiceMocks.writeFileContent.mockClear();
 
     await fireEvent.input(editor, { target: { value: 'console.log("edited");' } });
 
-    // Editing routes through the files-write-service (debounced content write).
-    expect(writeFileServiceMocks.writeFileContent).toHaveBeenCalledWith(
-      'ws-1',
-      'src/main.ts',
-      '/repo/src/main.ts',
-      'console.log("edited");',
-    );
+    expect(dispatchMock).toHaveBeenCalledWith({
+      type: 'files/updateFileContent',
+      payload: ['ws-1', 'src/main.ts', 'console.log("edited");'],
+    });
 
-    const saveIndicator = await screen.findByTestId('save-indicator');
-    await waitFor(() => expect(saveIndicator.getAttribute('data-dirty')).toBe('true'));
+    const headerState = await screen.findByTestId('header-state');
+    await waitFor(() => expect(headerState.getAttribute('data-dirty')).toBe('true'));
 
-    writeFileServiceMocks.writeFileContent.mockClear();
-    await fireEvent.click(saveIndicator);
+    await fireEvent.click(await screen.findByRole('button', { name: 'Panel actions' }));
+    const saveStatus = await screen.findByRole('menuitem', {
+      name: m.ui_saveIndicator_autoSaving_tooltip(),
+    });
+    expect(saveStatus.getAttribute('aria-disabled')).toBe('true');
 
-    // Manual save flushes immediately through the same service entry point.
-    expect(writeFileServiceMocks.writeFileContent).toHaveBeenCalledWith(
-      'ws-1',
-      'src/main.ts',
-      '/repo/src/main.ts',
-      'console.log("edited");',
-      { immediate: true },
-    );
+    dispatchMock.mockClear();
+    await fireEvent.keyDown(window, { key: 's', metaKey: true });
+
+    expect(dispatchMock).toHaveBeenCalledWith({
+      type: 'files/saveFileContentRequested',
+      payload: ['ws-1', 'src/main.ts', '/repo/src/main.ts', 'console.log("edited");'],
+    });
   });
 
   it('updates the visible open editor when external content is applied while clean', async () => {
@@ -554,13 +575,14 @@ describe('FileTabType Redux integration', () => {
 
     renderFileTab();
 
-    const saveIndicator = await screen.findByTestId('save-indicator');
     const headerState = await screen.findByTestId('header-state');
+    await fireEvent.click(await screen.findByRole('button', { name: 'Panel actions' }));
+    const saveStatus = await screen.findByRole('menuitem', {
+      name: m.ui_saveIndicator_saving_tooltip(),
+    });
 
     await waitFor(() => {
-      expect(saveIndicator.getAttribute('data-dirty')).toBe('true');
-      expect(saveIndicator.getAttribute('data-saving')).toBe('true');
-      expect(saveIndicator.getAttribute('data-auto-saving')).toBe('false');
+      expect(saveStatus.getAttribute('aria-disabled')).toBe('true');
       expect(headerState.getAttribute('data-dirty')).toBe('true');
       expect(headerState.getAttribute('data-saving')).toBe('true');
     });
@@ -763,6 +785,72 @@ describe('FileTabType Redux integration', () => {
     );
     expect(screen.queryByText(m.layout_fileTab_outsideWorkspace_label())).toBeNull();
   });
+
+  // Not-found error panel: always shows the attempted relative path; when the
+  // read saga recorded suffix-resolution candidates, renders a clickable
+  // "Did you mean" list that retargets the tab to the chosen candidate.
+  function errorFileEntry(overrides: Partial<(typeof mockReduxState.files)[string]> = {}) {
+    return {
+      localContent: null,
+      originalContent: null,
+      loading: false,
+      saving: false,
+      error: 'File not found',
+      isBinary: false,
+      lastUpdated: 0,
+      notFoundCandidates: [] as string[],
+      ...overrides,
+    };
+  }
+
+  it('shows the attempted path without candidates when suffix resolution found none', async () => {
+    mockReduxState.files['src/app.ts'] = errorFileEntry();
+
+    renderFileTab({ ...fileTab, id: 'tab-err', title: 'app.ts', filePath: 'src/app.ts' });
+
+    expect(await screen.findByText(m.layout_fileTab_errorLoading_label())).toBeTruthy();
+    expect(screen.getByText('File not found')).toBeTruthy();
+    expect(screen.getByText('src/app.ts')).toBeTruthy();
+    expect(screen.queryByText(m.layout_fileTab_didYouMean_label())).toBeNull();
+    expect(screen.queryByRole('button', { name: /src\// })).toBeNull();
+  });
+
+  it('renders clickable candidates and retargets the tab on click', async () => {
+    const candidates = ['packages/a/src/app.ts', 'packages/b/src/app.ts'];
+    mockReduxState.files['src/app.ts'] = errorFileEntry({ notFoundCandidates: candidates });
+
+    renderFileTab({ ...fileTab, id: 'tab-err', title: 'app.ts', filePath: 'src/app.ts' });
+
+    expect(await screen.findByText(m.layout_fileTab_didYouMean_label())).toBeTruthy();
+    expect(screen.getByText('src/app.ts')).toBeTruthy();
+
+    const candidateButton = screen.getByRole('button', { name: 'packages/b/src/app.ts' });
+    dispatchMock.mockClear();
+    await fireEvent.click(candidateButton);
+
+    expect(dispatchMock).toHaveBeenCalledWith({
+      type: 'files/removeFileContentEntry',
+      payload: ['ws-1', 'src/app.ts'],
+    });
+    expect(dispatchMock).toHaveBeenCalledWith({
+      type: 'panelLayout/updateFileTabPath',
+      payload: ['ws-1', 'src/app.ts', 'packages/b/src/app.ts', 'tab-err'],
+    });
+  });
+
+  it('caps the rendered candidate list at five entries', async () => {
+    const candidates = [1, 2, 3, 4, 5, 6, 7].map((i) => `packages/p${i}/src/app.ts`);
+    mockReduxState.files['src/app.ts'] = errorFileEntry({ notFoundCandidates: candidates });
+
+    renderFileTab({ ...fileTab, id: 'tab-err', title: 'app.ts', filePath: 'src/app.ts' });
+
+    await screen.findByText(m.layout_fileTab_didYouMean_label());
+    expect(screen.getAllByRole('button', { name: /packages\/p[0-9]+\/src\/app\.ts/ })).toHaveLength(
+      5,
+    );
+    expect(screen.getByRole('button', { name: 'packages/p5/src/app.ts' })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'packages/p6/src/app.ts' })).toBeNull();
+  });
 });
 
 describe('FileTabType content-save wiring', () => {
@@ -771,19 +859,13 @@ describe('FileTabType content-save wiring', () => {
     'utf-8',
   );
 
-  it('delegates the debounce to the files-write-service and flushes on teardown', () => {
-    // The component no longer hand-rolls a setTimeout auto-save; the debounce is
-    // owned by the files-write-service (keyed by ws::path). The component routes
-    // edits + manual saves through writeFileContent and flushes any pending save
-    // when the file/workspace changes or the tab unmounts.
+  it('delegates debounce and teardown flush ownership to filesWriteSaga', () => {
     expect(source).not.toContain('AUTO_SAVE_DELAY_MS');
     expect(source).not.toContain('autoSaveTimeoutId');
+    expect(source).not.toContain("from '$features/files/files-write-service'");
     expect(source).toContain(
-      'writeFileContent(workspaceId, tab.filePath, fileAbsolutePath, content)',
+      'appStore.dispatch(updateFileContent(workspaceId, tab.filePath, content))',
     );
-    expect(source).toContain(
-      'writeFileContent(workspaceId, tab.filePath, fileAbsolutePath, fileContent, { immediate: true })',
-    );
-    expect(source).toContain('flushFileContent(wsId, filePath)');
+    expect(source).toContain('saveFileContentRequested(wsId, filePath, absolutePath, content)');
   });
 });

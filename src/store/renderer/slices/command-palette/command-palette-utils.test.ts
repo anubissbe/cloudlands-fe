@@ -16,7 +16,7 @@ import {
   buildRecentItems,
   type WorkspaceObject,
 } from "./command-palette-utils";
-import type { Note } from "$shared/types";
+import { WorkspaceStatus, type Note } from "$shared/types";
 
 // ── fuzzyScore ─────────────────────────────────────────────────────────────
 
@@ -44,8 +44,51 @@ describe("fuzzyScore", () => {
 
   it("scores word-boundary matches higher", () => {
     const boundaryScore = fuzzyScore("my-file-name", "mfn");
-    const midScore = fuzzyScore("amfnxyz", "mfn");
+    const midScore = fuzzyScore("amxfxnyz", "mfn");
     expect(boundaryScore).toBeGreaterThan(midScore);
+  });
+
+  it("ranks a word-boundary substring above a scattered subsequence", () => {
+    const substringScore = fuzzyScore("Open HUD ", "hud");
+    const scatteredScore = fuzzyScore(
+      "Hardware update discussion some note description",
+      "hud",
+    );
+    expect(substringScore).toBeGreaterThan(scatteredScore);
+  });
+
+  it("ranks a plain substring above a scattered subsequence", () => {
+    const substringScore = fuzzyScore("shudder", "hud");
+    const scatteredScore = fuzzyScore(
+      "Hardware update discussion some note description",
+      "hud",
+    );
+    expect(substringScore).toBeGreaterThan(scatteredScore);
+  });
+
+  it("ranks a word-boundary substring above a plain substring", () => {
+    expect(fuzzyScore("Open HUD ", "hud")).toBeGreaterThan(fuzzyScore("shudder", "hud"));
+  });
+
+  it("still ranks a prefix match above a substring match", () => {
+    expect(fuzzyScore("hud panel", "hud")).toBeGreaterThan(fuzzyScore("Open HUD ", "hud"));
+  });
+
+  it("still ranks an exact match above everything", () => {
+    expect(fuzzyScore("hud", "hud")).toBe(1000);
+    expect(fuzzyScore("hud", "hud")).toBeGreaterThan(fuzzyScore("hud panel", "hud"));
+  });
+
+  it("prefers a later word-boundary occurrence over an earlier plain occurrence", () => {
+    expect(fuzzyScore("shud HUD", "hud")).toBe(122);
+    expect(fuzzyScore("shud HUD", "hud")).toBeGreaterThan(fuzzyScore("shudder", "hud"));
+  });
+
+  it("ranks a contiguous substring above any pure subsequence match for long needles", () => {
+    const contiguous = fuzzyScore("zzabcdefghijklmnop", "abcdefghijklmnop");
+    const scattered = fuzzyScore("za b c d e f g h i j k l m n o p", "abcdefghijklmnop");
+    expect(contiguous).toBeGreaterThan(scattered);
+    expect(scattered).toBeLessThan(50);
   });
 });
 // ── parseQueryFilter ───────────────────────────────────────────────────────
@@ -84,8 +127,16 @@ describe("formatRelativeTime", () => {
     expect(formatRelativeTime(undefined)).toBe("");
   });
 
+  it("returns empty string for the epoch-0 placeholder (unknown attribution time)", () => {
+    expect(formatRelativeTime(0)).toBe("");
+  });
+
   it("returns 'now' for recent timestamps", () => {
     expect(formatRelativeTime(new Date().toISOString())).toBe("now");
+  });
+
+  it("formats real numeric epoch-millisecond timestamps", () => {
+    expect(formatRelativeTime(Date.now())).toBe("now");
   });
 
   it("returns minutes ago for recent past", () => {
@@ -187,6 +238,32 @@ describe("buildMessageTitleSegments", () => {
       workspaceName: "ws-1",
       repoLabel: undefined,
     });
+  });
+
+  it("flags an archived workspace", () => {
+    expect(
+      buildMessageTitleSegments({
+        id: "ws-1",
+        title: "Old space",
+        status: WorkspaceStatus.Archived,
+      }),
+    ).toEqual({ workspaceName: "Old space", repoLabel: undefined, isArchivedWorkspace: true });
+  });
+
+  it("does not flag an active workspace", () => {
+    expect(
+      buildMessageTitleSegments({
+        id: "ws-1",
+        title: "Live space",
+        status: WorkspaceStatus.Active,
+      }).isArchivedWorkspace,
+    ).toBeUndefined();
+  });
+
+  it("does not flag a workspace without a status", () => {
+    expect(
+      buildMessageTitleSegments({ id: "ws-1", title: "No status" }).isArchivedWorkspace,
+    ).toBeUndefined();
   });
 });
 

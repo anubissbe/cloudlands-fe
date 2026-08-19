@@ -10,55 +10,62 @@
   import type { TabTypeComponentProps } from './registry';
   import { getPanelHeaderContext } from '$lib/components/layout/panel-system/panel-header-context.svelte';
   import {
-  selectFileTrackingCommits,
-  selectFileTrackingOlderCommits,
-  selectFileTrackingLoading,
-} from '$store/renderer/slices/changes/changes-selectors';
+    selectFileTrackingCommits,
+    selectFileTrackingOlderCommits,
+    selectFileTrackingLoading,
+  } from '$store/renderer/slices/changes/changes-selectors';
   import { selectWorkspaceById } from '$store/renderer/slices/workspace/workspace-selectors';
+  import { selectGitRoots } from '$store/renderer/slices/git-roots/git-roots-selectors';
   import ChatChangesPanel from '$lib/components/chat/ChatChangesPanel.svelte';
-  import { Button } from '$lib/components/ui/button';
+  import ViewSettingsDropdown from '../components/ViewSettingsDropdown.svelte';
   import {
-  selectLineWrapping,
-  selectFoldUnchanged,
-  selectDiffSideBySide,
-} from '$store/renderer/slices/ui-layout/ui-layout-selectors';
+    selectLineWrapping,
+    selectFoldUnchanged,
+    selectDiffSideBySide,
+  } from '$store/renderer/slices/ui-layout/ui-layout-selectors';
   import {
-  toggleLineWrapping,
-  toggleFoldUnchanged,
-  toggleDiffSideBySide,
-} from '$store/renderer/slices/ui-layout/ui-layout-slice';
+    toggleLineWrapping,
+    toggleFoldUnchanged,
+    toggleDiffSideBySide,
+  } from '$store/renderer/slices/ui-layout/ui-layout-slice';
 
   import { openAgentTabRequested } from '$store/renderer/slices/app-layout/app-layout-slice';
   import { openWorkspaceNote } from '$store/renderer/slices/workspace-navigation/workspace-navigation-slice';
-  import Fa from 'svelte-fa';
-  import {
-  faTextWidth,
-  faMap,
-  faColumns,
-  faCompressAlt,
-} from '@fortawesome/free-solid-svg-icons';
   import { appClient } from '$lib/client';
-  import { m } from '$shared/paraglide/messages.js';
+  import { isAbsolutePath } from '$lib/utils/path-utils';
   import { store as appStore } from '$store/renderer/store';
 
   const lineWrapping = selectLineWrapping();
   const foldUnchanged = selectFoldUnchanged();
   const diffSideBySide = selectDiffSideBySide();
-  const headerToggleActiveClass =
-    'text-foreground bg-sidebar hover:text-foreground hover:bg-sidebar';
-  const headerToggleInactiveClass = 'text-subtle';
-
   let { tab, workspaceId, isActive }: TabTypeComponentProps = $props();
 
   const headerContext = getPanelHeaderContext();
+  // svelte-ignore state_referenced_locally
   const workspace = selectWorkspaceById(workspaceId);
-  const workspacePath = $derived($workspace?.worktreePath || $workspace?.repositoryPath || '');
+  // svelte-ignore state_referenced_locally
+  const gitRoots$ = selectGitRoots(workspaceId);
 
   // Get commit data from tab
   const commitHash = $derived((tab.data?.commitHash as string) || '');
   const commitMessage = $derived((tab.data?.commitMessage as string) || '');
+  // Secondary git root scoping the changeset (multi git root tracking, v6.15).
+  // Absent → primary-root behavior, byte-identical to before.
+  const gitRootId = $derived((tab.data?.gitRootId as string) || '');
+  // Root path used to absolutize the daemon's root-relative file paths: the
+  // registered secondary root's path when `gitRootId` is set, else the
+  // workspace worktree.
+  const gitRootPath = $derived(
+    gitRootId ? $gitRoots$.find((r) => r.id === gitRootId)?.path || '' : '',
+  );
+  const workspacePath = $derived(
+    gitRootPath || $workspace?.worktreePath || $workspace?.repositoryPath || '',
+  );
+  // svelte-ignore state_referenced_locally
   const ftCommits$ = selectFileTrackingCommits(workspaceId);
+  // svelte-ignore state_referenced_locally
   const ftOlderCommits$ = selectFileTrackingOlderCommits(workspaceId);
+  // svelte-ignore state_referenced_locally
   const ftLoading$ = selectFileTrackingLoading(workspaceId);
   const allCommits = $derived($ftCommits$ || []);
   const olderCommits = $derived($ftOlderCommits$ || []);
@@ -83,6 +90,7 @@
     const hash = commitHash;
     const storeFiles = storeCommitFiles;
     const wsId = workspaceId;
+    const rootId = gitRootId;
 
     if (!hash || !wsId) return;
     // If store already has files for this commit, no need to fetch
@@ -98,14 +106,16 @@
     // Daemon-backed read (PROTOCOL §5.6): `appClient.git.commitDetails`
     // folds transport/gate errors to `null` and the daemon degrades non-repo /
     // remote / unknown-hash workspaces to an empty envelope, so this $effect
-    // never throws into the renderer.
+    // never throws into the renderer. `gitRootId` scopes the read to a
+    // registered secondary root (v6.15 param family).
     appClient.git
-      .commitDetails(wsId, hash)
+      .commitDetails(wsId, hash, rootId ? { gitRootId: rootId } : undefined)
       .then((result) => {
         if (result) {
-          fetchedFileDetails = result.fileDetails.length > 0
-            ? result.fileDetails
-            : result.files.map((f) => ({ path: f, additions: 0, deletions: 0 }));
+          fetchedFileDetails =
+            result.fileDetails.length > 0
+              ? result.fileDetails
+              : result.files.map((f) => ({ path: f, additions: 0, deletions: 0 }));
           fetchedCommitInfo = {
             author: result.author || undefined,
             authorEmail: result.authorEmail || undefined,
@@ -133,7 +143,7 @@
       const additions = typeof file === 'string' ? 0 : file.additions || 0;
       const deletions = typeof file === 'string' ? 0 : file.deletions || 0;
       return {
-        filePath: filePath.startsWith('/') ? filePath : `${workspacePath}/${filePath}`,
+        filePath: isAbsolutePath(filePath) ? filePath : `${workspacePath}/${filePath}`,
         action: 'modify' as const,
         additions,
         deletions,
@@ -150,67 +160,27 @@
   // Register header actions
   $effect(() => {
     if (!headerContext || !isActive) return;
-    headerContext.registerActions(changesActions);
+    headerContext.registerActions({ display: changesDisplayActions });
   });
 </script>
 
-{#snippet changesActions()}
-  <Button
-    variant="ghost-light"
-    size="icon-xs"
-    onclick={() => {
+{#snippet changesDisplayActions()}
+  <ViewSettingsDropdown
+    embedded
+    showExpand
+    expanded={changesAllExpanded}
+    onToggleExpand={() => {
       changesAllExpanded = !changesAllExpanded;
       if (changesAllExpanded) changesPanelRef?.expandAll();
       else changesPanelRef?.collapseAll();
     }}
-    tooltip={changesAllExpanded
-      ? m.layout_diffHeader_collapseAllFiles_tooltip()
-      : m.layout_diffHeader_expandAllFiles_tooltip()}
-    tooltipSide="bottom"
-    aria-pressed={changesAllExpanded}
-    class={changesAllExpanded ? headerToggleActiveClass : headerToggleInactiveClass}
-  >
-    <Fa icon={faCompressAlt} size="xs" class={changesAllExpanded ? '' : 'rotate-180'} />
-  </Button>
-  <Button
-    variant="ghost-light"
-    size="icon-xs"
-    onclick={() => appStore.dispatch(toggleLineWrapping())}
-    tooltip={$lineWrapping
-      ? m.layout_diffHeader_wrappingOn_tooltip()
-      : m.layout_diffHeader_wrapLines_tooltip()}
-    tooltipSide="bottom"
-    aria-pressed={$lineWrapping}
-    class={$lineWrapping ? headerToggleActiveClass : headerToggleInactiveClass}
-  >
-    <Fa icon={faTextWidth} size="xs" />
-  </Button>
-  <Button
-    variant="ghost-light"
-    size="icon-xs"
-    onclick={() => appStore.dispatch(toggleFoldUnchanged())}
-    tooltip={$foldUnchanged
-      ? m.layout_diffHeader_foldingOn_tooltip()
-      : m.layout_diffHeader_foldLines_tooltip()}
-    tooltipSide="bottom"
-    aria-pressed={$foldUnchanged}
-    class={$foldUnchanged ? headerToggleActiveClass : headerToggleInactiveClass}
-  >
-    <Fa icon={faMap} size="xs" />
-  </Button>
-  <Button
-    variant="ghost-light"
-    size="icon-xs"
-    onclick={() => appStore.dispatch(toggleDiffSideBySide())}
-    tooltip={$diffSideBySide
-      ? m.layout_diffHeader_unifiedView_tooltip()
-      : m.layout_diffHeader_splitView_tooltip()}
-    tooltipSide="bottom"
-    aria-pressed={$diffSideBySide}
-    class={$diffSideBySide ? headerToggleActiveClass : headerToggleInactiveClass}
-  >
-    <Fa icon={faColumns} size="xs" />
-  </Button>
+    foldEnabled={$foldUnchanged}
+    onToggleFold={() => appStore.dispatch(toggleFoldUnchanged())}
+    wrapEnabled={$lineWrapping}
+    onToggleWrap={() => appStore.dispatch(toggleLineWrapping())}
+    splitEnabled={$diffSideBySide}
+    onToggleSplit={() => appStore.dispatch(toggleDiffSideBySide())}
+  />
 {/snippet}
 
 {#key commitHash}
@@ -218,6 +188,8 @@
     bind:this={changesPanelRef}
     isLoading={$ftLoading$ || isFetchingDetails}
     {changes}
+    gitRootId={gitRootId || undefined}
+    gitRootPath={gitRootPath || undefined}
     commitInfo={{
       hash: commitHash,
       message: commitMessage,
@@ -231,13 +203,17 @@
       const openInAdjacentPanel = event?.metaKey || event?.ctrlKey || false;
       const panelElement = (event?.target as HTMLElement | null)?.closest('[data-panel-id]');
       const sourcePanelId = panelElement?.getAttribute('data-panel-id') ?? undefined;
-      appStore.dispatch(openAgentTabRequested(workspaceId, { agentId, openInAdjacentPanel, sourcePanelId }));
+      appStore.dispatch(
+        openAgentTabRequested(workspaceId, { agentId, openInAdjacentPanel, sourcePanelId }),
+      );
     }}
     onOpenNote={(noteId, event) => {
       const openInAdjacentPanel = event?.metaKey || event?.ctrlKey || false;
       const panelElement = (event?.target as HTMLElement | null)?.closest('[data-panel-id]');
       const sourcePanelId = panelElement?.getAttribute('data-panel-id') ?? undefined;
-      appStore.dispatch(openWorkspaceNote(workspaceId, noteId, { openInAdjacentPanel, sourcePanelId }));
+      appStore.dispatch(
+        openWorkspaceNote(workspaceId, noteId, { openInAdjacentPanel, sourcePanelId }),
+      );
     }}
   />
 {/key}

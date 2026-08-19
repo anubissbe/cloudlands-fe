@@ -12,9 +12,15 @@
 import { z } from 'zod';
 import { BROWSER_PROTOCOLS } from '../../../shared/constants';
 import { Logger } from '../../../shared/logger';
-import { embeddedBrowserCdp } from './embedded-browser-cdp-service';
+import { DEFAULT_AGENT_VIEWPORT, embeddedBrowserCdp } from './embedded-browser-cdp-service';
 import { browserCapture } from './browser-capture-service';
 import type { SnapshotOptions, SessionOptions, CaptureStepOptions } from './browser-capture-types';
+import {
+  rewriteLoopbackUrl,
+  type LoopbackRewriteContext,
+  type LoopbackRewriteResult,
+} from './loopback-rewrite';
+import { resolveRewrittenRemoteTarget, type TunnelProvider } from './loopback-url-resolver';
 
 const logger = new Logger('BrowserActionExecutor');
 
@@ -54,21 +60,23 @@ const WaitForOptionsSchema = z.object({
   timeout: z.number().optional(),
 });
 
-const SnapshotActionSchema = z.object({
-  action: z.literal('snapshot'),
-  workspaceId: z.string(),
-  tabId: z.string().optional(),
-  name: z.string().optional(),
-  reload: z.boolean().optional(),
-  waitFor: WaitForOptionsSchema.optional(),
-});
+const SnapshotActionSchema = z
+  .object({
+    action: z.literal('snapshot'),
+    tabId: z.string().optional(),
+    name: z.string().optional(),
+    reload: z.boolean().optional(),
+    waitFor: WaitForOptionsSchema.optional(),
+  })
+  .strict();
 
-const StartSessionActionSchema = z.object({
-  action: z.literal('startSession'),
-  workspaceId: z.string(),
-  tabId: z.string().optional(),
-  name: z.string().optional(),
-});
+const StartSessionActionSchema = z
+  .object({
+    action: z.literal('startSession'),
+    tabId: z.string().optional(),
+    name: z.string().optional(),
+  })
+  .strict();
 
 const StartCaptureActionSchema = z.object({
   action: z.literal('startCapture'),
@@ -110,15 +118,47 @@ const ResetTabActionSchema = z.object({
   tabId: z.string().optional(),
 });
 
-const GetSummaryActionSchema = z.object({
-  action: z.literal('getSummary'),
-  captureDir: z.string(),
-});
+const GetSummaryActionSchema = z
+  .object({
+    action: z.literal('getSummary'),
+    captureId: z.string(),
+  })
+  .strict();
+
+// Emulated viewport bounds for agent-owned tabs (monorepo#2857).
+const ViewportDimensionSchema = z.number().int().min(320).max(3840);
 
 const OpenTabActionSchema = z.object({
   action: z.literal('openTab'),
+  // `position` only applies when a genuinely new tab is opened — when an
+  // existing tab is reused (per-agent exact-URL dedupe) it is ignored and
+  // the reused tab is focused in place.
   url: z.string(),
   position: z.enum(['adjacent', 'replace', 'same']).optional(),
+  // Opt out of the per-agent exact-URL dedupe and always open a genuinely
+  // new tab (intent-hq/monorepo#2541). Also forwarded to the renderer so
+  // its own equivalent-tab dedupe doesn't coalesce the requested duplicate.
+  allowDuplicate: z.boolean().optional(),
+  // Pin the panel resolved by this open, including an existing reused panel.
+  pin: z.boolean().optional(),
+  // Emulated viewport for agent opens (monorepo#2857); omitted width
+  // defaults to the standard desktop viewport (1280×800). Ignored on user
+  // (agentId-less) opens, which stay native-sized and unowned.
+  width: ViewportDimensionSchema.optional(),
+  height: ViewportDimensionSchema.optional(),
+});
+
+// Atomically claim an unowned tab for the calling agent (monorepo#2857).
+// `width` is deliberately REQUIRED: a successful claim transfers ownership
+// and enables viewport emulation at the given size in one step — a claim
+// without a width fails schema validation before any ownership change.
+// tabId is explicit (no sequence-level default), like closeTab: a claim is
+// a significant state change and must name its target.
+const ClaimTabActionSchema = z.object({
+  action: z.literal('claimTab'),
+  tabId: z.string(),
+  width: ViewportDimensionSchema,
+  height: ViewportDimensionSchema.optional(),
 });
 
 const NavigateActionSchema = z.object({
@@ -126,6 +166,40 @@ const NavigateActionSchema = z.object({
   url: z.string(),
   tabId: z.string().optional(),
 });
+
+// tabId is deliberately REQUIRED (no fallback to the sequence-level default):
+// closing is destructive, so an explicit id per action avoids accidentally
+// closing the wrong tab (intent-hq/monorepo#1931).
+const CloseTabActionSchema = z.object({
+  action: z.literal('closeTab'),
+  tabId: z.string(),
+});
+
+const TunnelPortSchema = z.number().int().min(1).max(65535);
+
+// Programmatic tunnel actions (intent-hq/monorepo#2537): explicit, tab-free
+// control of daemon-port forwards. Uniform semantics regardless of transport
+// — remote ws/wss forwards ride the daemon /tunnel mux ("tunnel" backend),
+// local UDS/TCP get a direct FE-side loopback relay ("direct" backend).
+const OpenTunnelActionSchema = z
+  .object({
+    action: z.literal('openTunnel'),
+    remotePort: TunnelPortSchema,
+  })
+  .strict();
+
+const ListTunnelsActionSchema = z
+  .object({
+    action: z.literal('listTunnels'),
+  })
+  .strict();
+
+const CloseTunnelActionSchema = z
+  .object({
+    action: z.literal('closeTunnel'),
+    remotePort: TunnelPortSchema,
+  })
+  .strict();
 
 // Union of all action schemas
 const BrowserActionSchema = z.discriminatedUnion('action', [
@@ -145,7 +219,12 @@ const BrowserActionSchema = z.discriminatedUnion('action', [
   ResetTabActionSchema,
   GetSummaryActionSchema,
   OpenTabActionSchema,
+  ClaimTabActionSchema,
   NavigateActionSchema,
+  CloseTabActionSchema,
+  OpenTunnelActionSchema,
+  ListTunnelsActionSchema,
+  CloseTunnelActionSchema,
 ]);
 
 export type BrowserAction = z.infer<typeof BrowserActionSchema>;
@@ -169,6 +248,32 @@ function validateBrowserUrl(url: string): string | null {
   }
 }
 
+function requireWorkspaceId(workspaceId: string | undefined, action: string): string {
+  if (!workspaceId) {
+    throw new Error(`Action '${action}' requires workspace context`);
+  }
+  return workspaceId;
+}
+
+/**
+ * Echo fields merged into an action's result when its URL was rewritten by
+ * the loopback-hostname table (intent-hq/monorepo#2323). Empty for
+ * non-rewritten URLs so their result shape is unchanged. `tunneled` adds a
+ * `tunneled: true` marker when the URL was further redirected through a
+ * daemon tunnel forward after a failed reachability probe.
+ */
+function rewriteEcho(rewrite: LoopbackRewriteResult, tunneled = false): Record<string, unknown> {
+  if (!rewrite.rewritten) return {};
+  return {
+    ...(tunneled ? { tunneled: true } : {}),
+    requestedUrl: rewrite.requestedUrl,
+    finalUrl: rewrite.url,
+    rewritten: true,
+    reason: rewrite.reason,
+    ...(rewrite.warning ? { warning: rewrite.warning } : {}),
+  };
+}
+
 // Schema for the full action sequence
 const ActionSequenceSchema = z.object({
   actions: z.array(BrowserActionSchema),
@@ -186,6 +291,14 @@ export interface ActionResult {
   success: boolean;
   result?: unknown;
   error?: string;
+  /** Successful result with a caveat (e.g. listTabs answered from a stale cache). */
+  warning?: string;
+  /** Structured ownership error code (monorepo#2857). */
+  errorCode?: 'not-owner' | 'already-claimed';
+  /** Owning agent for ownership errors; null when the tab is unowned. */
+  ownerAgentId?: string | null;
+  /** Owning agent's display name for ownership errors, when resolvable. */
+  ownerAgentName?: string;
 }
 
 export interface ExecutionResult {
@@ -199,8 +312,85 @@ export interface ExecutionResult {
 // ============================================================================
 
 /**
+ * Actions that manipulate a specific tab and are therefore ownership-enforced
+ * for agent callers (monorepo#2857). `openTab` (creates/reuses own tabs),
+ * `claimTab` (the claiming op itself), `listTabs`, and the session/tunnel
+ * actions (scoped at session start / tab-free) are deliberately absent.
+ */
+const OWNERSHIP_ENFORCED_ACTIONS = new Set([
+  'focusTab',
+  'getAccessibilityTree',
+  'screenshot',
+  'evaluate',
+  'snapshot',
+  'startSession',
+  'resetTab',
+  'navigate',
+  'closeTab',
+]);
+
+/**
+ * Best-effort owner display-name lookup via the daemon's `agent.list`
+ * (PROTOCOL.md §5.5), so ownership errors can name the owner. Dynamic import
+ * (mirroring browser-exec-reverse) avoids a static main-process dependency
+ * cycle and keeps the executor unit-testable; any failure resolves undefined
+ * — the structured error still carries the owner id.
+ */
+async function resolveAgentDisplayName(
+  agentId: string,
+  workspaceId?: string,
+): Promise<string | undefined> {
+  if (!workspaceId) return undefined;
+  try {
+    const { getBackendClient } = await import('../../backend/main/backend.ipc');
+    const result = (await getBackendClient().request('agent.list', { workspaceId })) as
+      | { agents?: Array<{ id?: string; name?: string }> }
+      | undefined;
+    const name = result?.agents?.find((a) => a.id === agentId)?.name;
+    return typeof name === 'string' && name.length > 0 ? name : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Structured `not-owner` result for an agent action on a tab it does not own
+ * (monorepo#2857). `ownerAgentId` is null for unowned (user) tabs.
+ */
+async function notOwnerResult(
+  actionName: string,
+  tabId: string,
+  ownerAgentId: string | undefined,
+  workspaceId?: string,
+): Promise<ActionResult> {
+  const ownerAgentName = ownerAgentId
+    ? await resolveAgentDisplayName(ownerAgentId, workspaceId)
+    : undefined;
+  const ownerLabel = ownerAgentName ? `${ownerAgentName} (${ownerAgentId})` : ownerAgentId;
+  let error: string;
+  if (ownerAgentId) {
+    // i18n-ignore (agent-facing protocol error, not user-facing)
+    error = `Tab ${tabId} is owned by agent ${ownerLabel}. Agents may only manipulate tabs they own — use { action: "listTabs" } to see tabs and their owners, or open your own tab with { action: "openTab" }.`;
+  } else {
+    // i18n-ignore (agent-facing protocol error, not user-facing)
+    error = `Tab ${tabId} is not owned by you (it is unowned). Claim it first with { action: "claimTab", tabId: "${tabId}", width: <px> } or open your own tab with { action: "openTab" }.`;
+  }
+  return {
+    action: actionName,
+    success: false,
+    errorCode: 'not-owner',
+    ownerAgentId: ownerAgentId ?? null,
+    ...(ownerAgentName !== undefined ? { ownerAgentName } : {}),
+    error,
+  };
+}
+
+/**
  * Execute a single browser action.
- * If agentId is provided, tab leases are touched on every tab-targeting action.
+ * Agent callers (agentId present) are ownership-enforced: tab-manipulating
+ * actions on tabs the agent does not own fail with a structured `not-owner`
+ * error. Calls without agentId are the user and are unrestricted
+ * (monorepo#2857).
  */
 async function executeAction(
   action: BrowserAction,
@@ -208,26 +398,64 @@ async function executeAction(
   openTabFn?: (
     url: string,
     position?: 'adjacent' | 'replace' | 'same',
-  ) => { success: boolean; message: string },
+    allowDuplicate?: boolean,
+    requestedUrl?: string,
+    pin?: boolean,
+    ownerAgentId?: string,
+    replaceTabId?: string,
+  ) => { success: boolean; message: string; tabId?: string },
   agentId?: string,
   workspaceId?: string,
+  getLoopbackContext?: () => LoopbackRewriteContext,
+  getTunnelProvider?: () => TunnelProvider | null,
 ): Promise<ActionResult> {
   const tabId = ('tabId' in action ? action.tabId : undefined) || defaultTabId;
 
-  // Touch the lease for any action that targets a specific tab
-  if (tabId && agentId) {
-    embeddedBrowserCdp.touchLease(tabId, agentId);
+  // Ownership enforcement (monorepo#2857): resolve the tab the action will
+  // actually hit — including the first-tab fallback the underlying service
+  // methods apply — and reject agent calls on tabs the agent does not own.
+  // A missing target falls through so the action fails with its own
+  // descriptive "no tabs" error.
+  if (agentId && OWNERSHIP_ENFORCED_ACTIONS.has(action.action)) {
+    const targetTabId = tabId ?? embeddedBrowserCdp.getFirstTab()?.tabId;
+    if (targetTabId) {
+      const owner = await embeddedBrowserCdp.resolveTabOwner(targetTabId, workspaceId);
+      if (owner !== agentId) {
+        return notOwnerResult(action.action, targetTabId, owner, workspaceId);
+      }
+    }
   }
 
   try {
     switch (action.action) {
       case 'listTabs': {
-        const result = await embeddedBrowserCdp.listAllTabs(workspaceId);
-        return { action: 'listTabs', success: true, result };
+        // listAllTabs rejects when the tab list is unavailable (renderer
+        // never answered and no cache) — the catch below surfaces that as an
+        // action error instead of a silent empty list (monorepo#2756 RC4).
+        const { tabs, stale } = await embeddedBrowserCdp.listAllTabs(workspaceId);
+        if (stale) {
+          return {
+            action: 'listTabs',
+            success: true,
+            result: tabs,
+            // i18n-ignore (agent-facing protocol error, not user-facing)
+            warning: `The renderer did not answer the tab list request for workspace ${workspaceId}; this list is from a cached snapshot and may be outdated.`,
+          };
+        }
+        return { action: 'listTabs', success: true, result: tabs };
       }
 
       case 'focusTab': {
-        const result = embeddedBrowserCdp.focusTab(tabId || '', workspaceId);
+        // Resolves true only once the tab's webview is mounted and
+        // registered (bounded wait) — not merely when the focus message was
+        // delivered (intent-hq/monorepo#2756).
+        const result = await embeddedBrowserCdp.focusTab(tabId || '', workspaceId);
+        if (!result) {
+          const error = tabId
+            ? `Could not focus tab ${tabId}: the tab never mounted. Either workspace ${workspaceId} is not open in any window, or no tab with this id exists — check { action: "listTabs" }.` // i18n-ignore (agent-facing protocol error, not user-facing)
+            : 'focusTab requires a tabId.'; // i18n-ignore (agent-facing protocol error, not user-facing)
+          return { action: 'focusTab', success: false, error };
+        }
         return { action: 'focusTab', success: true, result };
       }
 
@@ -247,8 +475,9 @@ async function executeAction(
       }
 
       case 'snapshot': {
+        const captureWorkspaceId = requireWorkspaceId(workspaceId, action.action);
         const options: SnapshotOptions = {
-          workspaceId: action.workspaceId,
+          workspaceId: captureWorkspaceId,
           tabId,
           name: action.name,
           reload: action.reload,
@@ -259,8 +488,9 @@ async function executeAction(
       }
 
       case 'startSession': {
+        const captureWorkspaceId = requireWorkspaceId(workspaceId, action.action);
         const options: SessionOptions = {
-          workspaceId: action.workspaceId,
+          workspaceId: captureWorkspaceId,
           tabId,
           name: action.name,
         };
@@ -269,12 +499,18 @@ async function executeAction(
       }
 
       case 'startCapture': {
-        await browserCapture.startCapture(action.sessionId);
+        await browserCapture.startCapture(
+          action.sessionId,
+          requireWorkspaceId(workspaceId, action.action),
+        );
         return { action: 'startCapture', success: true };
       }
 
       case 'endCapture': {
-        await browserCapture.endCapture(action.sessionId);
+        await browserCapture.endCapture(
+          action.sessionId,
+          requireWorkspaceId(workspaceId, action.action),
+        );
         return { action: 'endCapture', success: true };
       }
 
@@ -283,32 +519,51 @@ async function executeAction(
           action.reload || action.waitFor
             ? { reload: action.reload, waitFor: action.waitFor }
             : undefined;
-        const result = await browserCapture.captureStep(action.sessionId, action.stepName, options);
+        const result = await browserCapture.captureStep(
+          action.sessionId,
+          requireWorkspaceId(workspaceId, action.action),
+          action.stepName,
+          options,
+        );
         return { action: 'captureStep', success: true, result };
       }
 
       case 'startTrace': {
-        const result = await browserCapture.startTrace(action.sessionId, action.traceName);
+        const result = await browserCapture.startTrace(
+          action.sessionId,
+          requireWorkspaceId(workspaceId, action.action),
+          action.traceName,
+        );
         return { action: 'startTrace', success: true, result };
       }
 
       case 'stopTrace': {
-        const result = await browserCapture.stopTrace(action.sessionId, action.traceName);
+        const result = await browserCapture.stopTrace(
+          action.sessionId,
+          requireWorkspaceId(workspaceId, action.action),
+          action.traceName,
+        );
         return { action: 'stopTrace', success: true, result };
       }
 
       case 'endSession': {
-        const result = await browserCapture.endSession(action.sessionId);
+        const result = await browserCapture.endSession(
+          action.sessionId,
+          requireWorkspaceId(workspaceId, action.action),
+        );
         return { action: 'endSession', success: true, result };
       }
 
       case 'resetTab': {
-        const result = await browserCapture.resetTab(tabId);
+        const result = await browserCapture.resetTab(tabId, workspaceId);
         return { action: 'resetTab', success: true, result };
       }
 
       case 'getSummary': {
-        const result = await browserCapture.getSummary(action.captureDir);
+        const result = await browserCapture.getSummary(
+          requireWorkspaceId(workspaceId, action.action),
+          action.captureId,
+        );
         return { action: 'getSummary', success: true, result };
       }
 
@@ -319,35 +574,124 @@ async function executeAction(
           return { action: 'openTab', success: false, error: openTabUrlError };
         }
 
-        // When called by an agent, try to reuse an idle browser tab instead of opening a new one
-        if (agentId) {
-          const idleTabId = embeddedBrowserCdp.findIdleTab(agentId);
-          if (idleTabId) {
-            logger.info('Reusing idle browser tab instead of opening new one', {
-              tabId: idleTabId,
-              url: action.url,
+        // Loopback-hostname rewrite (daemon.localhost / client.localhost /
+        // bare loopback) — a no-op for non-loopback URLs and local daemons.
+        const rewrite = rewriteLoopbackUrl(
+          action.url,
+          getLoopbackContext?.() ?? { daemonIsRemote: false },
+        );
+
+        // Rewritten to a remote host: verify reachability before opening a
+        // tab, falling back to a daemon tunnel forward when unreachable.
+        const openTabTarget = await resolveRewrittenRemoteTarget(rewrite, getTunnelProvider);
+        if (openTabTarget.error) {
+          return { action: 'openTab', success: false, error: openTabTarget.error };
+        }
+        const finalRewrite = openTabTarget.rewrite;
+        const echo = rewriteEcho(finalRewrite, openTabTarget.tunneled);
+
+        // When called by an agent, reuse one of the AGENT'S OWN tabs whose
+        // current URL exactly matches instead of opening a duplicate
+        // (intent-hq/monorepo#2541). Dedupe is strictly per-agent
+        // (monorepo#2857): other agents' and user-opened tabs are never
+        // considered — across agents a new tab is opened.
+        if (agentId && !action.allowDuplicate) {
+          const duplicateTabId = await embeddedBrowserCdp.findModelTabByExactUrl(
+            finalRewrite.url,
+            agentId,
+            workspaceId,
+          );
+          if (duplicateTabId) {
+            logger.info('Reusing own tab with matching URL', {
+              tabId: duplicateTabId,
+              url: finalRewrite.url,
+              requestedUrl: action.url,
+              agentId,
+            });
+            // Re-record the ownership identity for this open: tunneled opens
+            // set the requested URL backing the requested-URL dedupe fallback
+            // below; non-tunneled opens clear any stale identity from the
+            // tab's prior use (intent-hq/monorepo#2787).
+            embeddedBrowserCdp.setTabOwner(
+              duplicateTabId,
+              agentId,
+              openTabTarget.tunneled ? action.url : null,
+            );
+            const focused =
+              action.pin === undefined
+                ? await embeddedBrowserCdp.focusTab(duplicateTabId, workspaceId)
+                : await embeddedBrowserCdp.focusTab(duplicateTabId, workspaceId, action.pin);
+            return {
+              action: 'openTab',
+              success: true,
+              result: {
+                reused: true,
+                focused,
+                tabId: duplicateTabId,
+                url: finalRewrite.url,
+                ...echo,
+              },
+            };
+          }
+        }
+
+        // Tunneled opens: the final URL embeds the tunnel-local forward
+        // port, so if the forward was re-minted since the first open the
+        // exact-URL match above can never hit. Fall back to matching the
+        // ownership-recorded original requested URL and re-point the tab at
+        // the fresh tunnel URL (intent-hq/monorepo#2787).
+        if (agentId && !action.allowDuplicate && openTabTarget.tunneled) {
+          const requestedTabId = await embeddedBrowserCdp.findModelTabByRequestedUrl(
+            action.url,
+            agentId,
+            workspaceId,
+          );
+          if (requestedTabId) {
+            logger.info('Reusing own tab with matching requested URL', {
+              tabId: requestedTabId,
+              url: finalRewrite.url,
+              requestedUrl: action.url,
               agentId,
             });
             try {
               await embeddedBrowserCdp.evaluate(
-                idleTabId,
-                `window.location.href = ${JSON.stringify(action.url)}`,
+                requestedTabId,
+                `window.location.href = ${JSON.stringify(finalRewrite.url)}`,
               );
-              embeddedBrowserCdp.focusTab(idleTabId, workspaceId);
+              // Persist the navigated tab's new URL + requested URL in the
+              // panel layout so a restart re-runs the rewrite (monorepo#2789).
+              embeddedBrowserCdp.notifyTabNavigated(
+                requestedTabId,
+                workspaceId,
+                finalRewrite.url,
+                finalRewrite.rewritten ? finalRewrite.requestedUrl : undefined,
+              );
+              const focused = await embeddedBrowserCdp.focusTab(requestedTabId, workspaceId);
               return {
                 action: 'openTab',
                 success: true,
-                result: { reused: true, tabId: idleTabId, url: action.url },
+                result: {
+                  reused: true,
+                  focused,
+                  tabId: requestedTabId,
+                  url: finalRewrite.url,
+                  ...echo,
+                },
               };
             } catch (err) {
-              logger.warn('Failed to reuse idle tab, falling back to opening new tab', {
-                tabId: idleTabId,
+              // The tab stays owned by the agent (ownership is persistent);
+              // this open just falls through to creating a new tab.
+              logger.warn('Failed to reuse requested-URL tab, falling back to opening new tab', {
+                tabId: requestedTabId,
                 error: (err as Error).message,
               });
-              embeddedBrowserCdp.releaseLease(idleTabId);
             }
           }
         }
+
+        // NOTE: the former 3-minute idle-lease reuse (repurposing another
+        // agent's inactive tab) is gone — ownership is persistent and tabs
+        // are never transferred between agents (monorepo#2857).
 
         if (!openTabFn) {
           return {
@@ -356,8 +700,194 @@ async function executeAction(
             error: 'openTab not available in this context',
           };
         }
-        const result = openTabFn(action.url, action.position);
-        return { action: 'openTab', success: result.success, result };
+        // With position "replace" and an existing browser tab, the renderer
+        // updates that tab in place and never creates the pre-generated
+        // tabId — so resolve the adoption target up front and track it
+        // instead of a phantom id whose registration wait would always time
+        // out. The renderer replaces the first browser tab in the workspace
+        // layout, which is the first entry of the panel tab list here.
+        let replaceTargetTabId: string | undefined;
+        if (action.position === 'replace') {
+          try {
+            const { tabs } = await embeddedBrowserCdp.listAllTabs(workspaceId);
+            replaceTargetTabId = tabs[0]?.tabId;
+          } catch {
+            // Tab list unavailable — assume the renderer creates a new tab.
+          }
+          // A replace adopts an existing tab, which is a manipulation of that
+          // tab — agents may only replace tabs they own (monorepo#2857).
+          // The checked target is bound into the open payload below
+          // (replaceTabId) so the renderer replaces exactly this tab — a
+          // layout change between this check and the renderer handling the
+          // open cannot redirect the replace onto a different (possibly
+          // other-agent-owned) tab.
+          if (agentId && replaceTargetTabId) {
+            const owner = await embeddedBrowserCdp.resolveTabOwner(replaceTargetTabId, workspaceId);
+            if (owner !== agentId) {
+              return notOwnerResult('openTab', replaceTargetTabId, owner, workspaceId);
+            }
+          }
+        }
+        // For agent-driven opens the executor is the dedupe authority — it
+        // already checked the agent's own tabs above — so the renderer must
+        // create a genuinely new tab rather than coalesce onto an equivalent
+        // one (which could silently hand the agent a user-opened tab).
+        // Rewritten opens pass the original requested URL so the renderer
+        // persists it with the tab and a restart can re-run the rewrite
+        // (intent-hq/monorepo#2789). Agent opens pass the owner so the
+        // renderer persists ownership with the tab (monorepo#2857).
+        // The resolved replace target (when any) is bound into the payload
+        // so the renderer adopts exactly the checked tab (TOCTOU, #2857).
+        const result = openTabFn(
+          finalRewrite.url,
+          action.position,
+          agentId ? true : action.allowDuplicate,
+          finalRewrite.rewritten ? finalRewrite.requestedUrl : undefined,
+          action.pin,
+          agentId,
+          ...(replaceTargetTabId === undefined ? [] : ([replaceTargetTabId] as const)),
+        );
+        // The id the caller can address: the adopted existing tab on a
+        // replace, otherwise the pre-generated id of the new tab.
+        const effectiveTabId =
+          result.success && replaceTargetTabId ? replaceTargetTabId : result.tabId;
+        // Agent opens create OWNED, viewport-emulated tabs (monorepo#2857):
+        // record ownership right away — a repeat openTab for the same URL
+        // then dedupes onto it (intent-hq/monorepo#2541) — with the emulated
+        // size (omitted width defaults to the standard 1280×800 desktop
+        // viewport). Tunneled opens record the original requested URL,
+        // backing the requested-URL dedupe fallback above; non-tunneled
+        // opens clear any stale identity (a replace-position open adopts an
+        // existing tab whose record may carry one) (intent-hq/monorepo#2787).
+        // The renderer persists the owner from the open payload; main's
+        // registry is seeded here.
+        if (agentId && result.success && effectiveTabId) {
+          embeddedBrowserCdp.setTabOwner(
+            effectiveTabId,
+            agentId,
+            openTabTarget.tunneled ? action.url : null,
+            {
+              width: action.width ?? DEFAULT_AGENT_VIEWPORT.width,
+              height: action.height ?? DEFAULT_AGENT_VIEWPORT.height,
+            },
+          );
+          // A replace adopted an existing tab the renderer never saw an
+          // ownerAgentId open-payload for — sync it so the layout persists
+          // the ownership (monorepo#2857).
+          if (replaceTargetTabId) {
+            embeddedBrowserCdp.notifyTabOwnerChanged(effectiveTabId, workspaceId, agentId);
+          }
+        }
+        // Await the renderer's registration of the tab so the returned
+        // handle is immediately addressable — returning before the webview
+        // mounts made follow-up actions fail with "not found" (RC3,
+        // intent-hq/monorepo#2756). Bounded wait; a timeout fails the
+        // action truthfully instead of handing back an unusable id.
+        if (result.success && effectiveTabId) {
+          const registered = await embeddedBrowserCdp.waitForTabRegistration(effectiveTabId);
+          if (!registered) {
+            return {
+              action: 'openTab',
+              success: false,
+              result: { ...result, tabId: effectiveTabId, ...echo },
+              // i18n-ignore (agent-facing protocol error, not user-facing)
+              error: `Tab ${effectiveTabId} was requested but its webview did not mount in time. The page may be very slow to load — retry with { action: "focusTab", tabId: "${effectiveTabId}" } or check { action: "listTabs" }.`,
+            };
+          }
+        }
+        return {
+          action: 'openTab',
+          success: result.success,
+          result: {
+            ...result,
+            ...(effectiveTabId ? { tabId: effectiveTabId } : {}),
+            ...(result.success && replaceTargetTabId ? { replaced: true } : {}),
+            ...echo,
+          },
+          // Surface the failure message (e.g. "workspace not open in any
+          // window", intent-hq/monorepo#2602) as the action error so the
+          // sequence-level error is descriptive instead of "undefined".
+          ...(result.success ? {} : { error: result.message }),
+        };
+      }
+
+      case 'claimTab': {
+        // Atomically claim an unowned tab for the calling agent
+        // (monorepo#2857). Schema validation already rejected claims without
+        // a width, before any ownership change.
+        if (!agentId) {
+          return {
+            action: 'claimTab',
+            success: false,
+            error:
+              // i18n-ignore (agent-facing protocol error, not user-facing)
+              'claimTab requires an agent caller: user-initiated calls are unrestricted and never need to claim a tab.',
+          };
+        }
+        // Verify the tab exists in the requesting workspace's panel layout
+        // (also hydrates persisted ownership after a restart). The
+        // check-and-set inside claimTab stays synchronous, so a competing
+        // claim cannot interleave after this point. A stale (cached) tab
+        // list is not proof the tab still exists — the tab may have been
+        // closed while the renderer was unavailable — so a claim must not
+        // record ownership from it; the persistence event would be a no-op
+        // and the "claimed" tab may be gone.
+        const { tabs, stale } = await embeddedBrowserCdp.listAllTabs(workspaceId);
+        if (stale) {
+          return {
+            action: 'claimTab',
+            success: false,
+            // i18n-ignore (agent-facing protocol error, not user-facing)
+            error: `Cannot claim tab ${action.tabId}: the tab list for workspace ${workspaceId} could not be refreshed (renderer unavailable), so the tab's existence cannot be verified. Retry shortly.`,
+          };
+        }
+        if (!tabs.some((t) => t.tabId === action.tabId)) {
+          return {
+            action: 'claimTab',
+            success: false,
+            // i18n-ignore (agent-facing protocol error, not user-facing)
+            error: `Tab ${action.tabId} not found in workspace ${workspaceId} — check { action: "listTabs" }.`,
+          };
+        }
+        const size = {
+          width: action.width,
+          height: action.height ?? DEFAULT_AGENT_VIEWPORT.height,
+        };
+        const claim = embeddedBrowserCdp.claimTab(action.tabId, agentId, size);
+        if (claim.status === 'already-claimed') {
+          const ownerAgentName = await resolveAgentDisplayName(claim.ownerAgentId, workspaceId);
+          const ownerLabel = ownerAgentName
+            ? `${ownerAgentName} (${claim.ownerAgentId})`
+            : claim.ownerAgentId;
+          return {
+            action: 'claimTab',
+            success: false,
+            errorCode: 'already-claimed',
+            ownerAgentId: claim.ownerAgentId,
+            ...(ownerAgentName !== undefined ? { ownerAgentName } : {}),
+            // i18n-ignore (agent-facing protocol error, not user-facing)
+            error: `Tab ${action.tabId} is already claimed by agent ${ownerLabel}. Claims are first-claim-wins with no stealing — open your own tab with { action: "openTab" }.`,
+          };
+        }
+        // Persist the new owner on the panel-layout tab so ownership
+        // survives restart (monorepo#2857).
+        embeddedBrowserCdp.notifyTabOwnerChanged(action.tabId, workspaceId, agentId);
+        return {
+          action: 'claimTab',
+          success: true,
+          result: {
+            tabId: action.tabId,
+            ownerAgentId: agentId,
+            alreadyOwned: claim.alreadyOwned,
+            ...size,
+          },
+        };
+      }
+
+      case 'closeTab': {
+        // Explicit action.tabId only — never the sequence-level default (see schema note).
+        const result = await embeddedBrowserCdp.closeTab(action.tabId, workspaceId);
+        return { action: 'closeTab', success: true, result };
       }
 
       case 'navigate': {
@@ -374,15 +904,124 @@ async function executeAction(
             action: 'navigate',
             success: false,
             // i18n-ignore (agent-facing protocol error, not user-facing)
-            error: 'No browser tabs available. Use { action: "openTab", url: "..." } to open a tab first.',
+            error:
+              'No browser tabs available. Use { action: "openTab", url: "..." } to open a tab first.',
           };
+        }
+
+        // Loopback-hostname rewrite (daemon.localhost / client.localhost /
+        // bare loopback) — a no-op for non-loopback URLs and local daemons.
+        const rewrite = rewriteLoopbackUrl(
+          action.url,
+          getLoopbackContext?.() ?? { daemonIsRemote: false },
+        );
+
+        // Rewritten to a remote host: verify reachability before navigating,
+        // falling back to a daemon tunnel forward when unreachable.
+        const navigateTarget = await resolveRewrittenRemoteTarget(rewrite, getTunnelProvider);
+        if (navigateTarget.error) {
+          return { action: 'navigate', success: false, error: navigateTarget.error };
         }
 
         await embeddedBrowserCdp.evaluate(
           resolvedTabId,
-          `window.location.href = ${JSON.stringify(action.url)}`,
+          `window.location.href = ${JSON.stringify(navigateTarget.rewrite.url)}`,
         );
-        return { action: 'navigate', success: true, result: { tabId: resolvedTabId, url: action.url } };
+        // Persist the navigated tab's new URL + requested URL in the panel
+        // layout so a restart re-runs the rewrite instead of restoring a
+        // dead ephemeral forward port (monorepo#2789).
+        embeddedBrowserCdp.notifyTabNavigated(
+          resolvedTabId,
+          workspaceId,
+          navigateTarget.rewrite.url,
+          navigateTarget.rewrite.rewritten ? navigateTarget.rewrite.requestedUrl : undefined,
+        );
+        // The tab's content changed, so refresh its ownership identity:
+        // tunneled navigations record the requested URL (a later openTab for
+        // it can dedupe onto this tab), non-tunneled ones clear any stale
+        // identity — otherwise a later tunneled openTab for the tab's OLD
+        // requested URL could match it and navigate away from the new page
+        // (intent-hq/monorepo#2787). The enforcement gate above guarantees
+        // the agent already owns this tab.
+        if (agentId) {
+          embeddedBrowserCdp.setTabOwner(
+            resolvedTabId,
+            agentId,
+            navigateTarget.tunneled ? action.url : null,
+          );
+        }
+        return {
+          action: 'navigate',
+          success: true,
+          result: {
+            tabId: resolvedTabId,
+            url: navigateTarget.rewrite.url,
+            ...rewriteEcho(navigateTarget.rewrite, navigateTarget.tunneled),
+          },
+        };
+      }
+
+      case 'openTunnel': {
+        const tunnel = getTunnelProvider?.() ?? null;
+        if (!tunnel) {
+          return {
+            action: 'openTunnel',
+            success: false,
+            // i18n-ignore (agent-facing protocol error, not user-facing)
+            error: 'Tunneling is not available in this context (no tunnel provider).',
+          };
+        }
+        const backend = tunnel.backend ?? 'tunnel';
+        // Best-effort echo: true when a READY forward for the port already
+        // existed when the action ran. Concurrent openTunnel calls racing
+        // forward creation share one forward (the providers dedupe pending
+        // creates) but may each report reused: false, and a provider without
+        // activeForwards always reports false — don't branch on this flag
+        // for correctness, only for diagnostics.
+        const reused =
+          tunnel.activeForwards?.().some((f) => f.remotePort === action.remotePort) ?? false;
+        const localPort = await tunnel.forwardPort(action.remotePort);
+        return {
+          action: 'openTunnel',
+          success: true,
+          result: { remotePort: action.remotePort, localPort, backend, reused },
+        };
+      }
+
+      case 'listTunnels': {
+        const tunnel = getTunnelProvider?.() ?? null;
+        if (!tunnel) {
+          return { action: 'listTunnels', success: true, result: { tunnels: [] } };
+        }
+        const backend = tunnel.backend ?? 'tunnel';
+        const tunnels = (tunnel.activeForwards?.() ?? []).map((f) => ({ ...f, backend }));
+        return { action: 'listTunnels', success: true, result: { tunnels } };
+      }
+
+      case 'closeTunnel': {
+        const tunnel = getTunnelProvider?.() ?? null;
+        if (!tunnel?.closeForward) {
+          return {
+            action: 'closeTunnel',
+            success: false,
+            // i18n-ignore (agent-facing protocol error, not user-facing)
+            error: 'Tunneling is not available in this context (no tunnel provider).',
+          };
+        }
+        const closed = tunnel.closeForward(action.remotePort);
+        if (!closed) {
+          return {
+            action: 'closeTunnel',
+            success: false,
+            // i18n-ignore (agent-facing protocol error, not user-facing)
+            error: `No active tunnel forward for remote port ${action.remotePort}. Use { action: "listTunnels" } to see active forwards.`,
+          };
+        }
+        return {
+          action: 'closeTunnel',
+          success: true,
+          result: { remotePort: action.remotePort, closed: true },
+        };
       }
 
       default: {
@@ -414,15 +1053,29 @@ async function executeAction(
  * and the error is returned along with results from successful actions.
  *
  * @param agentId - If provided, enables tab lease tracking and idle tab reuse
+ * @param getLoopbackContext - Injectable resolver for the daemon loopback
+ *   locality (see `loopback-rewrite.ts`); defaults to a local daemon, so
+ *   `daemon.localhost`/`client.localhost` resolve to `127.0.0.1` and bare
+ *   loopback URLs pass through unchanged
+ * @param getTunnelProvider - Injectable tunnel seam for the probe-failure
+ *   fallback; when absent (non-Electron contexts) an unreachable rewritten
+ *   remote origin keeps failing with the explanatory probe error
  */
 export async function executeActions(
   input: unknown,
   openTabFn?: (
     url: string,
     position?: 'adjacent' | 'replace' | 'same',
-  ) => { success: boolean; message: string },
+    allowDuplicate?: boolean,
+    requestedUrl?: string,
+    pin?: boolean,
+    ownerAgentId?: string,
+    replaceTabId?: string,
+  ) => { success: boolean; message: string; tabId?: string },
   agentId?: string,
   workspaceId?: string,
+  getLoopbackContext?: () => LoopbackRewriteContext,
+  getTunnelProvider?: () => TunnelProvider | null,
 ): Promise<ExecutionResult> {
   // Validate input against schema
   const parseResult = ActionSequenceSchema.safeParse(input);
@@ -440,7 +1093,15 @@ export async function executeActions(
   const results: ActionResult[] = [];
 
   for (const action of actions) {
-    const result = await executeAction(action, defaultTabId, openTabFn, agentId, workspaceId);
+    const result = await executeAction(
+      action,
+      defaultTabId,
+      openTabFn,
+      agentId,
+      workspaceId,
+      getLoopbackContext,
+      getTunnelProvider,
+    );
     results.push(result);
 
     if (!result.success) {

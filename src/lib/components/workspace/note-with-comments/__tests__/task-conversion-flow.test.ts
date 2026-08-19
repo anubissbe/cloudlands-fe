@@ -1,24 +1,11 @@
 /**
  * @vitest-environment jsdom
  */
-import {
-  afterEach,
-  beforeEach,
-  describe,
-  expect,
-  it,
-  vi,
-} from 'vitest';
-import {
-  cleanup,
-  render,
-  waitFor,
-} from '@testing-library/svelte';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { cleanup, render, waitFor } from '@testing-library/svelte';
+import { tick } from 'svelte';
 import type { Note } from '$shared/types';
-import {
-  ContentType,
-  NoteVisibility,
-} from '$shared/types';
+import { ContentType, NoteVisibility } from '$shared/types';
 
 const {
   mockInvoke,
@@ -30,6 +17,13 @@ const {
   replaceNotes,
   getNoteById,
   mockSelectorStore,
+  mockProcessMarkdownToHTML,
+  mockApplyExternalUpdateHtml,
+  mockMaybeCreateCommentManagerV2,
+  deferMarkdownConversion,
+  takeDeferredMarkdownConversion,
+  resetDeferredMarkdownConversions,
+  editorWorkspaceIds,
 } = vi.hoisted(() => {
   const mockDispatch = vi.fn();
   const mockInvoke = vi.fn();
@@ -38,6 +32,33 @@ const {
     info: vi.fn(),
     warn: vi.fn(),
     error: vi.fn(),
+  };
+  const mockProcessMarkdownToHTML = vi.fn();
+  const mockApplyExternalUpdateHtml = vi.fn();
+  const mockMaybeCreateCommentManagerV2 = vi.fn(async () => null);
+  const deferredMarkdownConversions = new Map<
+    string,
+    Array<{ promise: Promise<string>; resolve: (html: string) => void }>
+  >();
+  const editorWorkspaceIds: string[] = [];
+
+  const deferMarkdownConversion = (markdown: string) => {
+    let resolve!: (html: string) => void;
+    const promise = new Promise<string>((resolvePromise) => {
+      resolve = resolvePromise;
+    });
+    const pending = { promise, resolve };
+    const queue = deferredMarkdownConversions.get(markdown) ?? [];
+    queue.push(pending);
+    deferredMarkdownConversions.set(markdown, queue);
+    return pending;
+  };
+
+  const takeDeferredMarkdownConversion = (markdown: string) => {
+    const queue = deferredMarkdownConversions.get(markdown);
+    const pending = queue?.shift();
+    if (queue?.length === 0) deferredMarkdownConversions.delete(markdown);
+    return pending;
   };
 
   const state = {
@@ -117,6 +138,15 @@ const {
       return state.notesById[noteId];
     },
     mockSelectorStore,
+    mockProcessMarkdownToHTML,
+    mockApplyExternalUpdateHtml,
+    mockMaybeCreateCommentManagerV2,
+    deferMarkdownConversion,
+    takeDeferredMarkdownConversion,
+    resetDeferredMarkdownConversions() {
+      deferredMarkdownConversions.clear();
+    },
+    editorWorkspaceIds,
   };
 });
 
@@ -260,10 +290,6 @@ vi.mock('$store/renderer/configured-store', () => ({
   store: mockSelectorStore,
 }));
 
-vi.mock('$store/renderer/slices/workspace/workspace-selectors', () => ({
-  selectActiveWorkspaceId: () => constantReadable('ws-1'),
-}));
-
 vi.mock('$store/renderer/slices/workspace-notes/workspace-notes-selectors', () => ({
   selectNoteById: Object.assign(() => currentNoteReadable, {
     select: (_state: any, _workspaceId: string, noteId: string) => getNoteById(noteId),
@@ -275,6 +301,7 @@ vi.mock('$store/renderer/slices/workspace-notes/workspace-notes-selectors', () =
     select: () => 'spec',
   }),
   selectNotesVersion: () => notesVersionReadable,
+  selectWorkspaceNotesState: () => constantReadable({ initialized: true }),
 }));
 
 vi.mock('$store/renderer/slices/comments/comments-selectors', () => ({
@@ -339,6 +366,19 @@ vi.mock('$lib/utils/editor-listeners', () => ({
   setupEditorListeners: () => () => {},
 }));
 
+vi.mock('$lib/utils/markdown-processor', async () => {
+  const actual = await vi.importActual<typeof import('$lib/utils/markdown-processor')>(
+    '$lib/utils/markdown-processor',
+  );
+  mockProcessMarkdownToHTML.mockImplementation((markdown: string, options: any) => {
+    return (
+      takeDeferredMarkdownConversion(markdown)?.promise ??
+      actual.processMarkdownToHTML(markdown, options)
+    );
+  });
+  return { ...actual, processMarkdownToHTML: mockProcessMarkdownToHTML };
+});
+
 vi.mock('$lib/components/tiptap/CommentDecorations', () => ({
   updateCommentDecorations: vi.fn(),
 }));
@@ -380,9 +420,22 @@ vi.mock('../note-scroll-handlers', () => ({
 }));
 
 vi.mock('../comment-manager-lifecycle', () => ({
-  maybeCreateCommentManagerV2: vi.fn(async () => null),
+  maybeCreateCommentManagerV2: mockMaybeCreateCommentManagerV2,
   destroyAndClearCommentManagerV2: vi.fn(() => null),
 }));
+
+vi.mock('../external-update-editor', async () => {
+  const actual = await vi.importActual<typeof import('../external-update-editor')>(
+    '../external-update-editor',
+  );
+  mockApplyExternalUpdateHtml.mockImplementation(
+    actual.applyExternalUpdateHtmlToEditorPreservingCursor,
+  );
+  return {
+    ...actual,
+    applyExternalUpdateHtmlToEditorPreservingCursor: mockApplyExternalUpdateHtml,
+  };
+});
 
 vi.mock('../comment-manager-content-change-handlers', () => ({
   createOnCommentManagerContentChangedAfterAnchorInsertion: vi.fn(() => vi.fn()),
@@ -400,25 +453,29 @@ vi.mock('$lib/utils/editor-config', async () => {
   const { createWorkspacesLink } = await import('$lib/utils/tiptap-link-extension');
 
   return {
-    createEditorConfig: ({ element, content, editable, onUpdate }: any) => ({
-      element,
-      content,
-      editable,
-      extensions: [
-        StarterKit.configure({
-          link: false,
-        }),
-        createWorkspacesLink({ openOnClick: false }),
-        TaskList,
-        CustomTaskItem.configure({
-          nested: true,
-          taskListTypeName: 'taskList',
-        }),
-      ],
-      onUpdate: ({ editor }: { editor: { getHTML: () => string } }) => {
-        onUpdate(editor.getHTML());
-      },
-    }),
+    createEditorConfig: ({ element, content, editable, onUpdate, workspace }: any) => {
+      editorWorkspaceIds.push(workspace?.id ?? '');
+      return {
+        element,
+        content,
+        editable,
+        extensions: [
+          StarterKit.configure({
+            link: false,
+          }),
+          createWorkspacesLink({ openOnClick: false }),
+          TaskList,
+          CustomTaskItem.configure({
+            nested: true,
+            workspaceId: workspace?.id,
+            taskListTypeName: 'taskList',
+          }),
+        ],
+        onUpdate: ({ editor }: { editor: { getHTML: () => string } }) => {
+          onUpdate(editor.getHTML());
+        },
+      };
+    },
   };
 });
 
@@ -454,6 +511,8 @@ describe('NoteWithComments task conversion regression', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     resetNotes();
+    resetDeferredMarkdownConversions();
+    editorWorkspaceIds.length = 0;
 
     vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
       callback(0);
@@ -471,7 +530,156 @@ describe('NoteWithComments task conversion regression', () => {
     cleanup();
     resetNotes();
     vi.unstubAllGlobals();
+    vi.useRealTimers();
     document.body.innerHTML = '';
+  });
+
+  async function renderInitializedNote(noteId = 'baseline', content = 'Baseline content') {
+    const view = render(NoteWithComments, {
+      props: {
+        workspace: {
+          id: WORKSPACE_ID,
+          name: 'Workspace',
+          path: '/tmp/workspace',
+          createdAt: '2026-04-14T00:00:00.000Z',
+        } as any,
+        noteId,
+        content,
+        editable: true,
+        showSuggestions: false,
+        showComments: true,
+      },
+    });
+
+    await waitFor(() => {
+      expect(view.container.querySelector('.ProseMirror')).toBeTruthy();
+    });
+
+    return view;
+  }
+
+  async function flushConversionCompletion() {
+    await Promise.resolve();
+    await Promise.resolve();
+    await tick();
+  }
+
+  it('keeps the newest note when conversions complete in reverse order', async () => {
+    const view = await renderInitializedNote();
+    const editorElement = view.container.querySelector('.ProseMirror') as HTMLElement;
+    editorElement.focus();
+    mockApplyExternalUpdateHtml.mockClear();
+    mockMaybeCreateCommentManagerV2.mockClear();
+    vi.useFakeTimers();
+
+    const noteAConversion = deferMarkdownConversion('Note A content');
+    const noteBConversion = deferMarkdownConversion('Note B content');
+
+    await view.rerender({
+      workspace: { id: WORKSPACE_ID } as any,
+      noteId: 'note-a',
+      content: 'Note A content',
+      editable: true,
+      showSuggestions: false,
+      showComments: true,
+    });
+    await tick();
+
+    await view.rerender({
+      workspace: { id: WORKSPACE_ID } as any,
+      noteId: 'note-b',
+      content: 'Note B content',
+      editable: true,
+      showSuggestions: false,
+      showComments: true,
+    });
+    await tick();
+
+    noteBConversion.resolve('<p>Note B converted</p>');
+    await flushConversionCompletion();
+    expect(editorElement.innerHTML).toContain('Note B converted');
+    expect(document.activeElement).toBe(editorElement);
+
+    noteAConversion.resolve('<p>Note A converted</p>');
+    await flushConversionCompletion();
+
+    expect(editorElement.innerHTML).toContain('Note B converted');
+    expect(editorElement.innerHTML).not.toContain('Note A converted');
+    expect(document.activeElement).toBe(editorElement);
+    expect(mockApplyExternalUpdateHtml).toHaveBeenCalledTimes(1);
+    expect(mockMaybeCreateCommentManagerV2).toHaveBeenCalledTimes(1);
+    expect(mockMaybeCreateCommentManagerV2).toHaveBeenCalledWith(
+      expect.objectContaining({ noteId: 'note-b' }),
+    );
+  });
+
+  it('does not apply a pending note conversion after unmount', async () => {
+    const view = await renderInitializedNote();
+    mockApplyExternalUpdateHtml.mockClear();
+    mockMaybeCreateCommentManagerV2.mockClear();
+    vi.useFakeTimers();
+
+    const pendingConversion = deferMarkdownConversion('Unmounted note content');
+    await view.rerender({
+      workspace: { id: WORKSPACE_ID } as any,
+      noteId: 'unmounted-note',
+      content: 'Unmounted note content',
+      editable: true,
+      showSuggestions: false,
+      showComments: true,
+    });
+    await tick();
+
+    view.unmount();
+    pendingConversion.resolve('<p>Must not be applied</p>');
+    await flushConversionCompletion();
+
+    expect(mockApplyExternalUpdateHtml).not.toHaveBeenCalled();
+    expect(mockMaybeCreateCommentManagerV2).not.toHaveBeenCalled();
+  });
+
+  it('recreates the editor with a new owner when the workspace changes', async () => {
+    const view = await renderInitializedNote();
+    expect(editorWorkspaceIds.at(-1)).toBe(WORKSPACE_ID);
+
+    await view.rerender({
+      workspace: { id: 'ws-2' } as any,
+      noteId: 'baseline',
+      content: 'Baseline content',
+      editable: true,
+      showSuggestions: false,
+      showComments: true,
+    });
+
+    await waitFor(() => expect(editorWorkspaceIds.at(-1)).toBe('ws-2'));
+  });
+
+  it('does not retain the old owner when workspace changes during editor initialization', async () => {
+    const pending = deferMarkdownConversion('Baseline content');
+    const view = render(NoteWithComments, {
+      props: {
+        workspace: { id: WORKSPACE_ID } as any,
+        noteId: 'baseline',
+        content: 'Baseline content',
+        editable: true,
+        showSuggestions: false,
+        showComments: true,
+      },
+    });
+
+    await view.rerender({
+      workspace: { id: 'ws-2' } as any,
+      noteId: 'baseline',
+      content: 'Baseline content',
+      editable: true,
+      showSuggestions: false,
+      showComments: true,
+    });
+    await tick();
+    pending.resolve('<p>Baseline content</p>');
+
+    await waitFor(() => expect(editorWorkspaceIds.at(-1)).toBe('ws-2'));
+    expect(editorWorkspaceIds).not.toContain(WORKSPACE_ID);
   });
 
   it('renders converted linked tasks when converted note content arrives after mount without the CustomEvent path', async () => {

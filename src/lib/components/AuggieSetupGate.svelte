@@ -1,41 +1,33 @@
 <script lang="ts">
- 
   import { page } from '$app/stores';
   import { Button } from '$lib/components/ui/button';
   import { toast } from '$lib/components/ui/toast';
   import { invoke, shell } from '$lib/electron-bridge';
-  import { selectManagedInstallStatusByProvider } from '$store/renderer/slices/agent-availability/agent-availability-selectors';
   import { retryLoadModels } from '$store/renderer/slices/model/model-slice';
   import AuggieInstructionsPanel from '$lib/components/AuggieInstructionsPanel.svelte';
 
   import { createLogger } from '$lib/utils/client-logger';
-  import { MINIMUM_AUGGIE_VERSION } from '$shared/constants/auggie';
   import { AUGGIE_CHANNELS, PROVIDERS_CHANNELS } from '$shared/ipc/channels';
   import { selectProviderCatalogEntry } from '$store/renderer/slices/provider-catalog/provider-catalog-selectors';
   import type { ProviderAvailabilityResult } from '$shared/types/provider-availability';
   import {
-  faCircleCheck,
-  faCircleNotch,
-  faDownload,
-  faPaste,
-  faExternalLinkAlt,
-} from '@fortawesome/free-solid-svg-icons';
+    faCircleCheck,
+    faCircleNotch,
+    faDownload,
+    faPaste,
+    faExternalLinkAlt,
+  } from '@fortawesome/free-solid-svg-icons';
   import { onMount } from 'svelte';
   import Fa from 'svelte-fa';
   import { store as appStore } from '$store/renderer/store';
   import { m } from '$shared/paraglide/messages.js';
 
   const logger = createLogger('AuggieSetupGate');
-  const codexManagedInstallStatus$ = selectManagedInstallStatusByProvider('codex');
 
+  /** Auggie install/auth state, from the generic per-provider check. */
   type AuggieStatus = {
     installed: boolean;
     authenticated: boolean;
-    version?: string;
-    versionOk: boolean;
-    minimumVersion: string;
-    authDetails?: string;
-    binaryInstallAvailable?: boolean;
   };
 
   const STATUS_REFRESH_INTERVAL_MS = 15000;
@@ -55,12 +47,11 @@
   let auggieInstructions = $state<string[] | null>(null);
   let auggieCommand = $state<string | null>(null);
 
-  // Skip gating on sandbox/test routes
+  // Skip gating on sandbox/test-catalog routes (the latter render at /test-*)
   const isSandboxPage = $derived(
     $page.url.pathname === '/sandbox' ||
       $page.url.pathname.startsWith('/sandbox/') ||
-      $page.url.pathname === '/test' ||
-      $page.url.pathname.startsWith('/test/'),
+      $page.url.pathname.startsWith('/test-'),
   );
 
   // Check if any provider is available (allows bypassing Auggie-specific setup)
@@ -91,19 +82,19 @@
     }
   }
 
-  /** Fetch auggie install/auth state from AUGGIE_CHANNELS.STATUS. */
+  /** Fetch auggie install/auth state from the generic per-provider check. */
   async function checkStatus() {
     try {
-      const result = await invoke<{ success: boolean; data?: AuggieStatus; error?: string }>(
-        AUGGIE_CHANNELS.STATUS,
-      );
-      status = result.data ?? {
-        installed: false,
-        authenticated: false,
-        versionOk: false,
-        minimumVersion: MINIMUM_AUGGIE_VERSION,
+      const result = await invoke<{
+        success: boolean;
+        data?: { available: boolean; authenticated?: boolean };
+        error?: string;
+      }>(PROVIDERS_CHANNELS.CHECK_SINGLE, { providerId: 'auggie' });
+      status = {
+        installed: result.data?.available ?? false,
+        authenticated: result.data?.authenticated === true,
       };
-      if (status?.installed && status?.versionOk && status?.authenticated) {
+      if (status.installed && status.authenticated) {
         appStore.dispatch(retryLoadModels());
       }
     } catch (err) {
@@ -201,16 +192,13 @@
     actionInProgress = true;
     try {
       await checkStatus();
-      if (status?.installed && status?.versionOk && status?.authenticated) {
+      if (status?.installed && status?.authenticated) {
         auggieInstructions = null;
         auggieCommand = null;
         toast.success(m.lib_auggieSetup_readyToGo_message());
         return;
       }
-      const channel =
-        status?.installed && status?.versionOk
-          ? AUGGIE_CHANNELS.AUTHENTICATE
-          : AUGGIE_CHANNELS.INSTALL;
+      const channel = status?.installed ? AUGGIE_CHANNELS.AUTHENTICATE : AUGGIE_CHANNELS.INSTALL;
       const args = channel === AUGGIE_CHANNELS.AUTHENTICATE ? [{ action: 'start' }] : [];
       const result = await invoke<InstructionResponse>(channel, ...args);
       if (result.success && result.data?.authenticated) {
@@ -229,7 +217,7 @@
     auggieCommand = null;
   }
 
-  // Provider setup is now non-blocking on the homepage — the gate is retained
+  // Provider setup is now non-blocking in the app shell — the gate is retained
   // for the multi-provider setup UI it hosts, but not rendered by default.
   const shouldBlock = $derived.by(() => false);
 
@@ -243,16 +231,19 @@
     };
   }
 
+  // Absent hidden list = gating verdict unknown — fall back to the catalog
+  // row's `visible` flag (same rule as orderProviderEntries) so gated
+  // providers (e.g. mock) don't leak on the degraded path. Default-deny:
+  // a row missing from the (possibly unhydrated) catalog counts as not
+  // visible, mirroring orderProviderEntries rendering nothing before the
+  // catalog loads.
+  function catalogRowVisible(providerId: string): boolean {
+    const entry = selectProviderCatalogEntry.select(appStore.state, providerId);
+    return entry !== undefined && entry.visible !== false;
+  }
+
   const providerOptions = $derived.by(() => {
-    const hidden = providerAvailability?.hiddenProviders ?? [];
-    const codexManagedInstallStatus = $codexManagedInstallStatus$;
-    const codexSetupInProgress = codexManagedInstallStatus?.managedInstallState === 'installing';
-    const codexProgress = codexManagedInstallStatus?.downloadProgress;
-    const codexSetupStatus = codexSetupInProgress
-      ? typeof codexProgress === 'number'
-        ? m.lib_auggieSetup_settingUpCodexPercent_label({ percent: Math.round(codexProgress * 100) })
-        : m.lib_auggieSetup_settingUpCodex_label()
-      : undefined;
+    const hidden = providerAvailability?.hiddenProviders;
     return [
       {
         id: 'auggie',
@@ -268,7 +259,7 @@
         id: 'claude-code',
         name: catalogRow('claude-code').displayName,
         command: catalogRow('claude-code').command,
-        installCommand: 'npm install -g @agentclientprotocol/claude-agent-acp',
+        installCommand: 'curl -fsSL https://claude.ai/install.sh | bash',
         description: m.lib_auggieSetup_claudeCode_description(),
         available: providerAvailability?.providers.claudeCode.available ?? false,
         requiresAuth: false,
@@ -278,10 +269,7 @@
         id: 'codex',
         name: catalogRow('codex').displayName,
         command: catalogRow('codex').command,
-        installCommand: codexSetupInProgress
-          ? undefined
-          : 'npm install -g @agentclientprotocol/codex-acp',
-        setupStatus: codexSetupStatus,
+        installCommand: 'npm i -g @openai/codex',
         description: m.lib_auggieSetup_codex_description(),
         available: providerAvailability?.providers.codex.available ?? false,
         requiresAuth: false,
@@ -297,7 +285,7 @@
         requiresAuth: false,
         docsUrl: 'https://docs.snowflake.com/en/developer-guide/cortex',
       },
-    ].filter((p) => !hidden.includes(p.id));
+    ].filter((p) => (hidden ? !hidden.includes(p.id) : catalogRowVisible(p.id)));
   });
 
   function openProviderDocs(url: string) {
@@ -379,7 +367,8 @@
                 {/if}
                 {#if provider.available}
                   <span class="available-badge">
-                    <Fa icon={faCircleCheck} class="inline" size="sm" /> {m.lib_auggieSetup_available_badge()}
+                    <Fa icon={faCircleCheck} class="inline" size="sm" />
+                    {m.lib_auggieSetup_available_badge()}
                   </span>
                 {/if}
               </div>
@@ -396,12 +385,7 @@
                     {/if}
                   </Button>
                 {:else}
-                  {#if provider.setupStatus}
-                    <div class="setup-status" role="status">
-                      <Fa icon={faCircleNotch} class="animate-spin" size="sm" />
-                      <span>{provider.setupStatus}</span>
-                    </div>
-                  {:else if provider.installCommand}
+                  {#if provider.installCommand}
                     {@const installCommand = provider.installCommand}
                     <button
                       class="install-command-button"
@@ -451,21 +435,24 @@
               });
             }}
           >
-            <Fa icon={faCircleNotch} class="mr-2" /> {m.lib_auggieSetup_checkAgain_label()}
+            <Fa icon={faCircleNotch} class="mr-2" />
+            {m.lib_auggieSetup_checkAgain_label()}
           </Button>
         </div>
       </section>
 
       <!-- Auggie login section (rendered when installed but not authenticated) -->
-      {#if status?.installed && status?.versionOk && !status?.authenticated}
+      {#if status?.installed && !status?.authenticated}
         <section class="authenticate">
           <h2>{m.lib_auggieSetup_authenticate_title()}</h2>
           <div class="actions">
             <Button onclick={() => startAuthentication()} disabled={actionInProgress}>
               {#if actionInProgress}
-                <Fa icon={faCircleNotch} class="animate-spin mr-2" /> {m.lib_auggieSetup_loading_label()}
+                <Fa icon={faCircleNotch} class="animate-spin mr-2" />
+                {m.lib_auggieSetup_loading_label()}
               {:else}
-                <Fa icon={faCircleCheck} class="mr-2" /> {m.lib_auggieSetup_loginWithAugment_label()}
+                <Fa icon={faCircleCheck} class="mr-2" />
+                {m.lib_auggieSetup_loginWithAugment_label()}
               {/if}
             </Button>
           </div>
@@ -570,15 +557,6 @@
 
   .install-command-button:hover :global(.copy-icon) {
     opacity: 1;
-  }
-
-  .setup-status {
-    display: inline-flex;
-    align-items: center;
-    gap: 0.5rem;
-    padding: 0.5rem 1rem;
-    color: hsl(var(--muted-foreground));
-    font-size: 0.875rem;
   }
 
   .error-message {

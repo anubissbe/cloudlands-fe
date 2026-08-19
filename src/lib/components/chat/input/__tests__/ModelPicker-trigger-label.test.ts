@@ -1,22 +1,11 @@
 // @vitest-environment jsdom
 
-import {
-  afterEach,
-  beforeEach,
-  describe,
-  expect,
-  it,
-  vi,
-} from 'vitest';
-import {
-  cleanup,
-  render,
-  screen,
-} from '@testing-library/svelte';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { cleanup, render, screen } from '@testing-library/svelte';
 import { tick } from 'svelte';
 import { writable } from 'svelte/store';
 
-type ModelOption = { value: string; label: string; description?: string };
+type ModelOption = { value: string; label: string; description?: string; isDefault?: boolean };
 type Session = {
   id: string;
   workspaceId: string;
@@ -34,17 +23,19 @@ const providerWarnings$ = writable<Record<string, string>>({});
 const sessionVersion$ = writable(0);
 const sessions = new Map<string, Session>();
 
-const mockReduxDispatch = vi.hoisted(() => vi.fn((action: { type?: string; payload?: unknown }) => {
-  if (action.type === 'agentSessions/updateSession' && Array.isArray(action.payload)) {
-    const [agentId, updates] = action.payload as [string, Partial<Session>];
-    sessions.set(agentId, {
-      ...(sessions.get(agentId) ?? { id: agentId, workspaceId: 'ws-1' }),
-      ...updates,
-    });
-    sessionVersion$.update((value) => value + 1);
-  }
-  return action;
-}));
+const mockReduxDispatch = vi.hoisted(() =>
+  vi.fn((action: { type?: string; payload?: unknown }) => {
+    if (action.type === 'agentSessions/updateSession' && Array.isArray(action.payload)) {
+      const [agentId, updates] = action.payload as [string, Partial<Session>];
+      sessions.set(agentId, {
+        ...(sessions.get(agentId) ?? { id: agentId, workspaceId: 'ws-1' }),
+        ...updates,
+      });
+      sessionVersion$.update((value) => value + 1);
+    }
+    return action;
+  }),
+);
 
 function selectorForSession(
   agentIdOrStore: string | { subscribe: (run: (value: string) => void) => () => void },
@@ -82,10 +73,7 @@ vi.mock('@fortawesome/free-solid-svg-icons', () => ({
   faArrowsRotate: { iconName: 'arrows-rotate' },
   faExclamationTriangle: { iconName: 'exclamation-triangle' },
   faTriangleExclamation: { iconName: 'triangle-exclamation' },
-}));
-
-vi.mock('$lib/icons/faSettings', () => ({
-  faSettings: { iconName: 'settings' },
+  faSettings: { iconName: 'gear' },
 }));
 
 vi.mock('$lib/components/ui/button/button.svelte', async () => {
@@ -98,9 +86,9 @@ vi.mock('$lib/components/ui/dropdown', async () => {
   return { Dropdown: SlotOnly };
 });
 
-vi.mock('$lib/components/ui/ProviderIcon.svelte', async () => {
-  const ProviderIcon = (await import('../../__tests__/mocks/ProviderIcon.svelte')).default;
-  return { default: ProviderIcon };
+vi.mock('$features/agent/components/AgentProviderIcon.svelte', async () => {
+  const mod = await import('../../__tests__/mocks/ProviderIcon.svelte');
+  return { default: mod.default, hasProviderIcon: mod.hasProviderIcon };
 });
 
 vi.mock('$features/agent/agent.client', () => ({
@@ -109,13 +97,17 @@ vi.mock('$features/agent/agent.client', () => ({
   },
 }));
 
+vi.mock('$features/agent/reasoning-effort', () => ({
+  applyReasoningEffort: vi.fn(async () => true),
+}));
+
 vi.mock('$store/renderer/store', async () => {
-  const { createAppStoreMockModule } = await import('$store/renderer/utils/test-helpers/store-mock');
+  const { createAppStoreMockModule } =
+    await import('$store/renderer/utils/test-helpers/store-mock');
   // Hydrated catalog with the synthetic `anthropic` provider these regressions
   // use, so the real provider-catalog selectors resolve ids/display names.
-  const { initialState, providerCatalogLoaded, providerCatalogReducer } = await import(
-    '$store/renderer/slices/provider-catalog/provider-catalog-slice'
-  );
+  const { initialState, providerCatalogLoaded, providerCatalogReducer } =
+    await import('$store/renderer/slices/provider-catalog/provider-catalog-slice');
   const providerCatalog = providerCatalogReducer(
     initialState,
     providerCatalogLoaded({
@@ -138,13 +130,35 @@ vi.mock('$store/renderer/store', async () => {
           canBeDisabled: true,
           visible: true,
         },
+        {
+          id: 'claude-code',
+          displayName: 'Claude Code',
+          shortName: 'Claude',
+          command: 'claude-code',
+          isDefault: false,
+          canBeDisabled: true,
+          visible: true,
+        },
+        {
+          id: 'codex',
+          displayName: 'Codex',
+          shortName: 'Codex',
+          command: 'codex',
+          isDefault: false,
+          canBeDisabled: true,
+          visible: true,
+        },
       ],
       defaultProviderId: 'auggie',
     }),
   );
 
   return createAppStoreMockModule({
-    state: () => ({ sessions, providerCatalog }),
+    state: () => ({
+      sessions,
+      providerCatalog,
+      providerSettings: { activeProviderId: 'auggie', enabledProviders: {} },
+    }),
     dispatch: mockReduxDispatch,
   });
 });
@@ -164,7 +178,10 @@ vi.mock('$store/renderer/slices/agent-session/agent-session-selectors', () => {
       selectorForSession(agentIdOrStore),
     { select: (_state: unknown, agentId: string) => sessions.get(agentId) },
   );
-  return { selectAgentSession };
+  const selectAgentReasoningEffort = Object.assign(() => writable(undefined), {
+    select: () => undefined,
+  });
+  return { selectAgentSession, selectAgentReasoningEffort };
 });
 
 vi.mock('$store/renderer/slices/agent-session/agent-session-slice', () => ({
@@ -183,10 +200,11 @@ vi.mock('$store/renderer/slices/model/model-selectors', () => ({
   selectIsLoadingModels: () => isLoadingModels$,
   selectLoadError: () => writable(null),
   selectAllProviderWarnings: () => providerWarnings$,
+  selectAllProviderStaleFlags: () => writable({}),
+  selectAgentModelEffortLevels: () => writable(undefined),
 }));
 
 vi.mock('$store/renderer/slices/agent-availability/agent-availability-selectors', () => ({
-  selectManagedInstallStatusByProvider: () => writable(null),
   selectHasCheckedOnce: () => writable(true),
 }));
 
@@ -196,6 +214,7 @@ vi.mock('$store/renderer/slices/daemon-health/daemon-health-selectors', () => ({
 
 vi.mock('$store/renderer/slices/provider-settings/provider-settings-selectors', () => ({
   selectActiveProviderId: () => activeProviderId$,
+  selectEnabledProviderIds: () => enabledProviderIds$,
   selectAvailableEnabledProviderIds: () => enabledProviderIds$,
 }));
 
@@ -210,7 +229,9 @@ vi.mock('$store/renderer/slices/model/model-utils', () => ({
     const models =
       providerId === 'anthropic'
         ? [{ value: 'anthropic:claude-opus-4-7', label: 'Claude Opus 4.7' }]
-        : [{ value: 'auggie:butler', label: 'Auggie Butler' }];
+        : providerId === 'claude-code'
+          ? [{ value: 'claude-code:claude-opus-4-8', label: 'Claude Opus 4.8', isDefault: true }]
+          : [{ value: 'auggie:butler', label: 'Auggie Butler' }];
     return Promise.resolve({ models });
   }),
 }));
@@ -399,13 +420,13 @@ describe('ModelPicker trigger label regressions', () => {
     render(ModelPicker, {
       props: {
         selectedModel: undefined,
-        defaultModelId: 'anthropic:claude-opus-4-7',
+        defaultModelId: 'claude-code:claude-opus-4-7',
         isLocked: true,
       },
     });
 
     expect(screen.getByTestId('provider-icon').getAttribute('data-provider-id')).toBe(
-      'anthropic',
+      'claude-code',
     );
   });
 
@@ -413,19 +434,17 @@ describe('ModelPicker trigger label regressions', () => {
     render(ModelPicker, {
       props: {
         selectedModel: undefined,
-        providerId: 'anthropic',
-        defaultModelId: 'auggie:butler',
+        providerId: 'auggie',
+        defaultModelId: 'claude-code:butler',
         isLocked: true,
       },
     });
 
-    expect(screen.getByTestId('provider-icon').getAttribute('data-provider-id')).toBe(
-      'anthropic',
-    );
+    expect(screen.getByTestId('provider-icon').getAttribute('data-provider-id')).toBe('auggie');
   });
 
   it('falls back to the active provider when no model or provider is resolvable', () => {
-    activeProviderId$.set('anthropic');
+    activeProviderId$.set('claude-code');
 
     render(ModelPicker, {
       props: {
@@ -435,12 +454,14 @@ describe('ModelPicker trigger label regressions', () => {
     });
 
     expect(screen.getByTestId('provider-icon').getAttribute('data-provider-id')).toBe(
-      'anthropic',
+      'claude-code',
     );
   });
 
   it('reacts when the Redux session provider changes without remounting', async () => {
-    sessions.set('agent-1', { id: 'agent-1', workspaceId: 'ws-1', provider: 'auggie' });
+    selectedModel$.set(undefined);
+    activeProviderId$.set('codex');
+    sessions.set('agent-1', { id: 'agent-1', workspaceId: 'ws-1', provider: 'codex' });
     sessionVersion$.update((value) => value + 1);
 
     render(ModelPicker, {
@@ -452,19 +473,149 @@ describe('ModelPicker trigger label regressions', () => {
       },
     });
 
-    expect(screen.getByTestId('provider-icon').getAttribute('data-provider-id')).toBe('auggie');
+    expect(screen.getByTestId('provider-icon').getAttribute('data-provider-id')).toBe('codex');
 
     appStore.dispatch(
       updateAgentSessionFields('agent-1', {
-        provider: 'anthropic',
-        model: 'anthropic:claude-opus-4-7',
+        provider: 'claude-code',
+        model: 'claude-code:claude-opus-4-7',
       }),
     );
 
     await tick();
     await new Promise((resolve) => setTimeout(resolve, 80));
 
-    expect(screen.getByTestId('provider-icon').getAttribute('data-provider-id')).toBe('anthropic');
-    expect(vi.mocked(getModelsForProviderForLoadingState)).toHaveBeenCalledWith('anthropic');
+    expect(screen.getByTestId('provider-icon').getAttribute('data-provider-id')).toBe(
+      'claude-code',
+    );
+    expect(vi.mocked(getModelsForProviderForLoadingState)).toHaveBeenCalledWith('claude-code');
+  });
+
+  it('does not render a provider icon for unknown provider IDs', () => {
+    activeProviderId$.set('anthropic');
+
+    render(ModelPicker, {
+      props: {
+        selectedModel: undefined,
+        isLocked: true,
+      },
+    });
+
+    expect(screen.queryByTestId('provider-icon')).toBeNull();
+  });
+
+  it('falls back to the catalog isDefault row when the daemon preview is absent (opt-in)', () => {
+    availableModels$.set([
+      { value: 'auggie:butler', label: 'Auggie Butler' },
+      { value: 'auggie:sonnet-4.6', label: 'Sonnet 4.6', isDefault: true },
+    ]);
+
+    render(ModelPicker, {
+      props: {
+        selectedModel: undefined,
+        defaultModelLabel: 'Provider default',
+        fallbackToCatalogDefault: true,
+        isLocked: true,
+      },
+    });
+
+    const text = screen.getByRole('button').textContent ?? '';
+    expect(text).toContain('Sonnet 4.6');
+    expect(text).not.toContain('Provider default');
+  });
+
+  it('keeps the defaultModelLabel when no catalog row is marked isDefault', () => {
+    availableModels$.set([{ value: 'auggie:butler', label: 'Auggie Butler' }]);
+
+    render(ModelPicker, {
+      props: {
+        selectedModel: undefined,
+        defaultModelLabel: 'Provider default',
+        fallbackToCatalogDefault: true,
+        isLocked: true,
+      },
+    });
+
+    expect(screen.getByRole('button').textContent ?? '').toContain('Provider default');
+  });
+
+  it('does not use the catalog isDefault fallback when a daemon preview (defaultModelId) resolves', () => {
+    availableModels$.set([
+      { value: 'auggie:butler', label: 'Auggie Butler' },
+      { value: 'auggie:sonnet-4.6', label: 'Sonnet 4.6', isDefault: true },
+    ]);
+
+    render(ModelPicker, {
+      props: {
+        selectedModel: undefined,
+        defaultModelId: 'auggie:butler',
+        defaultModelLabel: 'Provider default',
+        fallbackToCatalogDefault: true,
+        isLocked: true,
+      },
+    });
+
+    const text = screen.getByRole('button').textContent ?? '';
+    expect(text).toContain('Auggie Butler');
+    expect(text).not.toContain('Sonnet 4.6');
+  });
+
+  it('reads the fallbackProviderId provider for the catalog isDefault fallback, not the active provider', async () => {
+    enabledProviderIds$.set(['auggie', 'claude-code']);
+    availableModels$.set([
+      { value: 'auggie:butler', label: 'Auggie Butler' },
+      { value: 'auggie:sonnet-4.6', label: 'Sonnet 4.6', isDefault: true },
+    ]);
+
+    render(ModelPicker, {
+      props: {
+        selectedModel: undefined,
+        defaultModelLabel: 'Provider default',
+        fallbackToCatalogDefault: true,
+        fallbackProviderId: 'claude-code',
+        isLocked: true,
+      },
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    await tick();
+
+    const text = screen.getByRole('button').textContent ?? '';
+    expect(text).toContain('Claude Opus 4.8');
+    expect(text).not.toContain('Sonnet 4.6');
+    expect(screen.getByTestId('provider-icon').getAttribute('data-provider-id')).toBe(
+      'claude-code',
+    );
+  });
+
+  it('maps a legacy <provider>:default selection to the catalog isDefault row', () => {
+    availableModels$.set([
+      { value: 'auggie:butler', label: 'Auggie Butler' },
+      { value: 'auggie:sonnet-4.6', label: 'Sonnet 4.6', isDefault: true },
+    ]);
+
+    render(ModelPicker, {
+      props: {
+        selectedModel: 'auggie:default',
+        isLocked: true,
+      },
+    });
+
+    const text = screen.getByRole('button').textContent ?? '';
+    expect(text).toContain('Sonnet 4.6');
+    expect(text).not.toContain('default');
+  });
+
+  it('renders the raw id for a legacy <provider>:default selection with no isDefault row', () => {
+    availableModels$.set([{ value: 'auggie:butler', label: 'Auggie Butler' }]);
+
+    render(ModelPicker, {
+      props: {
+        selectedModel: 'auggie:default',
+        isLocked: true,
+      },
+    });
+
+    expect(screen.getByRole('button').textContent ?? '').toContain('default');
   });
 });

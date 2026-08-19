@@ -148,7 +148,7 @@ export const WorkspaceSchema = z.object({
   environmentConfig: z.any().optional(),
   defaultModel: z.string().optional(),
   agentSummary: z.object({ agentIds: z.array(z.string()) }).optional(),
-  taskStats: z.any().optional(), // Deprecated aggregate; fetch on demand
+  taskStats: z.any().optional(), // Task progress rollup; carried on metadata payloads (PROTOCOL §5.1)
   gitSummary: z.any().optional(), // Deprecated aggregate; fetch on demand
   /** CoW filesystem capability of the workspaces root (PROTOCOL §5.1); gates the cowIsolation toggle. */
   cowSupported: z.boolean().optional(),
@@ -271,6 +271,7 @@ export const CreateWorkspaceRequestSchema = z.object({
   // Execution environment for the workspace (PROTOCOL §5.5b); validated
   // daemon-side against enabled profiles + host capabilities.
   executionEnvironment: SandboxTypeSchema.optional(),
+  progressId: z.string().optional(), // FE-minted correlation id echoed on git:clone:progress/done frames (PROTOCOL §5.1)
 });
 
 export const UpdateWorkspaceRequestSchema = z.object({
@@ -341,6 +342,9 @@ export const TaskMetadataSchema = z.object({
   blockedReason: z.string().optional(),
   completedAt: z.string().datetime().optional(),
   startedAt: z.string().datetime().optional(),
+  dependsOn: z.array(z.string()).optional(), // Hard ordering edges (task note ids)
+  conflictsWith: z.array(z.string()).optional(), // Advisory conflict edges (task note ids)
+  unmetDependsOn: z.array(z.string()).optional(), // Daemon-computed unmet deps (read/push shapes, v6.8)
 });
 
 // Note: DependencyTypeSchema and NoteDependencySchema removed
