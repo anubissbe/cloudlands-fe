@@ -376,13 +376,15 @@
               </p>
             {/if}
           </div>
+          <!-- Direct is always enabled (the daemon rejects disabling it):
+               render its toggle locked on and non-interactive. -->
           <Toggle
-            pressed={row.available && row.enabled}
-            onclick={() => handleToggle(row.type, row.enabled)}
+            pressed={row.type === 'direct' || (row.available && row.enabled)}
+            onclick={row.type === 'direct' ? undefined : () => handleToggle(row.type, row.enabled)}
             variant="indicator"
             size="xs"
             class="mb-auto"
-            disabled={!row.available || updating}
+            disabled={row.type === 'direct' || !row.available || updating}
             ariaLabel={typeLabels[row.type]()}
           />
         </div>

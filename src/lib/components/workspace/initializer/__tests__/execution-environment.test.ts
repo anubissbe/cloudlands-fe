@@ -84,6 +84,26 @@ describe('pickableEnvironments', () => {
     };
     expect(pickableEnvironments(options)).toEqual(['direct', 'worktree']);
   });
+
+  it('flow matrix: local offers worktree; github/new-repo filter it out client-side', () => {
+    expect(pickableEnvironments(baseOptions, 'local')).toEqual(['direct', 'worktree', 'cow']);
+    expect(pickableEnvironments(baseOptions, 'github')).toEqual(['direct', 'cow']);
+    expect(pickableEnvironments(baseOptions, 'new-repo')).toEqual(['direct', 'cow']);
+  });
+
+  it('non-local flows still honor enabled+available for the remaining types', () => {
+    const options: SandboxOptions = {
+      defaultType: 'worktree',
+      options: [
+        { type: 'direct', enabled: true, available: true, default: false },
+        { type: 'worktree', enabled: true, available: true, default: true },
+        { type: 'cow', enabled: true, available: false, default: false, reason: 'no CoW FS' },
+        { type: 'microvm', enabled: false, available: true, default: false },
+      ],
+    };
+    expect(pickableEnvironments(options, 'github')).toEqual(['direct']);
+    expect(pickableEnvironments(options, 'new-repo')).toEqual(['direct']);
+  });
 });
 
 describe('preselectedEnvironment', () => {
@@ -115,6 +135,36 @@ describe('preselectedEnvironment', () => {
       ],
     };
     expect(preselectedEnvironment(options)).toBeNull();
+  });
+
+  it('worktree default in a github/new-repo flow falls back to Direct', () => {
+    expect(preselectedEnvironment(baseOptions, 'local')).toBe('worktree');
+    expect(preselectedEnvironment(baseOptions, 'github')).toBe('direct');
+    expect(preselectedEnvironment(baseOptions, 'new-repo')).toBe('direct');
+  });
+
+  it('non-worktree default stays preselected in non-local flows when pickable', () => {
+    const options: SandboxOptions = {
+      ...baseOptions,
+      defaultType: 'cow',
+    };
+    expect(preselectedEnvironment(options, 'github')).toBe('cow');
+    expect(preselectedEnvironment(options, 'new-repo')).toBe('cow');
+  });
+
+  it('returns null when a flow filters out every pickable type (picker hidden)', () => {
+    const options: SandboxOptions = {
+      defaultType: 'worktree',
+      options: [
+        { type: 'direct', enabled: false, available: true, default: false },
+        { type: 'worktree', enabled: true, available: true, default: true },
+        { type: 'cow', enabled: false, available: false, default: false, reason: 'no CoW FS' },
+        { type: 'microvm', enabled: false, available: false, default: false, reason: 'no CoW FS' },
+      ],
+    };
+    expect(preselectedEnvironment(options, 'local')).toBe('worktree');
+    expect(preselectedEnvironment(options, 'github')).toBeNull();
+    expect(preselectedEnvironment(options, 'new-repo')).toBeNull();
   });
 });
 

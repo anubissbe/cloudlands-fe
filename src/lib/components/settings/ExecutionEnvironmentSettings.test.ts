@@ -152,6 +152,54 @@ describe('ExecutionEnvironmentSettings (§5.5b)', () => {
     expect(reasons).toHaveLength(2);
   });
 
+  it('renders the Direct toggle locked on and non-interactive (always enabled)', async () => {
+    render(ExecutionEnvironmentSettings);
+
+    const toggles = await waitFor(() => {
+      const found = screen.getAllByRole('switch');
+      expect(found).toHaveLength(4);
+      return found;
+    });
+    const direct = toggles[0] as HTMLButtonElement;
+    expect(direct.getAttribute('data-state')).toBe('on');
+    expect(direct.disabled).toBe(true);
+
+    await fireEvent.click(direct);
+    expect(mocks.mockInvoke).not.toHaveBeenCalledWith(
+      SANDBOX_CHANNELS.PROFILES_UPDATE,
+      expect.anything(),
+    );
+  });
+
+  it('renders Direct on even when the daemon reports it disabled (always-enabled mirror)', async () => {
+    mocks.mockInvoke.mockImplementation(
+      mockChannels({
+        [SANDBOX_CHANNELS.OPTIONS]: {
+          success: true,
+          data: {
+            defaultType: 'worktree',
+            options: [
+              { type: 'direct', enabled: false, available: true, default: false },
+              { type: 'worktree', enabled: true, available: true, default: true },
+              { type: 'cow', enabled: false, available: true, default: false },
+              { type: 'microvm', enabled: false, available: true, default: false },
+            ],
+          },
+        },
+      }),
+    );
+
+    render(ExecutionEnvironmentSettings);
+
+    const toggles = await waitFor(() => {
+      const found = screen.getAllByRole('switch');
+      expect(found).toHaveLength(4);
+      return found;
+    });
+    expect(toggles[0].getAttribute('data-state')).toBe('on');
+    expect((toggles[0] as HTMLButtonElement).disabled).toBe(true);
+  });
+
   it('sends the exact enable payload via sandbox:profiles:update on toggle', async () => {
     render(ExecutionEnvironmentSettings);
 

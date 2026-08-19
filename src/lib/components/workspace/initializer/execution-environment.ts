@@ -37,23 +37,44 @@ export async function loadExecutionEnvironmentOptions(): Promise<SandboxOptions 
 }
 
 /**
- * Types offerable at creation: enabled in settings AND available on the host,
- * in the daemon's catalog order (direct, worktree, cow, microvm).
+ * Creation flow driving which environments are offerable: worktree needs an
+ * existing local checkout to link against, so it is only pickable for
+ * "Copy from local" (`local`) — never for "Pick a repo" (`github`) or
+ * "New repo" (`new-repo`), where CoW is just how the checkout is obtained.
  */
-export function pickableEnvironments(options: SandboxOptions): SandboxType[] {
-  return options.options
+export type CreationFlow = 'local' | 'github' | 'new-repo';
+
+/**
+ * Types offerable at creation: enabled in settings AND available on the host,
+ * in the daemon's catalog order (direct, worktree, cow, microvm). Worktree is
+ * additionally filtered out for the `github` / `new-repo` flows (the daemon
+ * rejects worktree combined with `githubUrl` / `isNewRepo`).
+ */
+export function pickableEnvironments(
+  options: SandboxOptions,
+  flow: CreationFlow = 'local',
+): SandboxType[] {
+  const pickable = options.options
     .filter((row) => row.enabled && row.available)
     .map((row) => row.type);
+  return flow === 'local' ? pickable : pickable.filter((type) => type !== 'worktree');
 }
 
 /**
- * The type to preselect: the profile default when it is pickable, else the
- * first pickable type, else `null` (nothing offerable — picker hidden).
+ * The type to preselect for a flow: the profile default when it is pickable
+ * in that flow; a worktree default in a `github` / `new-repo` flow falls back
+ * to Direct; else the first pickable type; else `null` (nothing offerable —
+ * picker hidden).
  */
-export function preselectedEnvironment(options: SandboxOptions): SandboxType | null {
-  const pickable = pickableEnvironments(options);
+export function preselectedEnvironment(
+  options: SandboxOptions,
+  flow: CreationFlow = 'local',
+): SandboxType | null {
+  const pickable = pickableEnvironments(options, flow);
   if (pickable.length === 0) return null;
-  return pickable.includes(options.defaultType) ? options.defaultType : pickable[0];
+  if (pickable.includes(options.defaultType)) return options.defaultType;
+  if (options.defaultType === 'worktree' && pickable.includes('direct')) return 'direct';
+  return pickable[0];
 }
 
 /** Human label for an execution-environment type. */

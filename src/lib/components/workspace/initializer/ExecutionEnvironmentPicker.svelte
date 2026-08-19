@@ -19,6 +19,7 @@
   import type { SandboxOptions, SandboxType } from '$shared/schemas';
   import { Select } from '$lib/components/ui/select';
   import {
+    type CreationFlow,
     environmentDescription,
     environmentLabel,
     loadExecutionEnvironmentOptions,
@@ -29,28 +30,42 @@
   interface Props {
     /** Currently selected type; `null` until options load (or when none are pickable). */
     value?: SandboxType | null;
+    /** Creation flow: worktree is only offerable for `local` (Copy from local). */
+    flow?: CreationFlow;
     /** Fired when the user picks a type (also on the initial preselection). */
     onchange?: (value: SandboxType) => void;
   }
 
-  let { value = $bindable(null), onchange }: Props = $props();
+  let { value = $bindable(null), flow = 'local', onchange }: Props = $props();
 
   let options = $state<SandboxOptions | null>(null);
-  const pickable = $derived(options ? pickableEnvironments(options) : []);
+  const pickable = $derived(options ? pickableEnvironments(options, flow) : []);
 
   onMount(() => {
     void (async () => {
       const loaded = await loadExecutionEnvironmentOptions();
       if (!loaded) return;
       options = loaded;
-      if (value === null || !pickableEnvironments(loaded).includes(value)) {
-        const preselect = preselectedEnvironment(loaded);
+      if (value === null || !pickableEnvironments(loaded, flow).includes(value)) {
+        const preselect = preselectedEnvironment(loaded, flow);
         if (preselect !== null) {
           value = preselect;
           onchange?.(preselect);
         }
       }
     })();
+  });
+
+  // Snap-back: a flow switch can strand a selection that is no longer
+  // offerable (worktree selected, then the repo choice moves to a github /
+  // new-repo flow) — snap it to Direct so the form never submits a
+  // combination the daemon rejects.
+  $effect(() => {
+    if (!options || value === null || pickable.includes(value)) return;
+    const next = pickable.includes('direct') ? 'direct' : preselectedEnvironment(options, flow);
+    if (next === null || next === value) return;
+    value = next;
+    onchange?.(next);
   });
 
   // Select binds a plain string; bridge to the typed value.

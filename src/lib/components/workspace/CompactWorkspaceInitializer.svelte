@@ -114,6 +114,7 @@
   } from './initializer/IssueSuggestions.svelte';
   import RepoAndBranchPicker from './initializer/RepoAndBranchPicker.svelte';
   import ExecutionEnvironmentPicker from './initializer/ExecutionEnvironmentPicker.svelte';
+  import type { CreationFlow } from './initializer/execution-environment';
   import type { SandboxType } from '$shared/schemas';
   import SetupScriptModal from '../modals/SetupScriptModal.svelte';
   import { noteUrl } from '$shared/constants/intent-links';
@@ -566,6 +567,12 @@
   // picker stays hidden and the legacy skipIsolation-only flow applies).
   let selectedEnvironment = $state<SandboxType | null>(null);
 
+  // Creation flow for the picker: worktree needs an existing local checkout
+  // to link against, so github picks and new repos never offer it.
+  const executionFlow: CreationFlow = $derived(
+    isNewRepo ? 'new-repo' : repoType === 'github' ? 'github' : 'local',
+  );
+
   // Keep the legacy skip-isolation checkbox and the picker coherent:
   // "work directly" IS the `direct` environment, and the daemon rejects
   // `skipIsolation: true` combined with a non-direct executionEnvironment.
@@ -578,9 +585,10 @@
       if (next) {
         selectedEnvironment = 'direct';
       } else if (selectedEnvironment === 'direct') {
-        // Unchecking "work directly" returns to an isolated checkout; the
-        // daemon default (worktree) matches the legacy behavior.
-        selectedEnvironment = 'worktree';
+        // Unchecking "work directly" returns to an isolated checkout:
+        // worktree (the legacy default) for local flows, cow for
+        // github/new-repo flows where worktree is not offerable.
+        selectedEnvironment = executionFlow === 'local' ? 'worktree' : 'cow';
       }
     }
   }
@@ -1529,8 +1537,11 @@
       remoteSetup = null;
     }
 
-    // GitHub repos require an isolated checkout - reset skipIsolation if switching to github type
-    if (event.detail.type === 'github') {
+    // Legacy flow only (picker never loaded): older daemons require an
+    // isolated checkout for GitHub repos, so reset skipIsolation when
+    // switching to github. With the picker active the github flow offers
+    // Direct explicitly, and its snap-back keeps the selection valid.
+    if (event.detail.type === 'github' && selectedEnvironment === null) {
       handleSkipIsolationChange(false);
     }
 
@@ -3323,6 +3334,7 @@
             </button>
             <ExecutionEnvironmentPicker
               bind:value={selectedEnvironment}
+              flow={executionFlow}
               onchange={handleEnvironmentChange}
             />
           </div>
