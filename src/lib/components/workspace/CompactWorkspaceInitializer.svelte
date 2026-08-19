@@ -3305,33 +3305,34 @@
         </div>
         <!-- Setup script -->
         <div class="space-y-2 border-t border-border pt-3">
-          <div class="flex items-center justify-between flex-wrap gap-2 w-full">
-            <!-- Left: setup script button -->
+          <!-- One inline sentence: "Set up dev environment with [chip] script
+               using [chip] isolation." — only the chips are click targets, and
+               the isolation fragment flows on the same line, wrapping only
+               when width requires it. -->
+          <div
+            class="flex min-h-9 w-full flex-wrap items-center gap-1.5 px-2.5 py-2 text-sm text-muted-foreground"
+          >
+            <span>{m.workspace_compactInitializer_setupDevEnvWith_before()}</span>
+            <!-- The pill and trailing suffix render in both states (spinner
+                 inside the pill while loading) so the row keeps the same
+                 structure and height when the probe resolves. -->
             <button
               type="button"
-              class="group flex min-h-9 w-full cursor-pointer items-center gap-1.5 rounded-md px-2.5 py-2 text-sm text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/40"
+              class="cursor-pointer rounded-md border border-border bg-background px-2 py-0.5 font-medium text-foreground transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/40"
               onclick={() => (showSetupScript = !showSetupScript)}
             >
-              <span>{m.workspace_compactInitializer_setupDevEnvWith_before()}</span>
-              <!-- The pill and trailing suffix render in both states (spinner
-                   inside the pill while loading) so the row keeps the same
-                   structure and height when the probe resolves. -->
-              <span
-                class="rounded-md border border-border bg-background px-2 py-0.5 font-medium text-foreground"
-              >
-                {#if isRepoConfigLoading}
-                  <Fa icon={faSpinner} class="animate-spin" size="sm" />
-                  <span class="sr-only"
-                    >{m.workspace_compactInitializer_detectingSetupScript_label()}</span
-                  >
-                {:else}
-                  {setupScriptName}
-                {/if}
-              </span>
-              <p class="text-sm text-subtle">
-                {m.workspace_compactInitializer_setupDevEnvWith_after()}
-              </p>
+              {#if isRepoConfigLoading}
+                <Fa icon={faSpinner} class="animate-spin" size="sm" />
+                <span class="sr-only"
+                  >{m.workspace_compactInitializer_detectingSetupScript_label()}</span
+                >
+              {:else}
+                {setupScriptName}
+              {/if}
             </button>
+            <span class="text-subtle">
+              {m.workspace_compactInitializer_setupDevEnvWith_after()}
+            </span>
             <ExecutionEnvironmentPicker
               bind:value={selectedEnvironment}
               flow={executionFlow}
