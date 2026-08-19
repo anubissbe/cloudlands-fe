@@ -84,7 +84,7 @@
       >
         {environmentLabel(value)}
       </Select.Trigger>
-      <Select.Content wrapperClass="py-0!" class="max-w-[360px] min-w-[260px]" portal>
+      <Select.Content wrapperClass="py-0!" class="max-w-90 min-w-65" portal>
         {#each pickable as type (type)}
           <Select.Item class="cursor-pointer" value={type}>
             <div class="flex-1 min-w-0">

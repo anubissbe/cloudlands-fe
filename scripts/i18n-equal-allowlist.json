@@ -38,13 +38,6 @@
     "fr",
     "es"
   ],
-  "chat_harnessFeaturesModal_title": [
-    "zh-CN",
-    "zh-TW",
-    "de",
-    "fr",
-    "es"
-  ],
   "chat_agentThread_assistant_label": [
     "fr"
   ],
@@ -114,6 +107,13 @@
   ],
   "chat_eventWakeup_summaryJoin_label": [
     "de"
+  ],
+  "chat_harnessFeaturesModal_title": [
+    "zh-CN",
+    "zh-TW",
+    "de",
+    "fr",
+    "es"
   ],
   "chat_hookWakeAttribution_fallbackName_label": [
     "de",
@@ -389,6 +389,25 @@
   ],
   "events_activity_workspaceStatus_label": [
     "de"
+  ],
+  "executionEnvironmentSettings_sizing_vcpus_label": [
+    "de"
+  ],
+  "executionEnvironmentSettings_type_cow_label": [
+    "de"
+  ],
+  "executionEnvironmentSettings_type_direct_label": [
+    "fr"
+  ],
+  "executionEnvironmentSettings_type_microvm_label": [
+    "de",
+    "fr",
+    "es"
+  ],
+  "executionEnvironmentSettings_type_worktree_label": [
+    "de",
+    "fr",
+    "es"
   ],
   "externalEditors_ipc_applications_filterName": [
     "fr"
@@ -882,9 +901,6 @@
   "settings_footer_support": [
     "de"
   ],
-  "settings_gitWorkspace_experimental_badge": [
-    "es"
-  ],
   "settings_hardware_joystickExplainer_label": [
     "de",
     "fr",
@@ -1206,6 +1222,30 @@
     "de",
     "es"
   ],
+  "workspaceInitializer_executionEnvironment_cow_label": [
+    "ja",
+    "ko",
+    "de",
+    "fr",
+    "es"
+  ],
+  "workspaceInitializer_executionEnvironment_direct_label": [
+    "fr"
+  ],
+  "workspaceInitializer_executionEnvironment_microvm_label": [
+    "zh-CN",
+    "zh-TW",
+    "ja",
+    "ko",
+    "de",
+    "fr",
+    "es"
+  ],
+  "workspaceInitializer_executionEnvironment_worktree_label": [
+    "de",
+    "fr",
+    "es"
+  ],
   "workspace_addContext_note_label": [
     "fr"
   ],
@@ -1251,21 +1291,21 @@
     "fr",
     "es"
   ],
+  "workspace_checkoutModePill_cow_label": [
+    "zh-CN",
+    "zh-TW",
+    "ja",
+    "ko",
+    "de",
+    "fr",
+    "es"
+  ],
   "workspace_commitsTimeline_commits_label": [
     "de",
     "fr",
     "es"
   ],
   "workspace_compactInitializer_progressWithPercent_label": [
-    "ko",
-    "de",
-    "fr",
-    "es"
-  ],
-  "workspace_checkoutModePill_cow_label": [
-    "zh-CN",
-    "zh-TW",
-    "ja",
     "ko",
     "de",
     "fr",

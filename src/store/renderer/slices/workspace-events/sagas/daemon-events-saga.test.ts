@@ -274,6 +274,8 @@ describe('daemonEventsSaga', () => {
       'app:ui-navigate',
       'app:ui-highlight',
       'app:workspace-open',
+      'sandbox:image:*',
+      'sandbox:vm:*',
     ]);
   });
 

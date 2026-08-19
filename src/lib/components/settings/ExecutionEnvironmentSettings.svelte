@@ -31,7 +31,10 @@
   } from '$shared/schemas';
   import { appClient } from '$lib/client';
   import { onBackendNotification } from '$lib/client/live/backend-transport';
-  import Toggle from '$lib/components/ui/toggle/toggle.svelte';
+  import { Toggle } from '$lib/components/ui/toggle';
+  import { Button } from '$lib/components/ui/button';
+  import { Input } from '$lib/components/ui/input';
+  import { Select } from '$lib/components/ui/select';
 
   const CLAUDE_TOKEN_PATH = 'providers.claudeCodeOauthToken';
 
@@ -245,9 +248,8 @@
     void applyUpdate({ profiles: { [type]: { enabled: !currentlyEnabled } } });
   }
 
-  function handleDefaultChange(event: Event) {
-    const value = (event.currentTarget as HTMLSelectElement).value as SandboxType;
-    void applyUpdate({ defaultType: value });
+  function handleDefaultChange(value: string) {
+    void applyUpdate({ defaultType: value as SandboxType });
   }
 
   /** Commit a sizing field on change; the daemon range-validates (§5.12). */
@@ -343,7 +345,7 @@
     {#if settingsError}
       <section class="px-6 py-2">
         <p
-          class="text-xs text-destructive-foreground bg-destructive/10 border border-destructive/20 rounded-md px-3 py-2"
+          class="text-xs text-error-foreground bg-destructive/10 border border-destructive/20 rounded-md px-3 py-2"
         >
           {settingsError}
         </p>
@@ -398,7 +400,7 @@
                   })}</span
                 >
               {:else}
-                <span class="text-destructive-foreground"
+                <span class="text-error-foreground"
                   >{m.executionEnvironmentSettings_image_error({ error: imageStatus.error })}</span
                 >
               {/if}
@@ -416,7 +418,7 @@
             <div class="flex items-center gap-4 pt-1">
               <label class="flex items-center gap-2 text-xs text-foreground">
                 {m.executionEnvironmentSettings_sizing_vcpus_label()}
-                <input
+                <Input
                   type="number"
                   min={MIN_VCPUS}
                   max={MAX_VCPUS}
@@ -425,12 +427,12 @@
                   onchange={() => handleSizingChange('vcpus', vcpusDraft)}
                   disabled={updating}
                   aria-label={m.executionEnvironmentSettings_sizing_vcpus_label()}
-                  class="w-20 px-2 py-1 bg-background border border-border rounded-md text-xs text-foreground transition-all focus:outline-none focus:border-primary focus:ring-2 focus:ring-primary/10"
+                  class="w-20 text-xs"
                 />
               </label>
               <label class="flex items-center gap-2 text-xs text-foreground">
                 {m.executionEnvironmentSettings_sizing_memMib_label()}
-                <input
+                <Input
                   type="number"
                   min={MIN_MEM_MIB}
                   step="128"
@@ -438,7 +440,7 @@
                   onchange={() => handleSizingChange('memMib', memMibDraft)}
                   disabled={updating}
                   aria-label={m.executionEnvironmentSettings_sizing_memMib_label()}
-                  class="w-24 px-2 py-1 bg-background border border-border rounded-md text-xs text-foreground transition-all focus:outline-none focus:border-primary focus:ring-2 focus:ring-primary/10"
+                  class="w-24 text-xs"
                 />
               </label>
             </div>
@@ -455,35 +457,37 @@
                 : m.executionEnvironmentSettings_imageOverride_builtIn()}
             </p>
             <div class="flex items-center gap-2 pt-1">
-              <input
+              <Input
                 type="text"
                 bind:value={imageUrlDraft}
                 placeholder={'https://…/manifest.json' /* i18n-ignore (URL format) */}
                 aria-label={m.executionEnvironmentSettings_imageOverride_inputAriaLabel()}
-                class="flex-1 px-3 py-1.5 bg-background border border-border rounded-md text-xs text-foreground transition-all focus:outline-none focus:border-primary focus:ring-2 focus:ring-primary/10"
+                class="flex-1 text-xs"
                 onkeydown={(e) => {
                   if (e.key === 'Enter') handleImageCheckAndSave();
                 }}
               />
-              <button
-                type="button"
-                class="text-primary hover:text-primary/80 cursor-pointer transition-colors font-medium text-xs shrink-0"
+              <Button
+                variant="link"
+                size="xs"
+                class="shrink-0 font-medium text-xs"
                 onclick={handleImageCheckAndSave}
                 disabled={!imageUrlDraft.trim() || imageChecking || updating}
               >
                 {imageChecking
                   ? m.executionEnvironmentSettings_imageOverride_checking()
                   : m.executionEnvironmentSettings_imageOverride_check()}
-              </button>
+              </Button>
               {#if imageOverride}
-                <button
-                  type="button"
-                  class="text-muted-foreground hover:text-foreground cursor-pointer transition-colors text-xs shrink-0"
+                <Button
+                  variant="ghost-light"
+                  size="xs"
+                  class="shrink-0 text-xs"
                   onclick={handleImageReset}
                   disabled={imageChecking || updating}
                 >
                   {m.executionEnvironmentSettings_imageOverride_reset()}
-                </button>
+                </Button>
               {/if}
             </div>
             {#if imageCheckResult}
@@ -497,7 +501,7 @@
                     })}</span
                   >
                 {:else}
-                  <span class="text-destructive-foreground"
+                  <span class="text-error-foreground"
                     >{m.executionEnvironmentSettings_imageOverride_invalid({
                       error: imageCheckResult.error,
                     })}</span
@@ -518,7 +522,7 @@
                   {#if tokenState === 'ready'}
                     {m.executionEnvironmentSettings_claudeToken_ready()}
                   {:else if tokenState === 'rejected'}
-                    <span class="text-destructive-foreground"
+                    <span class="text-error-foreground"
                       >{m.executionEnvironmentSettings_claudeToken_rejected()}</span
                     >
                   {:else}
@@ -526,19 +530,20 @@
                   {/if}
                 </p>
                 {#if tokenError}
-                  <p class="text-xs text-destructive-foreground">{tokenError}</p>
+                  <p class="text-xs text-error-foreground">{tokenError}</p>
                 {/if}
               </div>
               {#if !showTokenInput}
-                <button
-                  type="button"
-                  class="text-primary hover:text-primary/80 cursor-pointer transition-colors font-medium text-xs shrink-0"
+                <Button
+                  variant="link"
+                  size="xs"
+                  class="shrink-0 font-medium text-xs"
                   onclick={handleShowTokenInput}
                 >
                   {tokenState === 'ready'
                     ? m.executionEnvironmentSettings_claudeToken_replaceAction()
                     : m.executionEnvironmentSettings_claudeToken_setupAction()}
-                </button>
+                </Button>
               {/if}
             </div>
             {#if showTokenInput}
@@ -549,34 +554,36 @@
                 {m.executionEnvironmentSettings_claudeToken_setupHint_after()}
               </p>
               <div class="flex items-center gap-2">
-                <input
+                <Input
                   type="password"
                   bind:value={tokenDraft}
                   placeholder={'sk-ant-oat01-…' /* i18n-ignore (token format) */}
-                  class="flex-1 px-3 py-1.5 bg-background border border-border rounded-md text-xs text-foreground transition-all focus:outline-none focus:border-primary focus:ring-2 focus:ring-primary/10"
+                  class="flex-1 text-xs"
                   aria-label={m.executionEnvironmentSettings_claudeToken_inputAriaLabel()}
                   onkeydown={(e) => {
                     if (e.key === 'Enter') handleSubmitToken();
                     if (e.key === 'Escape') handleCancelTokenInput();
                   }}
                 />
-                <button
-                  type="button"
-                  class="text-primary hover:text-primary/80 cursor-pointer transition-colors font-medium text-xs"
+                <Button
+                  variant="link"
+                  size="xs"
+                  class="font-medium text-xs"
                   onclick={handleSubmitToken}
                   disabled={!tokenDraft.trim() || tokenSaving}
                 >
                   {tokenSaving
                     ? m.executionEnvironmentSettings_claudeToken_saving()
                     : m.executionEnvironmentSettings_claudeToken_save()}
-                </button>
-                <button
-                  type="button"
-                  class="text-muted-foreground hover:text-foreground cursor-pointer transition-colors text-xs"
+                </Button>
+                <Button
+                  variant="ghost-light"
+                  size="xs"
+                  class="text-xs"
                   onclick={handleCancelTokenInput}
                 >
                   {m.executionEnvironmentSettings_claudeToken_cancel()}
-                </button>
+                </Button>
               </div>
             {/if}
           </div>
@@ -596,17 +603,20 @@
               {m.executionEnvironmentSettings_defaultSelector_description()}
             </p>
           </div>
-          <select
-            id="ee-default-select"
-            value={options.defaultType}
-            onchange={handleDefaultChange}
-            disabled={updating}
-            class="w-56 px-3 py-1.5 bg-background border border-border rounded-md text-sm text-foreground transition-all focus:outline-none focus:border-primary focus:ring-2 focus:ring-primary/10"
-          >
-            {#each enabledTypes as type (type)}
-              <option value={type}>{typeLabels[type]()}</option>
-            {/each}
-          </select>
+          <div class="w-56">
+            <Select.Root value={options.defaultType} onchange={handleDefaultChange}>
+              <Select.Trigger id="ee-default-select" class="py-1.5" disabled={updating}>
+                <span class="truncate">{typeLabels[options.defaultType]()}</span>
+              </Select.Trigger>
+              <Select.Content portal class="max-h-75 w-56">
+                {#each enabledTypes as type (type)}
+                  <Select.Item value={type}>
+                    <span class="truncate">{typeLabels[type]()}</span>
+                  </Select.Item>
+                {/each}
+              </Select.Content>
+            </Select.Root>
+          </div>
         </div>
       </section>
     {/if}

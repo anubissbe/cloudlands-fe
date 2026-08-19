@@ -30,6 +30,7 @@ export const inputMetadata = parseUiComponentMetadata({
     'src/lib/components/settings/AIBehaviorEditor.svelte',
     'src/lib/components/settings/AgentBackendSettings.svelte',
     'src/lib/components/settings/AgentFeaturesSettings.svelte',
+    'src/lib/components/settings/ExecutionEnvironmentSettings.svelte',
     'src/lib/components/settings/LinearAuthConnection.svelte',
     'src/lib/components/settings/McpServersSettings.svelte',
     'src/lib/components/settings/SentryAuthConnection.svelte',

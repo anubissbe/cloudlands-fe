@@ -172,11 +172,25 @@ describe('ExecutionEnvironmentSettings (§5.5b)', () => {
   it('sends defaultType via sandbox:profiles:update when the default selector changes', async () => {
     render(ExecutionEnvironmentSettings);
 
-    const select = (await screen.findByLabelText('Default environment')) as HTMLSelectElement;
-    // Only enabled types are offered.
-    expect(Array.from(select.options).map((o) => o.value)).toEqual(['direct', 'worktree']);
+    const trigger = await waitFor(() =>
+      screen.getByRole('button', { name: /Default environment/ }),
+    );
+    expect(trigger.textContent).toContain('Worktree');
 
-    await fireEvent.change(select, { target: { value: 'direct' } });
+    trigger.focus();
+    await fireEvent.keyDown(trigger, { key: 'Enter' });
+    // Only enabled types are offered (direct, worktree); current is worktree.
+    const options = await waitFor(() => {
+      const found = screen.getAllByRole('option');
+      expect(found).toHaveLength(2);
+      return found;
+    });
+    expect(options.map((o) => o.textContent?.trim().split(/\s/)[0])).toEqual([
+      'Direct',
+      'Worktree',
+    ]);
+    await fireEvent.keyDown(trigger, { key: 'ArrowUp' });
+    await fireEvent.keyDown(trigger, { key: 'Enter' });
 
     await waitFor(() => {
       expect(mocks.mockInvoke).toHaveBeenCalledWith(SANDBOX_CHANNELS.PROFILES_UPDATE, {
