@@ -4,6 +4,7 @@
   import { loadPreview, setActivePreview } from './preview-discovery';
   import { resolvePreviewState, type PreviewState } from './preview-definition';
   import { watchCaptureStability } from './capture-stability';
+  import type { CatalogPreviewFit } from './catalog-preferences';
 
   interface RenderedScene {
     name: string;
@@ -14,7 +15,13 @@
     slug,
     requestedState,
     requestedWidth = 720,
-  }: { slug: string; requestedState?: string; requestedWidth?: number } = $props();
+    requestedFit,
+  }: {
+    slug: string;
+    requestedState?: string;
+    requestedWidth?: number;
+    requestedFit?: CatalogPreviewFit;
+  } = $props();
 
   let status = $state<'loading' | 'ready' | 'error'>('loading');
   let error = $state('');
@@ -49,6 +56,7 @@
     const nextSlug = slug;
     const nextState = requestedState;
     const nextWidth = width;
+    const nextFit = requestedFit;
     let cancelled = false;
     const disposeSetups: Array<() => void> = [];
     let setupDisposed = false;
@@ -175,6 +183,7 @@
                 state: stateName,
                 width: nextWidth,
                 status: 'ready',
+                ...(nextFit ? { fit: nextFit } : {}),
               });
             },
           },
@@ -198,6 +207,7 @@
 </script>
 
 <section
+  class:component-fit={requestedFit === 'component'}
   class="catalog-scene mx-auto grid max-w-full gap-4 p-4 sm:p-6 lg:p-10"
   class:workbench-scene={isDiagramWorkbench}
   data-testid="catalog-scene"
@@ -211,9 +221,10 @@
   data-preview-capture-motion={captureMotion}
   data-preview-generation={previewGeneration}
   data-preview-stability-generation={stabilityGeneration}
+  data-preview-fit={requestedFit}
   bind:this={sceneElement}
 >
-  {#if !isDiagramWorkbench}
+  {#if !isDiagramWorkbench && requestedFit !== 'component'}
     <header class="rounded-lg border border-border bg-card p-4">
       <p class="text-xs font-medium uppercase tracking-wide text-muted-foreground">Named preview</p>
       <h1 class="mt-1 text-2xl font-medium tracking-tight">{title || slug}</h1>
@@ -246,7 +257,7 @@
   {/if}
 
   {#if status === 'error'}
-    <div class="rounded-lg border border-destructive bg-card p-4" role="alert">
+    <div class="rounded-lg border border-danger bg-card p-4" role="alert">
       <p class="font-medium">{error}</p>
       {#if availableStates.length > 0}
         <p class="mt-1 text-sm text-muted-foreground">
@@ -256,15 +267,18 @@
     </div>
   {:else}
     {#if stabilityStatus === 'error'}
-      <div class="rounded-lg border border-destructive bg-card p-4" role="alert">
+      <div class="rounded-lg border border-danger bg-card p-4" role="alert">
         <p class="font-medium">{stabilityError}</p>
       </div>
     {/if}
     {#if Preview && scenes.length > 0}
-      <div class="grid gap-8" data-preview-scene-list={stateName === 'all' ? 'all' : undefined}>
+      <div
+        class="preview-scene-list grid gap-8"
+        data-preview-scene-list={stateName === 'all' ? 'all' : undefined}
+      >
         {#each scenes as rendered (rendered.name)}
-          <article class="grid gap-3" data-preview-rendered-state={rendered.name}>
-            {#if stateName === 'all'}
+          <article class="preview-article grid gap-3" data-preview-rendered-state={rendered.name}>
+            {#if stateName === 'all' && requestedFit !== 'component'}
               <h2 class="text-lg font-medium">
                 {m.sandbox_catalogScene_stateHeading_title({ state: rendered.name })}
               </h2>
@@ -308,5 +322,18 @@
     border-radius: 0;
     background: transparent;
     padding: 0;
+  }
+
+  .catalog-scene.component-fit {
+    width: max-content;
+    max-width: none;
+    gap: 0;
+    padding: 0;
+  }
+
+  .component-fit .preview-scene-list,
+  .component-fit .preview-article,
+  .component-fit .preview-frame {
+    display: contents;
   }
 </style>

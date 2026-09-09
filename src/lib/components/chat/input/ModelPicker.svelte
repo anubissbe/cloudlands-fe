@@ -540,6 +540,7 @@
     const providerIds = $modelFetchProviderIds$;
     clearTimeout(fetchDebounceTimer);
     fetchDebounceTimer = setTimeout(() => fetchAllProviderModels(providerIds), 50);
+    return () => clearTimeout(fetchDebounceTimer);
   });
 
   // React to the session cache being cleared (backend reconnect, RESUB-1):
@@ -1390,10 +1391,12 @@
   const lockedButtonTitle = $derived(
     lockedTitle?.trim() || m.chat_modelPicker_modelLocked_title({ model: triggerAccessibleLabel }),
   );
+  // The in-flight commit window is announced with `aria-busy` and re-entry is
+  // ignored in `handleReasoningSelect`; it must not feed the HTML `disabled`
+  // attribute, which would drop focus from the effort trigger (intent#4159).
   let updatingReasoningEffort = $state(false);
   const reasoningControlDisabled = $derived(
     reasoningDisabled ||
-      updatingReasoningEffort ||
       (!onReasoningChange && (!agentId || !workspaceId)) ||
       reasoningLevels.length === 0,
   );
@@ -1430,7 +1433,7 @@
   }
 
   async function handleReasoningSelect(value: string | null): Promise<boolean> {
-    if (reasoningControlDisabled) return false;
+    if (reasoningControlDisabled || updatingReasoningEffort) return false;
     const previous = persistedReasoningEffort;
     if (value === previous) return true;
 
@@ -1849,6 +1852,7 @@
           effortLevels={reasoningLevels}
           effort={persistedReasoningEffort}
           disabled={reasoningControlDisabled}
+          busy={updatingReasoningEffort}
           {modalAware}
           onEffortChange={handleReasoningSelect}
         />
@@ -1904,7 +1908,7 @@
     contentClass={cn(
       'max-w-[calc(100vw-32px)] bg-background! text-foreground!',
       '[&_[role=searchbox]]:border-b! [&_[role=searchbox]]:border-solid! [&_[role=searchbox]]:border-border!',
-      showReasoning ? 'w-85 min-h-90 max-h-90 flex flex-col' : 'w-[332px]',
+      showReasoning ? 'w-85 h-90 min-h-0 max-h-90 flex flex-col' : 'w-[332px]',
     )}
     contentMaxHeight={showReasoning ? 360 : undefined}
     fillContentHeight={showReasoning}

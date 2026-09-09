@@ -10,6 +10,7 @@
     writeCatalogPreferences,
     type CatalogColorTheme,
     type CatalogMotion,
+    type CatalogPreviewFit,
     type CatalogTheme,
   } from './catalog-preferences';
   import { installPreviewBrowserApi } from './preview-discovery';
@@ -18,6 +19,7 @@
   let theme = $state<CatalogTheme>(defaultCatalogPreferences.theme);
   let colorTheme = $state<CatalogColorTheme>(defaultCatalogPreferences.colorTheme);
   let motion = $state<CatalogMotion>(defaultCatalogPreferences.motion);
+  let fit = $state<CatalogPreviewFit>();
   let systemDark = $state(false);
   let systemReducedMotion = $state(false);
   let hydrated = $state(false);
@@ -25,6 +27,7 @@
   let initialRootLight = false;
   let initialRootReducedMotion = false;
   let initialRootFullMotion = false;
+  let initialRootComponentFit = false;
   let initialRootStyle: string | null = null;
 
   const resolvedTheme = $derived(theme === 'system' ? (systemDark ? 'dark' : 'light') : theme);
@@ -38,12 +41,14 @@
     initialRootLight = root.classList.contains('light');
     initialRootReducedMotion = root.classList.contains('catalog-reduced-motion');
     initialRootFullMotion = root.classList.contains('catalog-full-motion');
+    initialRootComponentFit = root.classList.contains('catalog-component-fit');
     initialRootStyle = root.getAttribute('style');
     const saved = readCatalogPreferences(localStorage);
     const urlSettings = parseCatalogUrlSettings(new URLSearchParams(window.location.search));
     theme = urlSettings.theme ?? saved.theme;
     colorTheme = saved.colorTheme;
     motion = urlSettings.motion ?? saved.motion;
+    fit = urlSettings.fit;
     const removePreviewBrowserApi = installPreviewBrowserApi(window);
 
     const media = window.matchMedia('(prefers-color-scheme: dark)');
@@ -63,6 +68,7 @@
       root.classList.toggle('light', initialRootLight);
       root.classList.toggle('catalog-reduced-motion', initialRootReducedMotion);
       root.classList.toggle('catalog-full-motion', initialRootFullMotion);
+      root.classList.toggle('catalog-component-fit', initialRootComponentFit);
       if (initialRootStyle === null) root.removeAttribute('style');
       else root.setAttribute('style', initialRootStyle);
     };
@@ -86,6 +92,7 @@
     root.classList.toggle('light', resolvedTheme === 'light');
     root.classList.toggle('catalog-reduced-motion', motion === 'reduced');
     root.classList.toggle('catalog-full-motion', motion === 'full');
+    root.classList.toggle('catalog-component-fit', fit === 'component');
 
     if (activeSlug) {
       const url = new URL(window.location.href);
@@ -98,6 +105,7 @@
 </script>
 
 <div
+  class:component-fit={fit === 'component'}
   class="catalog-shell min-h-screen bg-background text-foreground"
   data-testid="catalog-shell"
   data-catalog-theme={theme}
@@ -105,24 +113,26 @@
   data-catalog-motion={reducedMotion ? 'reduced' : 'full'}
   data-catalog-motion-preference={motion}
 >
-  <div class="min-h-screen w-full min-w-0">
-    <header class="catalog-topbar sticky top-0 border-b border-border bg-card/95 backdrop-blur">
-      <div class="catalog-topbar-inner mx-auto max-w-[1680px] px-4 py-2 sm:px-6">
-        <div class="flex min-w-0 items-center gap-3">
-          <a class="catalog-brand" href="/sandbox" aria-label="Component catalog home">
-            <span class="brand-mark" aria-hidden="true">DS</span>
-            <span class="truncate text-sm font-medium">Design system</span>
-          </a>
-          {#if activeSlug}
-            <a
-              class="rounded-md px-2 py-1 text-xs text-muted-foreground hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-              href="/sandbox">View all</a
-            >
-          {/if}
+  <div class="catalog-shell-content min-h-screen w-full min-w-0">
+    {#if fit !== 'component'}
+      <header class="catalog-topbar sticky top-0 border-b border-border bg-card/95 backdrop-blur">
+        <div class="catalog-topbar-inner mx-auto max-w-[1680px] px-4 py-2 sm:px-6">
+          <div class="flex min-w-0 items-center gap-3">
+            <a class="catalog-brand" href="/sandbox" aria-label="Component catalog home">
+              <span class="brand-mark" aria-hidden="true">DS</span>
+              <span class="truncate text-sm font-medium">Design system</span>
+            </a>
+            {#if activeSlug}
+              <a
+                class="rounded-md px-2 py-1 text-xs text-muted-foreground hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                href="/sandbox">View all</a
+              >
+            {/if}
+          </div>
+          <CatalogControls bind:theme bind:colorTheme {resolvedTheme} bind:motion />
         </div>
-        <CatalogControls bind:theme bind:colorTheme {resolvedTheme} bind:motion />
-      </div>
-    </header>
+      </header>
+    {/if}
     <main class="min-w-0 overflow-x-clip">{@render children?.()}</main>
   </div>
 </div>
@@ -133,6 +143,26 @@
     --catalog-row-gap: calc(var(--control-height-small) / 2);
     font-family: var(--font-ui);
     overflow-x: clip;
+  }
+
+  .catalog-shell.component-fit,
+  .component-fit .catalog-shell-content {
+    width: max-content;
+    min-height: 0;
+  }
+
+  .component-fit main {
+    display: contents;
+  }
+
+  :global(html.catalog-component-fit),
+  :global(html.catalog-component-fit body) {
+    width: max-content;
+    min-width: 0;
+    min-height: 0;
+    margin: 0;
+    padding: 0;
+    overflow: visible;
   }
 
   .catalog-topbar {

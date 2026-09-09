@@ -1766,7 +1766,7 @@
   }
 
   :global(.edge-label-container[data-semantic-style='danger'] .edge-label-html) {
-    color: hsl(var(--error-foreground));
+    color: hsl(var(--danger));
   }
 
   :global(.catalog-reduced-motion .edge-label-container),

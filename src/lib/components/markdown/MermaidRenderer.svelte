@@ -2141,11 +2141,11 @@ ${verticalSource}`;
 
   .mermaid-error {
     min-height: 4.5rem;
-    border-left: 2px solid hsl(var(--error-foreground));
+    border-left: 2px solid hsl(var(--danger));
     border-radius: var(--radius-small);
     background: hsl(var(--muted) / 0.25);
     padding: var(--space-3);
-    color: hsl(var(--error-foreground));
+    color: hsl(var(--danger));
     font-size: var(--text-caption-size);
     line-height: var(--text-caption-line-height);
   }
