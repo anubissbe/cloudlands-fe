@@ -392,8 +392,15 @@ describe('Layout Engine', () => {
     const points = layout.edges[0].points!;
 
     expect(chat.height).toBeLessThan(redux.height);
-    expect(points[0]).toEqual({ x: chat.x + chat.width, y: chat.y + chat.height / 2 });
-    expect(points.at(-1)).toEqual({ x: redux.x, y: redux.y + redux.height / 2 });
+    expect(points).toHaveLength(2);
+    expect(points[0].x).toBe(chat.x + chat.width);
+    expect(points.at(-1)!.x).toBe(redux.x);
+    expect(points[0].y).toBe(points.at(-1)!.y);
+    expect(points[0].y).toBeGreaterThanOrEqual(Math.max(chat.y + 6, redux.y + 10));
+    expect(points[0].y).toBeLessThanOrEqual(
+      Math.min(chat.y + chat.height - 6, redux.y + redux.height - 10),
+    );
+    expect(points.at(-1)!.x - points[0].x).toBe(redux.x - (chat.x + chat.width));
   });
 
   it('keeps capped mixed-script editorial labels inside the node', () => {

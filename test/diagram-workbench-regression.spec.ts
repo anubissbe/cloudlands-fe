@@ -873,6 +873,78 @@ async function expectNestedReviewGeometry(page: Page, context: string, width: nu
       const intake = route('Intake', 'Validate');
       const decision = route('Validate', 'Merge');
       const reciprocal = [...route('Validate', 'Enrich'), ...route('Enrich', 'Validate')];
+      const routePoints = (path: SVGPathElement) => {
+        const matrix = path.getScreenCTM()!;
+        return path.dataset.manhattanPoints!.split(' ').map((value) => {
+          const [x, y] = value.split(',').map(Number);
+          return new DOMPoint(x, y).matrixTransform(matrix);
+        });
+      };
+      const routeSegments = (path: SVGPathElement) => {
+        const points = routePoints(path);
+        return points.slice(1).map((end, index) => ({ start: points[index], end }));
+      };
+      const segmentsConflict = (
+        left: { start: DOMPoint; end: DOMPoint },
+        right: { start: DOMPoint; end: DOMPoint },
+      ) => {
+        const leftHorizontal = Math.abs(left.start.y - left.end.y) < 0.5;
+        const rightHorizontal = Math.abs(right.start.y - right.end.y) < 0.5;
+        const range = (a: number, b: number) => [Math.min(a, b), Math.max(a, b)] as const;
+        if (leftHorizontal === rightHorizontal) {
+          const leftAxis = leftHorizontal ? left.start.y : left.start.x;
+          const rightAxis = rightHorizontal ? right.start.y : right.start.x;
+          if (Math.abs(leftAxis - rightAxis) >= 0.5) return false;
+          const leftRange = leftHorizontal
+            ? range(left.start.x, left.end.x)
+            : range(left.start.y, left.end.y);
+          const rightRange = rightHorizontal
+            ? range(right.start.x, right.end.x)
+            : range(right.start.y, right.end.y);
+          return Math.min(leftRange[1], rightRange[1]) - Math.max(leftRange[0], rightRange[0]) > 1;
+        }
+        const horizontal = leftHorizontal ? left : right;
+        const vertical = leftHorizontal ? right : left;
+        const horizontalX = range(horizontal.start.x, horizontal.end.x);
+        const verticalY = range(vertical.start.y, vertical.end.y);
+        return (
+          vertical.start.x >= horizontalX[0] &&
+          vertical.start.x <= horizontalX[1] &&
+          horizontal.start.y >= verticalY[0] &&
+          horizontal.start.y <= verticalY[1]
+        );
+      };
+      const intakeConflicts =
+        intake.length === 2
+          ? routeSegments(intake[0]).filter((left) =>
+              routeSegments(intake[1]).some((right) => segmentsConflict(left, right)),
+            ).length
+          : -1;
+      const noRoute = decision.find(
+        (path) => path.dataset.nestedDecisionRoute === 'decision-return',
+      );
+      const noPoints = noRoute ? routePoints(noRoute) : [];
+      const noLength = noPoints
+        .slice(1)
+        .reduce(
+          (total, point, index) =>
+            total + Math.abs(point.x - noPoints[index].x) + Math.abs(point.y - noPoints[index].y),
+          0,
+        );
+      const noDirectDistance = noPoints.length
+        ? Math.abs(noPoints.at(-1)!.x - noPoints[0].x) +
+          Math.abs(noPoints.at(-1)!.y - noPoints[0].y)
+        : Number.POSITIVE_INFINITY;
+      const contextBounds = nodes.find(({ text }) => text === 'Context')!.bounds;
+      const noUsesUpperCorridor = noRoute
+        ? routeSegments(noRoute).some(
+            ({ start, end }) =>
+              Math.abs(start.y - end.y) < 0.5 &&
+              start.y < contextBounds.top - 4 &&
+              Math.min(start.x, end.x) < contextBounds.left &&
+              Math.max(start.x, end.x) > contextBounds.right,
+          )
+        : false;
       const lane = (path: SVGPathElement) => {
         const start = screenPoint(path, 0);
         const end = screenPoint(path, 1);
@@ -990,7 +1062,10 @@ async function expectNestedReviewGeometry(page: Page, context: string, width: nu
         })),
         diamondRoutes,
         crossings,
+        intakeConflicts,
         labelNodeOverlaps,
+        noExcessLength: noLength - noDirectDistance,
+        noUsesUpperCorridor,
         intakeSides: new Set(intake.map(lane)).size,
         intakePorts: new Set(intake.map(ports)).size,
         intakeDashes: new Set(intake.map((path) => getComputedStyle(path).strokeDasharray)).size,
@@ -1035,6 +1110,7 @@ async function expectNestedReviewGeometry(page: Page, context: string, width: nu
     }
   }
   expect(geometry.crossings, `${context} unrelated node crossings`).toEqual([]);
+  expect(geometry.intakeConflicts, `${context} intake route conflicts`).toBe(0);
   expect(geometry.labelNodeOverlaps, `${context} label/node overlaps`).toBe(0);
   expect(geometry.diamondRoutes, `${context} Ready? incident routes`).toHaveLength(6);
   expect(geometry.diamondRoutes.every(({ boundaryError }) => boundaryError <= 0.03)).toBe(true);
@@ -1054,6 +1130,18 @@ async function expectNestedReviewGeometry(page: Page, context: string, width: nu
   expect(geometry.decisionPorts).toBe(2);
   expect(geometry.reciprocalLanes).toBe(2);
   expect(geometry.reciprocalPorts).toBe(2);
+  if (width >= 960) {
+    expect(geometry.noUsesUpperCorridor, `${context} no branch upper corridor`).toBe(true);
+    expect(geometry.noExcessLength, `${context} no branch excess length`).toBeLessThanOrEqual(1);
+  }
+}
+
+for (const width of [420, 960] as const) {
+  test(`uses clear nested review corridors in dark at ${width}px`, async ({ page }) => {
+    test.setTimeout(120_000);
+    await openState(page, 'mermaid-nested-routing', width, 'dark');
+    await expectNestedReviewGeometry(page, `dark/${width}/nested`, width);
+  });
 }
 
 async function expectStoreNodeGeometry(
@@ -1742,6 +1830,43 @@ for (const appearance of [
       expect(reciprocal.laneGap).toBeGreaterThanOrEqual(40);
       expect(reciprocal.renderMarker).toContain('arrowhead');
       expect(reciprocal.dispatchMarker).toContain('arrowhead');
+
+      await page
+        .locator('#custom-walkthrough')
+        .getByRole('button', { name: 'State 2: 2. Follow execution' })
+        .click();
+      await expect(
+        page.locator('#custom-walkthrough .diagram-renderer[data-diagram-settled="true"]'),
+      ).toBeVisible();
+      const direct = await page.locator('#custom-walkthrough').evaluate((root) => {
+        const path = root.querySelector<SVGPathElement>(
+          '.diagram-edge[data-edge-id="w3"] .edge-path',
+        )!;
+        const chat = root
+          .querySelector<SVGGraphicsElement>('[data-node-id="chat"]')!
+          .getBoundingClientRect();
+        const redux = root
+          .querySelector<SVGGraphicsElement>('[data-node-id="redux"]')!
+          .getBoundingClientRect();
+        const matrix = path.getScreenCTM()!;
+        const start = path.getPointAtLength(0).matrixTransform(matrix);
+        const end = path.getPointAtLength(path.getTotalLength()).matrixTransform(matrix);
+        return {
+          excessLength: path.getTotalLength() * Math.hypot(matrix.a, matrix.b) - (end.x - start.x),
+          verticalChange: Math.abs(end.y - start.y),
+          sourceBoundaryGap: Math.abs(start.x - chat.right),
+          targetArrowGap: redux.left - end.x,
+          chatSideMargin: Math.min(start.y - chat.top, chat.bottom - start.y),
+          reduxSideMargin: Math.min(end.y - redux.top, redux.bottom - end.y),
+        };
+      });
+      expect(direct.excessLength).toBeLessThanOrEqual(1);
+      expect(direct.verticalChange).toBeLessThanOrEqual(1);
+      expect(direct.sourceBoundaryGap).toBeLessThanOrEqual(1);
+      expect(direct.targetArrowGap).toBeGreaterThanOrEqual(3);
+      expect(direct.targetArrowGap).toBeLessThanOrEqual(7);
+      expect(direct.chatSideMargin).toBeGreaterThan(4);
+      expect(direct.reduxSideMargin).toBeGreaterThan(8);
 
       await openState(page, 'mermaid-topology-stress', width, appearance.mode);
       const loop = await page

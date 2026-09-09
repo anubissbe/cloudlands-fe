@@ -2600,7 +2600,6 @@ function computeOrthogonalEdgePaths(
     const { fromNode, toNode, fromSide, toSide } = info;
     const isFromVertical = fromSide === 'top' || fromSide === 'bottom';
     const isToVertical = toSide === 'top' || toSide === 'bottom';
-
     const fromCenterX = fromNode.x + fromNode.width / 2;
     const fromCenterY = fromNode.y + fromNode.height / 2;
     const toCenterX = toNode.x + toNode.width / 2;
@@ -3080,6 +3079,56 @@ function computeOrthogonalEdgePaths(
 
     const isFromVertical = fromSide === 'top' || fromSide === 'bottom';
     const isToVertical = toSide === 'top' || toSide === 'bottom';
+    const sharedHorizontalPorts = (() => {
+      if (isFromVertical || isToVertical || biOffset) return null;
+      const paintedSideInset = (node: ComputedNode) =>
+        Math.min(node.height / 4, ['db', 'store', 'data_store'].includes(node.kind ?? '') ? 10 : 6);
+      const overlapTop = Math.max(
+        fromNode.y + paintedSideInset(fromNode),
+        toNode.y + paintedSideInset(toNode),
+      );
+      const overlapBottom = Math.min(
+        fromNode.y + fromNode.height - paintedSideInset(fromNode),
+        toNode.y + toNode.height - paintedSideInset(toNode),
+      );
+      if (overlapTop > overlapBottom) return null;
+      const y = Math.max(
+        overlapTop,
+        Math.min(
+          overlapBottom,
+          (fromNode.y + fromNode.height / 2 + toNode.y + toNode.height / 2) / 2,
+        ),
+      );
+      const source = { x: fromSide === 'right' ? fromNode.x + fromNode.width : fromNode.x, y };
+      const target = { x: toSide === 'left' ? toNode.x : toNode.x + toNode.width, y };
+      const left = Math.min(source.x, target.x);
+      const right = Math.max(source.x, target.x);
+      const endpointGroups = new Set(
+        [nodeGroup.get(fromNode.id), nodeGroup.get(toNode.id)].filter(
+          (groupId): groupId is string => groupId !== undefined,
+        ),
+      );
+      const blocked = nodes.some(
+        (node) =>
+          node.id !== fromNode.id &&
+          node.id !== toNode.id &&
+          node.x < right &&
+          node.x + node.width > left &&
+          y > node.y - ROUTE_NODE_CLEARANCE &&
+          y < node.y + node.height + ROUTE_NODE_CLEARANCE,
+      );
+      const groupBlocked = (groups ?? []).some(
+        (group) =>
+          !endpointGroups.has(group.id) &&
+          group.x < right &&
+          group.x + group.width > left &&
+          y > group.y - ROUTE_GROUP_CLEARANCE &&
+          y < group.y + group.height + ROUTE_GROUP_CLEARANCE,
+      );
+      const labelWidth = edge.label ? measureEdgeLabel(edge.label).width : 0;
+      const hasLabelRoom = right - left >= labelWidth + ROUTE_LABEL_CLEARANCE * 2;
+      return blocked || groupBlocked || !hasLabelRoom ? null : { source, target };
+    })();
 
     if (fromNode.id === toNode.id) {
       const source = { x: fromNode.x + fromNode.width, y: fromNode.y + fromNode.height / 2 };
@@ -3316,6 +3365,9 @@ function computeOrthogonalEdgePaths(
         points.push({ x: source.x, y: laneY }, { x: target.x, y: laneY });
         toPos = target;
       }
+    } else if (sharedHorizontalPorts) {
+      points[0] = sharedHorizontalPorts.source;
+      toPos = sharedHorizontalPorts.target;
     } else if (!isFromVertical && !isToVertical) {
       // Horizontal to horizontal - use allocated vertical channel
       const channelX = verticalChannelX.get(edge.id) ?? (fromPos.x + toPos.x) / 2;

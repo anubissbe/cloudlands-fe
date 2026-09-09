@@ -2653,12 +2653,16 @@ function routeNestedDecisionHierarchy(svg: SVGSVGElement, edges: FlowchartRoute[
     );
   } else {
     const metaY = Math.min(i.y, d.y) - 44;
-    const noY = s.y + s.height + 30;
     const retryY = s.y + s.height + 72;
     const ingressTarget = diamondBoundaryPort(d, 'left', -8);
-    const metadataTarget = diamondBoundaryPort(d, 'left', 8);
+    const metadataTarget = diamondBoundaryPort(d, 'top', -8);
     const branchSource = diamondBoundaryPort(d, 'right', -8);
     const returnSource = diamondBoundaryPort(d, 'right', 8);
+    const returnTarget = pointAt(m, 0, 0.68);
+    const noY = Math.max(
+      Math.min(returnSource.y, returnTarget.y),
+      Math.min(s.y - 24, Math.max(returnSource.y, returnTarget.y)),
+    );
     const addSource = diamondBoundaryPort(d, 'bottom', -10);
     const retryTarget = diamondBoundaryPort(d, 'bottom', 10);
     const branchTarget = pointAt(m, 0, 0.32);
@@ -2676,12 +2680,11 @@ function routeNestedDecisionHierarchy(svg: SVGSVGElement, edges: FlowchartRoute[
         points: [
           pointAt(i, 0.5, 0),
           { x: pointAt(i, 0.5, 0).x, y: metaY },
-          { x: d.x - 24, y: metaY },
-          { x: d.x - 24, y: metadataTarget.y },
+          { x: metadataTarget.x, y: metaY },
           metadataTarget,
         ],
         labelSegment: 1,
-        targetSide: 'left',
+        targetSide: 'top',
       },
       {
         edge: topology.add,
@@ -2720,11 +2723,11 @@ function routeNestedDecisionHierarchy(svg: SVGSVGElement, edges: FlowchartRoute[
         role: 'decision-return',
         points: [
           returnSource,
-          { x: d.x + d.width + 24, y: returnSource.y },
-          { x: d.x + d.width + 24, y: noY },
+          { x: d.x + d.width + 40, y: returnSource.y },
+          { x: d.x + d.width + 40, y: noY },
           { x: m.x - 12, y: noY },
-          { x: m.x - 12, y: pointAt(m, 0, 0.68).y },
-          pointAt(m, 0, 0.68),
+          { x: m.x - 12, y: returnTarget.y },
+          returnTarget,
         ],
         labelSegment: 2,
         sourceSide: 'right',
