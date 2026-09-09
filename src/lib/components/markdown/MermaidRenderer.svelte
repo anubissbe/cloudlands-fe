@@ -352,6 +352,85 @@ ${verticalSource}`;
     }
   }
 
+  function addMermaidLabelFeathers(svg: SVGSVGElement) {
+    const surfaces = [
+      ...svg.querySelectorAll<SVGRectElement>(
+        '.edgeLabel rect.background[data-label-padded], .edge-label-knockout',
+      ),
+    ];
+    if (surfaces.length === 0) return;
+    const signature = surfaces
+      .map((surface) =>
+        [
+          surface.getAttribute('x'),
+          surface.getAttribute('y'),
+          surface.getAttribute('width'),
+          surface.getAttribute('height'),
+          surface.dataset.labelPaddingX ?? '6',
+          surface.dataset.labelPaddingY ?? '4',
+        ].join(','),
+      )
+      .join(';');
+    const previous = svg.querySelector<SVGDefsElement>(':scope > defs.edge-label-feather-defs');
+    if (
+      previous?.dataset.signature === signature &&
+      surfaces.every((surface) => surface.hasAttribute('mask'))
+    ) {
+      return;
+    }
+    previous?.remove();
+    const defs = document.createElementNS('http://www.w3.org/2000/svg', 'defs');
+    defs.classList.add('edge-label-feather-defs');
+    defs.dataset.signature = signature;
+    svg.prepend(defs);
+
+    surfaces.forEach((surface, index) => {
+      const width = Number(surface.getAttribute('width'));
+      const height = Number(surface.getAttribute('height'));
+      const paddingX = Number(surface.dataset.labelPaddingX ?? 6);
+      const paddingY = Number(surface.dataset.labelPaddingY ?? 4);
+      if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) return;
+
+      const prefix = `${svg.id || 'mermaid'}-edge-label-feather-${index}`;
+      const filterId = `${prefix}-blur`;
+      const maskId = `${prefix}-mask`;
+      const x = Number(surface.getAttribute('x') ?? 0);
+      const y = Number(surface.getAttribute('y') ?? 0);
+      const filter = document.createElementNS('http://www.w3.org/2000/svg', 'filter');
+      filter.id = filterId;
+      filter.setAttribute('filterUnits', 'userSpaceOnUse');
+      filter.setAttribute('x', String(x));
+      filter.setAttribute('y', String(y));
+      filter.setAttribute('width', String(width));
+      filter.setAttribute('height', String(height));
+      const blur = document.createElementNS('http://www.w3.org/2000/svg', 'feGaussianBlur');
+      blur.setAttribute('stdDeviation', `${paddingX / 6} ${paddingY / 6}`);
+      filter.append(blur);
+      defs.append(filter);
+
+      const mask = document.createElementNS('http://www.w3.org/2000/svg', 'mask');
+      mask.id = maskId;
+      mask.setAttribute('maskContentUnits', 'userSpaceOnUse');
+      mask.setAttribute('maskUnits', 'userSpaceOnUse');
+      mask.setAttribute('mask-type', 'alpha');
+      mask.setAttribute('x', String(x));
+      mask.setAttribute('y', String(y));
+      mask.setAttribute('width', String(width));
+      mask.setAttribute('height', String(height));
+      const maskRect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+      maskRect.setAttribute('x', String(x + paddingX / 2));
+      maskRect.setAttribute('y', String(y + paddingY / 2));
+      maskRect.setAttribute('width', String(Math.max(0, width - paddingX)));
+      maskRect.setAttribute('height', String(Math.max(0, height - paddingY)));
+      maskRect.setAttribute('fill', '#fff');
+      maskRect.setAttribute('filter', `url(#${filterId})`);
+      mask.append(maskRect);
+      defs.append(mask);
+      surface.setAttribute('mask', `url(#${maskId})`);
+      surface.dataset.labelFeathered = 'true';
+    });
+  }
+
   function balanceMermaidEdgeLabelGlyphs(svg: SVGSVGElement) {
     const canvas = document.createElement('canvas');
     const context = canvas.getContext('2d');
@@ -1071,6 +1150,7 @@ ${verticalSource}`;
     if (svg.getAttribute('aria-roledescription') === 'sequence') {
       polishSequenceDiagram(svg);
       addMermaidLabelKnockouts(svg);
+      addMermaidLabelFeathers(svg);
       setReadableMermaidWidth(svg, svg.viewBox.baseVal.width);
       svg.dataset.layoutGeneration = String(generation);
       svg.dataset.layoutSettled = 'true';
@@ -1082,6 +1162,7 @@ ${verticalSource}`;
     balanceMermaidEdgeLabelGlyphs(svg);
     padMermaidEdgeLabels(svg);
     addMermaidLabelKnockouts(svg);
+    addMermaidLabelFeathers(svg);
     reserveFlowchartClusterHeaderBands(svg);
     repairEntityDividers(svg);
     refineMermaidCylinderNodes(svg);
@@ -1951,6 +2032,7 @@ ${verticalSource}`;
     opacity: 1 !important;
     stroke: none !important;
     filter: none !important;
+    transition: fill var(--motion-standard) var(--ease-standard);
   }
 
   .mermaid-presentation :global(.edge-label-knockout) {
@@ -1960,6 +2042,7 @@ ${verticalSource}`;
     stroke: none !important;
     filter: none !important;
     pointer-events: none;
+    transition: fill var(--motion-standard) var(--ease-standard);
   }
 
   .mermaid-presentation :global(.node > .label),
@@ -1975,13 +2058,15 @@ ${verticalSource}`;
     display: inline-block;
     border: 0;
     border-radius: 2px;
-    background: var(--diagram-label-surface) !important;
+    background: transparent !important;
     color: hsl(var(--muted-foreground)) !important;
     box-sizing: border-box;
     box-shadow: none !important;
   }
 
   .mermaid-presentation :global(foreignObject.edge-label-surface > .labelBkg) {
+    position: relative;
+    isolation: isolate;
     display: flex !important;
     width: 100%;
     height: 100%;
@@ -1989,8 +2074,54 @@ ${verticalSource}`;
     justify-content: center;
   }
 
+  .mermaid-presentation :global(foreignObject.edge-label-surface > .labelBkg::before) {
+    position: absolute;
+    z-index: 0;
+    inset: 0;
+    content: '';
+    background-color: var(--diagram-label-surface);
+    -webkit-mask-image:
+      linear-gradient(to right, transparent, #000 6px, #000 calc(100% - 6px), transparent),
+      linear-gradient(to bottom, transparent, #000 4px, #000 calc(100% - 4px), transparent);
+    -webkit-mask-composite: source-in;
+    -webkit-mask-repeat: no-repeat;
+    mask-image:
+      linear-gradient(to right, transparent, #000 6px, #000 calc(100% - 6px), transparent),
+      linear-gradient(to bottom, transparent, #000 4px, #000 calc(100% - 4px), transparent);
+    mask-composite: intersect;
+    mask-repeat: no-repeat;
+    pointer-events: none;
+    transition: background-color var(--motion-standard) var(--ease-standard);
+  }
+
   .mermaid-presentation :global(span.edgeLabel) {
+    position: relative;
+    z-index: 1;
     padding: 0;
+  }
+
+  :global(.catalog-reduced-motion .mermaid-presentation .edgeLabel rect.background),
+  :global(.catalog-reduced-motion .mermaid-presentation .edge-label-knockout),
+  :global(
+    .catalog-reduced-motion
+      .mermaid-presentation
+      foreignObject.edge-label-surface
+      > .labelBkg::before
+  ) {
+    transition: none;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    :global(html:not(.catalog-full-motion) .mermaid-presentation .edgeLabel rect.background),
+    :global(html:not(.catalog-full-motion) .mermaid-presentation .edge-label-knockout),
+    :global(
+      html:not(.catalog-full-motion)
+        .mermaid-presentation
+        foreignObject.edge-label-surface
+        > .labelBkg::before
+    ) {
+      transition: none;
+    }
   }
 
   .mermaid-presentation :global(span.edgeLabel > p) {

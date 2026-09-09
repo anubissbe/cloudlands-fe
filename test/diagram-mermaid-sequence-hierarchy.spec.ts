@@ -202,9 +202,15 @@ async function expectSequenceContract(
       labelSurfaceCount: labelSurfaces.filter((surface) =>
         surface?.classList.contains('edge-label-knockout'),
       ).length,
-      opaqueSurfaces: labelSurfaces.every((surface) => {
+      featheredSurfaces: labelSurfaces.every((surface) => {
         const style = getComputedStyle(surface!);
-        return style.fill === canvas && style.opacity === '1' && style.fillOpacity === '1';
+        return (
+          style.fill === canvas &&
+          style.opacity === '1' &&
+          style.fillOpacity === '1' &&
+          (surface as SVGRectElement).dataset.labelFeathered === 'true' &&
+          Boolean(surface?.getAttribute('mask'))
+        );
       }),
       minimumLabelContrast: Math.min(...messageLabels.map(textContrast)),
       contained: visibleElements.every((element) => {
@@ -235,7 +241,7 @@ async function expectSequenceContract(
   );
   expect(Math.max(...result.labelWidths)).toBeLessThanOrEqual(175);
   expect(result.labelSurfaceCount).toBe(result.labelWidths.length);
-  expect(result.opaqueSurfaces).toBe(true);
+  expect(result.featheredSurfaces).toBe(true);
   expect(result.minimumLabelContrast).toBeGreaterThanOrEqual(4.5);
   expect(result.minimumMessageContrast).toBeGreaterThanOrEqual(3);
   expect(result.minimumStructureContrast).toBeGreaterThanOrEqual(1.4);

@@ -491,9 +491,13 @@ for (const appearance of appearances) {
                   textBounds = range.getBoundingClientRect();
                 }
                 const style = getComputedStyle(surface);
+                const htmlSurface = surface.querySelector<HTMLElement>(':scope > .labelBkg');
+                const featherStyle = htmlSurface
+                  ? getComputedStyle(htmlSurface, '::before')
+                  : style;
                 const textStyle = getComputedStyle((text ?? htmlText)!);
                 const background =
-                  surface instanceof SVGRectElement ? style.fill : style.backgroundColor;
+                  surface instanceof SVGRectElement ? style.fill : featherStyle.backgroundColor;
                 const color = textStyle.fill === 'none' ? textStyle.color : textStyle.fill;
                 const alpha = Number(background.match(/[\d.]+/g)?.[3] ?? 1);
                 const edgePaths = label.closest('svg')!.querySelector('.edgePaths')!;
@@ -518,6 +522,13 @@ for (const appearance of appearances) {
                   border: style.stroke === 'none' || style.borderStyle === 'none',
                   shadow: style.filter === 'none' && style.boxShadow === 'none',
                   contrast: contrast(color, background),
+                  feathered:
+                    surface instanceof SVGRectElement
+                      ? surface.dataset.labelFeathered === 'true' &&
+                        Boolean(surface.getAttribute('mask'))
+                      : Boolean(htmlSurface) &&
+                        (featherStyle.webkitMaskImage || featherStyle.maskImage) !== 'none' &&
+                        style.backgroundColor === 'rgba(0, 0, 0, 0)',
                   paintOrder:
                     !!(
                       edgePaths.compareDocumentPosition(edgeLabels) &
@@ -541,6 +552,7 @@ for (const appearance of appearances) {
             surface.radius > 3 ||
             !surface.border ||
             !surface.shadow ||
+            !surface.feathered ||
             !surface.paintOrder ||
             surface.contrast < 4.5,
         ),
@@ -1137,6 +1149,7 @@ for (const appearance of appearances) {
           : null;
         const nodeStyle = getComputedStyle(node);
         const labelStyle = getComputedStyle(label);
+        const labelFeatherStyle = getComputedStyle(label, '::before');
         const svg = renderer.querySelector<SVGSVGElement>('.diagram-svg-layer')!;
         const matrix = svg.getScreenCTM()!;
         const scale = Math.hypot(matrix.a, matrix.b);
@@ -1145,6 +1158,8 @@ for (const appearance of appearances) {
           nodeBackground: nodeStyle.backgroundColor,
           nodeColor: nodeStyle.color,
           labelBackground: labelStyle.backgroundColor,
+          labelFeatherBackground: labelFeatherStyle.backgroundColor,
+          labelMask: labelFeatherStyle.webkitMaskImage || labelFeatherStyle.maskImage,
           horizontal:
             Math.min(textBounds.left - labelBounds.left, labelBounds.right - textBounds.right) /
             scale,
@@ -1168,7 +1183,9 @@ for (const appearance of appearances) {
       });
       expect(defaults.nodeBackground).not.toMatch(/rgba\(0, 0, 0, 0\)|transparent/);
       expect(defaults.edgeStroke).not.toBe(defaults.nodeColor);
-      expect(defaults.labelBackground).not.toMatch(/rgba\(0, 0, 0, 0\)|transparent/);
+      expect(defaults.labelBackground).toMatch(/rgba\(0, 0, 0, 0\)|transparent/);
+      expect(defaults.labelFeatherBackground).not.toMatch(/rgba\(0, 0, 0, 0\)|transparent/);
+      expect(defaults.labelMask).not.toBe('none');
       expect(defaults.horizontal).toBeGreaterThanOrEqual(5.9);
       expect(defaults.vertical).toBeGreaterThanOrEqual(3.9);
       await page.locator('.catalog-topbar').evaluate((toolbar) => {

@@ -1711,6 +1711,8 @@
   }
 
   :global(.edge-label-html) {
+    position: relative;
+    isolation: isolate;
     display: flex;
     align-items: center;
     justify-content: center;
@@ -1724,7 +1726,7 @@
     line-height: var(--text-caption-line-height);
     letter-spacing: var(--text-caption-tracking);
     color: hsl(var(--muted-foreground));
-    background: var(--diagram-label-surface);
+    background: transparent;
     padding: 4px 6px;
     overflow: hidden;
     overflow-wrap: normal;
@@ -1733,7 +1735,29 @@
     box-sizing: border-box;
   }
 
+  :global(.edge-label-html::before) {
+    position: absolute;
+    z-index: 0;
+    inset: 0;
+    content: '';
+    background-color: var(--diagram-label-surface);
+    -webkit-mask-image:
+      linear-gradient(to right, transparent, #000 6px, #000 calc(100% - 6px), transparent),
+      linear-gradient(to bottom, transparent, #000 4px, #000 calc(100% - 4px), transparent);
+    -webkit-mask-composite: source-in;
+    -webkit-mask-repeat: no-repeat;
+    mask-image:
+      linear-gradient(to right, transparent, #000 6px, #000 calc(100% - 6px), transparent),
+      linear-gradient(to bottom, transparent, #000 4px, #000 calc(100% - 4px), transparent);
+    mask-composite: intersect;
+    mask-repeat: no-repeat;
+    pointer-events: none;
+    transition: background-color var(--motion-standard) var(--ease-standard);
+  }
+
   :global(.edge-label-text) {
+    position: relative;
+    z-index: 1;
     display: -webkit-box;
     overflow: hidden;
     white-space: pre-line;
@@ -1746,6 +1770,7 @@
   }
 
   :global(.catalog-reduced-motion .edge-label-container),
+  :global(.catalog-reduced-motion .edge-label-html::before),
   :global(.catalog-reduced-motion .diagram-geometry-motion),
   :global(.catalog-reduced-motion .diagram-svg-layer),
   :global(.catalog-reduced-motion) .diagram-actions {
@@ -1761,6 +1786,7 @@
 
   @media (prefers-reduced-motion: reduce) {
     :global(html:not(.catalog-full-motion) .edge-label-container),
+    :global(html:not(.catalog-full-motion) .edge-label-html::before),
     :global(html:not(.catalog-full-motion) .diagram-geometry-motion),
     :global(html:not(.catalog-full-motion) .diagram-svg-layer),
     :global(html:not(.catalog-full-motion)) .diagram-actions {

@@ -792,9 +792,7 @@ test('keeps final diagram geometry polished across themes and widths', async ({ 
           ['#mermaid-nested-groups', '.mermaid-svg > svg', 'backgroundColor'],
           ['#mermaid-nested-groups', '.cluster > rect', 'fill'],
           ['#custom-bindings', '.diagram-svg-layer', 'backgroundColor'],
-          ['#custom-bindings', '.edge-label-html', 'backgroundColor'],
           ['#custom-walkthrough', '.diagram-svg-layer', 'backgroundColor'],
-          ['#custom-walkthrough', '.edge-label-html', 'backgroundColor'],
         ].flatMap(([rootSelector, targetSelector, property]) => {
           const root = document.querySelector<HTMLElement>(rootSelector)!;
           const probe = document.createElement('span');

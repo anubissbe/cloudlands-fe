@@ -305,7 +305,7 @@ async function expectMermaidEdgeLabelGeometry(page: Page, state: string, expecte
   expect(result.unbalanced, `${state} balanced edge-label knockout padding`).toEqual([]);
 }
 
-async function expectOpaqueStateLabelPaint(page: Page) {
+async function expectFeatheredStateLabelPaint(page: Page) {
   await page.setViewportSize({ width: 1400, height: 1400 });
   const state = page.locator('#mermaid-state');
   await state.scrollIntoViewIfNeeded();
@@ -361,8 +361,14 @@ async function expectOpaqueStateLabelPaint(page: Page) {
       const backgroundLayer = stack.indexOf(background);
       const routeLayer = stack.indexOf(path);
 
-      if (style.opacity !== '1' || style.fillOpacity !== '1' || style.fill !== canvasColor) {
-        failures.push(`${name}: translucent or canvas-mismatched surface`);
+      if (
+        style.opacity !== '1' ||
+        style.fillOpacity !== '1' ||
+        style.fill !== canvasColor ||
+        background.dataset.labelFeathered !== 'true' ||
+        !background.getAttribute('mask')
+      ) {
+        failures.push(`${name}: missing opaque center or four-sided feather`);
       }
       if (horizontalClearance < 5.9 || verticalClearance < 3.9) {
         failures.push(`${name}: incomplete text clearance`);
@@ -2026,7 +2032,7 @@ for (const { name, theme, nord } of [
   { name: 'Nord', theme: 'light', nord: true },
 ] as const) {
   for (const width of [320, 960] as const) {
-    test(`masks state routes with opaque ${name} label surfaces at ${width}px`, async ({
+    test(`masks state routes with feathered ${name} label surfaces at ${width}px`, async ({
       page,
     }) => {
       test.setTimeout(180_000);
@@ -2043,7 +2049,7 @@ for (const { name, theme, nord } of [
           'true',
         );
       }
-      await expectOpaqueStateLabelPaint(page);
+      await expectFeatheredStateLabelPaint(page);
     });
   }
 }
