@@ -49,6 +49,11 @@ const MIN_NODE_HEIGHT = 32;
 const AUTOMATIC_VERTICAL_THRESHOLD = 500;
 const MIN_READABLE_SCALE = 0.84;
 const PORT_SLOT_GAP = 16;
+export const CUSTOM_GROUP_TITLE_GEOMETRY = Object.freeze({
+  centerY: 24,
+  headerHeight: 68,
+  horizontalPadding: 24,
+});
 
 export function compactEdgeLabelMaxWidth(
   label: string,
@@ -95,6 +100,23 @@ export function measureDiagramTextWidth(
 
   measurementContext.font = `${weight} ${fontSize}px ${fontFamily}`;
   return measurementContext.measureText(text).width + Math.max(0, text.length - 1) * letterSpacing;
+}
+
+function minimumGroupTitleWidth(label: string): number {
+  const fontSize = rootPixelSize('--text-body-size', 15);
+  const tracking = rootToken('--text-caption-tracking', '0.01em');
+  const trackingAmount = Number.parseFloat(tracking);
+  const letterSpacing = Number.isFinite(trackingAmount)
+    ? tracking.endsWith('em')
+      ? trackingAmount * fontSize
+      : trackingAmount
+    : fontSize * 0.01;
+  const titleWidth = Math.max(
+    ...label
+      .split('\n')
+      .map((line) => measureDiagramTextWidth(line, fontSize, '500', 7.5, letterSpacing)),
+  );
+  return Math.ceil(titleWidth) + CUSTOM_GROUP_TITLE_GEOMETRY.horizontalPadding * 2;
 }
 
 export function measureEdgeLabel(
@@ -520,18 +542,23 @@ function computeGroupBoundsFromNodes(
     }
 
     const paddingX = 30;
-    const paddingTop = 52;
+    const paddingTop = CUSTOM_GROUP_TITLE_GEOMETRY.headerHeight;
     const paddingBottom = 30;
-    const minX = Math.min(...groupNodes.map((n) => n.x)) - paddingX;
+    const contentMinX = Math.min(...groupNodes.map((n) => n.x));
+    const contentMaxX = Math.max(...groupNodes.map((n) => n.x + n.width));
+    const width = Math.max(
+      contentMaxX - contentMinX + paddingX * 2,
+      minimumGroupTitleWidth(group.label),
+    );
+    const minX = (contentMinX + contentMaxX - width) / 2;
     const minY = Math.min(...groupNodes.map((n) => n.y)) - paddingTop;
-    const maxX = Math.max(...groupNodes.map((n) => n.x + n.width)) + paddingX;
     const maxY = Math.max(...groupNodes.map((n) => n.y + n.height)) + paddingBottom;
 
     return {
       ...group,
       x: minX,
       y: minY,
-      width: maxX - minX,
+      width,
       height: maxY - minY,
     };
   });
@@ -3672,14 +3699,16 @@ function computeGroupBounds(groups: DiagramGroup[], nodes: ComputedNode[]): Comp
     const maxY = Math.max(...groupNodes.map((n) => n.y + n.height));
 
     const paddingX = 30;
-    const paddingTop = 52;
+    const paddingTop = CUSTOM_GROUP_TITLE_GEOMETRY.headerHeight;
     const paddingBottom = 30;
+    const width = Math.max(maxX - minX + paddingX * 2, minimumGroupTitleWidth(group.label));
+    const x = (minX + maxX - width) / 2;
 
     return {
       ...group,
-      x: minX - paddingX,
+      x,
       y: minY - paddingTop,
-      width: maxX - minX + paddingX * 2,
+      width,
       height: maxY - minY + paddingTop + paddingBottom,
     };
   });

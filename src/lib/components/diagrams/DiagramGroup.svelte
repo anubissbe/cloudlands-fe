@@ -2,6 +2,7 @@
   /**
    * Diagram Group Component
    */
+  import { CUSTOM_GROUP_TITLE_GEOMETRY } from './layout-engine';
   import type { ComputedGroup } from './types';
 
   interface Props {
@@ -46,7 +47,7 @@
   <!-- Group label -->
   <text
     x={group.x + group.width / 2}
-    y={group.y + 17}
+    y={group.y + CUSTOM_GROUP_TITLE_GEOMETRY.centerY}
     text-anchor="middle"
     dominant-baseline="middle"
     class="group-label"

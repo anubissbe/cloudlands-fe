@@ -225,8 +225,8 @@ describe('Mermaid path terminal geometry', () => {
   });
 
   it('reserves the measured cluster title plus a stable content gap', () => {
-    expect(measuredClusterHeaderHeight(36.2)).toBe(85);
-    expect(measuredClusterHeaderHeight(12)).toBe(66);
+    expect(measuredClusterHeaderHeight(36.2)).toBe(93);
+    expect(measuredClusterHeaderHeight(12)).toBe(74);
   });
 
   it('intersects rays with the rhombus boundary instead of its rectangular bounds', () => {

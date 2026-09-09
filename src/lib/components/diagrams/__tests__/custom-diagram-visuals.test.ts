@@ -103,6 +103,29 @@ describe('custom diagram visual contract', () => {
     expect(multiline.nodes[2].width).toBeLessThanOrEqual(250);
   });
 
+  it('reserves a visible header band and side clearance for group titles', () => {
+    const diagram = customDiagram('custom-architecture');
+    const layout = computeLayout(diagram.model, diagram.baseView, diagram.grammar);
+
+    for (const group of layout.groups ?? []) {
+      const members = layout.nodes.filter(
+        (node) => node.group === group.id || group.nodeIds?.includes(node.id),
+      );
+      expect(
+        Math.min(...members.map((node) => node.y)) - group.y,
+        group.label,
+      ).toBeGreaterThanOrEqual(64);
+      expect(
+        Math.min(...members.map((node) => node.x)) - group.x,
+        group.label,
+      ).toBeGreaterThanOrEqual(24);
+      expect(
+        group.x + group.width - Math.max(...members.map((node) => node.x + node.width)),
+        group.label,
+      ).toBeGreaterThanOrEqual(24);
+    }
+  });
+
   it('renders every state-machine label with matching semantic markers', async () => {
     const { container } = render(DiagramRenderer, {
       props: { diagram: customDiagram('custom-state-machine') },

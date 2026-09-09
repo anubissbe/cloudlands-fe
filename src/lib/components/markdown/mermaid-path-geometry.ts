@@ -37,8 +37,11 @@ function segmentCssScale(path: SVGGraphicsElement, start: Point, end: Point) {
   return Math.hypot(screenEnd.x - screenStart.x, screenEnd.y - screenStart.y) / localLength || 1;
 }
 
+const CLUSTER_TITLE_INSET = 24;
+const CLUSTER_TITLE_CONTENT_GAP = 32;
+
 export function measuredClusterHeaderHeight(titleHeight: number) {
-  return Math.ceil(Math.max(titleHeight, 18)) + 48;
+  return Math.ceil(Math.max(titleHeight, 18)) + CLUSTER_TITLE_INSET + CLUSTER_TITLE_CONTENT_GAP;
 }
 
 export function buildFlowchartDecisionBranchPoints(
@@ -1151,9 +1154,9 @@ export function reserveFlowchartClusterHeaderBands(svg: SVGSVGElement) {
     const maxContentX = Math.max(...content.map(({ x, width }) => x + width));
     const minContentY = Math.min(...content.map(({ y }) => y));
     const maxContentY = Math.max(...content.map(({ y, height }) => y + height));
-    const x = Math.min(record.frame.x, minContentX - 20);
+    const x = Math.min(record.frame.x, minContentX - CLUSTER_TITLE_INSET);
     const y = Math.min(record.frame.y, minContentY - headerHeight);
-    const right = Math.max(record.frame.x + record.frame.width, maxContentX + 20);
+    const right = Math.max(record.frame.x + record.frame.width, maxContentX + CLUSTER_TITLE_INSET);
     const bottom = Math.max(record.frame.y + record.frame.height, maxContentY + 20);
     const frame = { x, y, width: right - x, height: bottom - y };
     record.rect.setAttribute('x', String(frame.x));
@@ -1164,14 +1167,17 @@ export function reserveFlowchartClusterHeaderBands(svg: SVGSVGElement) {
     if (viewport) {
       viewport.setAttribute('x', '0');
       viewport.setAttribute('y', '0');
-      viewport.setAttribute('width', String(Math.max(24, frame.width - 40)));
+      viewport.setAttribute('width', String(Math.max(24, frame.width - CLUSTER_TITLE_INSET * 2)));
       viewport.setAttribute('height', String(titleHeight));
-      record.label.setAttribute('transform', `translate(${frame.x + 20}, ${frame.y + 20})`);
+      record.label.setAttribute(
+        'transform',
+        `translate(${frame.x + CLUSTER_TITLE_INSET}, ${frame.y + CLUSTER_TITLE_INSET})`,
+      );
     } else {
       const title = record.label.getBBox();
       record.label.setAttribute(
         'transform',
-        `translate(${frame.x + frame.width / 2 - title.x - title.width / 2}, ${frame.y + 20 - title.y})`,
+        `translate(${frame.x + frame.width / 2 - title.x - title.width / 2}, ${frame.y + CLUSTER_TITLE_INSET - title.y})`,
       );
     }
     layouts.set(record.cluster, frame);
@@ -2321,7 +2327,8 @@ function reframeFlowchartClusters(
       ...children,
     ];
     if (!content.length) continue;
-    const headerHeight = Number(record.cluster.dataset.headerHeight) || 66;
+    const headerHeight =
+      Number(record.cluster.dataset.headerHeight) || measuredClusterHeaderHeight(18);
     const x = Math.min(...content.map((bounds) => bounds.x)) - 24;
     const y = Math.min(...content.map((bounds) => bounds.y)) - headerHeight;
     const right = Math.max(...content.map((bounds) => bounds.x + bounds.width)) + 24;
@@ -2334,13 +2341,16 @@ function reframeFlowchartClusters(
     if (viewport) {
       viewport.setAttribute('x', '0');
       viewport.setAttribute('y', '0');
-      viewport.setAttribute('width', String(Math.max(24, frame.width - 40)));
-      record.label.setAttribute('transform', `translate(${frame.x + 20}, ${frame.y + 20})`);
+      viewport.setAttribute('width', String(Math.max(24, frame.width - CLUSTER_TITLE_INSET * 2)));
+      record.label.setAttribute(
+        'transform',
+        `translate(${frame.x + CLUSTER_TITLE_INSET}, ${frame.y + CLUSTER_TITLE_INSET})`,
+      );
     } else {
       const title = record.label.getBBox();
       record.label.setAttribute(
         'transform',
-        `translate(${frame.x + frame.width / 2 - title.x - title.width / 2}, ${frame.y + 20 - title.y})`,
+        `translate(${frame.x + frame.width / 2 - title.x - title.width / 2}, ${frame.y + CLUSTER_TITLE_INSET - title.y})`,
       );
     }
     layouts.set(record.cluster, frame);
