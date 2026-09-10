@@ -26,7 +26,7 @@
   import { fade } from 'svelte/transition';
   import type { TransitionConfig } from 'svelte/transition';
   import { cubicOut } from 'svelte/easing';
-  import { flushSync, onDestroy, onMount, tick } from 'svelte';
+  import { flushSync, onDestroy, onMount, tick, untrack } from 'svelte';
   import { m } from '$shared/paraglide/messages.js';
   import { shouldReduceMotion } from '$lib/utils/motion-preference';
   import { cameraMotionKeyframes, partitionSceneIds } from './diagram-motion';
@@ -65,8 +65,11 @@
   const SECONDARY_TEXT_FLOOR = 10;
   const ARROW_TERMINAL_GAP_CSS_PX = 5;
   const ARROW_TIP_RADIUS_CSS_PX = 0.5;
+  let resizing = $state(false);
+  let layoutResizeRevision = $state(0);
+  let resizeFrame: number | undefined;
   function motionDuration(duration: number): number {
-    return shouldReduceMotion() ? 0 : duration;
+    return resizing || shouldReduceMotion() ? 0 : duration;
   }
 
   // Computed layout
@@ -78,6 +81,7 @@
   let scrollContainerEl = $state<HTMLDivElement | null>(null);
   let scrollContainerWidth = $state<number | null>(null);
   let fontMeasurementRevision = $state(0);
+  let stateFrameHeight = $state(0);
 
   onMount(() => {
     let cancelled = false;
@@ -127,6 +131,13 @@
       : styleConfig,
   );
   let renderedScale = $derived(cameraZoom * (fitToWidth || automaticallyFitState ? fitScale : 1));
+  let readableScale = $derived(
+    Math.max(
+      PRIMARY_TEXT_FLOOR / renderStyleConfig.labelFontSize,
+      SECONDARY_TEXT_FLOOR /
+        (styleConfig === DEFAULT_NODE_STYLE ? 11 : renderStyleConfig.kindFontSize),
+    ),
+  );
   let arrowTerminalGap = $derived(
     (ARROW_TERMINAL_GAP_CSS_PX + ARROW_TIP_RADIUS_CSS_PX) / renderedScale,
   );
@@ -298,7 +309,11 @@
     settlementFrame = requestAnimationFrame(() => {
       if (revision !== settlementRevision) return;
       const snapshot = motionSnapshot();
-      const active = movingEdgeIds.size > 0 || activeFiniteAnimations().length > 0;
+      const active =
+        motionPhase === 'camera' ||
+        motionPhase === 'exit' ||
+        movingEdgeIds.size > 0 ||
+        activeFiniteAnimations().length > 0;
       if (!active && previousSnapshot !== undefined && snapshot === previousSnapshot) {
         if (stateJustChanged) {
           stateJustChanged = false;
@@ -335,6 +350,7 @@
     transitionRevision += 1;
     settlementRevision += 1;
     if (settlementFrame !== undefined) cancelAnimationFrame(settlementFrame);
+    if (resizeFrame !== undefined) cancelAnimationFrame(resizeFrame);
     for (const animation of cameraAnimations) animation.cancel();
     cameraAnimations = [];
     movingEdgeIds.clear();
@@ -754,36 +770,67 @@
         renderStyleConfig,
         layoutWidthLimit,
       );
-      const nodeIds = new Set(visibleNodeIds);
-      const edgeIds = new Set(visibleEdgeIds);
-      const model = currentState
-        ? {
-            ...diagram.model,
-            nodes: diagram.model.nodes.filter((node) => nodeIds.has(node.id)),
-            edges: diagram.model.edges.filter((edge) => edgeIds.has(edge.id)),
-            groups: diagram.model.groups?.filter((group) =>
-              group.nodeIds?.some((nodeId) => nodeIds.has(nodeId)),
-            ),
-          }
-        : diagram.model;
-      layout = currentState
-        ? computeLayout(
-            model,
-            {
-              ...diagram.baseView,
-              layout: {
-                ...diagram.baseView.layout,
-                spacing: Math.min(
-                  diagram.baseView.layout.spacing ?? 80,
-                  usesCompactPresentation ? 40 : 56,
-                ),
-              },
+      const stateLayouts = (diagram.states ?? []).map((state) => {
+        const nodeIds = new Set(state.visibleNodes ?? diagram.model.nodes.map((node) => node.id));
+        const edgeIds = new Set(state.visibleEdges ?? diagram.model.edges.map((edge) => edge.id));
+        const model = {
+          ...diagram.model,
+          nodes: diagram.model.nodes.filter((node) => nodeIds.has(node.id)),
+          edges: diagram.model.edges.filter(
+            (edge) => edgeIds.has(edge.id) && nodeIds.has(edge.from) && nodeIds.has(edge.to),
+          ),
+          groups: diagram.model.groups?.filter((group) =>
+            group.nodeIds?.some((nodeId) => nodeIds.has(nodeId)),
+          ),
+        };
+        const stateLayout = computeLayout(
+          model,
+          {
+            ...diagram.baseView,
+            layout: {
+              ...diagram.baseView.layout,
+              spacing: Math.min(
+                diagram.baseView.layout.spacing ?? 80,
+                usesCompactPresentation ? 40 : 56,
+              ),
             },
-            diagram.grammar,
-            renderStyleConfig,
-            layoutWidthLimit,
-          )
-        : fullLayout;
+          },
+          diagram.grammar,
+          renderStyleConfig,
+          layoutWidthLimit,
+        );
+        return { state, layout: stateLayout };
+      });
+      layout = stateLayouts.find(({ state }) => state.id === currentStateId)?.layout ?? fullLayout;
+      // Reserve the largest step before navigation, not a growing, history-dependent height.
+      // Label centers lie on their routes; half a label on either side bounds their paint.
+      stateFrameHeight = Math.ceil(
+        Math.max(
+          0,
+          ...stateLayouts.map(({ state, layout }) => {
+            const labelHeight = Math.max(
+              0,
+              ...layout.edges.map((edge) =>
+                edge.label
+                  ? measureEdgeLabel(
+                      edge.label,
+                      usesCompactPresentation ? compactEdgeLabelMaxWidth(edge.label) : undefined,
+                    ).height
+                  : 0,
+              ),
+            );
+            const nodeWidth =
+              Math.max(1, ...layout.nodes.map((node) => node.x + node.width)) -
+              Math.min(0, ...layout.nodes.map((node) => node.x));
+            const zoom = state.camera?.zoom ?? 1;
+            const widthScale =
+              Math.max(1, (presentationWidth ?? 900) - 16) /
+              Math.max(1, (nodeWidth + canvasPadding * 2) * zoom);
+            const scale = zoom * Math.min(1.25, Math.max(readableScale, widthScale));
+            return (layout.bounds.height + labelHeight + canvasPadding * 2 + 6) * scale + 20;
+          }),
+        ),
+      );
       layoutError = false;
       beginDiagramSettlement();
     } catch {
@@ -799,15 +846,62 @@
   // Scroll container ref for focus scrolling
   let initialFitResolved = $state(false);
 
+  function clearTransitionScene() {
+    stateJustChanged = false;
+    motionPhase = 'scene';
+    holdSharedScene = false;
+    retainDepartingScene = false;
+    revealEnteringScene = true;
+    enteringNodeIds = [];
+    enteringGroupIds = [];
+    enteringEdgeIds = [];
+    departingNodes = [];
+    departingGroups = [];
+    departingEdges = [];
+    departingLabelPositions = new Map();
+    heldNodes = [];
+    heldGroups = [];
+    heldEdges = [];
+    heldLabelPositions = new Map();
+    presentedStateId = currentStateId;
+  }
+
   // Track scroll container width for sticky footer sizing
   $effect(() => {
     if (!scrollContainerEl) return;
-    scrollContainerWidth = scrollContainerEl.clientWidth;
-    updateFitScale();
+    untrack(() => {
+      scrollContainerWidth = scrollContainerEl!.clientWidth;
+      updateFitScale();
+    });
     const observer = new ResizeObserver((entries) => {
       for (const entry of entries) {
+        if (
+          automaticallyFitState &&
+          scrollContainerWidth !== null &&
+          Math.abs(entry.contentRect.width - scrollContainerWidth) > 0.5
+        ) {
+          // Old scene coordinates no longer fit after a lane resize. Settle that interruption
+          // immediately; ordinary step changes keep their existing motion schedule.
+          resizing = true;
+          transitionRevision += 1;
+          for (const animation of cameraAnimations) animation.cancel();
+          cameraAnimations = [];
+          movingEdgeIds.clear();
+          clearTransitionScene();
+        }
         scrollContainerWidth = entry.contentRect.width;
         updateFitScale();
+        flushSync();
+        if (resizing) {
+          layoutResizeRevision += 1;
+          flushSync();
+          for (const animation of activeFiniteAnimations()) animation.finish();
+          if (resizeFrame !== undefined) cancelAnimationFrame(resizeFrame);
+          resizeFrame = requestAnimationFrame(() => {
+            resizing = false;
+            resizeFrame = undefined;
+          });
+        }
       }
     });
     observer.observe(scrollContainerEl);
@@ -816,9 +910,24 @@
 
   // Apply camera transform (zoom + pan) to the diagram content
   let cameraTransformStyle = $derived.by(() => {
-    const panX = cameraPan?.x ?? 0;
-    const panY = cameraPan?.y ?? 0;
+    let panX = cameraPan?.x ?? 0;
+    let panY = cameraPan?.y ?? 0;
     if (automaticallyFitState) {
+      if (layout && visibleBounds && (heldNodes.length > 0 || departingNodes.length > 0)) {
+        // Aim at the next scene while leaving room for content that is still exiting.
+        const availableX = Math.max(0, ((presentationWidth ?? 0) - contentWidth) / 2 - 8);
+        const availableY = Math.max(0, (stateFrameHeight - contentHeight) / 2 - 8);
+        const targetX =
+          ((visibleBounds.minX + visibleBounds.maxX - layout.bounds.minX - layout.bounds.maxX) *
+            renderedScale) /
+          2;
+        const targetY =
+          ((visibleBounds.minY + visibleBounds.maxY - layout.bounds.minY - layout.bounds.maxY) *
+            renderedScale) /
+          2;
+        panX += Math.max(-availableX, Math.min(availableX, targetX));
+        panY += Math.max(-availableY, Math.min(availableY, targetY));
+      }
       return `scale(${renderedScale}) translate(calc(-50% + ${panX / renderedScale}px), calc(-50% + ${panY / renderedScale}px))`;
     }
     const transforms: string[] = [];
@@ -876,9 +985,10 @@
     }
 
     // Compute bounds from only visible elements
-    const nodes = visibleNodes;
-    const edges = visibleEdges;
-    const groups = visibleGroups;
+    // Keep outgoing paint in the camera bounds until its existing exit finishes.
+    const nodes = [...visibleNodes, ...departingNodes, ...heldNodes];
+    const edges = [...visibleEdges, ...departingEdges, ...heldEdges];
+    const groups = [...visibleGroups, ...departingGroups, ...heldGroups];
 
     if (nodes.length === 0) return layout.bounds;
 
@@ -921,7 +1031,11 @@
     }
 
     // Keep edge labels inside the SVG, including multiline labels offset from their path.
-    for (const label of edgeLabelPositions.values()) {
+    for (const label of [
+      ...edgeLabelPositions.values(),
+      ...departingLabelPositions.values(),
+      ...heldLabelPositions.values(),
+    ]) {
       minX = Math.min(minX, label.x);
       minY = Math.min(minY, label.y);
       maxX = Math.max(maxX, label.x + label.width);
@@ -960,16 +1074,16 @@
       return;
     }
     const availableWidth = Math.max(1, scrollContainerEl.clientWidth - 16);
-    const availableHeight = Math.max(1, scrollContainerEl.clientHeight - 16);
+    // A stateful canvas follows its content. Its own height must not feed back into fitting.
+    const availableHeight = automaticallyFitState
+      ? Number.POSITIVE_INFINITY
+      : Math.max(1, scrollContainerEl.clientHeight - 16);
     const renderedWidth = Math.max(1, svgWidth * cameraZoom);
     const renderedHeight = Math.max(1, svgHeight * cameraZoom);
-    const readableScale = Math.max(
-      PRIMARY_TEXT_FLOOR / renderStyleConfig.labelFontSize,
-      SECONDARY_TEXT_FLOOR /
-        (styleConfig === DEFAULT_NODE_STYLE ? 11 : renderStyleConfig.kindFontSize),
-    );
     const verticalStateWidthFloor =
-      automaticallyFitState && ['TB', 'BT'].includes(diagram.baseView.layout.direction ?? '')
+      automaticallyFitState &&
+      availableWidth >= 500 &&
+      ['TB', 'BT'].includes(diagram.baseView.layout.direction ?? '')
         ? 500
         : 160;
     layoutWidthLimit = Math.max(
@@ -1100,21 +1214,7 @@
       );
       flushSync();
     } else {
-      holdSharedScene = false;
-      retainDepartingScene = false;
-      revealEnteringScene = true;
-      enteringNodeIds = [];
-      enteringGroupIds = [];
-      enteringEdgeIds = [];
-      departingNodes = [];
-      departingGroups = [];
-      departingEdges = [];
-      departingLabelPositions = new Map();
-      heldNodes = [];
-      heldGroups = [];
-      heldEdges = [];
-      heldLabelPositions = new Map();
-      presentedStateId = stateId;
+      clearTransitionScene();
     }
     cameraAnimations = animateCameraStage(previousCameraStage);
     if (hasMotion) {
@@ -1159,6 +1259,7 @@
   class:fitted-diagram={fitToWidth}
   class:stateful-diagram={Boolean(diagram.states?.length)}
   class:camera-stage={motionPhase === 'camera'}
+  class:resizing
   style:--diagram-camera-duration={`${motionDuration(CAMERA_MOTION_MS)}ms`}
   style:--diagram-camera-easing={CAMERA_MOTION_EASING}
   style:--diagram-move-exit-duration={`${motionDuration(MOVE_EXIT_MS)}ms`}
@@ -1189,7 +1290,11 @@
     </div>
   {/if}
   <!-- Scrollable diagram content -->
-  <div class="diagram-scroll-container" bind:this={scrollContainerEl}>
+  <div
+    class="diagram-scroll-container"
+    bind:this={scrollContainerEl}
+    style:height={automaticallyFitState ? `${stateFrameHeight}px` : undefined}
+  >
     {#if layoutError}
       <div class="diagram-feedback" role="alert">
         <strong>{m.markdown_mermaid_renderFailed_error()}</strong>
@@ -1370,135 +1475,137 @@
               />
             </marker>
           </defs>
-          <g
-            class="diagram-geometry-motion"
-            transform={svgTransformAttribute}
-            style:transform={svgTransform}
-          >
-            <!-- Groups (background) -->
-            {#if renderedGroups}
-              {#each renderedGroups as group (group.id)}
-                <g
-                  in:fade={{
-                    delay: 0,
-                    duration: motionDuration(SCENE_ENTRY_MS),
-                  }}
-                  out:fade={{ duration: motionDuration(EXIT_CONTENT_MS) }}
-                >
-                  <DiagramGroup
-                    {group}
-                    dimmed={hoveredGroupId !== null && hoveredGroupId !== group.id}
-                    onHover={(groupId: string | null) => (hoveredGroupId = groupId)}
-                  />
-                </g>
-              {/each}
-            {/if}
+          {#key layoutResizeRevision}
+            <g
+              class="diagram-geometry-motion"
+              transform={svgTransformAttribute}
+              style:transform={svgTransform}
+            >
+              <!-- Groups (background) -->
+              {#if renderedGroups}
+                {#each renderedGroups as group (group.id)}
+                  <g
+                    in:fade={{
+                      delay: 0,
+                      duration: motionDuration(SCENE_ENTRY_MS),
+                    }}
+                    out:fade={{ duration: motionDuration(EXIT_CONTENT_MS) }}
+                  >
+                    <DiagramGroup
+                      {group}
+                      dimmed={hoveredGroupId !== null && hoveredGroupId !== group.id}
+                      onHover={(groupId: string | null) => (hoveredGroupId = groupId)}
+                    />
+                  </g>
+                {/each}
+              {/if}
 
-            <!-- Edges -->
-            {#each renderedEdges as edge (edge.id)}
-              {@const isEdgeDimmed =
-                (hoveredNodeId !== null && !connectedEdgeIds.has(edge.id)) ||
-                (hoveredGroupId !== null && !groupEdgeIds.has(edge.id)) ||
-                (hasStateHighlighting &&
-                  highlightedEdgeSet !== null &&
-                  !highlightedEdgeSet.has(edge.id))}
-              {@const isEdgeHighlighted =
-                highlightedEdgeSet !== null && highlightedEdgeSet.has(edge.id)}
-              <g
-                class="edge-reveal"
-                in:revealConnection={{ duration: SCENE_ENTRY_MS }}
-                out:revealConnection={{ duration: EXIT_CONNECTION_MS }}
-              >
-                <DiagramEdge
-                  {edge}
-                  dimmed={isEdgeDimmed}
-                  highlighted={isEdgeHighlighted}
-                  markerScope={diagram.id}
-                  terminalGap={arrowTerminalGap}
-                  motionDelay={0}
-                  onmotionchange={handleEdgeMotion}
-                />
-              </g>
-            {/each}
-
-            <!-- Edge labels (HTML via foreignObject) -->
-            {#each renderedEdges as edge (edge.id)}
-              {#if edge.label && renderedLabelPositions.has(edge.id)}
-                {@const labelPos = renderedLabelPositions.get(edge.id)!}
-                {@const isDimmed =
+              <!-- Edges -->
+              {#each renderedEdges as edge (edge.id)}
+                {@const isEdgeDimmed =
                   (hoveredNodeId !== null && !connectedEdgeIds.has(edge.id)) ||
                   (hoveredGroupId !== null && !groupEdgeIds.has(edge.id)) ||
                   (hasStateHighlighting &&
                     highlightedEdgeSet !== null &&
                     !highlightedEdgeSet.has(edge.id))}
-                <foreignObject
-                  x={labelPos.x}
-                  y={labelPos.y}
-                  width={labelPos.width}
-                  height={labelPos.height}
-                  class="edge-label-container diagram-geometry-motion {isDimmed
-                    ? 'edge-label-dimmed'
-                    : ''}"
-                  class:edge-label-entry={stateJustChanged && enteringEdgeIds.includes(edge.id)}
-                  data-edge-id={edge.id}
-                  data-semantic-style={edge.semanticStyle ?? 'default'}
-                  data-truncated={labelPos.truncated}
-                  out:fade={{ duration: motionDuration(EXIT_CONTENT_MS / 2) }}
+                {@const isEdgeHighlighted =
+                  highlightedEdgeSet !== null && highlightedEdgeSet.has(edge.id)}
+                <g
+                  class="edge-reveal"
+                  in:revealConnection={{ duration: SCENE_ENTRY_MS }}
+                  out:revealConnection={{ duration: EXIT_CONNECTION_MS }}
                 >
-                  {#if labelPos.truncated}
-                    <Tooltip content={edge.label} side="top" class="edge-label-tooltip">
-                      {#snippet trigger()}
-                        <div class="edge-label-html" aria-label={edge.label}>
-                          <span class="edge-label-text">{edge.label}</span>
-                        </div>
-                      {/snippet}
-                    </Tooltip>
-                  {:else}
-                    <div class="edge-label-html">
-                      <span class="edge-label-text">{edge.label}</span>
-                    </div>
-                  {/if}
-                </foreignObject>
-              {/if}
-            {/each}
+                  <DiagramEdge
+                    {edge}
+                    dimmed={isEdgeDimmed}
+                    highlighted={isEdgeHighlighted}
+                    markerScope={diagram.id}
+                    terminalGap={arrowTerminalGap}
+                    motionDelay={0}
+                    onmotionchange={handleEdgeMotion}
+                  />
+                </g>
+              {/each}
 
-            <!-- HTML nodes via foreignObject -->
-            {#each renderedNodes as node (node.id)}
-              {@const isNodeDimmed =
-                (hoveredNodeId !== null && !connectedNodeIds.has(node.id)) ||
-                (hoveredGroupId !== null && !groupNodeIds.has(node.id)) ||
-                (hasStateHighlighting &&
-                  highlightedNodeSet !== null &&
-                  !highlightedNodeSet.has(node.id))}
-              {@const isNodeHighlighted =
-                highlightedNodeSet !== null && highlightedNodeSet.has(node.id)}
-              <foreignObject
-                data-node-id={node.id}
-                x={node.x}
-                y={node.y}
-                width={node.width}
-                height={node.height}
-                class="diagram-geometry-motion"
-                in:fade={{
-                  delay: 0,
-                  duration: stateJustChanged ? motionDuration(SCENE_ENTRY_MS) : 0,
-                  easing: cubicOut,
-                }}
-                out:fade={{ duration: motionDuration(EXIT_CONTENT_MS) }}
-              >
-                <DiagramNodeHTML
-                  {node}
-                  {editable}
-                  styleConfig={renderStyleConfig}
-                  dimmed={isNodeDimmed}
-                  highlighted={isNodeHighlighted}
-                  onMove={(x: number, y: number) => handleNodeMove(node.id, x, y)}
-                  onHover={(nodeId: string | null) => (hoveredNodeId = nodeId)}
-                  {onBindingClick}
-                />
-              </foreignObject>
-            {/each}
-          </g>
+              <!-- Edge labels (HTML via foreignObject) -->
+              {#each renderedEdges as edge (edge.id)}
+                {#if edge.label && renderedLabelPositions.has(edge.id)}
+                  {@const labelPos = renderedLabelPositions.get(edge.id)!}
+                  {@const isDimmed =
+                    (hoveredNodeId !== null && !connectedEdgeIds.has(edge.id)) ||
+                    (hoveredGroupId !== null && !groupEdgeIds.has(edge.id)) ||
+                    (hasStateHighlighting &&
+                      highlightedEdgeSet !== null &&
+                      !highlightedEdgeSet.has(edge.id))}
+                  <foreignObject
+                    x={labelPos.x}
+                    y={labelPos.y}
+                    width={labelPos.width}
+                    height={labelPos.height}
+                    class="edge-label-container diagram-geometry-motion {isDimmed
+                      ? 'edge-label-dimmed'
+                      : ''}"
+                    class:edge-label-entry={stateJustChanged && enteringEdgeIds.includes(edge.id)}
+                    data-edge-id={edge.id}
+                    data-semantic-style={edge.semanticStyle ?? 'default'}
+                    data-truncated={labelPos.truncated}
+                    out:fade={{ duration: motionDuration(EXIT_CONTENT_MS / 2) }}
+                  >
+                    {#if labelPos.truncated}
+                      <Tooltip content={edge.label} side="top" class="edge-label-tooltip">
+                        {#snippet trigger()}
+                          <div class="edge-label-html" aria-label={edge.label}>
+                            <span class="edge-label-text">{edge.label}</span>
+                          </div>
+                        {/snippet}
+                      </Tooltip>
+                    {:else}
+                      <div class="edge-label-html">
+                        <span class="edge-label-text">{edge.label}</span>
+                      </div>
+                    {/if}
+                  </foreignObject>
+                {/if}
+              {/each}
+
+              <!-- HTML nodes via foreignObject -->
+              {#each renderedNodes as node (node.id)}
+                {@const isNodeDimmed =
+                  (hoveredNodeId !== null && !connectedNodeIds.has(node.id)) ||
+                  (hoveredGroupId !== null && !groupNodeIds.has(node.id)) ||
+                  (hasStateHighlighting &&
+                    highlightedNodeSet !== null &&
+                    !highlightedNodeSet.has(node.id))}
+                {@const isNodeHighlighted =
+                  highlightedNodeSet !== null && highlightedNodeSet.has(node.id)}
+                <foreignObject
+                  data-node-id={node.id}
+                  x={node.x}
+                  y={node.y}
+                  width={node.width}
+                  height={node.height}
+                  class="diagram-geometry-motion"
+                  in:fade={{
+                    delay: 0,
+                    duration: stateJustChanged ? motionDuration(SCENE_ENTRY_MS) : 0,
+                    easing: cubicOut,
+                  }}
+                  out:fade={{ duration: motionDuration(EXIT_CONTENT_MS) }}
+                >
+                  <DiagramNodeHTML
+                    {node}
+                    {editable}
+                    styleConfig={renderStyleConfig}
+                    dimmed={isNodeDimmed}
+                    highlighted={isNodeHighlighted}
+                    onMove={(x: number, y: number) => handleNodeMove(node.id, x, y)}
+                    onHover={(nodeId: string | null) => (hoveredNodeId = nodeId)}
+                    {onBindingClick}
+                  />
+                </foreignObject>
+              {/each}
+            </g>
+          {/key}
         </svg>
       </div>
     {/if}
@@ -1593,7 +1700,6 @@
   }
 
   .stateful-diagram .diagram-scroll-container {
-    height: 664px;
     display: grid;
     place-items: center;
     overflow: hidden;
@@ -1602,6 +1708,17 @@
   .stateful-diagram .diagram-content {
     min-width: 100%;
     min-height: 100%;
+  }
+
+  .stateful-diagram .diagram-footer :global(.controls-inner) {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: start;
+  }
+
+  .resizing :global(*) {
+    transition: none !important;
+    animation: none !important;
   }
 
   .stateful-diagram .diagram-svg-layer {
