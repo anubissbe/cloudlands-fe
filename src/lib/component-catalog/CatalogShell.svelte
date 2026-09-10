@@ -15,6 +15,9 @@
   } from './catalog-preferences';
   import { installPreviewBrowserApi } from './preview-discovery';
 
+  const sandboxFontUi =
+    "'Inter Variable', Inter, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif";
+
   let { activeSlug, children }: { activeSlug?: string; children?: Snippet } = $props();
   let theme = $state<CatalogTheme>(defaultCatalogPreferences.theme);
   let colorTheme = $state<CatalogColorTheme>(defaultCatalogPreferences.colorTheme);
@@ -80,6 +83,7 @@
     const root = document.documentElement;
     if (initialRootStyle === null) root.removeAttribute('style');
     else root.setAttribute('style', initialRootStyle);
+    root.style.setProperty('--font-ui', sandboxFontUi);
     const preset = themePresets.find(({ id }) => id === colorTheme);
     if (preset) {
       const parsedTheme = parseVSCodeTheme(preset[resolvedTheme]);

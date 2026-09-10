@@ -1003,6 +1003,46 @@ describe('Edge Routing', () => {
     expect(crossesHeading).toBe(false);
   });
 
+  it('reduces inter-group space only for an explicitly compact grouped layout', () => {
+    const diagram = createArchitectureDiagram(
+      [
+        { id: 'source', label: 'Source' },
+        { id: 'middle', label: 'Middle' },
+        { id: 'target', label: 'Target' },
+      ],
+      [
+        { id: 'internal-route', from: 'source', to: 'middle', label: 'internal step' },
+        { id: 'external-route', from: 'middle', to: 'target' },
+      ],
+    );
+    diagram.model.groups = [
+      { id: 'source-group', label: 'Source group', nodeIds: ['source', 'middle'] },
+      { id: 'target-group', label: 'Target group', nodeIds: ['target'] },
+    ];
+    diagram.baseView.layout.direction = 'TB';
+
+    const withSpacing = (spacing: number) =>
+      computeLayout(
+        diagram.model,
+        { ...diagram.baseView, layout: { ...diagram.baseView.layout, spacing } },
+        diagram.grammar,
+      );
+    const groupGap = (layout: ReturnType<typeof withSpacing>) => {
+      const source = layout.groups!.find(({ id }) => id === 'source-group')!;
+      const target = layout.groups!.find(({ id }) => id === 'target-group')!;
+      return target.y - (source.y + source.height);
+    };
+
+    const standard = withSpacing(56);
+    const compact = withSpacing(40);
+    const groupHeight = (layout: ReturnType<typeof withSpacing>) =>
+      layout.groups!.find(({ id }) => id === 'source-group')!.height;
+    expect(groupGap(compact)).toBeGreaterThan(0);
+    expect(groupGap(compact)).toBeLessThan(groupGap(standard));
+    expect(groupHeight(compact)).toBeLessThan(groupHeight(standard));
+    expect(compact.bounds.height).toBeLessThan(standard.bounds.height);
+  });
+
   it('gives a rank-spanning labeled route its own outside lane', () => {
     const diagram = createFlowchartDiagram(
       [

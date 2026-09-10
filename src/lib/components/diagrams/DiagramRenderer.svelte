@@ -75,6 +75,7 @@
   let fitToWidth = $state(false);
   let fitScale = $state(1);
   let layoutWidthLimit = $state(900);
+  let scrollContainerEl = $state<HTMLDivElement | null>(null);
   let scrollContainerWidth = $state<number | null>(null);
   let fontMeasurementRevision = $state(0);
 
@@ -102,9 +103,17 @@
   );
   let cameraZoom = $derived(currentState?.camera?.zoom ?? 1);
   let automaticallyFitState = $derived(currentState !== null);
+  let presentationWidth = $derived(
+    scrollContainerWidth !== null && scrollContainerWidth > 0
+      ? scrollContainerWidth
+      : (scrollContainerEl?.clientWidth ?? null),
+  );
   let usesCompactPresentation = $derived(
     layoutWidthLimit < 500 ||
-      (automaticallyFitState && scrollContainerWidth !== null && scrollContainerWidth < 500),
+      (automaticallyFitState &&
+        presentationWidth !== null &&
+        presentationWidth > 0 &&
+        presentationWidth < 500),
   );
   let canvasPadding = $derived(usesCompactPresentation ? 4 : PADDING);
   let renderStyleConfig = $derived(
@@ -764,7 +773,10 @@
               ...diagram.baseView,
               layout: {
                 ...diagram.baseView.layout,
-                spacing: Math.min(diagram.baseView.layout.spacing ?? 80, 56),
+                spacing: Math.min(
+                  diagram.baseView.layout.spacing ?? 80,
+                  usesCompactPresentation ? 40 : 56,
+                ),
               },
             },
             diagram.grammar,
@@ -785,7 +797,6 @@
   let cameraFocusNodeId = $derived(currentState?.camera?.focus ?? null);
 
   // Scroll container ref for focus scrolling
-  let scrollContainerEl = $state<HTMLDivElement | null>(null);
   let initialFitResolved = $state(false);
 
   // Track scroll container width for sticky footer sizing

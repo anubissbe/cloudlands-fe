@@ -30,6 +30,36 @@ afterEach(() => {
 });
 
 describe('catalog workspace', () => {
+  it('owns the bundled sandbox UI font across themes and restores the prior root style', async () => {
+    const root = document.documentElement;
+    root.style.setProperty('--font-ui', 'Existing UI');
+    root.style.setProperty('--existing-root-token', 'preserved');
+
+    const first = render(CatalogShell);
+    await waitFor(() =>
+      expect(root.style.getPropertyValue('--font-ui')).toContain('Inter Variable'),
+    );
+    await fireEvent.click(screen.getByRole('radio', { name: 'Dark' }));
+    await waitFor(() => {
+      expect(root.classList.contains('dark')).toBe(true);
+      expect(root.style.getPropertyValue('--font-ui')).toContain('Inter Variable');
+    });
+    await fireEvent.click(screen.getByRole('radio', { name: 'Light' }));
+    await waitFor(() =>
+      expect(root.style.getPropertyValue('--font-ui')).toContain('Inter Variable'),
+    );
+    first.unmount();
+    expect(root.style.getPropertyValue('--font-ui')).toBe('Existing UI');
+    expect(root.style.getPropertyValue('--existing-root-token')).toBe('preserved');
+
+    const second = render(CatalogShell);
+    await waitFor(() =>
+      expect(root.style.getPropertyValue('--font-ui')).toContain('Inter Variable'),
+    );
+    second.unmount();
+    expect(root.style.getPropertyValue('--font-ui')).toBe('Existing UI');
+  });
+
   it('uses canonical choices and persists color theme, mode, and motion', async () => {
     vi.mocked(localStorage.setItem).mockClear();
     const first = render(CatalogShell);

@@ -996,7 +996,8 @@ function computeHierarchicalGroupLayout(
 ): ComputedNode[] {
   const UNGROUPED = '__ungrouped__';
   const GROUP_PADDING = 32; // Padding around group contents and title
-  const GROUP_SPACING = Math.max(48, spacing * 0.75); // Space between groups
+  const usesCompactSpacing = spacing <= 40;
+  const GROUP_SPACING = Math.max(usesCompactSpacing ? 35 : 48, spacing * 0.75);
   const NODE_SPACING = Math.max(20, spacing * 0.32); // Space between nodes in same group
 
   // Step 1: Assign nodes to groups
@@ -1185,7 +1186,10 @@ function computeHierarchicalGroupLayout(
           return clearance;
         }
         const label = measureEdgeLabel(edge.label);
-        return Math.max(clearance, (isHorizontal ? label.width : label.height) + 24);
+        return Math.max(
+          clearance,
+          (isHorizontal ? label.width : label.height) + (usesCompactSpacing ? 18 : 24),
+        );
       }, 0);
       return Math.max(spacing * 0.5, labelClearance);
     });

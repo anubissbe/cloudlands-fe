@@ -26,6 +26,9 @@ type Probe = {
   exitingEdgeId?: string;
 };
 
+type ScreenPoint = { x: number; y: number };
+type ScreenBounds = { left: number; right: number; top: number; bottom: number };
+
 type Frame = {
   elapsedMs: number;
   settled: boolean;
@@ -37,8 +40,10 @@ type Frame = {
   groupAnimationDurations: number[];
   path: string;
   progress: number;
-  sourceDistance: number;
-  targetDistance: number;
+  sourcePoint: ScreenPoint;
+  sourceBounds: ScreenBounds;
+  targetPoint: ScreenPoint;
+  targetBounds: ScreenBounds;
   labelDistance: number | null;
   overflow: number;
   camera: string;
@@ -73,6 +78,22 @@ async function openSystemMotionFixture(page: Page, state: string, reduced: boole
   await expect(page.getByTestId('catalog-scene')).toHaveAttribute('data-preview-ready', 'true', {
     timeout: 30_000,
   });
+}
+
+async function expectBundledSandboxFont(page: Page, rootId: string) {
+  const evidence = await page
+    .locator(`#${rootId} .edge-label-html`)
+    .first()
+    .evaluate((label) => ({
+      token: getComputedStyle(document.documentElement).getPropertyValue('--font-ui').trim(),
+      computedFamily: getComputedStyle(label).fontFamily,
+      loadedFaces: [...document.fonts]
+        .filter(({ status }) => status === 'loaded')
+        .map(({ family }) => family),
+    }));
+  expect(evidence.token).toMatch(/^['"]Inter Variable['"]/);
+  expect(evidence.computedFamily).toMatch(/^['"]Inter Variable['"]/);
+  expect(evidence.loadedFaces).toContain('Inter Variable');
 }
 
 async function recordControlMotion(page: Page, rootId: string, direction: 'forward' | 'backward') {
@@ -328,13 +349,6 @@ async function recordTransition(page: Page, rootId: string, buttonName: string, 
       const beforeEdgeIds = new Set(
         [...root.querySelectorAll<SVGGElement>('.diagram-edge')].map((edge) => edge.dataset.edgeId),
       );
-      const sideDistance = (point: DOMPoint, bounds: DOMRect) =>
-        Math.min(
-          Math.hypot(point.x - (bounds.left + bounds.right) / 2, point.y - bounds.top),
-          Math.hypot(point.x - bounds.right, point.y - (bounds.top + bounds.bottom) / 2),
-          Math.hypot(point.x - (bounds.left + bounds.right) / 2, point.y - bounds.bottom),
-          Math.hypot(point.x - bounds.left, point.y - (bounds.top + bounds.bottom) / 2),
-        );
       const frame = (): Frame => {
         const renderer = root.querySelector<HTMLElement>('.diagram-renderer')!;
         const rendererBounds = renderer.getBoundingClientRect();
@@ -452,8 +466,20 @@ async function recordTransition(page: Page, rootId: string, buttonName: string, 
           groupAnimationDurations,
           path: path.getAttribute('d') ?? '',
           progress: Number(edgeGroup.dataset.edgeMotionProgress),
-          sourceDistance: sideDistance(start, source),
-          targetDistance: sideDistance(end, target),
+          sourcePoint: { x: start.x, y: start.y },
+          sourceBounds: {
+            left: source.left,
+            right: source.right,
+            top: source.top,
+            bottom: source.bottom,
+          },
+          targetPoint: { x: end.x, y: end.y },
+          targetBounds: {
+            left: target.left,
+            right: target.right,
+            top: target.top,
+            bottom: target.bottom,
+          },
           labelDistance,
           overflow: viewport.scrollWidth - viewport.clientWidth,
           camera: `${getComputedStyle(camera).transform}|${getComputedStyle(geometry).transform}`,
@@ -582,13 +608,63 @@ async function allRoutesComplete(page: Page, rootId: string) {
     );
 }
 
+function signedBoundaryDistance(point: ScreenPoint, bounds: ScreenBounds) {
+  const outsideX = Math.max(bounds.left - point.x, 0, point.x - bounds.right);
+  const outsideY = Math.max(bounds.top - point.y, 0, point.y - bounds.bottom);
+  if (outsideX > 0 || outsideY > 0) return Math.hypot(outsideX, outsideY);
+  const insideDistance = Math.min(
+    point.x - bounds.left,
+    bounds.right - point.x,
+    point.y - bounds.top,
+    bounds.bottom - point.y,
+  );
+  return insideDistance === 0 ? 0 : -insideDistance;
+}
+
 function expectFrameGeometry(frame: Frame) {
-  expect(frame.sourceDistance).toBeLessThanOrEqual(2);
-  expect(frame.targetDistance).toBeGreaterThanOrEqual(4.5);
-  expect(frame.targetDistance).toBeLessThanOrEqual(6);
+  expect(
+    Math.abs(signedBoundaryDistance(frame.sourcePoint, frame.sourceBounds)),
+  ).toBeLessThanOrEqual(2);
+  const targetDistance = signedBoundaryDistance(frame.targetPoint, frame.targetBounds);
+  expect(targetDistance).toBeGreaterThanOrEqual(4.5);
+  expect(targetDistance).toBeLessThanOrEqual(6);
   expect(frame.labelDistance).toBeLessThanOrEqual(4.5);
   expect(frame.overflow).toBeLessThanOrEqual(1);
 }
+
+test('endpoint boundary oracle rejects detached, interior, and wrong-shape points', () => {
+  const expectedShape = { left: 0, right: 100, top: 0, bottom: 40 };
+  const wrongShape = { left: 120, right: 220, top: 0, bottom: 40 };
+  expect(signedBoundaryDistance({ x: 0, y: 10 }, expectedShape)).toBe(0);
+  expect(signedBoundaryDistance({ x: -3, y: 10 }, expectedShape)).toBeGreaterThan(2);
+  expect(signedBoundaryDistance({ x: 95, y: 20 }, expectedShape)).toBe(-5);
+  expect(signedBoundaryDistance({ x: 105, y: 20 }, expectedShape)).toBe(5);
+  expect(signedBoundaryDistance({ x: 100, y: 20 }, wrongShape)).toBeGreaterThan(2);
+});
+
+test('keeps the bundled sandbox font through theme changes and repeated document visits', async ({
+  page,
+}) => {
+  for (const [state, rootId] of [
+    ['custom-architecture', 'custom-architecture'],
+    ['custom-walkthrough', 'custom-walkthrough'],
+    ['custom-architecture', 'custom-architecture'],
+  ] as const) {
+    await page.goto(
+      `${baseUrl}/sandbox/diagram-workbench?state=${state}&theme=light&width=960&motion=full`,
+      { waitUntil: 'domcontentloaded' },
+    );
+    await expect(page.getByTestId('catalog-scene')).toHaveAttribute('data-preview-ready', 'true', {
+      timeout: 30_000,
+    });
+    await expectBundledSandboxFont(page, rootId);
+    if (state === 'custom-architecture') {
+      await page.getByRole('radio', { name: 'Dark', exact: true }).click();
+      await expect(page.locator('html')).toHaveClass(/dark/);
+      await expectBundledSandboxFont(page, rootId);
+    }
+  }
+});
 
 function isBetween(value: number, start: number, end: number) {
   return value > Math.min(start, end) && value < Math.max(start, end);
