@@ -1520,6 +1520,8 @@
     --diagram-camera-duration: 180ms;
     --diagram-camera-easing: cubic-bezier(0.65, 0, 0.35, 1);
     --diagram-move-exit-duration: 220ms;
+    --diagram-label-entry-delay: 60ms;
+    --diagram-label-entry-duration: 120ms;
     display: flex;
     flex-direction: column;
     width: 100%;

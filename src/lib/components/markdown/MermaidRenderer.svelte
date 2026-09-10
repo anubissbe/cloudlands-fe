@@ -1797,7 +1797,7 @@ ${verticalSource}`;
 
   .mermaid-presentation :global(svg) {
     font-family: var(--mermaid-font-family) !important;
-    font-size: var(--mermaid-root-font-size, var(--text-caption-size)) !important;
+    font-size: var(--text-caption-size) !important;
     background: var(--diagram-canvas) !important;
     overflow: visible;
   }
@@ -1842,7 +1842,7 @@ ${verticalSource}`;
   .mermaid-presentation :global(.labelBox),
   .mermaid-presentation :global(.note),
   .mermaid-presentation :global(.entityBox) {
-    stroke-width: var(--line-hairline) !important;
+    stroke-width: 1px !important;
   }
 
   .mermaid-presentation :global(.node > .flowchart-node-outline) {
@@ -1870,7 +1870,7 @@ ${verticalSource}`;
 
   .mermaid-presentation :global(.classDiagram .class-box-divider) {
     stroke: hsl(var(--border)) !important;
-    stroke-width: var(--line-hairline) !important;
+    stroke-width: 1px !important;
     pointer-events: none;
   }
 
@@ -1952,14 +1952,14 @@ ${verticalSource}`;
 
   .mermaid-presentation :global(svg[aria-roledescription='sequence'] .sequence-frame-line) {
     stroke: var(--sequence-structure-stroke) !important;
-    stroke-width: var(--line-hairline) !important;
+    stroke-width: 1px !important;
     stroke-dasharray: none !important;
     opacity: 0.7;
   }
 
   .mermaid-presentation :global(svg[aria-roledescription='sequence'] .sequence-branch-divider) {
     stroke: var(--sequence-structure-stroke) !important;
-    stroke-width: var(--line-hairline) !important;
+    stroke-width: 1px !important;
     stroke-dasharray: none !important;
     opacity: 0.82;
   }

@@ -275,7 +275,7 @@
   }
 
   .node-danger {
-    --node-semantic: var(--destructive);
+    --node-semantic: var(--danger);
   }
 
   .node-success {
@@ -300,7 +300,7 @@
   }
 
   .node-danger {
-    color: hsl(var(--error-foreground));
+    color: hsl(var(--danger));
   }
 
   .node-muted {
@@ -434,7 +434,7 @@
   }
 
   .node-danger .node-icon {
-    color: hsl(var(--error-foreground));
+    color: hsl(var(--danger));
   }
 
   .node-danger .node-kind-label {
