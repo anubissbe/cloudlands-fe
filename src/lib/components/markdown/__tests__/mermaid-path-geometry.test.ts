@@ -11,6 +11,7 @@ import {
   diamondBoundaryPort,
   diamondRayIntersection,
   measuredClusterHeaderHeight,
+  preferClearStraightRoute,
   replacePathTerminal,
   routeOrthogonalAroundObstacles,
   simplifyOrthogonalPoints,
@@ -56,6 +57,121 @@ function expectRouteAvoids(points: TestPoint[], bounds: TestBounds) {
 }
 
 describe('Mermaid path terminal geometry', () => {
+  describe('clear straight boundary ports', () => {
+    const diamond = { x: 0, y: 0, width: 100, height: 100 };
+    const source = { point: diamondBoundaryPort(diamond, 'right', 8), side: 'right' as const };
+    const target = {
+      point: { x: 280, y: 60 },
+      side: 'left' as const,
+      range: [38, 72] as [number, number],
+    };
+    const jog = [source.point, { x: 150, y: 58 }, { x: 150, y: 60 }, target.point];
+
+    it('slides a free rectangular target onto the assigned diamond port corridor', () => {
+      const routed = preferClearStraightRoute(jog, source, target, []);
+      expect(routed).toEqual([source.point, { x: 280, y: 58 }]);
+      expect(routed[0]).toEqual(diamondBoundaryPort(diamond, 'right', 8));
+      expect(jog.at(-1)).toEqual({ x: 280, y: 60 });
+    });
+
+    it('uses the same boundary rule for upward connections', () => {
+      const start = { point: { x: 28, y: 200 }, side: 'top' as const };
+      const end = {
+        point: { x: 30, y: 20 },
+        side: 'bottom' as const,
+        range: [10, 50] as [number, number],
+      };
+      expect(
+        preferClearStraightRoute(
+          [start.point, { x: 28, y: 100 }, { x: 30, y: 100 }, end.point],
+          start,
+          end,
+          [],
+        ),
+      ).toEqual([start.point, { x: 28, y: 20 }]);
+    });
+
+    it.each([
+      { name: 'node', bounds: { x: 150, y: 45, width: 30, height: 30 } },
+      { name: 'group', bounds: { x: 120, y: 40, width: 100, height: 50 } },
+      { name: 'label clearance', bounds: { x: 150, y: 63, width: 30, height: 12 } },
+    ])('keeps the safe detour when the direct corridor meets a $name', ({ bounds }) => {
+      const detour = [
+        source.point,
+        { x: 100, y: 58 },
+        { x: 100, y: 100 },
+        { x: 260, y: 100 },
+        { x: 260, y: 60 },
+        target.point,
+      ];
+      const routed = preferClearStraightRoute(detour, source, target, [bounds]);
+      expect(routed).toEqual(detour);
+      expectOrthogonalRoute(routed);
+      expectRouteAvoids(routed, bounds);
+    });
+
+    it.each([
+      { start: { x: 120, y: 58 }, end: { x: 240, y: 58 } },
+      { start: { x: 120, y: 64 }, end: { x: 240, y: 64 } },
+      { start: { x: 170, y: 40 }, end: { x: 170, y: 80 } },
+    ])('does not merge with, crowd, or cross an occupied route', (occupied) => {
+      expect(preferClearStraightRoute(jog, source, target, [], [occupied])).toEqual(jog);
+    });
+
+    it('does not consume the neighboring target port capacity', () => {
+      expect(
+        preferClearStraightRoute(jog, source, target, [], [], [], [{ x: 280, y: 43 }]),
+      ).toEqual(jog);
+      expect(
+        preferClearStraightRoute(jog, source, target, [], [], [], [{ x: 280, y: 42 }]),
+      ).toHaveLength(2);
+    });
+
+    it('does not move fixed ports or move beyond the target boundary range', () => {
+      expect(preferClearStraightRoute(jog, source, { ...target, range: undefined }, [])).toEqual(
+        jog,
+      );
+      expect(preferClearStraightRoute(jog, source, { ...target, range: [60, 72] }, [])).toEqual(
+        jog,
+      );
+    });
+
+    it('preserves separate diamond ports while using a clear straight lane', () => {
+      const occupied = [
+        diamondBoundaryPort(diamond, 'right', -8),
+        diamondBoundaryPort(diamond, 'bottom', 10),
+      ];
+      const routed = preferClearStraightRoute(jog, source, target, [], [], occupied);
+      expect(routed).toHaveLength(2);
+      expect(new Set([...occupied, routed[0]].map(({ x, y }) => `${x},${y}`)).size).toBe(3);
+    });
+
+    it('does not reverse a port normal or collapse a same-side return', () => {
+      expect(preferClearStraightRoute(jog, source, { ...target, side: 'right' }, [])).toEqual(jog);
+      expect(
+        preferClearStraightRoute(jog, source, { ...target, point: { x: 20, y: 60 } }, []),
+      ).toEqual(jog);
+    });
+
+    it('finds an available straight lane between occupied port slots', () => {
+      const start = {
+        point: { x: 100, y: 58 },
+        side: 'right' as const,
+        range: [30, 90] as [number, number],
+      };
+      const end = { ...target, range: [30, 90] as [number, number] };
+      const ports = [
+        { x: 280, y: 45 },
+        { x: 280, y: 90 },
+      ];
+      const routed = preferClearStraightRoute(jog, start, end, [], [], [], ports);
+      expect(routed).toHaveLength(2);
+      expect(routed[0].y).toBe(routed[1].y);
+      expect(routed[1].y).toBeGreaterThanOrEqual(61);
+      expect(routed[1].y).toBeLessThanOrEqual(74);
+    });
+  });
+
   it('replaces directional wedges with compact open chevrons', () => {
     document.body.innerHTML = `<svg><defs>
       <marker id="diagram-pointEnd"><path d="M 0 0 L 10 5 L 0 10 z" /></marker>

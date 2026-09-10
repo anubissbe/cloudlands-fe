@@ -1545,12 +1545,16 @@ function placeFlowchartLabelOnRoute(
   path: SVGPathElement,
   points: Point[],
   preferredSegmentIndex?: number,
+  clearance?: { obstacles: Bounds[]; occupied: Segment[] },
 ) {
-  if (!label?.textContent?.trim() || points.length < 2) return;
+  if (!label?.textContent?.trim()) return true;
+  if (points.length < 2) return false;
   const pathMatrix = path.getScreenCTM();
   const labelParentMatrix = (label.parentElement as SVGGraphicsElement | null)?.getScreenCTM();
-  if (!pathMatrix || !labelParentMatrix) return;
+  if (!pathMatrix || !labelParentMatrix) return false;
   const current = label.getBoundingClientRect();
+  const currentBounds = clientBoundsInPathSpace(label, path);
+  if (clearance && !currentBounds) return false;
   const currentCenter = new DOMPoint(
     current.left + current.width / 2,
     current.top + current.height / 2,
@@ -1584,6 +1588,19 @@ function placeFlowchartLabelOnRoute(
         x: start.x + (end.x - start.x) * fraction,
         y: start.y + (end.y - start.y) * fraction,
       };
+      if (clearance && currentBounds) {
+        const bounds = {
+          x: center.x - currentBounds.width / 2,
+          y: center.y - currentBounds.height / 2,
+          width: currentBounds.width,
+          height: currentBounds.height,
+        };
+        if (
+          clearance.obstacles.some((other) => boundsOverlap(bounds, other, 4)) ||
+          clearance.occupied.some((segment) => segmentCrossesBounds(segment, bounds, 4))
+        )
+          return [];
+      }
       const screenCenter = new DOMPoint(center.x, center.y).matrixTransform(pathMatrix);
       const bounds = DOMRect.fromRect({
         x: screenCenter.x - current.width / 2,
@@ -1612,7 +1629,7 @@ function placeFlowchartLabelOnRoute(
       left.collisions - right.collisions ||
       left.distance - right.distance,
   )[0];
-  if (!placement) return;
+  if (!placement) return false;
   const center = new DOMPoint(placement.center.x, placement.center.y)
     .matrixTransform(pathMatrix)
     .matrixTransform(labelParentMatrix.inverse());
@@ -1623,6 +1640,7 @@ function placeFlowchartLabelOnRoute(
   label.dataset.routePathId = path.id;
   label.dataset.finalPathCenter = `${placement.center.x},${placement.center.y}`;
   path.dataset.labelSegment = `${placement.start.x},${placement.start.y} ${placement.end.x},${placement.end.y}`;
+  return true;
 }
 
 export function snapFlowchartPorts(svg: SVGSVGElement) {
@@ -1813,11 +1831,190 @@ export function snapFlowchartPorts(svg: SVGSVGElement) {
 
 type CardinalAttachment = { point: Point; side: CardinalSide; lead?: Point };
 
+type StraightRoutePort = CardinalAttachment & { range?: [number, number] };
+
+/** Keep assigned shape ports fixed; slide only ports with an explicit free boundary range. */
+export function preferClearStraightRoute(
+  points: Point[],
+  source: StraightRoutePort,
+  target: StraightRoutePort,
+  obstacles: Bounds[],
+  occupied: Segment[] = [],
+  sourcePorts: Point[] = [],
+  targetPorts: Point[] = [],
+  clearance = 8,
+) {
+  const opposite = { top: 'bottom', right: 'left', bottom: 'top', left: 'right' };
+  if (opposite[source.side] !== target.side) return points;
+  const horizontal = source.side === 'left' || source.side === 'right';
+  const axis = horizontal ? 'y' : 'x';
+  const along = horizontal ? 'x' : 'y';
+  const direction = source.side === 'right' || source.side === 'bottom' ? 1 : -1;
+  if ((target.point[along] - source.point[along]) * direction <= 0) return points;
+  const sourceRange = source.range ?? [source.point[axis], source.point[axis]];
+  const targetRange = target.range ?? [target.point[axis], target.point[axis]];
+  const low = Math.max(sourceRange[0], targetRange[0]);
+  const high = Math.min(sourceRange[1], targetRange[1]);
+  if (low > high) return points;
+  const clamp = (value: number) => Math.max(low, Math.min(high, value));
+  const candidates = [
+    ...new Set([
+      clamp(source.point[axis]),
+      clamp(target.point[axis]),
+      low,
+      high,
+      (low + high) / 2,
+      ...[...sourcePorts, ...targetPorts].flatMap((point) => [
+        point[axis] - FLOWCHART_PORT_SLOT_GAP,
+        point[axis] + FLOWCHART_PORT_SLOT_GAP,
+      ]),
+      ...obstacles.flatMap((bounds) => [
+        bounds[axis] - clearance,
+        bounds[axis] + (horizontal ? bounds.height : bounds.width) + clearance,
+      ]),
+      ...occupied.flatMap((segment) => [
+        Math.min(segment.start[axis], segment.end[axis]) - clearance,
+        Math.max(segment.start[axis], segment.end[axis]) + clearance,
+      ]),
+    ]),
+  ]
+    .filter((value) => value >= low && value <= high)
+    .toSorted(
+      (left, right) =>
+        Math.abs(left - source.point[axis]) +
+        Math.abs(left - target.point[axis]) -
+        Math.abs(right - source.point[axis]) -
+        Math.abs(right - target.point[axis]),
+    );
+  for (const coordinate of candidates) {
+    const start = { ...source.point, [axis]: coordinate };
+    const end = { ...target.point, [axis]: coordinate };
+    if (
+      sourcePorts.some(
+        (port) => Math.hypot(start.x - port.x, start.y - port.y) < FLOWCHART_PORT_SLOT_GAP - 0.001,
+      ) ||
+      targetPorts.some(
+        (port) => Math.hypot(end.x - port.x, end.y - port.y) < FLOWCHART_PORT_SLOT_GAP - 0.001,
+      )
+    )
+      continue;
+    const candidate = { start, end };
+    if (obstacles.some((bounds) => segmentCrossesBounds(candidate, bounds, clearance))) continue;
+    if (
+      occupied.some((segment) =>
+        segmentCrossesBounds(
+          candidate,
+          {
+            x: Math.min(segment.start.x, segment.end.x),
+            y: Math.min(segment.start.y, segment.end.y),
+            width: Math.abs(segment.start.x - segment.end.x),
+            height: Math.abs(segment.start.y - segment.end.y),
+          },
+          clearance,
+        ),
+      )
+    )
+      continue;
+    return [start, end];
+  }
+  return points;
+}
+
 function cardinalSideFromDirection(origin: Point, adjacent: Point): CardinalSide {
   const dx = adjacent.x - origin.x;
   const dy = adjacent.y - origin.y;
   if (Math.abs(dx) >= Math.abs(dy)) return dx >= 0 ? 'right' : 'left';
   return dy >= 0 ? 'bottom' : 'top';
+}
+
+function straightenClearFlowchartRoutes(svg: SVGSVGElement, edges: FlowchartRoute[]) {
+  const routes = edges
+    .map((edge) => ({
+      ...edge,
+      points: (edge.path.dataset.manhattanPoints ?? '').split(' ').map((value) => {
+        const [x, y] = value.split(',').map(Number);
+        return { x, y };
+      }),
+    }))
+    .filter(
+      ({ points }) =>
+        points.length >= 2 && points.every(({ x, y }) => Number.isFinite(x) && Number.isFinite(y)),
+    );
+  for (const route of routes) {
+    if (route.source === route.target || route.points.length === 2) continue;
+    const { path, points } = route;
+    const port = (role: 'source' | 'target'): StraightRoutePort | undefined => {
+      const node = flowchartNode(svg, route[role]);
+      const shape = node && shapeForNode(node);
+      const bounds = shape && boundsInPathSpace(shape, path);
+      if (!shape || !bounds) return;
+      const point = role === 'source' ? points[0] : points[points.length - 1];
+      const adjacent = role === 'source' ? points[1] : points[points.length - 2];
+      const side = cardinalSideFromDirection(point, adjacent);
+      const horizontal = side === 'left' || side === 'right';
+      const inset = Math.max(8, Number(shape.getAttribute(horizontal ? 'ry' : 'rx')) || 0);
+      const range: [number, number] | undefined =
+        shape.tagName.toLowerCase() === 'rect'
+          ? horizontal
+            ? [bounds.y + inset, bounds.y + bounds.height - inset]
+            : [bounds.x + inset, bounds.x + bounds.width - inset]
+          : undefined;
+      return { point, side, range };
+    };
+    const source = port('source');
+    const target = port('target');
+    if (!source || !target) continue;
+    const otherRoutes = routes.filter((other) => other !== route);
+    const occupiedPorts = (id: string) =>
+      otherRoutes.flatMap((other) => [
+        ...(other.source === id ? [other.points[0]] : []),
+        ...(other.target === id ? [other.points[other.points.length - 1]] : []),
+      ]);
+    const contains = (bounds: Bounds, point: Point) =>
+      point.x >= bounds.x &&
+      point.x <= bounds.x + bounds.width &&
+      point.y >= bounds.y &&
+      point.y <= bounds.y + bounds.height;
+    const obstacles = [
+      ...[...svg.querySelectorAll<SVGGElement>('g.node')].filter(
+        (node) => ![route.source, route.target].includes(flowchartNodeId(node)),
+      ),
+      ...svg.querySelectorAll<SVGGElement>('g.cluster > .cluster-label'),
+      ...[...svg.querySelectorAll<SVGGElement>('.edgeLabels > .edgeLabel')].filter(
+        (label) => label !== route.label && label.textContent?.trim(),
+      ),
+    ]
+      .map((element) => clientBoundsInPathSpace(element, path))
+      .filter((bounds): bounds is Bounds => !!bounds);
+    for (const rect of svg.querySelectorAll<SVGRectElement>('g.cluster > rect')) {
+      const bounds = boundsInPathSpace(rect, path);
+      if (bounds && !contains(bounds, source.point) && !contains(bounds, target.point))
+        obstacles.push(bounds);
+    }
+    const occupied = otherRoutes.flatMap((other) => segments(other.points));
+    const straight = preferClearStraightRoute(
+      points,
+      source,
+      target,
+      obstacles,
+      occupied,
+      occupiedPorts(route.source),
+      occupiedPorts(route.target),
+    );
+    if (straight === points) continue;
+    if (
+      !placeFlowchartLabelOnRoute(route.label, path, straight, undefined, { obstacles, occupied })
+    )
+      continue;
+    route.points = straight;
+    path.dataset.manhattanPoints = straight.map(({ x, y }) => `${x},${y}`).join(' ');
+    path.dataset.manhattanSegments = '1';
+    path.dataset.terminalDirection = `${straight[1].x - straight[0].x},${straight[1].y - straight[0].y}`;
+    path.setAttribute(
+      'd',
+      straight.map(({ x, y }, index) => `${index ? 'L' : 'M'}${x},${y}`).join(''),
+    );
+  }
 }
 
 function attachCardinalPorts(
@@ -2818,6 +3015,7 @@ function routeNestedDecisionHierarchy(svg: SVGSVGElement, edges: FlowchartRoute[
     );
     placeFlowchartLabelOnRoute(edge.label, edge.path, points, labelSegment);
   }
+  straightenClearFlowchartRoutes(svg, edges);
   return true;
 }
 
