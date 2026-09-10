@@ -1749,17 +1749,46 @@ for (const appearance of [
               const [x, y] = value.split(',').map(Number);
               return new DOMPoint(x, y).matrixTransform(path.getScreenCTM()!);
             });
-          const sourceShape = [...svg.querySelectorAll<SVGGElement>('g.node')]
-            .find((node) => node.textContent?.trim() === 'Source')!
-            .querySelector<SVGGraphicsElement>(':scope > .label-container')!;
+          const shape = (label: string) =>
+            [...svg.querySelectorAll<SVGGElement>('g.node')]
+              .find((node) => node.textContent?.trim() === label)!
+              .querySelector<SVGGraphicsElement>(':scope > .label-container')!;
+          const sourceShape = shape('Source');
+          const frameShape = shape('Frame');
           const source = sourceShape.getBoundingClientRect();
+          const frame = frameShape.getBoundingClientRect();
           const parse = points(route('A', 'B'));
           const lint = points(route('A', 'C'));
           const index = points(route('A', 'D'));
           const feedbackPath = route('G', 'A');
           const feedback = points(feedbackPath);
-          const capture = points(route('E', 'F'));
-          const inspect = points(route('E', 'G'));
+          const capturePath = route('E', 'F');
+          const inspectPath = route('E', 'G');
+          const capture = points(capturePath);
+          const inspect = points(inspectPath);
+          const horizontalFanout =
+            Math.max(Math.abs(capture[0].x - frame.right), Math.abs(inspect[0].x - frame.right)) <=
+            1;
+          const verticalFanout =
+            Math.max(
+              Math.abs(capture[0].y - frame.bottom),
+              Math.abs(inspect[0].y - frame.bottom),
+            ) <= 1;
+          const sharedPaintedLength = (() => {
+            const limit = Math.min(capturePath.getTotalLength(), inspectPath.getTotalLength(), 128);
+            const captureMatrix = capturePath.getScreenCTM()!;
+            const inspectMatrix = inspectPath.getScreenCTM()!;
+            let length = 0;
+            let previous = capturePath.getPointAtLength(0).matrixTransform(captureMatrix);
+            for (let distance = 0; distance <= limit; distance += 1) {
+              const a = capturePath.getPointAtLength(distance).matrixTransform(captureMatrix);
+              const b = inspectPath.getPointAtLength(distance).matrixTransform(inspectMatrix);
+              if (Math.hypot(a.x - b.x, a.y - b.y) > 0.5) break;
+              length += Math.hypot(a.x - previous.x, a.y - previous.y);
+              previous = a;
+            }
+            return length;
+          })();
           const outgoing = [parse[0], lint[0], index[0]].toSorted(
             (left, right) => left.x - right.x,
           );
@@ -1774,7 +1803,29 @@ for (const appearance of [
             sharedParseFeedbackColumn: Math.abs(feedback.at(-1)!.x - parse[0].x) <= 1,
             outgoingGaps: outgoing.slice(1).map((point, i) => point.x - outgoing[i].x),
             distinctFirstStems: new Set([parse[0].x, lint[0].x, index[0].x]).size,
-            framePortGap: Math.abs(capture[0].x - inspect[0].x),
+            horizontalFanout,
+            verticalFanout,
+            frameBoundaryError: horizontalFanout
+              ? Math.max(Math.abs(capture[0].x - frame.right), Math.abs(inspect[0].x - frame.right))
+              : Math.max(
+                  Math.abs(capture[0].y - frame.bottom),
+                  Math.abs(inspect[0].y - frame.bottom),
+                ),
+            framePortCenterError: horizontalFanout
+              ? Math.max(
+                  Math.abs(capture[0].y - (frame.top + frame.bottom) / 2),
+                  Math.abs(inspect[0].y - (frame.top + frame.bottom) / 2),
+                )
+              : Math.abs((capture[0].x + inspect[0].x) / 2 - (frame.left + frame.right) / 2),
+            framePortGap: Math.hypot(capture[0].x - inspect[0].x, capture[0].y - inspect[0].y),
+            frameStubLengths: [capture, inspect].map((route) =>
+              Math.hypot(route[1].x - route[0].x, route[1].y - route[0].y),
+            ),
+            sharedPaintedLength,
+            frameTargetGap: Math.hypot(
+              capture.at(-1)!.x - inspect.at(-1)!.x,
+              capture.at(-1)!.y - inspect.at(-1)!.y,
+            ),
             marker: feedbackPath.getAttribute('marker-end'),
           };
         });
@@ -1786,7 +1837,19 @@ for (const appearance of [
       expect(geometry.sharedParseFeedbackColumn).toBe(false);
       expect(Math.min(...geometry.outgoingGaps)).toBeGreaterThanOrEqual(10);
       expect(geometry.distinctFirstStems).toBe(3);
-      expect(geometry.framePortGap).toBeGreaterThanOrEqual(8);
+      expect(geometry.frameTargetGap).toBeGreaterThanOrEqual(8);
+      expect(geometry.horizontalFanout).toBe(width === 960);
+      expect(geometry.verticalFanout).toBe(width === 420);
+      expect(geometry.frameBoundaryError).toBeLessThanOrEqual(1);
+      expect(geometry.framePortCenterError).toBeLessThanOrEqual(1);
+      expect(Math.min(...geometry.frameStubLengths)).toBeGreaterThanOrEqual(8);
+      if (geometry.horizontalFanout) {
+        expect(geometry.framePortGap).toBeLessThanOrEqual(1);
+        expect(geometry.sharedPaintedLength).toBeGreaterThanOrEqual(8);
+      } else {
+        expect(geometry.framePortGap).toBeGreaterThanOrEqual(8);
+        expect(geometry.sharedPaintedLength).toBeLessThanOrEqual(1);
+      }
       expect(geometry.marker).toContain('pointEnd');
     });
 

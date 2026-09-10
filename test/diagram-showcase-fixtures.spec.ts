@@ -141,9 +141,25 @@ test('contains grouped nodes, mixed-height labels, and custom route terminals', 
         };
       },
     );
-    const mixedHeights = [
+    const multilineNodes = [
       ...document.querySelectorAll<SVGGElement>('#mermaid-long-labels g.node'),
-    ].map((node) => Math.round(node.getBoundingClientRect().height));
+    ].map((node) => {
+      const label = node.querySelector<HTMLElement>('.nodeLabel')!;
+      const range = document.createRange();
+      range.selectNodeContents(label);
+      const paintedLineTops = [...range.getClientRects()]
+        .filter(({ width, height }) => width > 0 && height > 0)
+        .map(({ top }) => top)
+        .toSorted((left, right) => left - right)
+        .filter((top, index, tops) => index === 0 || top - tops[index - 1] > 1);
+      const content = label.closest<HTMLElement>('foreignObject')!.getBoundingClientRect();
+      const bounds = node.getBoundingClientRect();
+      return {
+        paintedLines: paintedLineTops.length,
+        contentHeight: content.height,
+        nodeHeight: bounds.height,
+      };
+    });
     const nested = document.querySelector('#mermaid-nested-routing')!;
     const cluster = (label: string) =>
       [...nested.querySelectorAll<SVGGElement>('g.cluster')]
@@ -160,7 +176,7 @@ test('contains grouped nodes, mixed-height labels, and custom route terminals', 
       groupContainment,
       labelsContained,
       terminals,
-      mixedHeightCount: new Set(mixedHeights).size,
+      multilineNodes,
       nestedContainment: [
         contains(cluster('Checks'), node('Ready?')),
         contains(cluster('Checks'), node('Context')),
@@ -174,7 +190,20 @@ test('contains grouped nodes, mixed-height labels, and custom route terminals', 
   expect(geometry.terminals.every(({ source }) => source <= 1)).toBe(true);
   expect(geometry.terminals.every(({ target }) => target <= 6)).toBe(true);
   expect(geometry.terminals.every(({ marker }) => marker?.includes('arrowhead'))).toBe(true);
-  expect(geometry.mixedHeightCount).toBeGreaterThanOrEqual(3);
+  expect(geometry.multilineNodes[0].paintedLines).toBe(1);
+  expect(geometry.multilineNodes[1].paintedLines).toBeGreaterThanOrEqual(2);
+  expect(geometry.multilineNodes[2].paintedLines).toBeGreaterThanOrEqual(3);
+  expect(
+    geometry.multilineNodes.every(
+      ({ contentHeight, nodeHeight }) => contentHeight > 0 && nodeHeight >= contentHeight,
+    ),
+  ).toBe(true);
+  expect(geometry.multilineNodes[1].nodeHeight).toBeGreaterThan(
+    geometry.multilineNodes[0].nodeHeight,
+  );
+  expect(geometry.multilineNodes[2].nodeHeight).toBeGreaterThanOrEqual(
+    geometry.multilineNodes[1].nodeHeight,
+  );
   expect(geometry.nestedContainment.every(Boolean)).toBe(true);
 });
 

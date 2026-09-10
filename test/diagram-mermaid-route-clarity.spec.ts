@@ -500,10 +500,18 @@ for (const appearance of appearances) {
                   surface instanceof SVGRectElement ? style.fill : featherStyle.backgroundColor;
                 const color = textStyle.fill === 'none' ? textStyle.color : textStyle.fill;
                 const alpha = Number(background.match(/[\d.]+/g)?.[3] ?? 1);
-                const edgePaths = label.closest('svg')!.querySelector('.edgePaths')!;
-                const edgeLabels = label.closest('.edgeLabels')!;
+                const svg = label.closest('svg');
+                const edgePaths = svg?.querySelector('.edgePaths, .edges.edgePath');
+                const edgeLabels = label.closest('.edgeLabels');
+                const edgeLayerKind = edgePaths?.classList.contains('edgePaths')
+                  ? 'flowchart'
+                  : edgePaths?.matches('.edges.edgePath')
+                    ? 'state'
+                    : 'missing';
                 return {
                   text: label.textContent!.trim(),
+                  edgeLayerKind,
+                  layersPresent: Boolean(edgePaths && edgeLabels),
                   horizontal:
                     Math.min(
                       textBounds!.left - surfaceBounds.left,
@@ -530,9 +538,11 @@ for (const appearance of appearances) {
                         (featherStyle.webkitMaskImage || featherStyle.maskImage) !== 'none' &&
                         style.backgroundColor === 'rgba(0, 0, 0, 0)',
                   paintOrder:
-                    !!(
+                    Boolean(
+                      edgePaths &&
+                      edgeLabels &&
                       edgePaths.compareDocumentPosition(edgeLabels) &
-                      Node.DOCUMENT_POSITION_FOLLOWING
+                        Node.DOCUMENT_POSITION_FOLLOWING,
                     ) &&
                     !!(
                       surface.compareDocumentPosition((text ?? htmlText)!) &
@@ -543,9 +553,13 @@ for (const appearance of appearances) {
           );
         });
       expect(labelSurfaces.length).toBeGreaterThanOrEqual(12);
+      expect(new Set(labelSurfaces.map(({ edgeLayerKind }) => edgeLayerKind))).toEqual(
+        new Set(['flowchart', 'state']),
+      );
       expect(
         labelSurfaces.filter(
           (surface) =>
+            !surface.layersPresent ||
             surface.horizontal < 6 ||
             surface.vertical < 4 ||
             surface.alpha !== 1 ||
