@@ -631,19 +631,24 @@ async function expectTerminalArrowGeometry(
   page: Page,
   state: string,
   expectedTargets: Record<string, string>,
+  discoveryTimeout = 30_000,
 ) {
   const root = page.locator(`#${state}`);
   const mermaid = state.startsWith('mermaid-');
-  const pathSelector = mermaid ? '.edgePaths path[marker-end]' : '.diagram-edge path[marker-end]';
+  const pathSelector = mermaid
+    ? '.edgePaths path[marker-end], .edges.edgePath path[marker-end]'
+    : '.diagram-edge path[marker-end]';
   await expect(root.locator(pathSelector)).toHaveCount(Object.keys(expectedTargets).length, {
-    timeout: 30_000,
+    timeout: discoveryTimeout,
   });
   const result = await root.evaluate(
     (section, args) => {
       const isMermaid = args.state.startsWith('mermaid-');
       const paths = [
         ...section.querySelectorAll<SVGPathElement>(
-          isMermaid ? '.edgePaths path[marker-end]' : '.diagram-edge path[marker-end]',
+          isMermaid
+            ? '.edgePaths path[marker-end], .edges.edgePath path[marker-end]'
+            : '.diagram-edge path[marker-end]',
         ),
       ];
       const nodes = isMermaid
@@ -684,8 +689,11 @@ async function expectTerminalArrowGeometry(
         const markerPath = marker?.querySelector<SVGPathElement>('path');
         const pathMatrix = path.getScreenCTM();
         const length = path.getTotalLength();
-        const terminal = path.getPointAtLength(length);
-        const tangent = path.getPointAtLength(Math.max(0, length - 0.25));
+        const nonempty = Boolean(path.getAttribute('d')?.trim()) && length > 0;
+        const terminal = nonempty ? path.getPointAtLength(length) : new DOMPoint();
+        const tangent = nonempty
+          ? path.getPointAtLength(Math.max(0, length - 0.25))
+          : new DOMPoint();
         const angle = Math.atan2(terminal.y - tangent.y, terminal.x - tangent.x);
         const refX = Number(marker?.getAttribute('refX'));
         const refY = Number(marker?.getAttribute('refY'));
@@ -795,6 +803,9 @@ async function expectTerminalArrowGeometry(
           pathLinejoin: pathStyle.strokeLinejoin,
           markerLinecap: markerStyle?.strokeLinecap,
           markerLinejoin: markerStyle?.strokeLinejoin,
+          connected: path.isConnected && section.contains(path),
+          nonempty,
+          measurable: Boolean(pathMatrix),
         };
       });
     },
@@ -803,6 +814,9 @@ async function expectTerminalArrowGeometry(
 
   expect(result).toHaveLength(Object.keys(expectedTargets).length);
   for (const edge of result) {
+    expect(edge.connected, `${state}/${edge.key} connected rendered path`).toBe(true);
+    expect(edge.nonempty, `${state}/${edge.key} nonempty rendered path`).toBe(true);
+    expect(edge.measurable, `${state}/${edge.key} measurable rendered path`).toBe(true);
     expect(edge.targetLabel, `${state}/${edge.key} target label`).toBe(edge.expectedTarget);
     expect(
       edge.closestTargetId,
@@ -2361,6 +2375,43 @@ const stateRecoveryTargets = {
   '4': '',
   '5': '',
 };
+
+test('terminal arrow discovery supports Mermaid flowchart rendered groups', async ({ page }) => {
+  await openState(page, 'mermaid-flow', 320, 'light');
+  await expectTerminalArrowGeometry(page, 'mermaid-flow', {
+    '0': 'Valid?',
+    '1': 'Process request',
+    '2': 'Repair input',
+    '3': 'Valid?',
+    '4': 'Ready',
+  });
+});
+
+test('terminal arrow discovery rejects missing, empty, and detached state paths', async ({
+  page,
+}) => {
+  test.setTimeout(120_000);
+  const pathSelector = '#mermaid-state-recovery .edges.edgePath path[marker-end]';
+  const mutations = [
+    { name: 'missing', apply: 'missing-marker', error: /toHaveCount|to have count/ },
+    { name: 'empty', apply: 'empty-path', error: /nonempty rendered path/ },
+    { name: 'detached', apply: 'detach-path', error: /toHaveCount|to have count/ },
+  ] as const;
+
+  for (const mutation of mutations) {
+    await openState(page, 'mermaid-state-recovery', 320, 'light');
+    const paths = page.locator(pathSelector);
+    await expect(paths, `${mutation.name} control precondition`).toHaveCount(6);
+    await paths.first().evaluate((path, apply) => {
+      if (apply === 'missing-marker') path.removeAttribute('marker-end');
+      if (apply === 'empty-path') path.setAttribute('d', '');
+      if (apply === 'detach-path') path.remove();
+    }, mutation.apply);
+    await expect(
+      expectTerminalArrowGeometry(page, 'mermaid-state-recovery', stateRecoveryTargets, 250),
+    ).rejects.toThrow(mutation.error);
+  }
+});
 
 for (const appearance of [
   { name: 'light', mode: 'light' as const, colorTheme: 'Default' },
