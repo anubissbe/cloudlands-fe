@@ -281,7 +281,7 @@ for (const motion of ['full', 'reduced'] as const) {
     }
 
     if (motion === 'reduced') {
-      const priorGeneration = initial.generation;
+      const priorGeneration = (await read()).generation;
       await page.evaluate(() => {
         document.documentElement.style.setProperty('--diagram-node-surface', '210 40% 70%');
       });

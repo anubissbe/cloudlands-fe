@@ -80,6 +80,22 @@
   width: 100%;
 }
 
+/* Failed diagrams are note feedback, not wide canvases. Use the actual prose
+   width, including when comments reduce it; successful renders keep the lane. */
+.tiptap-editor.ProseMirror > .node-mermaidBlock:has(.mermaid-error) {
+  width: 100%;
+  max-width: 100%;
+  margin-inline: 0;
+}
+
+.tiptap-editor.ProseMirror
+  > .node-mermaidBlock:has(.mermaid-error)
+  > [data-node-view-wrapper]
+  > [data-diagram-presentation]
+  > [data-diagram-presentation-content] {
+  padding-inline: 0;
+}
+
 /* Monospace mode: code blocks don't need breakout since they're already
    styled differently (transparent bg, triple backtick fences) */
 .note-font-monospace .tiptap-editor.ProseMirror > pre {
