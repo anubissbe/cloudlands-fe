@@ -60,7 +60,21 @@ export function buildFlowchartDecisionBranchPoints(
       x: Math.max(target.x, Math.min(sourcePort.x, target.x + target.width)),
       y: targetTop.y,
     };
-    return [sourcePort, targetPort];
+    const sameBounds = (left: Bounds, right: Bounds) =>
+      Math.abs(left.x - right.x) < 0.001 &&
+      Math.abs(left.y - right.y) < 0.001 &&
+      Math.abs(left.width - right.width) < 0.001 &&
+      Math.abs(left.height - right.height) < 0.001;
+    const direct = { start: sourcePort, end: targetPort };
+    const directIsClear =
+      Math.abs(sourcePort.x - targetPort.x) < 0.001 &&
+      !occupied.some(
+        (bounds) =>
+          !sameBounds(bounds, source) &&
+          !sameBounds(bounds, target) &&
+          segmentCrossesBounds(direct, bounds, STATE_NODE_CLEARANCE_CSS),
+      );
+    if (directIsClear) return [sourcePort, targetPort];
   }
   const targetSide: CardinalSide = stackedTarget
     ? 'right'

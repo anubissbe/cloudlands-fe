@@ -17,6 +17,44 @@ import {
   snapOrthogonalTerminals,
 } from '../mermaid-path-geometry';
 
+type TestPoint = { x: number; y: number };
+type TestBounds = TestPoint & { width: number; height: number };
+
+function expectOrthogonalRoute(points: TestPoint[]) {
+  expect(
+    points.slice(0, -1).every((point, index) => {
+      const next = points[index + 1];
+      return Math.abs(point.x - next.x) < 0.001 || Math.abs(point.y - next.y) < 0.001;
+    }),
+  ).toBe(true);
+}
+
+function segmentEntersBounds(start: TestPoint, end: TestPoint, bounds: TestBounds) {
+  if (Math.abs(start.x - end.x) < 0.001) {
+    return (
+      start.x > bounds.x &&
+      start.x < bounds.x + bounds.width &&
+      Math.max(start.y, end.y) > bounds.y &&
+      Math.min(start.y, end.y) < bounds.y + bounds.height
+    );
+  }
+  if (Math.abs(start.y - end.y) >= 0.001) return true;
+  return (
+    start.y > bounds.y &&
+    start.y < bounds.y + bounds.height &&
+    Math.max(start.x, end.x) > bounds.x &&
+    Math.min(start.x, end.x) < bounds.x + bounds.width
+  );
+}
+
+function expectRouteAvoids(points: TestPoint[], bounds: TestBounds) {
+  expect(
+    points
+      .slice(0, -1)
+      .some((point, index) => segmentEntersBounds(point, points[index + 1], bounds)),
+  ).toBe(false);
+}
+
 describe('Mermaid path terminal geometry', () => {
   it('replaces directional wedges with compact open chevrons', () => {
     document.body.innerHTML = `<svg><defs>
@@ -340,16 +378,56 @@ describe('Mermaid path terminal geometry', () => {
     const target = { x: 10, y: 200, width: 80, height: 40 };
     const occupied = [source, target];
 
-    expect(buildFlowchartDecisionBranchPoints(source, target, 'upper', occupied, true)).toEqual([
+    const upper = buildFlowchartDecisionBranchPoints(source, target, 'upper', occupied, true);
+    expect(upper).toEqual([
       { x: 50, y: 100 },
       { x: 50, y: 200 },
     ]);
+    expectOrthogonalRoute(upper);
+    expectRouteAvoids(upper, source);
+    expectRouteAvoids(upper, target);
     expect(buildFlowchartDecisionBranchPoints(source, target, 'lower', occupied, true)).toEqual([
       { x: 100, y: 50 },
       { x: 132, y: 50 },
       { x: 132, y: 220 },
       { x: 90, y: 220 },
     ]);
+  });
+
+  it('keeps compact stacked branches orthogonal when the target is offset', () => {
+    const source = { x: 0, y: 0, width: 100, height: 100 };
+    const target = { x: 140, y: 200, width: 80, height: 40 };
+
+    const points = buildFlowchartDecisionBranchPoints(
+      source,
+      target,
+      'upper',
+      [source, target],
+      true,
+    );
+
+    expectOrthogonalRoute(points);
+    expectRouteAvoids(points, source);
+    expectRouteAvoids(points, target);
+  });
+
+  it('routes compact stacked branches around an aligned intervening shape', () => {
+    const source = { x: 0, y: 0, width: 100, height: 100 };
+    const target = { x: 10, y: 200, width: 80, height: 40 };
+    const obstacle = { x: 35, y: 130, width: 30, height: 40 };
+
+    const points = buildFlowchartDecisionBranchPoints(
+      source,
+      target,
+      'upper',
+      [source, obstacle, target],
+      true,
+    );
+
+    expectOrthogonalRoute(points);
+    expectRouteAvoids(points, source);
+    expectRouteAvoids(points, obstacle);
+    expectRouteAvoids(points, target);
   });
 
   it('builds a bounded feedback lane with centered perpendicular terminals', () => {

@@ -640,7 +640,7 @@ ${verticalSource}`;
     }
   }
 
-  async function polishSequenceDiagram(svg: SVGSVGElement) {
+  async function polishSequenceDiagram(svg: SVGSVGElement, source: string) {
     if (svg.getAttribute('aria-roledescription') !== 'sequence') return;
 
     const originalViewBox = {
@@ -801,48 +801,96 @@ ${verticalSource}`;
       });
     }
 
-    const notes = [...svg.querySelectorAll<SVGGElement>(':scope > g')].flatMap((group) => {
+    const normalizeNoteText = (text: string) =>
+      text
+        .replace(/<[^>]*>/g, '')
+        .replace(/\s+/g, ' ')
+        .trim();
+    const groupRenderedNoteLines = (rendered: string[], authored: string[]) => {
+      const grouped: string[] = [];
+      let renderedIndex = 0;
+      for (const authoredLine of authored) {
+        const target = normalizeNoteText(authoredLine);
+        let content = '';
+        while (renderedIndex < rendered.length && normalizeNoteText(content) !== target) {
+          const candidate = [content, rendered[renderedIndex]].filter(Boolean).join(' ');
+          if (!target.startsWith(normalizeNoteText(candidate))) return rendered;
+          content = candidate;
+          renderedIndex += 1;
+        }
+        if (normalizeNoteText(content) !== target) return rendered;
+        grouped.push(content);
+      }
+      return renderedIndex === rendered.length ? grouped : rendered;
+    };
+    const authoredNoteLines = source
+      .split('\n')
+      .map((line) => /^\s*note\s+(?:left of|right of|over)\s+[^:]+:\s*(.*)$/i.exec(line)?.[1])
+      .filter((content): content is string => content !== undefined)
+      .map((content) => content.split(/<br\s*\/?>/i));
+    const noteGroups = [...svg.querySelectorAll<SVGGElement>(':scope > g')].flatMap((group) => {
       const note = group.querySelector<SVGRectElement>(':scope > rect.note');
       const lines = [...group.querySelectorAll<SVGTextElement>(':scope > text.noteText')];
-      const text = lines[0];
-      if (!note || !text) return [];
-      const content = lines
-        .map((line) => line.textContent?.trim())
-        .filter(Boolean)
-        .join(' ');
-      const line = text.querySelector('tspan') ?? text;
-      line.textContent = content;
-      lines.slice(1).forEach((line) => line.remove());
-      return [{ group, note, text }];
+      return note && lines.length ? [{ group, note, lines }] : [];
     });
-    for (const { group, text } of notes) {
+    const notes = noteGroups.map(({ group, note, lines }, index) => {
+      const renderedLines = lines
+        .map((line) => line.textContent?.trim())
+        .filter(Boolean) as string[];
+      const authoredLines = authoredNoteLines[index] ?? [];
+      const desiredLines =
+        authoredLines.length > 1
+          ? groupRenderedNoteLines(renderedLines, authoredLines)
+          : [renderedLines.join(' ')];
+      desiredLines.forEach((content, lineIndex) => {
+        const text = lines[lineIndex];
+        const x = text.querySelector('tspan')?.getAttribute('x') ?? text.getAttribute('x');
+        const line = document.createElementNS('http://www.w3.org/2000/svg', 'tspan');
+        if (x) line.setAttribute('x', x);
+        line.textContent = content;
+        text.replaceChildren(line);
+      });
+      lines.slice(desiredLines.length).forEach((line) => line.remove());
+      const texts = lines.slice(0, desiredLines.length);
+      return { group, note, texts };
+    });
+    for (const { group, texts } of notes) {
       group.classList.add('sequence-note');
-      text.style.setProperty('transition-property', 'none', 'important');
-      text.classList.add('sequence-note-text');
+      for (const text of texts) {
+        text.style.setProperty('transition-property', 'none', 'important');
+        text.classList.add('sequence-note-text');
+      }
     }
     if (notes.length) {
       await Promise.all(
-        notes.map(({ text }) =>
-          document.fonts?.load(getComputedStyle(text).font, text.textContent ?? ''),
+        notes.flatMap(({ texts }) =>
+          texts.map((text) =>
+            document.fonts?.load(getComputedStyle(text).font, text.textContent ?? ''),
+          ),
         ),
       );
-      await new Promise<void>((resolve) =>
-        requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
-      );
     }
-    for (const { note, text } of notes) {
-      const bounds = text.getBBox();
+    for (const { note, texts } of notes) {
+      const textBounds = texts.map((text) => text.getBBox());
+      const left = Math.min(...textBounds.map((bounds) => bounds.x));
+      const top = Math.min(...textBounds.map((bounds) => bounds.y));
+      const right = Math.max(...textBounds.map((bounds) => bounds.x + bounds.width));
+      const bottom = Math.max(...textBounds.map((bounds) => bounds.y + bounds.height));
       const context = document.createElement('canvas').getContext('2d');
-      const style = getComputedStyle(text);
-      if (context) context.font = `${style.fontWeight} ${style.fontSize} ${style.fontFamily}`;
-      const textWidth = context?.measureText(text.textContent ?? '').width ?? bounds.width;
+      const textWidth = Math.max(
+        ...texts.map((text, index) => {
+          const style = getComputedStyle(text);
+          if (context) context.font = `${style.fontWeight} ${style.fontSize} ${style.fontFamily}`;
+          return context?.measureText(text.textContent ?? '').width ?? textBounds[index].width;
+        }),
+      );
       const width = textWidth + 20;
-      const height = Math.max(28, bounds.height + 12);
-      const textX = Number(text.getAttribute('x'));
-      const center = Number.isFinite(textX) ? textX : bounds.x + bounds.width / 2;
+      const height = Math.max(28, bottom - top + 12);
+      const textX = Number(texts[0].getAttribute('x'));
+      const center = Number.isFinite(textX) ? textX : (left + right) / 2;
       note.style.setProperty('transition-property', 'none', 'important');
       note.setAttribute('x', String(center - width / 2));
-      note.setAttribute('y', String(bounds.y - 6));
+      note.setAttribute('y', String(top - 6));
       note.setAttribute('width', String(width));
       note.setAttribute('height', String(height));
       note.setAttribute('rx', '6');
@@ -1172,7 +1220,7 @@ ${verticalSource}`;
     return { x: left, y: top, width: right - left, height: bottom - top };
   }
 
-  async function fitRenderedSvg(generation: number): Promise<boolean> {
+  async function fitRenderedSvg(generation: number, source: string): Promise<boolean> {
     const fit = ++fitGeneration;
     await tick();
     await document.fonts?.ready;
@@ -1183,7 +1231,7 @@ ${verticalSource}`;
     replaceSequenceActorFigures(svg);
     alignMermaidOpenArrowheads(svg);
     if (svg.getAttribute('aria-roledescription') === 'sequence') {
-      await polishSequenceDiagram(svg);
+      await polishSequenceDiagram(svg, source);
       if (generation !== renderGeneration || fit !== fitGeneration) return false;
       addMermaidLabelKnockouts(svg);
       addMermaidLabelFeathers(svg);
@@ -1450,7 +1498,7 @@ ${verticalSource}`;
       if (generation !== renderGeneration) return;
       renderedSvg = svg;
       error = null;
-      const fitCompleted = await fitRenderedSvg(generation);
+      const fitCompleted = await fitRenderedSvg(generation, renderCode);
       if (fitCompleted && generation === renderGeneration) settledGeneration = generation;
     } catch (err) {
       if (generation !== renderGeneration) return;
