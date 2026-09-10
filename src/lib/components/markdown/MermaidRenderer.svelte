@@ -28,6 +28,7 @@
     alignMermaidOpenArrowheads,
     applyMermaidTerminalGaps,
     attachStateTerminalArrowheads,
+    measureFlowchartContentBounds,
     measuredClusterHeaderHeight,
     placeStateLabelsOnFinalRoutes,
     positionCompactGroupedEdgeLabels,
@@ -1252,11 +1253,19 @@ ${verticalSource}`;
     refineMermaidCylinderNodes(svg);
     repairFlowchartNodeOutlines(svg);
     const flowchart = svg.getAttribute('aria-roledescription') === 'flowchart-v2';
+    const rendererWidth = rendererElement?.clientWidth ?? 0;
+    const compactRendererLayout = rendererWidth > 0 ? rendererWidth <= 620 : compactLayout;
+    if (flowchart && !compactRendererLayout && svg.querySelectorAll('g.cluster').length >= 2) {
+      routeFlowchartDecisionBranches(svg);
+    }
+    const initialBounds =
+      svg.dataset.nestedDecisionLayout === 'wide'
+        ? (measureFlowchartContentBounds(svg) ?? svg.getBBox())
+        : svg.getBBox();
     const captionSize = Number.parseFloat(getComputedStyle(svg).fontSize);
     const readableScale = 12 / (Number.isFinite(captionSize) ? captionSize : 13);
     const compactFlowchartLayout =
-      compactLayout ||
-      (flowchart && svg.getBBox().width * readableScale > (rendererElement?.clientWidth ?? 0));
+      compactRendererLayout || (flowchart && initialBounds.width * readableScale > rendererWidth);
     if (compactFlowchartLayout) {
       reflowCompactFlowchart(svg, false);
       reflowCompactFlowchart(svg);

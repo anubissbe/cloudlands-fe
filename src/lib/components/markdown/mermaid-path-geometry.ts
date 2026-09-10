@@ -3118,6 +3118,29 @@ function measureCompactFlowchartBounds(svg: SVGSVGElement, nodes: SVGGElement[])
   return { x: minX - 6, y: minY - 46, width: maxX - minX + 12, height: maxY - minY + 54 };
 }
 
+export function measureFlowchartContentBounds(svg: SVGSVGElement): Bounds | null {
+  const referencePath = svg.querySelector<SVGPathElement>('.edgePaths path');
+  if (!referencePath) return null;
+  const elements = [
+    ...[...svg.querySelectorAll<SVGGElement>('g.node')].flatMap((node) => {
+      const shape = shapeForNode(node);
+      return shape ? [shape] : [];
+    }),
+    ...svg.querySelectorAll<SVGRectElement>('g.cluster > rect'),
+    ...svg.querySelectorAll<SVGPathElement>('.edgePaths path'),
+  ];
+  const bounds = elements.flatMap((element) => {
+    const value = boundsInPathSpace(element, referencePath);
+    return value ? [value] : [];
+  });
+  if (!bounds.length) return null;
+  const x = Math.min(...bounds.map((value) => value.x));
+  const y = Math.min(...bounds.map((value) => value.y));
+  const right = Math.max(...bounds.map((value) => value.x + value.width));
+  const bottom = Math.max(...bounds.map((value) => value.y + value.height));
+  return { x, y, width: right - x, height: bottom - y };
+}
+
 function flowchartNodeId(node: SVGGElement): string {
   return node.id.match(/flowchart-(.+?)-\d+$/)?.[1] ?? node.id;
 }
