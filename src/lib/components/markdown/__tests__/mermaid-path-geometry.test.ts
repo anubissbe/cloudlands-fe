@@ -316,19 +316,33 @@ describe('Mermaid path terminal geometry', () => {
       { x: 50, y: 240 },
       { x: 50, y: 40 },
     ]);
+    expect(
+      buildFlowchartDecisionReturnPoints(
+        { x: 10, y: 200, width: 80, height: 40 },
+        { x: 0, y: 0, width: 100, height: 100 },
+        [
+          { x: 0, y: 0, width: 100, height: 100 },
+          { x: 10, y: 200, width: 80, height: 40 },
+        ],
+        true,
+      ),
+    ).toEqual([
+      { x: 50, y: 240 },
+      { x: 50, y: 252 },
+      { x: -28, y: 252 },
+      { x: -28, y: 50 },
+      { x: 0, y: 50 },
+    ]);
   });
 
-  it('keeps compact decision branches outside a vertically stacked diamond', () => {
+  it('separates compact decision branches around a vertically stacked diamond', () => {
     const source = { x: 0, y: 0, width: 100, height: 100 };
     const target = { x: 10, y: 200, width: 80, height: 40 };
     const occupied = [source, target];
 
     expect(buildFlowchartDecisionBranchPoints(source, target, 'upper', occupied, true)).toEqual([
-      { x: 50, y: 0 },
-      { x: 50, y: -12 },
-      { x: 116, y: -12 },
-      { x: 116, y: 220 },
-      { x: 90, y: 220 },
+      { x: 50, y: 100 },
+      { x: 50, y: 200 },
     ]);
     expect(buildFlowchartDecisionBranchPoints(source, target, 'lower', occupied, true)).toEqual([
       { x: 100, y: 50 },

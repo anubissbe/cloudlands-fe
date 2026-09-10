@@ -53,6 +53,15 @@ export function buildFlowchartDecisionBranchPoints(
 ): Point[] {
   const sourceSide = branch === 'upper' ? 'top' : 'right';
   const stackedTarget = branch === 'upper' && target.y >= source.y + source.height;
+  if (compact && stackedTarget) {
+    const sourcePort = boundsPort(source, 'bottom');
+    const targetTop = boundsPort(target, 'top');
+    const targetPort = {
+      x: Math.max(target.x, Math.min(sourcePort.x, target.x + target.width)),
+      y: targetTop.y,
+    };
+    return [sourcePort, targetPort];
+  }
   const targetSide: CardinalSide = stackedTarget
     ? 'right'
     : branch === 'upper'
@@ -131,21 +140,18 @@ export function buildFlowchartDecisionReturnPoints(
   compact = false,
 ): Point[] {
   const sourcePort = boundsPort(source, 'bottom');
-  const targetPort = boundsPort(target, 'bottom');
+  const targetPort = boundsPort(target, compact ? 'left' : 'bottom');
   const clearance = compact ? 16 : 32;
   const laneY = Math.max(...occupied.map((bounds) => bounds.y + bounds.height)) + clearance;
   if (compact) {
     const laneX =
       Math.min(source.x, target.x, ...occupied.map((bounds) => bounds.x)) - clearance - 12;
     const leadY = sourcePort.y + 12;
-    const approachY = targetPort.y + 12;
     return simplifyOrthogonalPoints([
       sourcePort,
       { x: sourcePort.x, y: leadY },
       { x: laneX, y: leadY },
-      { x: laneX, y: laneY },
-      { x: laneX, y: approachY },
-      { x: targetPort.x, y: approachY },
+      { x: laneX, y: targetPort.y },
       targetPort,
     ]);
   }
@@ -575,7 +581,9 @@ export function attachStateTerminalArrowheads(svg: SVGSVGElement) {
     return shape ? [{ node, shape }] : [];
   });
 
-  for (const path of svg.querySelectorAll<SVGPathElement>('.edgePaths path[marker-end]')) {
+  for (const path of svg.querySelectorAll<SVGPathElement>(
+    '.edgePaths path[marker-end], path.transition[data-edge="true"][marker-end]',
+  )) {
     const length = path.getTotalLength();
     if (length < 0.25) continue;
     const terminal = path.getPointAtLength(length);
@@ -1901,11 +1909,13 @@ function allocateDiamondAttachments(svg: SVGSVGElement, paths: SVGPathElement[])
       if (bounds) {
         const inferred = cardinalSideFromDirection(pointAt(bounds, 0.5, 0.5), points[1]);
         const side: CardinalSide =
-          path.dataset.decisionBranch === 'upper' || labelText === 'yes'
-            ? 'top'
-            : path.dataset.decisionBranch === 'lower' || labelText === 'no'
-              ? 'right'
-              : inferred;
+          path.dataset.decisionBranch === 'upper' && path.dataset.compactFlowchart === 'true'
+            ? 'bottom'
+            : path.dataset.decisionBranch === 'upper' || labelText === 'yes'
+              ? 'top'
+              : path.dataset.decisionBranch === 'lower' || labelText === 'no'
+                ? 'right'
+                : inferred;
         uses.push({
           path,
           role: 'source',
@@ -1930,9 +1940,11 @@ function allocateDiamondAttachments(svg: SVGSVGElement, paths: SVGPathElement[])
           );
         });
         const side: CardinalSide =
-          path.dataset.decisionReturn || reciprocal
-            ? 'bottom'
-            : cardinalSideFromDirection(pointAt(bounds, 0.5, 0.5), points[points.length - 2]);
+          path.dataset.decisionReturn && path.dataset.compactFlowchart === 'true'
+            ? 'left'
+            : path.dataset.decisionReturn || reciprocal
+              ? 'bottom'
+              : cardinalSideFromDirection(pointAt(bounds, 0.5, 0.5), points[points.length - 2]);
         uses.push({
           path,
           role: 'target',
@@ -2285,6 +2297,7 @@ function setFlowchartNodeCenter(node: SVGGElement, center: Point, referencePath:
   const current = shape && boundsInPathSpace(shape, referencePath);
   const matrix = node.transform.baseVal.consolidate()?.matrix;
   if (!current || !matrix) return;
+  node.style.setProperty('transition-property', 'none', 'important');
   node.setAttribute(
     'transform',
     `translate(${matrix.e + center.x - current.x - current.width / 2}, ${matrix.f + center.y - current.y - current.height / 2})`,
@@ -2334,6 +2347,7 @@ function reframeFlowchartClusters(
     const right = Math.max(...content.map((bounds) => bounds.x + bounds.width)) + 24;
     const bottom = Math.max(...content.map((bounds) => bounds.y + bounds.height)) + 24;
     const frame = { x, y, width: right - x, height: bottom - y };
+    record.rect.style.setProperty('transition-property', 'none', 'important');
     for (const [attribute, value] of Object.entries(frame)) {
       record.rect.setAttribute(attribute, String(value));
     }
@@ -2937,6 +2951,7 @@ export function reflowCompactFlowchart(svg: SVGSVGElement, routeEdges = true): B
   }
   const laneCounts = { left: 0, right: 0 };
   const stubCounts = new Map<string, number>();
+  const pairLaneCounts = new Map<string, number>();
   const placedLabelBounds: Bounds[] = [];
   const routedBounds = nodes.flatMap((node) => {
     const matrix = node.transform.baseVal.consolidate()?.matrix;
@@ -2962,6 +2977,15 @@ export function reflowCompactFlowchart(svg: SVGSVGElement, routeEdges = true): B
     const sourceIndex = nodeIndex.get(identity.source) ?? 0;
     const targetIndex = nodeIndex.get(identity.target) ?? 0;
     const pair = [identity.source, identity.target].toSorted().join('\u0000');
+    const pairCount = pairCounts.get(pair) ?? 0;
+    const pairLaneIndex = pairLaneCounts.get(pair) ?? 0;
+    pairLaneCounts.set(pair, pairLaneIndex + 1);
+    if (pairCount > 1) {
+      const lane = pairLaneIndex - (pairCount - 1) / 2;
+      path.dataset.parallelLane = lane < 0 ? 'before' : lane > 0 ? 'after' : 'center';
+    } else {
+      delete path.dataset.parallelLane;
+    }
     let points: Point[];
     if (
       targetIndex === sourceIndex + 1 &&
@@ -3980,8 +4004,13 @@ export function chooseLabelSegment(
 
 export function rewriteStateRoutes(svg: SVGSVGElement, compact = false) {
   if (!svg.classList.contains('statediagram')) return;
-  const paths = [...svg.querySelectorAll<SVGPathElement>('.edgePaths path')];
+  const paths = [
+    ...svg.querySelectorAll<SVGPathElement>('.edgePaths path, path.transition[data-edge="true"]'),
+  ];
   const labels = [...svg.querySelectorAll<SVGGElement>('.edgeLabels > .edgeLabel')];
+  for (const element of [...paths, ...labels]) {
+    element.style.setProperty('transition-property', 'none', 'important');
+  }
   const referencePath = paths[0];
   if (!referencePath) return;
   const nodeBounds = new Map<string, Bounds>();
@@ -4015,6 +4044,7 @@ export function rewriteStateRoutes(svg: SVGSVGElement, compact = false) {
       const matrix = geometry?.node.transform.baseVal.consolidate()?.matrix;
       if (!geometry || !current || !matrix) return;
       const target = { x: centerX + centerOffset - current.width / 2, y: idle.y + yOffset };
+      geometry.node.style.setProperty('transition-property', 'none', 'important');
       geometry.node.setAttribute(
         'transform',
         `translate(${matrix.e + target.x - current.x}, ${matrix.f + target.y - current.y})`,
@@ -4134,7 +4164,9 @@ export function rewriteStateRoutes(svg: SVGSVGElement, compact = false) {
 
 export function repairUpwardStateFailureRoutes(svg: SVGSVGElement) {
   if (!svg.classList.contains('statediagram')) return;
-  const paths = [...svg.querySelectorAll<SVGPathElement>('.edgePaths path')];
+  const paths = [
+    ...svg.querySelectorAll<SVGPathElement>('.edgePaths path, path.transition[data-edge="true"]'),
+  ];
   const labels = [...svg.querySelectorAll<SVGGElement>('.edgeLabels > .edgeLabel')];
   paths.forEach((path, index) => {
     const label = labels[index];
@@ -4194,7 +4226,9 @@ export function placeStateLabelsOnFinalRoutes(svg: SVGSVGElement, compact = fals
         ]
       : [];
   });
-  const routeSegments = [...svg.querySelectorAll<SVGPathElement>('.edgePaths path')].map((path) => {
+  const routeSegments = [
+    ...svg.querySelectorAll<SVGPathElement>('.edgePaths path, path.transition[data-edge="true"]'),
+  ].map((path) => {
     const points = (path.dataset.manhattanPoints ?? '')
       .split(' ')
       .map((point) => point.split(',').map(Number))

@@ -640,7 +640,7 @@ ${verticalSource}`;
     }
   }
 
-  function polishSequenceDiagram(svg: SVGSVGElement) {
+  async function polishSequenceDiagram(svg: SVGSVGElement) {
     if (svg.getAttribute('aria-roledescription') !== 'sequence') return;
 
     const originalViewBox = {
@@ -801,19 +801,47 @@ ${verticalSource}`;
       });
     }
 
-    for (const group of svg.querySelectorAll<SVGGElement>(':scope > g')) {
+    const notes = [...svg.querySelectorAll<SVGGElement>(':scope > g')].flatMap((group) => {
       const note = group.querySelector<SVGRectElement>(':scope > rect.note');
-      const text = group.querySelector<SVGTextElement>(':scope > text.noteText');
-      if (!note || !text) continue;
+      const lines = [...group.querySelectorAll<SVGTextElement>(':scope > text.noteText')];
+      const text = lines[0];
+      if (!note || !text) return [];
+      const content = lines
+        .map((line) => line.textContent?.trim())
+        .filter(Boolean)
+        .join(' ');
+      const line = text.querySelector('tspan') ?? text;
+      line.textContent = content;
+      lines.slice(1).forEach((line) => line.remove());
+      return [{ group, note, text }];
+    });
+    for (const { group, text } of notes) {
       group.classList.add('sequence-note');
+      text.style.setProperty('transition-property', 'none', 'important');
       text.classList.add('sequence-note-text');
-      const bounds = text.getBBox();
-      const width = Math.min(
-        Number(note.getAttribute('width')) || bounds.width + 20,
-        bounds.width + 20,
+    }
+    if (notes.length) {
+      await Promise.all(
+        notes.map(({ text }) =>
+          document.fonts?.load(getComputedStyle(text).font, text.textContent ?? ''),
+        ),
       );
+      await new Promise<void>((resolve) =>
+        requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
+      );
+    }
+    for (const { note, text } of notes) {
+      const bounds = text.getBBox();
+      const context = document.createElement('canvas').getContext('2d');
+      const style = getComputedStyle(text);
+      if (context) context.font = `${style.fontWeight} ${style.fontSize} ${style.fontFamily}`;
+      const textWidth = context?.measureText(text.textContent ?? '').width ?? bounds.width;
+      const width = textWidth + 20;
       const height = Math.max(28, bounds.height + 12);
-      note.setAttribute('x', String(bounds.x + bounds.width / 2 - width / 2));
+      const textX = Number(text.getAttribute('x'));
+      const center = Number.isFinite(textX) ? textX : bounds.x + bounds.width / 2;
+      note.style.setProperty('transition-property', 'none', 'important');
+      note.setAttribute('x', String(center - width / 2));
       note.setAttribute('y', String(bounds.y - 6));
       note.setAttribute('width', String(width));
       note.setAttribute('height', String(height));
@@ -821,15 +849,22 @@ ${verticalSource}`;
     }
 
     const finalBounds = svg.getBBox();
+    const finalX = Math.min(originalViewBox.x, Math.floor(finalBounds.x));
+    const finalRight = Math.max(
+      originalViewBox.x + originalViewBox.width,
+      Math.ceil(finalBounds.x + finalBounds.width),
+    );
+    const finalWidth = finalRight - finalX;
     const finalHeight = Math.ceil(
       finalBounds.y + finalBounds.height + bottomPadding - originalViewBox.y,
     );
-    if (finalHeight > originalViewBox.height) {
+    if (finalWidth > originalViewBox.width || finalHeight > originalViewBox.height) {
       svg.setAttribute(
         'viewBox',
-        `${originalViewBox.x} ${originalViewBox.y} ${originalViewBox.width} ${finalHeight}`,
+        `${finalX} ${originalViewBox.y} ${finalWidth} ${Math.max(originalViewBox.height, finalHeight)}`,
       );
-      svg.setAttribute('height', String(finalHeight));
+      svg.setAttribute('width', String(finalWidth));
+      svg.setAttribute('height', String(Math.max(originalViewBox.height, finalHeight)));
     }
   }
 
@@ -1148,7 +1183,8 @@ ${verticalSource}`;
     replaceSequenceActorFigures(svg);
     alignMermaidOpenArrowheads(svg);
     if (svg.getAttribute('aria-roledescription') === 'sequence') {
-      polishSequenceDiagram(svg);
+      await polishSequenceDiagram(svg);
+      if (generation !== renderGeneration || fit !== fitGeneration) return false;
       addMermaidLabelKnockouts(svg);
       addMermaidLabelFeathers(svg);
       setReadableMermaidWidth(svg, svg.viewBox.baseVal.width);
@@ -1167,7 +1203,13 @@ ${verticalSource}`;
     repairEntityDividers(svg);
     refineMermaidCylinderNodes(svg);
     repairFlowchartNodeOutlines(svg);
-    if (compactLayout) {
+    const flowchart = svg.getAttribute('aria-roledescription') === 'flowchart-v2';
+    const captionSize = Number.parseFloat(getComputedStyle(svg).fontSize);
+    const readableScale = 12 / (Number.isFinite(captionSize) ? captionSize : 13);
+    const compactFlowchartLayout =
+      compactLayout ||
+      (flowchart && svg.getBBox().width * readableScale > (rendererElement?.clientWidth ?? 0));
+    if (compactFlowchartLayout) {
       reflowCompactFlowchart(svg, false);
       reflowCompactFlowchart(svg);
     }
@@ -1180,7 +1222,7 @@ ${verticalSource}`;
     routeFlowchartCenteredFanouts(svg);
     routeFlowchartDecisionBranches(svg);
     let compactFlowchartBounds: SvgBounds | null = null;
-    if (compactLayout) {
+    if (compactFlowchartLayout) {
       reflowCompactFlowchart(svg);
       routeFlowchartFeedbackLane(svg, true);
       routeFlowchartCenteredFanouts(svg);
@@ -1238,10 +1280,9 @@ ${verticalSource}`;
         })
       : baseBounds;
     if (![bounds.x, bounds.y, bounds.width, bounds.height].every(Number.isFinite)) return false;
-    const flowchart = svg.getAttribute('aria-roledescription') === 'flowchart-v2';
     const groupedFlowchart = Boolean(svg.querySelector('g.cluster'));
     let padding = flowchart
-      ? compactLayout
+      ? compactFlowchartLayout
         ? svg.querySelector('g.cluster')
           ? 14
           : 20
@@ -1275,7 +1316,7 @@ ${verticalSource}`;
     setReadableMermaidWidth(svg, width);
     await new Promise<void>((resolve) => setTimeout(resolve, 64));
     if (generation !== renderGeneration) return false;
-    if (!compactLayout && svg.getAttribute('aria-roledescription') === 'flowchart-v2') {
+    if (!compactFlowchartLayout && svg.getAttribute('aria-roledescription') === 'flowchart-v2') {
       routeFlowchartFeedbackLane(svg, true);
       alignMermaidOpenArrowheads(svg);
       const finalBounds = measureFinalFlowchartBounds(svg);
@@ -1297,9 +1338,10 @@ ${verticalSource}`;
       snapFlowchartFeedbackPorts(svg);
       routeGroupedReturnEdges(svg);
       alignMermaidOpenArrowheads(svg);
-      if (compactLayout && svg.querySelector('g.cluster')) positionCompactGroupedEdgeLabels(svg);
+      if (compactFlowchartLayout && svg.querySelector('g.cluster'))
+        positionCompactGroupedEdgeLabels(svg);
     }
-    if (compactLayout) {
+    if (compactFlowchartLayout) {
       alignCompactClusterTitles(svg);
       routeFlowchartAroundClusterHeaders(svg);
       positionCompactGroupedEdgeLabels(svg);
@@ -1313,7 +1355,7 @@ ${verticalSource}`;
       roundOrthogonalBends(svg);
       if (groupedFlowchart) positionCompactGroupedEdgeLabels(svg);
       alignMermaidOpenArrowheads(svg);
-      if (compactLayout && svg.querySelector('path[data-grouped-return-lane="right"]')) {
+      if (compactFlowchartLayout && svg.querySelector('path[data-grouped-return-lane="right"]')) {
         padding = Math.max(padding, 23);
       }
       const finalBounds = measureFinalFlowchartBounds(svg);
@@ -1327,7 +1369,7 @@ ${verticalSource}`;
       svg.setAttribute('height', String(height));
       setReadableMermaidWidth(svg, width);
     }
-    if (normalizedState || groupedFlowchart || (compactLayout && flowchart)) {
+    if (normalizedState || (compactFlowchartLayout && flowchart && !groupedFlowchart)) {
       svg.style.setProperty('--mermaid-readable-width', '0px');
       svg.style.setProperty('max-width', '100%');
     }
@@ -1346,9 +1388,6 @@ ${verticalSource}`;
       svg.setAttribute('width', String(width));
       svg.setAttribute('height', String(height));
       setReadableMermaidWidth(svg, width);
-      if (groupedFlowchart) {
-        svg.style.setProperty('--mermaid-readable-width', '0px');
-      }
       await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
       if (generation !== renderGeneration || fit !== fitGeneration) return false;
     }
@@ -1381,9 +1420,7 @@ ${verticalSource}`;
         usesHtmlLabels,
       );
       const usesStateDiagram = /^\s*stateDiagram(?:-v2)?\b/m.test(renderCode);
-      if (usesStateDiagram) {
-        config.layout = 'elk';
-      }
+      config.layout = usesStateDiagram ? 'elk' : 'dagre';
       if (compactLayout) {
         config.flowchart = {
           ...config.flowchart,
