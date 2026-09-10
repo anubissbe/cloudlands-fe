@@ -68,7 +68,16 @@
 /* Cap inner wrapper so very wide SVGs scale down instead of overflowing */
 .tiptap-editor.ProseMirror > .node-mermaidBlock > [data-node-view-wrapper],
 .tiptap-editor.ProseMirror > .node-diagram_block > [data-node-view-wrapper] {
+  width: 100%;
+  min-width: 0;
   max-width: 100%;
+}
+
+.tiptap-editor.ProseMirror
+  > .node-mermaidBlock
+  > [data-node-view-wrapper]
+  > [data-diagram-presentation] {
+  width: 100%;
 }
 
 /* Monospace mode: code blocks don't need breakout since they're already

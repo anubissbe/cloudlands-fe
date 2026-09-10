@@ -16,6 +16,7 @@ const CONCEPT_LABELS = [
   'workspace.list filter',
   'project prompt',
 ];
+const NATIVE_NOTE_HOST_WIDTH = 1336;
 const CYCLE_NODES = ['Hub', 'Flow', 'Sequence', 'State', 'ER', 'Review'];
 const CYCLE_ROUTES = [
   'L_Hub_Flow_0',
@@ -45,17 +46,33 @@ async function openState(page: Page, state: string, motion: 'full' | 'reduced' =
 async function mountConceptAdd(page: Page, motion: 'full' | 'reduced') {
   await openState(page, 'mermaid-cycle-fanout', motion);
   await page.evaluate(async (source) => {
-    const [{ mount }, { default: MermaidRenderer }] = await Promise.all([
+    const [{ mount }, { default: MermaidBlockNodeView }] = await Promise.all([
       import('/@id/svelte'),
-      import('/src/lib/components/markdown/MermaidRenderer.svelte'),
+      import('/src/lib/components/tiptap/MermaidBlockNodeView.svelte'),
     ]);
     const host = document.createElement('div');
     host.id = 'concept-add-test-host';
-    host.style.width = '320px';
+    host.style.cssText = 'width:1336px;container-type:inline-size';
+    const positioning = document.createElement('div');
+    positioning.style.cssText =
+      'width:min(960px,100%);padding:0 48px;box-sizing:border-box;margin-inline:auto';
+    const editor = document.createElement('div');
+    editor.className = 'tiptap ProseMirror tiptap-editor';
+    editor.style.width = '100%';
+    const lane = document.createElement('div');
+    lane.className = 'node-mermaidBlock svelte-renderer';
+    editor.append(lane);
+    positioning.append(editor);
+    host.append(positioning);
     document.body.replaceChildren(host);
-    mount(MermaidRenderer, {
-      target: host,
-      props: { code: source, showExpandButton: false },
+    mount(MermaidBlockNodeView, {
+      target: lane,
+      props: {
+        node: { attrs: { code: source } },
+        selected: false,
+        updateAttributes: () => undefined,
+        editor: { isEditable: true },
+      },
     });
   }, CONCEPT_ADD_SOURCE);
 }
@@ -100,6 +117,9 @@ async function mermaidGeometry(
     const painted = [...nodeElements, ...pathElements, ...labelElements];
     const viewportBounds = viewport.getBoundingClientRect();
     const svgBounds = svg.getBoundingClientRect();
+    const lane = renderer.closest<HTMLElement>('.node-mermaidBlock');
+    const nodeView = renderer.closest<HTMLElement>('[data-node-view-wrapper]');
+    const presentation = renderer.closest<HTMLElement>('[data-diagram-presentation]');
     const matrix = svg.getScreenCTM();
     const records = [...nodes, ...routes, ...labels];
     return {
@@ -111,6 +131,9 @@ async function mermaidGeometry(
       viewBox: svg.getAttribute('viewBox'),
       svgBounds: boundsOf(svg),
       viewportBounds: boundsOf(viewport),
+      laneBounds: lane ? boundsOf(lane) : null,
+      nodeViewBounds: nodeView ? boundsOf(nodeView) : null,
+      presentationBounds: presentation ? boundsOf(presentation) : null,
       ctm: matrix ? [matrix.a, matrix.b, matrix.c, matrix.d, matrix.e, matrix.f].map(round) : null,
       scroll: [
         viewport.scrollLeft,
@@ -169,6 +192,19 @@ async function waitForStable(read: () => Promise<unknown>) {
     .toBe(true);
 }
 
+async function waitForMermaidStable(read: () => ReturnType<typeof mermaidGeometry>) {
+  await expect
+    .poll(
+      async () => {
+        const result = await read();
+        return 'settled' in result ? [result.settled, result.layoutSettled] : [];
+      },
+      { timeout: 30_000 },
+    )
+    .toEqual(['true', 'true']);
+  await waitForStable(read);
+}
+
 function expectMermaidContract(
   result: Awaited<ReturnType<typeof mermaidGeometry>>,
   expected: { nodes: string[]; routes: string[]; labels: string[] },
@@ -197,7 +233,7 @@ for (const motion of ['full', 'reduced'] as const) {
     const expected = { nodes: CONCEPT_NODES, routes: CONCEPT_ROUTES, labels: CONCEPT_LABELS };
     await mountConceptAdd(page, motion);
     const read = () => mermaidGeometry(page, '#concept-add-test-host', expected);
-    await waitForStable(read);
+    await waitForMermaidStable(read);
     const initial = await read();
     expectMermaidContract(initial, expected);
 
@@ -230,6 +266,20 @@ for (const motion of ['full', 'reduced'] as const) {
       expect(observation.geometry).toEqual(initial);
     }
 
+    for (const width of [420, NATIVE_NOTE_HOST_WIDTH]) {
+      const priorGeneration = (await read()).generation;
+      await page.locator('#concept-add-test-host').evaluate((element, value) => {
+        element.style.width = `${value}px`;
+      }, width);
+      await expect
+        .poll(async () => (await read()).generation, { timeout: 30_000 })
+        .toBeGreaterThan(priorGeneration);
+      await waitForMermaidStable(read);
+      const resized = await read();
+      expectMermaidContract(resized, expected);
+      expect(resized.nodeViewBounds?.[2]).toBe(resized.laneBounds?.[2]);
+    }
+
     if (motion === 'reduced') {
       const priorGeneration = initial.generation;
       await page.evaluate(() => {
@@ -238,7 +288,7 @@ for (const motion of ['full', 'reduced'] as const) {
       await expect
         .poll(async () => (await read()).generation, { timeout: 30_000 })
         .toBeGreaterThan(priorGeneration);
-      await waitForStable(read);
+      await waitForMermaidStable(read);
       expectMermaidContract(await read(), expected);
     }
   });
