@@ -44,6 +44,7 @@ describe('MermaidRenderer theme updates', () => {
     for (const name of Object.keys(tokens)) {
       document.documentElement.style.removeProperty(name);
     }
+    document.documentElement.style.removeProperty('--terminal-overlay-height');
   });
 
   it('rerenders with current tokens when a custom theme changes root styles', async () => {
@@ -56,6 +57,18 @@ describe('MermaidRenderer theme updates', () => {
     await waitFor(() => expect(mermaidMocks.initialize).toHaveBeenCalledTimes(2));
     const latestConfig = mermaidMocks.initialize.mock.calls.at(-1)?.[0];
     expect(latestConfig.themeVariables.primaryColor).toBe('hsl(260 20% 18%)');
+  });
+
+  it('ignores root style changes that do not affect the Mermaid theme', async () => {
+    render(MermaidRenderer, { code: 'sequenceDiagram\nA->>B: Ready' });
+    await waitFor(() => expect(mermaidMocks.initialize).toHaveBeenCalledOnce());
+
+    document.documentElement.style.setProperty('--terminal-overlay-height', '36px');
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    document.documentElement.style.setProperty('--terminal-overlay-height', '48px');
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(mermaidMocks.initialize).toHaveBeenCalledOnce();
   });
 
   it('keeps class diagrams on SVG labels for geometry repair', async () => {

@@ -56,6 +56,23 @@
   const logger = createLogger('MermaidRenderer');
   const SEQUENCE_MESSAGE_INSET = 12;
   const SEQUENCE_MESSAGE_LINE_HEIGHT = 16;
+  const MERMAID_THEME_TOKENS = [
+    '--background',
+    '--foreground',
+    '--card',
+    '--card-foreground',
+    '--muted',
+    '--muted-foreground',
+    '--border',
+    '--accent',
+    '--accent-foreground',
+    '--diagram-canvas',
+    '--diagram-node-surface',
+    '--diagram-connector',
+    '--font-ui',
+    '--text-caption-size',
+    '--radius-small',
+  ] as const;
   const STATE_LABEL_TEXT = {
     streamFails: 'Stream fails', // i18n-ignore (agent-authored Mermaid content)
     agentAsksUser: 'Agent asks user', // i18n-ignore (agent-authored Mermaid content)
@@ -93,6 +110,14 @@
   let settledGeneration = $state(0);
   let decodedSource = $derived(decodeHtmlEntities(decodeBase64(code)));
   const MermaidActorIcon = getPhosphorIconComponent(faUser);
+
+  function readMermaidThemeSignature(): string {
+    const styles = getComputedStyle(document.documentElement);
+    return [
+      styles.fontSize,
+      ...MERMAID_THEME_TOKENS.map((token) => styles.getPropertyValue(token).trim()),
+    ].join('\u0000');
+  }
 
   // Decode base64 encoded mermaid code
   function decodeBase64(str: string): string {
@@ -1577,7 +1602,11 @@ ${verticalSource}`;
       narrowLayout = rendererElement.clientWidth <= 420;
       resizeObserver.observe(rendererElement);
     }
+    let themeSignature = readMermaidThemeSignature();
     const observer = new MutationObserver(() => {
+      const nextThemeSignature = readMermaidThemeSignature();
+      if (nextThemeSignature === themeSignature) return;
+      themeSignature = nextThemeSignature;
       themeRevision += 1;
     });
     observer.observe(document.documentElement, {
