@@ -12,6 +12,65 @@ const showcaseIds = [
   'custom-service-boundaries',
   'custom-delivery-walkthrough',
 ] as const;
+const multilineLabelContract = [
+  { text: 'Preview source update', authoredBreaks: 0 },
+  { text: 'Browser-only scene\npreserves selected settings', authoredBreaks: 1 },
+  {
+    text: 'Capture harness waits\nfor measured layout\nbefore recording evidence',
+    authoredBreaks: 2,
+  },
+] as const;
+
+type Bounds = { left: number; top: number; right: number; bottom: number; height: number };
+type MultilineNodeGeometry = {
+  text: string;
+  authoredBreaks: number;
+  paintedLines: number;
+  textBounds: Bounds;
+  shapeBounds: Bounds;
+};
+type MultilineViolation = {
+  text: string;
+  issue:
+    'label-count' | 'missing-label' | 'authored-breaks' | 'visible-rows' | 'clipped' | 'no-growth';
+};
+
+function multilineGeometryViolations(nodes: MultilineNodeGeometry[]): MultilineViolation[] {
+  const violations: MultilineViolation[] = [];
+  if (nodes.length !== multilineLabelContract.length) {
+    violations.push({ text: 'collection', issue: 'label-count' });
+  }
+  const singleLine = nodes.find(({ text }) => text === multilineLabelContract[0].text);
+  for (const expected of multilineLabelContract) {
+    const node = nodes.find(({ text }) => text === expected.text);
+    if (!node) {
+      violations.push({ text: expected.text, issue: 'missing-label' });
+      continue;
+    }
+    if (node.authoredBreaks !== expected.authoredBreaks) {
+      violations.push({ text: expected.text, issue: 'authored-breaks' });
+    }
+    if (node.paintedLines < expected.authoredBreaks + 1) {
+      violations.push({ text: expected.text, issue: 'visible-rows' });
+    }
+    if (
+      node.textBounds.left < node.shapeBounds.left - 1 ||
+      node.textBounds.top < node.shapeBounds.top - 1 ||
+      node.textBounds.right > node.shapeBounds.right + 1 ||
+      node.textBounds.bottom > node.shapeBounds.bottom + 1
+    ) {
+      violations.push({ text: expected.text, issue: 'clipped' });
+    }
+    if (
+      expected.authoredBreaks > 0 &&
+      singleLine &&
+      node.shapeBounds.height <= singleLine.shapeBounds.height + 1
+    ) {
+      violations.push({ text: expected.text, issue: 'no-growth' });
+    }
+  }
+  return violations;
+}
 
 test.skip(!baseUrl, 'Set UI_PREVIEW_BASE_URL to the running diagram preview server.');
 test.describe.configure({ timeout: 120_000 });
@@ -146,18 +205,42 @@ test('contains grouped nodes, mixed-height labels, and custom route terminals', 
     ].map((node) => {
       const label = node.querySelector<HTMLElement>('.nodeLabel')!;
       const range = document.createRange();
-      range.selectNodeContents(label);
-      const paintedLineTops = [...range.getClientRects()]
+      const textRects: DOMRect[] = [];
+      const textNodes = document.createTreeWalker(label, NodeFilter.SHOW_TEXT);
+      while (textNodes.nextNode()) {
+        range.selectNodeContents(textNodes.currentNode);
+        textRects.push(...range.getClientRects());
+      }
+      const paintedLineTops = textRects
         .filter(({ width, height }) => width > 0 && height > 0)
         .map(({ top }) => top)
         .toSorted((left, right) => left - right)
         .filter((top, index, tops) => index === 0 || top - tops[index - 1] > 1);
-      const content = label.closest<HTMLElement>('foreignObject')!.getBoundingClientRect();
-      const bounds = node.getBoundingClientRect();
+      const textBounds = textRects.reduce(
+        (bounds, rect) => ({
+          left: Math.min(bounds.left, rect.left),
+          top: Math.min(bounds.top, rect.top),
+          right: Math.max(bounds.right, rect.right),
+          bottom: Math.max(bounds.bottom, rect.bottom),
+          height: Math.max(bounds.bottom, rect.bottom) - Math.min(bounds.top, rect.top),
+        }),
+        { left: Infinity, top: Infinity, right: -Infinity, bottom: -Infinity, height: 0 },
+      );
+      const shape = node
+        .querySelector<SVGGraphicsElement>(':scope > .label-container')!
+        .getBoundingClientRect();
       return {
+        text: label.innerText,
+        authoredBreaks: label.querySelectorAll('br').length,
         paintedLines: paintedLineTops.length,
-        contentHeight: content.height,
-        nodeHeight: bounds.height,
+        textBounds,
+        shapeBounds: {
+          left: shape.left,
+          top: shape.top,
+          right: shape.right,
+          bottom: shape.bottom,
+          height: shape.height,
+        },
       };
     });
     const nested = document.querySelector('#mermaid-nested-routing')!;
@@ -190,21 +273,48 @@ test('contains grouped nodes, mixed-height labels, and custom route terminals', 
   expect(geometry.terminals.every(({ source }) => source <= 1)).toBe(true);
   expect(geometry.terminals.every(({ target }) => target <= 6)).toBe(true);
   expect(geometry.terminals.every(({ marker }) => marker?.includes('arrowhead'))).toBe(true);
-  expect(geometry.multilineNodes[0].paintedLines).toBe(1);
-  expect(geometry.multilineNodes[1].paintedLines).toBeGreaterThanOrEqual(2);
-  expect(geometry.multilineNodes[2].paintedLines).toBeGreaterThanOrEqual(3);
-  expect(
-    geometry.multilineNodes.every(
-      ({ contentHeight, nodeHeight }) => contentHeight > 0 && nodeHeight >= contentHeight,
-    ),
-  ).toBe(true);
-  expect(geometry.multilineNodes[1].nodeHeight).toBeGreaterThan(
-    geometry.multilineNodes[0].nodeHeight,
-  );
-  expect(geometry.multilineNodes[2].nodeHeight).toBeGreaterThanOrEqual(
-    geometry.multilineNodes[1].nodeHeight,
-  );
+  expect(multilineGeometryViolations(geometry.multilineNodes)).toEqual([]);
   expect(geometry.nestedContainment.every(Boolean)).toBe(true);
+});
+
+test('rejects lost multiline breaks, missing rows, and clipped text', () => {
+  const shapeBounds = (height: number): Bounds => ({
+    left: 0,
+    top: 0,
+    right: 100,
+    bottom: height,
+    height,
+  });
+  const nodes: MultilineNodeGeometry[] = multilineLabelContract.map((expected, index) => ({
+    text: expected.text,
+    authoredBreaks: expected.authoredBreaks,
+    paintedLines: expected.authoredBreaks + 1,
+    textBounds: { left: 10, top: 5, right: 90, bottom: 15 + index * 15, height: 10 + index * 15 },
+    shapeBounds: shapeBounds(20 + index * 20),
+  }));
+  nodes[1] = { ...nodes[1], authoredBreaks: 0, paintedLines: 1 };
+  nodes[2] = {
+    ...nodes[2],
+    textBounds: { ...nodes[2].textBounds, bottom: nodes[2].shapeBounds.bottom + 2 },
+  };
+
+  expect(multilineGeometryViolations(nodes)).toEqual(
+    expect.arrayContaining([
+      { text: multilineLabelContract[1].text, issue: 'authored-breaks' },
+      { text: multilineLabelContract[1].text, issue: 'visible-rows' },
+      { text: multilineLabelContract[2].text, issue: 'clipped' },
+    ]),
+  );
+  const allEqualShapes = nodes.map((node) => ({
+    ...node,
+    shapeBounds: shapeBounds(80),
+  }));
+  expect(multilineGeometryViolations(allEqualShapes)).toEqual(
+    expect.arrayContaining([
+      { text: multilineLabelContract[1].text, issue: 'no-growth' },
+      { text: multilineLabelContract[2].text, issue: 'no-growth' },
+    ]),
+  );
 });
 
 test('supports keyboard walkthrough changes and staged full-motion focus', async ({ page }) => {
