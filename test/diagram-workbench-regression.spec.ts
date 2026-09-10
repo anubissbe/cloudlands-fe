@@ -46,6 +46,246 @@ async function openState(
   });
 }
 
+// The approved narrow walkthrough stacks nodes. Read real path paint in screen
+// coordinates; do not infer route separation from its overall bounding extent.
+function narrowWalkthroughGeometry(
+  root: Element,
+  connections: { id: string; source: string; target: string }[],
+) {
+  const viewport = root.querySelector('.diagram-scroll-container')!.getBoundingClientRect();
+  const nodes = [...root.querySelectorAll('[data-node-id]')].map((node) => ({
+    id: node.getAttribute('data-node-id'),
+    element: node,
+    bounds: node.getBoundingClientRect(),
+  }));
+  const visible = (element: Element) => {
+    for (let current: Element | null = element; current; current = current.parentElement) {
+      const style = getComputedStyle(current);
+      if (
+        style.display === 'none' ||
+        style.visibility !== 'visible' ||
+        Number(style.opacity) < 0.01
+      )
+        return false;
+    }
+    return true;
+  };
+  const rectDistance = (point: { x: number; y: number }, box: DOMRect) =>
+    Math.hypot(
+      Math.max(box.left - point.x, point.x - box.right, 0),
+      Math.max(box.top - point.y, point.y - box.bottom, 0),
+    );
+  const inside = (point: { x: number; y: number }, box: DOMRect) =>
+    point.x > box.left + 1 &&
+    point.x < box.right - 1 &&
+    point.y > box.top + 1 &&
+    point.y < box.bottom - 1;
+  const contains = (box: DOMRect) =>
+    box.left >= viewport.left - 1 &&
+    box.right <= viewport.right + 1 &&
+    box.top >= viewport.top - 1 &&
+    box.bottom <= viewport.bottom + 1;
+  const overlap = (a: DOMRect, b: DOMRect) =>
+    a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top;
+  type Point = { x: number; y: number };
+  const crosses = (a: Point, b: Point, c: Point, d: Point) => {
+    const cross = (p: Point, q: Point, r: Point) =>
+      (q.x - p.x) * (r.y - p.y) - (q.y - p.y) * (r.x - p.x);
+    return (
+      Math.max(Math.min(a.x, b.x), Math.min(c.x, d.x)) <=
+        Math.min(Math.max(a.x, b.x), Math.max(c.x, d.x)) &&
+      Math.max(Math.min(a.y, b.y), Math.min(c.y, d.y)) <=
+        Math.min(Math.max(a.y, b.y), Math.max(c.y, d.y)) &&
+      cross(a, b, c) * cross(a, b, d) <= 0 &&
+      cross(c, d, a) * cross(c, d, b) <= 0
+    );
+  };
+  const routes = connections.map(({ id, source, target }) => {
+    const path = root.querySelector<SVGPathElement>(
+      `.diagram-edge[data-edge-id="${id}"] .edge-path`,
+    )!;
+    const label = root.querySelector<SVGGraphicsElement>(
+      `.edge-label-container[data-edge-id="${id}"]`,
+    )!;
+    const matrix = path.getScreenCTM()!;
+    const length = path.getTotalLength() * Math.hypot(matrix.a, matrix.b);
+    if (length === 0) throw new Error(`${id} visible nonempty paint: empty path`);
+    const count = Math.max(1, Math.ceil(length));
+    const points = Array.from({ length: count + 1 }, (_, index) => {
+      const point = path
+        .getPointAtLength((path.getTotalLength() * index) / count)
+        .matrixTransform(matrix);
+      return { x: point.x, y: point.y };
+    });
+    const start = points[0];
+    const end = points.at(-1)!;
+    const sourceBox = nodes.find((node) => node.id === source)!.bounds;
+    const targetBox = nodes.find((node) => node.id === target)!.bounds;
+    const labelBox = label.getBoundingClientRect();
+    const selfCrossing = points
+      .slice(1)
+      .some((end, index) =>
+        points
+          .slice(index + 3, -1)
+          .some((otherStart, offset) =>
+            crosses(points[index], end, otherStart, points[index + 4 + offset]),
+          ),
+      );
+    const left = Math.min(...points.map((point) => point.x));
+    const xSpan = Math.max(...points.map((point) => point.x)) - left;
+    const boundaryGap = (point: { x: number; y: number }, box: DOMRect) =>
+      Math.min(
+        Math.abs(point.x - box.left),
+        Math.abs(point.x - box.right),
+        Math.abs(point.y - box.top),
+        Math.abs(point.y - box.bottom),
+      );
+    return {
+      id,
+      points,
+      start,
+      end,
+      length,
+      xSpan,
+      selfCrossing,
+      sourceGap: inside(start, sourceBox)
+        ? Infinity
+        : rectDistance(start, sourceBox) + boundaryGap(start, sourceBox),
+      targetGap: inside(end, targetBox) ? Infinity : rectDistance(end, targetBox),
+      sourceSideMargin: Math.min(start.y - sourceBox.top, sourceBox.bottom - start.y),
+      targetSideMargin: Math.min(end.y - targetBox.top, targetBox.bottom - end.y),
+      verticalOrder: sourceBox.bottom < targetBox.top,
+      leftReturn: left < Math.min(sourceBox.left, targetBox.left) - 20,
+      simpleExcess: length - (Math.abs(end.y - start.y) + start.x - left + end.x - left),
+      moves: (path.getAttribute('d')?.match(/M/g) ?? []).length,
+      marker: path.getAttribute('marker-end'),
+      painted:
+        visible(path) &&
+        visible(label) &&
+        length > 0 &&
+        labelBox.width > 0 &&
+        labelBox.height > 0 &&
+        Boolean(label.textContent?.trim()),
+      finite: points.every((point) => Number.isFinite(point.x) && Number.isFinite(point.y)),
+      contained: contains(path.getBoundingClientRect()) && contains(labelBox),
+      nodeCrossings: nodes
+        .filter((node) => points.some((point) => inside(point, node.bounds)))
+        .map((node) => node.id),
+      labelNodeOverlaps: nodes
+        .filter((node) => overlap(labelBox, node.bounds))
+        .map((node) => node.id),
+      labelRouteGap: Math.min(...points.map((point) => rectDistance(point, labelBox))),
+    };
+  });
+  let separation = Infinity;
+  for (let index = 0; index < routes.length; index++) {
+    for (const other of routes.slice(index + 1)) {
+      for (const point of routes[index].points) {
+        for (const target of other.points) {
+          separation = Math.min(separation, Math.hypot(point.x - target.x, point.y - target.y));
+        }
+      }
+    }
+  }
+  return {
+    routes,
+    separation,
+    nodesContained:
+      nodes.length > 0 &&
+      nodes.every(
+        (node) =>
+          visible(node.element) &&
+          node.bounds.width > 0 &&
+          node.bounds.height > 0 &&
+          contains(node.bounds),
+      ),
+  };
+}
+
+function expectNarrowWalkthrough(geometry: ReturnType<typeof narrowWalkthroughGeometry>) {
+  expect(geometry.nodesContained).toBe(true);
+  expect(geometry.separation, 'painted reciprocal separation').toBeGreaterThanOrEqual(40);
+  for (const route of geometry.routes) {
+    expect(route.painted, `${route.id} visible nonempty paint`).toBe(true);
+    expect(route.finite).toBe(true);
+    expect(route.contained).toBe(true);
+    expect(route.sourceGap, `${route.id} source boundary`).toBeLessThanOrEqual(1);
+    expect(route.targetGap, `${route.id} target arrow gap`).toBeGreaterThanOrEqual(3);
+    expect(route.targetGap, `${route.id} target arrow gap`).toBeLessThanOrEqual(7);
+    expect(route.marker).toContain('arrowhead');
+    expect(route.moves).toBe(1);
+    expect(route.selfCrossing).toBe(false);
+    expect(route.simpleExcess, `${route.id} simple vertical/return path`).toBeLessThanOrEqual(1);
+    expect(route.nodeCrossings).toEqual([]);
+    expect(route.labelNodeOverlaps).toEqual([]);
+    expect(route.labelRouteGap).toBeLessThanOrEqual(1);
+  }
+}
+
+for (const mutation of ['coincident', 'crossing', 'detached', 'empty', 'hidden'] as const) {
+  test(`narrow walkthrough oracle rejects ${mutation} painted routes`, async ({ page }) => {
+    await openState(page, 'custom-walkthrough', 420, 'light');
+    const root = page.locator('#custom-walkthrough');
+    const connections = [
+      { id: 'w2', source: 'redux', target: 'chat' },
+      { id: 'w3', source: 'chat', target: 'redux' },
+    ];
+    expectNarrowWalkthrough(await root.evaluate(narrowWalkthroughGeometry, connections));
+    const original = await root.evaluate((root, mutation) => {
+      const paths = ['w2', 'w3'].map((id) =>
+        root.querySelector<SVGPathElement>(`.diagram-edge[data-edge-id="${id}"] .edge-path`)!,
+      );
+      const [first, second] = paths;
+      const path = mutation === 'coincident' || mutation === 'crossing' ? second : first;
+      const original = {
+        id: path.closest('[data-edge-id]')!.getAttribute('data-edge-id')!,
+        d: path.getAttribute('d')!,
+        transform: path.getAttribute('transform'),
+        style: path.getAttribute('style'),
+      };
+      if (mutation === 'coincident' || mutation === 'crossing') {
+        const matrix = first.getScreenCTM()!;
+        const inverse = second.getScreenCTM()!.inverse();
+        const start = first.getPointAtLength(0).matrixTransform(matrix);
+        const end = first.getPointAtLength(first.getTotalLength()).matrixTransform(matrix);
+        const screenPoints =
+          mutation === 'coincident'
+            ? [start, end]
+            : [
+                new DOMPoint(start.x - 50, (start.y + end.y) / 2),
+                new DOMPoint(start.x + 50, (start.y + end.y) / 2),
+              ];
+        const points = screenPoints.map((point) => point.matrixTransform(inverse));
+        path.setAttribute('d', `M ${points[0].x} ${points[0].y} L ${points[1].x} ${points[1].y}`);
+      } else if (mutation === 'detached') path.setAttribute('transform', 'translate(0 -20)');
+      else if (mutation === 'empty') path.setAttribute('d', '');
+      else path.style.visibility = 'hidden';
+      return original;
+    }, mutation);
+    try {
+      const reason =
+        mutation === 'coincident' || mutation === 'crossing'
+          ? /painted reciprocal separation/
+          : mutation === 'detached'
+            ? /source boundary/
+            : /visible nonempty paint/;
+      await expect(async () => {
+        expectNarrowWalkthrough(await root.evaluate(narrowWalkthroughGeometry, connections));
+      }).rejects.toThrow(reason);
+    } finally {
+      await root.evaluate((root, original) => {
+        const path = root.querySelector(`.diagram-edge[data-edge-id="${original.id}"] .edge-path`)!;
+        for (const name of ['d', 'transform', 'style'] as const) {
+          const value = original[name];
+          if (value === null) path.removeAttribute(name);
+          else path.setAttribute(name, value);
+        }
+      }, original);
+    }
+    expectNarrowWalkthrough(await root.evaluate(narrowWalkthroughGeometry, connections));
+  });
+}
+
 async function expectClientRequestLane(page: Page, identity: string) {
   const result = await page
     .locator('#mermaid-nested-groups svg[data-layout-settled="true"]')
@@ -1888,9 +2128,22 @@ for (const appearance of [
           dispatchMarker: route('w3').getAttribute('marker-end'),
         };
       });
-      expect(reciprocal.renderAbove).toBe(true);
-      expect(reciprocal.dispatchBelow).toBe(true);
-      expect(reciprocal.laneGap).toBeGreaterThanOrEqual(40);
+      if (width === 960) {
+        expect(reciprocal.renderAbove).toBe(true);
+        expect(reciprocal.dispatchBelow).toBe(true);
+        expect(reciprocal.laneGap).toBeGreaterThanOrEqual(40);
+      } else {
+        const narrow = await page
+          .locator('#custom-walkthrough')
+          .evaluate(narrowWalkthroughGeometry, [
+            { id: 'w2', source: 'redux', target: 'chat' },
+            { id: 'w3', source: 'chat', target: 'redux' },
+          ]);
+        expectNarrowWalkthrough(narrow);
+        expect(narrow.routes[0].verticalOrder).toBe(true);
+        expect(narrow.routes[0].xSpan).toBeLessThanOrEqual(1);
+        expect(narrow.routes[1].leftReturn).toBe(true);
+      }
       expect(reciprocal.renderMarker).toContain('arrowhead');
       expect(reciprocal.dispatchMarker).toContain('arrowhead');
 
@@ -1923,13 +2176,23 @@ for (const appearance of [
           reduxSideMargin: Math.min(end.y - redux.top, redux.bottom - end.y),
         };
       });
-      expect(direct.excessLength).toBeLessThanOrEqual(1);
-      expect(direct.verticalChange).toBeLessThanOrEqual(1);
-      expect(direct.sourceBoundaryGap).toBeLessThanOrEqual(1);
-      expect(direct.targetArrowGap).toBeGreaterThanOrEqual(3);
-      expect(direct.targetArrowGap).toBeLessThanOrEqual(7);
-      expect(direct.chatSideMargin).toBeGreaterThan(4);
-      expect(direct.reduxSideMargin).toBeGreaterThan(8);
+      if (width === 960) {
+        expect(direct.excessLength).toBeLessThanOrEqual(1);
+        expect(direct.verticalChange).toBeLessThanOrEqual(1);
+        expect(direct.sourceBoundaryGap).toBeLessThanOrEqual(1);
+        expect(direct.targetArrowGap).toBeGreaterThanOrEqual(3);
+        expect(direct.targetArrowGap).toBeLessThanOrEqual(7);
+        expect(direct.chatSideMargin).toBeGreaterThan(4);
+        expect(direct.reduxSideMargin).toBeGreaterThan(8);
+      } else {
+        const narrow = await page
+          .locator('#custom-walkthrough')
+          .evaluate(narrowWalkthroughGeometry, [{ id: 'w3', source: 'chat', target: 'redux' }]);
+        expectNarrowWalkthrough(narrow);
+        expect(narrow.routes[0].leftReturn).toBe(true);
+        expect(narrow.routes[0].sourceSideMargin).toBeGreaterThan(4);
+        expect(narrow.routes[0].targetSideMargin).toBeGreaterThan(8);
+      }
 
       await openState(page, 'mermaid-topology-stress', width, appearance.mode);
       const loop = await page
