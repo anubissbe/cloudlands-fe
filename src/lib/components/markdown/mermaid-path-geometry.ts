@@ -4283,7 +4283,7 @@ export function placeStateLabelsOnFinalRoutes(svg: SVGSVGElement, compact = fals
     const local = label.getBBox();
     const fractions = compact
       ? path.dataset.routeLabel === STATE_LABEL.requestFails
-        ? [0.0285]
+        ? [0.03]
         : [0.5, 0.25, 0.75, 0.15, 0.35, 0.65, 0.85]
       : [0.5, 0.25, 0.75];
     const ownSegments = routeSegments.find((route) => route.path === path)?.segments ?? [];

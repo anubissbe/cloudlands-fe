@@ -371,7 +371,11 @@ test('keeps the complex state machine compact with clear routes and idle actions
             rect: rect(element),
             routePathId: element.dataset.routePathId,
           }));
-        const paths = [...svg.querySelectorAll<SVGPathElement>('.edgePaths path')];
+        const paths = [
+          ...svg.querySelectorAll<SVGPathElement>(
+            '.edgePaths path, path.transition[data-edge="true"]',
+          ),
+        ];
         const pathPoints = paths.map((path) => {
           const length = path.getTotalLength();
           const matrix = path.getScreenCTM()!;
@@ -461,7 +465,7 @@ test('keeps the complex state machine compact with clear routes and idle actions
           nodesSeparated: states.every((state, index) =>
             states.slice(index + 1).every((other) => !intersects(state.rect, other.rect, 2)),
           ),
-          orthogonal: [...svg.querySelectorAll<SVGPathElement>('.edgePaths path')].every((path) => {
+          orthogonal: paths.every((path) => {
             const d = path.getAttribute('d') ?? '';
             return d.includes('L') && !/[CSA]/.test(d);
           }),
@@ -516,3 +520,42 @@ test('keeps the complex state machine compact with clear routes and idle actions
     await actionButton.blur();
   }
 });
+
+for (const theme of ['light', 'dark', 'nord'] as const) {
+  test(`keeps the narrow Request fails label clear of Starting in ${theme}`, async ({ page }) => {
+    await gotoPreview(
+      page,
+      `${baseUrl}/sandbox/diagram-workbench?state=mermaid-state&theme=${theme}&width=420&motion=reduced`,
+    );
+    await page.evaluate(() => document.fonts.ready);
+
+    const clearance = await page
+      .locator('[data-diagram-case="mermaid-state"] svg.statediagram')
+      .evaluate((svg) => {
+        const starting = [...svg.querySelectorAll<SVGGElement>('g.node.statediagram-state')].find(
+          (node) => node.textContent?.trim() === 'Starting',
+        )!;
+        const label = [...svg.querySelectorAll<SVGGElement>('.edgeLabels > .edgeLabel')].find(
+          (candidate) => candidate.textContent?.trim() === 'Request fails',
+        )!;
+        const routePathId = label.dataset.routePathId!;
+        const paintedPath = svg.querySelector<SVGPathElement>(
+          `.edgePaths #${CSS.escape(routePathId)}, path.transition[data-edge="true"]#${CSS.escape(routePathId)}`,
+        );
+        const stateRect = starting.getBoundingClientRect();
+        const labelRect = label.getBoundingClientRect();
+        return {
+          painted: Boolean(paintedPath),
+          gap: Math.max(
+            labelRect.left - stateRect.right,
+            stateRect.left - labelRect.right,
+            labelRect.top - stateRect.bottom,
+            stateRect.top - labelRect.bottom,
+          ),
+        };
+      });
+
+    expect(clearance.painted).toBe(true);
+    expect(clearance.gap).toBeGreaterThanOrEqual(2);
+  });
+}
