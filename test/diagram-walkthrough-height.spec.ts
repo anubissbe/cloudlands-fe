@@ -177,11 +177,14 @@ for (const width of [960, 662, 420]) {
         body: JSON.stringify({ steps, transitions }, null, 2),
         contentType: 'application/json',
       });
-      const tallestContent = Math.max(...steps.map((step) => step.contentHeight));
+      // Active-scene sizing intentionally changes height between steps. Bound each
+      // step's own whitespace, not a union or the first step's reserved frame.
       for (const step of steps) {
-        expect(step.height).toBeLessThanOrEqual(tallestContent + 140);
-        expect(step.height).toBeCloseTo(steps[0].height, 0);
-        expect(step.controlOffset).toBeCloseTo(steps[0].controlOffset, 0);
+        expect(step.height).toBeLessThanOrEqual(step.contentHeight + 140);
+        expect(step.controlOffset - step.footerOffset).toBeCloseTo(
+          steps[0].controlOffset - steps[0].footerOffset,
+          0,
+        );
         expect(step.fonts.length).toBeGreaterThanOrEqual(5);
         expect(Math.min(...step.fonts.map((font) => font.css))).toBeGreaterThanOrEqual(10);
         expect(Math.min(...step.fonts.map((font) => font.screen))).toBeGreaterThanOrEqual(10);
@@ -197,14 +200,12 @@ for (const width of [960, 662, 420]) {
       for (const samples of transitions) {
         expect(samples.every((sample) => sample.finitePaint)).toBe(true);
         expect(Math.max(...samples.map((sample) => sample.overflow))).toBeLessThanOrEqual(1);
-        expect(
-          Math.max(...samples.map((sample) => sample.height)) -
-            Math.min(...samples.map((sample) => sample.height)),
-        ).toBeLessThanOrEqual(1);
-        expect(
-          Math.max(...samples.map((sample) => sample.controlOffset)) -
-            Math.min(...samples.map((sample) => sample.controlOffset)),
-        ).toBeLessThanOrEqual(1);
+        const navigationOffsets = samples.map(
+          (sample) => sample.controlOffset - sample.footerOffset,
+        );
+        expect(Math.max(...navigationOffsets) - Math.min(...navigationOffsets)).toBeLessThanOrEqual(
+          1,
+        );
         if (motion === 'reduced')
           expect(samples.every((sample) => sample.animationCount === 0)).toBe(true);
         else expect(samples.some((sample) => sample.animationCount > 0)).toBe(true);

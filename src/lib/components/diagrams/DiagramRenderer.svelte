@@ -81,7 +81,6 @@
   let scrollContainerEl = $state<HTMLDivElement | null>(null);
   let scrollContainerWidth = $state<number | null>(null);
   let fontMeasurementRevision = $state(0);
-  let stateFrameHeight = $state(0);
 
   onMount(() => {
     let cancelled = false;
@@ -167,6 +166,7 @@
   let transitionRevision = 0;
   let motionPhase = $state<'settled' | 'camera' | 'exit' | 'scene'>('settled');
   let cameraAnimations: Animation[] = [];
+  let cameraSourceScale = $state(1);
 
   const CAMERA_MOTION_MS = 180;
   const CAMERA_MOTION_EASING = 'cubic-bezier(0.65, 0, 0.35, 1)';
@@ -180,9 +180,11 @@
   function captureCameraStage() {
     const camera = rendererEl?.querySelector<SVGSVGElement>('.diagram-svg-layer');
     const geometry = rendererEl?.querySelector<SVGGElement>('.diagram-geometry-motion');
+    const matrix = camera?.getScreenCTM?.();
     return {
       camera: camera ? getComputedStyle(camera).transform : null,
       geometry: geometry ? getComputedStyle(geometry).transform : null,
+      scale: matrix ? Math.hypot(matrix.a, matrix.b) : renderedScale,
     };
   }
 
@@ -763,73 +765,47 @@
   $effect(() => {
     fontMeasurementRevision;
     try {
-      const fullLayout = computeLayout(
-        diagram.model,
-        diagram.baseView,
+      // Lay out only the selected scene. Future steps must not reserve space or supply
+      // routing obstacles, and hidden members must not inflate an active group's frame.
+      const model = currentState
+        ? {
+            ...diagram.model,
+            nodes: diagram.model.nodes.filter((node) => visibleNodeIdSet.has(node.id)),
+            edges: diagram.model.edges.filter((edge) => visibleEdgeIds.includes(edge.id)),
+            groups: diagram.model.groups
+              ?.filter((group) => {
+                if (currentState.visibleGroups)
+                  return currentState.visibleGroups.includes(group.id);
+                const members = currentState.highlightedNodes?.length
+                  ? currentState.highlightedNodes
+                  : visibleNodeIds;
+                return group.nodeIds?.some(
+                  (id) => members.includes(id) && visibleNodeIdSet.has(id),
+                );
+              })
+              .map((group) => ({
+                ...group,
+                nodeIds: group.nodeIds?.filter((id) => visibleNodeIdSet.has(id)),
+              })),
+          }
+        : diagram.model;
+      layout = computeLayout(
+        model,
+        currentState
+          ? {
+              ...diagram.baseView,
+              layout: {
+                ...diagram.baseView.layout,
+                spacing: Math.min(
+                  diagram.baseView.layout.spacing ?? 80,
+                  usesCompactPresentation ? 40 : 56,
+                ),
+              },
+            }
+          : diagram.baseView,
         diagram.grammar,
         renderStyleConfig,
         layoutWidthLimit,
-      );
-      const stateLayouts = (diagram.states ?? []).map((state) => {
-        const nodeIds = new Set(state.visibleNodes ?? diagram.model.nodes.map((node) => node.id));
-        const edgeIds = new Set(state.visibleEdges ?? diagram.model.edges.map((edge) => edge.id));
-        const model = {
-          ...diagram.model,
-          nodes: diagram.model.nodes.filter((node) => nodeIds.has(node.id)),
-          edges: diagram.model.edges.filter(
-            (edge) => edgeIds.has(edge.id) && nodeIds.has(edge.from) && nodeIds.has(edge.to),
-          ),
-          groups: diagram.model.groups?.filter((group) =>
-            group.nodeIds?.some((nodeId) => nodeIds.has(nodeId)),
-          ),
-        };
-        const stateLayout = computeLayout(
-          model,
-          {
-            ...diagram.baseView,
-            layout: {
-              ...diagram.baseView.layout,
-              spacing: Math.min(
-                diagram.baseView.layout.spacing ?? 80,
-                usesCompactPresentation ? 40 : 56,
-              ),
-            },
-          },
-          diagram.grammar,
-          renderStyleConfig,
-          layoutWidthLimit,
-        );
-        return { state, layout: stateLayout };
-      });
-      layout = stateLayouts.find(({ state }) => state.id === currentStateId)?.layout ?? fullLayout;
-      // Reserve the largest step before navigation, not a growing, history-dependent height.
-      // Label centers lie on their routes; half a label on either side bounds their paint.
-      stateFrameHeight = Math.ceil(
-        Math.max(
-          0,
-          ...stateLayouts.map(({ state, layout }) => {
-            const labelHeight = Math.max(
-              0,
-              ...layout.edges.map((edge) =>
-                edge.label
-                  ? measureEdgeLabel(
-                      edge.label,
-                      usesCompactPresentation ? compactEdgeLabelMaxWidth(edge.label) : undefined,
-                    ).height
-                  : 0,
-              ),
-            );
-            const nodeWidth =
-              Math.max(1, ...layout.nodes.map((node) => node.x + node.width)) -
-              Math.min(0, ...layout.nodes.map((node) => node.x));
-            const zoom = state.camera?.zoom ?? 1;
-            const widthScale =
-              Math.max(1, (presentationWidth ?? 900) - 16) /
-              Math.max(1, (nodeWidth + canvasPadding * 2) * zoom);
-            const scale = zoom * Math.min(1.25, Math.max(readableScale, widthScale));
-            return (layout.bounds.height + labelHeight + canvasPadding * 2 + 6) * scale + 20;
-          }),
-        ),
       );
       layoutError = false;
       beginDiagramSettlement();
@@ -910,24 +886,9 @@
 
   // Apply camera transform (zoom + pan) to the diagram content
   let cameraTransformStyle = $derived.by(() => {
-    let panX = cameraPan?.x ?? 0;
-    let panY = cameraPan?.y ?? 0;
+    const panX = cameraPan?.x ?? 0;
+    const panY = cameraPan?.y ?? 0;
     if (automaticallyFitState) {
-      if (layout && visibleBounds && (heldNodes.length > 0 || departingNodes.length > 0)) {
-        // Aim at the next scene while leaving room for content that is still exiting.
-        const availableX = Math.max(0, ((presentationWidth ?? 0) - contentWidth) / 2 - 8);
-        const availableY = Math.max(0, (stateFrameHeight - contentHeight) / 2 - 8);
-        const targetX =
-          ((visibleBounds.minX + visibleBounds.maxX - layout.bounds.minX - layout.bounds.maxX) *
-            renderedScale) /
-          2;
-        const targetY =
-          ((visibleBounds.minY + visibleBounds.maxY - layout.bounds.minY - layout.bounds.maxY) *
-            renderedScale) /
-          2;
-        panX += Math.max(-availableX, Math.min(availableX, targetX));
-        panY += Math.max(-availableY, Math.min(availableY, targetY));
-      }
       return `scale(${renderedScale}) translate(calc(-50% + ${panX / renderedScale}px), calc(-50% + ${panY / renderedScale}px))`;
     }
     const transforms: string[] = [];
@@ -990,7 +951,7 @@
     const edges = [...visibleEdges, ...departingEdges, ...heldEdges];
     const groups = [...visibleGroups, ...departingGroups, ...heldGroups];
 
-    if (nodes.length === 0) return layout.bounds;
+    if (nodes.length === 0) return { minX: 0, minY: 0, maxX: 0, maxY: 0, width: 0, height: 0 };
 
     let minX = Math.min(...nodes.map((n) => n.x));
     let minY = Math.min(...nodes.map((n) => n.y));
@@ -1005,27 +966,15 @@
       maxY = Math.max(maxY, g.y + g.height);
     }
 
-    // Include visible edge points — but only those within a reasonable
-    // bounding box of the visible nodes. Edge routes from the full layout
-    // may extend far beyond visible nodes (e.g., orthogonal routing waypoints
-    // computed for all nodes), which would inflate bounds and cause scrollbars.
-    const nodesBounds = { minX, minY, maxX, maxY };
-    const edgeMargin = canvasPadding * 2;
-
+    // Every waypoint is painted, including perimeter turns outside the node envelope.
+    // Four scene units also contain the seven-unit marker and its rounded stroke.
     for (const edge of edges) {
       if (edge.points) {
         for (const point of edge.points) {
-          if (
-            point.x >= nodesBounds.minX - edgeMargin &&
-            point.x <= nodesBounds.maxX + edgeMargin &&
-            point.y >= nodesBounds.minY - edgeMargin &&
-            point.y <= nodesBounds.maxY + edgeMargin
-          ) {
-            minX = Math.min(minX, point.x);
-            minY = Math.min(minY, point.y);
-            maxX = Math.max(maxX, point.x);
-            maxY = Math.max(maxY, point.y);
-          }
+          minX = Math.min(minX, point.x - 4);
+          minY = Math.min(minY, point.y - 4);
+          maxX = Math.max(maxX, point.x + 4);
+          maxY = Math.max(maxY, point.y + 4);
         }
       }
     }
@@ -1057,6 +1006,15 @@
 
   let contentWidth = $derived(svgWidth * renderedScale);
   let contentHeight = $derived((svgHeight + 6) * renderedScale);
+  // Exit geometry contributes only until its animation completes; returning to a small
+  // scene then restores that scene's height rather than retaining the largest step.
+  let stateFrameHeight = $derived(
+    Math.ceil(
+      (svgHeight + 6) *
+        (motionPhase === 'camera' ? Math.max(cameraSourceScale, renderedScale) : renderedScale) +
+        20,
+    ),
+  );
 
   let svgTransform = $derived.by(() => {
     if (!visibleBounds) return 'translate(0, 0)';
@@ -1150,6 +1108,7 @@
   function changeState(stateId: string) {
     if (stateId === currentStateId) return;
     const previousCameraStage = captureCameraStage();
+    cameraSourceScale = previousCameraStage.scale;
     transitionRevision += 1;
     const revision = transitionRevision;
     const sourceNodes = renderedNodes;
@@ -1764,7 +1723,9 @@
   .diagram-footer {
     grid-column: 1;
     grid-row: 3;
-    position: relative;
+    position: sticky;
+    bottom: 0;
+    align-self: end;
     flex-shrink: 0;
     z-index: 1;
     box-sizing: border-box;
@@ -1820,6 +1781,15 @@
 
   .stateful-diagram.camera-stage :global(.group-label) {
     transition-delay: 0ms;
+  }
+
+  /* Once exits finish, changing the SVG origin and its containing frame is one
+     coordinate rebase, not another camera move. Interpolating only the origin
+     leaves entering paint outside the already-shrunken frame. Node/edge motion
+     remains independent; the deliberate camera stage still interpolates. */
+  .stateful-diagram:not(.camera-stage) .diagram-svg-layer,
+  .stateful-diagram:not(.camera-stage) .diagram-svg-layer > .diagram-geometry-motion {
+    transition: none;
   }
 
   :global(.edge-label-dimmed) {

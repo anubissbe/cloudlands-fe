@@ -87,6 +87,16 @@
     background: transparent;
   }
 
+  .diagram-presentation[data-diagram-kind='custom']:has(:global(.stateful-diagram)) {
+    width: 100%;
+  }
+
+  .diagram-presentation[data-diagram-kind='custom']:has(:global(.stateful-diagram))
+    > .diagram-presentation-content {
+    /* Keep canvas paint contained without intercepting the note's sticky scrollport. */
+    overflow: clip;
+  }
+
   .diagram-presentation-actions {
     display: flex;
     align-items: center;
