@@ -852,34 +852,150 @@ async function expectTerminalArrowGeometry(
   }
 }
 
-async function expectRunningToolClearance(page: Page, context: string) {
-  const result = await page
-    .locator('#mermaid-state svg[data-layout-settled=true]')
-    .evaluate((svg) => {
-      const label = [...svg.querySelectorAll<SVGGElement>('.edgeLabels > .edgeLabel')].find(
-        (candidate) => candidate.textContent?.replace(/\s+/g, ' ').trim() === 'Tool starts',
-      )!;
-      const path = svg.querySelector<SVGPathElement>(`#${CSS.escape(label.dataset.routePathId!)}`)!;
-      const surface = label.querySelector<SVGGraphicsElement>('rect.background')!;
-      const values = path.dataset.labelSegment!.match(/-?(?:\d+(?:\.\d*)?|\.\d+)/g)!.map(Number);
-      const matrix = path.getScreenCTM()!;
-      const first = new DOMPoint(values[0], values[1]).matrixTransform(matrix);
-      const last = new DOMPoint(values[2], values[3]).matrixTransform(matrix);
-      const bounds = surface.getBoundingClientRect();
-      const vertical = Math.abs(first.x - last.x) < Math.abs(first.y - last.y);
-      return {
-        settled: Boolean(label.dataset.finalPathCenter),
-        before: vertical
-          ? bounds.top - Math.min(first.y, last.y)
-          : bounds.left - Math.min(first.x, last.x),
-        after: vertical
-          ? Math.max(first.y, last.y) - bounds.bottom
-          : Math.max(first.x, last.x) - bounds.right,
-      };
-    });
+function runningToolGeometry(svg: Element) {
+  const unique = <T>(matches: T[], name: string): T => {
+    if (matches.length !== 1)
+      throw new Error(`Tool starts ${name}: expected 1, got ${matches.length}`);
+    return matches[0];
+  };
+  const label = unique(
+    [...svg.querySelectorAll<SVGGElement>('.edgeLabels > .edgeLabel')].filter(
+      (candidate) => candidate.textContent?.replace(/\s+/g, ' ').trim() === 'Tool starts',
+    ),
+    'label',
+  );
+  const paths = [...svg.querySelectorAll<SVGPathElement>('.edgePaths path, .edges.edgePath path')];
+  const path = unique(
+    paths.filter(
+      (candidate) =>
+        Boolean(label.dataset.routePathId) && candidate.id === label.dataset.routePathId,
+    ),
+    'routePathId',
+  );
+  const nativeLabel = unique(
+    [...label.querySelectorAll<SVGGElement>(':scope > .label[data-id]')],
+    'native label',
+  );
+  if (
+    !nativeLabel.dataset.id ||
+    path.dataset.id !== nativeLabel.dataset.id ||
+    unique(
+      paths.filter((candidate) => candidate.dataset.id === nativeLabel.dataset.id),
+      'native path',
+    ) !== path ||
+    unique(
+      paths.filter((candidate) => candidate.dataset.routeLabel === 'Tool starts'),
+      'routeLabel',
+    ) !== path
+  ) {
+    throw new Error('Tool starts native route ownership mismatch');
+  }
+  const surface = unique(
+    [
+      ...label.querySelectorAll<SVGGraphicsElement>(
+        'foreignObject.edge-label-surface, rect.background',
+      ),
+    ],
+    'label surface',
+  );
+  const painted = (element: Element) => {
+    for (let current: Element | null = element; current; current = current.parentElement) {
+      const style = getComputedStyle(current);
+      if (style.display === 'none' || style.visibility !== 'visible' || Number(style.opacity) === 0)
+        return false;
+    }
+    return element.isConnected;
+  };
+  const matrix = path.getScreenCTM();
+  const length = path.getTotalLength();
+  const bounds = surface.getBoundingClientRect();
+  if (
+    !matrix ||
+    !path.getAttribute('d')?.trim() ||
+    !Number.isFinite(length) ||
+    length <= 0 ||
+    !painted(path) ||
+    !painted(surface) ||
+    getComputedStyle(path).stroke === 'none' ||
+    bounds.width <= 0 ||
+    bounds.height <= 0
+  ) {
+    throw new Error('Tool starts requires a measurable painted path and label surface');
+  }
+  const scaleBound = Math.hypot(matrix.a, matrix.b, matrix.c, matrix.d);
+  if (!Number.isFinite(scaleBound) || scaleBound <= 0) throw new Error('Tool starts invalid CTM');
+  // Sample actual path paint at <=0.1 CSS px, including both endpoints. Neither
+  // labelSegment nor manhattanPoints is authoritative after terminal-gap trimming.
+  const count = Math.max(1, Math.ceil((length * scaleBound) / 0.1));
+  const points = Array.from({ length: count + 1 }, (_, index) =>
+    path.getPointAtLength((length * index) / count).matrixTransform(matrix),
+  );
+  if (points.some((point) => !Number.isFinite(point.x) || !Number.isFinite(point.y))) {
+    throw new Error('Tool starts nonfinite rendered geometry');
+  }
+  const inside = points.flatMap((point, index) =>
+    point.x >= bounds.left &&
+    point.x <= bounds.right &&
+    point.y >= bounds.top &&
+    point.y <= bounds.bottom
+      ? [index]
+      : [],
+  );
+  if (inside.length < 2 || inside.at(-1)! - inside[0] + 1 !== inside.length) {
+    throw new Error('Tool starts requires one continuous path crossing its label surface');
+  }
+  const entry = points[inside[0]];
+  const exit = points[inside.at(-1)!];
+  const vertical = Math.abs(exit.y - entry.y) > Math.abs(exit.x - entry.x);
+  const axis = vertical ? 'y' : 'x';
+  const cross = vertical ? 'x' : 'y';
+  if (inside.some((index) => Math.abs(points[index][cross] - entry[cross]) > 0.01)) {
+    throw new Error('Tool starts label crossing is not axis-aligned');
+  }
+  // Stop at the nearest bend or actual endpoint, never at a removed terminal segment.
+  let first = inside[0];
+  let last = inside.at(-1)!;
+  while (first > 0 && Math.abs(points[first - 1][cross] - entry[cross]) <= 0.01) first--;
+  while (last < count && Math.abs(points[last + 1][cross] - exit[cross]) <= 0.01) last++;
+  const forward = exit[axis] > entry[axis];
+  const low = vertical ? bounds.top : bounds.left;
+  const high = vertical ? bounds.bottom : bounds.right;
+  const plainPoint = (point: DOMPoint) => ({ x: point.x, y: point.y });
+  return {
+    settled: Boolean(label.dataset.finalPathCenter),
+    pathId: path.id,
+    routePathId: label.dataset.routePathId,
+    nativePathId: path.dataset.id,
+    nativeLabelId: nativeLabel.dataset.id,
+    routeLabel: path.dataset.routeLabel,
+    surface: surface.tagName,
+    bounds: { left: bounds.left, right: bounds.right, top: bounds.top, bottom: bounds.bottom },
+    matrix: { a: matrix.a, b: matrix.b, c: matrix.c, d: matrix.d, e: matrix.e, f: matrix.f },
+    d: path.getAttribute('d'),
+    labelSegment: path.dataset.labelSegment,
+    pathStart: plainPoint(points[0]),
+    pathEnd: plainPoint(points[count]),
+    segmentStart: plainPoint(points[first]),
+    segmentEnd: plainPoint(points[last]),
+    before: forward ? low - points[first][axis] : points[first][axis] - high,
+    after: forward ? points[last][axis] - high : low - points[last][axis],
+  };
+}
+
+function expectRunningToolGeometry(
+  result: ReturnType<typeof runningToolGeometry>,
+  context: string,
+) {
   expect(result.settled, `${context} final label placement`).toBe(true);
   expect(result.before, `${context} visible segment after turn`).toBeGreaterThanOrEqual(7.75);
   expect(result.after, `${context} visible outgoing stub`).toBeGreaterThanOrEqual(7.75);
+}
+
+async function expectRunningToolClearance(page: Page, context: string) {
+  const result = await page
+    .locator('#mermaid-state svg[data-layout-settled=true]')
+    .evaluate(runningToolGeometry);
+  expectRunningToolGeometry(result, context);
 }
 
 async function expectStateObstacleGeometry(page: Page, context: string) {
@@ -2507,6 +2623,121 @@ const stateRecoveryTargets = {
   '5': '',
 };
 
+for (const width of [320, 960] as const) {
+  test(`keeps Tool starts rendered label stubs clear at ${width}px`, async ({ page }) => {
+    await openState(page, 'mermaid-state', width, 'light');
+    const svg = page.locator('#mermaid-state svg[data-layout-settled=true]');
+    const result = await svg.evaluate(runningToolGeometry);
+    await test.info().attach('tool-starts-geometry', {
+      body: JSON.stringify(result, null, 2),
+      contentType: 'application/json',
+    });
+    await svg.screenshot({ path: test.info().outputPath('tool-starts.png') });
+    expectRunningToolGeometry(result, `${width}px Tool starts`);
+  });
+}
+
+test('Tool starts oracle rejects a shortened rendered shaft with stale pre-trim metadata', async ({
+  page,
+}) => {
+  await openState(page, 'mermaid-state', 960, 'light');
+  const svg = page.locator('#mermaid-state svg[data-layout-settled=true]');
+  const control = await svg.evaluate(runningToolGeometry);
+  expectRunningToolGeometry(control, 'unmodified control');
+  const staleOutgoing = await svg.evaluate((element, geometry) => {
+    const path = element.querySelector<SVGPathElement>(`#${CSS.escape(geometry.pathId)}`)!;
+    const matrix = path.getScreenCTM()!;
+    const length = path.getTotalLength();
+    const vertical =
+      Math.abs(geometry.segmentEnd.y - geometry.segmentStart.y) >
+      Math.abs(geometry.segmentEnd.x - geometry.segmentStart.x);
+    const axis = vertical ? 'y' : 'x';
+    const cross = vertical ? 'x' : 'y';
+    const direction = Math.sign(geometry.segmentEnd[axis] - geometry.segmentStart[axis]);
+    const low = vertical ? geometry.bounds.top : geometry.bounds.left;
+    const high = vertical ? geometry.bounds.bottom : geometry.bounds.right;
+    const boundary = direction > 0 ? high : low;
+    const target = boundary + direction * 2;
+    // Cut the real route two CSS pixels past the label exit, even when another
+    // bend separates that label segment from the final terminal.
+    const samples = Math.ceil((length * Math.hypot(matrix.a, matrix.b, matrix.c, matrix.d)) / 0.05);
+    let shortenedLength = 0;
+    let nearest = Infinity;
+    for (let index = 0; index <= samples; index++) {
+      const distance = (length * index) / samples;
+      const point = path.getPointAtLength(distance).matrixTransform(matrix);
+      const error = Math.hypot(point[axis] - target, point[cross] - geometry.segmentEnd[cross]);
+      if (error < nearest) {
+        nearest = error;
+        shortenedLength = distance;
+      }
+    }
+    if (nearest > 0.1) throw new Error('Cannot locate rendered label-exit cut point');
+    const count = Math.ceil(shortenedLength / 0.1);
+    const points = Array.from({ length: count + 1 }, (_, index) =>
+      path.getPointAtLength((shortenedLength * index) / count),
+    );
+    path.setAttribute(
+      'd',
+      points.map((point, index) => `${index ? 'L' : 'M'}${point.x},${point.y}`).join(''),
+    );
+    // Preserve the metadata exactly: the old oracle would still accept this route.
+    const values = path.dataset.labelSegment!.match(/-?(?:\d+(?:\.\d*)?|\.\d+)/g)!.map(Number);
+    const staleEnd = new DOMPoint(values[2], values[3]).matrixTransform(matrix);
+    return direction * (staleEnd[axis] - boundary);
+  }, control);
+  expect(staleOutgoing, 'pre-trim metadata would pass').toBeGreaterThanOrEqual(7.75);
+  const shortened = await svg.evaluate(runningToolGeometry);
+  expect(shortened.labelSegment).toBe(control.labelSegment);
+  expect(shortened.d).not.toBe(control.d);
+  expect(shortened.after, 'actual shaft was shortened').toBeLessThan(7.75);
+  await test.info().attach('tool-starts-stale-metadata', {
+    body: JSON.stringify({ control, staleOutgoing, shortened }, null, 2),
+    contentType: 'application/json',
+  });
+  await svg.screenshot({ path: test.info().outputPath('tool-starts-shortened.png') });
+  await expect(expectRunningToolClearance(page, 'shortened shaft')).rejects.toThrow(
+    /visible outgoing stub/,
+  );
+});
+
+for (const mutation of [
+  'missing-label',
+  'duplicate-label',
+  'missing-path',
+  'duplicate-path',
+  'wrong-native-id',
+  'wrong-route-label',
+  'missing-surface',
+] as const) {
+  test(`Tool starts oracle rejects ${mutation} ownership`, async ({ page }) => {
+    await openState(page, 'mermaid-state', 960, 'light');
+    const svg = page.locator('#mermaid-state svg[data-layout-settled=true]');
+    const control = await svg.evaluate(runningToolGeometry);
+    expectRunningToolGeometry(control, 'unmodified control');
+    await svg.evaluate(
+      (element, { mutation, pathId }) => {
+        const label = element.querySelector<SVGGElement>(`[data-route-path-id="${pathId}"]`)!;
+        const path = element.querySelector<SVGPathElement>(`#${CSS.escape(pathId)}`)!;
+        if (mutation === 'missing-label') label.remove();
+        if (mutation === 'duplicate-label') label.parentElement!.append(label.cloneNode(true));
+        if (mutation === 'missing-path') path.remove();
+        if (mutation === 'duplicate-path') path.parentElement!.append(path.cloneNode(true));
+        if (mutation === 'wrong-native-id') path.dataset.id = 'wrong-edge';
+        if (mutation === 'wrong-route-label') path.dataset.routeLabel = 'wrong-label';
+        if (mutation === 'missing-surface')
+          label
+            .querySelector('foreignObject.edge-label-surface')!
+            .classList.remove('edge-label-surface');
+      },
+      { mutation, pathId: control.pathId },
+    );
+    await expect(svg.evaluate(runningToolGeometry)).rejects.toThrow(
+      /Tool starts (label|routePathId|native route ownership|routeLabel)/,
+    );
+  });
+}
+
 test('terminal arrow discovery supports Mermaid flowchart rendered groups', async ({ page }) => {
   await openState(page, 'mermaid-flow', 320, 'light');
   await expectTerminalArrowGeometry(page, 'mermaid-flow', {
@@ -2522,7 +2753,7 @@ test('terminal arrow discovery rejects missing, empty, and detached state paths'
   page,
 }) => {
   test.setTimeout(120_000);
-  const pathSelector = '#mermaid-state-recovery .edges.edgePath path[marker-end]';
+  const pathSelector = '.edgePaths path[marker-end], .edges.edgePath path[marker-end]';
   const mutations = [
     { name: 'missing', apply: 'missing-marker', error: /toHaveCount|to have count/ },
     { name: 'empty', apply: 'empty-path', error: /nonempty rendered path/ },
@@ -2531,7 +2762,7 @@ test('terminal arrow discovery rejects missing, empty, and detached state paths'
 
   for (const mutation of mutations) {
     await openState(page, 'mermaid-state-recovery', 320, 'light');
-    const paths = page.locator(pathSelector);
+    const paths = page.locator('#mermaid-state-recovery').locator(pathSelector);
     await expect(paths, `${mutation.name} control precondition`).toHaveCount(6);
     await paths.first().evaluate((path, apply) => {
       if (apply === 'missing-marker') path.removeAttribute('marker-end');
@@ -2550,7 +2781,7 @@ test('keeps state terminal clearance idempotent through repeated auto-fit resize
   test.setTimeout(120_000);
   await openState(page, 'mermaid-state-recovery', 320, 'light');
   const root = page.locator('#mermaid-state-recovery');
-  const paths = root.locator('.edges.edgePath path[marker-end]');
+  const paths = root.locator('.edgePaths path[marker-end], .edges.edgePath path[marker-end]');
   await expect(paths).toHaveCount(6);
   await expect(root.locator('g.node[id*="root_start"]')).toHaveCount(1);
   await expect(root.locator('g.node[id*="root_end"]')).toHaveCount(1);
