@@ -47,6 +47,7 @@ type Frame = {
   labelDistance: number | null;
   overflow: number;
   camera: string;
+  cameraPose: number[];
   footerOffset: number;
   motionPhase: string;
   cameraAnimationCount: number;
@@ -109,17 +110,13 @@ async function recordControlMotion(page: Page, rootId: string, direction: 'forwa
     edgeIds: [...element.querySelectorAll<HTMLElement>('.diagram-edge')].map(
       (edge) => edge.dataset.edgeId,
     ),
+    camera: getComputedStyle(element.querySelector('.diagram-svg-layer')!).transform,
+    geometry: getComputedStyle(element.querySelector('.diagram-geometry-motion')!).transform,
   }));
   const renderer = await root.locator('.diagram-renderer').elementHandle();
-  await root
-    .locator('.diagram-nav-button')
-    .nth(direction === 'forward' ? 1 : 0)
-    .click();
-  const frames = [];
-  const deadline = Date.now() + 2_500;
-  while (Date.now() < deadline) {
-    frames.push(
-      await root.evaluate((element, before) => {
+  const recorder = await root.evaluateHandle(
+    (element, { before, direction }) => {
+      const read = () => {
         const diagram = element.querySelector<HTMLElement>('.diagram-renderer')!;
         const camera = element.querySelector<SVGSVGElement>('.diagram-svg-layer')!;
         const geometry = element.querySelector<SVGGElement>('.diagram-geometry-motion')!;
@@ -199,6 +196,7 @@ async function recordControlMotion(page: Page, rootId: string, direction: 'forwa
           phase: diagram.dataset.diagramMotionPhase,
           settled: diagram.dataset.diagramSettled === 'true',
           camera: getComputedStyle(camera).transform,
+          geometry: getComputedStyle(geometry).transform,
           cameraAnimationCount: cameraAnimations.length,
           cameraDurations: cameraAnimations.map((animation) =>
             Number(animation.effect?.getTiming().duration),
@@ -226,13 +224,39 @@ async function recordControlMotion(page: Page, rootId: string, direction: 'forwa
             Number(edge.dataset.edgeMotionProgress),
           ),
         };
-      }, baseline),
-    );
-    if (frames.at(-1)!.settled && frames.length > 1) break;
-    await page.evaluate(
-      () => new Promise<void>((resolve) => requestAnimationFrame(() => resolve())),
-    );
-  }
+      };
+      const finished = new Promise<ReturnType<typeof read>[]>((resolve) => {
+        const button =
+          element.querySelectorAll('.diagram-nav-button')[direction === 'forward' ? 1 : 0];
+        window.addEventListener(
+          'click',
+          async (event) => {
+            if (!(event.target instanceof Node) || !button.contains(event.target))
+              throw new Error('Unexpected control click while recording diagram motion');
+            // Observe after Svelte's delegated handler, not at the button where a
+            // native event's microtask checkpoint can still precede delegation.
+            await Promise.resolve();
+            const frames = [read()];
+            const deadline = performance.now() + 2_500;
+            do {
+              await new Promise<void>((next) => requestAnimationFrame(() => next()));
+              frames.push(read());
+            } while (!frames.at(-1)!.settled && performance.now() < deadline);
+            resolve(frames);
+          },
+          { once: true },
+        );
+      });
+      return { finished };
+    },
+    { before: baseline, direction },
+  );
+  await root
+    .locator('.diagram-nav-button')
+    .nth(direction === 'forward' ? 1 : 0)
+    .click();
+  const frames = await recorder.evaluate(async ({ finished }) => finished);
+  await recorder.dispose();
   return {
     baseline,
     frames,
@@ -483,6 +507,18 @@ async function recordTransition(page: Page, rootId: string, buttonName: string, 
           labelDistance,
           overflow: viewport.scrollWidth - viewport.clientWidth,
           camera: `${getComputedStyle(camera).transform}|${getComputedStyle(geometry).transform}`,
+          cameraPose: (() => {
+            const matrix = camera.getScreenCTM()!;
+            const bounds = renderer.getBoundingClientRect();
+            return [
+              matrix.a,
+              matrix.b,
+              matrix.c,
+              matrix.d,
+              matrix.e - bounds.x,
+              matrix.f - bounds.y,
+            ];
+          })(),
           footerOffset:
             footer.getBoundingClientRect().bottom - renderer.getBoundingClientRect().bottom,
           motionPhase: renderer.dataset.diagramMotionPhase ?? '',
@@ -671,12 +707,9 @@ function isBetween(value: number, start: number, end: number) {
 }
 
 function cameraMatrix(frame: Frame) {
-  const values = frame.camera
-    .split('|')[0]
-    .match(/-?(?:\d+(?:\.\d*)?|\.\d+)/g)
-    ?.map(Number);
-  if (!values || values.length !== 6) throw new Error(`Invalid camera matrix: ${frame.camera}`);
-  return values;
+  if (frame.cameraPose.length !== 6 || !frame.cameraPose.every(Number.isFinite))
+    throw new Error(`Invalid camera pose: ${frame.cameraPose}`);
+  return frame.cameraPose;
 }
 
 function cameraProgress(start: Frame, current: Frame, end: Frame) {
@@ -746,6 +779,28 @@ function expectFixedFooter(transition: Awaited<ReturnType<typeof recordTransitio
   }
 }
 
+function expectUnchangedCameraBeforeScene(
+  transition: Awaited<ReturnType<typeof recordTransition>>,
+) {
+  expect(transition.afterClick.motionPhase).toBe('exit');
+  expect(transition.afterClick.cameraAnimationCount).toBe(0);
+  expect(transition.afterClick.camera).toBe(transition.before.camera);
+  expect(transition.cameraFrames).toHaveLength(0);
+  expect(
+    Math.hypot(
+      transition.afterClick.anchor.x - transition.before.anchor.x,
+      transition.afterClick.anchor.y - transition.before.anchor.y,
+    ),
+  ).toBeLessThanOrEqual(1);
+  const scene = transition.samples.findIndex((frame) => frame.motionPhase === 'scene');
+  expect(scene).toBeGreaterThan(0);
+  expect(
+    transition.samples
+      .slice(0, scene)
+      .every((frame) => frame.motionPhase === 'exit' && frame.entranceOpacity === 0),
+  ).toBe(true);
+}
+
 function expectCameraInterpolation(transition: Awaited<ReturnType<typeof recordTransition>>) {
   expect(transition.start.camera).not.toBe(transition.settled.camera);
   expect(
@@ -756,7 +811,8 @@ function expectCameraInterpolation(transition: Awaited<ReturnType<typeof recordT
   ).toBe(true);
   expect(
     transition.cameraFrames.some((frame) => {
-      const progress = cameraProgress(transition.before, frame, transition.settled);
+      // Camera interpolation ends before the scene's content/origin rebase.
+      const progress = cameraProgress(transition.before, frame, transition.afterCamera);
       return progress > 0.15 && progress < 0.85;
     }),
   ).toBe(true);
@@ -918,7 +974,13 @@ test('keeps explicit full motion active for every stepped sandbox control', asyn
           Object.keys(transition.frames[0][key]).some((id) => !(id in settledFrame[key])),
         );
         if (hasDepartingContent) {
-          expect(exitIndex).toBeGreaterThan(0);
+          if (exitIndex === 0 && cameraFrames.length === 0) {
+            expect(transition.frames[0].cameraAnimationCount).toBe(0);
+            expect(transition.frames[0].camera).toBe(transition.baseline.camera);
+            expect(transition.frames[0].geometry).toBe(transition.baseline.geometry);
+          } else {
+            expect(exitIndex).toBeGreaterThan(0);
+          }
           expect(sceneIndex).toBeGreaterThan(exitIndex);
         }
         const lifecycle = (
@@ -1175,7 +1237,9 @@ test('coordinates architecture and ownership state motion through settled frames
         frame.exitingReveal < 1,
     ),
   ).toBe(true);
-  expectCameraBeforeScene(architecture31);
+  // Observe already fits the union camera: this reverse jump needs only exit
+  // and scene motion, not a fabricated camera animation.
+  expectUnchangedCameraBeforeScene(architecture31);
   expectFixedFooter(architecture31);
 
   await openMotionFixture(page, 'custom-walkthrough');
@@ -1224,7 +1288,8 @@ test('coordinates architecture and ownership state motion through settled frames
     ),
   ).toBe(true);
   expect(ownership23.settled.exitingReveal).toBeNull();
-  expectCameraBeforeScene(ownership23);
+  // Execute and Render share the union camera; retain explicit no-camera checks.
+  expectUnchangedCameraBeforeScene(ownership23);
   expectFrameGeometry(ownership23.settled);
   expectFixedFooter(ownership23);
   const ownershipStable = await readStableSignature(page, 'custom-walkthrough');
@@ -1249,16 +1314,26 @@ test('coordinates architecture and ownership state motion through settled frames
   await expect(root.locator('.diagram-scroll-container')).toHaveJSProperty('scrollLeft', 0);
   expect(await readStableSignature(page, 'custom-architecture')).toEqual(architectureStable);
 
-  await root
-    .getByRole('button', { name: 'State 2: 2. Follow the data' })
-    .evaluate((node) => (node as HTMLButtonElement).click());
-  await expect(root.locator('.diagram-renderer')).toHaveAttribute(
-    'data-diagram-motion-phase',
-    'camera',
-  );
-  await root
-    .getByRole('button', { name: 'State 1: 1. Start in the workbench' })
-    .evaluate((node) => (node as HTMLButtonElement).click());
+  const interruptedExit = await root.evaluate((element) => {
+    const diagram = element.querySelector<HTMLElement>('.diagram-renderer')!;
+    const camera = element.querySelector<SVGSVGElement>('.diagram-svg-layer')!;
+    const before = getComputedStyle(camera).transform;
+    element.querySelector<HTMLButtonElement>('[data-diagram-step-index="1"]')!.click();
+    const interrupted = {
+      phase: diagram.dataset.diagramMotionPhase,
+      settled: diagram.dataset.diagramSettled,
+      unchangedCamera: getComputedStyle(camera).transform === before,
+      cameraAnimations: camera.getAnimations().length,
+    };
+    element.querySelector<HTMLButtonElement>('[data-diagram-step-index="0"]')!.click();
+    return interrupted;
+  });
+  expect(interruptedExit).toEqual({
+    phase: 'exit',
+    settled: 'false',
+    unchangedCamera: true,
+    cameraAnimations: 0,
+  });
   await expect(root.locator('.diagram-renderer')).toHaveAttribute('data-diagram-settled', 'true');
   await expect(root.locator('.diagram-renderer')).toHaveAttribute('data-diagram-state', 'orient');
   expect(await readStableSignature(page, 'custom-architecture')).toEqual(architectureOrient);

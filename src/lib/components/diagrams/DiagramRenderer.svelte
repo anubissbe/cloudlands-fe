@@ -185,6 +185,9 @@
     return {
       camera: camera ? getComputedStyle(camera).transform : null,
       geometry: geometry ? getComputedStyle(geometry).transform : null,
+      screenMatrix: matrix
+        ? new DOMMatrix([matrix.a, matrix.b, matrix.c, matrix.d, matrix.e, matrix.f])
+        : null,
       scale: matrix ? Math.hypot(matrix.a, matrix.b) : renderedScale,
     };
   }
@@ -199,7 +202,27 @@
       if (!element || !previousTransform) return [];
       for (const animation of element.getAnimations({ subtree: false })) animation.cancel();
       const nextTransform = getComputedStyle(element).transform;
-      const keyframes = cameraMotionKeyframes(previousTransform, nextTransform);
+      let startTransform = previousTransform;
+      if (element === elements[0][0] && previous.screenMatrix) {
+        const screen = element.getScreenCTM();
+        if (screen) {
+          // The centered SVG's layout origin moves when the content-derived frame
+          // changes height. Rebase its old screen pose into the new parent space.
+          const current = new DOMMatrix([
+            screen.a,
+            screen.b,
+            screen.c,
+            screen.d,
+            screen.e,
+            screen.f,
+          ]);
+          startTransform = new DOMMatrix(nextTransform)
+            .multiply(current.inverse())
+            .multiply(previous.screenMatrix)
+            .toString();
+        }
+      }
+      const keyframes = cameraMotionKeyframes(startTransform, nextTransform);
       if (keyframes.length === 0) return [];
       const animation = element.animate(keyframes, {
         duration: CAMERA_MOTION_MS,
@@ -768,26 +791,33 @@
     try {
       // Lay out only the selected scene. Future steps must not reserve space or supply
       // routing obstacles, and hidden members must not inflate an active group's frame.
+      const groups = currentState
+        ? diagram.model.groups
+            ?.filter((group) => {
+              if (currentState.visibleGroups) return currentState.visibleGroups.includes(group.id);
+              const members = currentState.highlightedNodes?.length
+                ? currentState.highlightedNodes
+                : visibleNodeIds;
+              return group.nodeIds?.some((id) => members.includes(id) && visibleNodeIdSet.has(id));
+            })
+            .map((group) => ({
+              ...group,
+              nodeIds: group.nodeIds?.filter((id) => visibleNodeIdSet.has(id)),
+            }))
+        : diagram.model.groups;
+      const groupIds = new Set(groups?.map((group) => group.id));
       const model = currentState
         ? {
             ...diagram.model,
-            nodes: diagram.model.nodes.filter((node) => visibleNodeIdSet.has(node.id)),
+            // Hiding a group frame must not hide its still-visible members. The
+            // layout engine positions nodes only within groups in this model.
+            nodes: diagram.model.nodes
+              .filter((node) => visibleNodeIdSet.has(node.id))
+              .map((node) =>
+                node.group && !groupIds.has(node.group) ? { ...node, group: undefined } : node,
+              ),
             edges: diagram.model.edges.filter((edge) => visibleEdgeIds.includes(edge.id)),
-            groups: diagram.model.groups
-              ?.filter((group) => {
-                if (currentState.visibleGroups)
-                  return currentState.visibleGroups.includes(group.id);
-                const members = currentState.highlightedNodes?.length
-                  ? currentState.highlightedNodes
-                  : visibleNodeIds;
-                return group.nodeIds?.some(
-                  (id) => members.includes(id) && visibleNodeIdSet.has(id),
-                );
-              })
-              .map((group) => ({
-                ...group,
-                nodeIds: group.nodeIds?.filter((id) => visibleNodeIdSet.has(id)),
-              })),
+            groups,
           }
         : diagram.model;
       layout = computeLayout(
