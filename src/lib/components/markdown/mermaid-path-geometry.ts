@@ -4399,15 +4399,63 @@ export function rewriteStateRoutes(svg: SVGSVGElement, compact = false) {
   return { x: minX, y: minY, width: maxX - minX, height: maxY - minY };
 }
 
+type StateLabelPathCandidate = {
+  id: string;
+  nativeId?: string;
+  intersectsLabel: boolean;
+};
+
+export function chooseStateLabelPathIndex(
+  label: { nativeId?: string; routePathId?: string },
+  paths: StateLabelPathCandidate[],
+) {
+  if (label.nativeId) {
+    const matches = paths.flatMap((path, index) =>
+      path.nativeId === label.nativeId ? [index] : [],
+    );
+    if (matches.length) return matches.length === 1 ? matches[0] : null;
+  }
+  if (label.routePathId) {
+    const matches = paths.flatMap((path, index) => (path.id === label.routePathId ? [index] : []));
+    if (matches.length) return matches.length === 1 ? matches[0] : null;
+  }
+  const intersections = paths.flatMap((path, index) => (path.intersectsLabel ? [index] : []));
+  return intersections.length === 1 ? intersections[0] : null;
+}
+
+function statePathIntersectsLabel(path: SVGPathElement, label: SVGGElement) {
+  const bounds = clientBoundsInPathSpace(label, path);
+  const length = path.getTotalLength();
+  if (!bounds || !length) return false;
+  const step = Math.max(1, Math.min(bounds.width, bounds.height) / 4);
+  const samples = Math.max(16, Math.min(2048, Math.ceil(length / step)));
+  return Array.from({ length: samples + 1 }, (_, index) =>
+    path.getPointAtLength((length * index) / samples),
+  ).some((point) => distanceToBounds(point, bounds) <= 0.5);
+}
+
 export function repairUpwardStateFailureRoutes(svg: SVGSVGElement) {
   if (!svg.classList.contains('statediagram')) return;
   const paths = [
     ...svg.querySelectorAll<SVGPathElement>('.edgePaths path, path.transition[data-edge="true"]'),
   ];
   const labels = [...svg.querySelectorAll<SVGGElement>('.edgeLabels > .edgeLabel')];
-  paths.forEach((path, index) => {
-    const label = labels[index];
-    if (label?.textContent?.replace(/\s+/g, ' ').trim().toLowerCase() !== 'fail') return;
+  const claimed = new Set<SVGPathElement>();
+  labels.forEach((label) => {
+    if (label.textContent?.replace(/\s+/g, ' ').trim().toLowerCase() !== 'fail') return;
+    const nativeId = label
+      .querySelector<SVGGraphicsElement>(':scope > .label[data-id]')
+      ?.getAttribute('data-id');
+    const pathIndex = chooseStateLabelPathIndex(
+      { nativeId: nativeId ?? undefined, routePathId: label.dataset.routePathId },
+      paths.map((path) => ({
+        id: path.id,
+        nativeId: path.dataset.id,
+        intersectsLabel: statePathIntersectsLabel(path, label),
+      })),
+    );
+    const path = pathIndex === null ? undefined : paths[pathIndex];
+    if (!path || claimed.has(path)) return;
     const length = path.getTotalLength();
     if (!length) return;
     const start = path.getPointAtLength(0);
@@ -4435,7 +4483,9 @@ export function repairUpwardStateFailureRoutes(svg: SVGSVGElement) {
       { x, y: source.bounds.y },
       { x, y: target.bounds.y + target.bounds.height },
     ];
-    path.setAttribute('d', `M${points[0].x},${points[0].y}L${points[1].x},${points[1].y}`);
+    const pathData = `M${points[0].x},${points[0].y}L${points[1].x},${points[1].y}`;
+    path.setAttribute('d', pathData);
+    path.dataset.terminalGapBasePath = pathData;
     path.dataset.manhattanPoints = points.map((point) => `${point.x},${point.y}`).join(' ');
     path.dataset.manhattanSegments = '1';
     path.dataset.labelSegment = `${points[0].x},${points[0].y} ${points[1].x},${points[1].y}`;
@@ -4443,6 +4493,7 @@ export function repairUpwardStateFailureRoutes(svg: SVGSVGElement) {
     path.dataset.terminalTarget = target.node.id;
     path.dataset.terminalDirection = '0,-1';
     label.dataset.routePathId = path.id;
+    claimed.add(path);
   });
 }
 

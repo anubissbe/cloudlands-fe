@@ -951,27 +951,158 @@ async function expectStateFailureTerminal(page: Page, context: string) {
     .locator('#mermaid-state-recovery svg[data-layout-settled=true]')
     .evaluate((svg) => {
       const labels = [...svg.querySelectorAll<SVGGElement>('.edgeLabels > .edgeLabel')];
-      const paths = [...svg.querySelectorAll<SVGPathElement>('.edgePaths path')];
-      const path = paths.find((_, index) => labels[index]?.textContent?.trim() === 'fail')!;
-      const points = (path.dataset.manhattanPoints ?? '').split(' ').map((value) => {
+      const failLabels = labels.filter(
+        (label) => label.textContent?.replace(/\s+/g, ' ').trim().toLowerCase() === 'fail',
+      );
+      const failLabel = failLabels[0];
+      const paths = [
+        ...svg.querySelectorAll<SVGPathElement>('.edgePaths path, .edges.edgePath path'),
+      ];
+      const routePathId = failLabel?.dataset.routePathId ?? '';
+      const pathMatches = routePathId
+        ? paths.filter((candidate) => candidate.id === routePathId)
+        : [];
+      const path = pathMatches.length === 1 ? pathMatches[0] : null;
+      const pointValues = (path?.dataset.manhattanPoints ?? '').trim();
+      const points = (pointValues ? pointValues.split(/\s+/) : []).map((value) => {
         const [x, y] = value.split(',').map(Number);
         return { x, y };
       });
+      const pathLength = path?.getTotalLength() ?? 0;
+      const pathMatrix = path?.getScreenCTM() ?? null;
+      const screenPoint = (candidate: SVGPathElement, ratio: number) => {
+        const length = candidate.getTotalLength();
+        const point = candidate.getPointAtLength(length * ratio);
+        return point.matrixTransform(candidate.getScreenCTM()!);
+      };
+      const pointSegmentDistance = (
+        point: { x: number; y: number },
+        start: { x: number; y: number },
+        end: { x: number; y: number },
+      ) => {
+        const dx = end.x - start.x;
+        const dy = end.y - start.y;
+        const squared = dx * dx + dy * dy;
+        const progress = squared
+          ? Math.max(
+              0,
+              Math.min(1, ((point.x - start.x) * dx + (point.y - start.y) * dy) / squared),
+            )
+          : 0;
+        return Math.hypot(point.x - start.x - dx * progress, point.y - start.y - dy * progress);
+      };
+      const labelBounds = failLabel?.getBoundingClientRect();
+      const labelPathIds = labelBounds
+        ? paths.flatMap((candidate) => {
+            const length = candidate.getTotalLength();
+            if (!length || !candidate.getScreenCTM()) return [];
+            const intersects = Array.from({ length: 401 }, (_, index) =>
+              screenPoint(candidate, index / 400),
+            ).some(
+              (point) =>
+                point.x >= labelBounds.left - 0.5 &&
+                point.x <= labelBounds.right + 0.5 &&
+                point.y >= labelBounds.top - 0.5 &&
+                point.y <= labelBounds.bottom + 0.5,
+            );
+            return intersects ? [candidate.id] : [];
+          })
+        : [];
+      const shapes = [...svg.querySelectorAll<SVGGElement>('g.node')].flatMap((node) => {
+        const shape = node.querySelector<SVGGraphicsElement>(
+          ':scope > .label-container, :scope > rect, :scope > circle, :scope > ellipse, :scope > .outer-path, :scope > .basic.label-container, :scope > polygon',
+        );
+        return shape
+          ? [
+              {
+                id: node.id,
+                label: node.textContent?.trim() ?? '',
+                bounds: shape.getBoundingClientRect(),
+              },
+            ]
+          : [];
+      });
+      const distanceToBounds = (point: { x: number; y: number }, bounds: DOMRect) =>
+        Math.hypot(
+          Math.max(bounds.left - point.x, 0, point.x - bounds.right),
+          Math.max(bounds.top - point.y, 0, point.y - bounds.bottom),
+        );
+      const paintedPoints =
+        path && pathLength && pathMatrix
+          ? Array.from({ length: 201 }, (_, index) => screenPoint(path, index / 200))
+          : [];
+      const start = paintedPoints[0];
+      const end = paintedPoints.at(-1);
+      const endpointLabel = (point: { x: number; y: number } | undefined) =>
+        point
+          ? shapes.toSorted(
+              (left, right) =>
+                distanceToBounds(point, left.bounds) - distanceToBounds(point, right.bounds),
+            )[0]?.label
+          : null;
       return {
+        labelCount: labels.length,
+        failLabelCount: failLabels.length,
+        pathCount: paths.length,
+        routePathId,
+        pathMatches: pathMatches.length,
+        connected: path?.isConnected ?? false,
+        nonempty: Boolean(path?.getAttribute('d')?.trim()) && pathLength > 0,
+        finitePoints: points.every(({ x, y }) => Number.isFinite(x) && Number.isFinite(y)),
         pointCount: points.length,
-        verticalDrift: Math.abs(points[0].x - points.at(-1)!.x),
-        rise: points[0].y - points.at(-1)!.y,
-        direction: path.dataset.terminalDirection,
-        marker: path.getAttribute('marker-end'),
-        moveCommands: (path.getAttribute('d')?.match(/M/g) ?? []).length,
+        verticalDrift: points.length > 1 ? Math.abs(points[0].x - points.at(-1)!.x) : null,
+        rise: points.length > 1 ? points[0].y - points.at(-1)!.y : null,
+        direction: path?.dataset.terminalDirection,
+        marker: path?.getAttribute('marker-end'),
+        moveCommands: (path?.getAttribute('d')?.match(/M/g) ?? []).length,
+        nativeLabelId: failLabel
+          ?.querySelector<SVGGraphicsElement>(':scope > .label[data-id]')
+          ?.getAttribute('data-id'),
+        nativePathId: path?.dataset.id,
+        routeLabel: path?.dataset.routeLabel,
+        routeLabels: paths.flatMap((candidate) =>
+          candidate.dataset.routeLabel ? [candidate.dataset.routeLabel] : [],
+        ),
+        associatedLabels: labels.flatMap((label) =>
+          label.dataset.routePathId ? [label.textContent?.trim() ?? ''] : [],
+        ),
+        labelPathIds,
+        sourceLabel: endpointLabel(start),
+        targetLabel: endpointLabel(end),
+        paintedDeviation:
+          start && end
+            ? Math.max(...paintedPoints.map((point) => pointSegmentDistance(point, start, end)))
+            : null,
       };
     });
+  expect(geometry.labelCount, `${context} authored labeled routes`).toBe(4);
+  expect(geometry.failLabelCount, `${context} unique fail label`).toBe(1);
+  expect(geometry.pathCount, `${context} labeled and unlabeled routes`).toBe(6);
+  expect(geometry.routePathId, `${context} fail route association`).toBeTruthy();
+  expect(geometry.pathMatches, `${context} unique fail route association`).toBe(1);
+  expect(geometry.connected, `${context} connected fail route`).toBe(true);
+  expect(geometry.nonempty, `${context} nonempty fail route`).toBe(true);
+  expect(geometry.finitePoints, `${context} finite fail route points`).toBe(true);
   expect(geometry.pointCount, `${context} fail segments`).toBe(2);
   expect(geometry.verticalDrift, `${context} fail shaft alignment`).toBeLessThanOrEqual(0.01);
   expect(geometry.rise, `${context} upward fail terminal`).toBeGreaterThan(40);
   expect(geometry.direction, `${context} fail arrow direction`).toBe('0,-1');
   expect(geometry.marker, `${context} fail marker`).toContain('barbEnd');
   expect(geometry.moveCommands, `${context} continuous fail route`).toBe(1);
+  expect(geometry.nativePathId, `${context} native fail edge identity`).toBe(
+    geometry.nativeLabelId,
+  );
+  expect(geometry.routeLabel, `${context} fail route metadata`).toBe('fail');
+  expect(geometry.routeLabels, `${context} unrelated route metadata`).toEqual(['fail']);
+  expect(geometry.associatedLabels, `${context} unrelated label associations`).toEqual(['fail']);
+  expect(geometry.labelPathIds, `${context} painted fail label association`).toEqual([
+    geometry.routePathId,
+  ]);
+  expect(geometry.sourceLabel, `${context} fail source ownership`).toBe('Running');
+  expect(geometry.targetLabel, `${context} fail target ownership`).toBe('Failed');
+  expect(geometry.paintedDeviation, `${context} straight painted fail route`).toBeLessThanOrEqual(
+    0.01,
+  );
 }
 
 async function expectEntityDividerGeometry(page: Page, state: string, context: string) {

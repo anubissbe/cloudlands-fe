@@ -8,6 +8,7 @@ import {
   buildGroupedReturnLanePoints,
   chooseFlowchartFeedbackTargetX,
   chooseLabelSegment,
+  chooseStateLabelPathIndex,
   diamondBoundaryPort,
   diamondRayIntersection,
   measuredClusterHeaderHeight,
@@ -57,6 +58,65 @@ function expectRouteAvoids(points: TestPoint[], bounds: TestBounds) {
 }
 
 describe('Mermaid path terminal geometry', () => {
+  describe('state label route association', () => {
+    const paths = Array.from({ length: 6 }, (_, index) => ({
+      id: `render-edge-${index}`,
+      nativeId: `edge${index}`,
+      intersectsLabel: false,
+    }));
+
+    it('uses native identities when unlabeled terminal edges outnumber labels', () => {
+      const labels = ['edge1', 'edge2', 'edge3', 'edge4'];
+
+      expect(labels.map((nativeId) => chooseStateLabelPathIndex({ nativeId }, paths))).toEqual([
+        1, 2, 3, 4,
+      ]);
+    });
+
+    it('falls back only to one painted label intersection', () => {
+      const candidates = paths.map((path, index) => ({
+        ...path,
+        intersectsLabel: index === 2,
+      }));
+
+      expect(chooseStateLabelPathIndex({}, candidates)).toBe(2);
+      expect(
+        chooseStateLabelPathIndex(
+          {},
+          candidates.map((path, index) => ({
+            ...path,
+            intersectsLabel: index === 2 || index === 3,
+          })),
+        ),
+      ).toBeNull();
+      expect(
+        chooseStateLabelPathIndex(
+          {},
+          candidates.map((path) => ({ ...path, intersectsLabel: false })),
+        ),
+      ).toBeNull();
+    });
+
+    it('rejects ambiguous native and cached identities without falling through', () => {
+      expect(
+        chooseStateLabelPathIndex(
+          { nativeId: 'edge2' },
+          paths.map((path, index) => ({
+            ...path,
+            nativeId: index === 3 ? 'edge2' : path.nativeId,
+            intersectsLabel: index === 2,
+          })),
+        ),
+      ).toBeNull();
+      expect(
+        chooseStateLabelPathIndex({ routePathId: 'render-edge-2' }, [
+          ...paths,
+          { ...paths[2], intersectsLabel: true },
+        ]),
+      ).toBeNull();
+    });
+  });
+
   describe('clear straight boundary ports', () => {
     const diamond = { x: 0, y: 0, width: 100, height: 100 };
     const source = { point: diamondBoundaryPort(diamond, 'right', 8), side: 'right' as const };
