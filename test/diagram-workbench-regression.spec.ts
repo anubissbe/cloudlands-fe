@@ -2413,6 +2413,45 @@ test('terminal arrow discovery rejects missing, empty, and detached state paths'
   }
 });
 
+test('keeps state terminal clearance idempotent through repeated auto-fit resizes', async ({
+  page,
+}) => {
+  test.setTimeout(120_000);
+  await openState(page, 'mermaid-state-recovery', 320, 'light');
+  const root = page.locator('#mermaid-state-recovery');
+  const paths = root.locator('.edges.edgePath path[marker-end]');
+  await expect(paths).toHaveCount(6);
+  await expect(root.locator('g.node[id*="root_start"]')).toHaveCount(1);
+  await expect(root.locator('g.node[id*="root_end"]')).toHaveCount(1);
+
+  const geometry = () =>
+    paths.evaluateAll((edges) =>
+      edges.map((edge) => ({
+        d: edge.getAttribute('d'),
+        base: (edge as SVGPathElement).dataset.terminalGapBasePath,
+        gap: (edge as SVGPathElement).dataset.terminalGapCss,
+        target: (edge as SVGPathElement).dataset.terminalTarget,
+      })),
+    );
+  await expectTerminalArrowGeometry(page, 'mermaid-state-recovery', stateRecoveryTargets);
+  const initial = await geometry();
+  expect(initial.every((edge) => edge.base && edge.gap === '5' && edge.target)).toBe(true);
+
+  for (const width of [420, 320, 420, 320]) {
+    await page
+      .getByTestId('catalog-scene-focus')
+      .evaluate((element, value) => (element.style.width = `${value}px`), width);
+    await expect(root.locator('.mermaid-renderer')).toHaveAttribute('data-render-settled', 'true');
+    await page.evaluate(
+      () =>
+        new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))),
+    );
+    await expectTerminalArrowGeometry(page, 'mermaid-state-recovery', stateRecoveryTargets);
+  }
+
+  expect(await geometry()).toEqual(initial);
+});
+
 for (const appearance of [
   { name: 'light', mode: 'light' as const, colorTheme: 'Default' },
   { name: 'dark', mode: 'dark' as const, colorTheme: 'Default' },

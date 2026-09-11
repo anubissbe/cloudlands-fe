@@ -654,7 +654,9 @@ export function applyMermaidTerminalGaps(svg: SVGSVGElement, cssGap = 5) {
     return shape ? [{ node, shape }] : [];
   });
 
-  for (const path of svg.querySelectorAll<SVGPathElement>('.edgePaths path[marker-end]')) {
+  for (const path of svg.querySelectorAll<SVGPathElement>(
+    '.edgePaths path[marker-end], .edges.edgePath path[marker-end]',
+  )) {
     if (markerForPath(svg, path)?.dataset.diagramChevron !== 'true') continue;
     const basePath = path.dataset.terminalGapBasePath ?? path.getAttribute('d');
     if (!basePath) continue;
