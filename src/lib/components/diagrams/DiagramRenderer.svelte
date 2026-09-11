@@ -30,6 +30,7 @@
   import { m } from '$shared/paraglide/messages.js';
   import { shouldReduceMotion } from '$lib/utils/motion-preference';
   import { cameraMotionKeyframes, partitionSceneIds } from './diagram-motion';
+  import { walkthroughFooter } from './note-diagram-controls';
 
   interface Props {
     diagram: DiagramPrimitive;
@@ -1572,11 +1573,14 @@
 
   <!-- Footer with controls and narrative (only show if states exist) - sticky at bottom -->
   {#if !layoutError && diagram.model.nodes.length > 0 && diagram.states && diagram.states.length > 0}
-    <div
-      class="diagram-footer"
-      style:width={scrollContainerWidth != null ? `${scrollContainerWidth}px` : '100%'}
-    >
-      <DiagramControls states={diagram.states} {currentStateId} onStateChange={changeState} />
+    <div class="diagram-controls-slot">
+      <div
+        class="diagram-footer"
+        use:walkthroughFooter
+        style:width={scrollContainerWidth != null ? `${scrollContainerWidth}px` : '100%'}
+      >
+        <DiagramControls states={diagram.states} {currentStateId} onStateChange={changeState} />
+      </div>
     </div>
   {/if}
 </div>
@@ -1718,6 +1722,13 @@
     transform-origin: top left;
     transition: transform var(--diagram-camera-duration, 220ms)
       var(--diagram-camera-easing, cubic-bezier(0.65, 0, 0.35, 1));
+  }
+
+  .diagram-controls-slot {
+    display: contents;
+    grid-column: 1;
+    grid-row: 3;
+    min-width: 0;
   }
 
   .diagram-footer {
