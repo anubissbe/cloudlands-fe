@@ -6,8 +6,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import CatalogFoundations from './CatalogFoundations.svelte';
 import CatalogGallery from './CatalogGallery.svelte';
 import CatalogShell from './CatalogShell.svelte';
+import SandboxLayout from '../../routes/sandbox/+layout.svelte';
 import { themePresets } from '$lib/utils/theme-presets';
 import { parseVSCodeTheme } from '$lib/utils/vscode-theme-parser';
+
+vi.mock('$app/state', () => ({ page: { params: {} } }));
 
 const originalResizeObserver = globalThis.ResizeObserver;
 
@@ -30,12 +33,12 @@ afterEach(() => {
 });
 
 describe('catalog workspace', () => {
-  it('owns the bundled sandbox UI font across themes and restores the prior root style', async () => {
+  it('lets the sandbox layout own the bundled UI font across themes and restore it', async () => {
     const root = document.documentElement;
     root.style.setProperty('--font-ui', 'Existing UI');
     root.style.setProperty('--existing-root-token', 'preserved');
 
-    const first = render(CatalogShell);
+    const first = render(SandboxLayout);
     await waitFor(() =>
       expect(root.style.getPropertyValue('--font-ui')).toContain('Inter Variable'),
     );
@@ -52,7 +55,7 @@ describe('catalog workspace', () => {
     expect(root.style.getPropertyValue('--font-ui')).toBe('Existing UI');
     expect(root.style.getPropertyValue('--existing-root-token')).toBe('preserved');
 
-    const second = render(CatalogShell);
+    const second = render(SandboxLayout);
     await waitFor(() =>
       expect(root.style.getPropertyValue('--font-ui')).toContain('Inter Variable'),
     );

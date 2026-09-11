@@ -39,7 +39,7 @@ describe('CatalogScene', () => {
     );
     mocks.watchCaptureStability.mockImplementation(async (_root, _options, lifecycle) => {
       lifecycle.onWaiting?.(1);
-      lifecycle.onStable({ imageCount: 0, reducedMotion: true }, 1);
+      lifecycle.onStable({ imageCount: 0, deferredImageCount: 0, reducedMotion: true }, 1);
     });
   });
 
@@ -223,7 +223,11 @@ describe('CatalogScene', () => {
   });
 
   it('does not publish DOM or API readiness before capture stability resolves', async () => {
-    const stability = deferred<{ imageCount: number; reducedMotion: boolean }>();
+    const stability = deferred<{
+      imageCount: number;
+      deferredImageCount: number;
+      reducedMotion: boolean;
+    }>();
     mocks.watchCaptureStability.mockImplementationOnce(async (_root, _options, lifecycle) => {
       lifecycle.onWaiting?.(1);
       lifecycle.onStable(await stability.promise, 1);
@@ -241,7 +245,7 @@ describe('CatalogScene', () => {
       expect.objectContaining({ status: 'ready' }),
     );
 
-    stability.resolve({ imageCount: 0, reducedMotion: true });
+    stability.resolve({ imageCount: 0, deferredImageCount: 0, reducedMotion: true });
     await waitFor(() =>
       expect(screen.getByTestId('catalog-scene').dataset.previewReady).toBe('true'),
     );

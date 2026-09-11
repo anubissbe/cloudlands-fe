@@ -80,16 +80,20 @@
   width: 100%;
 }
 
-/* Failed diagrams are note feedback, not wide canvases. Use the actual prose
-   width, including when comments reduce it; successful renders keep the lane. */
-.tiptap-editor.ProseMirror > .node-mermaidBlock:has(.mermaid-error) {
+/* Failed renders have no diagram to show: keep the error card (and its
+   expanded source details) aligned with the prose column instead of the
+   wide lane. The wrapper reports the render state, see MermaidBlockNodeView. */
+.tiptap-editor.ProseMirror
+  > .node-mermaidBlock:has(> [data-node-view-wrapper][data-render-state='error']) {
+  display: block;
   width: 100%;
   max-width: 100%;
-  margin-inline: 0;
+  margin-left: 0;
+  margin-right: 0;
 }
 
 .tiptap-editor.ProseMirror
-  > .node-mermaidBlock:has(.mermaid-error)
+  > .node-mermaidBlock:has(> [data-node-view-wrapper][data-render-state='error'])
   > [data-node-view-wrapper]
   > [data-diagram-presentation]
   > [data-diagram-presentation-content] {
