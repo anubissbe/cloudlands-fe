@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   alignMermaidOpenArrowheads,
+  buildDownstreamFanoutRoutes,
   buildRoundedOrthogonalPath,
   buildFlowchartDecisionBranchPoints,
   buildFlowchartDecisionReturnPoints,
@@ -58,6 +59,114 @@ function expectRouteAvoids(points: TestPoint[], bounds: TestBounds) {
 }
 
 describe('Mermaid path terminal geometry', () => {
+  describe('downstream fanout corridors', () => {
+    const source = { x: 110, y: 70, width: 100, height: 50 };
+    const targets = [
+      { bounds: { x: 300, y: 210, width: 100, height: 50 }, port: { x: 350, y: 210 } },
+      { bounds: { x: 200, y: 430, width: 100, height: 50 }, port: { x: 242, y: 430 } },
+    ];
+
+    it.each([1, 1.7])(
+      'uses a common right exit and top entries under scale %s and translation',
+      (scale) => {
+        const point = ({ x, y }: TestPoint) => ({ x: x * scale - 87, y: y * scale + 43 });
+        const bounds = (b: TestBounds) => ({
+          ...point(b),
+          width: b.width * scale,
+          height: b.height * scale,
+        });
+        const s = bounds(source);
+        const t = targets.map((target) => ({
+          bounds: bounds(target.bounds),
+          port: point(target.port),
+        }));
+        const routes = buildDownstreamFanoutRoutes(s, t, [], []);
+        expect(routes).not.toBeNull();
+        for (const [index, route] of routes!.entries()) {
+          expectOrthogonalRoute(route);
+          expect(route[0]).toEqual({ x: s.x + s.width, y: s.y + s.height / 2 });
+          expect(route.at(-1)).toEqual(t[index].port);
+          expect(route.at(-2)!.x).toBe(t[index].port.x);
+          expect(route.at(-2)!.y).toBeLessThan(t[index].bounds.y);
+          t.forEach((target) => expectRouteAvoids(route, target.bounds));
+        }
+        expect(routes![0].slice(0, 2)).toEqual(routes![1].slice(0, 2));
+      },
+    );
+
+    it('keeps a valid downstream terminal leg rather than replacing it', () => {
+      const tail = [{ x: 350, y: 174 }, targets[0].port];
+      const routes = buildDownstreamFanoutRoutes(
+        source,
+        [{ ...targets[0], tail }, targets[1]],
+        [],
+        [],
+      );
+      expect(routes![0].slice(-2)).toEqual(tail);
+    });
+
+    it('enters an overlapping target from outside its left edge, not through its interior', () => {
+      const overlapping = { ...targets[1], port: { x: targets[1].bounds.x, y: 455 } };
+      const routes = buildDownstreamFanoutRoutes(source, [targets[0], overlapping], [], []);
+      expect(routes).not.toBeNull();
+      expect(routes![1].at(-2)!.x).toBeLessThan(overlapping.bounds.x);
+      expect(routes![1].at(-1)).toEqual(overlapping.port);
+      expectRouteAvoids(routes![1], overlapping.bounds);
+      expectRouteAvoids(routes![0], overlapping.bounds);
+      expect(routes![0].slice(0, 2)).toEqual(routes![1].slice(0, 2));
+    });
+
+    it.each(['node', 'label', 'unrelated route'])(
+      'leaves the whole group unchanged for a blocked %s corridor',
+      (kind) => {
+        const block = { x: 215, y: 140, width: 24, height: 24 };
+        expect(
+          buildDownstreamFanoutRoutes(
+            source,
+            targets,
+            kind === 'unrelated route' ? [] : [block],
+            kind === 'unrelated route' ? [block] : [],
+          ),
+        ).toBeNull();
+      },
+    );
+
+    it('rejects an old terminal leg through a sibling and chooses a clear top approach', () => {
+      const blocked = {
+        bounds: { x: 310, y: 340, width: 100, height: 50 },
+        port: { x: 350, y: 340 },
+        tail: [
+          { x: 350, y: 180 },
+          { x: 350, y: 340 },
+        ],
+      };
+      const routes = buildDownstreamFanoutRoutes(source, [targets[0], blocked], [], []);
+      expect(routes).not.toBeNull();
+      expect(routes![1].slice(-2)).not.toEqual(blocked.tail);
+      routes!.forEach((route) => expectRouteAvoids(route, targets[0].bounds));
+    });
+
+    it('does not repurpose compact, upstream, or three-arm groups', () => {
+      expect(
+        buildDownstreamFanoutRoutes(
+          source,
+          [targets[0], { ...targets[1], port: { x: 150, y: 430 } }],
+          [],
+          [],
+        ),
+      ).toBeNull();
+      expect(
+        buildDownstreamFanoutRoutes(
+          source,
+          targets.map((target) => ({ ...target, bounds: { ...target.bounds, y: 100 } })),
+          [],
+          [],
+        ),
+      ).toBeNull();
+      expect(buildDownstreamFanoutRoutes(source, [...targets, targets[0]], [], [])).toBeNull();
+    });
+  });
+
   describe('state label route association', () => {
     const paths = Array.from({ length: 6 }, (_, index) => ({
       id: `render-edge-${index}`,

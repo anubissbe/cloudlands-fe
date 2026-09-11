@@ -62,6 +62,11 @@ export function createMermaidConfig(styles: TokenStyle, htmlLabels = true): Merm
     fontFamily,
     fontSize: Number.parseFloat(fontSize),
     htmlLabels,
+    // Mermaid scopes this CSS to its SVG before measuring temporary HTML labels.
+    // A global reduced-motion duration otherwise animates their initial 2000px
+    // dimensions, so Dagre reads the placeholder rather than the measured label.
+    themeCSS:
+      '.label, foreignObject { transition-property: opacity, color, background-color !important; }',
     flowchart: {
       useMaxWidth: false,
       curve: 'stepAfter',
