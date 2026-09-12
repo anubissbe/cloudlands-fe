@@ -285,7 +285,10 @@
               size="icon-xs"
               aria-label={m.tiptap_comment_collapse_label()}
               tooltip={m.tiptap_comment_collapse_label()}
-              onclick={() => onClose?.()}
+              onclick={(event) => {
+                event.stopPropagation();
+                onClose?.();
+              }}
             >
               <Fa icon={faTimes} size="xs" />
             </Button>
