@@ -1452,7 +1452,7 @@ for (const appearance of framingAppearances) {
         expect(metrics.centerDelta).toBeLessThanOrEqual(8);
         expect(Math.abs(metrics.footerOffset)).toBeLessThanOrEqual(1);
         expect(metrics.clearsFooter).toBe(true);
-        expect(metrics.overflowStyle).toBe('hidden');
+        expect(metrics.overflowStyle).toBe('auto');
         expect(metrics.finiteAnimationCount).toBe(0);
       }
     });
