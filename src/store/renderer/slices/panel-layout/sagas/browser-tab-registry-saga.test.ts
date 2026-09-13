@@ -55,6 +55,7 @@ import {
   openTabInRightmostColumn,
   openTabInRightmostColumnRequested,
   panelLayoutReducer as rawPanelLayoutReducer,
+  reopenClosedTab,
   setActiveTab,
   setRestoreStatus,
   setTabOwnerAgent,
@@ -1382,6 +1383,13 @@ describe('browserTabRegistrySaga', () => {
       expect(mocks.listTabs).toHaveBeenCalledTimes(1);
       expect(mocks.upsertTab).not.toHaveBeenCalled();
       expect(mocks.syncTabs).not.toHaveBeenCalled();
+      // Destroyed, not merely closed: nothing sits in recentlyClosed for a
+      // collaborator to bring back.
+      expect(h.layout().recentlyClosed).toEqual([]);
+      h.dispatch(reopenClosedTab(WS, 1000));
+      h.dispatch(reopenClosedTab(WS, 1001, 'b3'));
+      await flush();
+      expect(h.tabs()).toEqual([]);
 
       h.dispatch(setRestoreStatus(WS, 'restored'));
       await flush();
@@ -1402,6 +1410,10 @@ describe('browserTabRegistrySaga', () => {
       expect(h.tabs().map((tab) => tab.id)).toEqual([]);
       expect(h.registry()).toMatchObject({ phase: 'applied', reported: {} });
       expect(mocks.upsertTab).not.toHaveBeenCalled();
+      expect(h.layout().recentlyClosed).toEqual([]);
+      h.dispatch(reopenClosedTab(WS, 1002));
+      await flush();
+      expect(h.tabs()).toEqual([]);
       await stop(h);
     });
   });
