@@ -398,7 +398,6 @@ describe('daemonEventsBridge (wire contract — agent:idle clears the spinner)',
 
   afterEach(() => vi.clearAllMocks());
 
-
   it('agent:idle notification flips selectAgentIsResponding from true → false', async () => {
     // Optimistic chatSendStarted-style flag: the FE reducer marks isStreaming
     // true while the user message is being sent.

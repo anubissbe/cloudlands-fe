@@ -198,10 +198,10 @@ const EnvironmentConfigSchema = z.object({
 
 // Execution-environment profile surface (`sandbox.profiles.*` / `sandbox.options`,
 // PROTOCOL §5.5b). Fixed catalog order: direct, worktree, cow, microvm.
-export const SandboxTypeSchema = z.enum(['direct', 'worktree', 'cow', 'microvm']);
+const SandboxTypeSchema = z.enum(['direct', 'worktree', 'cow', 'microvm']);
 
 /** Optional microVM guest-image override (`{ manifestUrl, sha256 }`, `null` when unset). */
-export const SandboxImageSchema = z.object({
+const SandboxImageSchema = z.object({
   manifestUrl: z.string(),
   sha256: z.string(),
 });

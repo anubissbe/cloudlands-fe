@@ -149,9 +149,7 @@
     if (!params || typeof params !== 'object') return {};
     const wrapped = (params as { event?: { data?: unknown } }).event;
     const data =
-      wrapped && typeof wrapped === 'object'
-        ? wrapped.data
-        : (params as { data?: unknown }).data;
+      wrapped && typeof wrapped === 'object' ? wrapped.data : (params as { data?: unknown }).data;
     return data && typeof data === 'object' ? (data as Record<string, unknown>) : {};
   }
 
@@ -345,7 +343,7 @@
     {#if settingsError}
       <section class="px-6 py-2">
         <p
-          class="text-xs text-error-foreground bg-destructive/10 border border-destructive/20 rounded-md px-3 py-2"
+          class="text-xs text-danger bg-danger-background/10 border border-danger/20 rounded-md px-3 py-2"
         >
           {settingsError}
         </p>
@@ -402,7 +400,7 @@
                   })}</span
                 >
               {:else}
-                <span class="text-error-foreground"
+                <span class="text-danger"
                   >{m.executionEnvironmentSettings_image_error({ error: imageStatus.error })}</span
                 >
               {/if}
@@ -462,7 +460,7 @@
               <Input
                 type="text"
                 bind:value={imageUrlDraft}
-                placeholder={'https://…/manifest.json' /* i18n-ignore (URL format) */}
+                placeholder={/* i18n-ignore (URL format example) */ 'https://…/manifest.json'}
                 aria-label={m.executionEnvironmentSettings_imageOverride_inputAriaLabel()}
                 class="flex-1 text-xs"
                 onkeydown={(e) => {
@@ -503,7 +501,7 @@
                     })}</span
                   >
                 {:else}
-                  <span class="text-error-foreground"
+                  <span class="text-danger"
                     >{m.executionEnvironmentSettings_imageOverride_invalid({
                       error: imageCheckResult.error,
                     })}</span
@@ -524,7 +522,7 @@
                   {#if tokenState === 'ready'}
                     {m.executionEnvironmentSettings_claudeToken_ready()}
                   {:else if tokenState === 'rejected'}
-                    <span class="text-error-foreground"
+                    <span class="text-danger"
                       >{m.executionEnvironmentSettings_claudeToken_rejected()}</span
                     >
                   {:else}
@@ -532,7 +530,7 @@
                   {/if}
                 </p>
                 {#if tokenError}
-                  <p class="text-xs text-error-foreground">{tokenError}</p>
+                  <p class="text-xs text-danger">{tokenError}</p>
                 {/if}
               </div>
               {#if !showTokenInput}
@@ -559,7 +557,7 @@
                 <Input
                   type="password"
                   bind:value={tokenDraft}
-                  placeholder={'sk-ant-oat01-…' /* i18n-ignore (token format) */}
+                  placeholder={/* i18n-ignore (credential format example) */ 'sk-ant-oat01-…'}
                   class="flex-1 text-xs"
                   aria-label={m.executionEnvironmentSettings_claudeToken_inputAriaLabel()}
                   onkeydown={(e) => {

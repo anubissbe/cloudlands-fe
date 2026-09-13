@@ -13,9 +13,7 @@ import type { SandboxOptions, SandboxType } from '$shared/schemas';
 import { m } from '$shared/paraglide/messages.js';
 
 /** `{ success, data } | { success:false, error }` envelope from the sandbox IPC bridge. */
-type SandboxEnvelope<T> =
-  | { success: true; data: T }
-  | { success: false; error?: string };
+type SandboxEnvelope<T> = { success: true; data: T } | { success: false; error?: string };
 
 /**
  * Fetch the capability-resolved execution-environment matrix. Returns `null`

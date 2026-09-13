@@ -12,24 +12,24 @@
  *
  * Handlers are registered at import time (host-bridge-seeder idiom).
  */
-import { registerMockIpcHandler } from "$shared/ipc-mock-router";
-import { IPC_CHANNELS } from "$shared/ipc-registry";
+import { registerMockIpcHandler } from '$shared/ipc-mock-router';
+import { IPC_CHANNELS } from '$shared/ipc-registry';
 import {
   SandboxImageCheckSchema,
   SandboxOptionsSchema,
   SandboxProfilesSchema,
-} from "$shared/schemas";
-import { backendRequest } from "$lib/client/live/backend-transport";
+} from '$shared/schemas';
+import { backendRequest } from '$lib/client/live/backend-transport';
 
 /** Coerce a possibly-unknown argument into a plain object record. */
 function asRecord(arg: unknown): Record<string, unknown> {
-  return arg && typeof arg === "object" ? (arg as Record<string, unknown>) : {};
+  return arg && typeof arg === 'object' ? (arg as Record<string, unknown>) : {};
 }
 
 /** `sandbox:profiles:list` → daemon `sandbox.profiles.list`. */
 registerMockIpcHandler(IPC_CHANNELS.SANDBOX.PROFILES_LIST, async () => {
   try {
-    const result = await backendRequest("sandbox.profiles.list");
+    const result = await backendRequest('sandbox.profiles.list');
     const parsed = SandboxProfilesSchema.parse(result);
     return { success: true, data: parsed };
   } catch (error) {
@@ -52,7 +52,7 @@ registerMockIpcHandler(IPC_CHANNELS.SANDBOX.PROFILES_UPDATE, async (arg) => {
   if (params.defaultType !== undefined) daemonParams.defaultType = params.defaultType;
   if (params.profiles !== undefined) daemonParams.profiles = params.profiles;
   try {
-    const result = await backendRequest("sandbox.profiles.update", daemonParams);
+    const result = await backendRequest('sandbox.profiles.update', daemonParams);
     const parsed = SandboxProfilesSchema.parse(result);
     return { success: true, data: parsed };
   } catch (error) {
@@ -66,7 +66,7 @@ registerMockIpcHandler(IPC_CHANNELS.SANDBOX.PROFILES_UPDATE, async (arg) => {
 /** `sandbox:options` → daemon `sandbox.options` (capability-resolved matrix). */
 registerMockIpcHandler(IPC_CHANNELS.SANDBOX.OPTIONS, async () => {
   try {
-    const result = await backendRequest("sandbox.options");
+    const result = await backendRequest('sandbox.options');
     const parsed = SandboxOptionsSchema.parse(result);
     return { success: true, data: parsed };
   } catch (error) {
@@ -88,7 +88,7 @@ registerMockIpcHandler(IPC_CHANNELS.SANDBOX.IMAGE_CHECK, async (arg) => {
   const daemonParams: Record<string, unknown> = { manifestUrl: params.manifestUrl };
   if (params.sha256 !== undefined) daemonParams.sha256 = params.sha256;
   try {
-    const result = await backendRequest("sandbox.image.check", daemonParams);
+    const result = await backendRequest('sandbox.image.check', daemonParams);
     const parsed = SandboxImageCheckSchema.parse(result);
     return { success: true, data: parsed };
   } catch (error) {

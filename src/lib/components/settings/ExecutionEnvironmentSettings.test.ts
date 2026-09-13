@@ -465,9 +465,7 @@ describe('ExecutionEnvironmentSettings (§5.5b)', () => {
 
       render(ExecutionEnvironmentSettings);
 
-      const input = (await screen.findByLabelText(
-        'Guest image manifest URL',
-      )) as HTMLInputElement;
+      const input = (await screen.findByLabelText('Guest image manifest URL')) as HTMLInputElement;
       await fireEvent.input(input, { target: { value: 'https://example.test/m.json' } });
       await fireEvent.click(screen.getByText('Check & save'));
 
@@ -501,9 +499,7 @@ describe('ExecutionEnvironmentSettings (§5.5b)', () => {
 
       render(ExecutionEnvironmentSettings);
 
-      const input = (await screen.findByLabelText(
-        'Guest image manifest URL',
-      )) as HTMLInputElement;
+      const input = (await screen.findByLabelText('Guest image manifest URL')) as HTMLInputElement;
       await fireEvent.input(input, { target: { value: 'https://bad.test/m.json' } });
       await fireEvent.click(screen.getByText('Check & save'));
 
@@ -544,9 +540,7 @@ describe('ExecutionEnvironmentSettings (§5.5b)', () => {
       await waitFor(() => {
         expect(screen.getByText('Using a custom image manifest.')).toBeTruthy();
       });
-      const input = (await screen.findByLabelText(
-        'Guest image manifest URL',
-      )) as HTMLInputElement;
+      const input = (await screen.findByLabelText('Guest image manifest URL')) as HTMLInputElement;
       expect(input.value).toBe('https://example.test/m.json');
 
       await fireEvent.click(screen.getByText('Reset to default'));

@@ -104,7 +104,15 @@
   "fileTracking_prNode_commitCount_one": ["fr", "es"],
   "hardwareConsole_connectionToast_firmware_description": ["de", "es"],
   "hardwareConsole_connectionToast_transportBluetooth_label": ["ja", "de", "fr", "es"],
-  "hardwareConsole_connectionToast_transportUsb_label": ["zh-CN", "zh-TW", "ja", "ko", "de", "fr", "es"],
+  "hardwareConsole_connectionToast_transportUsb_label": [
+    "zh-CN",
+    "zh-TW",
+    "ja",
+    "ko",
+    "de",
+    "fr",
+    "es"
+  ],
   "hud_attention_kindGeneric_label": ["fr"],
   "hud_attention_kindQuestion_label": ["fr"],
   "hud_attention_sourceAgent_label": ["de", "fr"],
@@ -331,6 +339,14 @@
   "executionEnvironmentSettings_type_worktree_label": ["de", "fr", "es"],
   "workspaceInitializer_executionEnvironment_cow_label": ["ja", "ko", "de", "fr", "es"],
   "workspaceInitializer_executionEnvironment_direct_label": ["fr"],
-  "workspaceInitializer_executionEnvironment_microvm_label": ["zh-CN", "zh-TW", "ja", "ko", "de", "fr", "es"],
+  "workspaceInitializer_executionEnvironment_microvm_label": [
+    "zh-CN",
+    "zh-TW",
+    "ja",
+    "ko",
+    "de",
+    "fr",
+    "es"
+  ],
   "workspaceInitializer_executionEnvironment_worktree_label": ["de", "fr", "es"]
 }
