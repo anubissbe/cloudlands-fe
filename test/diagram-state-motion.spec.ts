@@ -1390,11 +1390,200 @@ for (const appearance of framingAppearances) {
           'data-diagram-settled',
           'true',
         );
-        const metrics = await root.evaluate((section) => {
+        const metrics = await root.evaluate(async (section) => {
           const renderer = section.querySelector<HTMLElement>('.diagram-renderer')!;
           const viewport = section.querySelector<HTMLElement>('.diagram-scroll-container')!;
           const footer = section.querySelector<HTMLElement>('.diagram-footer')!;
-          const viewportBounds = viewport.getBoundingClientRect();
+          const svg = viewport.querySelector<SVGSVGElement>('.diagram-svg-layer')!;
+          const originalScroll = { left: viewport.scrollLeft, top: viewport.scrollTop };
+          const nextFrame = () =>
+            new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+          viewport.scrollTo({ left: 0, top: 0, behavior: 'instant' });
+          await nextFrame();
+
+          type PaintDescriptor =
+            | { kind: 'element'; id: string; category: string; element: Element; margin: number }
+            | { kind: 'text'; id: string; category: string; element: Element; part: number }
+            | {
+                kind: 'marker';
+                id: string;
+                category: string;
+                element: SVGPathElement;
+                distance: number;
+              };
+          const descriptors: PaintDescriptor[] = [
+            ...section.querySelectorAll<SVGGraphicsElement>(
+              '[data-node-id], [data-group-id] .group-bg, .group-label, .edge-path, .edge-label-container',
+            ),
+          ]
+            .filter(
+              (element) =>
+                !element.closest('mask') && Number(getComputedStyle(element).opacity) > 0,
+            )
+            .map((element, index) => {
+              const nodeId = element.closest('[data-node-id]')?.getAttribute('data-node-id');
+              const groupId = element.closest('[data-group-id]')?.getAttribute('data-group-id');
+              const edgeId = element.closest('[data-edge-id]')?.getAttribute('data-edge-id');
+              const category = nodeId
+                ? 'node'
+                : element.matches('.group-bg, .group-label')
+                  ? 'group'
+                  : element.matches('.edge-label-container')
+                    ? 'label'
+                    : 'route';
+              const strokeWidth = Number.parseFloat(getComputedStyle(element).strokeWidth) || 0;
+              return {
+                kind: 'element' as const,
+                id: `${category}:${nodeId ?? groupId ?? edgeId ?? index}`,
+                category,
+                element,
+                margin: category === 'route' ? strokeWidth / 2 + 0.5 : 0,
+              };
+            });
+          for (const [index, element] of [
+            ...section.querySelectorAll('.node-label, .edge-label-text'),
+          ].entries()) {
+            const range = document.createRange();
+            range.selectNodeContents(element);
+            for (let part = 0; part < range.getClientRects().length; part += 1) {
+              descriptors.push({
+                kind: 'text',
+                id: `text:${element.textContent?.trim()}:${index}:${part}`,
+                category: 'text',
+                element,
+                part,
+              });
+            }
+          }
+          for (const [index, path] of [
+            ...section.querySelectorAll<SVGPathElement>('path.edge-path'),
+          ]
+            .filter((element) => !element.closest('mask'))
+            .entries()) {
+            const style = getComputedStyle(path);
+            const length = path.getTotalLength();
+            const edgeId = path.closest('[data-edge-id]')?.getAttribute('data-edge-id') ?? index;
+            if (style.markerStart !== 'none')
+              descriptors.push({
+                kind: 'marker',
+                id: `marker-start:${edgeId}`,
+                category: 'marker',
+                element: path,
+                distance: 0,
+              });
+            if (style.markerEnd !== 'none')
+              descriptors.push({
+                kind: 'marker',
+                id: `marker-end:${edgeId}`,
+                category: 'marker',
+                element: path,
+                distance: length,
+              });
+          }
+
+          const readPaint = () =>
+            descriptors.map((descriptor) => {
+              if (descriptor.kind === 'element') {
+                const bounds = descriptor.element.getBoundingClientRect();
+                return {
+                  id: descriptor.id,
+                  category: descriptor.category,
+                  left: bounds.left - descriptor.margin,
+                  right: bounds.right + descriptor.margin,
+                  top: bounds.top - descriptor.margin,
+                  bottom: bounds.bottom + descriptor.margin,
+                };
+              }
+              if (descriptor.kind === 'text') {
+                const range = document.createRange();
+                range.selectNodeContents(descriptor.element);
+                const bounds = range.getClientRects()[descriptor.part]!;
+                return { id: descriptor.id, category: descriptor.category, ...bounds.toJSON() };
+              }
+              const matrix = descriptor.element.getScreenCTM()!;
+              const point = descriptor.element
+                .getPointAtLength(descriptor.distance)
+                .matrixTransform(matrix);
+              const markerRadius = 7;
+              return {
+                id: descriptor.id,
+                category: descriptor.category,
+                left: point.x - markerRadius,
+                right: point.x + markerRadius,
+                top: point.y - markerRadius,
+                bottom: point.y + markerRadius,
+              };
+            });
+          const readSample = () => ({
+            left: viewport.scrollLeft,
+            top: viewport.scrollTop,
+            viewport: viewport.getBoundingClientRect().toJSON(),
+            svg: svg.getBoundingClientRect().toJSON(),
+            paint: readPaint(),
+            foreignObjectsContained: [...viewport.querySelectorAll('foreignObject')].every(
+              (foreignObject) => {
+                const outer = foreignObject.getBoundingClientRect();
+                const inner = foreignObject.firstElementChild?.getBoundingClientRect();
+                return (
+                  !inner ||
+                  (inner.left >= outer.left - 1 &&
+                    inner.right <= outer.right + 1 &&
+                    inner.top >= outer.top - 1 &&
+                    inner.bottom <= outer.bottom + 1)
+                );
+              },
+            ),
+          });
+          const axis = (maximum: number, size: number) => {
+            const values = [0];
+            for (let value = size * 0.8; value < maximum; value += size * 0.8) values.push(value);
+            if (maximum > 0) values.push(maximum);
+            return values;
+          };
+          const maxLeft = viewport.scrollWidth - viewport.clientWidth;
+          const maxTop = viewport.scrollHeight - viewport.clientHeight;
+          const samples: ReturnType<typeof readSample>[] = [];
+          for (const top of axis(maxTop, viewport.clientHeight)) {
+            for (const left of axis(maxLeft, viewport.clientWidth)) {
+              viewport.scrollTo({ left, top, behavior: 'instant' });
+              await nextFrame();
+              samples.push(readSample());
+            }
+          }
+          const first = samples[0];
+          const localPaint = first.paint.map((paint) => ({
+            ...paint,
+            left: paint.left - first.viewport.left,
+            right: paint.right - first.viewport.left,
+            top: paint.top - first.viewport.top,
+            bottom: paint.bottom - first.viewport.top,
+          }));
+          const unreachable = first.paint.flatMap((paint, paintIndex) =>
+            (['left', 'right', 'top', 'bottom'] as const).flatMap((side) => {
+              const horizontal = side === 'left' || side === 'right';
+              return samples.some((sample) => {
+                const value = sample.paint[paintIndex][side];
+                const start = horizontal ? sample.viewport.left : sample.viewport.top;
+                const end = horizontal ? sample.viewport.right : sample.viewport.bottom;
+                return value >= start - 1 && value <= end + 1;
+              })
+                ? []
+                : [`${paint.id}:${side}`];
+            }),
+          );
+          const svgLoss = samples.flatMap((sample) =>
+            sample.paint.flatMap((paint) =>
+              paint.left >= sample.svg.left - 1 &&
+              paint.right <= sample.svg.right + 1 &&
+              paint.top >= sample.svg.top - 1 &&
+              paint.bottom <= sample.svg.bottom + 1
+                ? []
+                : [paint.id],
+            ),
+          );
+
+          viewport.scrollTo({ ...originalScroll, behavior: 'instant' });
+          const viewportBounds = first.viewport;
           const painted = [
             ...section.querySelectorAll<SVGGraphicsElement>(
               '[data-node-id], [data-group-id] .group-bg, .edge-path, .edge-label-container',
@@ -1414,28 +1603,9 @@ for (const appearance of framingAppearances) {
             );
           return {
             nodeCount: section.querySelectorAll('[data-node-id]').length,
-            clipped: painted.some(
-              (bounds) =>
-                bounds.left < viewportBounds.left - 1 ||
-                bounds.right > viewportBounds.right + 1 ||
-                bounds.top < viewportBounds.top - 1 ||
-                bounds.bottom > viewportBounds.bottom + 1,
-            ),
             centerDelta: Math.abs(
               (minX + maxX) / 2 - (viewportBounds.left + viewportBounds.right) / 2,
             ),
-            clipAmount: Math.max(
-              viewportBounds.left - minX,
-              maxX - viewportBounds.right,
-              viewportBounds.top - minY,
-              maxY - viewportBounds.bottom,
-            ),
-            clipSides: {
-              left: viewportBounds.left - minX,
-              right: maxX - viewportBounds.right,
-              top: viewportBounds.top - minY,
-              bottom: maxY - viewportBounds.bottom,
-            },
             footerOffset:
               footer.getBoundingClientRect().bottom - renderer.getBoundingClientRect().bottom,
             clearsFooter: viewportBounds.bottom <= footer.getBoundingClientRect().top + 1,
@@ -1445,15 +1615,79 @@ for (const appearance of framingAppearances) {
             ),
             overflowStyle: getComputedStyle(viewport).overflow,
             finiteAnimationCount: finiteAnimations.length,
+            capHeight: window.innerHeight * 0.9,
+            clientHeight: viewport.clientHeight,
+            scrollHeight: viewport.scrollHeight,
+            clientWidth: viewport.clientWidth,
+            scrollWidth: viewport.scrollWidth,
+            maxLeft,
+            maxTop,
+            capped: viewport.scrollHeight > viewport.clientHeight + 1,
+            fullyContainedAtTop: first.paint.every(
+              (paint) =>
+                paint.left >= first.viewport.left - 1 &&
+                paint.right <= first.viewport.right + 1 &&
+                paint.top >= first.viewport.top - 1 &&
+                paint.bottom <= first.viewport.bottom + 1,
+            ),
+            strictHorizontalContainment: samples.every((sample) =>
+              sample.paint.every(
+                (paint) =>
+                  paint.left >= sample.viewport.left - 1 &&
+                  paint.right <= sample.viewport.right + 1,
+              ),
+            ),
+            nonnegativePaintOrigin: localPaint.every(
+              (paint) => paint.left >= -1 && paint.top >= -1,
+            ),
+            paintWithinNaturalExtent: localPaint.every(
+              (paint) =>
+                paint.right <= viewport.scrollWidth + 1 &&
+                paint.bottom <= viewport.scrollHeight + 1,
+            ),
+            unreachable,
+            svgLoss,
+            foreignObjectsContained: samples.every((sample) => sample.foreignObjectsContained),
+            reachedTop: samples.some((sample) => sample.left === 0 && sample.top === 0),
+            reachedMaximum: samples.some(
+              (sample) => sample.left === maxLeft && sample.top === maxTop,
+            ),
+            paintCategories: [...new Set(first.paint.map((paint) => paint.category))].sort(),
           };
         });
         expect(metrics.nodeCount).toBe(nodeCounts[index]);
-        expect(metrics.clipped, JSON.stringify({ index, metrics })).toBe(false);
         expect(metrics.centerDelta).toBeLessThanOrEqual(8);
         expect(Math.abs(metrics.footerOffset)).toBeLessThanOrEqual(1);
         expect(metrics.clearsFooter).toBe(true);
         expect(metrics.overflowStyle).toBe('auto');
         expect(metrics.finiteAnimationCount).toBe(0);
+        expect(metrics.paintCategories).toEqual([
+          'group',
+          'label',
+          'marker',
+          'node',
+          'route',
+          'text',
+        ]);
+        expect(metrics.maxLeft, JSON.stringify({ index, metrics })).toBe(0);
+        expect(metrics.scrollWidth).toBe(metrics.clientWidth);
+        expect(metrics.strictHorizontalContainment, JSON.stringify({ index, metrics })).toBe(true);
+        expect(metrics.nonnegativePaintOrigin, JSON.stringify({ index, metrics })).toBe(true);
+        expect(metrics.paintWithinNaturalExtent, JSON.stringify({ index, metrics })).toBe(true);
+        expect(metrics.unreachable, JSON.stringify({ index, metrics })).toEqual([]);
+        expect(metrics.svgLoss, JSON.stringify({ index, metrics })).toEqual([]);
+        expect(metrics.foreignObjectsContained, JSON.stringify({ index, metrics })).toBe(true);
+        expect(metrics.reachedTop).toBe(true);
+        expect(metrics.reachedMaximum).toBe(true);
+        if (metrics.capped) {
+          expect(Math.abs(metrics.clientHeight - metrics.capHeight)).toBeLessThanOrEqual(1);
+          expect(metrics.scrollHeight).toBeGreaterThan(metrics.clientHeight);
+          expect(metrics.maxTop).toBe(metrics.scrollHeight - metrics.clientHeight);
+        } else {
+          expect(metrics.scrollHeight).toBe(metrics.clientHeight);
+          expect(metrics.clientHeight).toBeLessThanOrEqual(metrics.capHeight + 1);
+          expect(metrics.fullyContainedAtTop, JSON.stringify({ index, metrics })).toBe(true);
+        }
       }
     });
   }
