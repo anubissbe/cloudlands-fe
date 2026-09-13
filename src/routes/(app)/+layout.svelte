@@ -87,6 +87,7 @@
   import { resolveTerminalShortcutWorkspaceId } from '$features/terminal/terminal-shortcut-context';
   import {
     selectIsCollaboratorOnlyClient,
+    selectIsWorkspaceCollaborator,
     selectWorkspaceHasLoaded,
     selectWorkspaceItems,
     selectWorkspaceLoading,
@@ -666,6 +667,9 @@
     // Ctrl+` -> toggle terminal overlay (matches VS Code behavior - Ctrl on all platforms including Mac)
     // Registered globally so it works on workspace and non-workspace pages alike.
     const toggleTerminal = () => {
+      // Collaborators (multiplayer w3) are refused on terminal methods: no root
+      // overlay for a collaborator-only client, none for a collaborator workspace.
+      if ($isCollaboratorOnlyClient$) return;
       const isOnWorkspacePage = $page.url.pathname.startsWith('/workspace/');
       const terminalContextId = resolveTerminalShortcutWorkspaceId({
         isOnWorkspacePage,
@@ -673,6 +677,7 @@
         selectedWorkspaceId: $currentWorkspaceTabId,
         routeWorkspaceId: currentWorkspaceId,
       });
+      if (selectIsWorkspaceCollaborator.select(appStore.state, terminalContextId)) return;
       appStore.dispatch(toggleTerminalOverlay(terminalContextId));
     };
     register({
@@ -994,7 +999,9 @@
             </div>
 
             <!-- Root Quake Terminal Overlay (self-gates on __root__ terminal state) -->
-            <RootQuakeTerminalOverlay />
+            {#if !$isCollaboratorOnlyClient$}
+              <RootQuakeTerminalOverlay />
+            {/if}
           </main>
         </div>
       </div>
