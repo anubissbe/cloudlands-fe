@@ -21,9 +21,11 @@
     activeTab: SettingsTab;
     onSelect: (tab: SettingsTab) => void;
     agentsNavigation: Snippet;
+    /** Tabs withheld from this client (e.g. administrator-only sections for a collaborator). */
+    hiddenTabs?: readonly SettingsTab[];
   }
 
-  let { activeTab, onSelect, agentsNavigation }: Props = $props();
+  let { activeTab, onSelect, agentsNavigation, hiddenTabs = [] }: Props = $props();
 
   const groups = [
     {
@@ -139,50 +141,55 @@
   aria-label={m.settings_page_title()}
 >
   {#each groups as group (group.id)}
-    <section aria-labelledby={`settings-group-${group.id}`}>
-      <h2
-        id={`settings-group-${group.id}`}
-        class="mb-2 px-2.5 type-caption font-semibold text-muted-foreground"
-      >
-        {group.label}
-      </h2>
-      <div class="flex flex-col gap-0.5">
-        {#each primaryItems.filter((item) => item.group === group.id) as item (item.id)}
-          <Button
-            variant="ghost"
-            type="button"
-            onclick={() => onSelect(item.id as SettingsTab)}
-            active={activeTab === item.id}
-            aria-current={activeTab === item.id ? 'page' : undefined}
-            data-settings-tab={item.id}
-            class="h-auto w-full justify-start p-0 text-left type-caption {activeTab === item.id
-              ? 'bg-muted font-medium text-foreground shadow-xs'
-              : 'text-muted-foreground'}"
-          >
-            <ListRow class="min-h-(--row-height-regular) w-full gap-2.5 px-2.5 py-0">
-              {#snippet leading()}
-                <span
-                  data-slot="settings-sidebar-icon"
-                  class="flex size-4 shrink-0 items-center justify-center opacity-75"
-                >
-                  <Fa icon={item.icon} size="sm" />
-                </span>
-              {/snippet}
-              {#snippet title()}{item.label}{/snippet}
-            </ListRow>
-          </Button>
-        {/each}
-      </div>
-      {#if group.id === 'agents'}
-        <section data-settings-agents-section data-settings-specialists-section class="mt-2">
-          <h3 class="px-2.5 type-caption font-semibold text-muted-foreground">
-            {m.settings_sidebar_specialists_label()}
-          </h3>
-          <div class="mt-2 flex flex-col gap-0.5 [&_[data-settings-agent-row]]:justify-start">
-            {@render agentsNavigation()}
-          </div>
-        </section>
-      {/if}
-    </section>
+    {@const groupItems = primaryItems.filter(
+      (item) => item.group === group.id && !hiddenTabs.includes(item.id as SettingsTab),
+    )}
+    {#if groupItems.length > 0}
+      <section aria-labelledby={`settings-group-${group.id}`}>
+        <h2
+          id={`settings-group-${group.id}`}
+          class="mb-2 px-2.5 type-caption font-semibold text-muted-foreground"
+        >
+          {group.label}
+        </h2>
+        <div class="flex flex-col gap-0.5">
+          {#each groupItems as item (item.id)}
+            <Button
+              variant="ghost"
+              type="button"
+              onclick={() => onSelect(item.id as SettingsTab)}
+              active={activeTab === item.id}
+              aria-current={activeTab === item.id ? 'page' : undefined}
+              data-settings-tab={item.id}
+              class="h-auto w-full justify-start p-0 text-left type-caption {activeTab === item.id
+                ? 'bg-muted font-medium text-foreground shadow-xs'
+                : 'text-muted-foreground'}"
+            >
+              <ListRow class="min-h-(--row-height-regular) w-full gap-2.5 px-2.5 py-0">
+                {#snippet leading()}
+                  <span
+                    data-slot="settings-sidebar-icon"
+                    class="flex size-4 shrink-0 items-center justify-center opacity-75"
+                  >
+                    <Fa icon={item.icon} size="sm" />
+                  </span>
+                {/snippet}
+                {#snippet title()}{item.label}{/snippet}
+              </ListRow>
+            </Button>
+          {/each}
+        </div>
+        {#if group.id === 'agents'}
+          <section data-settings-agents-section data-settings-specialists-section class="mt-2">
+            <h3 class="px-2.5 type-caption font-semibold text-muted-foreground">
+              {m.settings_sidebar_specialists_label()}
+            </h3>
+            <div class="mt-2 flex flex-col gap-0.5 [&_[data-settings-agent-row]]:justify-start">
+              {@render agentsNavigation()}
+            </div>
+          </section>
+        {/if}
+      </section>
+    {/if}
   {/each}
 </nav>
