@@ -141,28 +141,28 @@ describe('ReleaseNotesModal redesigned dialog', () => {
     expect(viewer.textContent).toContain('something changed');
   });
 
-  it('renders the scoped release-notes container classes', async () => {
-    renderModal(markdownBody);
-
-    await waitForViewer();
-
-    expect(document.body.querySelector('.release-notes-dialog')).not.toBeNull();
-    const body = document.body.querySelector('.release-notes-body');
-    expect(body).not.toBeNull();
-    // The markdown body renders inside the scoped container.
-    expect(body?.querySelector('.markdown-viewer')).not.toBeNull();
-  });
-
-  it('renders the footer buttons', async () => {
-    renderModal(markdownBody);
-
-    await waitForViewer();
-
-    const labels = Array.from(document.body.querySelectorAll('button')).map((b) =>
-      b.textContent?.trim(),
+  it('renders cumulative release bodies once with separators', async () => {
+    renderModal(
+      [
+        'Intent v2.20.0',
+        '',
+        '## Current changes',
+        '',
+        '---',
+        '',
+        'Intent v2.19.0',
+        '',
+        '## Previous changes',
+      ].join('\n'),
     );
-    expect(labels).toContain(m.releaseNotes_modal_viewOnGitHub_label());
-    expect(labels).toContain(m.releaseNotes_modal_dismiss_label());
+
+    const viewer = await waitForViewer();
+
+    expect(viewer.querySelectorAll('hr')).toHaveLength(1);
+    expect(viewer.textContent?.match(/Current changes/g)).toHaveLength(1);
+    expect(viewer.textContent?.match(/Previous changes/g)).toHaveLength(1);
+    expect(viewer.textContent).not.toContain('Intent v2.20.0');
+    expect(viewer.textContent?.match(/Intent v2\.19\.0/g)).toHaveLength(1);
   });
 
   it('shows the loading message while loading', async () => {

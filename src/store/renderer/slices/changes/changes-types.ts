@@ -6,43 +6,31 @@
  * Re-exports domain types from the feature module for convenience.
  */
 
-import type { WorkspaceGitStatus } from "$features/accept-changes/types";
 import type {
   TrackedChange,
   StageTransition,
   CommitInfo,
   FileListViewMode,
   MainPanelViewType,
-} from "$features/file-tracking/types";
+} from '$features/file-tracking/types';
 
 // Re-export domain types for consumer convenience
-export type { TrackedChange, StageTransition, CommitInfo, FileListViewMode, MainPanelViewType };
+export type { TrackedChange, CommitInfo };
 
 // ---------------------------------------------------------------------------
 // Accept changes state (moved from transient-ui slice)
 // ---------------------------------------------------------------------------
 
-export type PendingCommitAction = "commit" | "add-to-pr" | "merge" | "squash-merge" | null;
-export type BackgroundOperationType = "commit" | "add-to-pr" | "create-pr";
-export type BackgroundOperationPhase = "generating" | "executing";
+export type PendingCommitAction = 'commit' | 'add-to-pr' | 'merge' | 'squash-merge' | null;
 
-export interface BackgroundOperationState {
-  type: BackgroundOperationType;
-  startedAt: number;
-  phase: BackgroundOperationPhase;
-  label?: string;
-}
-
-export interface PendingPRContext {
+interface PendingPRContext {
   includeStagedFiles: boolean;
   includeCommitHashes: string[];
   targetBranch: string;
 }
 
-export type PendingAutoActionType = "commit" | "create-pr" | "merge" | null;
-
 export interface PendingAutoAction {
-  action: "commit" | "create-pr" | "merge";
+  action: 'commit' | 'create-pr' | 'merge';
   workspaceId: string;
   /** For PR auto-create: the target branch from the executor context */
   targetBranch?: string;
@@ -57,9 +45,6 @@ export interface AcceptChangesState {
   pendingPRContext: PendingPRContext | null;
   isAutofillAndCommitting: boolean;
   isAutofillAndCreatingPR: boolean;
-  backgroundOperation: BackgroundOperationState | null;
-  cachedGitStatus: WorkspaceGitStatus | null;
-  cachedGitStatusTimestamp: number | null;
   commitWhenReady: boolean;
   createPRWhenReady: boolean;
   mergeWhenReady: boolean;
@@ -83,7 +68,7 @@ export interface ChangesCoordinationState {
  * Main panel view state — controls what's displayed in the changes main panel.
  */
 export type MainPanelViewState = {
-  type: MainPanelViewType | "diff";
+  type: MainPanelViewType | 'diff';
   agentId?: string;
   sessionId?: string;
   turnNumber?: number;
@@ -132,7 +117,7 @@ export type FileLineChange = {
   path: string;
   additions: number;
   deletions: number;
-  action: "create" | "modify" | "delete";
+  action: 'create' | 'modify' | 'delete';
 };
 
 /**
@@ -147,4 +132,3 @@ export type FileTrackingState = {
   /** Agent stats request lifecycle keyed by agent ID */
   agentLineStatsRequests: Record<string, AgentLineStatsRequestState>;
 };
-

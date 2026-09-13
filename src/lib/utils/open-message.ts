@@ -32,6 +32,12 @@ import { appClient } from '$lib/client';
 import { store as appStore } from '$store/renderer/store';
 import { openAgentTabRequested } from '$store/renderer/slices/app-layout/app-layout-slice';
 import { replaceMessages } from '$store/renderer/slices/agent-session/agent-session-slice';
+import {
+  openPanel,
+  setChiefActiveAgentId,
+} from '$store/renderer/slices/sidebar-nav/sidebar-nav-slice';
+import { setActiveAgentId } from '$store/renderer/slices/workspace-agents/workspace-agents-slice';
+import { CHIEF_WORKSPACE_ID } from '$shared/types/branded-ids';
 import { dispatchWindowEvent } from './window-events';
 import { navigateToRoute } from './navigation.client';
 
@@ -46,7 +52,7 @@ export interface OpenMessageOptions {
 }
 
 /** Detail payload of the 'chat:open-message' window event ChatPanel consumes. */
-export interface OpenMessageEventDetail {
+interface OpenMessageEventDetail {
   agentId: string;
   messageId: string;
   query?: string;
@@ -109,8 +115,15 @@ async function waitForMessage(agentId: string, messageId: string): Promise<boole
  * Fetch the page containing the message (§5.5 `aroundMessageId` seek) and
  * replace the session's messages with it. Returns false when the message no
  * longer exists (-32602) or the session is not in the store.
+ *
+ * Also exported for ChatPanel's message navigator: selecting an index-only
+ * row (outside the loaded window) reuses this seek + replace before the
+ * panel force-renders and scrolls to the message.
  */
-async function seekToMessage(agentId: string, messageId: string): Promise<boolean> {
+export async function seekConversationToMessage(
+  agentId: string,
+  messageId: string,
+): Promise<boolean> {
   try {
     const page = await appClient.agents.getConversation(
       agentId,
@@ -122,7 +135,7 @@ async function seekToMessage(agentId: string, messageId: string): Promise<boolea
     appStore.dispatch(replaceMessages(agentId, page.messages));
     return isMessageInStore(agentId, messageId);
   } catch (error) {
-    logger.warn('[openMessage] Seek fetch failed (message may no longer exist)', {
+    logger.warn('[seekConversationToMessage] Seek fetch failed (message may no longer exist)', {
       agentId,
       messageId,
       error,
@@ -144,20 +157,38 @@ export async function openMessage(options: OpenMessageOptions): Promise<void> {
     messageId,
   });
 
-  if (typeof window !== 'undefined' && window.location.pathname !== `/workspace/${workspaceId}`) {
+  const isChiefMessage = workspaceId === CHIEF_WORKSPACE_ID;
+
+  if (
+    !isChiefMessage &&
+    typeof window !== 'undefined' &&
+    window.location.pathname !== `/workspace/${workspaceId}`
+  ) {
+    const targetPathname = `/workspace/${workspaceId}`;
     try {
       // navigateToRoute no-ops in the HUD pop-out window (never leaves /hud).
-      await navigateToRoute(`/workspace/${workspaceId}`);
+      await navigateToRoute(targetPathname);
     } catch (error) {
       logger.warn('[openMessage] Workspace navigation failed', { workspaceId, error });
+      return;
+    }
+    if (window.location.pathname !== targetPathname) {
+      logger.warn('[openMessage] Workspace navigation was not confirmed', { workspaceId });
+      return;
     }
   }
 
-  appStore.dispatch(openAgentTabRequested(workspaceId, { agentId }));
+  if (isChiefMessage) {
+    appStore.dispatch(setChiefActiveAgentId(agentId));
+    appStore.dispatch(setActiveAgentId(CHIEF_WORKSPACE_ID, agentId));
+    appStore.dispatch(openPanel('chief'));
+  } else {
+    appStore.dispatch(openAgentTabRequested(workspaceId, { agentId }));
+  }
 
   const present = (await waitForMessage(agentId, messageId))
     ? true
-    : await seekToMessage(agentId, messageId);
+    : await seekConversationToMessage(agentId, messageId);
   if (!present) {
     logger.warn('[openMessage] Message not found; conversation opened at tail', {
       agentId,

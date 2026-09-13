@@ -4,13 +4,16 @@
  * Types for the git Redux slice. Safe to import from any process.
  */
 
-import type { GitStatus, DiffChunk } from "$shared/types";
+import type { CommitFile } from '$features/file-tracking/types';
+import type { WorkspaceGitStatus } from '$features/accept-changes/types';
+import type { CommitInfo, GitStatus, DiffChunk } from '$shared/types';
+import type { Collection } from '@augmentcode/themis/utils/collections/collection-utils';
 
 // ── Git Operation Event Types ──
 
-export type GitOperationType = "commit" | "push" | "create-pr" | "auto-commit";
+type GitOperationType = 'commit' | 'push' | 'create-pr' | 'auto-commit';
 
-export type GitOperationResult = {
+type GitOperationResult = {
   commitHash?: string;
   prNumber?: number;
   prUrl?: string;
@@ -18,7 +21,7 @@ export type GitOperationResult = {
   reason?: string;
 };
 
-export type GitOperationMetadata = {
+type GitOperationMetadata = {
   message?: string;
   prTitle?: string;
   agentId?: string;
@@ -41,11 +44,11 @@ export type GitOperationFailedEvent = {
   metadata?: GitOperationMetadata;
 };
 
-export type AutoCommitHookFailureEvent = {
+type AutoCommitHookFailureEvent = {
   workspaceId: string;
   agentId: string;
   agentName?: string;
-  status: "waking-agent" | "retries-exhausted";
+  status: 'waking-agent' | 'retries-exhausted';
   hookOutput: string;
   retryCount: number;
 };
@@ -64,13 +67,13 @@ export interface PostMergeState {
 }
 
 export type GitOperationFlagName =
-  | "isPushing"
-  | "isPulling"
-  | "isForcePushing"
-  | "isRebasing"
-  | "isRefreshingPR"
-  | "isRefreshingGitStatus"
-  | "isResettingToTrunk";
+  | 'isPushing'
+  | 'isPulling'
+  | 'isForcePushing'
+  | 'isRebasing'
+  | 'isRefreshingPR'
+  | 'isRefreshingGitStatus'
+  | 'isResettingToTrunk';
 
 export interface GitOperationFlags {
   isPushing: boolean;
@@ -97,7 +100,31 @@ export type GitWorkspaceState = {
   ahead: number;
   behind: number;
   postMergeState: PostMergeState | null;
+  acceptChangesStatus: WorkspaceGitStatus | null;
+  acceptChangesStatusLoading: boolean;
   gitOperations: GitOperationFlags;
+  secondaryRoots: Record<string, SecondaryRootGitState>;
+};
+
+type SecondaryRootGitState = {
+  status: GitStatus | null;
+  commits: Collection<CommitInfo, 'hash'>;
+  nextToken?: string;
+  commitFiles: Collection<SecondaryRootCommitFiles, 'commitHash'>;
+  loading: boolean;
+  error: string | null;
+};
+
+type SecondaryRootCommitFiles = {
+  commitHash: string;
+  files: Collection<CommitFile, 'path'> | null;
+};
+
+export type SecondaryRootGitData = {
+  status: GitStatus | null;
+  commits: CommitInfo[];
+  nextToken?: string;
+  commitFiles: Record<string, CommitFile[] | null>;
 };
 
 export type GitState = {
@@ -106,4 +133,3 @@ export type GitState = {
   lastGitError: GitOperationFailedEvent | null;
   lastAutoCommitHookFailure: AutoCommitHookFailureEvent | null;
 };
-

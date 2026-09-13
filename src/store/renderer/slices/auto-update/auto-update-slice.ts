@@ -4,7 +4,7 @@ import type { AutoUpdateState } from './auto-update-types';
 import type { UpdateProgress, UpdateState } from '$features/auto-update/types';
 import { m } from '$shared/paraglide/messages.js';
 
-export const initialState: AutoUpdateState = {
+const initialState: AutoUpdateState = {
   status: 'idle',
   currentVersion: '',
   updateInfo: null,
@@ -100,6 +100,9 @@ autoUpdateReducer.with(showToastChecking, (state) => ({
   ...state,
   toastVisible: true,
   status: 'checking' as const,
+  // A manual check is an explicit request to see the result — clear the 24h
+  // dismiss cooldown so a re-landed 'downloaded' status shows persistently.
+  downloadedToastDismissedAt: null,
 }));
 autoUpdateReducer.with(setUpToDate, (state, { payload: [version] }) => ({
   ...state,

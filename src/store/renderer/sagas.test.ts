@@ -15,7 +15,6 @@ describe('renderer app saga registry', () => {
       'daemonEventsSaga',
       'daemonHealthSaga',
       'connectionsSaga',
-      'bootFallbackToastSaga',
       'settingsHydrationSaga',
       'activeStreamsSaga',
       'agentReadSaga',
@@ -24,18 +23,22 @@ describe('renderer app saga registry', () => {
       'chatSubscribeSaga',
       'chatSendSaga',
       'chatScrollbackSaga',
+      'switchTimingSaga',
       'permissionResponseSaga',
       'agentStreamSaga',
       'agentCreationSaga',
       'backgroundExecutorSaga',
       'agentMutationSaga',
       'editRegenerateSaga',
+      'regenerateFromMessageSaga',
       'agentFailureToastSaga',
       'gitReadSaga',
+      'acceptChangesStatusSaga',
       'fileExplorerSaga',
       'filesReadSaga',
       'filesWriteSaga',
       'workspaceNotesSaga',
+      'noteReadTrackingSaga',
       'contextSaga',
       'taskAgentAssociationsSaga',
       'appLayoutNavigationSaga',
@@ -47,9 +50,12 @@ describe('renderer app saga registry', () => {
       'scriptsOperationSaga',
       'lifecycleReadSaga',
       'lifecycleIpcReadSaga',
+      'workspaceLoadSaga',
+      'workspaceReconnectSaga',
       'modelSelectionSaga',
       'backgroundAgentSettingsSaga',
       'providerSettingsSaga',
+      'antigravitySetupSaga',
       'modelBootSaga',
       'modelReloadSaga',
       'providerAvailabilitySaga',
@@ -61,6 +67,9 @@ describe('renderer app saga registry', () => {
       'themeSaga',
       'autoUpdateSaga',
       'specialistsSaga',
+      'proposalLifecycleSaga',
+      'settingsProposalHistorySaga',
+      'specialistProposalHistorySaga',
       'githubAuthSaga',
       'githubRepoSearchSaga',
       'sentryAuthSaga',
@@ -73,14 +82,18 @@ describe('renderer app saga registry', () => {
       'gitRootsSaga',
       'uiLayoutPersistenceSaga',
       'tabStateSaga',
+      'workspaceTabReconciliationSaga',
       'workspaceTabCleanupSaga',
       'sidebarNavSaga',
       'panelLayoutSaga',
+      'browserTabRegistrySaga',
       'unreadTrackingSaga',
       'releaseNotesSaga',
       'browserPersistenceSaga',
+      'browserClientsSaga',
       'fileContentPruneSaga',
       'terminalPersistenceSaga',
+      'terminalCommandsSaga',
       'externalEditorsPersistenceSaga',
       'workspaceSettingsSaga',
       'updateChannelSaga',
@@ -95,7 +108,7 @@ describe('renderer app saga registry', () => {
       'agentEventsIpcSaga',
       'gitEventsIpcSaga',
     ]);
-    expect(new Set(sagas).size).toBe(82);
+    expect(new Set(sagas).size).toBe(95);
   });
 
   it('returns one cancellation handler per registered saga', () => {
@@ -104,9 +117,9 @@ describe('renderer app saga registry', () => {
 
     const handlers = startAllAppSagas(store as never);
 
-    expect(store.runSaga).toHaveBeenCalledTimes(82);
+    expect(store.runSaga).toHaveBeenCalledTimes(95);
     expect(store.runSaga.mock.calls.map(([saga]) => saga)).toEqual(sagas);
-    expect(handlers).toEqual(Array(82).fill(cancel));
+    expect(handlers).toEqual(Array(95).fill(cancel));
   });
 
   it('starts every hardware-console owner exactly once under one cancellable composition', () => {

@@ -73,15 +73,14 @@ test('supports click, keyboard, focus, reduced motion, and a live collapsed coun
   await expect(rows).toHaveCount(0);
 });
 
-test('preserves the held hint and edit, remove, and send-now callbacks', async ({ mount }) => {
+test('preserves the edit, remove, and send-now callbacks', async ({ mount }) => {
   const component = await mount(QueuedMessageGeometryHost, {
-    props: { width: 360, zoom: 1, messageCount: 1, heldForQuestions: true },
+    props: { width: 360, zoom: 1, messageCount: 1 },
   });
   const row = component.getByTestId('queued-message-row');
   const actions = component.getByTestId('queued-message-actions').getByRole('button');
   const lastAction = component.getByTestId('queued-message-last-action');
 
-  await expect(component.getByTestId('queued-messages-held-hint')).toBeVisible();
   await expect(actions).toHaveCount(3);
   await row.hover();
 
@@ -98,19 +97,84 @@ test('preserves the held hint and edit, remove, and send-now callbacks', async (
   );
 });
 
-test('spans the panel-width container with the top divider', async ({ mount }) => {
+test('never spawns a horizontal scrollbar in the transcript scroll viewport', async ({
+  mount,
+  page,
+}) => {
+  await page.addStyleTag({
+    content: `
+      [data-testid='queued-message-scroll-viewport'] {
+        border-right: 16px solid transparent;
+      }
+
+      [data-testid='queued-message-scroll-viewport']::-webkit-scrollbar {
+        width: 16px;
+        height: 16px;
+      }
+    `,
+  });
+  const component = await mount(QueuedMessageGeometryHost, {
+    props: { width: 720, contentWidth: 480, zoom: 1, messageCount: 20, scrollViewport: true },
+  });
+  const viewport = component.getByTestId('queued-message-scroll-viewport');
+  const metrics = await viewport.evaluate((node) => ({
+    offsetWidth: (node as HTMLElement).offsetWidth,
+    offsetHeight: (node as HTMLElement).offsetHeight,
+    clientWidth: node.clientWidth,
+    clientHeight: node.clientHeight,
+    scrollWidth: node.scrollWidth,
+    scrollHeight: node.scrollHeight,
+    overflowX: getComputedStyle(node).overflowX,
+    overflowY: getComputedStyle(node).overflowY,
+    reservedLaneWidth: Number.parseFloat(getComputedStyle(node).borderRightWidth),
+  }));
+  // Classic scrollbars can reserve a vertical gutter, while overlay scrollbars do not.
+  expect(metrics.clientWidth).toBeLessThanOrEqual(metrics.offsetWidth);
+  expect(metrics.scrollWidth).toBeCloseTo(metrics.clientWidth, 1);
+  // Regression (intent-hq/monorepo#2969): the horizontal axis must not be
+  // user-scrollable. The computed-style check is the primary pin — headless CT
+  // renders no classic scrollbar, so the height check below only guards
+  // scrollbar-consumed height in headful/classic-scrollbar renderings.
+  expect(metrics.overflowX).toBe('hidden');
+  expect(metrics.offsetHeight - metrics.clientHeight).toBe(0);
+});
+
+test('renders no generated top divider', async ({ mount }) => {
   const component = await mount(QueuedMessageGeometryHost, {
     props: { width: 720, contentWidth: 480, zoom: 1, messageCount: 1 },
   });
   const queue = component.getByTestId('queued-messages-container');
   const geometry = await queue.evaluate((node) => ({
     contentWidth: node.getBoundingClientRect().width,
-    dividerWidth: Number.parseFloat(getComputedStyle(node, '::before').width),
+    pseudoContent: getComputedStyle(node, '::before').content,
   }));
 
   expect(geometry.contentWidth).toBeCloseTo(480, 1);
-  expect(geometry.dividerWidth).toBeCloseTo(720, 1);
+  expect(geometry.pseudoContent).toBe('none');
 });
+
+for (const state of [
+  { name: 'narrow at 100%', viewportWidth: 390, width: 360, zoom: 1 },
+  { name: 'wide at 100%', viewportWidth: 900, width: 720, zoom: 1 },
+  { name: 'narrow at 200%', viewportWidth: 390, width: 180, zoom: 2 },
+  { name: 'wide at 200%', viewportWidth: 900, width: 360, zoom: 2 },
+]) {
+  test(`aligns the queue surface with the prompt box at ${state.name}`, async ({ mount, page }) => {
+    await page.setViewportSize({ width: state.viewportWidth, height: 900 });
+    const component = await mount(QueuedMessageGeometryHost, {
+      props: { width: state.width, zoom: state.zoom, alignWithPrompt: true },
+    });
+    const [queue, prompt] = await Promise.all([
+      component.getByTestId('queued-messages-container').boundingBox(),
+      component.getByTestId('queued-message-prompt-bounds').boundingBox(),
+    ]);
+
+    expect(queue).not.toBeNull();
+    expect(prompt).not.toBeNull();
+    expect(queue!.x).toBeCloseTo(prompt!.x, 1);
+    expect(queue!.x + queue!.width).toBeCloseTo(prompt!.x + prompt!.width, 1);
+  });
+}
 
 for (const state of [
   { name: 'one message narrow', width: 240, zoom: 1, messageCount: 1 },

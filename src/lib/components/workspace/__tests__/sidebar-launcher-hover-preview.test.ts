@@ -7,6 +7,9 @@ import {
   getAgentLauncherPreview,
   getNoteLauncherPreview,
 } from '../utils/sidebar-launcher-preview';
+import { warmImport } from '../../../../test/warm-import';
+
+warmImport(() => import('../sidebar/SidebarLauncherHoverCard.svelte'));
 
 function source(relativePath: string) {
   return readFileSync(new URL(relativePath, import.meta.url), 'utf8');
@@ -68,6 +71,15 @@ describe('sidebar launcher hover previews', () => {
   it('creates a readable note preview from markdown content', () => {
     const note = { content: '# Plan\n\nReview **hover previews**.' } as Note;
     expect(getNoteLauncherPreview(note)).toBe('Plan\n\nReview hover previews.');
+  });
+
+  it('falls back to contentPreview for slim rows whose content is not loaded', () => {
+    const slim = {
+      content: '',
+      contentPreview: '# Plan\n\nSlim **preview** body.',
+      contentLength: 500,
+    } as Note;
+    expect(getNoteLauncherPreview(slim)).toBe('Plan\n\nSlim preview body.');
   });
 
   it('includes every unique agent and prioritizes running then unread sessions', () => {
@@ -148,5 +160,24 @@ describe('sidebar launcher hover previews', () => {
       'isolate grid h-9 w-full min-w-0 grid-flow-col items-start overflow-visible',
     );
     expect(sidebar).toContain('data-launcher-pack="left"');
+  });
+
+  it('delays launcher hover cards so a mouse pass-over never opens them', async () => {
+    // Perf invariant (Trace-20260831T161502): opening a tooltip triggers
+    // floating-ui measurement, so switch-path sidebar rows must require a
+    // deliberate 400ms hover before opening.
+    const { render, cleanup } = await import('@testing-library/svelte');
+    const { default: SidebarLauncherHoverCard } =
+      await import('../sidebar/SidebarLauncherHoverCard.svelte');
+    try {
+      const { container } = render(SidebarLauncherHoverCard, {
+        props: { title: 'Agents', rows: [], emptyText: 'No agents yet', kind: 'agent' as const },
+      });
+      const trigger = container.querySelector('[data-tooltip-trigger]');
+      expect(trigger).not.toBeNull();
+      expect(trigger!.getAttribute('data-delay-duration')).toBe('400');
+    } finally {
+      cleanup();
+    }
   });
 });

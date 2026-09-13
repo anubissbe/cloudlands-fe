@@ -2,7 +2,7 @@
 
 Electron + SvelteKit + TypeScript desktop frontend for **Intent** that talks to
 the `intentd` daemon. It is consumed as the `packages/cloudlands-fe` git
-submodule of [intent-hq/monorepo](https://github.com/intent-hq/monorepo).
+submodule of [intent-hq/intent](https://github.com/intent-hq/intent).
 
 ## Architecture
 
@@ -37,22 +37,24 @@ SvelteKit renderer  <->  AppClient (JSON-RPC boundary)  <->  intentd daemon
 of the monorepo:
 
 ```bash
-git clone https://github.com/intent-hq/monorepo.git
-cd monorepo
+git clone https://github.com/intent-hq/intent.git
+cd intent
 
 # Initialize this submodule (some sibling submodules are still private,
 # so initialize selectively rather than cloning with --recurse-submodules)
 git submodule update --init --recursive packages/cloudlands-fe
 
-cd packages/cloudlands-fe
-pnpm install
-pnpm run dev
+# Fast browser-only component work
+make dev-ui
+
+# Full app with an intentd sidecar
+make dev
 ```
 
-Without a staged `intentd` sidecar, `pnpm run dev` falls back to the mock
-AppClient. For the full stack, run `make dev` from the monorepo root, which
-builds `intentd` and launches the app with it as a sidecar (see
-[intentd sidecar pin](#intentd-sidecar-pin)).
+`make dev-ui` installs the locked frontend dependencies when needed and opens no
+Electron or daemon process. `make dev-ui DEV_PORT=5290` gives a concurrent workspace
+its own strict Vite port. For the full stack, `make dev` builds `intentd` and launches
+the app with it as a sidecar (see [intentd sidecar pin](#intentd-sidecar-pin)).
 
 ### Standalone
 
@@ -62,26 +64,49 @@ mock AppClient when no daemon is present):
 ```bash
 git clone https://github.com/intent-hq/cloudlands-fe.git
 cd cloudlands-fe
-pnpm install
-pnpm run dev
+corepack pnpm install --frozen-lockfile
+corepack pnpm run dev:ui
 ```
+
+Use `corepack pnpm run dev` instead when you need the complete Electron app. Without a
+staged `intentd` sidecar, it falls back to the mock AppClient.
 
 ## Commands
 
-Use `pnpm` (not `npm`). The following scripts are defined in `package.json`:
+Use the repository-pinned `pnpm` through Corepack, not `npm`. The following scripts are
+defined in `package.json`:
 
 ```bash
-pnpm install            # Install dependencies
-pnpm run dev            # Start the app in development (Vite + Electron)
-pnpm run dev:web        # Start the plain-browser development profile
-pnpm run build          # Production build (renderer, main, preload)
-pnpm run build:web      # Build static plain-browser output in dist/web
-pnpm run check          # svelte-check (Svelte + TypeScript diagnostics)
-pnpm run lint           # ESLint
-pnpm run format         # Prettier (write)
-pnpm run test:unit      # Vitest unit suite
-pnpm run test:playwright # Playwright tests
+corepack pnpm install --frozen-lockfile # Install locked dependencies
+corepack pnpm run dev:ui        # Fast named-state component preview
+corepack pnpm run dev:web       # Complete plain-browser renderer
+corepack pnpm run dev           # Complete Vite + Electron app
+corepack pnpm run dev:cdp       # Electron app with CDP support
+corepack pnpm run build         # Production build (renderer, main, preload)
+corepack pnpm run build:web     # Build static plain-browser output in dist/web
+corepack pnpm run check         # Svelte + TypeScript diagnostics
+corepack pnpm run lint          # ESLint
+corepack pnpm run format        # Prettier write pass
+corepack pnpm run test:unit     # Vitest unit suite
+corepack pnpm run test:playwright # Playwright tests
 ```
+
+### Fast named-state previews
+
+Use `dev:ui` for isolated component work, `dev:web` for the complete browser renderer
+and its client connection, and `dev:cdp` for Electron main, preload, native, window, or
+shell work. A direct preview URL controls state, theme, width, and motion:
+
+```text
+http://127.0.0.1:5190/sandbox/button?state=loading&theme=dark&width=420&motion=reduced
+http://127.0.0.1:5190/sandbox/mention-agent-avatar?state=waiting&theme=dark&width=420&motion=reduced
+```
+
+Button provides `default`, `loading`, `disabled`, and `destructive`. Mention agent
+avatar provides `idle`, `waiting`, and `error`. See the monorepo
+[Developer Guide](../../docs/fe/DEVELOPER_GUIDE.md#fast-ui-preview-workflow) for every
+working URL, browser discovery and readiness calls, HMR and hidden-tab guidance, and a
+targeted component-test command.
 
 ### Web runtime configuration
 
@@ -130,8 +155,7 @@ each pointing the auto-updater at the latest build for that channel:
 
 - **alpha** — every `vX.Y.Z` tag (cut by merging the release-please PR) builds
   the app and publishes both an immutable versioned release and the rolling
-  `alpha` release (`.github/workflows/release-beta.yml`; the file name is
-  historical).
+  `alpha` release (`.github/workflows/release-alpha.yml`).
 - **beta** — a manual promotion of an existing versioned release (no new
   build): dispatch `.github/workflows/promote-beta.yml` with the `version`
   input to copy that release's assets and updater feeds into the rolling
@@ -178,35 +202,34 @@ Frontend documentation lives in the monorepo's [`docs/fe/`](../../docs/fe)
 
 Bug reports and feature requests for all Intent components — including this
 frontend — are tracked centrally on the
-[intent-hq/monorepo issue tracker](https://github.com/intent-hq/monorepo/issues),
+[intent-hq/intent issue tracker](https://github.com/intent-hq/intent/issues),
 not on this repository.
 
 ## Network & privacy
 
-The desktop app is local-first and ships **no telemetry or analytics** —
-Segment, Sentry error reporting, and download-attribution have all been
-removed. The app itself makes only these network calls:
+The desktop app is local-first and ships **no telemetry or analytics**. The
+only network calls the app itself makes go to public GitHub Releases:
 
-- **Auto-updates** — the built app checks for and downloads updates from
-  GitHub Releases on
-  [intent-hq/cloudlands-releases](https://github.com/intent-hq/cloudlands-releases).
+- **Auto-updates & release notes** — the built app checks for and downloads
+  updates from GitHub Releases on
+  [intent-hq/cloudlands-releases](https://github.com/intent-hq/cloudlands-releases),
+  and fetches release notes for the installed version from the same repo's
+  GitHub Releases API
+  (`src/features/release-notes/main/release-notes.service.ts`).
   `AUTO_UPDATE_URL` in `src/shared/constants.ts` is the release-download base
   URL; the `publish` URL in `electron-builder.yml` appends the release channel
   (e.g. `/stable`).
-- **Auggie binary download (on demand)** — when you install the Auggie CLI from
-  the app, the pre-built binary is downloaded from the latest public release of
-  [augmentcode/auggie](https://github.com/augmentcode/auggie)
-  (`AUGGIE_BINARY_BASE_URL` in `src/shared/constants/auggie.ts`).
-- **Sentry integration (opt-in, user-configured)** — if you connect a Sentry
-  account with your own API token, the app calls the Sentry REST API
-  (`SENTRY_API_BASE_URL` in `src/features/sentry-auth/constants.ts`) to browse
-  your organization's issues and projects. Nothing is sent to Sentry unless you
-  configure this integration.
 
-Everything else goes through the local `intentd` daemon. Daemon-side network
-calls — provider OAuth sign-ins, user-configured integrations (GitHub, Linear,
-Sentry), and the sitter self-update — are documented in the
-[monorepo README's Network & privacy section](https://github.com/intent-hq/monorepo#network--privacy).
+Everything else goes through the `intentd` daemon the app is connected to —
+local by default; connecting to a remote daemon makes that daemon traffic go
+to the host you chose. If you connect the GitHub, Linear, or Sentry
+integrations, the daemon calls those services' APIs on your behalf — nothing
+is sent to them unless you configure the integration — and the daemon is
+likewise what probes an MCP server when you test its connection. Daemon-side
+network calls — provider OAuth sign-ins, the user-configured integrations
+(GitHub, Linear, Sentry), user-configured MCP servers, and the sitter
+self-update — are documented in the
+[monorepo README's Network & privacy section](https://github.com/intent-hq/intent#network--privacy).
 
 ## History
 

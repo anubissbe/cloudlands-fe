@@ -66,16 +66,13 @@ vi.mock('$store/renderer/store', async () => {
   return createAppStoreMockModule({
     state: () => ({
       providerCatalog,
-      providerSettings: { activeProviderId: 'auggie', enabledProviders: {} },
+      providerSettings: { enabledProviders: {} },
+      model: { defaultProviderId: 'auggie' },
       // The auggie catalog KNOWS opus4.6 — the restored override is valid.
       providerModels: {
         byProviderId: {
           auggie: {
-            models: [
-              { value: 'fable-5' },
-              { value: 'opus4.6' },
-              { value: 'user-picked-model' },
-            ],
+            models: [{ value: 'fable-5' }, { value: 'opus4.6' }, { value: 'user-picked-model' }],
             fetchedAt: '2026-08-15T00:00:00.000Z',
           },
         },
@@ -123,7 +120,29 @@ vi.mock('$store/renderer/slices/specialists/specialists-selectors', () => ({
   selectEffectiveBehaviorPrompt: { select: vi.fn(() => undefined) },
   selectEffectiveModel: { select: vi.fn(() => undefined) },
   selectEffectiveCodingAgent: { select: vi.fn(() => undefined) },
-  filterPickableSpecialists: (specialists: unknown[]) => specialists,
+  selectOrchestratorSpecialist: Object.assign(
+    () =>
+      mocks.readable({
+        id: 'spec-writer',
+        name: 'Coordinator',
+        description: '',
+        role: 'orchestrator',
+        teamAgents: ['implementor', 'verifier'],
+        icon: 'coordinator',
+      }),
+    {
+      select: vi.fn(() => ({
+        id: 'spec-writer',
+        name: 'Coordinator',
+        description: '',
+        role: 'orchestrator',
+        teamAgents: ['implementor', 'verifier'],
+        icon: 'coordinator',
+      })),
+    },
+  ),
+  filterModalPickableSpecialists: (specialists: Array<{ role?: string }>) =>
+    specialists.filter((s) => s.role !== 'internal'),
 }));
 
 vi.mock('$store/renderer/slices/github-auth/github-auth-selectors', () => ({
@@ -138,10 +157,11 @@ vi.mock('$lib/utils/workspace-navigation', () => ({
   navigateToSettings: vi.fn(),
 }));
 
-vi.mock('$features/setup-scripts', () => ({
+vi.mock('$features/setup-scripts', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('$features/setup-scripts')>()),
   SETUP_SCRIPT_TEMPLATES: [],
   getTemplateContent: vi.fn(() => ''),
-  chooseDefaultSetupScript: vi.fn(() => ({ content: '', name: 'Custom' })),
+  chooseDefaultSetupScript: vi.fn(() => ({ content: '', name: 'Custom', source: 'custom' })),
   fetchRepoConfigSetupScript: vi.fn(async () => null),
   fetchGitHubRepoConfigSetupScript: vi.fn(async () => null),
   probeRepoConfigSetupScript: vi.fn(),

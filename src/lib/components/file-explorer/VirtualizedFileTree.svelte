@@ -35,9 +35,7 @@
   import { selectIsWorkspaceHostLocal } from '$store/renderer/slices/workspace/workspace-selectors';
   import { store as appStore } from '$store/renderer/store';
   import { m } from '$shared/paraglide/messages.js';
-  import type { PanelTab } from '$store/renderer/slices/panel-layout/panel-layout-types';
-  import { getPanelTabOpenState } from '$store/renderer/slices/panel-layout/panel-layout-selectors';
-  import OpenPanelIndicator from '$lib/components/workspace/sidebar/OpenPanelIndicator.svelte';
+  import { isCmdClickModifier } from '$shared/utils/link-helpers';
 
   // Sentinel path for inline creation node
   const CREATING_SENTINEL_PATH = '__creating_new_file__';
@@ -60,19 +58,17 @@
     flattenedNodes: FlattenedFileNode[];
     selectedFile?: string;
     workspaceId?: string;
-    onFileSelect?: (path: string) => void;
+    onFileSelect?: (path: string, event?: MouseEvent | KeyboardEvent) => void;
     onToggleDirectory?: (node: FileNode, flatNode?: FlattenedFileNode) => void;
     onCreateFile?: (folderPath: string, fileName?: string) => void | Promise<void>;
     onRenameFile?: (oldPath: string, newPath: string) => void | Promise<void>;
-    onSelectAgent?: (agentId: string) => void;
+    onSelectAgent?: (agentId: string, event?: MouseEvent | KeyboardEvent) => void;
     getGitStatusColor?: (status?: string) => string;
     isFileModified?: (path: string) => boolean;
     itemHeight?: number;
     overscan?: number;
     /** Callback when external files are dropped onto the tree */
     onExternalFilesDrop?: (files: File[], targetPath: string | null) => void;
-    openPanelTabs?: PanelTab[];
-    activePanelTab?: PanelTab | null;
   }
 
   let {
@@ -89,8 +85,6 @@
     itemHeight = 25, // Match ListItem sm size
     overscan = 5,
     onExternalFilesDrop,
-    openPanelTabs = [],
-    activePanelTab,
   }: Props = $props();
 
   // svelte-ignore state_referenced_locally - intentional initial capture; the $effect below syncs later changes
@@ -491,7 +485,7 @@
           }
         } else {
           // For files, open the file
-          onFileSelect?.(node.path);
+          onFileSelect?.(node.path, e);
         }
         break;
       }
@@ -520,12 +514,14 @@
         e.preventDefault();
         if (!focusedNode) break;
         const node = focusedNode.node;
-        if (onRenameFile) {
+        if (isCmdClickModifier({ event: e }) && node.type === 'file') {
+          onFileSelect?.(node.path, e);
+        } else if (onRenameFile) {
           startEditing(node.path, node.name);
         } else if (node.type === 'directory') {
           requestToggleDirectory(focusedNode);
         } else {
-          onFileSelect?.(node.path);
+          onFileSelect?.(node.path, e);
         }
         break;
       }
@@ -536,7 +532,7 @@
         if (!focusedNode) break;
         const node = focusedNode.node;
         if (node.type === 'file') {
-          onFileSelect?.(node.path);
+          onFileSelect?.(node.path, e);
           // Focus stays in explorer - don't blur
         } else {
           // For directories, toggle expansion
@@ -996,14 +992,6 @@
     return false;
   }
 
-  function getFilePanelState(filePath: string) {
-    return getPanelTabOpenState(openPanelTabs, activePanelTab, workspaceId, {
-      type: 'file',
-      filePath,
-      workspaceId,
-    });
-  }
-
   // Scroll state
   let scrollTop = $state(0);
   let scrollEl: HTMLDivElement | undefined = $state();
@@ -1059,12 +1047,11 @@
   let treeContainer: HTMLDivElement | undefined = $state();
 
   // Handle item click
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  function handleItemClick(flatNode: FlattenedFileNode, index: number) {
+  function handleItemClick(flatNode: FlattenedFileNode, _index: number, event: MouseEvent) {
     // Update focused path on click (use path directly for stability)
     focusedPath = flatNode.node.path;
     if (flatNode.node.type === 'file') {
-      onFileSelect?.(flatNode.node.path);
+      onFileSelect?.(flatNode.node.path, event);
     } else {
       requestToggleDirectory(flatNode);
     }
@@ -1171,8 +1158,6 @@
             {@const hasChanges =
               (flatNode.gitStatus?.additions ?? 0) > 0 || (flatNode.gitStatus?.deletions ?? 0) > 0}
             {@const isModified = isFileModified(node.path) && node.type === 'file'}
-            {@const panelState =
-              node.type === 'file' ? getFilePanelState(node.path) : { count: 0, isActive: false }}
             {@const isDropTarget =
               isExternalFileDragOver &&
               dropTargetPath !== null &&
@@ -1186,7 +1171,7 @@
 
             <!-- svelte-ignore a11y_no_static_element_interactions -->
             <div
-              class="flex items-center transition-colors duration-150 {isIgnored
+              class="relative flex items-center transition-colors duration-150 {isIgnored
                 ? 'opacity-50'
                 : ''}"
               class:folder-drop-target={isDropTarget}
@@ -1199,7 +1184,7 @@
               {#if editingPath === node.path}
                 <!-- Inline edit mode - matches ListItem sm size styling exactly -->
                 <div
-                  class="relative min-w-0 flex items-center gap-2.5 py-1 rounded-md border border-border shadow-xs bg-background text-foreground"
+                  class="relative z-10 min-w-0 flex items-center gap-2.5 py-1 rounded-md text-foreground"
                   style="margin-left: 0.5px; padding-left: 9px; padding-right: 0.5px; width: calc(100% - 0.5px);"
                 >
                   <span
@@ -1217,7 +1202,7 @@
                     bind:value={editingValue}
                     onblur={saveEdit}
                     onkeydown={handleEditKeydown}
-                    class="flex-1 text-sm leading-tight bg-transparent border-none outline-none! ring-0! focus:ring-0! focus:outline-none! focus-visible:ring-0! focus-visible:outline-none! min-w-0"
+                    class="inline-edit-input relative z-10 min-w-0 flex-1 border-none bg-transparent text-sm leading-tight outline-none! ring-0! focus:outline-none! focus:ring-0! focus-visible:outline-none! focus-visible:ring-0!"
                     onclick={(e) => e.stopPropagation()}
                   />
                 </div>
@@ -1229,8 +1214,8 @@
                   icon={faChevronDown}
                   iconClass={`opacity-50 [&>svg]:w-2! [&>svg]:mr-1! ${gitColor} transition-transform duration-150 ${flatNode.isExpanded ? '' : 'rotate-90'}`}
                   title={displayName}
-                  titleClass={gitColor}
-                  onclick={() => handleItemClick(flatNode, absoluteIndex)}
+                  titleClass={`cursor-text ${gitColor}`}
+                  onclick={(event) => handleItemClick(flatNode, absoluteIndex, event)}
                   size="sm"
                   class="flex-1"
                   actions={onCreateFile
@@ -1255,10 +1240,10 @@
                   tabindex={-1}
                   iconClass={gitColor}
                   title={displayName}
-                  titleClass={gitColor}
+                  titleClass={`cursor-text ${gitColor}`}
                   badge={isModified ? '•' : undefined}
                   badgeClass={isModified ? 'text-blue-500' : undefined}
-                  onclick={() => handleItemClick(flatNode, absoluteIndex)}
+                  onclick={(event) => handleItemClick(flatNode, absoluteIndex, event)}
                   size="sm"
                   class="flex-1"
                 >
@@ -1267,7 +1252,6 @@
                       {@html getFileTypeIconSvg(node.name)}
                     </span>
                   {/snippet}
-                  <OpenPanelIndicator count={panelState.count} active={panelState.isActive} />
                 </ListItem>
               {/if}
               {#if hasChanges}
@@ -1287,14 +1271,21 @@
                       title={m.fileExplorer_tree_openAgent_tooltip()}
                       onclick={(e) => {
                         e.stopPropagation();
-                        onSelectAgent?.(agentId);
+                        onSelectAgent?.(agentId, e);
                       }}
                     >
-                      <AgentAvatar {agentId} size={16} />
+                      <AgentAvatar {agentId} variant="compact" />
                     </button>
                   {/each}
                 </div>
               {/if}
+              <span
+                aria-hidden="true"
+                class="pointer-events-none absolute z-0 rounded-(--radius-small) border transition-[inset,border-color,background-color] duration-(--motion-standard) ease-(--ease-standard) motion-reduce:transition-none {editingPath ===
+                node.path
+                  ? 'inset-px border-ring/60 bg-background'
+                  : 'inset-x-1 inset-y-0.5 border-transparent bg-transparent'}"
+              ></span>
             </div>
           {/if}
         {/each}
@@ -1315,6 +1306,10 @@
 {/if}
 
 <style>
+  input.inline-edit-input::selection {
+    background: hsl(var(--ring) / 0.3);
+  }
+
   /* Visual feedback when dragging files to root level (no specific folder targeted) */
   .file-drop-root {
     outline: 2px dashed hsl(var(--primary));

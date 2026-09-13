@@ -12,6 +12,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { DraftAttachment, DraftsClient } from '$lib/client/app-client';
 import type { ContextItem } from '$lib/components/chat/input/context-api';
 import {
+  LEGACY_ONBOARDING_PROMPT_SESSION_KEY,
   LEGACY_PROMPT_SESSION_KEY,
   MAX_DRAFT_ATTACHMENTS_BYTES,
   NEW_WORKSPACE_DRAFT_AGENT_ID,
@@ -140,6 +141,39 @@ describe('restoreNewWorkspaceDraft', () => {
     expect(sessionStorage.getItem(LEGACY_PROMPT_SESSION_KEY)).toBe('legacy prompt');
     expect(drafts.set).not.toHaveBeenCalled();
   });
+
+  it('migrates the onboarding legacy key when passed via options.legacyKey', async () => {
+    sessionStorage.setItem(LEGACY_ONBOARDING_PROMPT_SESSION_KEY, 'onboarding legacy prompt');
+    const drafts = createMockDrafts(null);
+
+    const restored = await restoreNewWorkspaceDraft(drafts, {
+      legacyKey: LEGACY_ONBOARDING_PROMPT_SESSION_KEY,
+    });
+
+    expect(restored).toEqual({
+      status: 'restored',
+      text: 'onboarding legacy prompt',
+      contextItems: [],
+    });
+    expect(sessionStorage.getItem(LEGACY_ONBOARDING_PROMPT_SESSION_KEY)).toBeNull();
+    expect(drafts.set).toHaveBeenCalledWith(
+      '__new-workspace__',
+      '__initializer__',
+      'onboarding legacy prompt',
+      undefined,
+    );
+  });
+
+  it('removes only the provided legacy key when a daemon draft exists', async () => {
+    sessionStorage.setItem(LEGACY_ONBOARDING_PROMPT_SESSION_KEY, 'stale onboarding prompt');
+    sessionStorage.setItem(LEGACY_PROMPT_SESSION_KEY, 'modal prompt untouched');
+    const drafts = createMockDrafts({ text: 'daemon wins', updatedAt: '2026-07-23T00:00:00Z' });
+
+    await restoreNewWorkspaceDraft(drafts, { legacyKey: LEGACY_ONBOARDING_PROMPT_SESSION_KEY });
+
+    expect(sessionStorage.getItem(LEGACY_ONBOARDING_PROMPT_SESSION_KEY)).toBeNull();
+    expect(sessionStorage.getItem(LEGACY_PROMPT_SESSION_KEY)).toBe('modal prompt untouched');
+  });
 });
 
 describe('buildNewWorkspaceDraftPayload', () => {
@@ -175,6 +209,23 @@ describe('buildNewWorkspaceDraftPayload', () => {
 
     expect(payload).toEqual({ text: 'still saved' });
     expect('attachments' in payload!).toBe(false);
+  });
+
+  it('keeps the attachments that fit when one exceeds the size guard', () => {
+    // An image accepted at the 30 MiB reference cap exceeds the 20 MiB
+    // draft guard — it must be dropped alone, not take the fitting
+    // attachments down with it.
+    const oversizedItem: ContextItem = {
+      ...imageItem,
+      id: 'image-oversized',
+      imageData: 'a'.repeat(MAX_DRAFT_ATTACHMENTS_BYTES + 1),
+    };
+
+    const payload = buildNewWorkspaceDraftPayload('still saved', [oversizedItem, imageItem]);
+
+    expect(payload!.text).toBe('still saved');
+    expect(payload!.attachments).toHaveLength(1);
+    expect(payload!.attachments![0].id).toBe(imageItem.id);
   });
 
   it('guards on text + attachments combined, not attachments alone', () => {
@@ -237,8 +288,9 @@ describe('persistNewWorkspaceDraft', () => {
 });
 
 describe('clearNewWorkspaceDraft', () => {
-  it('issues drafts.clear under the sentinel keys and removes the legacy sessionStorage key', () => {
-    sessionStorage.setItem(LEGACY_PROMPT_SESSION_KEY, 'stale');
+  it('issues drafts.clear under the sentinel keys and removes BOTH legacy sessionStorage keys (shared draft: the other surface must not migrate a cleared draft back in)', () => {
+    sessionStorage.setItem(LEGACY_PROMPT_SESSION_KEY, 'stale modal prompt');
+    sessionStorage.setItem(LEGACY_ONBOARDING_PROMPT_SESSION_KEY, 'stale onboarding prompt');
     const drafts = createMockDrafts();
 
     clearNewWorkspaceDraft(drafts);
@@ -246,6 +298,7 @@ describe('clearNewWorkspaceDraft', () => {
     expect(drafts.clear).toHaveBeenCalledOnce();
     expect(drafts.clear).toHaveBeenCalledWith('__new-workspace__', '__initializer__');
     expect(sessionStorage.getItem(LEGACY_PROMPT_SESSION_KEY)).toBeNull();
+    expect(sessionStorage.getItem(LEGACY_ONBOARDING_PROMPT_SESSION_KEY)).toBeNull();
   });
 
   it('is non-fatal when drafts.clear rejects', async () => {
@@ -256,6 +309,61 @@ describe('clearNewWorkspaceDraft', () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
 
     expect(drafts.clear).toHaveBeenCalledOnce();
+  });
+});
+
+describe('image + staged attachment save payload', () => {
+  it('regression: staged non-image attachments ride the drafts.set payload alongside image context items (a text save must not wipe them)', () => {
+    vi.useFakeTimers();
+    try {
+      const drafts = createMockDrafts();
+      const saver = createNewWorkspaceDraftSaver(drafts);
+      // Path-only staged item as OnboardingPromptStep stages it (no bytes;
+      // placed at create-time redemption).
+      const stagedItem: ContextItem = {
+        id: 'staged-file-1721650000000-0',
+        type: 'file',
+        label: 'report.pdf',
+        description: 'application/pdf • 1.2 MB',
+        path: 'report.pdf',
+        attachmentMimeType: 'application/pdf',
+        attachmentSize: 1258291,
+        sourcePath: '/home/user/report.pdf',
+      };
+
+      // Mirrors the onboarding save payload: image context items + staged
+      // non-image items in one attachments array.
+      saver.schedule('typed after staging a pdf', [imageItem, stagedItem]);
+      vi.advanceTimersByTime(300);
+
+      expect(drafts.set).toHaveBeenCalledOnce();
+      expect(drafts.set).toHaveBeenCalledWith(
+        '__new-workspace__',
+        '__initializer__',
+        'typed after staging a pdf',
+        [
+          {
+            id: 'image-1721650000000-0',
+            type: 'file',
+            label: 'screenshot.png',
+            imageData: 'iVBORw0KGgoAAAANSUhEUg==',
+            imageMimeType: 'image/png',
+          },
+          {
+            id: 'staged-file-1721650000000-0',
+            type: 'file',
+            label: 'report.pdf',
+            description: 'application/pdf • 1.2 MB',
+            path: 'report.pdf',
+            attachmentMimeType: 'application/pdf',
+            attachmentSize: 1258291,
+            sourcePath: '/home/user/report.pdf',
+          },
+        ],
+      );
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
@@ -360,6 +468,57 @@ describe('createNewWorkspaceDraftSaver', () => {
     saver.schedule('typed before destroy', []);
 
     expect(() => saver.flush()).not.toThrow();
+  });
+
+  it('cancel() drops an armed debounced save (regression: a queued drafts.set firing after drafts.clear resurrects the draft)', () => {
+    const drafts = createMockDrafts();
+    const saver = createNewWorkspaceDraftSaver(drafts);
+
+    saver.schedule('submitted prompt', [imageItem]);
+    saver.cancel();
+
+    vi.advanceTimersByTime(300);
+    expect(drafts.set).not.toHaveBeenCalled();
+
+    // The pending payload is dropped too — a later flush must not revive it.
+    saver.flush();
+    expect(drafts.set).not.toHaveBeenCalled();
+  });
+
+  it('cancel() does not break subsequent schedules', () => {
+    const drafts = createMockDrafts();
+    const saver = createNewWorkspaceDraftSaver(drafts);
+
+    saver.schedule('cancelled', []);
+    saver.cancel();
+    saver.schedule('kept', []);
+    vi.advanceTimersByTime(300);
+
+    expect(drafts.set).toHaveBeenCalledOnce();
+    expect(drafts.set).toHaveBeenCalledWith(
+      '__new-workspace__',
+      '__initializer__',
+      'kept',
+      undefined,
+    );
+  });
+
+  it('text typed while the restore is pending is flushable (regression: navigate away during a slow drafts.get)', () => {
+    const drafts = createMockDrafts();
+    // Mirrors the onboarding wiring: skipEmptySave is true until the restore
+    // settles, so pre-settle empty saves are dropped but typed text persists.
+    const saver = createNewWorkspaceDraftSaver(drafts, { skipEmptySave: () => true });
+
+    saver.schedule('typed during restore', []);
+    saver.flush();
+
+    expect(drafts.set).toHaveBeenCalledOnce();
+    expect(drafts.set).toHaveBeenCalledWith(
+      '__new-workspace__',
+      '__initializer__',
+      'typed during restore',
+      undefined,
+    );
   });
 });
 

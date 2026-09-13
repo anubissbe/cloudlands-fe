@@ -12,8 +12,22 @@ const lifecycleSelectorState = vi.hoisted(() => ({
   result: null as { workspaceId?: string } | null,
 }));
 
+const historySelectorState = vi.hoisted(() => ({
+  settingsApplied: null as null | { appliedAt: number; reverseChanges: unknown[] },
+  specialistApplied: null as null | { appliedAt: number; reverse: unknown },
+}));
+
 const navigationMocks = vi.hoisted(() => ({
   goto: vi.fn(),
+}));
+
+const electronBridgeMocks = vi.hoisted(() => ({
+  invoke: vi.fn(),
+}));
+
+vi.mock('$lib/electron-bridge', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('$lib/electron-bridge')>()),
+  invoke: electronBridgeMocks.invoke,
 }));
 
 const prBranchLookupState = vi.hoisted(() => {
@@ -59,8 +73,8 @@ vi.mock(
   '$store/renderer/slices/settings-proposal-history/settings-proposal-history-selectors',
   () => ({
     selectProposalAppliedState: vi.fn(() => ({
-      subscribe: (run: (value: null) => void) => {
-        run(null);
+      subscribe: (run: (value: typeof historySelectorState.settingsApplied) => void) => {
+        run(historySelectorState.settingsApplied);
         return () => {};
       },
     })),
@@ -70,8 +84,8 @@ vi.mock(
   '$store/renderer/slices/specialist-proposal-history/specialist-proposal-history-selectors',
   () => ({
     selectSpecialistProposalAppliedState: vi.fn(() => ({
-      subscribe: (run: (value: null) => void) => {
-        run(null);
+      subscribe: (run: (value: typeof historySelectorState.specialistApplied) => void) => {
+        run(historySelectorState.specialistApplied);
         return () => {};
       },
     })),
@@ -120,17 +134,22 @@ vi.mock('$store/renderer/store', () => ({
   },
 }));
 
-import { requestPrBranchLookup } from '$store/renderer/slices/pr-branch-lookup/pr-branch-lookup-slice';
+import {
+  getPrBranchLookupKey,
+  prBranchLookupStarted,
+} from '$store/renderer/slices/pr-branch-lookup/pr-branch-lookup-slice';
 import ProposalCard from './ProposalCard.svelte';
 import { warmImport } from '../../../../test/warm-import';
 
 const originalElectronAPI = window.electronAPI;
 
-function setElectronInvoke(invoke: ReturnType<typeof vi.fn>) {
+// Presence of window.electronAPI gates canUseElectronPrLookup(); the actual
+// IPC call goes through the mocked $lib/electron-bridge invoke.
+function setElectronEnv() {
   Object.defineProperty(window, 'electronAPI', {
     configurable: true,
     writable: true,
-    value: { invoke },
+    value: { invoke: vi.fn() },
   });
 }
 
@@ -167,7 +186,10 @@ beforeEach(() => {
   lifecycleSelectorState.error = null;
   lifecycleSelectorState.errorCode = null;
   lifecycleSelectorState.result = null;
+  historySelectorState.settingsApplied = null;
+  historySelectorState.specialistApplied = null;
   navigationMocks.goto.mockReset();
+  electronBridgeMocks.invoke.mockReset();
   prBranchLookupState.reset();
 });
 
@@ -239,7 +261,7 @@ describe('ProposalCard', () => {
     expect(status.textContent).toContain('Applying…');
     expect(status.getAttribute('aria-live')).toBe('polite');
     expect(screen.getByRole('button', { name: 'Applying…' }).hasAttribute('disabled')).toBe(true);
-    expect(screen.getByRole('button', { name: 'Discard' }).hasAttribute('disabled')).toBe(true);
+    expect(screen.getByRole('button', { name: 'Not now' }).hasAttribute('disabled')).toBe(true);
   });
 
   it('renders applied proposals as completed instead of actionable', () => {
@@ -259,40 +281,21 @@ describe('ProposalCard', () => {
     expect(status.className).toContain('text-success');
     expect(container.querySelector('[data-lifecycle-status="applied"]')).not.toBeNull();
     expect(screen.queryByRole('button', { name: 'Apply' })).toBeNull();
-    expect(screen.queryByRole('button', { name: 'Discard' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Not now' })).toBeNull();
     expect(screen.queryByRole('button', { name: 'Edit Title' })).toBeNull();
     expect(onApply).not.toHaveBeenCalled();
     expect(onDiscard).not.toHaveBeenCalled();
   });
 
-  it('uses a neutral outer border for completed cards when requested by the host', () => {
-    lifecycleSelectorState.status = 'applied';
-    const { container } = render(ProposalCard, {
-      props: {
-        proposal: makeProposal([{ key: 'title', label: 'Title', value: 'Workspace title' }]),
-        neutralBorder: true,
-      },
-    });
-
-    const card = container.querySelector('[data-proposal-kind]');
-    expect(card?.className).toContain('border-border');
-    expect(card?.className).not.toContain('border-success');
-    expect(screen.getByRole('status').className).toContain('text-success');
-  });
-
-  it('uses the compact editorial surface and semantic status roles', () => {
+  it('uses the editorial type ramp without raw palette colors', () => {
     const { container } = render(ProposalCard, {
       props: {
         proposal: makeProposal([{ key: 'title', label: 'Title', value: 'Workspace title' }]),
       },
     });
 
-    const card = container.querySelector('[data-proposal-kind]');
-    expect(card?.className).toContain('rounded-(--radius-medium)');
-    expect(card?.className).toContain('bg-card');
-    expect(card?.className).toContain('shadow-(--elevation-raised)');
-    expect(screen.getByRole('heading', { name: 'Change settings' }).className).toContain(
-      'type-body',
+    expect(screen.getByRole('heading', { name: 'Apply these changes?' }).className).toContain(
+      'type-title',
     );
     expect(container.innerHTML).not.toMatch(/(?:green|emerald)-[0-9]/);
   });
@@ -444,14 +447,13 @@ describe('ProposalCard', () => {
     expect(screen.queryByRole('button', { name: 'Archive' })).toBeNull();
   });
 
-  it('renders Layout A Discard with the same Button styling as Layout B', () => {
+  it('renders the same secondary action for workspace and settings proposals', () => {
     const { unmount } = render(ProposalCard, {
       props: {
         proposal: makeWorkspaceProposal(),
       },
     });
-    const workspaceDiscard = screen.getByRole('button', { name: 'Discard' });
-    const workspaceDiscardClass = workspaceDiscard.className;
+    const workspaceDismiss = screen.getByRole('button', { name: 'Not now' });
 
     unmount();
 
@@ -461,8 +463,8 @@ describe('ProposalCard', () => {
       },
     });
 
-    expect(workspaceDiscard.getAttribute('data-slot')).toBe('button');
-    expect(workspaceDiscardClass).toBe(screen.getByRole('button', { name: 'Discard' }).className);
+    expect(workspaceDismiss.getAttribute('data-slot')).toBe('button');
+    expect(screen.getByRole('button', { name: 'Not now' })).toBeTruthy();
   });
 
   it('renders workspace metadata controls with the shared label and control row structure', () => {
@@ -481,12 +483,11 @@ describe('ProposalCard', () => {
 
     const rows = Array.from(container.querySelectorAll('[data-row="metadata"]'));
 
-    expect(rows).toHaveLength(3);
+    expect(rows).toHaveLength(2);
     expect(
       rows.map((row) => row.querySelector('[data-metadata-label]')?.textContent?.trim()),
-    ).toEqual(['Repo', 'Base branch', 'Specialist']);
+    ).toEqual(['Project', 'Initial agent']);
     for (const row of rows) {
-      expect(row.className).toContain('grid-cols-[6rem_minmax(0,1fr)]');
       expect(row.querySelector('[data-metadata-label]')?.className).toContain(
         'text-muted-foreground',
       );
@@ -497,9 +498,9 @@ describe('ProposalCard', () => {
       rows[0],
     );
     expect(screen.getByTestId('proposal-branch-picker').closest('[data-row="metadata"]')).toBe(
-      rows[1],
+      rows[0],
     );
-    expect(screen.getByTestId('proposal-specialist-dropdown')).toBe(rows[2]);
+    expect(screen.getByTestId('proposal-specialist-dropdown')).toBe(rows[1]);
     const pickerMocks = screen.getAllByTestId('mock-repo-and-branch-picker');
     expect(pickerMocks.map((picker) => picker.getAttribute('data-field'))).toEqual([
       'repo',
@@ -547,8 +548,42 @@ describe('ProposalCard', () => {
     });
 
     expect(screen.getByText('Edit specialist: Review Buddy')).toBeTruthy();
-    expect(container.textContent).toContain('Name: Reviewer → Review Buddy');
+    expect(
+      container.querySelector('[data-proposal-before-after-row="name"]')?.textContent,
+    ).toContain('Reviewer → Review Buddy');
     expect(container.textContent).not.toContain('specialist edit');
+  });
+
+  // Undo reachability (intent-hq/intent#3965): an applied proposal routed
+  // through ProposalCard must surface the Undo affordance from its history
+  // entry and forward onUndo with the proposal id.
+  it('offers Undo on an applied specialist proposal and forwards onUndo', async () => {
+    historySelectorState.specialistApplied = { appliedAt: Date.now(), reverse: {} };
+    const proposal = { ...makeSpecialistProposal(), applyToolCallId: 'tool-specialist-edit' };
+    const onUndo = vi.fn();
+    render(ProposalCard, { props: { proposal, onUndo } });
+
+    expect(screen.queryByRole('button', { name: 'Apply' })).toBeNull();
+    await fireEvent.click(screen.getByRole('button', { name: 'Undo' }));
+
+    expect(onUndo).toHaveBeenCalledWith('tool-specialist-edit');
+  });
+
+  it('offers Undo on an applied settings proposal and forwards onUndo', async () => {
+    historySelectorState.settingsApplied = { appliedAt: Date.now(), reverseChanges: [] };
+    const proposal: Proposal = {
+      kind: 'settings-change',
+      applyToolCallId: 'tool-settings-change',
+      payload: { changes: [{ path: 'theme.activePresetId', value: 'dracula' }] },
+      preview: { title: 'Theme preset: Dracula' },
+    };
+    const onUndo = vi.fn();
+    render(ProposalCard, { props: { proposal, onUndo } });
+
+    expect(screen.queryByRole('button', { name: 'Apply' })).toBeNull();
+    await fireEvent.click(screen.getByRole('button', { name: 'Undo' }));
+
+    expect(onUndo).toHaveBeenCalledWith('tool-settings-change');
   });
 
   it('renders workspace initialPrompt as an always-visible textarea and applies typed edits', async () => {
@@ -649,12 +684,12 @@ describe('ProposalCard', () => {
     expect(screen.getByTestId('mock-specialist-dropdown').textContent).toContain('pr-reviewer');
   });
 
-  it('dispatches a cached PR source branch lookup and displays the cached result', async () => {
-    const invoke = vi.fn().mockResolvedValue({
+  it('performs the PR source branch lookup via IPC and displays the result', async () => {
+    setElectronEnv();
+    electronBridgeMocks.invoke.mockResolvedValue({
       success: true,
       data: { sourceBranch: 'install-local-package' },
     });
-    setElectronInvoke(invoke);
 
     render(ProposalCard, {
       props: {
@@ -668,16 +703,19 @@ describe('ProposalCard', () => {
       },
     });
 
-    const expectedAction = requestPrBranchLookup({
-      owner: 'example-org',
-      repo: 'example-repo',
-      prNumber: 648,
-    });
-    await waitFor(() => expect(prBranchLookupState.dispatch).toHaveBeenCalledWith(expectedAction));
-    expect(prBranchLookupState.dispatch).toHaveBeenCalledTimes(1);
-    expect(invoke).not.toHaveBeenCalled();
+    const request = { owner: 'example-org', repo: 'example-repo', prNumber: 648 };
+    const payload = { ...request, key: getPrBranchLookupKey(request) };
+    const startedAction = prBranchLookupStarted(payload);
+    await waitFor(() => expect(prBranchLookupState.dispatch).toHaveBeenCalledWith(startedAction));
+    await waitFor(() =>
+      expect(electronBridgeMocks.invoke).toHaveBeenCalledWith('git-tracking:get-pull-request', {
+        owner: 'example-org',
+        repo: 'example-repo',
+        number: 648,
+      }),
+    );
 
-    prBranchLookupState.lookupEntries[expectedAction.payload.key] = {
+    prBranchLookupState.lookupEntries[payload.key] = {
       status: 'succeeded',
       branch: 'install-local-package',
     };
@@ -687,7 +725,9 @@ describe('ProposalCard', () => {
   });
 
   it('prevents creating a PR workspace until branch detection finishes', async () => {
-    setElectronInvoke(vi.fn());
+    setElectronEnv();
+    const lookup = deferred<{ success: boolean; data: { sourceBranch: string } }>();
+    electronBridgeMocks.invoke.mockReturnValue(lookup.promise);
     const { container } = render(ProposalCard, {
       props: {
         proposal: makeWorkspaceProposal(
@@ -704,12 +744,11 @@ describe('ProposalCard', () => {
       .querySelector('[data-proposal-kind]')
       ?.addEventListener('proposalapply', applyListener as EventListener);
 
-    const expectedAction = requestPrBranchLookup({
-      owner: 'example-org',
-      repo: 'example-repo',
-      prNumber: 648,
-    });
-    await waitFor(() => expect(prBranchLookupState.dispatch).toHaveBeenCalledWith(expectedAction));
+    const request = { owner: 'example-org', repo: 'example-repo', prNumber: 648 };
+    const payload = { ...request, key: getPrBranchLookupKey(request) };
+    await waitFor(() =>
+      expect(prBranchLookupState.dispatch).toHaveBeenCalledWith(prBranchLookupStarted(payload)),
+    );
 
     const button = await screen.findByRole('button', { name: /Detecting branch/ });
     expect(button.hasAttribute('disabled')).toBe(true);
@@ -718,7 +757,8 @@ describe('ProposalCard', () => {
     await fireEvent.click(button);
     expect(applyListener).not.toHaveBeenCalled();
 
-    prBranchLookupState.lookupEntries[expectedAction.payload.key] = {
+    lookup.resolve({ success: true, data: { sourceBranch: 'install-local-package' } });
+    prBranchLookupState.lookupEntries[payload.key] = {
       status: 'succeeded',
       branch: 'install-local-package',
     };
@@ -730,9 +770,9 @@ describe('ProposalCard', () => {
   });
 
   it('does not overwrite a user-edited branch when the PR branch lookup resolves late', async () => {
+    setElectronEnv();
     const lookup = deferred<{ success: boolean; data: { sourceBranch: string } }>();
-    const invoke = vi.fn().mockReturnValue(lookup.promise);
-    setElectronInvoke(invoke);
+    electronBridgeMocks.invoke.mockReturnValue(lookup.promise);
 
     render(ProposalCard, {
       props: {
@@ -746,16 +786,15 @@ describe('ProposalCard', () => {
       },
     });
 
-    const expectedAction = requestPrBranchLookup({
-      owner: 'example-org',
-      repo: 'example-repo',
-      prNumber: 648,
-    });
-    await waitFor(() => expect(prBranchLookupState.dispatch).toHaveBeenCalledWith(expectedAction));
+    const request = { owner: 'example-org', repo: 'example-repo', prNumber: 648 };
+    const payload = { ...request, key: getPrBranchLookupKey(request) };
+    await waitFor(() =>
+      expect(prBranchLookupState.dispatch).toHaveBeenCalledWith(prBranchLookupStarted(payload)),
+    );
     await fireEvent.click(screen.getByRole('button', { name: 'Mock branch change' }));
 
     lookup.resolve({ success: true, data: { sourceBranch: 'install-local-package' } });
-    prBranchLookupState.lookupEntries[expectedAction.payload.key] = {
+    prBranchLookupState.lookupEntries[payload.key] = {
       status: 'succeeded',
       branch: 'install-local-package',
     };
@@ -767,8 +806,7 @@ describe('ProposalCard', () => {
   });
 
   it('does not fetch a PR branch when no PR URL is available', async () => {
-    const invoke = vi.fn();
-    setElectronInvoke(invoke);
+    setElectronEnv();
 
     render(ProposalCard, {
       props: {
@@ -778,13 +816,12 @@ describe('ProposalCard', () => {
 
     await flushAsyncWork();
 
-    expect(invoke).not.toHaveBeenCalled();
+    expect(electronBridgeMocks.invoke).not.toHaveBeenCalled();
     expect(prBranchLookupState.dispatch).not.toHaveBeenCalled();
   });
 
   it('does not fetch a PR branch when an explicit branch is already provided', async () => {
-    const invoke = vi.fn();
-    setElectronInvoke(invoke);
+    setElectronEnv();
 
     render(ProposalCard, {
       props: {
@@ -800,7 +837,7 @@ describe('ProposalCard', () => {
 
     await flushAsyncWork();
 
-    expect(invoke).not.toHaveBeenCalled();
+    expect(electronBridgeMocks.invoke).not.toHaveBeenCalled();
     expect(prBranchLookupState.dispatch).not.toHaveBeenCalled();
     expect(getBranchPicker().textContent).toContain('feature/foo');
   });
@@ -828,8 +865,9 @@ describe('ProposalCard', () => {
     );
   });
 
-  it('renders a subtle branch fallback hint when cached PR branch lookup fails', async () => {
-    setElectronInvoke(vi.fn());
+  it('renders a subtle branch fallback hint when the PR branch lookup fails', async () => {
+    setElectronEnv();
+    electronBridgeMocks.invoke.mockResolvedValue({ success: false, error: 'rate limited' });
 
     render(ProposalCard, {
       props: {
@@ -843,14 +881,13 @@ describe('ProposalCard', () => {
       },
     });
 
-    const expectedAction = requestPrBranchLookup({
-      owner: 'example-org',
-      repo: 'example-repo',
-      prNumber: 648,
-    });
-    await waitFor(() => expect(prBranchLookupState.dispatch).toHaveBeenCalledWith(expectedAction));
+    const request = { owner: 'example-org', repo: 'example-repo', prNumber: 648 };
+    const payload = { ...request, key: getPrBranchLookupKey(request) };
+    await waitFor(() =>
+      expect(prBranchLookupState.dispatch).toHaveBeenCalledWith(prBranchLookupStarted(payload)),
+    );
 
-    prBranchLookupState.lookupEntries[expectedAction.payload.key] = {
+    prBranchLookupState.lookupEntries[payload.key] = {
       status: 'failed',
       error: 'rate limited',
     };
@@ -896,6 +933,187 @@ describe('ProposalCard', () => {
     expect(event?.detail.editedFields.specialist).toBe('ui-designer');
   });
 
+  it('renders sibling mode with editable allowed fields and locked repository metadata', async () => {
+    const { container } = render(ProposalCard, {
+      props: {
+        proposal: makeWorkspaceProposal({
+          workspaceCreate: {
+            mode: 'sibling',
+            title: 'Investigate follow-up',
+            initialPrompt: 'Inspect the separate issue.',
+            repoPath: '/repo/current',
+            repoType: 'local',
+            branch: 'feature/dependency',
+            specialist: 'planner',
+          },
+        }),
+      },
+    });
+    const applyListener = vi.fn();
+    container
+      .querySelector('[data-proposal-kind]')
+      ?.addEventListener('proposalapply', applyListener as EventListener);
+
+    const title = screen.getByTestId('proposal-workspace-title') as HTMLInputElement;
+    const prompt = screen.getByPlaceholderText('What would you like to work on?');
+    expect(title.value).toBe('Investigate follow-up');
+    expect(screen.getByTestId('proposal-repo-locked').textContent).toContain('/repo/current');
+    expect(screen.queryByTestId('proposal-repo-picker')).toBeNull();
+    expect(screen.getByTestId('proposal-branch-picker')).toBeTruthy();
+
+    await fireEvent.input(title, { target: { value: 'Edited follow-up' } });
+    await fireEvent.input(prompt, { target: { value: 'Use the findings from this workspace.' } });
+    await fireEvent.click(screen.getByRole('button', { name: 'Mock branch change' }));
+    await fireEvent.click(screen.getByRole('button', { name: 'Mock specialist change' }));
+    await fireEvent.click(screen.getByRole('button', { name: /Create workspace/ }));
+
+    const event = applyListener.mock.calls[0]?.[0] as CustomEvent | undefined;
+    expect(event?.detail.editedFields).toEqual({
+      title: 'Edited follow-up',
+      initialPrompt: 'Use the findings from this workspace.',
+      branch: 'mock-branch',
+      specialist: 'ui-designer',
+    });
+  });
+
+  it('renders the localized sibling heading without changing the Chief heading', () => {
+    const { unmount } = render(ProposalCard, {
+      props: {
+        proposal: makeWorkspaceProposal({
+          workspaceCreate: {
+            mode: 'sibling',
+            title: 'Investigate follow-up',
+            repoPath: '/repo/current',
+          },
+        }),
+      },
+    });
+
+    expect(screen.getByRole('heading', { name: 'Create a new workspace?' })).toBeTruthy();
+    unmount();
+
+    render(ProposalCard, { props: { proposal: makeWorkspaceProposal() } });
+    expect(screen.getByRole('heading', { name: 'Create a new workspace?' })).toBeTruthy();
+  });
+
+  it('keeps the sibling repository locked while the branch remains selectable', () => {
+    render(ProposalCard, {
+      props: {
+        proposal: makeWorkspaceProposal({
+          workspaceCreate: {
+            mode: 'sibling',
+            title: 'Investigate follow-up',
+            repoPath: '/repo/current',
+            branch: 'main',
+          },
+        }),
+      },
+    });
+
+    expect(screen.getByTestId('proposal-repo-locked').textContent).toContain('/repo/current');
+    expect(screen.queryByTestId('proposal-repo-picker')).toBeNull();
+    expect(getBranchPicker().getAttribute('data-presentation')).toBe('metadata');
+  });
+
+  it('shows the sibling shortcut hint only while a title or prompt editor has focus', async () => {
+    const { unmount } = render(ProposalCard, {
+      props: {
+        proposal: makeWorkspaceProposal({
+          workspaceCreate: {
+            mode: 'sibling',
+            title: 'Investigate follow-up',
+            initialPrompt: 'Inspect the separate issue.',
+            repoPath: '/repo/current',
+          },
+        }),
+      },
+    });
+    const title = screen.getByTestId('proposal-workspace-title');
+    const prompt = screen.getByPlaceholderText('What would you like to work on?');
+    const createButton = screen.getByRole('button', { name: /Create workspace/ });
+    const shortcutHint = () => screen.queryByText(/^(?:⌘|Ctrl)\+↵$/);
+
+    expect(shortcutHint()).toBeNull();
+    await fireEvent.focus(title);
+    expect(shortcutHint()).toBeTruthy();
+
+    await fireEvent.blur(title, { relatedTarget: prompt });
+    expect(shortcutHint()).toBeTruthy();
+    await fireEvent.focus(prompt);
+    expect(shortcutHint()).toBeTruthy();
+
+    await fireEvent.blur(prompt, { relatedTarget: createButton });
+    await fireEvent.focus(createButton);
+    expect(shortcutHint()).toBeNull();
+    unmount();
+
+    render(ProposalCard, {
+      props: {
+        proposal: makeWorkspaceProposal({
+          workspaceCreate: {
+            mode: 'sibling',
+            title: 'Disabled follow-up',
+            repoPath: '/repo/current',
+          },
+        }),
+        disabled: true,
+      },
+    });
+    await fireEvent.focus(screen.getByTestId('proposal-workspace-title'));
+    expect(shortcutHint()).toBeNull();
+  });
+
+  it('keeps Ctrl+Enter workspace submission from the focused sibling prompt', async () => {
+    const { container } = render(ProposalCard, {
+      props: {
+        proposal: makeWorkspaceProposal({
+          workspaceCreate: {
+            mode: 'sibling',
+            title: 'Investigate follow-up',
+            initialPrompt: 'Inspect the separate issue.',
+            repoPath: '/repo/current',
+          },
+        }),
+      },
+    });
+    const applyListener = vi.fn();
+    container
+      .querySelector('[data-proposal-kind]')
+      ?.addEventListener('proposalapply', applyListener as EventListener);
+    const prompt = screen.getByPlaceholderText('What would you like to work on?');
+
+    await fireEvent.focus(prompt);
+    await fireEvent.keyDown(prompt, { key: 'Enter' });
+    expect(applyListener).not.toHaveBeenCalled();
+
+    await fireEvent.keyDown(prompt, { key: 'Enter', ctrlKey: true });
+    expect(applyListener).toHaveBeenCalledTimes(1);
+  });
+
+  it('discards sibling mode without applying workspace creation', async () => {
+    const onApply = vi.fn();
+    const onDiscard = vi.fn();
+    render(ProposalCard, {
+      props: {
+        proposal: makeWorkspaceProposal({
+          workspaceCreate: {
+            mode: 'sibling',
+            title: 'Separate follow-up',
+            repoPath: '/repo/current',
+          },
+        }),
+        onApply,
+        onDiscard,
+      },
+    });
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Not now' }));
+
+    expect(onApply).not.toHaveBeenCalled();
+    expect(onDiscard).toHaveBeenCalledTimes(1);
+    expect(screen.getByText(/Discarded:/)).toBeTruthy();
+  });
+
   it('uses workspace-specific wording for workspace-create while applying', () => {
     lifecycleSelectorState.status = 'applying';
     const { container } = render(ProposalCard, {
@@ -924,7 +1142,15 @@ describe('ProposalCard', () => {
     lifecycleSelectorState.status = 'applied';
     lifecycleSelectorState.result = { workspaceId: 'ws-new' };
     render(ProposalCard, {
-      props: { proposal: makeWorkspaceProposal() },
+      props: {
+        proposal: makeWorkspaceProposal({
+          workspaceCreate: {
+            mode: 'sibling',
+            title: 'Sibling follow-up',
+            repoPath: '/repo/current',
+          },
+        }),
+      },
     });
 
     const link = screen.getByTestId('proposal-open-created-workspace');
@@ -954,7 +1180,7 @@ describe('ProposalCard', () => {
     expect(screen.queryByTestId('proposal-repo-picker')).toBeNull();
     expect(screen.queryByTestId('proposal-branch-picker')).toBeNull();
     expect(screen.queryByTestId('proposal-specialist-dropdown')).toBeNull();
-    expect(screen.queryByRole('button', { name: 'Discard' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Not now' })).toBeNull();
     expect(screen.queryByRole('button', { name: /Retry/ })).toBeNull();
     expect(screen.queryByRole('button', { name: /Applying/ })).toBeNull();
   });
@@ -1141,11 +1367,11 @@ describe('ProposalCard', () => {
   });
 
   it('associates the mismatch warning with the branch row and clears it when a PR branch lookup resolves', async () => {
-    const invoke = vi.fn().mockResolvedValue({
+    setElectronEnv();
+    electronBridgeMocks.invoke.mockResolvedValue({
       success: true,
       data: { sourceBranch: 'pr-head-branch' },
     });
-    setElectronInvoke(invoke);
 
     render(ProposalCard, {
       props: {
@@ -1169,13 +1395,12 @@ describe('ProposalCard', () => {
 
     // Preselecting 'main' arms the PR-branch lookup; once it resolves, the
     // PR head branch replaces the default and the stale warning is cleared.
-    const expectedAction = requestPrBranchLookup({
-      owner: 'example-org',
-      repo: 'example-repo',
-      prNumber: 648,
-    });
-    await waitFor(() => expect(prBranchLookupState.dispatch).toHaveBeenCalledWith(expectedAction));
-    prBranchLookupState.lookupEntries[expectedAction.payload.key] = {
+    const request = { owner: 'example-org', repo: 'example-repo', prNumber: 648 };
+    const payload = { ...request, key: getPrBranchLookupKey(request) };
+    await waitFor(() =>
+      expect(prBranchLookupState.dispatch).toHaveBeenCalledWith(prBranchLookupStarted(payload)),
+    );
+    prBranchLookupState.lookupEntries[payload.key] = {
       status: 'succeeded',
       branch: 'pr-head-branch',
     };

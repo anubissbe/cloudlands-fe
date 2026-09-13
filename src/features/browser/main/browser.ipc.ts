@@ -13,11 +13,8 @@ import { BROWSER_PROTOCOLS } from '../../../shared/constants';
 import { IPC_CHANNELS } from '../../../shared/ipc-registry';
 import { workspaceCommandPayload } from '../../../shared/ipc/workspace-command-payloads';
 import { Logger } from '../../../shared/logger';
-import {
-  executeActions,
-  type ExecutionResult,
-  type ActionSequence,
-} from './browser-action-executor';
+import { executeActions, type ExecutionResult } from './browser-action-executor';
+import type { BrowserExecutionBackendContext } from './browser-exec-reverse';
 import { embeddedBrowserCdp } from './embedded-browser-cdp-service';
 import { loopbackContextFromTransport, type LoopbackRewriteContext } from './loopback-rewrite';
 import {
@@ -29,11 +26,21 @@ import {
   ForwardOwnershipRegistry,
   wrapTunnelProviderWithOwnership,
 } from './tunnel-forward-ownership';
-import { ensureWorkspaceForwardCleanup } from './workspace-forward-cleanup.service';
-import { getBackendClient, isSameHostBackendActive } from '../../backend/main/backend.ipc';
+import {
+  disposeWorkspaceForwardCleanupForClient,
+  ensureWorkspaceForwardCleanup,
+  resetWorkspaceForwardCleanup,
+} from './workspace-forward-cleanup.service';
+import {
+  BACKEND_CLIENT_DISCONNECTED_EVENT,
+  getBackendClientForId,
+  getBackendIdForIpcSender,
+} from '../../backend/main/backend.ipc';
+import { getFocusedWindowBackendId } from '../../../main/window';
 import { DirectRelay } from '../../backend/main/direct-relay';
 import { TunnelManager } from '../../backend/main/tunnel-manager';
 import { sendToWorkspaceWindows } from '../../system/main/system.ipc';
+import { LOCAL_CONNECTION_ID } from '../../../shared/types/connections';
 
 const logger = new Logger('BrowserIPC');
 
@@ -48,7 +55,12 @@ const logger = new Logger('BrowserIPC');
  * (intent-hq/monorepo#2541). `allowDuplicate` is forwarded so the renderer's
  * own equivalent-tab dedupe doesn't override an explicit request for a
  * genuinely new tab. `ownerAgentId` (agent opens) is persisted with the tab
- * so ownership survives restart (monorepo#2857).
+ * so ownership survives restart (monorepo#2857), and `emulatedSize` (agent
+ * opens) rides along so the emulated viewport survives restart too.
+ * `ownerAgentName` (agent opens, best-effort) is persisted so the sidebar
+ * owner group can label the tab without an agent-store lookup
+ * (monorepo#3438). `visible: false` (agent opens, monorepo#3045) creates the
+ * tab hidden — no panel mount, webview kept alive offscreen.
  */
 function openBrowserTab(
   url: string,
@@ -59,6 +71,9 @@ function openBrowserTab(
   pin?: boolean,
   ownerAgentId?: string,
   replaceTabId?: string,
+  emulatedSize?: { width: number; height: number },
+  visible?: boolean,
+  ownerAgentName?: string,
 ): { success: boolean; message: string; tabId?: string } {
   const workspacePayload = workspaceCommandPayload(workspaceId);
   if (!workspacePayload) {
@@ -104,7 +119,10 @@ function openBrowserTab(
       ...(requestedUrl === undefined ? {} : { requestedUrl }),
       ...(pin === undefined ? {} : { pin }),
       ...(ownerAgentId === undefined ? {} : { ownerAgentId }),
+      ...(ownerAgentName === undefined ? {} : { ownerAgentName }),
       ...(replaceTabId === undefined ? {} : { replaceTabId }),
+      ...(emulatedSize === undefined ? {} : { emulatedSize }),
+      ...(visible === undefined ? {} : { visible }),
     },
   );
   if (!delivery.delivered) {
@@ -133,6 +151,42 @@ const UnregisterTabSchema = z.object({
   tabId: z.string(),
 });
 
+// Omitted width/height is an explicit clear: the reporting element stopped
+// displaying the tab (unmount/handoff), so its bounds no longer apply.
+const ReportTabBoundsSchema = z.object({
+  tabId: z.string(),
+  width: z.number().positive().optional(),
+  height: z.number().positive().optional(),
+});
+
+const ViewportSizeSchema = z.number().int().positive();
+const SetTabViewportSchema = z.object({
+  tabId: z.string().min(1),
+  viewport: z.discriminatedUnion('mode', [
+    z.object({ mode: z.literal('fit') }).strict(),
+    z
+      .object({
+        mode: z.literal('preset'),
+        presetId: z.string().min(1),
+        width: ViewportSizeSchema,
+        height: ViewportSizeSchema,
+      })
+      .strict(),
+    z
+      .object({ mode: z.literal('custom'), width: ViewportSizeSchema, height: ViewportSizeSchema })
+      .strict(),
+  ]),
+});
+
+const OpenDevToolsPanelSchema = z.object({
+  tabId: z.string().min(1),
+  panel: z.enum(['console', 'sources', 'elements']),
+});
+
+const ClearAgentTabsSchema = z.object({
+  agentId: z.string(),
+});
+
 const ExecSchema = z.object({
   actions: z.array(z.record(z.unknown())),
   tabId: z.string().optional(),
@@ -153,9 +207,16 @@ const ResolveUrlSchema = z.object({
  * rewriting; `*.localhost` aliases still resolve to `127.0.0.1`) if the
  * connection state cannot be read.
  */
-function getDaemonLoopbackContext(): LoopbackRewriteContext {
+function getDaemonLoopbackContext(
+  backendContext: BrowserExecutionBackendContext,
+): LoopbackRewriteContext {
   try {
-    return loopbackContextFromTransport(isSameHostBackendActive(), getBackendClient().getConfig());
+    const config = backendContext.client.getConfig();
+    return loopbackContextFromTransport(
+      !backendContext.savedRemote && config.transport === 'uds',
+      config,
+      backendContext.savedRemote,
+    );
   } catch (err) {
     logger.warn('Could not resolve daemon loopback context; assuming local daemon', {
       error: (err as Error).message,
@@ -174,10 +235,12 @@ function getDaemonLoopbackContext(): LoopbackRewriteContext {
  * Both are reset on backend switch (see `registerBrowserHandlers`) so
  * forwards never outlive the connection they were opened against.
  */
-let tunnelManager: TunnelManager | null = null;
+const tunnelManagers = new Map<BrowserExecutionBackendContext['client'], TunnelManager>();
 let directRelay: DirectRelay | null = null;
 
-function getBrowserTunnelProvider(): TunnelManager | DirectRelay {
+function getBrowserTunnelProvider(
+  backendContext: BrowserExecutionBackendContext,
+): TunnelManager | DirectRelay {
   // Unlike `getDaemonLoopbackContext()`'s assume-local fallback (benign for
   // URL rewriting), the backend choice decides WHICH MACHINE a forward lands
   // on: assuming local here would silently relay to the CLIENT's loopback and
@@ -186,9 +249,11 @@ function getBrowserTunnelProvider(): TunnelManager | DirectRelay {
   // throws and degrade to their explanatory error).
   let daemonIsRemote: boolean;
   try {
+    const config = backendContext.client.getConfig();
     daemonIsRemote = loopbackContextFromTransport(
-      isSameHostBackendActive(),
-      getBackendClient().getConfig(),
+      !backendContext.savedRemote && config.transport === 'uds',
+      config,
+      backendContext.savedRemote,
     ).daemonIsRemote;
   } catch (err) {
     throw new Error(
@@ -197,20 +262,21 @@ function getBrowserTunnelProvider(): TunnelManager | DirectRelay {
     );
   }
   if (daemonIsRemote) {
-    if (!tunnelManager) {
-      tunnelManager = new TunnelManager({
-        getConfig: () => {
-          try {
-            return getBackendClient().getConfig();
-          } catch (err) {
-            logger.warn('Could not resolve backend config for the browser tunnel', {
-              error: (err as Error).message,
-            });
-            return null;
-          }
-        },
-      });
-    }
+    const existing = tunnelManagers.get(backendContext.client);
+    if (existing) return existing;
+    const tunnelManager = new TunnelManager({
+      getConfig: () => {
+        try {
+          return backendContext.client.getConfig();
+        } catch (err) {
+          logger.warn('Could not resolve backend config for the browser tunnel', {
+            error: (err as Error).message,
+          });
+          return null;
+        }
+      },
+    });
+    tunnelManagers.set(backendContext.client, tunnelManager);
     return tunnelManager;
   }
   if (!directRelay) {
@@ -227,14 +293,34 @@ function getBrowserTunnelProvider(): TunnelManager | DirectRelay {
  */
 const forwardOwnership = new ForwardOwnershipRegistry();
 
-// Wrapper memo (keyed by workspace id, '' = app-lifetime) so repeated getter
-// calls hand back the SAME provider object while the underlying backend is
-// unchanged — callers treat the provider as a stable singleton.
-const ownershipWrappers = new Map<string, { inner: TunnelProvider; wrapper: TunnelProvider }>();
+// Wrapper memo per provider + workspace id ('' = app-lifetime). Pooled clients
+// may own the same remote port independently, so their wrappers must remain
+// stable without replacing one another.
+const ownershipWrappers = new Map<TunnelProvider, Map<string, TunnelProvider>>();
 
-/** Close a forward on whichever live provider carries it; never constructs one. */
-function closeOwnedForward(remotePort: number): void {
-  tunnelManager?.closeForward(remotePort);
+/** Dispose only the browser tunnel state owned by one departing pooled client. */
+function disposeTunnelManagerForClient(
+  backendClient: BrowserExecutionBackendContext['client'],
+): void {
+  disposeWorkspaceForwardCleanupForClient(backendClient);
+  const tunnelManager = tunnelManagers.get(backendClient);
+  if (!tunnelManager) return;
+  tunnelManagers.delete(backendClient);
+  tunnelManager.dispose();
+  // dispose() drops every active forward, whose onForwardDropped hook clears
+  // its ownership entry. Remove wrappers that would otherwise retain/reuse the
+  // disposed manager after this saved remote is re-paired.
+  ownershipWrappers.delete(tunnelManager);
+}
+
+/** Close a forward on its owning provider; never constructs one. */
+function closeOwnedForward(remotePort: number, provider?: TunnelProvider): void {
+  if (provider?.closeForward) {
+    provider.closeForward(remotePort);
+    return;
+  }
+  // Compatibility for registry entries recorded without a provider.
+  for (const tunnelManager of tunnelManagers.values()) tunnelManager.closeForward(remotePort);
   directRelay?.closeForward(remotePort);
 }
 
@@ -245,14 +331,28 @@ function closeOwnedForward(remotePort: number): void {
  * — for `workspaceId` when present, app-lifetime otherwise. Also (re)arms
  * the cleanup subscription lazily.
  */
-function getOwnedBrowserTunnelProvider(workspaceId?: string): TunnelProvider {
-  ensureWorkspaceForwardCleanup({ registry: forwardOwnership, closeForward: closeOwnedForward });
-  const inner = getBrowserTunnelProvider();
+function getOwnedBrowserTunnelProvider(
+  backendContext: BrowserExecutionBackendContext,
+  workspaceId?: string,
+): TunnelProvider {
+  const inner = getBrowserTunnelProvider(backendContext);
+  ensureWorkspaceForwardCleanup({
+    registry: forwardOwnership,
+    closeForward: closeOwnedForward,
+    client: backendContext.client,
+    backendId: backendContext.backendId,
+    provider: inner,
+  });
   const key = workspaceId ?? '';
-  const cached = ownershipWrappers.get(key);
-  if (cached && cached.inner === inner) return cached.wrapper;
+  let wrappers = ownershipWrappers.get(inner);
+  if (!wrappers) {
+    wrappers = new Map();
+    ownershipWrappers.set(inner, wrappers);
+  }
+  const cached = wrappers.get(key);
+  if (cached) return cached;
   const wrapper = wrapTunnelProviderWithOwnership(inner, forwardOwnership, workspaceId);
-  ownershipWrappers.set(key, { inner, wrapper });
+  wrappers.set(key, wrapper);
   return wrapper;
 }
 
@@ -262,17 +362,32 @@ function getOwnedBrowserTunnelProvider(workspaceId?: string): TunnelProvider {
  * This is a secure alternative to arbitrary code execution - each action
  * is validated against a known schema before execution.
  *
- * Exported for use by MCP tools.
+ * Exported for use by MCP tools. `deadline` (epoch ms) is the caller's
+ * transport deadline minus margin; capture stages are clamped to it (#4835).
  */
 export async function executeBrowserActions(
   actions: unknown[],
   tabId?: string,
   agentId?: string,
   workspaceId?: string,
+  backendContext?: BrowserExecutionBackendContext,
+  deadline?: number,
 ): Promise<ExecutionResult> {
+  const resolvedBackendContext = backendContext ?? getFocusedBrowserBackendContext();
   return executeActions(
     { actions, tabId },
-    (url, position, allowDuplicate, requestedUrl, pin, ownerAgentId, replaceTabId) =>
+    (
+      url,
+      position,
+      allowDuplicate,
+      requestedUrl,
+      pin,
+      ownerAgentId,
+      replaceTabId,
+      emulatedSize,
+      visible,
+      ownerAgentName,
+    ) =>
       openBrowserTab(
         url,
         position,
@@ -282,16 +397,42 @@ export async function executeBrowserActions(
         pin,
         ownerAgentId,
         replaceTabId,
+        emulatedSize,
+        visible,
+        ownerAgentName,
       ),
     agentId,
     workspaceId,
-    getDaemonLoopbackContext,
-    () => getOwnedBrowserTunnelProvider(workspaceId),
+    () => getDaemonLoopbackContext(resolvedBackendContext),
+    () => getOwnedBrowserTunnelProvider(resolvedBackendContext, workspaceId),
+    deadline,
   );
 }
 
+/**
+ * Fallback context for callers without an invoke event (MCP tools): keyed
+ * off the FOCUSED window's backend (local fallback when no window), not the
+ * app-primary client.
+ */
+function getFocusedBrowserBackendContext(): BrowserExecutionBackendContext {
+  const backendId = getFocusedWindowBackendId();
+  return {
+    client: getBackendClientForId(backendId),
+    backendId,
+    savedRemote: backendId !== LOCAL_CONNECTION_ID,
+  };
+}
+
+function getRendererBrowserBackendContext(
+  event: Electron.IpcMainInvokeEvent,
+): BrowserExecutionBackendContext {
+  const backendId = getBackendIdForIpcSender(event.sender);
+  const client = getBackendClientForId(backendId);
+  return { client, backendId, savedRemote: backendId !== LOCAL_CONNECTION_ID };
+}
+
 // Re-export types for MCP tools
-export type { ExecutionResult, ActionSequence };
+export type { ExecutionResult };
 
 /**
  * Register browser IPC handlers
@@ -299,21 +440,24 @@ export type { ExecutionResult, ActionSequence };
 export function registerBrowserHandlers(): void {
   logger.info('Registering browser IPC handlers');
 
+  (app as NodeJS.EventEmitter).on(BACKEND_CLIENT_DISCONNECTED_EVENT, disposeTunnelManagerForClient);
+
   // A backend switch invalidates every tunnel forward (they target the old
   // daemon's loopback); dispose both backends so the next use rebuilds them
   // against the new connection. Cast: 'backend-connection-changed' is a
   // custom app event (emitted by backend.ipc.ts), not in Electron's App type.
   (app as NodeJS.EventEmitter).on('backend-connection-changed', () => {
-    if (tunnelManager) {
+    for (const tunnelManager of tunnelManagers.values()) {
       tunnelManager.dispose();
-      tunnelManager = null;
     }
+    tunnelManagers.clear();
     if (directRelay) {
       directRelay.dispose();
       directRelay = null;
     }
     forwardOwnership.reset();
     ownershipWrappers.clear();
+    resetWorkspaceForwardCleanup();
   });
 
   // Register a browser tab for CDP access
@@ -342,14 +486,82 @@ export function registerBrowserHandlers(): void {
     ),
   );
 
+  // Visible webview element bounds, reported by the renderer so emulated
+  // (agent-owned) tabs scale-to-fit their panel (docs/protocol §5.9).
+  ipcMain.handle(
+    IPC_CHANNELS.BROWSER.REPORT_TAB_BOUNDS,
+    createSafeValidatedHandler(
+      ReportTabBoundsSchema,
+      async (event, validated) => {
+        if (validated.width !== undefined && validated.height !== undefined) {
+          const zoomFactor = event.sender.getZoomFactor();
+          embeddedBrowserCdp.reportTabViewBounds(
+            validated.tabId,
+            validated.width * zoomFactor,
+            validated.height * zoomFactor,
+          );
+        } else {
+          embeddedBrowserCdp.clearTabViewBounds(validated.tabId);
+        }
+        return { success: true };
+      },
+      IPC_CHANNELS.BROWSER.REPORT_TAB_BOUNDS,
+    ),
+  );
+
+  ipcMain.handle(
+    IPC_CHANNELS.BROWSER.SET_TAB_VIEWPORT,
+    createSafeValidatedHandler(
+      SetTabViewportSchema,
+      async (_event, validated) => {
+        embeddedBrowserCdp.setTabViewport(validated.tabId, validated.viewport);
+        return { success: true };
+      },
+      IPC_CHANNELS.BROWSER.SET_TAB_VIEWPORT,
+    ),
+  );
+
+  ipcMain.handle(
+    IPC_CHANNELS.BROWSER.OPEN_DEVTOOLS_PANEL,
+    createSafeValidatedHandler(
+      OpenDevToolsPanelSchema,
+      async (_event, validated) => {
+        await embeddedBrowserCdp.openDevToolsPanel(validated.tabId, validated.panel);
+        return { success: true };
+      },
+      IPC_CHANNELS.BROWSER.OPEN_DEVTOOLS_PANEL,
+    ),
+  );
+
+  // Clear main's registrations (CDP registry + ownership + tab cache) for a
+  // deleted agent's owned tabs — the renderer already removed them from the
+  // layout on the agent:deleted commit (monorepo#2857).
+  ipcMain.handle(
+    IPC_CHANNELS.BROWSER.CLEAR_AGENT_TABS,
+    createSafeValidatedHandler(
+      ClearAgentTabsSchema,
+      async (_event, validated) => {
+        const tabIds = embeddedBrowserCdp.clearAgentTabs(validated.agentId);
+        return { success: true, tabIds };
+      },
+      IPC_CHANNELS.BROWSER.CLEAR_AGENT_TABS,
+    ),
+  );
+
   // Execute browser actions
   ipcMain.handle(
     IPC_CHANNELS.BROWSER.EXEC,
     createSafeValidatedHandler(
       ExecSchema,
-      async (_event, validated) =>
+      async (event, validated) =>
         // executeBrowserActions returns { success, results, error? } directly
-        executeBrowserActions(validated.actions, validated.tabId, undefined, validated.workspaceId),
+        executeBrowserActions(
+          validated.actions,
+          validated.tabId,
+          undefined,
+          validated.workspaceId,
+          getRendererBrowserBackendContext(event),
+        ),
       IPC_CHANNELS.BROWSER.EXEC,
     ),
   );
@@ -366,14 +578,15 @@ export function registerBrowserHandlers(): void {
     IPC_CHANNELS.BROWSER.RESOLVE_URL,
     createSafeValidatedHandler(
       ResolveUrlSchema,
-      async (_event, validated): Promise<ResolvedBrowserUrl> => {
+      async (event, validated): Promise<ResolvedBrowserUrl> => {
         try {
+          const backendContext = getRendererBrowserBackendContext(event);
           return await resolveBrowserUrl(
             validated.url,
-            getDaemonLoopbackContext(),
+            getDaemonLoopbackContext(backendContext),
             // No workspaceId on this renderer-facing path: any forward it
             // mints is app-lifetime (never workspace-cleaned).
-            () => getOwnedBrowserTunnelProvider(),
+            () => getOwnedBrowserTunnelProvider(backendContext),
             { rewriteOnly: validated.mode === 'rewrite-only' },
           );
         } catch (err) {

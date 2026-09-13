@@ -13,11 +13,3 @@ export type LayoutPresetId =
   | 'agents-row'
   | 'changes'
   | 'review';
-
-/** Preset configuration */
-export interface LayoutPreset {
-  id: LayoutPresetId;
-  label: string;
-  description: string;
-  isBuiltIn: boolean;
-}

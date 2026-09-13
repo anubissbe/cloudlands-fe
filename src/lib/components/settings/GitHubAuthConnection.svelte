@@ -6,7 +6,6 @@
   import { m } from '$shared/paraglide/messages.js';
   import { store as appStore } from '$store/renderer/store';
   import {
-    initializeGitHubAuth,
     startGitHubAuth,
     logoutGitHub,
     checkGitHubAuthStatus,
@@ -21,13 +20,6 @@
   } from '$store/renderer/slices/github-auth/github-auth-selectors';
   import GitHubDeviceCodeCard from '$lib/components/GitHubDeviceCodeCard.svelte';
 
-  interface Props {
-    /** Skip initialization if parent already initialized the store */
-    skipInitialize?: boolean;
-  }
-
-  let { skipInitialize = false }: Props = $props();
-
   let isDisconnectingGitHub = $state(false);
 
   const isAuthenticated$ = selectGitHubAuthIsAuthenticated();
@@ -38,10 +30,6 @@
   const requiresDaemonAuth$ = selectGitHubAuthRequiresDaemonAuth();
 
   onMount(() => {
-    if (!skipInitialize) {
-      appStore.dispatch(initializeGitHubAuth());
-    }
-
     // Check auth status immediately when window gains focus
     // This makes the UI update snappily when user returns from browser
     const handleFocus = () => {
@@ -100,7 +88,7 @@
         {m.settings_connections_github_description()}
       </p>
       {#if $error$}
-        <p class="text-xs text-error-foreground pl-6">{$error$}</p>
+        <p class="text-xs text-danger pl-6">{$error$}</p>
       {/if}
     </div>
 
@@ -118,7 +106,7 @@
         <span class="text-ghost">·</span>
         <button
           type="button"
-          class="text-muted-foreground hover:text-error-foreground cursor-pointer transition-colors"
+          class="text-muted-foreground hover:text-danger cursor-pointer transition-colors"
           onclick={handleGitHubDisconnect}
           disabled={isDisconnectingGitHub}
         >

@@ -6,13 +6,13 @@
   import { getPanelCanvasWidths } from './panel-canvas-width';
 
   let {
+    active = true,
     sizing,
     viewportWidth,
     panelColumnWidths,
     resetPanelColumnWidths = panelColumnWidths,
     canvasWidth: providedCanvasWidth,
     canvasWidthSource = 'explicit',
-    transientWidthDelta = 0,
     scrollContainer,
     onWidthChange,
     onResizeStart,
@@ -21,23 +21,18 @@
     onResizeCancel,
     children,
   }: {
+    active?: boolean;
     sizing: PanelCanvasSizing;
     viewportWidth: number;
     panelColumnWidths: readonly number[];
     resetPanelColumnWidths?: readonly number[];
     /**
      * Persisted canvas width from Redux (`null` before the user resizes).
-     * When present it drives `defaultWidth`, so middle-handle drags that
-     * dispatch `resizePanelLayoutAtHorizontalPanel` grow the outer canvas.
-     * The resolved Redux width is authoritative rather than an additive delta,
-     * so a direct outer-handle drag cannot be applied twice after commit.
-     * When absent, the canvas falls back to
-     * the active sizing mode's automatic width.
+     * When present it drives `defaultWidth`. When absent, the canvas falls back
+     * to the active sizing mode's automatic width.
      */
     canvasWidth: number | null;
     canvasWidthSource?: PanelCanvasWidthSource | null;
-    /** Live width delta while an inner panel handle is being dragged. */
-    transientWidthDelta?: number;
     scrollContainer: HTMLElement | null;
     onWidthChange: (width: number) => void;
     onResizeStart: () => void;
@@ -60,6 +55,7 @@
 </script>
 
 <ResizablePanel
+  {active}
   storageKey={null}
   minWidth={widths.minWidth}
   maxWidth={widths.defaultWidth + 2560}
@@ -68,10 +64,10 @@
   side="left"
   resizeScrollContainer={scrollContainer}
   syncWithDefaultWidth={true}
-  {transientWidthDelta}
   disableWidthTransition={true}
   showHandleIndicator={true}
-  handleClassName="right-0! panel-canvas-resize-handle"
+  handleClassName="panel-canvas-resize-handle"
+  lockRenderedWidthDuringResize={sizing === 'viewport'}
   {onWidthChange}
   {onResizeStart}
   onResize={(_previousWidth, nextWidth) => onResizePreview(nextWidth - widths.defaultWidth)}
@@ -81,17 +77,3 @@
 >
   {@render children()}
 </ResizablePanel>
-
-<style>
-  :global(.panel-canvas-resize-handle[data-resize-axis='x'])::before {
-    right: 0;
-    left: auto;
-    transform: none;
-  }
-
-  :global(
-    .panel-canvas-resize-handle[data-resize-indicator='short'][data-resize-axis='x']
-  )::before {
-    transform: translateY(-50%);
-  }
-</style>

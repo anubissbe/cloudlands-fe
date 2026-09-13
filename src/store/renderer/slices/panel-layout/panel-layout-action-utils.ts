@@ -2,6 +2,7 @@ import {
   applyPreset,
   clearPanelLayout,
   closeActiveTab,
+  closeFocusedPanelTab,
   closeAllOthersEverywhere,
   closeAllTabs,
   closeOtherTabs,
@@ -26,6 +27,7 @@ import {
   openTabInAdjacentOrSplit,
   pruneRecentlyClosed,
   reconcileStaleAgentTabs,
+  reopenClosedPanelColumn,
   reopenClosedTab,
   reorderTabs,
   resetLayout,
@@ -43,6 +45,7 @@ import {
   updateTabFavicon,
   updateTabTitle,
 } from './panel-layout-slice';
+import { removeScript } from '../scripts/scripts-slice';
 import { removeTerminal } from '../terminals/terminals-slice';
 
 export const TAB_REMOVAL_ACTIONS = [
@@ -51,6 +54,7 @@ export const TAB_REMOVAL_ACTIONS = [
   createGridLayout,
   closeTab,
   closeActiveTab,
+  closeFocusedPanelTab,
   closeTabsByType,
   closeTabsByAgentId,
   moveTabToPanel,
@@ -65,6 +69,7 @@ export const TAB_REMOVAL_ACTIONS = [
   goBack,
   goForward,
   reconcileStaleAgentTabs,
+  removeScript,
   clearPanelLayout,
 ];
 
@@ -77,6 +82,7 @@ export const PANEL_LAYOUT_STATE_ACTIONS = [
   openTab,
   pruneRecentlyClosed,
   removeTerminal,
+  reopenClosedPanelColumn,
   reopenClosedTab,
   setActiveTab,
   selectNextTab,

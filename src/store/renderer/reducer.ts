@@ -1,4 +1,5 @@
 import { providerSettingsReducer } from './slices/provider-settings/provider-settings-slice';
+import { antigravitySetupReducer } from './slices/antigravity-setup/antigravity-setup-slice';
 import { providerCatalogReducer } from './slices/provider-catalog/provider-catalog-slice';
 import { providerModelsReducer } from './slices/provider-models/provider-models-slice';
 import { backgroundAgentSettingsReducer } from './slices/background-agent-settings/background-agent-settings-slice';
@@ -40,12 +41,15 @@ import { legacyImportReducer } from './slices/legacy-import/legacy-import-slice'
 import { linearAuthReducer } from './slices/linear-auth/linear-auth-slice';
 import { voiceSettingsReducer } from './slices/voice-settings/voice-settings-slice';
 import { browserReducer } from './slices/browser/browser-slice';
+import { browserClientsReducer } from './slices/browser-clients/browser-clients-slice';
+import { browserTabRegistryReducer } from './slices/browser-tab-registry/browser-tab-registry-slice';
 import { sentryAuthReducer } from './slices/sentry-auth/sentry-auth-slice';
 import { contextReducer } from './slices/context/context-slice';
 import { setupScriptsReducer } from './slices/setup-scripts/setup-scripts-slice';
 import { mcpSettingsReducer } from './slices/mcp-settings/mcp-settings-slice';
 import { commentsReducer } from './slices/comments/comments-slice';
 import { taskAgentAssociationsReducer } from './slices/task-agent-associations/task-agent-associations-slice';
+import { workspaceLifecycleReducer } from './slices/workspace-lifecycle/workspace-lifecycle-slice';
 
 import { autoUpdateReducer } from './slices/auto-update/auto-update-slice';
 import { sidebarNavReducer } from './slices/sidebar-nav/sidebar-nav-slice';
@@ -94,6 +98,7 @@ import { workspaceImportReducer } from './slices/workspace-import/workspace-impo
 
 export const reducers = {
   providerSettings: providerSettingsReducer,
+  antigravitySetup: antigravitySetupReducer,
   providerCatalog: providerCatalogReducer,
   providerModels: providerModelsReducer,
   backgroundAgentSettings: backgroundAgentSettingsReducer,
@@ -136,11 +141,14 @@ export const reducers = {
   voiceSettings: voiceSettingsReducer,
   sentryAuth: sentryAuthReducer,
   browser: browserReducer,
+  browserClients: browserClientsReducer,
+  browserTabRegistry: browserTabRegistryReducer,
   context: contextReducer,
   setupScripts: setupScriptsReducer,
   mcpSettings: mcpSettingsReducer,
   comments: commentsReducer,
   taskAgentAssociations: taskAgentAssociationsReducer,
+  workspaceLifecycle: workspaceLifecycleReducer,
 
   autoUpdate: autoUpdateReducer,
   sidebarNav: sidebarNavReducer,

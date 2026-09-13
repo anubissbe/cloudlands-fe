@@ -6,7 +6,7 @@
  * back to sanitized input/output under the parent disclosure, without adding a
  * redundant completion state or nested disclosure.
  */
-import { render, cleanup } from '@testing-library/svelte';
+import { render, cleanup, screen } from '@testing-library/svelte';
 import { describe, it, expect, vi, afterEach } from 'vitest';
 
 vi.mock('$store/renderer/store', async () => {
@@ -153,6 +153,52 @@ describe('ToolDetails empty rich-result fallback', () => {
   });
 });
 
+describe('ToolDetails screenshot sources', () => {
+  const pngBase64 =
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9Zl2kAAAAASUVORK5CYII=';
+
+  it('renders a real PNG browser screenshot with matching metadata', () => {
+    render(ToolDetails, {
+      props: {
+        input: {},
+        parsedResult: { type: 'browser' as const, screenshotBase64: pngBase64 },
+      },
+    });
+
+    expect(screen.getByRole('img', { name: 'Browser screenshot' }).getAttribute('src')).toBe(
+      `data:image/png;base64,${pngBase64}`,
+    );
+  });
+
+  it('does not render unsafe browser screenshot URLs', () => {
+    render(ToolDetails, {
+      props: {
+        input: {},
+        parsedResult: { type: 'browser' as const, screenshotUrl: 'javascript:alert(1)' },
+      },
+    });
+
+    expect(screen.queryByRole('img', { name: 'Browser screenshot' })).toBeNull();
+  });
+
+  it('preserves the existing Figma image MIME behavior', () => {
+    render(ToolDetails, {
+      props: {
+        input: {},
+        parsedResult: {
+          type: 'figma' as const,
+          figmaScreenshot: pngBase64,
+          figmaScreenshotMimeType: 'image/png',
+        },
+      },
+    });
+
+    expect(screen.getByRole('img', { name: 'Figma design screenshot' }).getAttribute('src')).toBe(
+      `data:image/png;base64,${pngBase64}`,
+    );
+  });
+});
+
 describe('ToolDetails pending (running) rendering', () => {
   it('shows the full multiline command for a pending terminal call without a result section', () => {
     const command = 'cd packages/cloudlands-fe && \\\n  pnpm vitest run \\\n  src/lib/tests';
@@ -232,6 +278,75 @@ describe('ToolDetails pending (running) rendering', () => {
     expect(pre?.textContent).toContain('API_KEY=[redacted]');
     expect(pre?.textContent).toContain('\n  ./deploy.sh');
     expect(pre?.textContent).not.toContain('abc123');
+  });
+});
+
+describe('ToolDetails code-search empty-state guard', () => {
+  it('does not show "No results" above raw fallback content holding real matches', () => {
+    // Regression for #3284: unparsed grep output fell into content while the
+    // empty-snippets branch still rendered the "No results" label above it
+    const { container } = render(ToolDetails, {
+      props: {
+        input: { pattern: 'isDefault' },
+        result: 'src/a.ts:10:isDefault',
+        parsedResult: {
+          type: 'code-search' as const,
+          snippets: [],
+          content: 'raw grep output with thousands of matches',
+        },
+        isError: false,
+      },
+    });
+
+    expect(container.textContent).not.toContain('No results');
+  });
+
+  it('shows "No results" for a genuinely empty search carrying a query echo', () => {
+    const { container } = render(ToolDetails, {
+      props: {
+        input: { pattern: 'TODO' },
+        result: '',
+        parsedResult: {
+          type: 'code-search' as const,
+          snippets: [],
+          content: 'Search: TODO',
+          noMatches: true,
+        },
+        isError: false,
+      },
+    });
+
+    expect(container.textContent).toContain('No results');
+  });
+
+  it('shows "No results" when there are no snippets and no content', () => {
+    const { container } = render(ToolDetails, {
+      props: {
+        input: {},
+        result: '',
+        parsedResult: { type: 'code-search' as const, snippets: [] },
+        isError: false,
+      },
+    });
+
+    expect(container.textContent).toContain('No results');
+  });
+
+  it('renders snippet cards without the empty-state when snippets exist', () => {
+    const { container } = render(ToolDetails, {
+      props: {
+        input: { pattern: 'foo' },
+        result: 'src/lib/a.ts:10:const foo = 1;',
+        parsedResult: {
+          type: 'code-search' as const,
+          snippets: [{ path: 'src/lib/a.ts', content: '10: const foo = 1;', lineStart: 10 }],
+        },
+        isError: false,
+      },
+    });
+
+    expect(container.textContent).toContain('a.ts');
+    expect(container.textContent).not.toContain('No results');
   });
 });
 

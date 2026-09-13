@@ -5,6 +5,7 @@ import { relative, resolve } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { svelte } from '@sveltejs/vite-plugin-svelte';
 import { createServer, type ViteDevServer } from 'vite';
+import { viteHarnessCacheDir } from './vite-harness-cache.mjs';
 import { approvedRowIds, baselineRows, target } from './current-main-baseline.matrix';
 import {
   createEvidenceRows,
@@ -104,6 +105,7 @@ test.beforeAll(async () => {
   server = await createServer({
     configFile: false,
     root: process.cwd(),
+    cacheDir: viteHarnessCacheDir('current-main-baseline'),
     plugins: [svelte({ configFile: resolve('svelte.config.js') })],
     resolve: {
       alias: [
@@ -129,7 +131,7 @@ test.beforeAll(async () => {
 });
 test.afterAll(async () => server?.close());
 
-test('locks the complete 55-row current-main evidence contract', () => {
+test('locks the complete 53-row current-main evidence contract', () => {
   expect(() =>
     execFileSync('git', ['merge-base', '--is-ancestor', target.commit, 'HEAD']),
   ).not.toThrow();
@@ -137,7 +139,7 @@ test('locks the complete 55-row current-main evidence contract', () => {
     execFileSync('git', ['rev-parse', target.commit + '^{tree}'], { encoding: 'utf8' }).trim(),
   ).toBe(target.tree);
   expect(baselineRows.map(({ row }) => row)).toEqual([...approvedRowIds]);
-  expect(new Set(approvedRowIds).size).toBe(55);
+  expect(new Set(approvedRowIds).size).toBe(53);
   const allEvidence = [...mountedDefinitions, ...semanticEvidence];
   const evidenceIds = allEvidence.map(({ evidenceId }) => evidenceId);
   expect(new Set(evidenceIds).size).toBe(evidenceIds.length);
@@ -340,11 +342,11 @@ async function assertMountedScene(page: Page, scene: MountedScene) {
     };
   }
   if (scene === 'tabs') {
-    const toggle = page.getByRole('button', { name: /Open spaces/ });
-    await toggle.hover();
-    await toggle.focus();
+    const spacesControl = page.getByRole('button', { name: 'Toggle Spaces' });
+    await spacesControl.hover();
+    await spacesControl.focus();
     await page.keyboard.press('Enter');
-    await expect(toggle).toHaveAccessibleName('Open spaces');
+    await expect(spacesControl).toHaveAccessibleName('Toggle Spaces');
     return { 'WORKSPACE-31': { consolidatedControl: true, keyboardActivation: true } };
   }
 

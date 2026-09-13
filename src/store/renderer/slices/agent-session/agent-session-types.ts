@@ -1,7 +1,7 @@
-import type { AgentSession, AgentMessage } from "$shared/types";
-import type { UnifiedAgentConfig } from "$shared/types/agent.types";
+import type { AgentSession, AgentMessage } from '$shared/types';
+import type { UnifiedAgentConfig } from '$shared/types/agent.types';
 
-export interface AgentSessionSendContextItem {
+interface AgentSessionSendContextItem {
   id: string;
   type: string;
   label?: string;
@@ -15,7 +15,7 @@ export interface AgentSessionSendContextItem {
   fileMimeType?: string;
 }
 
-export interface AgentSessionContextReference {
+interface AgentSessionContextReference {
   type: string;
   filePath?: string;
   noteId?: string;
@@ -32,13 +32,13 @@ export interface AgentSessionSendMessageOptions {
   agentId?: string;
   contextReferences?: AgentSessionContextReference[];
   /** Image content blocks riding the message (PROTOCOL §5.5) — plain base64. */
-  imageBlocks?: Array<{ type: "image"; data: string; mimeType: string }>;
+  imageBlocks?: Array<{ type: 'image'; data?: string; mimeType?: string; attachmentId?: string }>;
   /**
    * Attachment-reference file blocks riding the message (PROTOCOL §5.5) —
    * registry UUID + metadata only, never bytes.
    */
   fileBlocks?: Array<{
-    type: "file";
+    type: 'file';
     attachmentId: string;
     fileName: string;
     mimeType?: string;
@@ -62,8 +62,8 @@ export interface AgentSessionForkOptions {
   selectedText?: string;
 }
 
-export type AgentSessionLaunchConfig = Omit<UnifiedAgentConfig, "workspaceId"> & {
-  workspaceId?: UnifiedAgentConfig["workspaceId"];
+export type AgentSessionLaunchConfig = Omit<UnifiedAgentConfig, 'workspaceId'> & {
+  workspaceId?: UnifiedAgentConfig['workspaceId'];
 };
 
 export interface AgentSessionLaunchOptions {
@@ -83,7 +83,7 @@ export interface AgentSessionLaunchOptions {
  * ordered `AgentMessage[]` consumed by UI, sagas, persistence payloads, and
  * retry/regenerate flows.
  */
-export type StoredAgentSession = Omit<AgentSession, "messages"> & {
+export type StoredAgentSession = Omit<AgentSession, 'messages'> & {
   messages: AgentMessage[];
   /**
    * FE-owned sticky turn-liveness. Set by the event fold when a live running
@@ -93,8 +93,8 @@ export type StoredAgentSession = Omit<AgentSession, "messages"> & {
    *
    * Exists because the daemon emits the turn-start event BEFORE opening the
    * STAB-125 live-turn slot (agent_manager: try_begin → persist_status(Active)
-   * → run_prompt_turn → begin_live_turn), so the STAB-9 `agent.list` refetch
-   * fired off that very event can resolve with `turnInFlight: false` mid-turn
+   * → run_prompt_turn → begin_live_turn), so the STAB-9 per-agent `agent.get`
+   * refetch fired off that very event can resolve with `turnInFlight: false` mid-turn
    * — the HUD waiting gate must not trust that single racy snapshot field.
    */
   liveTurnOpen?: boolean;
@@ -107,6 +107,16 @@ export type StoredAgentSession = Omit<AgentSession, "messages"> & {
    * terminal event missed across a disconnect) still applies.
    */
   liveTurnOpenedAt?: string;
+  /**
+   * FE-owned latch: true once the client-side `MAX_MESSAGES_PER_AGENT` cap
+   * actually dropped rows from the live tail (live growth past the cap).
+   * The chat-init transcript snapshot meta (`truncated`/`totalMessages`) is
+   * captured once per init and goes stale as the conversation grows, so the
+   * scrollback triggers OR this latch into their "older rows exist" inputs.
+   * Wire sessions never carry it (preserved across upserts); cleared only by
+   * a full transcript reset (chatReset / a §7.1 `resumed: false` snapshot).
+   */
+  tailCapPruned?: boolean;
 };
 
 /**
@@ -149,7 +159,9 @@ export interface AgentHistorySegment {
    * used to be attributed all-above, overestimating the virtual extent by up
    * to 2x mid-walk). Absent on seek-seeded segments (`startOrdinalEstimate`
    * anchors their split) and while the segment is contiguous with the tail.
-   * An estimate: rows the TAIL prunes into the hole are not observed here.
+   * Rows the TAIL cap-prunes into the hole (live appends past
+   * `MAX_MESSAGES_PER_AGENT` while a contiguous segment is loaded) are also
+   * counted here — the tail prune opens the gap and adds the dropped count.
    */
   holeRowsEstimate?: number;
 }
@@ -172,4 +184,3 @@ export interface AgentSessionState {
    */
   historySegmentsByAgentId?: Record<string, AgentHistorySegment>;
 }
-

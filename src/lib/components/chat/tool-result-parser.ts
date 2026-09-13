@@ -7,9 +7,13 @@
 
 import { decode as decodeToon } from '@toon-format/toon';
 import { m } from '$shared/paraglide/messages.js';
+import {
+  inferBrowserScreenshotMimeType,
+  type BrowserScreenshotMimeType,
+} from './browser-screenshot-source';
 import { formatInteger } from '$lib/i18n/format';
 
-export type ToolResultType =
+type ToolResultType =
   | 'file-view'
   | 'file-edit'
   | 'file-save'
@@ -38,7 +42,7 @@ export type ToolResultType =
   | 'unknown';
 
 /** A started row from a batch delegate result (agentId/agentName per row). */
-export interface DelegateBatchStartedRow {
+interface DelegateBatchStartedRow {
   agentId: string;
   agentName?: string;
   taskNoteId?: string;
@@ -46,7 +50,7 @@ export interface DelegateBatchStartedRow {
 }
 
 /** Disposition summary of a batch delegate result (`ws.agent.delegate({ tasks })`). */
-export interface DelegateBatchSummary {
+interface DelegateBatchSummary {
   started: number;
   held: number;
   skipped: number;
@@ -67,6 +71,7 @@ export interface ParsedToolResult {
   editSummary?: string;
   // For search results
   snippets?: Array<{ path: string; content: string; lineStart?: number }>;
+  noMatches?: boolean;
   // For terminal
   command?: string;
   exitCode?: number;
@@ -123,6 +128,7 @@ export interface ParsedToolResult {
   browserAction?: string;
   screenshotBase64?: string;
   screenshotUrl?: string;
+  screenshotMimeType?: BrowserScreenshotMimeType;
   screenshotWidth?: number;
   screenshotHeight?: number;
   browserTabs?: Array<{
@@ -257,12 +263,12 @@ const LANGUAGE_MAP: Record<string, string> = {
   toml: 'toml',
 };
 
-export function detectLanguage(filePath: string): string {
+function detectLanguage(filePath: string): string {
   const ext = filePath.split('.').pop()?.toLowerCase() || '';
   return LANGUAGE_MAP[ext] || 'plaintext';
 }
 
-export function getFileName(filePath: string): string {
+function getFileName(filePath: string): string {
   return filePath.split('/').pop() || filePath;
 }
 
@@ -972,7 +978,92 @@ function parseSaveResult(
 }
 
 /**
- * Parse codebase-retrieval result
+ * Grep match line: `path:line:content`. Tried before the context form so
+ * hyphen-digit filenames (utf-8-utils.ts, sha-256.ts) are not misparsed as
+ * context lines of a truncated path.
+ */
+const GREP_MATCH_REGEX = /^(.+?):(\d+):(.*)$/;
+/** Grep context line from -A/-B/-C: `path-line-content` */
+const GREP_CONTEXT_REGEX = /^(.+?)-(\d+)-(.*)$/;
+/** rtk grep header line: `266 matches in 1 files:` */
+const RTK_HEADER_REGEX = /^\d+ matches? in \d+ files?:$/;
+/** rtk grep truncation footer: `  +241 more in <file> [see remaining: ...]` */
+const RTK_FOOTER_REGEX = /^\s*\+\d+ more in .+$/;
+
+/** Heuristic: does a grep-line prefix plausibly name a file? */
+function looksLikeFilePath(path: string): boolean {
+  if (!path || /^\s/.test(path)) return false;
+  return path.includes('/') || path.includes('\\') || /\.[A-Za-z0-9_-]+$/.test(path);
+}
+
+/**
+ * Parse grep-style `file:line:` output (plain grep/rg -n and rtk grep's
+ * compact format) into per-file snippets. Returns empty snippets when the
+ * text does not look like grep output, so callers can fall back to raw
+ * content. `truncationNote` carries rtk `+N more in <file>` footers so the
+ * card view can surface that matches were dropped.
+ */
+function parseGrepSnippets(result: string): {
+  snippets: NonNullable<ParsedToolResult['snippets']>;
+  truncationNote?: string;
+} {
+  const byFile = new Map<string, { lineStart: number; rows: string[] }>();
+  const footers: string[] = [];
+  let considered = 0;
+  let grepLines = 0;
+  let matchLines = 0;
+
+  for (const line of result.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed === '--') continue;
+    // rtk grep decorations: header, truncation footers, hook warnings
+    if (RTK_HEADER_REGEX.test(trimmed)) continue;
+    if (RTK_FOOTER_REGEX.test(line)) {
+      footers.push(trimmed.replace(/\s*\[see remaining:.*$/, ''));
+      continue;
+    }
+    if (trimmed.startsWith('[rtk]')) continue;
+    considered++;
+
+    // Try the match form first, then the context form, so hyphen-digit
+    // filenames (utf-8-utils.ts) bind to `:` instead of fabricating a card
+    let match = line.match(GREP_MATCH_REGEX);
+    let isMatch = true;
+    if (!match || !looksLikeFilePath(match[1])) {
+      match = line.match(GREP_CONTEXT_REGEX);
+      isMatch = false;
+      if (!match || !looksLikeFilePath(match[1])) continue;
+    }
+    const [, path, lineNumber, text] = match;
+    grepLines++;
+    if (isMatch) matchLines++;
+
+    let entry = byFile.get(path);
+    if (!entry) {
+      entry = { lineStart: parseInt(lineNumber, 10), rows: [] };
+      byFile.set(path, entry);
+    }
+    // rg --column output (`file:line:col:content`) keeps the column in the
+    // row text; columns are rare enough that we render them as-is.
+    entry.rows.push(`${lineNumber}: ${text}`);
+  }
+
+  // Require at least one real match and a strict majority of grep-shaped lines
+  // so prose containing colons does not misparse as search results.
+  if (matchLines === 0 || grepLines * 2 <= considered) return { snippets: [] };
+
+  return {
+    snippets: [...byFile.entries()].map(([path, entry]) => ({
+      path,
+      content: entry.rows.join('\n'),
+      lineStart: entry.lineStart,
+    })),
+    truncationNote: footers.length > 0 ? footers.join('\n') : undefined,
+  };
+}
+
+/**
+ * Parse codebase-retrieval / grep-style search results
  */
 function parseSearchResult(
   input: Record<string, any>,
@@ -984,7 +1075,11 @@ function parseSearchResult(
     snippets,
   };
 
-  if (!result) {
+  if (!result?.trim()) {
+    // Genuinely empty (or whitespace-only) search result — flag it so the
+    // renderer shows the "No results" empty-state even when a query echo is
+    // added below.
+    parsed.noMatches = true;
     // When result is empty but we have a query/pattern, add it as content
     // This ensures search tools always have something to display when expanded
     if (input.information_request) {
@@ -1010,6 +1105,17 @@ function parseSearchResult(
       if (content) {
         snippets.push({ path, content });
       }
+    }
+  }
+
+  // Try grep-style `file:line:` output (plain grep/rg and rtk grep)
+  if (snippets.length === 0) {
+    const grep = parseGrepSnippets(result);
+    snippets.push(...grep.snippets);
+    if (grep.truncationNote) {
+      // Surface rtk truncation footers so the card view does not silently
+      // understate the result set.
+      parsed.content = grep.truncationNote;
     }
   }
 
@@ -1919,7 +2025,7 @@ function parseBrowserResult(input: Record<string, any>, result: unknown): Parsed
         (typeof decoded.base64 === 'string' || typeof decoded.assetUrl === 'string')
       ) {
         // Screenshot result: { base64 | assetUrl, width, height }
-        if (typeof decoded.base64 === 'string') parsed.screenshotBase64 = decoded.base64;
+        setBrowserScreenshotBase64(parsed, decoded.base64);
         if (typeof decoded.assetUrl === 'string') parsed.screenshotUrl = decoded.assetUrl;
         if (typeof decoded.width === 'number') parsed.screenshotWidth = decoded.width;
         if (typeof decoded.height === 'number') parsed.screenshotHeight = decoded.height;
@@ -1966,7 +2072,7 @@ function parseBrowserResult(input: Record<string, any>, result: unknown): Parsed
   if (data && typeof data === 'object' && !Array.isArray(data) && (data.base64 || data.assetUrl)) {
     // Screenshot result: { base64, width, height } or { assetUrl, width, height }
     if (data.base64) {
-      parsed.screenshotBase64 = data.base64;
+      setBrowserScreenshotBase64(parsed, data.base64);
     }
     if (data.assetUrl) {
       parsed.screenshotUrl = data.assetUrl;
@@ -1999,7 +2105,7 @@ function parseUnwrappedBrowserAction(parsed: ParsedToolResult, resultText: strin
       try {
         const data = JSON.parse(resultText);
         if (data && (data.base64 || data.assetUrl)) {
-          if (data.base64) parsed.screenshotBase64 = data.base64;
+          setBrowserScreenshotBase64(parsed, data.base64);
           if (data.assetUrl) parsed.screenshotUrl = data.assetUrl;
           parsed.screenshotWidth = data.width;
           parsed.screenshotHeight = data.height;
@@ -2067,7 +2173,7 @@ function parseMultiActionResults(parsed: ParsedToolResult, actionResults: any[])
     if (!ar || typeof ar !== 'object') continue;
 
     if (ar.action === 'screenshot' && (ar.result?.base64 || ar.result?.assetUrl)) {
-      if (ar.result.base64) parsed.screenshotBase64 = ar.result.base64;
+      setBrowserScreenshotBase64(parsed, ar.result.base64);
       if (ar.result.assetUrl) parsed.screenshotUrl = ar.result.assetUrl;
       parsed.screenshotWidth = ar.result.width;
       parsed.screenshotHeight = ar.result.height;
@@ -2131,7 +2237,7 @@ function extractFromTruncatedActions(parsed: ParsedToolResult, text: string): bo
   if (!parsed.screenshotUrl) {
     const base64Match = text.match(/"base64"\s*:\s*"([A-Za-z0-9+/=]{20,})"/);
     if (base64Match) {
-      parsed.screenshotBase64 = base64Match[1];
+      setBrowserScreenshotBase64(parsed, base64Match[1]);
       foundSomething = true;
     }
   }
@@ -2143,6 +2249,12 @@ function extractFromTruncatedActions(parsed: ParsedToolResult, text: string): bo
   if (heightMatch) parsed.screenshotHeight = parseInt(heightMatch[1]);
 
   return foundSomething;
+}
+
+function setBrowserScreenshotBase64(parsed: ParsedToolResult, base64: unknown): void {
+  if (typeof base64 !== 'string') return;
+  parsed.screenshotBase64 = base64;
+  parsed.screenshotMimeType = inferBrowserScreenshotMimeType(base64);
 }
 
 /**

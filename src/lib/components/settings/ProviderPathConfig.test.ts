@@ -4,7 +4,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/svelte';
 import { tick } from 'svelte';
-import ProviderPathConfig from './ProviderPathConfig.svelte';
+import ProviderPathConfigHost from './__tests__/ProviderPathConfigHost.svelte';
 import { warmImport } from '../../../test/warm-import';
 
 const mocks = vi.hoisted(() => ({
@@ -53,10 +53,6 @@ const flush = async () => {
   await tick();
 };
 
-async function openPopup(providerName: string) {
-  await fireEvent.click(screen.getByTitle(`Configure ${providerName} path`));
-}
-
 // Pre-warm the component module graph so the cold dynamic import is not
 // billed to the first test's timeout (intent-hq/monorepo#1464).
 warmImport(() => import('../workspace/sidebar/__tests__/mocks/MockSimple.svelte'));
@@ -65,6 +61,24 @@ warmImport(
 );
 
 describe('ProviderPathConfig', () => {
+  it('saves the Antigravity ACP path without overwriting another provider', async () => {
+    mocks.mockSettingsGet.mockResolvedValue({ value: { codex: '/keep/codex' } });
+    render(ProviderPathConfigHost, {
+      props: {
+        providerId: 'antigravity',
+        providerName: 'Antigravity',
+        cliCommand: 'antigravity-acp',
+        isInstalled: false,
+      },
+    });
+    await fireEvent.click(screen.getByRole('button', { name: 'Choose file' }));
+    await flush();
+    await fireEvent.click(screen.getByTestId('mock-picker-select'));
+    await flush();
+    expect(mocks.mockSettingsUpdate).toHaveBeenCalledExactlyOnceWith([
+      { path: 'providers.paths', value: { codex: '/keep/codex', antigravity: '/Users/me/src' } },
+    ]);
+  });
   beforeEach(() => {
     vi.clearAllMocks();
     mocks.mockSettingsGet.mockResolvedValue({ value: {} });
@@ -75,42 +89,8 @@ describe('ProviderPathConfig', () => {
     cleanup();
   });
 
-  it('supports a controlled open state without rendering the folder trigger', () => {
-    render(ProviderPathConfig, {
-      props: {
-        providerId: 'claude-code',
-        providerName: 'Claude Code',
-        cliCommand: 'claude-agent-acp',
-        open: true,
-        showTrigger: false,
-      },
-    });
-
-    expect(screen.queryByTitle('Configure Claude Code path')).toBeNull();
-    expect(screen.getByText('Claude Code CLI Path')).toBeTruthy();
-  });
-
-  it('renders the full auto-detected path wrapped, not truncated', async () => {
-    render(ProviderPathConfig, {
-      props: {
-        providerId: 'claude-code',
-        providerName: 'Claude Code',
-        cliCommand: 'claude-agent-acp',
-        resolvedPath: LONG_PATH,
-        isInstalled: true,
-      },
-    });
-    await openPopup('Claude Code');
-
-    const code = screen.getByText(LONG_PATH);
-    expect(code.textContent).toBe(LONG_PATH);
-    expect(code.className).toContain('break-all');
-    expect(code.className).not.toContain('truncate');
-    expect(screen.getByText('Auto-detected at')).toBeTruthy();
-  });
-
-  it('keeps the auto-detected row visible and marked when an override is configured', async () => {
-    render(ProviderPathConfig, {
+  it('loads a configured override', () => {
+    render(ProviderPathConfigHost, {
       props: {
         providerId: 'claude-code',
         providerName: 'Claude Code',
@@ -120,18 +100,71 @@ describe('ProviderPathConfig', () => {
         isInstalled: true,
       },
     });
-    await openPopup('Claude Code');
-
     const input = screen.getByPlaceholderText(LONG_PATH) as HTMLInputElement;
     expect(input.value).toBe('/custom/bin/claude-agent-acp');
-    expect(screen.getByText(LONG_PATH)).toBeTruthy();
-    expect(screen.getByText('(overridden by the path above)')).toBeTruthy();
   });
 
-  it('renders the overridable unsloth CLI row and the read-only opencode runtime row (unsloth)', async () => {
+  it('describes the pinned npx launch for npx-only providers instead of an auto-detected adapter', () => {
+    const npxPath = '/usr/local/bin/npx';
+    const npxPackage = '@agentclientprotocol/claude-agent-acp@1.2.3';
+    render(ProviderPathConfigHost, {
+      props: {
+        providerId: 'claude-code',
+        providerName: 'Claude Code',
+        cliCommand: 'claude-agent-acp',
+        resolvedPath: npxPath,
+        npxPackage,
+        isInstalled: true,
+      },
+    });
+    // The daemon's resolvedPath for an npx-only provider is npx itself, so it
+    // must not be offered as the adapter path placeholder.
+    expect(screen.queryByPlaceholderText(npxPath)).toBeNull();
+    expect(screen.getByPlaceholderText('Path to claude-agent-acp')).toBeTruthy();
+    expect(screen.getByText(npxPath)).toBeTruthy();
+    // The pinned package spec is named in both the hint and the status row.
+    expect(screen.getAllByText(npxPackage, { exact: false }).length).toBeGreaterThan(0);
+  });
+
+  it('does not describe a pinned npx launch when npx itself is unresolved', () => {
+    const npxPackage = '@agentclientprotocol/claude-agent-acp@1.2.3';
+    render(ProviderPathConfigHost, {
+      props: {
+        providerId: 'claude-code',
+        providerName: 'Claude Code',
+        cliCommand: 'claude-agent-acp',
+        resolvedPath: '',
+        npxPackage,
+        isInstalled: false,
+      },
+    });
+    // Nothing can run via npx, so the popup must not claim an npx default.
+    expect(screen.queryByText(npxPackage, { exact: false })).toBeNull();
+    expect(screen.getByPlaceholderText('Path to claude-agent-acp')).toBeTruthy();
+  });
+
+  it('keeps the npx path row alongside the configured path once an npx-only provider is overridden', () => {
+    const npxPath = '/usr/local/bin/npx';
+    render(ProviderPathConfigHost, {
+      props: {
+        providerId: 'claude-code',
+        providerName: 'Claude Code',
+        cliCommand: 'claude-agent-acp',
+        configuredPath: '/opt/homebrew/bin/claude-agent-acp',
+        resolvedPath: npxPath,
+        npxPackage: '@agentclientprotocol/claude-agent-acp@1.2.3',
+        isInstalled: true,
+      },
+    });
+    const input = screen.getByPlaceholderText('Path to claude-agent-acp') as HTMLInputElement;
+    expect(input.value).toBe('/opt/homebrew/bin/claude-agent-acp');
+    expect(screen.getByText(npxPath)).toBeTruthy();
+  });
+
+  it('renders the overridable unsloth CLI row and the read-only opencode runtime row (unsloth)', () => {
     const opencodePath = '/Users/clement/.opencode/bin/opencode';
     const unslothPath = '/Users/clement/.local/bin/unsloth';
-    render(ProviderPathConfig, {
+    render(ProviderPathConfigHost, {
       props: {
         providerId: 'unsloth',
         providerName: 'Unsloth',
@@ -142,43 +175,13 @@ describe('ProviderPathConfig', () => {
         isInstalled: true,
       },
     });
-    await openPopup('Unsloth');
-
-    expect(screen.getByText('Auto-detected unsloth at')).toBeTruthy();
-    expect(screen.getByText(unslothPath)).toBeTruthy();
-    expect(screen.getByText('opencode runtime at')).toBeTruthy();
-    expect(screen.getByText(opencodePath)).toBeTruthy();
-    expect(screen.getByText("(follows the opencode provider's configuration)")).toBeTruthy();
-    expect(screen.queryByText('Auto-detected at')).toBeNull();
-  });
-
-  it('marks only the overridable unsloth CLI row as overridden for dual-binary providers', async () => {
-    const opencodePath = '/Users/clement/.opencode/bin/opencode';
-    const unslothPath = '/Users/clement/.local/bin/unsloth';
-    render(ProviderPathConfig, {
-      props: {
-        providerId: 'unsloth',
-        providerName: 'Unsloth',
-        cliCommand: 'unsloth',
-        configuredPath: '/custom/bin/unsloth',
-        resolvedPath: unslothPath,
-        runtimeCliCommand: 'opencode',
-        runtimeResolvedPath: opencodePath,
-        isInstalled: true,
-      },
-    });
-    await openPopup('Unsloth');
-
-    const input = screen.getByPlaceholderText(unslothPath) as HTMLInputElement;
-    expect(input.value).toBe('/custom/bin/unsloth');
     expect(screen.getByText(unslothPath)).toBeTruthy();
     expect(screen.getByText(opencodePath)).toBeTruthy();
-    expect(screen.getAllByText('(overridden by the path above)')).toHaveLength(1);
   });
 
-  it('shows only the runtime row when the unsloth CLI did not resolve', async () => {
+  it('shows only the runtime row when the unsloth CLI did not resolve', () => {
     const opencodePath = '/Users/clement/.opencode/bin/opencode';
-    render(ProviderPathConfig, {
+    render(ProviderPathConfigHost, {
       props: {
         providerId: 'unsloth',
         providerName: 'Unsloth',
@@ -188,37 +191,12 @@ describe('ProviderPathConfig', () => {
         isInstalled: false,
       },
     });
-    await openPopup('Unsloth');
-
     expect(screen.getByPlaceholderText('Path to unsloth')).toBeTruthy();
-    expect(screen.getByText('opencode runtime at')).toBeTruthy();
     expect(screen.getByText(opencodePath)).toBeTruthy();
-    expect(screen.getByText("(follows the opencode provider's configuration)")).toBeTruthy();
-    expect(screen.queryByText('Auto-detected unsloth at')).toBeNull();
   });
 
-  it('shows the runtime row without a path when the runtime binary did not resolve', async () => {
-    const unslothPath = '/Users/clement/.local/bin/unsloth';
-    render(ProviderPathConfig, {
-      props: {
-        providerId: 'unsloth',
-        providerName: 'Unsloth',
-        cliCommand: 'unsloth',
-        resolvedPath: unslothPath,
-        runtimeCliCommand: 'opencode',
-        isInstalled: true,
-      },
-    });
-    await openPopup('Unsloth');
-
-    expect(screen.getByText('Auto-detected unsloth at')).toBeTruthy();
-    expect(screen.getByText('opencode runtime')).toBeTruthy();
-    expect(screen.getByText("(follows the opencode provider's configuration)")).toBeTruthy();
-    expect(screen.queryByText('opencode runtime at')).toBeNull();
-  });
-
-  it('renders the path as a readonly field with a file picker, not a free-text input', async () => {
-    render(ProviderPathConfig, {
+  it('renders the path as a readonly field with a file picker, not a free-text input', () => {
+    render(ProviderPathConfigHost, {
       props: {
         providerId: 'claude-code',
         providerName: 'Claude Code',
@@ -227,8 +205,6 @@ describe('ProviderPathConfig', () => {
         isInstalled: true,
       },
     });
-    await openPopup('Claude Code');
-
     const input = screen.getByPlaceholderText(LONG_PATH) as HTMLInputElement;
     expect(input.readOnly).toBe(true);
     expect(screen.getByRole('button', { name: 'Choose file' })).toBeTruthy();
@@ -237,7 +213,7 @@ describe('ProviderPathConfig', () => {
   it('picking a file read-merge-writes the override into providers.paths', async () => {
     mocks.mockSettingsGet.mockResolvedValue({ value: { codex: '/old/codex' } });
     const onPathChange = vi.fn();
-    render(ProviderPathConfig, {
+    render(ProviderPathConfigHost, {
       props: {
         providerId: 'claude-code',
         providerName: 'Claude Code',
@@ -247,8 +223,6 @@ describe('ProviderPathConfig', () => {
         onPathChange,
       },
     });
-    await openPopup('Claude Code');
-
     await fireEvent.click(screen.getByRole('button', { name: 'Choose file' }));
     await flush();
 
@@ -282,7 +256,7 @@ describe('ProviderPathConfig', () => {
     // step below uses Escape, which is layout-independent.
     const queryMenu = () => screen.queryByRole('menu', { hidden: true });
 
-    render(ProviderPathConfig, {
+    render(ProviderPathConfigHost, {
       props: {
         providerId: 'claude-code',
         providerName: 'Claude Code',
@@ -291,7 +265,6 @@ describe('ProviderPathConfig', () => {
         isInstalled: true,
       },
     });
-    await openPopup('Claude Code');
     expect(queryMenu()).toBeTruthy();
 
     // The service mock routes to openModal (remote case).
@@ -330,7 +303,7 @@ describe('ProviderPathConfig', () => {
       value: { 'claude-code': '/custom/bin/claude-agent-acp', codex: '/old/codex' },
     });
     const onPathChange = vi.fn();
-    render(ProviderPathConfig, {
+    render(ProviderPathConfigHost, {
       props: {
         providerId: 'claude-code',
         providerName: 'Claude Code',
@@ -341,8 +314,6 @@ describe('ProviderPathConfig', () => {
         onPathChange,
       },
     });
-    await openPopup('Claude Code');
-
     await fireEvent.click(screen.getByRole('button', { name: 'Clear path and restore default' }));
     await flush();
 

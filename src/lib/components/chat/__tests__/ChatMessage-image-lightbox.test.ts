@@ -1,15 +1,19 @@
-import { render, screen, fireEvent, waitFor } from '@testing-library/svelte';
-import { describe, it, expect, vi } from 'vitest';
+import { render, screen, fireEvent, waitFor, within } from '@testing-library/svelte';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { AgentMessage } from '$shared/types';
+import { WorkspaceId } from '$shared/types/branded-ids';
 import { ChatTranscriptReconciler } from '$lib/client/live/live-chat-client';
+
+const dispatchMock = vi.hoisted(() => vi.fn());
+const mockStoreState = vi.hoisted(() => ({ value: {} as Record<string, unknown> }));
 
 // Mock Redux store and selectors
 vi.mock('$store/renderer/store', async () => {
   const { createAppStoreMockModule } =
     await import('$store/renderer/utils/test-helpers/store-mock');
   return createAppStoreMockModule({
-    state: () => ({}),
-    dispatch: vi.fn(),
+    state: () => mockStoreState.value,
+    dispatch: dispatchMock,
   });
 });
 
@@ -25,10 +29,21 @@ vi.mock('$store/renderer/slices/workspace-notes/workspace-notes-selectors', () =
   ),
 }));
 
+const mockStoreMessage = vi.hoisted(() => ({ value: undefined as unknown }));
+
 vi.mock('$store/renderer/slices/agent-session/agent-session-selectors', () => ({
   selectAgentMessageById: Object.assign(
     () => ({
       subscribe: (run: (value: any) => void) => {
+        run(mockStoreMessage.value);
+        return () => {};
+      },
+    }),
+    { select: () => mockStoreMessage.value },
+  ),
+  selectAgentSession: Object.assign(
+    () => ({
+      subscribe: (run: (value: undefined) => void) => {
         run(undefined);
         return () => {};
       },
@@ -38,11 +53,19 @@ vi.mock('$store/renderer/slices/agent-session/agent-session-selectors', () => ({
 }));
 
 import ChatMessage from '../ChatMessage.svelte';
+import ChatMessageRouteContextHarness from './ChatMessageRouteContextHarness.test.svelte';
+import { store as mockStore } from '$store/renderer/store';
 
 describe('ChatMessage image lightbox', () => {
   const mockImageData =
     'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
   const mockImageMimeType = 'image/png';
+
+  beforeEach(() => {
+    dispatchMock.mockReset();
+    mockStoreState.value = {};
+    mockStoreMessage.value = undefined;
+  });
 
   function createMessageWithImage(): AgentMessage {
     return {
@@ -154,6 +177,29 @@ describe('ChatMessage image lightbox', () => {
 
     const image = screen.getByRole('img', { name: 'Attached image 1' });
     expect(image.getAttribute('src')).toBe(`data:${mockImageMimeType};base64,${mockImageData}`);
+  });
+
+  it('resolves assistant workspace image links from the route when no workspace prop is given', async () => {
+    const { container } = render(ChatMessageRouteContextHarness, {
+      props: {
+        workspaceId: WorkspaceId('ws-1'),
+        message: {
+          id: 'msg-agent-workspace-image',
+          role: 'assistant',
+          contentBlocks: [
+            { type: 'text', text: '![chart](intent://local/file/charts/bridge_tracking.png)' },
+          ],
+          timestamp: new Date('2024-01-01T12:00:00Z'),
+        } satisfies AgentMessage,
+      },
+    });
+
+    await waitFor(() => {
+      expect(
+        container.querySelector('img[src^="workspace-file://ws-1/charts/bridge_tracking.png?v="]'),
+      ).toBeTruthy();
+    });
+    expect(container.querySelector('img[src^="intent://"]')).toBeNull();
   });
 
   it('opens lightbox when image thumbnail is clicked', async () => {
@@ -406,5 +452,262 @@ describe('ChatMessage image lightbox', () => {
     expect(screen.getByRole('button', { name: /zoom in/i })).toBeTruthy();
     expect(screen.getByRole('button', { name: /zoom out/i })).toBeTruthy();
     expect(screen.getByRole('button', { name: /reset zoom/i })).toBeTruthy();
+  });
+
+  describe('lazy attachment hydration (§5.5 slim → v7.2 agent.getMessageBlock)', () => {
+    const thumbnailData = 'R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
+    const fullImageData =
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
+
+    function createTruncatedMessage(): AgentMessage {
+      return {
+        id: 'msg-slim',
+        role: 'user',
+        contentBlocks: [
+          { type: 'text', text: 'Here is a screenshot:' },
+          {
+            type: 'image',
+            id: 'msg-slim:1',
+            data: thumbnailData,
+            mimeType: mockImageMimeType,
+            dataTruncated: true,
+            dataIsThumbnail: true,
+          },
+        ],
+        timestamp: new Date('2024-01-01T12:00:00Z'),
+      } as AgentMessage;
+    }
+
+    it('clicking a truncated attachment dispatches a hydration request instead of opening', async () => {
+      const message = createTruncatedMessage();
+      mockStoreMessage.value = message;
+      // Mimic the reducer: the request marks the entry loading synchronously.
+      dispatchMock.mockImplementation((action) => {
+        if (action?.type === 'chatState/messageBlockHydrationRequested') {
+          mockStoreState.value = {
+            chatState: {
+              byAgentId: {
+                'agent-1': {
+                  hydratedBlocks: {
+                    'msg-slim|msg-slim:1': { status: 'loading', seq: 1 },
+                  },
+                },
+              },
+            },
+          };
+          (mockStore as unknown as { emitState: () => void }).emitState();
+        }
+      });
+      render(ChatMessage, {
+        props: { message, agentId: 'agent-1', messageId: 'msg-slim' },
+      });
+
+      const imageButton = screen.getByRole('button', {
+        name: /view attached image 1 of 1 full size/i,
+      });
+      expect(imageButton.querySelector('img')?.getAttribute('src')).toBe(
+        `data:${mockImageMimeType};base64,${thumbnailData}`,
+      );
+
+      await fireEvent.click(imageButton);
+
+      const hydrationActions = dispatchMock.mock.calls
+        .map(([action]) => action)
+        .filter((action) => action?.type === 'chatState/messageBlockHydrationRequested');
+      expect(hydrationActions).toHaveLength(1);
+      expect(hydrationActions[0].payload).toEqual(['agent-1', 'msg-slim', 'msg-slim:1']);
+
+      // The lightbox stays closed while hydration is in flight.
+      expect(screen.queryByRole('dialog', { name: /image preview/i })).toBeNull();
+    });
+
+    it('does not open the thumbnail when the selector readable lags the request dispatch (throttled cadence race)', async () => {
+      // Regression (thumbnail-instead-of-full-res lightbox): the store's
+      // selector readables emit on a throttled cadence tick, so right after
+      // the click's dispatch the readable still shows the PRE-request map
+      // (no `loading` entry). The settle effect must decide on a fresh
+      // store read, not the lagging readable — otherwise it opens the
+      // thumbnail immediately and never upgrades. Simulated here by having
+      // dispatch update the state WITHOUT notifying the readable.
+      const message = createTruncatedMessage();
+      mockStoreMessage.value = message;
+      dispatchMock.mockImplementation((action) => {
+        if (action?.type === 'chatState/messageBlockHydrationRequested') {
+          mockStoreState.value = {
+            chatState: {
+              byAgentId: {
+                'agent-1': {
+                  hydratedBlocks: {
+                    'msg-slim|msg-slim:1': { status: 'loading', seq: 1 },
+                  },
+                },
+              },
+            },
+          };
+          // No emitState(): the throttled readable has not ticked yet.
+        }
+      });
+      render(ChatMessage, {
+        props: { message, agentId: 'agent-1', messageId: 'msg-slim' },
+      });
+
+      await fireEvent.click(
+        screen.getByRole('button', { name: /view attached image 1 of 1 full size/i }),
+      );
+
+      // The lightbox must NOT open with the stale (thumbnail) data.
+      expect(screen.queryByRole('dialog', { name: /image preview/i })).toBeNull();
+
+      // The fetch settles and the readable finally ticks: the lightbox opens
+      // with the full-resolution block.
+      mockStoreState.value = {
+        chatState: {
+          byAgentId: {
+            'agent-1': {
+              hydratedBlocks: {
+                'msg-slim|msg-slim:1': {
+                  status: 'loaded',
+                  seq: 1,
+                  block: {
+                    type: 'image',
+                    id: 'msg-slim:1',
+                    data: fullImageData,
+                    mimeType: mockImageMimeType,
+                  },
+                },
+              },
+            },
+          },
+        },
+      };
+      (mockStore as unknown as { emitState: () => void }).emitState();
+
+      await waitFor(() => {
+        const dialog = screen.getByRole('dialog', { name: /image preview/i });
+        expect(within(dialog).getByRole('img').getAttribute('src')).toBe(
+          `data:${mockImageMimeType};base64,${fullImageData}`,
+        );
+      });
+    });
+
+    it('opens the lightbox with the hydrated full-resolution image once loaded', async () => {
+      const message = createTruncatedMessage();
+      mockStoreMessage.value = message;
+      mockStoreState.value = {
+        chatState: {
+          byAgentId: {
+            'agent-1': {
+              hydratedBlocks: {
+                'msg-slim|msg-slim:1': { status: 'loading', seq: 1 },
+              },
+            },
+          },
+        },
+      };
+      render(ChatMessage, {
+        props: { message, agentId: 'agent-1', messageId: 'msg-slim' },
+      });
+
+      const imageButton = screen.getByRole('button', {
+        name: /view attached image 1 of 1 full size/i,
+      });
+      await fireEvent.click(imageButton);
+      expect(screen.queryByRole('dialog', { name: /image preview/i })).toBeNull();
+
+      // The fetch settles: the full block (PROTOCOL v7.2 agent.getMessageBlock
+      // shape — original data, no slim flags) lands in the cache.
+      mockStoreState.value = {
+        chatState: {
+          byAgentId: {
+            'agent-1': {
+              hydratedBlocks: {
+                'msg-slim|msg-slim:1': {
+                  status: 'loaded',
+                  seq: 1,
+                  block: {
+                    type: 'image',
+                    id: 'msg-slim:1',
+                    data: fullImageData,
+                    mimeType: mockImageMimeType,
+                  },
+                },
+              },
+            },
+          },
+        },
+      };
+      (mockStore as unknown as { emitState: () => void }).emitState();
+
+      await waitFor(() => {
+        const dialog = screen.getByRole('dialog', { name: /image preview/i });
+        expect(within(dialog).getByRole('img').getAttribute('src')).toBe(
+          `data:${mockImageMimeType};base64,${fullImageData}`,
+        );
+      });
+    });
+
+    it('falls back to the thumbnail lightbox when hydration fails', async () => {
+      const message = createTruncatedMessage();
+      mockStoreMessage.value = message;
+      mockStoreState.value = {
+        chatState: {
+          byAgentId: {
+            'agent-1': {
+              hydratedBlocks: {
+                'msg-slim|msg-slim:1': { status: 'loading', seq: 1 },
+              },
+            },
+          },
+        },
+      };
+      render(ChatMessage, {
+        props: { message, agentId: 'agent-1', messageId: 'msg-slim' },
+      });
+
+      await fireEvent.click(
+        screen.getByRole('button', { name: /view attached image 1 of 1 full size/i }),
+      );
+      expect(screen.queryByRole('dialog', { name: /image preview/i })).toBeNull();
+
+      mockStoreState.value = {
+        chatState: {
+          byAgentId: {
+            'agent-1': {
+              hydratedBlocks: {
+                'msg-slim|msg-slim:1': { status: 'error', seq: 1, error: 'boom' },
+              },
+            },
+          },
+        },
+      };
+      (mockStore as unknown as { emitState: () => void }).emitState();
+
+      await waitFor(() => {
+        const dialog = screen.getByRole('dialog', { name: /image preview/i });
+        expect(within(dialog).getByRole('img').getAttribute('src')).toBe(
+          `data:${mockImageMimeType};base64,${thumbnailData}`,
+        );
+      });
+    });
+
+    it('opens a non-truncated attachment immediately without a hydration request', async () => {
+      const message = createMessageWithImage();
+      mockStoreMessage.value = message;
+      render(ChatMessage, {
+        props: { message, agentId: 'agent-1', messageId: 'msg-1' },
+      });
+
+      await fireEvent.click(
+        screen.getByRole('button', { name: /view attached image 1 of 1 full size/i }),
+      );
+
+      await waitFor(() => {
+        expect(screen.getByRole('dialog', { name: /image preview/i })).toBeTruthy();
+      });
+      const hydrationActions = dispatchMock.mock.calls
+        .map(([action]) => action)
+        .filter((action) => action?.type === 'chatState/messageBlockHydrationRequested');
+      expect(hydrationActions).toHaveLength(0);
+    });
   });
 });

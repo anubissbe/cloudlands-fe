@@ -1,5 +1,21 @@
 import { describe, expect, it } from 'vitest';
-import { hydrateSidebarNav, initialState, openPanel, setCombinedPanelSplit, setShowArchivedWorkspaces, setMultiSelectSidebarSelectedTabs, setStatsOverlayOpen, sidebarNavReducer, togglePanel, toggleShowArchivedWorkspaces, toggleWorkspaceCollapsedNote } from './sidebar-nav-slice';
+import {
+  hydrateSidebarNav,
+  hydrateWorkspaceSidebarUi,
+  initialState,
+  openPanel,
+  setCombinedPanelSplit,
+  setChiefCollapsed,
+  setShowArchivedWorkspaces,
+  setMultiSelectSidebarSelectedTabs,
+  setStatsOverlayOpen,
+  sidebarNavReducer,
+  togglePanel,
+  toggleChiefCollapsed,
+  toggleShowArchivedWorkspaces,
+  toggleStatusGroupCollapsed,
+  toggleWorkspaceCollapsedNote,
+} from './sidebar-nav-slice';
 import { isCombinedWorkspacePanelItem } from './sidebar-nav-types';
 
 describe('sidebarNavReducer Chief navigation', () => {
@@ -84,6 +100,28 @@ describe('sidebarNavReducer Chief navigation', () => {
 });
 
 describe('sidebarNavReducer workspace sidebar UI persistence', () => {
+  it('toggles serializable status-group and Chief collapse preferences', () => {
+    const collapsedGroup = sidebarNavReducer(initialState, toggleStatusGroupCollapsed('idle'));
+    const expandedGroup = sidebarNavReducer(collapsedGroup, toggleStatusGroupCollapsed('idle'));
+    const collapsedChief = sidebarNavReducer(initialState, setChiefCollapsed(true));
+    const expandedChief = sidebarNavReducer(collapsedChief, toggleChiefCollapsed());
+
+    expect(collapsedGroup.collapsedStatusGroupIds).toEqual(['idle']);
+    expect(expandedGroup.collapsedStatusGroupIds).toEqual([]);
+    expect(collapsedChief.isChiefCollapsed).toBe(true);
+    expect(expandedChief.isChiefCollapsed).toBe(false);
+  });
+
+  it('hydrates status-group and Chief collapse preferences', () => {
+    const next = sidebarNavReducer(
+      initialState,
+      hydrateSidebarNav({ collapsedStatusGroupIds: ['idle', 'archived'], isChiefCollapsed: true }),
+    );
+
+    expect(next.collapsedStatusGroupIds).toEqual(['idle', 'archived']);
+    expect(next.isChiefCollapsed).toBe(true);
+  });
+
   it('stores and hydrates archived workspace visibility with a false default', () => {
     expect(initialState.showArchivedWorkspaces).toBe(false);
 
@@ -128,6 +166,44 @@ describe('sidebarNavReducer workspace sidebar UI persistence', () => {
 
     expect(collapsed.collapsedNoteIdsByWorkspaceId['ws-1']).toEqual(['note-1']);
     expect(expanded.collapsedNoteIdsByWorkspaceId['ws-1']).toEqual([]);
+  });
+
+  it('hydrates per-workspace selected tabs, note order, and collapsed notes without touching other workspaces', () => {
+    const seeded = sidebarNavReducer(
+      initialState,
+      setMultiSelectSidebarSelectedTabs('ws-other', ['overview']),
+    );
+    const hydrated = sidebarNavReducer(
+      seeded,
+      hydrateWorkspaceSidebarUi('ws-1', {
+        selectedTabIds: ['context', 'overview'],
+        noteOrder: ['note-2', 'note-1'],
+        collapsedNoteIds: ['note-1'],
+      }),
+    );
+
+    expect(hydrated.multiSelectSelectedTabIdsByWorkspaceId).toEqual({
+      'ws-other': ['overview'],
+      'ws-1': ['context', 'overview'],
+    });
+    expect(hydrated.noteOrderByWorkspaceId).toEqual({ 'ws-1': ['note-2', 'note-1'] });
+    expect(hydrated.collapsedNoteIdsByWorkspaceId).toEqual({ 'ws-1': ['note-1'] });
+
+    const tabsOnly = sidebarNavReducer(
+      seeded,
+      hydrateWorkspaceSidebarUi('ws-1', { selectedTabIds: ['context'] }),
+    );
+    expect(tabsOnly.noteOrderByWorkspaceId).toBe(seeded.noteOrderByWorkspaceId);
+    expect(tabsOnly.collapsedNoteIdsByWorkspaceId).toBe(seeded.collapsedNoteIdsByWorkspaceId);
+
+    const notesOnly = sidebarNavReducer(
+      seeded,
+      hydrateWorkspaceSidebarUi('ws-1', { collapsedNoteIds: ['note-2'] }),
+    );
+    expect(notesOnly.multiSelectSelectedTabIdsByWorkspaceId).toBe(
+      seeded.multiSelectSelectedTabIdsByWorkspaceId,
+    );
+    expect(notesOnly.noteOrderByWorkspaceId).toBe(seeded.noteOrderByWorkspaceId);
   });
 });
 

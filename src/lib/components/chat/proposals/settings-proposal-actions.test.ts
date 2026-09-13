@@ -7,7 +7,9 @@ import {
 import {
   initialState as userPreferencesInitialState,
   setAgentFontStyle,
+  setChatAuroraEnabled,
   setGithubLinkDefaultAction,
+  setShellTransparencyEnabled,
   setVolume,
 } from '$store/renderer/slices/user-preferences/user-preferences-slice';
 import {
@@ -15,10 +17,18 @@ import {
   setEnabled,
 } from '$store/renderer/slices/mcp-settings/mcp-settings-slice';
 import {
+  initialState as externalEditorsInitialState,
+  setEditorOrder,
+} from '$store/renderer/slices/external-editors/external-editors-slice';
+import {
   applyProposalRequested,
   undoProposalRequested,
 } from '$store/renderer/slices/proposal-lifecycle/proposal-lifecycle-slice';
 import { setProviderEnabled } from '$store/renderer/slices/provider-settings/provider-settings-slice';
+import {
+  clearThemeCustomization,
+  initialState as themeInitialState,
+} from '$store/renderer/slices/theme/theme-slice';
 import { initialState as specialistsInitialState } from '$store/renderer/slices/specialists/specialists-slice';
 import { initialState as modelInitialState } from '$store/renderer/slices/model/model-slice';
 import {
@@ -28,7 +38,7 @@ import {
 } from '$store/renderer/slices/provider-catalog/provider-catalog-slice';
 import { MOCK_PROVIDER_CATALOG } from '../../../../test/fixtures/provider-catalog.fixture';
 import { createCollection } from '@augmentcode/themis/utils/collections/collection-utils';
-import type { StoreState } from '$lib/store/types';
+import type { StoreState } from '$store/renderer/types';
 
 const providerCatalog = providerCatalogReducer(
   providerCatalogInitialState,
@@ -49,7 +59,9 @@ vi.mock('$lib/store/redux-dispatch-bridge', () => ({
 vi.mock('$store/renderer/store', () => ({
   store: {
     dispatch: mocks.dispatch,
-    get state() { return mocks.getState(); },
+    get state() {
+      return mocks.getState();
+    },
     createSelector: vi.fn((fn) => ({ select: fn })),
   },
 }));
@@ -71,6 +83,7 @@ function makeState(overrides: Partial<StoreState> = {}): StoreState {
   return {
     backgroundAgentSettings: backgroundAgentSettingsInitialState,
     mcpSettings: mcpSettingsInitialState,
+    externalEditors: externalEditorsInitialState,
     userPreferences: userPreferencesInitialState,
     settingsProposalHistory: { entries: {} },
     providerCatalog,
@@ -134,6 +147,56 @@ describe('settings-proposal-actions', () => {
     ]);
   });
 
+  it('applies normalized Open In editor order, persists it, and returns a reversible change', async () => {
+    const setItem = vi.mocked(window.localStorage.setItem);
+    setItem.mockClear();
+    mocks.getState.mockReturnValue(
+      makeState({
+        externalEditors: { ...externalEditorsInitialState, editorOrder: ['vscode', 'zed'] },
+      }),
+    );
+
+    const result = await applySettingsProposalWork(
+      makeDetail(makeProposal('openIn.editorOrder', ['zed', 42, 'zed', 'vscode'])),
+    );
+
+    expect(mocks.dispatch).toHaveBeenCalledWith(setEditorOrder(['zed', 'vscode']));
+    expect(setItem).toHaveBeenCalledWith(
+      'settings:openInEditorsOrder',
+      JSON.stringify(['zed', 'vscode']),
+    );
+    expect(result.reverseChanges).toEqual([
+      {
+        path: 'openIn.editorOrder',
+        value: ['vscode', 'zed'],
+        apply: { kind: 'local-storage-set', key: 'settings:openInEditorsOrder' },
+      },
+    ]);
+
+    setItem.mockClear();
+    await undoSettingsProposalWork(result.reverseChanges);
+
+    expect(mocks.dispatch).toHaveBeenCalledWith(setEditorOrder(['vscode', 'zed']));
+    expect(setItem).toHaveBeenCalledWith(
+      'settings:openInEditorsOrder',
+      JSON.stringify(['vscode', 'zed']),
+    );
+  });
+
+  it('rejects a non-array Open In editor order value without writing it', async () => {
+    const setItem = vi.mocked(window.localStorage.setItem);
+    setItem.mockClear();
+
+    await expect(
+      applySettingsProposalWork(makeDetail(makeProposal('openIn.editorOrder', 'zed'))),
+    ).rejects.toThrow('Invalid value for setting "openIn.editorOrder": "zed"');
+
+    expect(mocks.dispatch).not.toHaveBeenCalledWith(
+      expect.objectContaining({ type: setEditorOrder.type }),
+    );
+    expect(setItem).not.toHaveBeenCalledWith('settings:openInEditorsOrder', expect.anything());
+  });
+
   it('narrows font setting values without unsafe casts', async () => {
     const proposal = makeProposal('fonts.agent', 'monospace');
 
@@ -153,6 +216,28 @@ describe('settings-proposal-actions', () => {
         path: 'githubLinks.defaultAction',
         value: 'show-choices',
         apply: { kind: 'redux-action', action: 'userPreferences/setGithubLinkDefaultAction' },
+      },
+    ]);
+  });
+
+  it('applies and reverses the appearance preferences', async () => {
+    const proposal = makeProposal('appearance.chatAurora', false);
+    proposal.payload.changes.push({ path: 'appearance.shellTransparency', value: false });
+
+    const result = await applySettingsProposalWork(makeDetail(proposal));
+
+    expect(mocks.dispatch).toHaveBeenCalledWith(setChatAuroraEnabled(false));
+    expect(mocks.dispatch).toHaveBeenCalledWith(setShellTransparencyEnabled(false));
+    expect(result.reverseChanges).toEqual([
+      {
+        path: 'appearance.chatAurora',
+        value: true,
+        apply: { kind: 'redux-action', action: 'userPreferences/setChatAuroraEnabled' },
+      },
+      {
+        path: 'appearance.shellTransparency',
+        value: true,
+        apply: { kind: 'redux-action', action: 'userPreferences/setShellTransparencyEnabled' },
       },
     ]);
   });
@@ -180,6 +265,134 @@ describe('settings-proposal-actions', () => {
     );
   });
 
+  // Regression pin for intent-hq/monorepo#4188: read-only settings (e.g.
+  // model.providerDefaults) and unknown paths used to no-op silently, letting
+  // the proposal lifecycle record a fake "Applied" without writing anything.
+  it('rejects a read-only setting instead of reporting success', async () => {
+    const setItem = vi.spyOn(Storage.prototype, 'setItem');
+    const proposal = makeProposal('model.providerDefaults', { codex: 'gpt-5' });
+
+    await expect(applySettingsProposalWork(makeDetail(proposal))).rejects.toThrow(
+      'Setting "model.providerDefaults" is read-only and cannot be changed',
+    );
+
+    expect(setItem).not.toHaveBeenCalled();
+    expect(mocks.settingsUpdate).not.toHaveBeenCalled();
+    setItem.mockRestore();
+  });
+
+  it('rejects an unknown setting path instead of reporting success', async () => {
+    const proposal = makeProposal('no.such.setting', 'value');
+
+    await expect(applySettingsProposalWork(makeDetail(proposal))).rejects.toThrow(
+      'Unknown or unsupported setting "no.such.setting"',
+    );
+
+    expect(mocks.settingsUpdate).not.toHaveBeenCalled();
+  });
+
+  it('rejects a read-only setting even when the payload supplies its own apply plan', async () => {
+    const setItem = vi.spyOn(Storage.prototype, 'setItem');
+    const proposal: Proposal = {
+      kind: 'settings-change',
+      applyToolCallId: 'tool-settings',
+      payload: {
+        changes: [
+          {
+            path: 'model.providerDefaults',
+            value: { codex: 'gpt-5' },
+            apply: { kind: 'local-storage-set', key: 'smuggled-key' },
+          },
+        ],
+      },
+      preview: { title: 'Change setting' },
+    };
+
+    await expect(applySettingsProposalWork(makeDetail(proposal))).rejects.toThrow(
+      'Setting "model.providerDefaults" is read-only and cannot be changed',
+    );
+
+    expect(setItem).not.toHaveBeenCalledWith('smuggled-key', expect.anything());
+    setItem.mockRestore();
+  });
+
+  it('rejects an unknown setting path even when the payload supplies its own apply plan', async () => {
+    const setItem = vi.spyOn(Storage.prototype, 'setItem');
+    const proposal: Proposal = {
+      kind: 'settings-change',
+      applyToolCallId: 'tool-settings',
+      payload: {
+        changes: [
+          {
+            path: 'no.such.setting',
+            value: 'value',
+            apply: { kind: 'local-storage-set', key: 'smuggled-key' },
+          },
+        ],
+      },
+      preview: { title: 'Change setting' },
+    };
+
+    await expect(applySettingsProposalWork(makeDetail(proposal))).rejects.toThrow(
+      'Unknown or unsupported setting "no.such.setting"',
+    );
+
+    expect(setItem).not.toHaveBeenCalledWith('smuggled-key', expect.anything());
+    expect(mocks.settingsUpdate).not.toHaveBeenCalled();
+    setItem.mockRestore();
+  });
+
+  it('rejects a setting whose apply plan has no proposal writer', async () => {
+    const proposal = makeProposal('mcp.servers', { some: { command: 'x' } });
+
+    await expect(applySettingsProposalWork(makeDetail(proposal))).rejects.toThrow(
+      'Setting "mcp.servers" cannot be applied from a proposal (user-mcp-settings)',
+    );
+
+    expect(mocks.settingsUpdate).not.toHaveBeenCalled();
+  });
+
+  it('clears the theme customization when the active preset is reset to default', async () => {
+    mocks.getState.mockReturnValue(
+      makeState({
+        theme: { ...themeInitialState, activePresetId: 'night', hasCustomTheme: true },
+      } as Partial<StoreState>),
+    );
+    const proposal = makeProposal('theme.activePresetId', null);
+
+    const result = await applySettingsProposalWork(makeDetail(proposal));
+
+    expect(mocks.dispatch).toHaveBeenCalledWith(clearThemeCustomization());
+    expect(result.reverseChanges).toEqual([
+      {
+        path: 'theme.activePresetId',
+        value: 'night',
+        apply: { kind: 'redux-action', action: 'theme/selectThemePreset' },
+      },
+    ]);
+  });
+
+  it('rolls back earlier writes when a read-only change follows in the same proposal', async () => {
+    const proposal: Proposal = {
+      kind: 'settings-change',
+      applyToolCallId: 'tool-settings',
+      payload: {
+        changes: [
+          { path: 'quickActions.defaultModel', value: 'new-model' },
+          { path: 'model.providerDefaults', value: { codex: 'gpt-5' } },
+        ],
+      },
+      preview: { title: 'Change settings' },
+    };
+
+    await expect(applySettingsProposalWork(makeDetail(proposal))).rejects.toThrow(
+      'Setting "model.providerDefaults" is read-only and cannot be changed',
+    );
+
+    expect(mocks.dispatch).toHaveBeenCalledWith(setDefaultModel('new-model'));
+    expect(mocks.dispatch).toHaveBeenCalledWith(setDefaultModel('old-model'));
+  });
+
   it('rolls back applied settings when a later apply write fails', async () => {
     const proposal: Proposal = {
       kind: 'settings-change',
@@ -194,9 +407,9 @@ describe('settings-proposal-actions', () => {
     };
     mocks.settingsUpdate.mockRejectedValueOnce(new Error('settings unavailable'));
 
-    await expect(
-      applySettingsProposalWork(makeDetail(proposal)),
-    ).rejects.toThrow('Failed to apply settings change: settings unavailable');
+    await expect(applySettingsProposalWork(makeDetail(proposal))).rejects.toThrow(
+      'Failed to apply settings change: settings unavailable',
+    );
 
     expect(mocks.dispatch).toHaveBeenCalledWith(setDefaultModel('new-model'));
     expect(mocks.dispatch).toHaveBeenCalledWith(setDefaultModel('old-model'));
@@ -342,5 +555,47 @@ describe('settings-proposal-actions', () => {
         apply: { kind: 'daemon-settings-update', path: 'workspace.branchPrefix' },
       },
     ]);
+  });
+
+  // Backend scoping: a local-storage-set write against a per-backend key must
+  // not touch the local machine's bare key when a remote backend is active.
+  it('namespaces backend-scoped localStorage writes under the active remote backend', async () => {
+    const setItem = vi.mocked(window.localStorage.setItem);
+    setItem.mockClear();
+    mocks.getState.mockReturnValue(
+      makeState({ connections: { windowBackendId: 'remote-1' } } as Partial<StoreState>),
+    );
+
+    await undoSettingsProposalWork([
+      {
+        path: 'legacy.activeProvider',
+        value: 'codex',
+        apply: { kind: 'local-storage-set', key: 'workspaces-active-provider' },
+      },
+    ]);
+
+    expect(setItem).toHaveBeenCalledWith(
+      'backend:remote-1:workspaces-active-provider',
+      JSON.stringify('codex'),
+    );
+    expect(setItem).not.toHaveBeenCalledWith('workspaces-active-provider', expect.anything());
+  });
+
+  it('keeps the bare key for backend-scoped localStorage writes on the local backend', async () => {
+    const setItem = vi.mocked(window.localStorage.setItem);
+    setItem.mockClear();
+    mocks.getState.mockReturnValue(
+      makeState({ connections: { windowBackendId: 'local' } } as Partial<StoreState>),
+    );
+
+    await undoSettingsProposalWork([
+      {
+        path: 'legacy.activeProvider',
+        value: 'codex',
+        apply: { kind: 'local-storage-set', key: 'workspaces-active-provider' },
+      },
+    ]);
+
+    expect(setItem).toHaveBeenCalledWith('workspaces-active-provider', JSON.stringify('codex'));
   });
 });

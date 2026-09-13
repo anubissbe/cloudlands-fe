@@ -1,7 +1,11 @@
-import type { PanelLayoutNode, PanelState, WorkspacePanelLayout } from './panel-layout-types';
+import type {
+  PanelLayoutNode,
+  PanelState,
+  WorkspacePanelLayout,
+  WorkspacePanelLayoutState,
+} from './panel-layout-types';
 import {
   DEFAULT_PANEL_WIDTH,
-  getAcceptedIndependentPanelResizeWidth,
   getAutomaticPanelCanvasWidth,
   getPanelDefaultWidth,
   PANEL_SPLIT_GUTTER_WIDTH,
@@ -176,68 +180,43 @@ export function resizePanelTreeAtHorizontalIndex(
   return { ...node, children, sizes: nextSizes };
 }
 
-export function resizeRootHorizontalPanel(
+export function commitRootHorizontalPanelWidths(
   node: PanelLayoutNode,
-  previousWidth: number,
-  requestedNextWidth: number,
-  panelIndex: number,
-  previousPanelWidths?: readonly number[],
-): { node: PanelLayoutNode; nextWidth: number } {
+  previousPanelWidths: readonly number[],
+  finalPanelWidths: readonly number[],
+): { node: PanelLayoutNode; panelWidths: number[]; changed: boolean } {
+  const previousWidths = Array.isArray(previousPanelWidths) ? [...previousPanelWidths] : [];
   if (
     node.type !== 'split' ||
     node.direction !== 'horizontal' ||
-    previousWidth <= 0 ||
-    requestedNextWidth <= 0 ||
-    !Number.isFinite(previousWidth) ||
-    !Number.isFinite(requestedNextWidth) ||
-    !Number.isFinite(panelIndex)
+    previousWidths.length !== node.children.length ||
+    !Array.isArray(finalPanelWidths) ||
+    finalPanelWidths.length !== node.children.length ||
+    previousWidths.some((width) => !Number.isFinite(width) || width <= 0) ||
+    finalPanelWidths.some((width) => !Number.isFinite(width) || width <= 0)
   ) {
-    return { node, nextWidth: previousWidth };
+    return { node, panelWidths: previousWidths, changed: false };
   }
-
-  const sizes = normalizeSizes(node.sizes, node.children.length);
-  const lastIndex = node.children.length - 1;
-  if (lastIndex < 1) return { node, nextWidth: previousWidth };
-  const targetIndex =
-    panelIndex < 0 || panelIndex > lastIndex ? lastIndex : Math.max(0, panelIndex);
-  const hasRenderedWidths =
-    previousPanelWidths?.length === node.children.length &&
-    previousPanelWidths.every((width) => Number.isFinite(width) && width > 0);
-  const renderedWidths = hasRenderedWidths
-    ? [...previousPanelWidths!]
-    : sizes.map((size) => (previousWidth * size) / 100);
-  const previousTargetWidth = renderedWidths[targetIndex];
-  const nextWidth = getAcceptedIndependentPanelResizeWidth(
-    previousWidth,
-    previousTargetWidth,
-    requestedNextWidth,
-  );
-  if (!hasRenderedWidths) {
-    return {
-      node: resizePanelTreeAtHorizontalIndex(node, previousWidth, nextWidth, targetIndex),
-      nextWidth,
-    };
-  }
-
-  const nextTargetWidth = previousTargetWidth + nextWidth - previousWidth;
-  renderedWidths[targetIndex] = nextTargetWidth;
-  const children = [...node.children];
-  children[targetIndex] = resizePanelTreeRightEdge(
-    children[targetIndex],
-    previousTargetWidth,
-    nextTargetWidth,
-  );
+  const panelWidths = [...finalPanelWidths];
+  const changed = panelWidths.some((width, index) => width !== previousWidths[index]);
+  if (!changed) return { node, panelWidths, changed: false };
+  const totalWidth = panelWidths.reduce((sum, width) => sum + width, 0);
   return {
     node: {
       ...node,
-      children,
-      sizes: renderedWidths.map((width) => (width / nextWidth) * 100),
+      children: node.children.map((child, index) =>
+        panelWidths[index] === previousWidths[index]
+          ? child
+          : resizePanelTreeRightEdge(child, previousWidths[index], panelWidths[index]),
+      ),
+      sizes: panelWidths.map((width) => (width / totalWidth) * 100),
     },
-    nextWidth,
+    panelWidths,
+    changed: true,
   };
 }
 
-export function createHorizontalRoot(panelIds: string[]): PanelLayoutNode {
+function createHorizontalRoot(panelIds: string[]): PanelLayoutNode {
   if (panelIds.length === 1) return { type: 'panel', panelId: panelIds[0] };
   const size = 100 / panelIds.length;
   return {
@@ -246,6 +225,81 @@ export function createHorizontalRoot(panelIds: string[]): PanelLayoutNode {
     children: panelIds.map((panelId) => ({ type: 'panel' as const, panelId })),
     sizes: panelIds.map(() => size),
   };
+}
+
+function getDirectFixedColumnIds(root: PanelLayoutNode): string[] | null {
+  if (root.type === 'panel') return [root.panelId];
+  if (
+    root.direction !== 'horizontal' ||
+    root.children.length < 2 ||
+    root.children.length > 4 ||
+    root.sizes.length !== root.children.length ||
+    root.sizes.some((size) => !Number.isFinite(size) || size <= 0) ||
+    root.children.some((child) => child.type !== 'panel')
+  ) {
+    return null;
+  }
+  return root.children.map((child) => (child.type === 'panel' ? child.panelId : ''));
+}
+
+export function getFixedColumnPanelIds(
+  layout: Pick<WorkspacePanelLayoutState, 'root' | 'panels' | 'columnCount'>,
+): string[] | null {
+  const panelIds = getDirectFixedColumnIds(layout.root);
+  if (
+    !panelIds ||
+    panelIds.length !== layout.columnCount ||
+    new Set(panelIds).size !== panelIds.length
+  ) {
+    return null;
+  }
+  const panelMapIds = Object.keys(layout.panels);
+  if (
+    panelMapIds.length !== panelIds.length ||
+    panelIds.some((panelId) => layout.panels[panelId]?.id !== panelId)
+  ) {
+    return null;
+  }
+  return panelIds;
+}
+
+export function insertFixedColumnInLayout(
+  root: PanelLayoutNode,
+  panelId: string,
+  targetPanelId: string,
+  position: 'before' | 'after',
+  existingCanvasWidth: number | null | undefined,
+  requestedPanelWidth: number = DEFAULT_PANEL_WIDTH,
+): PanelLayoutNode | null {
+  const panelIds = getDirectFixedColumnIds(root);
+  if (!panelIds || panelIds.length >= 4 || panelIds.includes(panelId)) return null;
+  const targetIndex = panelIds.indexOf(targetPanelId);
+  if (targetIndex < 0) return null;
+
+  const safeCanvasWidth =
+    typeof existingCanvasWidth === 'number' &&
+    Number.isFinite(existingCanvasWidth) &&
+    existingCanvasWidth > 0
+      ? existingCanvasWidth
+      : getAutomaticPanelCanvasWidth(panelIds.length, 'content');
+  const panelWidth =
+    Number.isFinite(requestedPanelWidth) && requestedPanelWidth > 0
+      ? requestedPanelWidth
+      : DEFAULT_PANEL_WIDTH;
+  const existingGapWidth = PANEL_SPLIT_GUTTER_WIDTH * Math.max(0, panelIds.length - 1);
+  const existingPanelWidth = Math.max(1, safeCanvasWidth - existingGapWidth);
+  const newColumnSize = (panelWidth / (existingPanelWidth + panelWidth)) * 100;
+  const insertIndex = targetIndex + (position === 'after' ? 1 : 0);
+  const children = panelIds.map((existingPanelId) => ({
+    type: 'panel' as const,
+    panelId: existingPanelId,
+  }));
+  children.splice(insertIndex, 0, { type: 'panel', panelId });
+  const previousSizes =
+    root.type === 'split' ? normalizeSizes(root.sizes, root.children.length) : [100];
+  const sizes = previousSizes.map((size) => size * (1 - newColumnSize / 100));
+  sizes.splice(insertIndex, 0, newColumnSize);
+  return { type: 'split', direction: 'horizontal', children, sizes };
 }
 
 export function insertHorizontalPanelInLayout(
@@ -565,14 +619,17 @@ function reorderSiblingPanels(
     );
     if (sourceIndex >= 0 && initialTargetIndex >= 0) {
       const children = [...node.children];
+      const sizes = normalizeSizes(node.sizes, node.children.length);
       const [source] = children.splice(sourceIndex, 1);
+      const [sourceSize] = sizes.splice(sourceIndex, 1);
       const targetIndex = children.findIndex(
         (child) => child.type === 'panel' && child.panelId === targetPanelId,
       );
       const insertBefore = position === 'before' || position === 'above';
       const insertIndex = insertBefore ? targetIndex : targetIndex + 1;
       children.splice(insertIndex, 0, source);
-      return { ...node, children };
+      sizes.splice(insertIndex, 0, sourceSize);
+      return { ...node, children, sizes };
     }
   }
   for (let index = 0; index < node.children.length; index += 1) {
@@ -654,6 +711,183 @@ export function movePanelToRootEdgeInLayout(
   };
 }
 
+export type PaneMoveTarget =
+  | { kind: 'edge'; position: 'before' | 'after' }
+  | {
+      kind: 'panel';
+      targetPanelId: string;
+      position: 'before' | 'after' | 'center';
+      insertIndex?: number;
+    };
+
+export interface PaneMoveProjection {
+  root: PanelLayoutNode;
+  panels: Record<string, PanelState>;
+  canvasWidth: number | null | undefined;
+  destinationPanelId: string;
+  changed: boolean;
+}
+
+type PaneMoveLayout = Pick<WorkspacePanelLayout, 'root' | 'panels' | 'canvasWidth'>;
+
+function getPaneMoveTargetPanelId(
+  panelIds: readonly string[],
+  target: PaneMoveTarget,
+): string | undefined {
+  if (target.kind === 'panel') return target.targetPanelId;
+  return target.position === 'before' ? panelIds[0] : panelIds.at(-1);
+}
+
+function removePaneFromStack(panel: PanelState, tabId: string): PanelState {
+  const tabIndex = panel.tabs.findIndex((tab) => tab.id === tabId);
+  const tabs = panel.tabs.filter((_, index) => index !== tabIndex);
+  const activeTabId =
+    panel.activeTabId === tabId
+      ? (tabs[Math.min(tabIndex, tabs.length - 1)]?.id ?? null)
+      : panel.activeTabId;
+  return {
+    ...panel,
+    tabs,
+    activeTabId,
+    attentionTabIds: panel.attentionTabIds?.filter((id) => id !== tabId),
+    pristine: tabs.length === 0 ? true : panel.pristine,
+  };
+}
+
+function getCanvasWidthAfterPaneColumnRemoval(
+  root: PanelLayoutNode,
+  remainingWidthRatio: number,
+  canvasWidth: number | null | undefined,
+): number | null | undefined {
+  if (typeof canvasWidth !== 'number') return canvasWidth;
+  const previousColumnCount = countHorizontalPanelColumns(root);
+  const remainingColumnCount = Math.max(1, previousColumnCount - 1);
+  const previousGutterWidth = PANEL_SPLIT_GUTTER_WIDTH * Math.max(0, previousColumnCount - 1);
+  const remainingGutterWidth = PANEL_SPLIT_GUTTER_WIDTH * Math.max(0, remainingColumnCount - 1);
+  return (
+    Math.max(0, canvasWidth - previousGutterWidth) * remainingWidthRatio + remainingGutterWidth
+  );
+}
+
+/** Project the exact fixed-column pane move used by both drag preview and drop reducers. */
+export function projectPaneMoveInLayout(
+  layout: PaneMoveLayout,
+  tabId: string,
+  fromPanelId: string,
+  target: PaneMoveTarget,
+  destinationPanelId: string,
+): PaneMoveProjection | null {
+  const panelIds = getDirectFixedColumnIds(layout.root);
+  const fromPanel = layout.panels[fromPanelId];
+  const tabIndex = fromPanel?.tabs.findIndex((tab) => tab.id === tabId) ?? -1;
+  const targetPanelId = panelIds ? getPaneMoveTargetPanelId(panelIds, target) : undefined;
+  if (
+    !panelIds ||
+    !fromPanel ||
+    tabIndex < 0 ||
+    !targetPanelId ||
+    !panelIds.includes(fromPanelId) ||
+    !panelIds.includes(targetPanelId)
+  ) {
+    return null;
+  }
+
+  const stable = (destinationId = fromPanelId): PaneMoveProjection => ({
+    root: layout.root,
+    panels: layout.panels,
+    canvasWidth: layout.canvasWidth,
+    destinationPanelId: destinationId,
+    changed: false,
+  });
+  const tab = fromPanel.tabs[tabIndex];
+
+  if (target.kind === 'panel' && target.position === 'center') {
+    if (targetPanelId === fromPanelId) return stable();
+    const targetPanel = layout.panels[targetPanelId];
+    if (!targetPanel || targetPanel.tabs.some((candidate) => candidate.id === tabId)) return null;
+    const insertIndex = target.insertIndex ?? targetPanel.tabs.length;
+    const panels = {
+      ...layout.panels,
+      [fromPanelId]: removePaneFromStack(fromPanel, tabId),
+      [targetPanelId]: {
+        ...targetPanel,
+        tabs: [
+          ...targetPanel.tabs.slice(0, insertIndex),
+          tab,
+          ...targetPanel.tabs.slice(insertIndex),
+        ],
+        activeTabId: tabId,
+        attentionTabIds: targetPanel.attentionTabIds?.filter((id) => id !== tabId),
+      },
+    };
+    if (fromPanel.tabs.length > 1) {
+      return {
+        root: layout.root,
+        panels,
+        canvasWidth: layout.canvasWidth,
+        destinationPanelId: targetPanelId,
+        changed: true,
+      };
+    }
+
+    const removal = removePanelPreservingHorizontalWidths(layout.root, fromPanelId);
+    if (!removal.node || !removal.removed) return null;
+    delete panels[fromPanelId];
+    return {
+      root: removal.node,
+      panels,
+      canvasWidth: getCanvasWidthAfterPaneColumnRemoval(
+        layout.root,
+        removal.remainingWidthRatio,
+        layout.canvasWidth,
+      ),
+      destinationPanelId: targetPanelId,
+      changed: true,
+    };
+  }
+
+  if (target.position === 'center') return stable();
+  const position = target.position;
+  if (fromPanel.tabs.length === 1) {
+    const root =
+      target.kind === 'edge'
+        ? movePanelToRootEdgeInLayout(layout.root, fromPanelId, position)
+        : movePanelInLayout(layout.root, fromPanelId, targetPanelId, position);
+    return root
+      ? {
+          root,
+          panels: layout.panels,
+          canvasWidth: layout.canvasWidth,
+          destinationPanelId: fromPanelId,
+          changed: true,
+        }
+      : stable();
+  }
+
+  if (panelIds.length >= 4 || layout.panels[destinationPanelId]) return stable();
+  const root = insertFixedColumnInLayout(
+    layout.root,
+    destinationPanelId,
+    targetPanelId,
+    position,
+    layout.canvasWidth,
+  );
+  if (!root) return stable();
+  const baseCanvasWidth =
+    layout.canvasWidth ?? getAutomaticPanelCanvasWidth(panelIds.length, 'content');
+  return {
+    root,
+    panels: {
+      ...layout.panels,
+      [fromPanelId]: removePaneFromStack(fromPanel, tabId),
+      [destinationPanelId]: { id: destinationPanelId, tabs: [tab], activeTabId: tabId },
+    },
+    canvasWidth: baseCanvasWidth + DEFAULT_PANEL_WIDTH + PANEL_SPLIT_GUTTER_WIDTH,
+    destinationPanelId,
+    changed: true,
+  };
+}
+
 function uniquePanelId(base: string, used: Set<string>): string {
   let candidate = base;
   let suffix = 2;
@@ -682,7 +916,6 @@ export function normalizeTablessPanelLayout(layout: LayoutShape): LayoutShape {
         tabs: tab ? [tab] : [],
         activeTabId: tab?.id ?? null,
         ...(panel.pristine !== undefined ? { pristine: panel.pristine && !tab } : {}),
-        ...(panel.pinned !== undefined ? { pinned: panel.pinned } : {}),
       };
       panelIds.push(panelId);
       if (

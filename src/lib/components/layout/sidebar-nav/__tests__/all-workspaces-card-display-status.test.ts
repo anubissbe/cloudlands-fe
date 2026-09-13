@@ -17,7 +17,7 @@
  *   path) regroups the sidebar live without a refetch
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, screen, waitFor } from '@testing-library/svelte';
+import { fireEvent, render, screen, waitFor } from '@testing-library/svelte';
 import { store as appStore } from '$store/renderer/store';
 import {
   setWorkspaceEntity,
@@ -33,6 +33,7 @@ import {
   type Workspace,
   type WorkspaceId,
 } from '$shared/types';
+import { m } from '$shared/paraglide/messages.js';
 import AllWorkspacesCardHarness from './mocks/AllWorkspacesCardHarness.svelte';
 
 vi.mock('$lib/components/workspace/WorkspaceCard.svelte', async () => ({
@@ -238,8 +239,100 @@ describe('AllWorkspacesCard BE displayStatus (Status view)', () => {
 
     await waitFor(() => {
       const headers = getRedesignedGroupHeaders();
-      expect(headers).toEqual(['Needs Attention', 'Idle', 'In Progress']);
+      expect(headers).toEqual(['Needs Attention', 'In Progress', 'Idle']);
     });
+  });
+
+  it('renders sections in the canonical lifecycle order', async () => {
+    // Canonical fixed section order: failed, blocked, needs_attention,
+    // not_started, in_progress, idle, complete, pr_open, pr_ready, pr_queued,
+    // pr_merged. In particular: idle directly after in_progress, complete
+    // before pr_open, and pr_open before pr_ready before pr_queued
+    // (open → mergeable → queued → merged progression).
+    const statuses = [
+      'pr_merged',
+      'pr_queued',
+      'pr_ready',
+      'pr_open',
+      'complete',
+      'in_progress',
+      'not_started',
+      'idle',
+      'needs_attention',
+      'blocked',
+      'failed',
+    ] as const;
+    const workspaces = statuses.map((status, i) =>
+      makeWorkspace(`ws-order-${status}`, `Workspace ${i}`, { displayStatus: status }),
+    );
+
+    render(AllWorkspacesCardHarness, {
+      props: {
+        setup: () => {
+          appStore.dispatch(resetWorkspaceState());
+          for (const ws of workspaces) appStore.dispatch(setWorkspaceEntity(ws));
+          appStore.dispatch(setWorkspaceHasLoaded(true));
+          appStore.dispatch(setAllSpacesViewMode('status'));
+        },
+        expanded: true,
+      },
+    });
+
+    await waitFor(() => {
+      expect(getGroupHeaders()).toEqual([
+        'Failed',
+        'Blocked',
+        'Needs Attention',
+        'No Code Changes',
+        'In Progress',
+        'Idle',
+        'Completed',
+        'PR Open',
+        'PR Mergeable',
+        m.layout_allCard_statusPrQueued_label(),
+        'PR Merged',
+      ]);
+    });
+  });
+
+  it('collapses a status group from a keyboard-generated activation', async () => {
+    const first = makeWorkspace('ws-collapse-1', 'First active workspace', {
+      displayStatus: 'in_progress',
+    });
+    const second = makeWorkspace('ws-collapse-2', 'Second active workspace', {
+      displayStatus: 'in_progress',
+    });
+
+    render(AllWorkspacesCardHarness, {
+      props: {
+        setup: () => {
+          appStore.dispatch(resetWorkspaceState());
+          appStore.dispatch(setWorkspaceEntity(first));
+          appStore.dispatch(setWorkspaceEntity(second));
+          appStore.dispatch(setWorkspaceHasLoaded(true));
+          appStore.dispatch(setAllSpacesViewMode('status'));
+        },
+        expanded: true,
+      },
+    });
+
+    const toggle = await screen.findByRole('button', { name: 'In Progress' });
+    expect(toggle.tagName).toBe('BUTTON');
+    expect(toggle.getAttribute('aria-expanded')).toBe('true');
+    expect(screen.getByText('First active workspace')).toBeTruthy();
+
+    toggle.focus();
+    await fireEvent.click(toggle, { detail: 0 });
+
+    await waitFor(() => {
+      expect(toggle.getAttribute('aria-expanded')).toBe('false');
+      expect(document.getElementById('status-group-in_progress')?.hidden).toBe(true);
+    });
+    expect(appStore.state.sidebarNav.collapsedStatusGroupIds).toEqual(['in_progress']);
+
+    await fireEvent.click(toggle, { detail: 0 });
+    await waitFor(() => expect(toggle.getAttribute('aria-expanded')).toBe('true'));
+    expect(appStore.state.sidebarNav.collapsedStatusGroupIds).toEqual([]);
   });
 
   it('defaults an unknown wire displayStatus to not_started (forward compat)', async () => {

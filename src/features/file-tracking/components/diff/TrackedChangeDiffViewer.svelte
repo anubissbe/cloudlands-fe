@@ -8,7 +8,7 @@
    * - Hunk staging/unstaging with hover actions in the gutter
    * - Real-time updates when file content changes
    */
-  import { onMount, untrack } from 'svelte';
+  import { untrack } from 'svelte';
   import { writable } from 'svelte/store';
   import { invoke } from '$lib/electron-bridge';
 
@@ -40,6 +40,7 @@
 
   interface Props {
     change: TrackedChange;
+    active?: boolean;
     workspaceId?: string;
     viewMode?: 'unified' | 'split';
     showHeader?: boolean;
@@ -94,6 +95,7 @@
 
   let {
     change,
+    active = true,
     workspaceId: workspaceIdProp,
     viewMode = 'unified',
     showHeader = false,
@@ -493,6 +495,8 @@
           // only fail on a status-marked submodule entry (#1739).
           const diffChunk = await batchedGitDiff(wsIdForDiff, stagedFlag, filePath, {
             gitlink: change.gitlink,
+            gitRootId,
+            gitRootPath,
           });
 
           if (diffChunk) {
@@ -532,11 +536,12 @@
             // Old side always comes from a git ref; new side comes from the
             // working copy for unstaged changes.
             const gitRef = stagedFlag ? 'HEAD' : ':0';
-            const oldResult = await dedupedShowFile(wsIdForDiff, gitRef, filePath);
+            const showOptions = gitRootId ? { gitRootId } : undefined;
+            const oldResult = await dedupedShowFile(wsIdForDiff, gitRef, filePath, showOptions);
             if (oldResult?.success) oldContent = oldResult.data || '';
 
             if (stagedFlag) {
-              const indexResult = await dedupedShowFile(wsIdForDiff, ':0', filePath);
+              const indexResult = await dedupedShowFile(wsIdForDiff, ':0', filePath, showOptions);
               if (indexResult?.success) newContent = indexResult.data || '';
             } else {
               const wsId = workspaceId || workspace?.id;
@@ -1025,8 +1030,9 @@
     return changedLineMemoValue;
   }
 
-  // Load content on mount
-  onMount(() => {
+  // Load on mount and refresh after a retained workspace surface is reactivated.
+  $effect(() => {
+    if (!active) return;
     logger.info('[onMount] Component mounted', {
       instanceId,
       changeId: change?.id,
@@ -1034,10 +1040,11 @@
       stage: change?.stage,
       commitHash: change?.commitHash,
     });
-    loadDiffContent();
+    untrack(() => void loadDiffContent());
   });
 
   $effect(() => {
+    if (!active) return;
     const wsId = workspaceId;
     const filePath = resolveRelativeFilePath(change?.relativePath || change?.file || '');
     const absolutePath = getAbsoluteFilePath(filePath);
@@ -1069,7 +1076,7 @@
   });
 
   $effect(() => {
-    if (useProvidedContent) return;
+    if (!active || useProvidedContent) return;
     const content = $workingTreeFileContentStore;
     if (content === null || content === lastObservedWorkingTreeContent) return;
 
@@ -1086,6 +1093,7 @@
 
   // Watch for refreshKey changes
   $effect(() => {
+    if (!active) return;
     if (refreshKey !== undefined && refreshKey !== lastRefreshKey) {
       const isFirst = lastRefreshKey === undefined;
       lastRefreshKey = refreshKey;
@@ -1103,6 +1111,7 @@
   // Watch for change prop changes - only reload when the actual change identity changes
   // Skip the initial run since onMount already handles loading
   $effect(() => {
+    if (!active) return;
     const currentId = change?.id;
     const currentFile = change?.file;
 
@@ -1136,6 +1145,7 @@
   // Manage hover button - append to number element when hovering a changed line
   // Only react to hoveredLine changes - use untrack for everything else to prevent loops
   $effect(() => {
+    if (!active) return;
     const line = hoveredLine;
 
     // Cleanup previous button
@@ -1244,8 +1254,8 @@
     </div>
   {:else if error}
     <div class="error-state">
-      <Fa icon={faExclamationTriangle} class="text-error-foreground" />
-      <span class="text-error-foreground text-sm ml-2">{error}</span>
+      <Fa icon={faExclamationTriangle} class="text-danger" />
+      <span class="text-danger text-sm ml-2">{error}</span>
     </div>
   {:else if contentTooLarge}
     <div class="error-state">
@@ -1355,7 +1365,7 @@
             display: flex;
             align-items: center;
             gap: 0.25rem;
-            transition: all 0.15s;
+            transition: background-color 0.15s;
             white-space: nowrap;
           }
           .hunk-action-btn .icon {
@@ -1474,6 +1484,6 @@
   }
 
   .diff-skeleton-line--removed {
-    background: hsl(var(--destructive) / 0.08);
+    background: hsl(var(--danger-background) / 0.08);
   }
 </style>

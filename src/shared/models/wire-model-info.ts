@@ -10,14 +10,14 @@
  * historical names elsewhere.
  */
 
-export interface WireModelBadge {
+interface WireModelBadge {
   color: string;
   label: string;
   variant?: string;
 }
 
 /** Wire `ModelInfo` row as returned by `models.list`. */
-export interface WireModelInfo {
+interface WireModelInfo {
   id?: string;
   name?: string;
   provider?: string;
@@ -27,6 +27,7 @@ export interface WireModelInfo {
   badges?: WireModelBadge[];
   effortLevels?: string[];
   isDefault?: boolean;
+  isLegacyModel?: boolean;
   priority?: number;
 }
 
@@ -40,6 +41,7 @@ export interface ProviderModelInfo {
   badges?: WireModelBadge[];
   effortLevels?: string[];
   isDefault?: boolean;
+  isLegacyModel?: boolean;
   priority?: number;
 }
 
@@ -56,7 +58,7 @@ export interface WireModelsListResult {
 }
 
 /** Map a wire row to the FE model shape; `null` when key fields are missing. */
-export function wireModelToProviderModel(wire: WireModelInfo): ProviderModelInfo | null {
+function wireModelToProviderModel(wire: WireModelInfo): ProviderModelInfo | null {
   if (typeof wire?.id !== 'string' || !wire.id) return null;
   if (typeof wire?.name !== 'string' || !wire.name) return null;
   const model: ProviderModelInfo = { value: wire.id, label: wire.name };
@@ -68,6 +70,7 @@ export function wireModelToProviderModel(wire: WireModelInfo): ProviderModelInfo
   if (Array.isArray(wire.badges)) model.badges = wire.badges;
   if (Array.isArray(wire.effortLevels)) model.effortLevels = wire.effortLevels;
   if (wire.isDefault === true) model.isDefault = true;
+  if (wire.isLegacyModel === true) model.isLegacyModel = true;
   if (typeof wire.priority === 'number') model.priority = wire.priority;
   return model;
 }
@@ -77,4 +80,3 @@ export function wireModelsToProviderModels(result: WireModelsListResult): Provid
   if (!Array.isArray(result?.models)) return [];
   return result.models.flatMap((row) => wireModelToProviderModel(row) ?? []);
 }
-

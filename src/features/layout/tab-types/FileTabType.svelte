@@ -33,12 +33,14 @@
   import { selectWorkspaceById } from '$store/renderer/slices/workspace/workspace-selectors';
   import { invoke } from '$lib/electron-bridge';
   import { appClient } from '$lib/client';
+  import { backendRequest } from '$lib/client/live/backend-transport';
+  import { resolveFileBySuffix } from '$lib/services/files/resolve-file-by-suffix';
   import { LineType } from '$shared/types';
   import { getLanguageFromPath } from '$lib/utils/file-utils';
   import { isAbsolutePath, isAbsolutePathOutsideRoot, isTildePath } from '$lib/utils/path-utils';
   import { parseHunksToLineChanges, type LineChange } from '$lib/utils/line-change-decorations';
   import CodeEditor from '$lib/components/editor/CodeEditor.svelte';
-  import MarkdownFileEditor from '$lib/components/editor/MarkdownFileEditor.svelte';
+  import MarkdownViewer from '$lib/components/markdown/MarkdownViewer.svelte';
   import FileViewer from '$lib/components/editor/FileViewer.svelte';
   import { Skeleton } from '$lib/components/ui/skeleton';
   import * as Menu from '$lib/components/ui/menu';
@@ -61,6 +63,8 @@
   import { m } from '$shared/paraglide/messages.js';
   import { writable } from 'svelte/store';
   import { store as appStore } from '$store/renderer/store';
+  import { getEffectiveShortcut } from '$lib/utils/effective-shortcuts';
+  import { matchesShortcut, type ShortcutId } from '$lib/utils/shortcut-bindings';
 
   const lineWrapping = selectLineWrapping();
   const diffIndicators = selectDiffIndicators();
@@ -120,26 +124,32 @@
         : m.ui_saveIndicator_saved_tooltip(),
   );
 
-  let codeEditorRef = $state<{ focus: () => boolean } | null>(null);
+  type EditorShortcutAction = 'undo' | 'redo' | 'copy' | 'select-all' | 'toggle-task-list';
+  let codeEditorRef = $state<{
+    focus: () => boolean;
+    runShortcut: (action: Exclude<EditorShortcutAction, 'toggle-task-list'>) => boolean;
+  } | null>(null);
   let isMounted = $state(true);
   let fileLineChanges = $state<LineChange[]>([]);
+  let resolvedWorkspaceMediaPath = $state<string | null>(null);
 
   // Jump to line from tab data (e.g., when opening from reference block)
   let jumpToLine = $state<{ line?: number; column?: number } | undefined>(undefined);
 
   // Track the last processed timestamp to detect new navigation requests
   let lastJumpTimestamp = $state<number | undefined>(undefined);
+  let markdownPreview = $state(true); // default to rich text for markdown files
 
   // Extract line from tab.data when tab changes
   // Uses jumpTimestamp to detect changes even when navigating to the same line
   $effect(() => {
     const line = tab.data?.line as number | undefined;
     const timestamp = tab.data?.jumpTimestamp as number | undefined;
-    // Only process if this is a new navigation request (new timestamp)
-    if (line && timestamp && timestamp !== lastJumpTimestamp) {
-      lastJumpTimestamp = timestamp;
-      jumpToLine = { line };
-    }
+    if (!line || (timestamp !== undefined && timestamp === lastJumpTimestamp)) return;
+
+    lastJumpTimestamp = timestamp;
+    jumpToLine = { line };
+    markdownPreview = false;
   });
 
   $effect(() => {
@@ -168,9 +178,113 @@
         : `${repoPath}/${tab.filePath}`
       : null,
   );
+  const isAllowlistedMediaPath = $derived(
+    !!tab.filePath && /\.(?:png|jpe?g|gif|webp|mp4|webm)$/i.test(tab.filePath),
+  );
+  const workspaceMediaPath = $derived.by(() => {
+    const filePath = tab.filePath;
+    if (!filePath || !workspaceId || isOutsideWorkspace || !/^[A-Za-z0-9._-]+$/.test(workspaceId)) {
+      return null;
+    }
+
+    const normalizedPath = filePath.replace(/\\/g, '/');
+    let relativePath = normalizedPath;
+    if (isAbsolutePath(filePath)) {
+      if (!repoPath) return null;
+      const normalizedRoot = repoPath.replace(/\\/g, '/').replace(/\/+$/, '');
+      const caseInsensitive =
+        /^[A-Za-z]:\//.test(normalizedRoot) || normalizedRoot.startsWith('//');
+      const comparedPath = caseInsensitive ? normalizedPath.toLowerCase() : normalizedPath;
+      const comparedRoot = caseInsensitive ? normalizedRoot.toLowerCase() : normalizedRoot;
+      if (!comparedPath.startsWith(`${comparedRoot}/`)) return null;
+      relativePath = normalizedPath.slice(normalizedRoot.length + 1);
+    }
+
+    const segments = relativePath.split('/');
+    if (
+      segments.length === 0 ||
+      segments.some(
+        (segment) =>
+          !segment ||
+          segment === '.' ||
+          segment === '..' ||
+          segment.includes('\0') ||
+          segment.includes('/') ||
+          segment.includes('\\'),
+      ) ||
+      /^[A-Za-z]:/.test(segments[0]) ||
+      !/\.(?:png|jpe?g|gif|webp|mp4|webm)$/i.test(segments[segments.length - 1])
+    ) {
+      return null;
+    }
+
+    return segments.join('/');
+  });
+  const workspaceMediaUrl = $derived(
+    resolvedWorkspaceMediaPath && workspaceId
+      ? `workspace-file://${workspaceId}/${resolvedWorkspaceMediaPath
+          .split('/')
+          .map(encodeURIComponent)
+          .join('/')}`
+      : null,
+  );
   const fileLanguage = $derived(tab.filePath ? getLanguageFromPath(tab.filePath) : 'plaintext');
   const isMarkdownFile = $derived(fileLanguage === 'markdown');
-  let markdownPreview = $state(true); // default to rich text for markdown files
+
+  // Media cannot use the UTF-8 file.read fallback. Confirm the exact contained
+  // path first, then use the existing bounded ignored-artifact resolver. Hold
+  // rendering until this completes so an incorrect workspace-file URL is not
+  // committed before a unique candidate can retarget the owning tab.
+  $effect(() => {
+    if (!isActive) return;
+    const requestedPath = workspaceMediaPath;
+    const sourceFilePath = tab.filePath;
+    const wsId = workspaceId;
+    const tabId = tab.id;
+    resolvedWorkspaceMediaPath = null;
+    if (!requestedPath || !sourceFilePath || !wsId) return;
+
+    let cancelled = false;
+    const isCurrent = () =>
+      !cancelled && workspaceId === wsId && tab.id === tabId && tab.filePath === sourceFilePath;
+
+    void (async () => {
+      let exactFile = false;
+      try {
+        const stat = await backendRequest<{ isFile?: boolean }>('file.stat', {
+          workspaceId: wsId,
+          path: requestedPath,
+        });
+        exactFile = stat?.isFile === true;
+      } catch {
+        // A missing exact path is the expected entry into suffix recovery.
+      }
+      if (!isCurrent()) return;
+      if (exactFile) {
+        resolvedWorkspaceMediaPath = requestedPath;
+        return;
+      }
+      if (!/\.(?:png|jpe?g|gif|webp|mp4|webm)$/i.test(requestedPath)) {
+        resolvedWorkspaceMediaPath = requestedPath;
+        return;
+      }
+
+      const { candidates, truncated } = await resolveFileBySuffix(wsId, requestedPath);
+      if (!isCurrent()) return;
+      if (!truncated && candidates.length === 1) {
+        appStore.dispatch(updateFileTabPath(wsId, sourceFilePath, candidates[0], tabId));
+        return;
+      }
+
+      // Missing, ambiguous, and truncated results remain on the requested path;
+      // the binary protocol will report absence without falling back to file.read.
+      resolvedWorkspaceMediaPath = requestedPath;
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  });
 
   // Find tracked changes for the file
   function matchesPath(c: TrackedChange, path: string): boolean {
@@ -215,12 +329,20 @@
     const filePath = tab.filePath;
     const absolutePath = fileAbsolutePath;
     const wsId = workspaceId;
+    if (!isActive) return;
 
     // `file.read` is scoped by workspaceId and accepts a repository-relative
     // path. Do not block the read while the workspace entity/root hydrates —
     // doing so leaves activity-opened tabs stuck at "Preparing to load file".
     // The effect runs again with the resolved absolute path once hydration lands.
-    if (filePath && wsId && !isOutsideWorkspace) {
+    const waitingForAbsoluteRoot = !!filePath && isAbsolutePath(filePath) && !repoPath;
+    if (
+      filePath &&
+      wsId &&
+      !isOutsideWorkspace &&
+      !isAllowlistedMediaPath &&
+      !waitingForAbsoluteRoot
+    ) {
       appStore.dispatch(loadFileContentRequested(wsId, filePath, absolutePath ?? filePath));
     }
   });
@@ -293,10 +415,27 @@
   });
 
   function handleKeyDown(e: KeyboardEvent) {
-    if ((e.metaKey || e.ctrlKey) && e.key === 's') {
+    const isMac = /Mac|iPhone|iPad|iPod/.test(navigator.userAgent);
+    const matches = (id: ShortcutId) => matchesShortcut(e, getEffectiveShortcut(id), isMac);
+    if (matches('editor.save')) {
       e.preventDefault();
       if (isFileDirty && !fileSaving) saveFileContent();
+      return;
     }
+    const action = matches('editor.undo')
+      ? 'undo'
+      : matches('editor.redo')
+        ? 'redo'
+        : matches('editor.toggle-task-list')
+          ? 'toggle-task-list'
+          : matches('editor.copy')
+            ? 'copy'
+            : matches('editor.select-all')
+              ? 'select-all'
+              : null;
+    if (!action) return;
+    const handled = action !== 'toggle-task-list' && codeEditorRef?.runShortcut(action);
+    if (handled) e.preventDefault();
   }
 
   function handleGoToChanges(e?: MouseEvent) {
@@ -358,7 +497,7 @@
   });
 </script>
 
-<svelte:window onkeydown={handleKeyDown} />
+<svelte:window onkeydown={(event) => isActive && handleKeyDown(event)} />
 
 {#snippet fileDisplayActions()}
   <!-- Save/edit affordances are hidden for out-of-workspace paths -->
@@ -415,6 +554,15 @@
         <p>{m.layout_fileTab_outsideWorkspace_label()}</p>
         <p class="text-xs">{tab.filePath}</p>
       </div>
+    {:else if workspaceMediaUrl}
+      <FileViewer
+        filePath={resolvedWorkspaceMediaPath ?? tab.filePath}
+        sourceUrl={workspaceMediaUrl}
+      />
+    {:else if isAllowlistedMediaPath}
+      <div class="flex items-center justify-center h-full text-subtle">
+        <p>{m.layout_fileTab_preparing_label()}</p>
+      </div>
     {:else if fileLoading}
       <div class="flex flex-col h-full">
         <div class="flex-1 p-4 space-y-2">
@@ -428,7 +576,7 @@
       </div>
     {:else if fileError}
       <div class="flex flex-col items-center justify-center h-full text-subtle gap-2">
-        <p class="text-error-foreground">{m.layout_fileTab_errorLoading_label()}</p>
+        <p class="text-danger">{m.layout_fileTab_errorLoading_label()}</p>
         <p class="text-xs">{fileError}</p>
         <p class="text-xs font-mono">{tab.filePath}</p>
         {#if fileNotFoundCandidates.length > 0}
@@ -458,10 +606,9 @@
           isBinary={isFileBinary}
         />
       {:else if isMarkdownFile && markdownPreview}
-        <MarkdownFileEditor
-          bind:value={getFileContentForEditor, setFileContentFromEditor}
-          externalContentVersion={fileLastUpdated}
-        />
+        <div class="h-full overflow-auto p-4">
+          <MarkdownViewer content={fileContent} {workspaceId} renderRichFencesAsCode />
+        </div>
       {:else}
         <CodeEditor
           bind:this={codeEditorRef}

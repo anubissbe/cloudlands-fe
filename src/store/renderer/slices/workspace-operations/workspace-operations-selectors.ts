@@ -1,4 +1,6 @@
-import { store } from "../../store";
+import { getItems, type Collection } from '@augmentcode/themis/utils/collections/collection-utils';
+import { store } from '../../store';
+import type { OpenPrWarningItem } from './workspace-operations-types';
 
 export const selectShowDeleteWarning = store.createSelector((state) => {
   return state.workspaceOperations.showDeleteWarning;
@@ -14,6 +16,16 @@ export const selectRunningAgentNamesForDelete = store.createSelector((state) => 
 
 export const selectActiveHookNamesForDelete = store.createSelector((state) => {
   return state.workspaceOperations.activeHookNamesForDelete;
+});
+
+export const selectOpenPrsForDelete = store.createSelector((state): OpenPrWarningItem[] => {
+  return getItems<OpenPrWarningItem, 'number'>(
+    state.workspaceOperations.openPrsForDelete as Collection<OpenPrWarningItem, 'number'>,
+  );
+});
+
+export const selectLocalChangesForDelete = store.createSelector((state) => {
+  return state.workspaceOperations.localChangesForDelete;
 });
 
 export const selectShowArchiveWarning = store.createSelector((state) => {
@@ -32,20 +44,14 @@ export const selectActiveHookNamesForArchive = store.createSelector((state) => {
   return state.workspaceOperations.activeHookNamesForArchive;
 });
 
-export const selectShowBulkArchiveConfirm = store.createSelector((state) => {
-  return state.workspaceOperations.showBulkArchiveConfirm;
+export const selectOpenPrsForArchive = store.createSelector((state): OpenPrWarningItem[] => {
+  return getItems<OpenPrWarningItem, 'number'>(
+    state.workspaceOperations.openPrsForArchive as Collection<OpenPrWarningItem, 'number'>,
+  );
 });
 
-export const selectBulkArchiveActiveAgentCount = store.createSelector((state) => {
-  return state.workspaceOperations.bulkArchiveActiveAgentCount;
-});
-
-export const selectBulkArchiveActiveHookCount = store.createSelector((state) => {
-  return state.workspaceOperations.bulkArchiveActiveHookCount;
-});
-
-export const selectShowBulkDeleteArchivedConfirm = store.createSelector((state) => {
-  return state.workspaceOperations.showBulkDeleteArchivedConfirm;
+export const selectLocalChangesForArchive = store.createSelector((state) => {
+  return state.workspaceOperations.localChangesForArchive;
 });
 
 export const selectPendingBulkRepoKey = store.createSelector((state) => {
@@ -58,26 +64,6 @@ export const selectBulkArchiveComputeToken = store.createSelector((state) => {
 
 export const selectPendingBulkDeleteRepoKey = store.createSelector((state) => {
   return state.workspaceOperations.pendingBulkDeleteRepoKey;
-});
-
-export const selectShowBulkDeleteWarningConfirm = store.createSelector((state) => {
-  return state.workspaceOperations.showBulkDeleteWarningConfirm;
-});
-
-export const selectBulkDeleteWorkspaceCount = store.createSelector((state) => {
-  return state.workspaceOperations.bulkDeleteWorkspaceCount;
-});
-
-export const selectBulkDeleteActiveAgentCount = store.createSelector((state) => {
-  return state.workspaceOperations.bulkDeleteActiveAgentCount;
-});
-
-export const selectBulkDeleteActiveHookCount = store.createSelector((state) => {
-  return state.workspaceOperations.bulkDeleteActiveHookCount;
-});
-
-export const selectShowRemoveRepoConfirm = store.createSelector((state) => {
-  return state.workspaceOperations.showRemoveRepoConfirm;
 });
 
 export const selectPendingRemoveRepoPath = store.createSelector((state) => {

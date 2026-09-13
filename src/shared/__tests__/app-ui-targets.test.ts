@@ -24,19 +24,32 @@ describe('app UI targets registry', () => {
     const expectedTabs = {
       providers: 'providers',
       integrations: 'connections',
-      'mcp-servers': 'tools',
-      'git-workspace': 'git-workspace',
-      'cli-optimization': 'tools',
-      'utility-default-model': 'tools',
-      notifications: 'general',
-      'open-in': 'general',
-      'github-link-action': 'general',
-      appearance: 'appearance',
-      'color-theme': 'appearance',
-      'note-font': 'appearance',
-      'agent-chat-font': 'appearance',
-      'code-font': 'appearance',
+      voice: 'input',
+      'keyboard-shortcuts': 'input',
+      'mcp-servers': 'connections',
+      'git-workspace': 'setup',
+      git: 'setup',
+      shell: 'setup',
+      workspace: 'setup',
+      'cli-optimization': 'setup',
+      'workspace-api': 'advanced',
+      'utility-default-model': 'providers',
+      notifications: 'app-behavior',
+      updates: 'app-behavior',
+      'open-in': 'app-behavior',
+      'github-link-action': 'app-behavior',
+      'agent-features': 'agent-behavior',
+      'global-instructions': 'agent-behavior',
+      appearance: 'display',
+      'font-style': 'display',
+      language: 'display',
+      'color-theme': 'display',
+      'note-font': 'display',
+      'agent-chat-font': 'display',
+      'code-font': 'display',
       general: 'advanced',
+      devices: 'devices',
+      'websocket-api': 'devices',
     } as const;
 
     const targets = getAppUiTargets();
@@ -56,39 +69,83 @@ describe('app UI targets registry', () => {
     '/settings?tab=setup#notifications',
     '/settings?tab=fonts-colors#theme',
     '/settings?tab=interface-system#color-theme',
+    '/settings?tab=connections#voice',
+    '/settings?tab=system#workspace-api',
+    '/settings?tab=agents#default-model',
   ])('keeps legacy settings URLs resolvable: %s', (route) => {
     expect(isResolvableNavTarget(route)).toBe(true);
   });
 
-  it('preserves agents sub-view query parameters', () => {
+  it('preserves specialist sub-view query parameters', () => {
     const targets = getAppUiTargets();
 
     expect(targets.find((target) => target.id === 'create-specialist')?.route).toBe(
-      '/settings?tab=agents&view=create-specialist#create-specialist',
+      '/settings?tab=specialists&view=create-specialist#create-specialist',
     );
     expect(targets.find((target) => target.id === 'specialist-entry')?.route).toBe(
-      '/settings?tab=agents&specialist={specialistId}#specialist-{specialistId}',
+      '/settings?tab=specialists&specialist={specialistId}#specialist-{specialistId}',
     );
   });
 
-  it('resolves the default-model hash to the canonical background agent target', () => {
+  it('resolves dynamic specialist hashes to the Specialists target', () => {
+    const route = '/settings?tab=specialists&specialist=implementor#specialist-implementor';
+
+    expect(resolveHashToTarget('specialist-implementor')).toMatchObject({
+      id: 'specialist-implementor',
+      tab: 'specialists',
+      category: 'specialist',
+      dynamic: true,
+    });
+    expect(getHighlightIdFromRoute(route)).toBe('specialist-implementor');
+    expect(isResolvableNavTarget(route)).toBe(true);
+  });
+
+  it('resolves the default-model hash to the Providers default model target', () => {
     const target = resolveHashToTarget('default-model');
 
     expect(target).toMatchObject({
-      id: 'quickActions.defaultModel',
-      tab: 'agents',
-      scrollSelector: '#default-model',
-      highlightSelector: '[data-highlight-id="quickActions.defaultModel"]',
+      id: 'utility-default-model',
+      tab: 'providers',
+      scrollSelector: '#utility-default-model',
+      highlightSelector: '[data-highlight-id="utility-default-model"]',
+      route: '/settings?tab=providers#utility-default-model',
     });
+  });
+
+  it('resolves agent-behavior hashes to the Global Instructions target', () => {
+    for (const hash of ['global-instructions', 'agents', 'specialists', 'all-agents']) {
+      expect(resolveHashToTarget(hash), hash).toMatchObject({
+        id: 'global-instructions',
+        tab: 'agent-behavior',
+        scrollSelector: '#global-instructions',
+        highlightSelector: '[data-highlight-id="global-instructions"]',
+      });
+    }
+    expect(getHighlightIdFromRoute('/settings?tab=agent-behavior#global-instructions')).toBe(
+      'global-instructions',
+    );
   });
 
   // monorepo#1729: the hash is UI-only, so links minted before the
   // backgroundAgents.* → quickActions.* rename must keep resolving.
   it('still resolves the pre-rename backgroundAgents.defaultModel hash', () => {
     expect(resolveHashToTarget('backgroundAgents.defaultModel')).toMatchObject({
-      id: 'quickActions.defaultModel',
+      id: 'utility-default-model',
     });
     expect(isResolvableNavTarget('/settings#backgroundAgents.defaultModel')).toBe(true);
+  });
+
+  it('resolves the legacy machines hash to the canonical Devices target', () => {
+    expect(resolveHashToTarget('machines')).toMatchObject({ id: 'devices', tab: 'devices' });
+    expect(isResolvableNavTarget('/settings?tab=machines#machines')).toBe(true);
+  });
+
+  it('resolves the remote-access alias to the websocket-api target on the Devices tab', () => {
+    const canonical = resolveHashToTarget('websocket-api');
+    expect(canonical).toMatchObject({ id: 'websocket-api', tab: 'devices' });
+    expect(resolveHashToTarget('remote-access')).toEqual(canonical);
+    expect(isResolvableNavTarget('/settings?tab=advanced#websocket-api')).toBe(true);
+    expect(isResolvableNavTarget('/settings#remote-access')).toBe(true);
   });
 
   it('returns undefined for an unknown hash', () => {

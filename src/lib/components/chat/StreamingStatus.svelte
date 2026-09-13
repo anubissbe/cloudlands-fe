@@ -6,6 +6,7 @@
   - Error/Timeout: clear failed state with Try Again button
 -->
 <script lang="ts">
+  import { onDestroy } from 'svelte';
   import { fade } from 'svelte/transition';
   import { cubicOut } from 'svelte/easing';
   import Fa from 'svelte-fa';
@@ -14,11 +15,19 @@
     faExclamationTriangle,
     faCopy,
     faCheck,
+    faStop,
   } from '@fortawesome/free-solid-svg-icons';
   import { Button } from '$lib/components/ui/button';
   import { cn } from '$lib/utils/cn';
+  import CopyButton from '$lib/components/ui/CopyButton.svelte';
   import RelativeTime from '$lib/components/ui/RelativeTime.svelte';
-  import { deriveErrorDisplay } from './streaming-status-utils';
+  import {
+    deriveErrorDisplay,
+    formatElapsed,
+    getActiveStalledEvent,
+    getLatestThinkingStatusEvent,
+    getStatusMarkVariant,
+  } from './streaming-status-utils';
   import { m } from '$shared/paraglide/messages.js';
   import StreamingTypingIndicator from './StreamingTypingIndicator.svelte';
 
@@ -42,11 +51,35 @@
     sessionCorrupted?: boolean;
     /** ISO timestamp of when the failure occurred - renders a live "failed X ago" */
     failedAt?: string | null;
+    /**
+     * Provider auth-failure login guidance: when the error matches the
+     * provider's auth-error patterns, shows the copyable login command (and
+     * the claude-code desktop-app caveat) instead of just the raw error.
+     */
+    authGuidance?: {
+      loginCommandHint: string;
+      showClaudeDesktopNote: boolean;
+    } | null;
     /** Model unavailable info - when set, shows retry with suggested model */
     modelUnavailable?: {
       failedModel: string;
       nextAvailableModel: string;
     } | null;
+    /**
+     * Provider usage-limit recovery (#4455): set when the daemon reported
+     * `errorCode: "quota-exceeded"` for the failed turn. `providerId` is the
+     * provider that ran out (already excluded from `quotaRetryProviders`).
+     * Retrying the same provider cannot succeed, so the banner offers the
+     * available alternatives instead of a bare "Try again".
+     */
+    quotaExceeded?: { providerId: string; displayName?: string } | null;
+    /**
+     * Alternative providers offerable for a quota retry — enabled, installed
+     * and authenticated, minus the exhausted one. Empty means no alternative
+     * is usable, so the banner falls back to the plain error surface rather
+     * than dangling an action that cannot work.
+     */
+    quotaRetryProviders?: Array<{ id: string; displayName: string }>;
     /** Transient lifecycle status events from the backend */
     statusEvents?: Array<{
       phase: string;
@@ -62,8 +95,15 @@
     onRetry?: () => void;
     /** Callback to retry with a specific model */
     onRetryWithModel?: (model: string) => void;
+    /**
+     * Callback to retry the failed turn on a different provider (#4455).
+     * Switches the live session to `providerId` and redrives the turn.
+     */
+    onRetryWithProvider?: (providerId: string) => void;
     /** Callback to stop streaming */
     onStop?: () => void;
+    /** Callback to cancel the stalled turn and re-send the last input (monorepo#3402) */
+    onStalledRetry?: () => void;
     /** Seed for spinner colors (typically agent ID) */
     seed?: string;
     /** Additional class names */
@@ -73,7 +113,6 @@
   let {
     isStreaming = false,
     isProcessing = false,
-    // eslint-disable-next-line @typescript-eslint/no-unused-vars
     lastChunkTime = null,
     // eslint-disable-next-line @typescript-eslint/no-unused-vars
     receivedFirstChunk = false,
@@ -82,33 +121,111 @@
     error = null,
     sessionCorrupted = false,
     failedAt = null,
+    authGuidance = null,
     modelUnavailable = null,
-    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    quotaExceeded = null,
+    quotaRetryProviders = [],
     statusEvents = [],
     // eslint-disable-next-line @typescript-eslint/no-unused-vars
     streamingStartTime = null,
     hasPendingPermission = false,
     onRetry,
     onRetryWithModel,
-    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    onRetryWithProvider,
     onStop,
+    onStalledRetry,
     seed,
     class: className = '',
   }: Props = $props();
 
   // Determine current status
-  type Status = 'normal' | 'error' | 'model-unavailable';
+  type Status = 'normal' | 'error' | 'model-unavailable' | 'quota-exceeded';
 
   let status: Status = $derived.by(() => {
     if (modelUnavailable) return 'model-unavailable';
+    // Only claim the quota surface when there is somewhere to go: with no
+    // usable alternative provider the offer would be a dead end, so fall
+    // through to the ordinary error banner and its "Try again".
+    if (quotaExceeded && quotaRetryProviders.length > 0) return 'quota-exceeded';
     if (error) return 'error';
     return 'normal';
   });
+
+  /**
+   * Display name of the exhausted provider. It cannot be looked up in
+   * `quotaRetryProviders` — that list deliberately EXCLUDES the exhausted
+   * provider — so the parent supplies the catalog display name alongside the
+   * id. The raw id is the fallback so a provider the renderer has no catalog
+   * row for still names itself rather than rendering an empty code span.
+   */
+  let quotaProviderLabel = $derived(
+    quotaExceeded ? (quotaExceeded.displayName ?? quotaExceeded.providerId) : '',
+  );
 
   // Should we show at all?
   // Don't show thinking indicator when waiting for permission - the permission UI takes over.
   let visible = $derived(
     error || modelUnavailable || ((isStreaming || isProcessing) && !hasPendingPermission),
+  );
+  // Daemon-reported mid-turn stall (monorepo#3402): only meaningful while the
+  // turn is still active — turn end/failure clears statusEvents or flips
+  // status away from 'normal', so the stalled row can never outlive the turn.
+  let stalledEvent = $derived(
+    status === 'normal' && (isStreaming || isProcessing) && !hasPendingPermission
+      ? getActiveStalledEvent(statusEvents, lastChunkTime)
+      : null,
+  );
+  let thinkingVisible = $derived(
+    status === 'normal' && (isStreaming || isProcessing) && !hasPendingPermission && !stalledEvent,
+  );
+  // Skips stalled events: an active stall has its own row, and a superseded
+  // one must not leak its stale message into the returning thinking indicator.
+  let latestStatusEvent = $derived(getLatestThinkingStatusEvent(statusEvents));
+  let markVariant = $derived(getStatusMarkVariant(latestStatusEvent?.phase));
+
+  let nowMs = $state(Date.now());
+  let elapsedInterval: ReturnType<typeof setInterval> | undefined;
+  // The thinking row's elapsed text is only revealed on hover, so it is
+  // refreshed on pointerenter and ticks only while hovered; the stalled row's
+  // duration is always visible and ticks whenever it is shown.
+  let thinkingHovered = $state(false);
+  let thinkingElapsedTicking = $derived(thinkingVisible && !!latestStatusEvent && thinkingHovered);
+
+  function clearElapsedInterval() {
+    if (elapsedInterval === undefined) return;
+    clearInterval(elapsedInterval);
+    elapsedInterval = undefined;
+  }
+
+  $effect(() => {
+    if (!thinkingElapsedTicking && !stalledEvent) {
+      clearElapsedInterval();
+      return;
+    }
+    nowMs = Date.now();
+    clearElapsedInterval();
+    elapsedInterval = setInterval(() => (nowMs = Date.now()), 1_000);
+    return clearElapsedInterval;
+  });
+
+  onDestroy(clearElapsedInterval);
+
+  let elapsedTime = $derived(
+    latestStatusEvent
+      ? m.chat_streamingStatus_elapsedAgo_label({
+          duration: formatElapsed(nowMs - latestStatusEvent.timestamp),
+        })
+      : null,
+  );
+
+  // Live "No model activity for N" copy. The daemon emits the stalled event
+  // only after measuring `silentMs` of silence, so anchor at
+  // `timestamp - silentMs` to reflect the actual silence duration rather
+  // than starting the counter at the emission time.
+  let stalledElapsed = $derived(
+    stalledEvent
+      ? formatElapsed(nowMs - (stalledEvent.timestamp - (stalledEvent.silentMs ?? 0)))
+      : null,
   );
 
   // Status message: the raw error when one is set, otherwise "Thinking"
@@ -136,16 +253,74 @@
   }
 </script>
 
+<StreamingTypingIndicator
+  visible={thinkingVisible}
+  message={statusMessage}
+  lifecycleMessage={latestStatusEvent?.message}
+  elapsed={elapsedTime}
+  onHoverChange={(hovered) => (thinkingHovered = hovered)}
+  variant={markVariant}
+  {seed}
+  class="mt-2 {className}"
+/>
+
+{#if stalledEvent}
+  <div
+    data-stream-stalled="true"
+    class={cn(
+      'type-caption mt-2 flex items-center gap-2 rounded-md border border-warning/20 bg-warning/5 py-2 pl-2 pr-1',
+      className,
+    )}
+    in:fade={{ duration: 200, easing: cubicOut }}
+    out:fade={{ duration: 150, easing: cubicOut }}
+  >
+    <!-- Static live announcement: announced once when the stall appears. The
+         visible label ticks every second and must stay out of the live region
+         so assistive tech doesn't re-announce it for the entire stall. -->
+    <span role="status" class="sr-only" data-testid="stalled-announcement"
+      >{m.chat_streamingStatus_stalledAnnouncement_label()}</span
+    >
+    <Fa icon={faExclamationTriangle} class="shrink-0 text-warning/70" />
+    <span class="min-w-0 flex-1 truncate text-warning" data-testid="stalled-message"
+      >{m.chat_streamingStatus_stalled_label({ duration: stalledElapsed ?? '' })}</span
+    >
+    {#if onStalledRetry}
+      <Button
+        variant="ghost-light"
+        size="sm"
+        onclick={onStalledRetry}
+        class="type-caption h-7 shrink-0 gap-1.5 px-2 text-muted-foreground"
+        data-testid="stalled-retry"
+      >
+        <Fa icon={faRotateRight} class="size-3" />
+        {m.chat_streamingStatus_stalledRetry_label()}
+      </Button>
+    {/if}
+    {#if onStop}
+      <Button
+        variant="ghost-light"
+        size="sm"
+        onclick={onStop}
+        class="type-caption h-7 shrink-0 gap-1.5 px-2 text-muted-foreground"
+        data-testid="stalled-cancel"
+      >
+        <Fa icon={faStop} class="size-3" />
+        {m.chat_streamingStatus_stalledCancel_label()}
+      </Button>
+    {/if}
+  </div>
+{/if}
+
 {#if visible}
-  {#if status === 'normal'}
-    <StreamingTypingIndicator visible message={statusMessage} {seed} class="mt-2 {className}" />
-  {:else}
+  {#if status !== 'normal'}
     <div
       role={status === 'error' ? 'alert' : undefined}
       aria-live={status === 'error' ? 'assertive' : undefined}
+      data-stream-terminal-error="true"
       class={cn(
         'type-caption flex flex-col gap-0 py-2 pr-1',
-        status === 'model-unavailable' &&
+        status === 'error' && 'mt-2',
+        (status === 'model-unavailable' || status === 'quota-exceeded') &&
           'rounded-md border border-warning/20 bg-warning/5 pl-2 pr-3',
         className,
       )}
@@ -163,9 +338,16 @@
               >
               {m.chat_streamingStatus_modelUnavailable_after()}
             </span>
+          {:else if status === 'quota-exceeded' && quotaExceeded}
+            <Fa icon={faExclamationTriangle} class="shrink-0 text-warning/70" />
+            <span class="text-warning" data-testid="error-quota-exceeded">
+              {m.chat_streamingStatus_quotaExceeded_before()}
+              <code class="px-1 py-0.5 bg-muted rounded text-ui">{quotaProviderLabel}</code>
+              {m.chat_streamingStatus_quotaExceeded_after()}
+            </span>
           {:else if status === 'error' && errorDisplay}
             <div class="flex min-w-0 flex-1 flex-col gap-0.5">
-              <span class="font-medium text-error-foreground" data-testid="error-title"
+              <span class="font-medium text-danger" data-testid="error-title"
                 >{errorDisplay.title}{#if failedAt}
                   <span
                     class="type-caption ml-1.5 leading-4 font-normal text-muted-foreground"
@@ -175,19 +357,21 @@
                   </span>
                 {/if}</span
               >
-              <div class="relative flex min-h-5 w-full min-w-0 items-start gap-1.5 py-0">
+              <div
+                class="relative grid min-h-5 w-full min-w-0 grid-cols-[1.75rem_minmax(0,1fr)] items-start gap-x-1.5 py-0"
+              >
                 <Button
-                  variant="plain"
-                  size="icon-xs"
+                  variant="ghost-light"
+                  size="icon-sm"
                   onclick={handleCopyError}
                   iconOnly
                   tooltip={m.error_boundary_copyDetails_tooltip()}
                   aria-label={m.error_boundary_copyDetails_tooltip()}
-                  class="size-4! shrink-0 p-0! text-muted-foreground opacity-30 hover:opacity-100"
+                  class="absolute top-3 left-0 -translate-y-1/2 text-muted-foreground"
                 >
-                  <Fa icon={errorCopied ? faCheck : faCopy} size="xs" class="w-4 shrink-0" />
+                  <Fa icon={errorCopied ? faCheck : faCopy} class="shrink-0" />
                 </Button>
-                <div class="flex min-w-0 flex-1 flex-col">
+                <div class="col-start-2 flex min-w-0 flex-col">
                   <Button
                     variant="plain"
                     class="type-caption h-auto! min-w-0 max-w-full justify-start text-left leading-4 text-muted-foreground"
@@ -208,6 +392,28 @@
                       data-testid="error-detail">{errorDisplay.detail}</span
                     >
                   {/if}
+                  {#if authGuidance}
+                    <div class="mt-1.5 flex flex-col gap-1" data-testid="error-auth-guidance">
+                      <span class="type-caption leading-4 text-muted-foreground"
+                        >{m.settings_providers_runToLogIn_label()}</span
+                      >
+                      <div class="flex items-center gap-1">
+                        <code
+                          class="rounded bg-muted px-1.5 py-0.5 text-ui"
+                          data-testid="error-auth-login-command"
+                          >{authGuidance.loginCommandHint}</code
+                        >
+                        <CopyButton text={authGuidance.loginCommandHint} size="xs" />
+                      </div>
+                      {#if authGuidance.showClaudeDesktopNote}
+                        <span
+                          class="type-caption leading-4 text-muted-foreground"
+                          data-testid="error-auth-claude-desktop-note"
+                          >{m.settings_providers_claudeDesktopNote_label()}</span
+                        >
+                      {/if}
+                    </div>
+                  {/if}
                 </div>
               </div>
             </div>
@@ -215,7 +421,20 @@
         </div>
 
         <div class="flex items-center gap-1">
-          {#if status === 'model-unavailable' && modelUnavailable && onRetryWithModel}
+          {#if status === 'quota-exceeded' && onRetryWithProvider}
+            {#each quotaRetryProviders as alt (alt.id)}
+              <Button
+                variant="default"
+                size="sm"
+                onclick={() => onRetryWithProvider(alt.id)}
+                data-testid="retry-with-provider"
+                class="type-caption h-7 gap-1.5 px-2"
+              >
+                <Fa icon={faRotateRight} class="size-3" />
+                {m.chat_streamingStatus_retryOnProvider_label({ provider: alt.displayName })}
+              </Button>
+            {/each}
+          {:else if status === 'model-unavailable' && modelUnavailable && onRetryWithModel}
             <Button
               variant="default"
               size="sm"

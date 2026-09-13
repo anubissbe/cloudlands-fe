@@ -14,9 +14,8 @@ const MAX_NAVIGATION_HISTORY = 50;
 type JsonPrimitive = string | number | boolean | null;
 export type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue };
 
-export type WorkspaceNavigationWorkspaceStatus = 'loading' | 'ready' | 'error' | 'creating';
 export type WorkspaceNavigationDrawerType = 'agent' | 'terminal' | 'overview' | null;
-export type WorkspaceNavigationHistoryType =
+type WorkspaceNavigationHistoryType =
   | 'note'
   | 'file'
   | 'diff'
@@ -57,18 +56,18 @@ export type WorkspaceNavigationMainPanelType =
   | 'commit-changeset'
   | 'code-review';
 
-export type WorkspaceNavigationAgentTurn = {
+type WorkspaceNavigationAgentTurn = {
   agentId: string;
   sessionId?: string;
   turnNumber?: number;
 };
 
-export type WorkspaceNavigationCommit = {
+type WorkspaceNavigationCommit = {
   hash: string;
   message?: string;
 };
 
-export interface WorkspaceNavigationHistoryEntry {
+interface WorkspaceNavigationHistoryEntry {
   type: WorkspaceNavigationHistoryType;
   id?: string;
   label?: string;
@@ -130,7 +129,7 @@ export interface WorkspaceNavigationMainPanelState {
   error?: string;
 }
 
-export interface WorkspaceNavigationDrawerState {
+interface WorkspaceNavigationDrawerState {
   open: boolean;
   type: WorkspaceNavigationDrawerType;
   itemId: string | null;
@@ -141,7 +140,7 @@ export interface WorkspaceNavigationNavigationState {
   currentIndex: number;
 }
 
-export interface WorkspaceNavigationUIState {
+interface WorkspaceNavigationUIState {
   hasInitialized: boolean;
   jumpToLine?: number;
 }
@@ -150,7 +149,6 @@ export interface WorkspaceNavigationWorkspaceState {
   version: number;
   workspace: {
     id: string;
-    status: WorkspaceNavigationWorkspaceStatus;
   };
   mainPanel: WorkspaceNavigationMainPanelState;
   drawer: WorkspaceNavigationDrawerState;
@@ -162,11 +160,10 @@ export interface WorkspaceNavigationState {
   byWorkspaceId: Record<string, WorkspaceNavigationWorkspaceState>;
 }
 
-export const emptyWorkspaceNavigationState: WorkspaceNavigationWorkspaceState = {
+const emptyWorkspaceNavigationState: WorkspaceNavigationWorkspaceState = {
   version: STORAGE_VERSION,
   workspace: {
     id: '',
-    status: 'loading',
   },
   mainPanel: {
     type: 'notes',
@@ -186,17 +183,13 @@ export const emptyWorkspaceNavigationState: WorkspaceNavigationWorkspaceState = 
   },
 };
 
-export const initialState: WorkspaceNavigationState = {
+const initialState: WorkspaceNavigationState = {
   byWorkspaceId: {},
 };
 
 const { getWorkspaceState, setWorkspaceState, clearWorkspaceState } = createWorkspaceScopedHelpers(
   emptyWorkspaceNavigationState,
 );
-
-export function workspaceNavigationStorageKey(wsId: string): string {
-  return `workspace:state:${wsId}`;
-}
 
 export function createWorkspaceNavigationState(
   wsId: string,
@@ -206,7 +199,6 @@ export function createWorkspaceNavigationState(
     version: STORAGE_VERSION,
     workspace: {
       id: wsId,
-      status: overrides?.workspace?.status ?? emptyWorkspaceNavigationState.workspace.status,
     },
     mainPanel: {
       ...emptyWorkspaceNavigationState.mainPanel,
@@ -338,10 +330,6 @@ export const hydrateWorkspaceNavigation = createAction<
   [wsId: string, workspaceState: WorkspaceNavigationWorkspaceState]
 >('workspaceNavigation/hydrateWorkspaceNavigation');
 
-export const setWorkspaceNavigationWorkspaceStatus = createAction<
-  [wsId: string, status: WorkspaceNavigationWorkspaceStatus]
->('workspaceNavigation/setWorkspaceNavigationWorkspaceStatus');
-
 export const markWorkspaceNavigationInitialized = createAction<[wsId: string]>(
   'workspaceNavigation/markWorkspaceNavigationInitialized',
 );
@@ -368,7 +356,7 @@ export const openWorkspaceNote = createAction<
     noteId: string,
     options?: {
       openInAdjacentPanel?: boolean;
-      /** @deprecated Adjacent opens now always create a fresh panel. */
+      /** Force a fresh adjacent column even when an equivalent tab is already open elsewhere. */
       openInNewAdjacentPanel?: boolean;
       sourcePanelId?: string;
     },
@@ -406,15 +394,17 @@ export const openWorkspaceDiff = createAction<
       sourcePanelId?: string;
       branchBaseRef?: string;
       branchBaseCommitSha?: string;
+      gitRootId?: string;
+      gitRootPath?: string;
     },
   ]
 >('workspaceNavigation/openWorkspaceDiff');
 
-export const openWorkspaceChangeSet = createAction<[wsId: string]>(
+const openWorkspaceChangeSet = createAction<[wsId: string]>(
   'workspaceNavigation/openWorkspaceChangeSet',
 );
 
-export const openWorkspaceAgentTurnChanges = createAction<
+const openWorkspaceAgentTurnChanges = createAction<
   [wsId: string, turn: WorkspaceNavigationAgentTurn, aggregate?: boolean]
 >('workspaceNavigation/openWorkspaceAgentTurnChanges');
 
@@ -450,9 +440,9 @@ export function chatChangesDedupId(options?: {
   return 'aggregate';
 }
 
-export const openWorkspaceLocalChanges = createAction<[wsId: string]>(
-  'workspaceNavigation/openWorkspaceLocalChanges',
-);
+export const openWorkspaceLocalChanges = createAction<
+  [wsId: string, options?: { gitRootId?: string }]
+>('workspaceNavigation/openWorkspaceLocalChanges');
 
 export const openWorkspaceCommitChangeset = createAction<
   [
@@ -508,25 +498,13 @@ workspaceNavigationReducer.with(
       version: STORAGE_VERSION,
       workspace: {
         id: wsId,
-        status: workspaceState.workspace.status,
       },
     }),
 );
-workspaceNavigationReducer.with(
-  setWorkspaceNavigationWorkspaceStatus,
-  (state, { payload: [wsId, status] }) =>
-    withWorkspaceNavigationState(state, wsId, (workspaceState) =>
-      mergeWorkspaceNavigationState(workspaceState, {
-        workspace: {
-          ...workspaceState.workspace,
-          id: wsId,
-          status,
-        },
-      }),
-    ),
-);
 workspaceNavigationReducer.with(markWorkspaceNavigationInitialized, (state, { payload: [wsId] }) =>
   withWorkspaceNavigationState(state, wsId, (workspaceState) => {
+    if (workspaceState.ui.hasInitialized) return workspaceState;
+
     let nextState = mergeWorkspaceNavigationState(workspaceState, {
       ui: {
         ...workspaceState.ui,

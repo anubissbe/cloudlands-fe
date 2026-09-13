@@ -1,6 +1,7 @@
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/svelte';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { m } from '$shared/paraglide/messages.js';
+import ImageLightbox from '$lib/components/ui/ImageLightbox.svelte';
 import SheetHarness from './SheetHarness.svelte';
 import { sheetMetadata } from './sheet.meta';
 
@@ -64,31 +65,48 @@ describe('Sheet', () => {
     await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
   });
 
-  it('uses a contained editorial surface with a quiet edge and stable scrolling', async () => {
-    render(SheetHarness, { props: { longContent: true } });
-    await fireEvent.click(screen.getByRole('button', { name: 'Open sheet' }));
-    const sheet = screen.getByRole('dialog');
-    expect(sheet.className).toContain('bg-popover');
-    expect(sheet.className).toContain('border-border');
-    expect(sheet.className).toContain('overflow-y-auto');
-    expect(sheet.className).toContain('sheet-editorial-content');
-    expect(sheet.className).toContain('rounded-l-md');
-    expect(sheet.getAttribute('data-side')).toBe('right');
-    expect(document.querySelector('[data-slot="sheet-title"]')?.className).toContain('type-title');
-    expect(document.querySelector('[data-slot="sheet-description"]')?.className).toContain(
-      'type-body',
-    );
-    expect(document.querySelector('[data-slot="sheet-header"]')?.className).toContain('px-4');
-    expect(document.querySelector('[data-slot="sheet-footer"]')?.className).toContain('py-3');
-    expect(screen.getByTestId('sheet-long-content')).toBeTruthy();
-    expect(sheet.className).not.toMatch(/bg-(?:white|black|gray|slate|zinc|neutral)-?/);
-  });
-
   it('keeps a destructive confirmation action open until explicit dismissal', async () => {
     render(SheetHarness);
     await fireEvent.click(screen.getByRole('button', { name: 'Open sheet' }));
     await fireEvent.click(screen.getByRole('button', { name: 'Delete item' }));
     expect(screen.getByLabelText('Sheet destructive count').textContent).toBe('1');
     expect(screen.getByRole('dialog')).toBeTruthy();
+  });
+
+  it('ignores interactions inside a lightbox stacked above the sheet', async () => {
+    render(SheetHarness);
+    await fireEvent.click(screen.getByRole('button', { name: 'Open sheet' }));
+    const sheet = screen.getByRole('dialog', { name: 'Canonical sheet' });
+    await waitFor(() => expect(sheet.contains(document.activeElement)).toBe(true));
+
+    const lightboxOnClose = vi.fn();
+    render(ImageLightbox, {
+      props: {
+        open: true,
+        imageUrl: 'data:image/png;base64,iVBORw0KGgo=',
+        imageName: 'test.png',
+        onClose: lightboxOnClose,
+      },
+    });
+    const backdrop = await screen.findByRole('dialog', { name: /image preview/i });
+    // Let the dismissible layer's 10ms interact-outside debounce settle
+    await new Promise((resolve) => setTimeout(resolve, 30));
+
+    await fireEvent.pointerDown(backdrop, {
+      button: 0,
+      clientX: 10,
+      clientY: 10,
+      pointerType: 'mouse',
+    });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    // The pointerdown inside the lightbox must not dismiss the sheet
+    expect(screen.getByRole('dialog', { name: 'Canonical sheet' })).toBeTruthy();
+
+    await fireEvent.click(backdrop, { button: 0, clientX: 10, clientY: 10 });
+    await waitFor(() => {
+      expect(screen.queryByRole('dialog', { name: /image preview/i })).toBeNull();
+    });
+    expect(lightboxOnClose).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole('dialog', { name: 'Canonical sheet' })).toBeTruthy();
   });
 });

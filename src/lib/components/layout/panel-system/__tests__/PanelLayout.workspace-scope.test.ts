@@ -27,7 +27,6 @@ vi.mock('$store/renderer/slices/panel-layout/panel-layout-selectors', () => ({
   selectFocusedPanel: readableSelector(null),
   selectActiveTab: readableSelector(null),
   selectAllTabs: readableSelector([]),
-  selectPanelColumnCount: readableSelector(0),
   selectPanelColumnDefaultWidthTiers: readableSelector([]),
   selectPanelCanvasWidth: readableSelector(null),
   selectPanelCanvasWidthSource: readableSelector(null),
@@ -35,9 +34,6 @@ vi.mock('$store/renderer/slices/panel-layout/panel-layout-selectors', () => ({
   selectPendingPanelReveal: readableSelector(null),
   selectRestoreStatus: readableSelector('pending'),
   selectRecentlyClosed: readableSelector([]),
-}));
-vi.mock('$store/renderer/slices/terminals/terminals-selectors', () => ({
-  selectIsTerminalOverlayOpen: readableSelector(true),
 }));
 vi.mock('$store/renderer/slices/ui-layout/ui-layout-selectors', () => ({
   selectIsCollapsed: readableSelector(false),
@@ -56,7 +52,6 @@ vi.mock('$store/renderer/slices/tab-state/tab-state-selectors', () => ({
 
 vi.mock('$store/renderer/slices/terminals/terminals-slice', () => ({
   removeTerminal: vi.fn(),
-  terminalCreated: vi.fn(),
 }));
 
 const layoutManager = {
@@ -104,10 +99,6 @@ vi.mock('$lib/client', () => ({ appClient: { terminals: { create: vi.fn() } } })
 vi.mock('../PanelContainer.svelte', async () => ({
   default: (await import('../../../workspace/sidebar/__tests__/mocks/MockSimple.svelte')).default,
 }));
-vi.mock('../HandleDropOverlay.svelte', async () => ({
-  default: (await import('../../../workspace/sidebar/__tests__/mocks/MockSimple.svelte')).default,
-}));
-
 import PanelLayout from '../PanelLayout.svelte';
 
 describe('PanelLayout workspace-scoped layout lifecycle', () => {
@@ -139,21 +130,6 @@ describe('PanelLayout workspace-scoped layout lifecycle', () => {
     );
     expect(dispatchMock).not.toHaveBeenCalledWith(
       expect.objectContaining({ payload: ['ws-redux-b'] }),
-    );
-  });
-
-  it('only renders the handle drop overlay while the layout is active', async () => {
-    const { container, rerender } = render(PanelLayout, {
-      props: { workspaceId: 'ws-component-a', active: false },
-    });
-    const inactiveMockCount = container.querySelectorAll('[data-testid="mock-component"]').length;
-
-    await rerender({ workspaceId: 'ws-component-a', active: true });
-
-    await waitFor(() =>
-      expect(container.querySelectorAll('[data-testid="mock-component"]')).toHaveLength(
-        inactiveMockCount + 1,
-      ),
     );
   });
 });

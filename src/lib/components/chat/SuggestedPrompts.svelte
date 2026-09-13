@@ -74,12 +74,15 @@
         <div
           role="button"
           tabindex="0"
-          class="{OPERATIONAL_ROW_GEOMETRY_TOKENS_CLASS} {OPERATIONAL_ROW_TONE_CLASS} group flex cursor-pointer items-center gap-[var(--operational-leading-gap)] rounded-sm border border-transparent bg-transparent px-1.5 py-0.5 text-left hover:bg-muted/30 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
+          class="{OPERATIONAL_ROW_GEOMETRY_TOKENS_CLASS} {OPERATIONAL_ROW_TONE_CLASS} group flex cursor-pointer items-center gap-[var(--operational-leading-gap)] rounded-sm border border-transparent bg-transparent px-1.5 py-0.5 text-left transition-colors hover:text-foreground focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
           data-typography-role="body"
           onclick={() => handleClick(prompt)}
           onkeydown={(e) => handleKeyDown(e, prompt)}
         >
-          <span class={CHAT_OPERATIONAL_LEADING_CLASS} data-suggested-prompt-icon>
+          <span
+            class="{CHAT_OPERATIONAL_LEADING_CLASS} mt-px self-start"
+            data-suggested-prompt-icon
+          >
             <Fa icon={faArrowRight} size={16} class={CHAT_OPERATIONAL_ICON_CLASS} />
           </span>
           <span class="min-w-0 flex-1 text-pretty" data-suggested-prompt-label>{prompt}</span>

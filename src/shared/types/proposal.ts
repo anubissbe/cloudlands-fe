@@ -41,7 +41,11 @@ export interface BulkProposalItem {
 
 export type WorkspaceCreateRepoType = 'local' | 'github' | 'remote';
 
+type WorkspaceCreateProposalMode = 'sibling';
+
 export interface WorkspaceCreateProposalFields {
+  mode?: WorkspaceCreateProposalMode;
+  title?: string;
   initialPrompt?: string;
   repoPath?: string;
   repoType?: WorkspaceCreateRepoType;
@@ -74,7 +78,7 @@ interface BaseProposal<K extends ProposalKind, P extends Record<string, unknown>
   applyToolCallId?: string;
 }
 
-export type SettingsProposalChange = AppSettingChange & { apply?: AppSettingApplyPlan };
+type SettingsProposalChange = AppSettingChange & { apply?: AppSettingApplyPlan };
 
 export type SettingsChangeProposal = BaseProposal<
   'settings-change',
@@ -86,7 +90,7 @@ export type WorkspaceCreateProposal = BaseProposal<
   { operation: 'workspace.create'; params?: Record<string, unknown> }
 >;
 
-export type SpecialistProposalOperation = 'create' | 'edit' | 'delete';
+type SpecialistProposalOperation = 'create' | 'edit' | 'delete';
 
 export type SpecialistEditProposal = BaseProposal<
   'specialist-edit',
@@ -114,10 +118,7 @@ export type BulkOperationProposal = BaseProposal<
 >;
 
 export type Proposal =
-  | WorkspaceCreateProposal
-  | SettingsChangeProposal
-  | SpecialistEditProposal
-  | BulkOperationProposal;
+  WorkspaceCreateProposal | SettingsChangeProposal | SpecialistEditProposal | BulkOperationProposal;
 
 export interface ProposalActionDetail {
   proposal: Proposal;

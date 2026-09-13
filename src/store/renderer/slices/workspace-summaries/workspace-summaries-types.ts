@@ -1,4 +1,4 @@
-import type { WorkspaceDiffSummary, WorkspaceGitSummary } from "$shared/types";
+import type { WorkspaceDiffSummary, WorkspaceGitSummary } from '$shared/types';
 
 /** Per-workspace on-demand diff/git summary state. */
 export interface WorkspaceSummariesWorkspaceState {
@@ -6,8 +6,6 @@ export interface WorkspaceSummariesWorkspaceState {
   diffSummary: WorkspaceDiffSummary | null;
   /** Latest git summary fetched from WORKSPACE_CHANNELS.GET_GIT_SUMMARY (null when unavailable). */
   gitSummary: WorkspaceGitSummary | null;
-  loading: boolean;
-  error: string | null;
   /** True once summaries have been loaded at least once for this workspace. */
   initialized: boolean;
 }
@@ -16,4 +14,3 @@ export interface WorkspaceSummariesWorkspaceState {
 export interface WorkspaceSummariesState {
   byWorkspaceId: Record<string, WorkspaceSummariesWorkspaceState>;
 }
-

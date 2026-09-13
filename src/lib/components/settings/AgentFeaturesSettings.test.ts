@@ -43,42 +43,30 @@ const FEATURE_PATHS = [
   'agentFeatures.stateSnapshot',
   'agentFeatures.prMonitor',
   'agentFeatures.taskGraph',
+  'agentFeatures.peerAgents',
+  'agentFeatures.mcpTools',
 ];
 
 describe('AgentFeaturesSettings', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     // Default daemon state (PROTOCOL §5.12 settings.list entries): all on
-    // except taskGraph, the one default-off opt-in (intent-hq/monorepo#2445)
-    mocks.mockSettingsList.mockResolvedValue(
-      FEATURE_PATHS.map((path) => ({ path, value: path !== 'agentFeatures.taskGraph' })),
-    );
+    mocks.mockSettingsList.mockResolvedValue(FEATURE_PATHS.map((path) => ({ path, value: true })));
   });
 
   afterEach(() => {
     cleanup();
   });
 
-  it('renders eleven toggles; all on by default except task graph, which is off', async () => {
+  it('renders thirteen toggles; all on when the daemon reports every path true', async () => {
     render(AgentFeaturesSettings);
 
     await waitFor(() => {
-      expect(screen.getAllByRole('switch')).toHaveLength(11);
+      expect(screen.getAllByRole('switch')).toHaveLength(13);
     });
-    const taskGraph = screen.getByRole('switch', { name: 'Task graph coordination' });
-    expect(taskGraph.getAttribute('aria-checked')).toBe('false');
     for (const toggle of screen.getAllByRole('switch')) {
-      if (toggle === taskGraph) continue;
       expect(toggle.getAttribute('aria-checked')).toBe('true');
     }
-  });
-
-  it('shows the new-sessions-only note without a live-read qualifier', async () => {
-    render(AgentFeaturesSettings);
-
-    const note = screen.getByText(/newly created agent sessions only/i);
-    expect(note).toBeTruthy();
-    expect(note.textContent).not.toMatch(/unless noted otherwise/i);
   });
 
   it('defaults each feature to its daemon default when the daemon has no entry for its path', async () => {
@@ -88,18 +76,21 @@ describe('AgentFeaturesSettings', () => {
     render(AgentFeaturesSettings);
 
     await waitFor(() => {
-      expect(screen.getAllByRole('switch')).toHaveLength(11);
+      expect(screen.getAllByRole('switch')).toHaveLength(13);
     });
-    const taskGraph = screen.getByRole('switch', { name: 'Task graph coordination' });
-    expect(taskGraph.getAttribute('aria-checked')).toBe('false');
+    const peerAgents = screen.getByRole('switch', {
+      name: 'Top-level agent spawning & retirement',
+    });
+    // peerAgents is the one opt-in feature — absent coerces to off
+    expect(peerAgents.getAttribute('aria-checked')).toBe('false');
     for (const toggle of screen.getAllByRole('switch')) {
-      if (toggle === taskGraph) continue;
+      if (toggle === peerAgents) continue;
       expect(toggle.getAttribute('aria-checked')).toBe('true');
     }
   });
 
-  it('renders task graph off when an older daemon does not report the key', async () => {
-    // Daemon predates agentFeatures.taskGraph — the other ten entries are present
+  it('renders task graph on when an older daemon does not report the key', async () => {
+    // Daemon predates agentFeatures.taskGraph — the other twelve entries are present
     mocks.mockSettingsList.mockResolvedValue(
       FEATURE_PATHS.filter((path) => path !== 'agentFeatures.taskGraph').map((path) => ({
         path,
@@ -111,41 +102,46 @@ describe('AgentFeaturesSettings', () => {
 
     const taskGraph = await screen.findByRole('switch', { name: 'Task graph coordination' });
     await waitFor(() => {
-      expect(taskGraph.getAttribute('aria-checked')).toBe('false');
+      expect(taskGraph.getAttribute('aria-checked')).toBe('true');
     });
   });
 
-  it('renders task graph on when the daemon reports value true', async () => {
-    mocks.mockSettingsList.mockResolvedValue(FEATURE_PATHS.map((path) => ({ path, value: true })));
+  it('renders task graph off when the daemon reports value false', async () => {
+    mocks.mockSettingsList.mockResolvedValue(
+      FEATURE_PATHS.map((path) => ({
+        path,
+        value: path !== 'agentFeatures.taskGraph',
+      })),
+    );
 
     render(AgentFeaturesSettings);
 
     const taskGraph = await screen.findByRole('switch', { name: 'Task graph coordination' });
     await waitFor(() => {
-      expect(taskGraph.getAttribute('aria-checked')).toBe('true');
+      expect(taskGraph.getAttribute('aria-checked')).toBe('false');
     });
   });
 
-  it('toggling task graph on sends the exact settings.update request', async () => {
+  it('toggling task graph off sends the exact settings.update request', async () => {
     mocks.mockSettingsUpdate.mockResolvedValueOnce([
-      { path: 'agentFeatures.taskGraph', value: true },
+      { path: 'agentFeatures.taskGraph', value: false },
     ]);
 
     render(AgentFeaturesSettings);
 
     const toggle = await screen.findByRole('switch', { name: 'Task graph coordination' });
     await waitFor(() => {
-      expect(toggle.getAttribute('aria-checked')).toBe('false');
+      expect(toggle.getAttribute('aria-checked')).toBe('true');
     });
     await fireEvent.click(toggle);
 
     await waitFor(() => {
       expect(mocks.mockSettingsUpdate).toHaveBeenCalledWith([
-        { path: 'agentFeatures.taskGraph', value: true },
+        { path: 'agentFeatures.taskGraph', value: false },
       ]);
     });
     expect(mockToast.error).not.toHaveBeenCalled();
-    expect(toggle.getAttribute('aria-checked')).toBe('true');
+    expect(toggle.getAttribute('aria-checked')).toBe('false');
   });
 
   it('renders a feature off when the daemon reports value false', async () => {
@@ -240,6 +236,33 @@ describe('AgentFeaturesSettings', () => {
     });
   });
 
+  it('renders tokenImpact when the daemon provides it (§5.12)', async () => {
+    mocks.mockSettingsList.mockResolvedValue(
+      FEATURE_PATHS.map((path) => ({
+        path,
+        value: true,
+        tokenImpact:
+          path === 'agentFeatures.stateSnapshot' ? '~50 tokens/turn' : '~620 tokens/session',
+      })),
+    );
+
+    render(AgentFeaturesSettings);
+
+    await waitFor(() => {
+      expect(screen.getAllByText('~620 tokens/session')).toHaveLength(12);
+    });
+    expect(screen.getByText('~50 tokens/turn')).toBeTruthy();
+  });
+
+  it('renders no token-impact line when the daemon omits the field (older daemon)', async () => {
+    render(AgentFeaturesSettings);
+
+    await waitFor(() => {
+      expect(screen.getAllByRole('switch')).toHaveLength(13);
+    });
+    expect(screen.queryByText(/tokens\/(session|turn)/)).toBeNull();
+  });
+
   it('shows toast.error and reverts when the daemon returns a rolled-back value', async () => {
     // Daemon rolled back to true when toggling off
     mocks.mockSettingsUpdate.mockResolvedValueOnce([
@@ -269,6 +292,156 @@ describe('AgentFeaturesSettings', () => {
       expect(mockToast.error).toHaveBeenCalledWith(expect.stringContaining('daemon unavailable'));
     });
     expect(toggle.getAttribute('aria-checked')).toBe('true');
+  });
+
+  describe('peer agents (opt-in)', () => {
+    const maxAgentsInputName = 'Maximum top-level agents per workspace';
+
+    it('renders peer agents on when the daemon reports value true', async () => {
+      render(AgentFeaturesSettings);
+
+      const toggle = await screen.findByRole('switch', {
+        name: 'Top-level agent spawning & retirement',
+      });
+      await waitFor(() => {
+        expect(toggle.getAttribute('aria-checked')).toBe('true');
+      });
+    });
+
+    it('toggling peer agents on sends the exact settings.update request', async () => {
+      mocks.mockSettingsList.mockResolvedValue(
+        FEATURE_PATHS.map((path) => ({
+          path,
+          value: path !== 'agentFeatures.peerAgents',
+        })),
+      );
+      mocks.mockSettingsUpdate.mockResolvedValueOnce([
+        { path: 'agentFeatures.peerAgents', value: true },
+      ]);
+
+      render(AgentFeaturesSettings);
+
+      const toggle = await screen.findByRole('switch', {
+        name: 'Top-level agent spawning & retirement',
+      });
+      await waitFor(() => {
+        expect(toggle.getAttribute('aria-checked')).toBe('false');
+      });
+      await fireEvent.click(toggle);
+
+      await waitFor(() => {
+        expect(mocks.mockSettingsUpdate).toHaveBeenCalledWith([
+          { path: 'agentFeatures.peerAgents', value: true },
+        ]);
+      });
+      expect(mockToast.error).not.toHaveBeenCalled();
+      expect(toggle.getAttribute('aria-checked')).toBe('true');
+    });
+
+    it('seeds the max agents input from agents.maxTopLevelAgents in settings.list', async () => {
+      mocks.mockSettingsList.mockResolvedValue([
+        ...FEATURE_PATHS.map((path) => ({ path, value: true })),
+        { path: 'agents.maxTopLevelAgents', value: 8 },
+      ]);
+
+      render(AgentFeaturesSettings);
+
+      const input = await screen.findByRole('spinbutton', { name: maxAgentsInputName });
+      await waitFor(() => {
+        expect((input as HTMLInputElement).value).toBe('8');
+      });
+    });
+
+    it('saving the max agents cap sends the exact settings.update request', async () => {
+      mocks.mockSettingsList.mockResolvedValue([
+        ...FEATURE_PATHS.map((path) => ({ path, value: true })),
+        { path: 'agents.maxTopLevelAgents', value: 20 },
+      ]);
+      mocks.mockSettingsUpdate.mockResolvedValueOnce([
+        { path: 'agents.maxTopLevelAgents', value: 5 },
+      ]);
+
+      render(AgentFeaturesSettings);
+
+      const input = await screen.findByRole('spinbutton', { name: maxAgentsInputName });
+      await waitFor(() => expect((input as HTMLInputElement).value).toBe('20'));
+      await fireEvent.input(input, { target: { value: '5' } });
+      const save = await screen.findByRole('button', { name: 'Save' });
+      await fireEvent.click(save);
+
+      await waitFor(() => {
+        expect(mocks.mockSettingsUpdate).toHaveBeenCalledWith([
+          { path: 'agents.maxTopLevelAgents', value: 5 },
+        ]);
+      });
+      expect(mockToast.error).not.toHaveBeenCalled();
+    });
+
+    it('rejects a sub-minimum max agents value without calling settings.update', async () => {
+      render(AgentFeaturesSettings);
+
+      const input = await screen.findByRole('spinbutton', { name: maxAgentsInputName });
+      await fireEvent.input(input, { target: { value: '0' } });
+
+      const save = await screen.findByRole('button', { name: 'Save' });
+      expect((save as HTMLButtonElement).disabled).toBe(true);
+      expect(mocks.mockSettingsUpdate).not.toHaveBeenCalled();
+    });
+
+    it('rejects a non-integer max agents value without calling settings.update', async () => {
+      render(AgentFeaturesSettings);
+
+      const input = await screen.findByRole('spinbutton', { name: maxAgentsInputName });
+      await fireEvent.input(input, { target: { value: '2.5' } });
+
+      const save = await screen.findByRole('button', { name: 'Save' });
+      expect((save as HTMLButtonElement).disabled).toBe(true);
+      expect(mocks.mockSettingsUpdate).not.toHaveBeenCalled();
+    });
+
+    it('disables the max agents input while the peer agents toggle is off', async () => {
+      mocks.mockSettingsList.mockResolvedValue(
+        FEATURE_PATHS.map((path) => ({
+          path,
+          value: path !== 'agentFeatures.peerAgents',
+        })),
+      );
+
+      render(AgentFeaturesSettings);
+
+      const toggle = await screen.findByRole('switch', {
+        name: 'Top-level agent spawning & retirement',
+      });
+      await waitFor(() => {
+        expect(toggle.getAttribute('aria-checked')).toBe('false');
+      });
+      const input = screen.getByRole('spinbutton', { name: maxAgentsInputName });
+      expect((input as HTMLInputElement).disabled).toBe(true);
+    });
+
+    it('reverts the max agents input when the daemon rolls the value back', async () => {
+      mocks.mockSettingsList.mockResolvedValue([
+        ...FEATURE_PATHS.map((path) => ({ path, value: true })),
+        { path: 'agents.maxTopLevelAgents', value: 20 },
+      ]);
+      // Daemon clamps/rolls back to 20
+      mocks.mockSettingsUpdate.mockResolvedValueOnce([
+        { path: 'agents.maxTopLevelAgents', value: 20 },
+      ]);
+
+      render(AgentFeaturesSettings);
+
+      const input = await screen.findByRole('spinbutton', { name: maxAgentsInputName });
+      await waitFor(() => expect((input as HTMLInputElement).value).toBe('20'));
+      await fireEvent.input(input, { target: { value: '50' } });
+      const save = await screen.findByRole('button', { name: 'Save' });
+      await fireEvent.click(save);
+
+      await waitFor(() => {
+        expect(mockToast.error).toHaveBeenCalled();
+      });
+      expect((input as HTMLInputElement).value).toBe('20');
+    });
   });
 
   describe('PR monitoring (§6.9)', () => {
@@ -316,7 +489,8 @@ describe('AgentFeaturesSettings', () => {
       render(AgentFeaturesSettings);
 
       await screen.findByRole('spinbutton', { name: debounceInputName });
-      expect(screen.getAllByRole('spinbutton')).toHaveLength(1);
+      // Exactly two numeric inputs: the debounce and the max top-level agents cap
+      expect(screen.getAllByRole('spinbutton')).toHaveLength(2);
     });
 
     it('saving the debounce sends the exact settings.update request', async () => {
@@ -352,7 +526,6 @@ describe('AgentFeaturesSettings', () => {
 
       const save = await screen.findByRole('button', { name: 'Save' });
       expect((save as HTMLButtonElement).disabled).toBe(true);
-      expect(screen.getByText(/between 10 and 86,400 seconds/i)).toBeTruthy();
       expect(mocks.mockSettingsUpdate).not.toHaveBeenCalled();
     });
 

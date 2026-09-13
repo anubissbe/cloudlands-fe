@@ -80,7 +80,8 @@
   <div>
     <AgentAvatarWithState
       agentId={node.agentId}
-      size={node.isCoordinator ? 32 : 24}
+      variant="emphasized"
+      size={node.isCoordinator ? 32 : undefined}
       {state}
       specialist={specialist as BuiltinSpecialistId | null}
     />
@@ -94,7 +95,7 @@
         date={$attentionRequest$.timestamp}
         compact
         class="text-ui leading-none {$attentionRequest$.kind === 'blocker'
-          ? 'text-destructive'
+          ? 'text-danger'
           : 'text-warning'}"
       />
     {/if}

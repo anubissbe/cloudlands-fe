@@ -18,7 +18,6 @@
   import SidebarContextMenu from '$lib/components/ui/sidebar-context-menu/SidebarContextMenu.svelte';
   import type { SidebarMenuEntry } from '$lib/components/ui/sidebar-context-menu/types';
   import { m } from '$shared/paraglide/messages.js';
-  import OpenPanelIndicator from './OpenPanelIndicator.svelte';
   import ResourceIconTile from '$lib/components/shared/ResourceIconTile.svelte';
 
   interface Props {
@@ -29,7 +28,6 @@
     onClick?: (item: ContextItem) => void;
     onExternalOpen?: (item: ContextItem) => void;
     onDelete?: (item: ContextItem) => void;
-    openPanelCount?: number;
   }
 
   let {
@@ -40,7 +38,6 @@
     onClick,
     onExternalOpen,
     onDelete,
-    openPanelCount = 0,
   }: Props = $props();
 
   // Display text based on item type
@@ -151,7 +148,7 @@
          {isSelected
     ? 'bg-primary/10 text-primary border-transparent'
     : isActive
-      ? 'bg-background text-foreground border-border shadow-xs'
+      ? 'bg-background text-foreground border-transparent'
       : 'bg-sidebar border-transparent'}"
   onclick={handleClick}
   oncontextmenu={handleContextMenu}
@@ -187,8 +184,6 @@
     {/if}
   </div>
 
-  <OpenPanelIndicator count={openPanelCount} active={isActive} />
-
   <!-- Action buttons -->
   <div
     class="absolute right-0 bg-inherit px-1 flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity"
@@ -208,10 +203,10 @@
       <Tooltip content="Remove from context" side="top" delayDuration={300}>
         <button
           type="button"
-          class="p-1 rounded hover:bg-destructive/10 transition-colors cursor-pointer"
+          class="p-1 rounded hover:bg-danger-background/10 transition-colors cursor-pointer"
           onclick={handleDeleteClick}
         >
-          <Fa icon={faTrash} size="xs" class="text-ghost hover:text-error-foreground" />
+          <Fa icon={faTrash} size="xs" class="text-ghost hover:text-danger" />
         </button>
       </Tooltip>
     {/if} -->

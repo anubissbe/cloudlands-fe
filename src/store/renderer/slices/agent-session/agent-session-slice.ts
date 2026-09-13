@@ -1,5 +1,5 @@
 import { deepEqual, shallowEqual } from 'fast-equals';
-import type { AgentSession, AgentMessage, SessionStats } from '$shared/types';
+import type { AgentMetadata, AgentSession, AgentMessage, SessionStats } from '$shared/types';
 import { AgentStatus } from '$shared/types/agent.types';
 import type { CanonicalAgentStatusFields, WorkspaceEvent } from '$features/events/types';
 import { createAction, createAsyncAction } from '@augmentcode/themis/utils/store/create-action';
@@ -31,6 +31,7 @@ import {
   chatReset,
   chatStreamingReconciled,
   chatInitialized,
+  chatTranscriptSnapshotApplied,
   streamCompleted,
   streamTimedOut,
 } from '../chat-state/chat-state-slice';
@@ -47,13 +48,15 @@ export {
 
 /**
  * Single authoritative transcript cap: the store prunes each agent's messages
- * to the newest 500, and the transcript pagers (chat-read-service,
+ * to the newest 200, and the transcript pagers (chat-read-service,
  * chat-read-saga's older-history fetch) deliberately stop fetching at the same
  * bound — pages past it would only be sliced off by the prune
- * (intent-hq/monorepo#2627). Keep pager bound and prune cap coupled by
- * importing this constant rather than mirroring the value.
+ * (intent-hq/monorepo#2627). Kept small so a long ACTIVE conversation stays
+ * memory-bounded in the renderer — evicted older rows are re-fetched on
+ * demand by the scroll-to-load history segment. Keep pager bound and prune
+ * cap coupled by importing this constant rather than mirroring the value.
  */
-export const MAX_MESSAGES_PER_AGENT = 500;
+export const MAX_MESSAGES_PER_AGENT = 200;
 /** Cap for the on-demand scrollback history segment (rows older than the tail). */
 export const HISTORY_SEGMENT_MAX = 500;
 const USER_REPLY_ORDER_WINDOW_MS = 1_000;
@@ -135,11 +138,30 @@ function repairNearSimultaneousOrphanAssistantOrdering(messages: AgentMessage[])
 }
 
 /**
- * Stable sort by timestamp ascending, then repair the close event-ordering case
- * where a subsequent assistant reply sorts immediately above its user reply.
+ * Order the transcript by the daemon's per-agent monotonic `seq` (PROTOCOL
+ * §5.5) when any row carries one: seq-bearing rows sort ascending by seq;
+ * rows WITHOUT a seq (optimistic user rows pre-echo, in-flight assistant
+ * messages before the terminal frame) sort AFTER all seq-bearing rows,
+ * preserving their local insertion order among themselves. `seq` lives in a
+ * single clock domain (the daemon's), so this ordering is immune to
+ * daemon/renderer clock skew — the idle-send transient inversion where a
+ * skewed-ahead daemon timestamp on the user-row echo sorted the
+ * renderer-clock in-flight assistant message above it cannot occur.
+ *
+ * Old-daemon compatibility: when NO row carries a seq (daemons predating the
+ * per-message `seq` wire field, or purely-local transcripts), fall back to
+ * the previous stable timestamp-ascending sort plus the near-simultaneous
+ * orphan-assistant repair.
  */
 function orderMessagesForConversation(messages: AgentMessage[]): AgentMessage[] {
   if (messages.length <= 1) return messages;
+  if (messages.some((m) => typeof m.seq === 'number')) {
+    const withSeq = messages
+      .filter((m) => typeof m.seq === 'number')
+      .sort((a, b) => (a.seq as number) - (b.seq as number));
+    const withoutSeq = messages.filter((m) => typeof m.seq !== 'number');
+    return [...withSeq, ...withoutSeq];
+  }
   const sorted = [...messages].sort((a, b) => {
     const tsA =
       typeof a.timestamp === 'string' ? a.timestamp : (a.timestamp?.toISOString?.() ?? '');
@@ -341,6 +363,53 @@ function setSession(
   };
 }
 
+/**
+ * Count how many of the rows a tail cap prune dropped were resident in the
+ * PREVIOUS tail. Distinguishes genuine live growth past the cap (dropped
+ * rows were tail-resident and are now lost client-side) from a
+ * prepend-shaped replacement whose added older rows are sliced right back
+ * off (those were never in the tail and are still hydrated elsewhere).
+ */
+function countDroppedResidentTailRows(
+  previous: AgentMessage[],
+  ordered: AgentMessage[],
+  pruned: AgentMessage[],
+): number {
+  const droppedCount = ordered.length - pruned.length;
+  if (droppedCount === 0 || previous.length === 0) return 0;
+  const previousIds = new Set(previous.map((message) => message.id));
+  let count = 0;
+  for (let i = 0; i < droppedCount; i++) {
+    if (previousIds.has(ordered[i].id)) count++;
+  }
+  return count;
+}
+
+/**
+ * History-segment bookkeeping for rows the live tail's
+ * `MAX_MESSAGES_PER_AGENT` prune dropped: the dropped rows now sit between
+ * history's newest row and the tail's oldest retained row, so a contiguous
+ * segment is severed (the gap opens) and serial-walk segments count the
+ * dropped rows into the hole estimate so the virtual extent attributes them
+ * to the hole. The per-session `tailCapPruned` latch is set by the caller
+ * alongside the pruned messages array.
+ */
+function accountTailCapPrune(
+  state: AgentSessionState,
+  agentId: string,
+  dropped: number,
+): AgentSessionState {
+  const segment = getHistorySegment(state, agentId);
+  if (!segment || segment.messages.length === 0) return state;
+  return setHistorySegment(state, agentId, {
+    ...segment,
+    gapToTail: true,
+    ...(segment.startOrdinalEstimate === undefined
+      ? { holeRowsEstimate: (segment.holeRowsEstimate ?? 0) + dropped }
+      : {}),
+  });
+}
+
 function addMessageToSession(
   state: AgentSessionState,
   agentId: string,
@@ -351,11 +420,16 @@ function addMessageToSession(
   const currentList = session.messages;
   const insertedMessages = insertAgentMessageWithDedup(currentList, message);
   if (insertedMessages === currentList) return state;
-  const nextMessages = pruneMessages(orderMessagesForConversation(insertedMessages));
-  return setSession(state, agentId, {
+  const ordered = orderMessagesForConversation(insertedMessages);
+  const nextMessages = pruneMessages(ordered);
+  const droppedResident = countDroppedResidentTailRows(currentList, ordered, nextMessages);
+  let next = setSession(state, agentId, {
     ...session,
     messages: nextMessages,
+    ...(droppedResident > 0 ? { tailCapPruned: true } : {}),
   });
+  if (droppedResident > 0) next = accountTailCapPrune(next, agentId, droppedResident);
+  return next;
 }
 
 function replaceSessionMessageById(
@@ -612,6 +686,41 @@ function canonicalFieldsFromWorkspaceEvent(event: {
   return null;
 }
 
+/**
+ * `agent:updated` question-marker projection (PROTOCOL §6.5 "Pending-question
+ * `agent:updated` payloads"): a committed marker mutation carries the mutated
+ * value in `event.data` — a set is the message id, a clear is a WRITTEN empty
+ * string, and a legacy marker-less session omits the field. Mirror exactly the
+ * string fields present so the store reflects the marker in the same
+ * synchronous step the event is applied (the follow-up `agent.get` refresh is
+ * async and can land after a later `agent:queue:updated` shrink, which would
+ * otherwise reopen a just-answered question set for one event interval).
+ * Omitted / non-string fields are left untouched — never fabricated.
+ */
+type PendingQuestionMarkerFields = Partial<
+  Pick<AgentMetadata, 'pendingQuestionsMessageId' | 'dismissedQuestionsMessageId'>
+>;
+
+export function pendingQuestionMarkersFromWorkspaceEvent(event: {
+  type?: string;
+  data?: any;
+}): [string, PendingQuestionMarkerFields] | null {
+  if (event.type !== 'agent:updated') return null;
+  const data = event.data;
+  if (!data || typeof data !== 'object') return null;
+  const agentId = data.agentId;
+  if (typeof agentId !== 'string' || agentId.length === 0) return null;
+  const fields: PendingQuestionMarkerFields = {};
+  if (typeof data.pendingQuestionsMessageId === 'string') {
+    fields.pendingQuestionsMessageId = data.pendingQuestionsMessageId;
+  }
+  if (typeof data.dismissedQuestionsMessageId === 'string') {
+    fields.dismissedQuestionsMessageId = data.dismissedQuestionsMessageId;
+  }
+  if (Object.keys(fields).length === 0) return null;
+  return [agentId, fields];
+}
+
 function userMessageFromWorkspaceEvent(event: WorkspaceEvent): [string, AgentMessage] | null {
   if (event.type !== 'agent:user-message:sent') return null;
   const data = event.data;
@@ -719,6 +828,7 @@ type SessionComparisonSnapshot = Pick<
   | 'sessionCorrupted'
 > & {
   messageCount: number;
+  wireMessageCount: number | undefined;
   lastMessageId: AgentMessage['id'] | undefined;
   wireLastMessageId: string | undefined;
   lastMessageBlockCount: number;
@@ -729,6 +839,7 @@ type SessionComparisonSnapshot = Pick<
   completionReport: string | undefined;
   taskNoteId: string | undefined;
   dismissedQuestionsMessageId: string | undefined;
+  pendingQuestionsMessageId: string | undefined;
   lastSeenMessageId: string | undefined;
   sandboxId: string | undefined;
   sandboxPath: string | undefined;
@@ -737,6 +848,7 @@ type SessionComparisonSnapshot = Pick<
   turnInFlight: boolean | undefined;
   liveTurnOpen: boolean | undefined;
   liveTurnOpenedAt: string | undefined;
+  tailCapPruned: boolean | undefined;
   harnessVersion: string | undefined;
   harnessFeaturesKey: string | undefined;
 };
@@ -787,6 +899,10 @@ function toSessionComparisonSnapshot(session: StoredAgentSession): SessionCompar
       typeof metadata?.dismissedQuestionsMessageId === 'string'
         ? metadata.dismissedQuestionsMessageId
         : undefined,
+    pendingQuestionsMessageId:
+      typeof metadata?.pendingQuestionsMessageId === 'string'
+        ? metadata.pendingQuestionsMessageId
+        : undefined,
     lastSeenMessageId:
       typeof metadata?.lastSeenMessageId === 'string' ? metadata.lastSeenMessageId : undefined,
     sandboxId: typeof metadata?.sandboxId === 'string' ? metadata.sandboxId : undefined,
@@ -799,6 +915,7 @@ function toSessionComparisonSnapshot(session: StoredAgentSession): SessionCompar
     liveTurnOpen: session.liveTurnOpen === true ? true : undefined,
     liveTurnOpenedAt:
       typeof session.liveTurnOpenedAt === 'string' ? session.liveTurnOpenedAt : undefined,
+    tailCapPruned: session.tailCapPruned === true ? true : undefined,
     // Harness stamp (§5.5, additive): normally immutable, but a daemon
     // upgrade backfills harnessVersion on legacy rows and first activation
     // materializes harnessFeatures — those upserts must not be swallowed
@@ -811,6 +928,7 @@ function toSessionComparisonSnapshot(session: StoredAgentSession): SessionCompar
           .join(',')
       : undefined,
     messageCount: messages.length,
+    wireMessageCount: typeof session.messageCount === 'number' ? session.messageCount : undefined,
     lastMessageId: messages.length === 0 ? undefined : messages[messages.length - 1]?.id,
     // The daemon can append trailing blocks to an already-stored message
     // (e.g. the §7.1 lifted proposal-resource block the live accumulator
@@ -823,9 +941,9 @@ function toSessionComparisonSnapshot(session: StoredAgentSession): SessionCompar
 
 /**
  * Shallow equivalence check for upsertSession no-op guard.
- * Compares key scalar fields and message count / last message ID / last
- * message content-block count to avoid creating new state references when
- * nothing changed.
+ * Compares key scalar fields, wire message signals, and loaded transcript
+ * count / last message ID / last message content-block count to avoid creating
+ * new state references when nothing changed.
  */
 function isSessionEquivalent(a: StoredAgentSession, b: StoredAgentSession): boolean {
   return shallowEqual(toSessionComparisonSnapshot(a), toSessionComparisonSnapshot(b));
@@ -845,6 +963,17 @@ function applySessionUpsert(
   const agentId = String(finalSession.id);
   const wsId = String(session.workspaceId);
   const existing = getSession(state, agentId);
+
+  // The latch is FE-owned: wire sessions never carry it, so an upsert must
+  // not clear it. An incoming snapshot itself overflowing the cap also
+  // latches (its overflow rows were just dropped client-side). No hole
+  // accounting here — a re-delivered snapshot must not double-count.
+  if (
+    existing?.tailCapPruned === true ||
+    (session.messages?.length ?? 0) > MAX_MESSAGES_PER_AGENT
+  ) {
+    finalSession.tailCapPruned = true;
+  }
 
   if (existing) {
     // When a turn is actively in flight (both runtime flags set, e.g. right
@@ -1042,16 +1171,13 @@ export const replaceMessageById = createAction<
   [agentId: string, oldId: string, newMessage: AgentMessage]
 >('agentSessions/replaceMessageById');
 
-/** Non-message field updates */
-export const updateSession = createAction<[agentId: string, updates: Partial<AgentSession>]>(
-  'agentSessions/updateSession',
-);
-
-/** Saga-owned core send side effect trigger. */
-export const agentSessionSendMessageRequested = createAsyncAction<
-  [agentId: string, wsId: string, text: string, options?: AgentSessionSendMessageOptions],
-  void
->('agentSessions/sendMessage', 'agentSessions/sendMessageRequested');
+/** Non-message field updates (plus the FE-owned sticky liveness fields). */
+export const updateSession = createAction<
+  [
+    agentId: string,
+    updates: Partial<AgentSession> & Pick<StoredAgentSession, 'liveTurnOpen' | 'liveTurnOpenedAt'>,
+  ]
+>('agentSessions/updateSession');
 
 /** Saga-owned core stop side effect trigger. */
 export const agentSessionStopChatRequested = createAsyncAction<[agentId: string], void>(
@@ -1064,6 +1190,21 @@ export const agentSessionDismissQuestionsRequested = createAsyncAction<
   [agentId: string, wsId: string, messageId: string],
   void
 >('agentSessions/dismissQuestions', 'agentSessions/dismissQuestionsRequested');
+
+/**
+ * Saga-owned pending-proposal resolution trigger (`agent.resolveProposal`,
+ * PROTOCOL §5.5). Success reconciles the proposal-lifecycle slice
+ * (`proposalResolutionReconciled`); failure surfaces a toast and leaves the
+ * proposal pending.
+ */
+export const agentProposalResolveRequested = createAsyncAction<
+  [
+    agentId: string,
+    wsId: string,
+    request: { proposalId: string; outcome: 'applied' | 'dismissed'; detail?: string },
+  ],
+  void
+>('agentSessions/resolveProposal', 'agentSessions/resolveProposalRequested');
 
 /** Saga-owned agent launch side effect trigger. Resolves with the created session. */
 export const agentSessionLaunchAgentRequested = createAsyncAction<
@@ -1106,7 +1247,40 @@ export const agentSessionRetryWithModelRequested = createAsyncAction<
   void
 >('agentSessions/retryWithModel', 'agentSessions/retryWithModelRequested');
 
-/** Saga-owned fork-session side effect trigger. Resolves with the forked agent id. */
+/**
+ * Saga-owned retry-on-another-provider side effect trigger (#4455).
+ *
+ * The quota-exceeded banner offers sibling providers, not models, but
+ * `agent.setModel` is the only FE→daemon path that can move a LIVE agent to
+ * another provider — and it requires a concrete modelId. So the saga first
+ * resolves a model on `providerId` from that provider's `models.list`
+ * catalog, switches the session with it, and only then redrives the failed
+ * turn through the retry-with-model path with that model as an explicit
+ * override (the plain last-message retry would re-send the exhausted
+ * provider's recorded model). Kept as its own action (rather than reusing
+ * retry-with-model) because the caller genuinely does not know a model id —
+ * picking one is the saga's job.
+ */
+export const agentSessionRetryWithProviderRequested = createAsyncAction<
+  [agentId: string, wsId: string, providerId: string],
+  void
+>('agentSessions/retryWithProvider', 'agentSessions/retryWithProviderRequested');
+
+/**
+ * Saga-owned retry-from-stalled side effect trigger (monorepo#3402): cancels
+ * the hung turn, waits for the stop to settle, then re-sends the identical
+ * last user input. A no-op when the stall is no longer active by the time
+ * the command runs (resumed event, stream delta, or turn end).
+ */
+export const agentSessionRetryFromStalledRequested = createAsyncAction<
+  [agentId: string, wsId: string],
+  void
+>('agentSessions/retryFromStalled', 'agentSessions/retryFromStalledRequested');
+
+/**
+ * Saga-owned fork-session side effect trigger. Resolves with the forked agent id.
+ * @public not dispatched yet — reserved for the fork feature (intent-hq/intent#3729)
+ */
 export const agentSessionForkSessionRequested = createAsyncAction<
   [agentId: string, wsId: string, options?: AgentSessionForkOptions],
   string
@@ -1134,6 +1308,19 @@ export const clearProcessQueueHint = createAction<[agentId: string]>(
   'agentSessions/clearProcessQueueHint',
 );
 
+/**
+ * Agent process evicted (agent:process:evicted, §6.5). The daemon parked the
+ * agent's OS process — dropped from the spawn queue, or reaped by the idle
+ * TTL sweep (reason "idle-ttl", intent-hq/intentd#1356). The session row
+ * survives and the next send transparently respawns the process, so this is
+ * NOT an "agent ended" transition. The daemon only evicts idle processes,
+ * so any FE busy indicator at that moment is provably stale (monorepo#3040):
+ * clear the queue hint and the optimistic busy flags, and demote a stale
+ * RUNNING status to 'idle' (waiting/error/terminal statuses stay untouched).
+ * Payload: [agentId]
+ */
+export const processEvicted = createAction<[agentId: string]>('agentSessions/processEvicted');
+
 /** Rename agent session */
 export const renameSession = createAction<[agentId: string, name: string]>(
   'agentSessions/renameSession',
@@ -1158,6 +1345,13 @@ export type BulkUpsertSessionsOptions = {
    * in-flight pair.
    */
   allowActiveTurnRuntimeFlagClear?: boolean;
+  /**
+   * Mixed list snapshots may contain both crash-leftover idle rows and live
+   * rows. IDs listed here receive the authoritative stale-clear semantics
+   * (`preserveExplicitRuntimeFlags: false` plus active-turn clear) without
+   * splitting one hydration into multiple reducer commits.
+   */
+  staleRuntimeFlagClearAgentIds?: string[];
 };
 
 /** Bulk upsert sessions (initial load / snapshot reconciliation / batched upsert storage) */
@@ -1246,12 +1440,21 @@ agentSessionReducer.with(updateMessage, (state, { payload: [agentId, messageId, 
 agentSessionReducer.with(replaceMessages, (state, { payload: [agentId, messages] }) => {
   const session = getSession(state, agentId);
   if (!session) return state;
-  const nextMessages = reconcileMessageIdentities(
-    session.messages,
-    normalizeSortPruneMessages(messages),
-  );
+  const ordered = normalizeSortHistoryMessages(messages);
+  const pruned = pruneMessages(ordered);
+  const nextMessages = reconcileMessageIdentities(session.messages, pruned);
   if (nextMessages === session.messages) return state;
-  return setSession(state, agentId, { ...session, messages: nextMessages });
+  // Cap prune dropped rows that were tail-resident: live growth past the cap
+  // (not a prepend-shaped replacement re-slicing rows never in the tail) —
+  // latch it and account the dropped rows into the history-segment gap.
+  const droppedResident = countDroppedResidentTailRows(session.messages, ordered, pruned);
+  let next = setSession(state, agentId, {
+    ...session,
+    messages: nextMessages,
+    ...(droppedResident > 0 ? { tailCapPruned: true } : {}),
+  });
+  if (droppedResident > 0) next = accountTailCapPrune(next, agentId, droppedResident);
+  return next;
 });
 agentSessionReducer.with(removeMessage, (state, { payload: [agentId, messageId] }) => {
   const session = getSession(state, agentId);
@@ -1268,10 +1471,20 @@ agentSessionReducer.with(updateSession, (state, { payload: [agentId, updates] })
   if (!session) return state;
   const { messages, ...otherUpdates } = updates;
   let merged: StoredAgentSession = { ...session, ...otherUpdates };
+  let droppedResident = 0;
   if (messages && Array.isArray(messages)) {
-    merged = { ...merged, messages: normalizeSortPruneMessages(messages) };
+    const ordered = normalizeSortHistoryMessages(messages);
+    const pruned = pruneMessages(ordered);
+    droppedResident = countDroppedResidentTailRows(session.messages, ordered, pruned);
+    merged = {
+      ...merged,
+      messages: pruned,
+      ...(droppedResident > 0 ? { tailCapPruned: true } : {}),
+    };
   }
-  return setSession(state, agentId, merged);
+  let next = setSession(state, agentId, merged);
+  if (droppedResident > 0) next = accountTailCapPrune(next, agentId, droppedResident);
+  return next;
 });
 agentSessionReducer.with(eventReceived, (state, { payload: [, event] }) => {
   const userMessage = userMessageFromWorkspaceEvent(event);
@@ -1288,6 +1501,22 @@ agentSessionReducer.with(eventReceived, (state, { payload: [, event] }) => {
     return updateSessionFields(state, agentId, { stats });
   }
 
+  const markers = pendingQuestionMarkersFromWorkspaceEvent(event);
+  if (markers) {
+    const [agentId, fields] = markers;
+    const existing = getSession(state, agentId);
+    if (!existing) return state;
+    const metadata = existing.metadata ?? {};
+    if (
+      Object.entries(fields).every(
+        ([key, value]) => metadata[key as keyof typeof metadata] === value,
+      )
+    ) {
+      return state;
+    }
+    return updateSessionFields(state, agentId, { metadata: { ...metadata, ...fields } });
+  }
+
   const canonical = canonicalFieldsFromWorkspaceEvent(event);
   if (!canonical) return state;
   const [agentId, fields] = canonical;
@@ -1296,11 +1525,20 @@ agentSessionReducer.with(eventReceived, (state, { payload: [, event] }) => {
     typeof event.timestamp === 'string' ? event.timestamp : undefined,
   );
   if (Object.keys(updates).length === 0) return state;
-  return updateSessionFields(
-    state,
-    agentId,
-    updates as Partial<Omit<StoredAgentSession, 'messages'>>,
-  );
+  // Fresh running edge (the sticky liveTurnOpen slot transitions closed →
+  // open): clear the previous turn's `lastToolUse` so it cannot render as a
+  // live tool chip during the startup window before the first
+  // `agent:stream:activity` ping of the new turn arrives. Keyed on the slot
+  // EDGE, not on every running status event — mid-turn status ticks (slot
+  // already open) must not wipe the current turn's live tool. The first
+  // tool-arm ping of the new turn repopulates the field.
+  const existing = getSession(state, agentId);
+  const opensLiveTurn = updates.liveTurnOpen === true && existing?.liveTurnOpen !== true;
+  const merged: Partial<Omit<StoredAgentSession, 'messages'>> = {
+    ...(updates as Partial<Omit<StoredAgentSession, 'messages'>>),
+    ...(opensLiveTurn && existing?.lastToolUse ? { lastToolUse: undefined } : {}),
+  };
+  return updateSessionFields(state, agentId, merged);
 });
 agentSessionReducer.with(renameSession, (state, { payload: [agentId, name] }) => {
   const session = getSession(state, agentId);
@@ -1309,11 +1547,18 @@ agentSessionReducer.with(renameSession, (state, { payload: [agentId, name] }) =>
 });
 agentSessionReducer.with(bulkUpsertSessions, (state, { payload: [sessions, options] }) => {
   let next = state;
-  const storageOptions: SessionUpsertStorageOptions = {
+  const defaultStorageOptions: SessionUpsertStorageOptions = {
     preserveExplicitRuntimeFlags: options?.preserveExplicitRuntimeFlags ?? true,
     allowActiveTurnRuntimeFlagClear: options?.allowActiveTurnRuntimeFlagClear ?? false,
   };
+  const staleClearIds = new Set(options?.staleRuntimeFlagClearAgentIds ?? []);
   for (const session of sessions) {
+    const storageOptions = staleClearIds.has(String(session.id))
+      ? {
+          preserveExplicitRuntimeFlags: false,
+          allowActiveTurnRuntimeFlagClear: true,
+        }
+      : defaultStorageOptions;
     next = applySessionUpsert(next, session, storageOptions);
   }
   return next;
@@ -1427,6 +1672,9 @@ agentSessionReducer.with(chatReset, (state, { payload: [agentId] }) =>
       isStreaming: false,
       isProcessing: false,
       isResponding: false,
+      // Full transcript reset — the cap-pruned latch no longer describes the
+      // fresh transcript (only written when latched, keeping no-ops no-ops).
+      ...(getSession(state, agentId)?.tailCapPruned === true ? { tailCapPruned: false } : {}),
     }),
     agentId,
   ),
@@ -1473,6 +1721,32 @@ agentSessionReducer.with(clearProcessQueueHint, (state, { payload: [agentId] }) 
     processQueueHint: undefined,
   }),
 );
+// Process parked (queue drop or idle-TTL reap): the daemon only evicts idle
+// processes, so besides the queue hint, clear any stale optimistic busy flags
+// (and the sticky liveTurnOpen) that would otherwise render a phantom
+// "Thinking" indicator until the next canonical event (monorepo#3040). A
+// stale RUNNING status ('active'/'processing'/'responding', e.g. a missed
+// agent:idle) would keep isAgentRunningState — and thus the Thinking
+// indicator — true on its own, and §6.5 guarantees an evicted process is
+// idle, so demote it to 'idle' (the same status the agent:idle branch
+// defaults to). Non-running statuses (waiting/error/terminal) are BE-owned
+// signals the eviction says nothing about and stay untouched.
+agentSessionReducer.with(processEvicted, (state, { payload: [agentId] }) => {
+  const existing = getSession(state, agentId);
+  if (!existing) return state;
+  const updates: Partial<Omit<StoredAgentSession, 'messages'>> = {
+    processQueueHint: undefined,
+    isStreaming: false,
+    isProcessing: false,
+    isResponding: false,
+    liveTurnOpen: false,
+    liveTurnOpenedAt: undefined,
+  };
+  if (RUNNING_STATUSES.has(existing.status as string)) {
+    updates.status = AgentStatus.RuntimeIdle;
+  }
+  return updateSessionFields(state, agentId, updates);
+});
 // -----------------------------------------------------------------------
 // Scrollback history segment (bounded, on-demand; tail semantics untouched)
 // -----------------------------------------------------------------------
@@ -1489,7 +1763,11 @@ agentSessionReducer.with(prependHistoryMessages, (state, { payload: [agentId, me
   // count (floor 0). An estimate only — oldestReached pins it to exactly 0.
   const startOrdinalEstimate = shiftStartOrdinalForPrepend(existing, merged);
   if (merged.length <= HISTORY_SEGMENT_MAX) {
-    return setHistorySegment(state, agentId, { ...existing, messages: merged, startOrdinalEstimate });
+    return setHistorySegment(state, agentId, {
+      ...existing,
+      messages: merged,
+      startOrdinalEstimate,
+    });
   }
   // Past the cap: prune from the NEWEST side (viewport is walking up), which
   // severs contiguity with the tail — a hole opens. Serial-walk segments
@@ -1571,10 +1849,7 @@ agentSessionReducer.with(
     const session = getSession(state, agentId);
     if (!session) return state;
     const incoming = normalizeSortHistoryMessages(messages);
-    const seeded = dropRowsPresentInTail(incoming, session.messages).slice(
-      0,
-      HISTORY_SEGMENT_MAX,
-    );
+    const seeded = dropRowsPresentInTail(incoming, session.messages).slice(0, HISTORY_SEGMENT_MAX);
     // Landing rows overlapping the tail mean the seek landed at/near the
     // newest end — the segment is contiguous with the tail (no hole), same
     // overlap rule as the gap-refill append.
@@ -1596,3 +1871,19 @@ agentSessionReducer.with(
 agentSessionReducer.with(clearHistorySegment, (state, { payload: [agentId] }) =>
   removeHistorySegment(state, agentId),
 );
+// Cross-slice: a §7.1 `resumed: false` seq-0 snapshot discards the retained
+// transcript, so the history segment — unanchored against the fresh
+// transcript — is dropped in the SAME dispatch the chat-state reducer resets
+// the walk cursors and fetching flags in (atomic walk reset; the scrollback
+// saga's clearHistorySegment chain still runs and is idempotent here).
+agentSessionReducer.with(chatTranscriptSnapshotApplied, (state, { payload: [agentId, meta] }) => {
+  if (meta.resumed !== false) return state;
+  // Fresh (non-resumed) transcript: clear the FE-owned cap-pruned latch with
+  // the segment — both described the discarded transcript. Only touch the
+  // session when actually latched so an unlatched apply stays a state no-op.
+  const next =
+    getSession(state, agentId)?.tailCapPruned === true
+      ? updateSessionFields(state, agentId, { tailCapPruned: false })
+      : state;
+  return removeHistorySegment(next, agentId);
+});

@@ -20,6 +20,7 @@
   import { faFolder } from '@fortawesome/free-solid-svg-icons';
   import Fa from 'svelte-fa';
   import Input from '$lib/components/ui/input/input.svelte';
+  import GitHubAvatar from '$lib/components/ui/GitHubAvatar.svelte';
   import { cn } from '$lib/utils';
   import DirectoryPickerModal from './DirectoryPickerModal.svelte';
   import { pickDirectory } from '$lib/directory-picker-service';
@@ -30,12 +31,15 @@
     /** Path of the currently selected repo (for highlight state). */
     selectedPath?: string;
     /** Called when the user clicks a repo row or picks a folder. */
-    onSelect: (path: string, scope?: string) => void;
+    onSelect: (path: string, scope?: string, initGit?: boolean) => void;
     /** Called when user presses Enter - should select AND advance to next step */
-    onSelectAndAdvance?: (path: string, scope?: string) => void;
+    onSelectAndAdvance?: (path: string, scope?: string, initGit?: boolean) => void;
   }
 
   interface DirectoryStatus {
+    exists?: boolean;
+    isDirectory?: boolean;
+    isGitRepo?: boolean;
     relativePathFromGitRoot?: string;
     isSubdirectoryOfGitRepo?: boolean;
   }
@@ -51,6 +55,7 @@
   let listContainerRef = $state<HTMLDivElement | null>(null);
   /** Manually picked folders (via the folder picker) that aren't in known repos. */
   let manuallyAddedPaths = $state<string[]>([]);
+  let initGitPath = $state('');
 
   // Build recent repos list
   const recentRepos = $derived.by(() => {
@@ -128,10 +133,6 @@
     focusedViaKeyboard = false;
   });
 
-  function getGitHubAvatarUrl(owner: string, size: number = 32): string {
-    return `https://github.com/${owner}.png?size=${size}`;
-  }
-
   async function getDirectoryStatus(path: string): Promise<DirectoryStatus | null> {
     if (typeof window === 'undefined' || !window.electronAPI) return null;
     try {
@@ -149,11 +150,25 @@
     const advanceCb = onSelectAndAdvance;
     const selectCb = onSelect;
     const status = await getDirectoryStatus(path);
+    if (status?.isDirectory === false) {
+      initGitPath = '';
+      selectCb('');
+      return;
+    }
     const scope = status?.isSubdirectoryOfGitRepo ? status.relativePathFromGitRoot : undefined;
+    const initGit =
+      !!status &&
+      !!status.exists &&
+      !!status.isDirectory &&
+      !status.isGitRepo &&
+      !status.isSubdirectoryOfGitRepo;
+    initGitPath = initGit ? path : '';
     if (advance && advanceCb) {
-      advanceCb(path, scope);
+      if (initGit) advanceCb(path, scope, true);
+      else advanceCb(path, scope);
     } else {
-      selectCb(path, scope);
+      if (initGit) selectCb(path, scope, true);
+      else selectCb(path, scope);
     }
   }
 
@@ -297,12 +312,11 @@
           >
             <div class="size-6 shrink-0">
               {#if repo.owner}
-                <img
-                  src={getGitHubAvatarUrl(repo.owner, 32)}
+                <GitHubAvatar
+                  identity={repo.owner}
                   alt={repo.owner}
+                  size={24}
                   class="w-6 h-6 rounded-full shrink-0"
-                  loading="lazy"
-                  onerror={(e) => ((e.currentTarget as HTMLImageElement).style.display = 'none')}
                 />
               {:else}
                 <div class="w-6 h-6 flex items-center justify-center shrink-0">
@@ -347,6 +361,15 @@
               <path d="M9 5l7 7-7 7" />
             </svg>
           </button>
+          {#if isCommitted && initGitPath === repo.path}
+            <div
+              role="status"
+              class="mx-3 mb-2 rounded-md border border-border bg-muted/30 px-3 py-2 text-xs text-muted-foreground"
+            >
+              {m.workspace_repoSelector_notGitRepository_label()}
+              {m.onboarding_localRepoTab_initializeGit_description()}
+            </div>
+          {/if}
         {/each}
       </div>
     {:else if searchQuery}
@@ -354,7 +377,9 @@
         {m.onboarding_localRepoTab_noMatches_label({ query: searchQuery })}
       </div>
     {:else}
-      <div class="py-4 text-center text-sm text-muted-foreground">{m.onboarding_localRepoTab_noRecent_label()}</div>
+      <div class="py-4 text-center text-sm text-muted-foreground">
+        {m.onboarding_localRepoTab_noRecent_label()}
+      </div>
     {/if}
   </div>
 </div>

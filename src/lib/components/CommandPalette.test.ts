@@ -18,8 +18,6 @@ const {
   createSelectorReadable,
   paletteMruEntries,
   paletteFileMru,
-  workspaceViewMode,
-  toggleWorkspaceViewModeMock,
 } = vi.hoisted(() => {
   const createSelectorReadable = <TArg, TValue>(arg: TArg, resolver: (value: any) => TValue) => ({
     subscribe: (fn: (value: TValue) => void) => {
@@ -31,20 +29,6 @@ const {
       return () => {};
     },
   });
-
-  const workspaceViewMode = {
-    value: 'single' as 'single' | 'columns',
-    listeners: new Set<(value: 'single' | 'columns') => void>(),
-    subscribe(listener: (value: 'single' | 'columns') => void) {
-      this.listeners.add(listener);
-      listener(this.value);
-      return () => this.listeners.delete(listener);
-    },
-    set(value: 'single' | 'columns') {
-      this.value = value;
-      for (const listener of this.listeners) listener(value);
-    },
-  };
 
   return {
     gotoMock: vi.fn(),
@@ -59,8 +43,6 @@ const {
     createSelectorReadable,
     paletteMruEntries: { value: [] as any[] },
     paletteFileMru: { value: {} as Record<string, number> },
-    workspaceViewMode,
-    toggleWorkspaceViewModeMock: vi.fn(() => Promise.resolve()),
   };
 });
 
@@ -114,17 +96,6 @@ vi.mock('$store/renderer/slices/workspace/workspace-selectors', () => ({
       return () => {};
     },
   }),
-}));
-vi.mock('$store/renderer/slices/tab-state/tab-state-selectors', () => ({
-  selectWorkspaceViewMode: Object.assign(
-    vi.fn(() => workspaceViewMode),
-    {
-      select: vi.fn(() => workspaceViewMode.value),
-    },
-  ),
-}));
-vi.mock('$features/workspace/workspace-view-mode-action', () => ({
-  toggleWorkspaceViewModeWithTransition: toggleWorkspaceViewModeMock,
 }));
 vi.mock('$features/agent/browser', () => ({}));
 
@@ -189,6 +160,10 @@ vi.mock('$store/renderer/slices/terminals/terminals-slice', () => ({
     type: 'terminals/createTerminalRequested',
     payload: args,
   })),
+  removeTerminal: vi.fn((...args: any[]) => ({
+    type: 'terminals/removeTerminal',
+    payload: args,
+  })),
 }));
 vi.mock('$store/renderer/slices/note-read-tracking/note-read-tracking-slice', () => ({
   createNoteRequested: vi.fn((...args: any[]) => ({
@@ -248,7 +223,8 @@ import { createTerminalRequested } from '$store/renderer/slices/terminals/termin
 import { createNoteRequested } from '$store/renderer/slices/note-read-tracking/note-read-tracking-slice';
 import { commandPaletteNewFileRequested } from '$store/renderer/slices/app-layout/app-layout-slice';
 import { setStatsOverlayOpen } from '$store/renderer/slices/sidebar-nav/sidebar-nav-slice';
-import { togglePanelOpenMode } from '$store/renderer/slices/user-preferences/user-preferences-slice';
+import { openTab } from '$store/renderer/slices/panel-layout/panel-layout-slice';
+import { terminalManager } from '$features/terminal/terminal-manager.svelte';
 
 // Actions that dispatch Redux actions directly (no window event intermediary)
 const reduxActions = [
@@ -266,7 +242,6 @@ describe('CommandPalette new actions', () => {
     sessionSessions.value = [];
     paletteMruEntries.value = [];
     paletteFileMru.value = {};
-    workspaceViewMode.set('single');
   });
 
   it('dispatches Redux actions for agent, terminal, note, and file from keyboard', async () => {
@@ -291,6 +266,37 @@ describe('CommandPalette new actions', () => {
       await fireEvent.keyDown(input, { key: 'Enter' });
       expect(reduxDispatchMock).toHaveBeenCalledWith(action.actionCreator('ws-1'));
     }
+  });
+
+  it('opens an existing terminal search result as a panel-layout terminal tab', async () => {
+    vi.mocked(terminalManager.loadTerminalMetadata).mockReturnValue([
+      { terminalId: 'term-1', title: 'My Terminal', createdAt: new Date().toISOString() },
+    ] as any);
+    const onClose = vi.fn();
+
+    render(CommandPalette, { props: { isOpen: true, workspaceId: 'ws-1', onClose } });
+
+    const input = screen.getByRole('textbox');
+    await fireEvent.input(input, { target: { value: 'My Terminal' } });
+
+    const item = await screen.findByRole('button', { name: /My Terminal/ });
+    reduxDispatchMock.mockClear();
+    await fireEvent.click(item);
+
+    expect(reduxDispatchMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: openTab.type,
+        payload: expect.objectContaining({
+          wsId: 'ws-1',
+          tab: expect.objectContaining({
+            type: 'terminal',
+            terminalId: 'term-1',
+            closable: true,
+          }),
+        }),
+      }),
+    );
+    expect(onClose).toHaveBeenCalled();
   });
 
   it('dispatches Redux actions for agent, terminal, note, and file from clicks', async () => {
@@ -324,18 +330,6 @@ describe('CommandPalette new actions', () => {
     expect((await screen.findByRole('button', { name: /Attach files/i })).textContent).toContain(
       '⇧⌘A',
     );
-  });
-
-  it('toggles the global panel mode from a searched command', async () => {
-    render(CommandPalette, { props: { isOpen: true, workspaceId: 'ws-1', onClose: vi.fn() } });
-    const input = screen.getByRole('textbox');
-    await fireEvent.input(input, { target: { value: 'toggle panel open mode' } });
-
-    const button = await screen.findByRole('button', { name: /Toggle panel open mode/i });
-    expect(button.textContent).toContain('⌥⌘P');
-    await fireEvent.click(button);
-
-    expect(reduxDispatchMock).toHaveBeenCalledWith(togglePanelOpenMode());
   });
 
   it('opens HUD through the exact window IPC request and opens usage stats through Redux', async () => {
@@ -373,29 +367,6 @@ describe('CommandPalette new actions', () => {
     }
 
     events.forEach((event, index) => window.removeEventListener(event, listeners[index]));
-  });
-
-  it('shows and handles the dynamic workspace view command', async () => {
-    const onClose = vi.fn();
-    render(CommandPalette, { props: { isOpen: true, workspaceId: 'ws-1', onClose } });
-    const input = screen.getByRole('textbox');
-
-    await fireEvent.input(input, { target: { value: 'layout' } });
-    const horizontal = await screen.findByRole('button', {
-      name: /Switch to horizontal workspace view/i,
-    });
-    expect(horizontal.textContent).toContain('Show open workspaces side by side in columns.');
-    expect(horizontal.textContent).toMatch(/L/);
-    expect(horizontal.querySelector('[data-navigation-icon="spaces"]')).toBeTruthy();
-
-    await fireEvent.click(horizontal);
-    expect(toggleWorkspaceViewModeMock).toHaveBeenCalledOnce();
-    expect(onClose).toHaveBeenCalledOnce();
-
-    workspaceViewMode.set('columns');
-    const tabs = await screen.findByRole('button', { name: /Switch to tab workspace view/i });
-    expect(tabs.textContent).toContain('Show one workspace at a time with tabs.');
-    expect(tabs.querySelector('[data-navigation-icon="tabs"]')).toBeTruthy();
   });
 });
 

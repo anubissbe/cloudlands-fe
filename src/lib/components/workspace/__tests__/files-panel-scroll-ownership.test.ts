@@ -1,3 +1,9 @@
+// @verify-changed-triggers: ../MultiSelectTabbedSidebar.svelte, ../sidebar/FilesPanel.svelte,
+//   ../sidebar/ExpandableFileSearch.svelte, ../sidebar/SidebarExpandableSearch.svelte,
+//   ../../file-explorer/file-tree-view.svelte, ../../file-explorer/VirtualizedFileTree.svelte,
+//   ../../file-explorer/VSCodeFileExplorer.svelte, ../../ui/VSCodeScrollablePanel.svelte,
+//   ../../ui/list/ListItem.svelte
+
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 
@@ -9,6 +15,7 @@ describe('Files panel scroll ownership', () => {
   it('keeps the sidebar shell fixed and delegates scrolling to the virtualized tree', () => {
     const sidebar = source('../MultiSelectTabbedSidebar.svelte');
     const filesPanel = source('../sidebar/FilesPanel.svelte');
+    const fileTreeView = source('../../file-explorer/file-tree-view.svelte');
     const virtualizedTree = source('../../file-explorer/VirtualizedFileTree.svelte');
 
     expect(sidebar).toContain(
@@ -19,6 +26,8 @@ describe('Files panel scroll ownership', () => {
     expect(filesPanel).toContain('class="min-h-0 flex-1 overflow-hidden"');
     expect(filesPanel).not.toContain('overflow-y-auto');
     expect(virtualizedTree).toContain('class="h-full overflow-y-auto overflow-x-hidden"');
+    expect(fileTreeView).toContain('virtualizedTreeRef?.scrollToPath(targetFile)');
+    expect(fileTreeView).not.toContain('document.querySelector(');
   });
 
   it('disables the generic outer ScrollArea for the expanded Code panel', () => {

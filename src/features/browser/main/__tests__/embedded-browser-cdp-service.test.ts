@@ -1,14 +1,16 @@
+import sharp from 'sharp';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
   handle: vi.fn(),
   sendToWorkspaceWindows: vi.fn(),
   fromId: vi.fn(),
+  getAllWebContents: vi.fn(() => []),
 }));
 
 vi.mock('electron', () => ({
   ipcMain: { handle: mocks.handle },
-  webContents: { fromId: mocks.fromId },
+  webContents: { fromId: mocks.fromId, getAllWebContents: mocks.getAllWebContents },
 }));
 
 vi.mock('../../../system/main/system.ipc', () => ({
@@ -172,6 +174,633 @@ describe('embedded browser CDP workspace routing', () => {
         vi.useRealTimers();
       }
     });
+  });
+
+  // Viewport emulation for agent-owned tabs (docs/protocol §5.9): owned tabs
+  // are always emulated at their recorded size; scale-to-fit shrinks the
+  // displayed image to the reported webview bounds without changing layout.
+  describe('viewport emulation (§5.9)', () => {
+    function mountedWebContents() {
+      const sendCommand = vi.fn().mockResolvedValue(undefined);
+      const wc = {
+        isDestroyed: () => false,
+        once: vi.fn(),
+        debugger: {
+          isAttached: () => true,
+          sendCommand,
+          on: vi.fn(),
+        },
+      };
+      mocks.fromId.mockReturnValue(wc);
+      return sendCommand;
+    }
+
+    async function flushAsync() {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+
+    it('applies device-metrics emulation when a mounted tab is claimed', async () => {
+      const sendCommand = mountedWebContents();
+      embeddedBrowserCdp.registerTab('tab-emu-1', 301);
+      sendCommand.mockClear();
+
+      embeddedBrowserCdp.claimTab('tab-emu-1', 'agent-1', { width: 1024, height: 768 });
+      await flushAsync();
+
+      expect(sendCommand).toHaveBeenCalledWith('Emulation.setDeviceMetricsOverride', {
+        width: 1024,
+        height: 768,
+        deviceScaleFactor: 0,
+        mobile: false,
+        scale: 1,
+      });
+    });
+
+    it('re-applies the recorded viewport when an owned tab registers (remount)', async () => {
+      const sendCommand = mountedWebContents();
+      embeddedBrowserCdp.setTabOwner('tab-emu-2', 'agent-1', undefined, {
+        width: 390,
+        height: 844,
+      });
+      sendCommand.mockClear();
+
+      embeddedBrowserCdp.registerTab('tab-emu-2', 302);
+      await flushAsync();
+
+      expect(sendCommand).toHaveBeenCalledWith(
+        'Emulation.setDeviceMetricsOverride',
+        expect.objectContaining({ width: 390, height: 844 }),
+      );
+    });
+
+    it('resizeTab records the new size, keeps height when omitted, and re-emulates', async () => {
+      const sendCommand = mountedWebContents();
+      embeddedBrowserCdp.registerTab('tab-emu-3', 303);
+      embeddedBrowserCdp.setTabOwner('tab-emu-3', 'agent-1', undefined, {
+        width: 1280,
+        height: 800,
+      });
+      sendCommand.mockClear();
+
+      const size = embeddedBrowserCdp.resizeTab('tab-emu-3', 390);
+      await flushAsync();
+
+      expect(size).toEqual({ width: 390, height: 800 });
+      expect(embeddedBrowserCdp.getTabEmulatedSize('tab-emu-3')).toEqual({
+        width: 390,
+        height: 800,
+      });
+      expect(sendCommand).toHaveBeenCalledWith(
+        'Emulation.setDeviceMetricsOverride',
+        expect.objectContaining({ width: 390, height: 800 }),
+      );
+    });
+
+    it('resizeTab returns undefined for unowned tabs and applies nothing', async () => {
+      const sendCommand = mountedWebContents();
+      embeddedBrowserCdp.registerTab('tab-emu-4', 304);
+      sendCommand.mockClear();
+
+      expect(embeddedBrowserCdp.resizeTab('tab-emu-4', 800)).toBeUndefined();
+      await flushAsync();
+      expect(sendCommand).not.toHaveBeenCalled();
+    });
+
+    it('scale-to-fit shrinks the display to reported bounds but never upscales', async () => {
+      const sendCommand = mountedWebContents();
+      embeddedBrowserCdp.registerTab('tab-emu-5', 305);
+      embeddedBrowserCdp.setTabOwner('tab-emu-5', 'agent-1', undefined, {
+        width: 1280,
+        height: 800,
+      });
+      sendCommand.mockClear();
+
+      // Element half the emulated size → scale 0.5.
+      embeddedBrowserCdp.reportTabViewBounds('tab-emu-5', 640, 400);
+      await flushAsync();
+      expect(sendCommand).toHaveBeenCalledWith(
+        'Emulation.setDeviceMetricsOverride',
+        expect.objectContaining({ width: 1280, height: 800, scale: 0.5 }),
+      );
+
+      // Element larger than the emulated size → capped at 1 (no upscale).
+      sendCommand.mockClear();
+      embeddedBrowserCdp.reportTabViewBounds('tab-emu-5', 2000, 1500);
+      await flushAsync();
+      expect(sendCommand).toHaveBeenCalledWith(
+        'Emulation.setDeviceMetricsOverride',
+        expect.objectContaining({ scale: 1 }),
+      );
+    });
+
+    it('ignores duplicate and non-positive bounds reports', async () => {
+      const sendCommand = mountedWebContents();
+      embeddedBrowserCdp.registerTab('tab-emu-6', 306);
+      embeddedBrowserCdp.setTabOwner('tab-emu-6', 'agent-1');
+      embeddedBrowserCdp.reportTabViewBounds('tab-emu-6', 640, 400);
+      await flushAsync();
+      sendCommand.mockClear();
+
+      embeddedBrowserCdp.reportTabViewBounds('tab-emu-6', 640, 400);
+      embeddedBrowserCdp.reportTabViewBounds('tab-emu-6', 0, 400);
+      embeddedBrowserCdp.reportTabViewBounds('tab-emu-6', 640, -1);
+      await flushAsync();
+
+      expect(sendCommand).not.toHaveBeenCalled();
+    });
+
+    it('applies nothing for unmounted owned tabs (registration re-applies later)', async () => {
+      const sendCommand = vi.fn().mockResolvedValue(undefined);
+      mocks.fromId.mockReturnValue(undefined);
+
+      embeddedBrowserCdp.setTabOwner('tab-emu-unmounted', 'agent-1', undefined, {
+        width: 1024,
+        height: 768,
+      });
+      await flushAsync();
+
+      expect(sendCommand).not.toHaveBeenCalled();
+    });
+
+    it('an explicit bounds clear drops the recorded bounds and re-applies at scale 1', async () => {
+      const sendCommand = mountedWebContents();
+      embeddedBrowserCdp.registerTab('tab-emu-clear', 307);
+      embeddedBrowserCdp.setTabOwner('tab-emu-clear', 'agent-1', undefined, {
+        width: 1280,
+        height: 800,
+      });
+      embeddedBrowserCdp.reportTabViewBounds('tab-emu-clear', 640, 400);
+      await flushAsync();
+      sendCommand.mockClear();
+
+      embeddedBrowserCdp.clearTabViewBounds('tab-emu-clear');
+      await flushAsync();
+
+      expect(sendCommand).toHaveBeenCalledWith(
+        'Emulation.setDeviceMetricsOverride',
+        expect.objectContaining({ width: 1280, height: 800, scale: 1 }),
+      );
+
+      // Clearing again is a no-op (nothing recorded).
+      sendCommand.mockClear();
+      embeddedBrowserCdp.clearTabViewBounds('tab-emu-clear');
+      await flushAsync();
+      expect(sendCommand).not.toHaveBeenCalled();
+    });
+
+    // Regression: a visible→offscreen handoff re-registers the tab with a new
+    // webContentsId BEFORE the old guest's destroyed fires, so the destroyed
+    // hook's handoff guard is false and cannot drop the visible element's
+    // bounds. The renderer's explicit clear (destroy() of the bounds action)
+    // must restore scale 1 on the offscreen host.
+    it('handoff regression: explicit clear removes stale visible bounds after register-before-destroy', async () => {
+      const sendCommand = vi.fn().mockResolvedValue(undefined);
+      let destroyedCallback: (() => void) | undefined;
+      mocks.fromId.mockImplementation((id: number) => ({
+        isDestroyed: () => false,
+        once: (event: string, cb: () => void) => {
+          if (event === 'destroyed' && id === 401) destroyedCallback = cb;
+        },
+        debugger: { isAttached: () => true, sendCommand, on: vi.fn() },
+      }));
+
+      // Visible host mounts and reports its (smaller) panel bounds.
+      embeddedBrowserCdp.registerTab('tab-handoff-scale', 401);
+      embeddedBrowserCdp.setTabOwner('tab-handoff-scale', 'agent-1', undefined, {
+        width: 1280,
+        height: 800,
+      });
+      embeddedBrowserCdp.reportTabViewBounds('tab-handoff-scale', 640, 400);
+      await flushAsync();
+
+      // Handoff: offscreen host registers FIRST — stale bounds still apply.
+      sendCommand.mockClear();
+      embeddedBrowserCdp.registerTab('tab-handoff-scale', 402);
+      await flushAsync();
+      expect(sendCommand).toHaveBeenCalledWith(
+        'Emulation.setDeviceMetricsOverride',
+        expect.objectContaining({ scale: 0.5 }),
+      );
+
+      // The visible element's explicit clear restores scale 1...
+      sendCommand.mockClear();
+      embeddedBrowserCdp.clearTabViewBounds('tab-handoff-scale');
+      await flushAsync();
+      expect(sendCommand).toHaveBeenCalledWith(
+        'Emulation.setDeviceMetricsOverride',
+        expect.objectContaining({ width: 1280, height: 800, scale: 1 }),
+      );
+
+      // ...and the old guest's late destroyed must not clobber the newer
+      // registration (handoff guard) — emulation still targets the new host.
+      destroyedCallback?.();
+      sendCommand.mockClear();
+      embeddedBrowserCdp.resizeTab('tab-handoff-scale', 390);
+      await flushAsync();
+      expect(sendCommand).toHaveBeenCalledWith(
+        'Emulation.setDeviceMetricsOverride',
+        expect.objectContaining({ width: 390, height: 800, scale: 1 }),
+      );
+    });
+  });
+
+  // Regression (intent-hq/intent#4627): Page.captureScreenshot cannot resize a
+  // <webview> guest (its RenderWidgetHostViewChildFrame ignores SetSize), so
+  // Chromium tiles whatever the guest surface holds into the requested
+  // clip.width × clip.height × clip.scale × DPR image. A tab displayed at
+  // scale-to-fit 0.5 therefore came back as a 2x2 repeat of the page; the clip
+  // scale must match the scale the tab is actually drawn at so the request
+  // equals the surface.
+  describe('screenshot clip on scale-to-fit tabs (intent-hq/intent#4627)', () => {
+    type CaptureRequest = {
+      format: 'jpeg' | 'png';
+      quality?: number;
+      clip: { width: number; height: number; scale: number };
+    };
+
+    const MARKER = 16;
+    const isMarkerRed = (r: number, g: number, b: number) => r > 180 && g < 90 && b < 90;
+
+    /**
+     * Independent model of Chromium's PageHandler::CaptureScreenshot for a
+     * <webview> guest (content/browser/devtools/protocol/page_handler.cc): the
+     * guest keeps the element's physical size because a child-frame view
+     * ignores SetSize, the handler expects clip × clip.scale × DPR pixels, and
+     * on a mismatch it fills the request by repeating the surface bitmap
+     * (SkBitmapOperations::CreateTiledBitmap). The page is white with one red
+     * MARKER×MARKER square at its origin, so a repeated page shows extra
+     * squares.
+     */
+    async function chromiumGuestCapture(
+      request: CaptureRequest,
+      guest: { dpr: number; elementDip: { width: number; height: number } },
+    ): Promise<{ data: string }> {
+      const surface = {
+        width: Math.round(guest.elementDip.width * guest.dpr),
+        height: Math.round(guest.elementDip.height * guest.dpr),
+      };
+      const requested = {
+        width: Math.round(request.clip.width * request.clip.scale * guest.dpr),
+        height: Math.round(request.clip.height * request.clip.scale * guest.dpr),
+      };
+      const surfaceRow = Buffer.alloc(surface.width * 4, 255);
+      const markerRow = Buffer.from(surfaceRow);
+      markerRow.fill(Buffer.from([255, 0, 0, 255]), 0, MARKER * 4);
+      const out = Buffer.alloc(requested.width * requested.height * 4);
+      for (let y = 0; y < requested.height; y++) {
+        const source = y % surface.height < MARKER ? markerRow : surfaceRow;
+        for (let x = 0; x < requested.width; x += surface.width) {
+          const span = Math.min(surface.width, requested.width - x);
+          source.copy(out, (y * requested.width + x) * 4, 0, span * 4);
+        }
+      }
+      const image = sharp(out, { raw: { ...requested, channels: 4 } });
+      const encoded = await (
+        request.format === 'png' ? image.png() : image.jpeg({ quality: request.quality ?? 80 })
+      ).toBuffer();
+      return { data: encoded.toString('base64') };
+    }
+
+    async function decodeCapture(base64: string) {
+      const { data, info } = await sharp(Buffer.from(base64, 'base64'))
+        .ensureAlpha()
+        .raw()
+        .toBuffer({ resolveWithObject: true });
+      const markerPixels: Array<{ x: number; y: number }> = [];
+      for (let i = 0; i < data.length; i += info.channels) {
+        if (isMarkerRed(data[i], data[i + 1], data[i + 2])) {
+          const pixel = i / info.channels;
+          markerPixels.push({ x: pixel % info.width, y: Math.floor(pixel / info.width) });
+        }
+      }
+      return { width: info.width, height: info.height, markerPixels };
+    }
+
+    function screenshotWebContents(
+      opts: {
+        emulationDelayMs?: number;
+        capture?: (request: CaptureRequest) => Promise<{ data: string }>;
+      } = {},
+    ) {
+      const sendCommand = vi.fn((method: string, params?: unknown) => {
+        if (method === 'Page.getLayoutMetrics') {
+          return Promise.resolve({
+            layoutViewport: { clientWidth: 1280, clientHeight: 800 },
+            cssVisualViewport: { clientWidth: 1280, clientHeight: 800, pageX: 0, pageY: 0 },
+          });
+        }
+        if (method === 'Page.captureScreenshot') {
+          return opts.capture
+            ? opts.capture(params as CaptureRequest)
+            : Promise.resolve({ data: 'anVuaw==' });
+        }
+        if (method === 'Emulation.setDeviceMetricsOverride' && opts.emulationDelayMs) {
+          return new Promise((resolve) => setTimeout(resolve, opts.emulationDelayMs));
+        }
+        return Promise.resolve(undefined);
+      });
+      const debuggerListeners = new Map<string, (event: unknown, reason: string) => void>();
+      mocks.fromId.mockReturnValue({
+        isDestroyed: () => false,
+        once: vi.fn(),
+        debugger: {
+          isAttached: () => true,
+          sendCommand,
+          detach: vi.fn(),
+          on: vi.fn((event: string, listener: (event: unknown, reason: string) => void) => {
+            debuggerListeners.set(event, listener);
+          }),
+        },
+      });
+      return { sendCommand, debuggerListeners };
+    }
+
+    function captureScreenshotClip(sendCommand: ReturnType<typeof vi.fn>) {
+      const calls = sendCommand.mock.calls.filter(
+        ([method]) => method === 'Page.captureScreenshot',
+      );
+      return (calls.at(-1)?.[1] as { clip: { scale: number } } | undefined)?.clip;
+    }
+
+    function ownScaledTab(tabId: string, webContentsId: number) {
+      embeddedBrowserCdp.registerTab(tabId, webContentsId);
+      embeddedBrowserCdp.setTabOwner(tabId, 'agent-1', undefined, { width: 1280, height: 800 });
+      embeddedBrowserCdp.reportTabViewBounds(tabId, 640, 400);
+    }
+
+    async function flushAsync() {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+
+    it('requests the clip at the fit scale the tab is displayed at', async () => {
+      const { sendCommand } = screenshotWebContents();
+      ownScaledTab('tab-shot-fit', 501);
+      await flushAsync();
+
+      try {
+        await expect(embeddedBrowserCdp.screenshot('tab-shot-fit')).resolves.toEqual({
+          base64: 'anVuaw==',
+          width: 1280,
+          height: 800,
+        });
+        expect(sendCommand).toHaveBeenCalledWith('Page.captureScreenshot', {
+          format: 'jpeg',
+          quality: 80,
+          clip: { x: 0, y: 0, width: 1280, height: 800, scale: 0.5 },
+        });
+      } finally {
+        embeddedBrowserCdp.unregisterTab('tab-shot-fit');
+      }
+    });
+
+    // The capture is decoded and inspected: a 1280x800 tab shown in a 640x400
+    // panel must come back as one page at the panel's physical size, never as
+    // a 2x2 repeat. The guest model above tiles on a request/surface mismatch
+    // exactly as Chromium does, so a clip.scale of 1 fails both cases.
+    for (const dpr of [1, 2]) {
+      it(`captures a scale-to-fit tab untiled at its displayed size (DPR ${dpr})`, async () => {
+        const guest = { dpr, elementDip: { width: 640, height: 400 } };
+        const tabId = `tab-shot-dpr-${dpr}`;
+        screenshotWebContents({ capture: (request) => chromiumGuestCapture(request, guest) });
+        ownScaledTab(tabId, 510 + dpr);
+        await flushAsync();
+
+        try {
+          const result = await embeddedBrowserCdp.screenshot(tabId);
+          expect(result).toMatchObject({ width: 1280, height: 800 });
+
+          const image = await decodeCapture(result.base64);
+          expect({
+            width: image.width,
+            height: image.height,
+            markerSquares: Math.round(image.markerPixels.length / (MARKER * MARKER)),
+            markerWithinFirstPage: image.markerPixels.every((p) => p.x < MARKER && p.y < MARKER),
+          }).toEqual({
+            width: 640 * dpr,
+            height: 400 * dpr,
+            markerSquares: 1,
+            markerWithinFirstPage: true,
+          });
+        } finally {
+          embeddedBrowserCdp.unregisterTab(tabId);
+        }
+      });
+    }
+
+    it('keeps clip scale 1 when the emulated viewport is not shrunk to fit', async () => {
+      const { sendCommand } = screenshotWebContents();
+      embeddedBrowserCdp.registerTab('tab-shot-unscaled', 502);
+      embeddedBrowserCdp.setTabOwner('tab-shot-unscaled', 'agent-1', undefined, {
+        width: 1280,
+        height: 800,
+      });
+      embeddedBrowserCdp.reportTabViewBounds('tab-shot-unscaled', 2000, 1500);
+      await flushAsync();
+
+      try {
+        await embeddedBrowserCdp.screenshot('tab-shot-unscaled');
+        expect(sendCommand).toHaveBeenCalledWith(
+          'Page.captureScreenshot',
+          expect.objectContaining({
+            clip: { x: 0, y: 0, width: 1280, height: 800, scale: 1 },
+          }),
+        );
+      } finally {
+        embeddedBrowserCdp.unregisterTab('tab-shot-unscaled');
+      }
+    });
+
+    // Chromium disposes the emulation with the CDP session, so after any
+    // detach the guest is back at its native size until the next
+    // applyViewportEmulation; a stale override flag would shrink the clip
+    // of a full-size surface.
+    it('drops the fit scale after forceDetachDebugger resets the session', async () => {
+      const { sendCommand } = screenshotWebContents();
+      ownScaledTab('tab-shot-reset', 503);
+      await flushAsync();
+
+      try {
+        await embeddedBrowserCdp.screenshot('tab-shot-reset');
+        expect(captureScreenshotClip(sendCommand)?.scale).toBe(0.5);
+
+        embeddedBrowserCdp.forceDetachDebugger(503);
+        await embeddedBrowserCdp.screenshot('tab-shot-reset');
+        expect(captureScreenshotClip(sendCommand)?.scale).toBe(1);
+      } finally {
+        embeddedBrowserCdp.unregisterTab('tab-shot-reset');
+      }
+    });
+
+    it('drops the fit scale when the debugger detaches externally', async () => {
+      const { sendCommand, debuggerListeners } = screenshotWebContents();
+      ownScaledTab('tab-shot-detach', 504);
+      await flushAsync();
+
+      try {
+        await embeddedBrowserCdp.screenshot('tab-shot-detach');
+        expect(captureScreenshotClip(sendCommand)?.scale).toBe(0.5);
+
+        const onDetach = debuggerListeners.get('detach');
+        expect(onDetach).toBeTypeOf('function');
+        onDetach?.({}, 'target closed');
+        await embeddedBrowserCdp.screenshot('tab-shot-detach');
+        expect(captureScreenshotClip(sendCommand)?.scale).toBe(1);
+      } finally {
+        embeddedBrowserCdp.unregisterTab('tab-shot-detach');
+      }
+    });
+
+    it('waits for an in-flight emulation before choosing the clip scale', async () => {
+      const { sendCommand } = screenshotWebContents({ emulationDelayMs: 20 });
+      ownScaledTab('tab-shot-race', 505);
+
+      try {
+        await embeddedBrowserCdp.screenshot('tab-shot-race');
+        expect(captureScreenshotClip(sendCommand)?.scale).toBe(0.5);
+      } finally {
+        embeddedBrowserCdp.unregisterTab('tab-shot-race');
+      }
+    });
+  });
+
+  // showTab (monorepo#3045): reveal delivery + confirm-by-list discipline.
+  describe('showTab', () => {
+    it.each([undefined, null, ''])(
+      'rejects show without workspace context instead of broadcasting: %j',
+      async (workspaceId) => {
+        await expect(
+          embeddedBrowserCdp.showTab('tab-1', workspaceId as unknown as string),
+        ).rejects.toThrow('workspaceId is required');
+        expect(mocks.sendToWorkspaceWindows).not.toHaveBeenCalled();
+      },
+    );
+
+    it('fails with a clear error when the workspace is not open in any window', async () => {
+      mocks.sendToWorkspaceWindows.mockReturnValue(DROPPED);
+      await expect(embeddedBrowserCdp.showTab('tab-1', 'ws-closed', true)).rejects.toThrow(
+        'workspace ws-closed is not open in any window',
+      );
+    });
+
+    it('sends the reveal scoped to the workspace and confirms via a fresh non-hidden active listing', async () => {
+      mocks.sendToWorkspaceWindows.mockImplementation(
+        (_ws: string, channel: string, payload: { requestId?: string }) => {
+          if (channel !== IPC_CHANNELS.BROWSER.LIST_TABS_REQUEST) return DELIVERED;
+          responseHandlers.get(IPC_CHANNELS.BROWSER.LIST_TABS_RESPONSE)?.(
+            {},
+            {
+              tabs: [{ tabId: 'tab-1', url: 'https://a.test', title: 'A', active: true }],
+              requestId: payload.requestId,
+            },
+          );
+          return DELIVERED;
+        },
+      );
+
+      await expect(embeddedBrowserCdp.showTab('tab-1', 'ws-2', false)).resolves.toBeUndefined();
+      expect(mocks.sendToWorkspaceWindows.mock.calls[0]).toEqual([
+        'ws-2',
+        IPC_CHANNELS.BROWSER.SHOW_TAB,
+        { tabId: 'tab-1', workspaceId: 'ws-2', focus: false },
+      ]);
+    });
+
+    // A visible-but-inactive listing means the activation has not applied
+    // yet: the confirmation must keep polling until the tab is its panel's
+    // active tab, so a success never precedes a paintable tab.
+    it('keeps polling a visible-but-inactive listing until the tab is active', async () => {
+      let listings = 0;
+      mocks.sendToWorkspaceWindows.mockImplementation(
+        (_ws: string, channel: string, payload: { requestId?: string }) => {
+          if (channel !== IPC_CHANNELS.BROWSER.LIST_TABS_REQUEST) return DELIVERED;
+          listings += 1;
+          responseHandlers.get(IPC_CHANNELS.BROWSER.LIST_TABS_RESPONSE)?.(
+            {},
+            {
+              tabs: [
+                {
+                  tabId: 'tab-1',
+                  url: 'https://a.test',
+                  title: 'A',
+                  ...(listings >= 2 ? { active: true } : {}),
+                },
+              ],
+              requestId: payload.requestId,
+            },
+          );
+          return DELIVERED;
+        },
+      );
+
+      await expect(embeddedBrowserCdp.showTab('tab-1', 'ws-2')).resolves.toBeUndefined();
+      expect(listings).toBe(2);
+    });
+
+    it('fails when the tab is listed visible but never becomes active', async () => {
+      mocks.sendToWorkspaceWindows.mockImplementation(
+        (_ws: string, channel: string, payload: { requestId?: string }) => {
+          if (channel !== IPC_CHANNELS.BROWSER.LIST_TABS_REQUEST) return DELIVERED;
+          responseHandlers.get(IPC_CHANNELS.BROWSER.LIST_TABS_RESPONSE)?.(
+            {},
+            {
+              tabs: [{ tabId: 'tab-1', url: 'https://a.test', title: 'A' }],
+              requestId: payload.requestId,
+            },
+          );
+          return DELIVERED;
+        },
+      );
+
+      await expect(embeddedBrowserCdp.showTab('tab-1', 'ws-2')).rejects.toThrow(
+        'could not be shown',
+      );
+    });
+
+    it('fails when the tab stays hidden in every confirmation listing', async () => {
+      mocks.sendToWorkspaceWindows.mockImplementation(
+        (_ws: string, channel: string, payload: { requestId?: string }) => {
+          if (channel !== IPC_CHANNELS.BROWSER.LIST_TABS_REQUEST) return DELIVERED;
+          responseHandlers.get(IPC_CHANNELS.BROWSER.LIST_TABS_RESPONSE)?.(
+            {},
+            {
+              tabs: [{ tabId: 'tab-1', url: 'https://a.test', title: 'A', hidden: true }],
+              requestId: payload.requestId,
+            },
+          );
+          return DELIVERED;
+        },
+      );
+
+      await expect(embeddedBrowserCdp.showTab('tab-1', 'ws-2')).rejects.toThrow(
+        'could not be shown',
+      );
+    });
+  });
+
+  // Hidden marker projection (monorepo#3045): listAllTabs carries the
+  // renderer's hidden flag through for the executor's visibility field.
+  it('listAllTabs carries the hidden marker for hidden tabs only', async () => {
+    mocks.fromId.mockReturnValue(undefined);
+    mocks.sendToWorkspaceWindows.mockImplementation(
+      (_ws: string, channel: string, payload: { requestId?: string }) => {
+        if (channel !== IPC_CHANNELS.BROWSER.LIST_TABS_REQUEST) return DELIVERED;
+        responseHandlers.get(IPC_CHANNELS.BROWSER.LIST_TABS_RESPONSE)?.(
+          {},
+          {
+            tabs: [
+              { tabId: 'tab-hidden', url: 'https://h.test', title: 'H', hidden: true },
+              { tabId: 'tab-visible', url: 'https://v.test', title: 'V' },
+            ],
+            requestId: payload.requestId,
+          },
+        );
+        return DELIVERED;
+      },
+    );
+
+    const { tabs } = await embeddedBrowserCdp.listAllTabs('ws-2');
+    expect(tabs.find((t) => t.tabId === 'tab-hidden')?.hidden).toBe(true);
+    expect(tabs.find((t) => t.tabId === 'tab-visible')).not.toHaveProperty('hidden');
   });
 
   it('fails a close with a clear error when the workspace is not open in any window', async () => {
@@ -391,5 +1020,239 @@ describe('embedded browser CDP workspace routing', () => {
       expect(channel).toBe(IPC_CHANNELS.BROWSER.LIST_TABS_REQUEST);
       expect(payload).toEqual({ requestId: expect.any(String), workspaceId: 'ws-2' });
     }
+  });
+
+  // Regression (monorepo#2857): a LIST_TABS_RESPONSE produced before the
+  // renderer purged a deleted agent's tabs must not re-hydrate ownership or
+  // re-enter the cache after clearAgentTabs tombstoned the agent.
+  it('ignores stale list-tabs replies for agents whose tabs were cleared', async () => {
+    const ownedTab = {
+      tabId: 'tab-tomb',
+      url: 'https://owned.test',
+      title: 'Owned',
+      ownerAgentId: 'agent-tomb',
+    };
+    // Seed ownership via a normal reply round-trip.
+    mocks.sendToWorkspaceWindows.mockImplementation(
+      (_ws: string, channel: string, payload: { requestId?: string }) => {
+        if (channel !== IPC_CHANNELS.BROWSER.LIST_TABS_REQUEST) return DELIVERED;
+        responseHandlers.get(IPC_CHANNELS.BROWSER.LIST_TABS_RESPONSE)?.(
+          {},
+          { tabs: [ownedTab], requestId: payload.requestId },
+        );
+        return DELIVERED;
+      },
+    );
+    await embeddedBrowserCdp.requestPanelBrowserTabs('ws-tomb');
+    expect(embeddedBrowserCdp.getTabOwner('tab-tomb')).toBe('agent-tomb');
+
+    expect(embeddedBrowserCdp.clearAgentTabs('agent-tomb')).toEqual(['tab-tomb']);
+    expect(embeddedBrowserCdp.getTabOwner('tab-tomb')).toBeUndefined();
+
+    // A stale reply (same pre-purge tab list) arrives afterwards.
+    await embeddedBrowserCdp.requestPanelBrowserTabs('ws-tomb');
+    expect(embeddedBrowserCdp.getTabOwner('tab-tomb')).toBeUndefined();
+
+    // The stale tab is filtered out of the resolved list and cache too.
+    mocks.sendToWorkspaceWindows.mockReturnValue(DROPPED);
+    await expect(embeddedBrowserCdp.requestPanelBrowserTabs('ws-tomb')).resolves.toEqual({
+      tabs: [],
+      stale: true,
+    });
+  });
+
+  // listAgentOwnedTabs answers purely from main-process state (quit
+  // confirmation must never block on a renderer round-trip).
+  it('lists agent-owned tabs from the ownership registry without any renderer round-trip', async () => {
+    const ownedTab = {
+      tabId: 'tab-owned-quit',
+      url: 'https://owned-quit.test',
+      title: 'Owned quit tab',
+      ownerAgentId: 'agent-quit',
+    };
+    // Seed ownership + cache via a normal reply round-trip.
+    mocks.sendToWorkspaceWindows.mockImplementation(
+      (_ws: string, channel: string, payload: { requestId?: string }) => {
+        if (channel !== IPC_CHANNELS.BROWSER.LIST_TABS_REQUEST) return DELIVERED;
+        responseHandlers.get(IPC_CHANNELS.BROWSER.LIST_TABS_RESPONSE)?.(
+          {},
+          { tabs: [ownedTab], requestId: payload.requestId },
+        );
+        return DELIVERED;
+      },
+    );
+    await embeddedBrowserCdp.requestPanelBrowserTabs('ws-quit');
+    // An owned tab the cache has never seen still appears, without enrichment.
+    embeddedBrowserCdp.setTabOwner('tab-bare-quit', 'agent-quit-2');
+
+    mocks.sendToWorkspaceWindows.mockClear();
+    const tabs = embeddedBrowserCdp.listAgentOwnedTabs();
+
+    expect(mocks.sendToWorkspaceWindows).not.toHaveBeenCalled();
+    expect(tabs).toEqual(
+      expect.arrayContaining([
+        {
+          tabId: 'tab-owned-quit',
+          ownerAgentId: 'agent-quit',
+          title: 'Owned quit tab',
+          url: 'https://owned-quit.test',
+          workspaceId: 'ws-quit',
+        },
+        { tabId: 'tab-bare-quit', ownerAgentId: 'agent-quit-2' },
+      ]),
+    );
+    // Cleanup so this suite's shared singleton does not leak into others.
+    embeddedBrowserCdp.clearAgentTabs('agent-quit');
+    embeddedBrowserCdp.clearAgentTabs('agent-quit-2');
+  });
+
+  // Regression (monorepo#3366): on a guest whose compositor produces no
+  // frames, both the CDP Page-domain commands AND the capturePage()
+  // fallback hang forever. The fallback must be bounded so screenshot
+  // fails fast with a clear error instead of eating the caller's whole
+  // 30s reverse-request budget.
+  describe('screenshot capturePage fallback (monorepo#3366)', () => {
+    function capturedImage(width = 1280, height = 800, bytes = 'jpeg-bytes') {
+      return {
+        isEmpty: () => false,
+        getSize: () => ({ width, height }),
+        toJPEG: () => Buffer.from(bytes),
+      };
+    }
+
+    function screenshotWebContents(overrides: Record<string, unknown> = {}) {
+      const wc = {
+        isDestroyed: () => false,
+        once: vi.fn(),
+        debugger: {
+          isAttached: () => true,
+          // Page domain hangs (never settles) — forces the CDP timeouts.
+          sendCommand: vi.fn(() => new Promise(() => {})),
+          on: vi.fn(),
+        },
+        capturePage: vi.fn(() => new Promise(() => {})),
+        ...overrides,
+      };
+      mocks.fromId.mockReturnValue(wc);
+      return wc;
+    }
+
+    it('bounds the capturePage fallback instead of hanging when the guest is not painting', async () => {
+      vi.useFakeTimers();
+      try {
+        const wc = screenshotWebContents();
+        embeddedBrowserCdp.registerTab('tab-shot-hang', 401);
+
+        const pending = embeddedBrowserCdp.screenshot('tab-shot-hang');
+        const guarded = pending.catch((error: Error) => error);
+        // CDP Page.getLayoutMetrics timeout (5s) → fallback capturePage
+        // timeout (5s): total stays far below the 30s caller budget.
+        await vi.advanceTimersByTimeAsync(5_000);
+        await vi.advanceTimersByTimeAsync(5_000);
+        const error = await guarded;
+        expect(error).toBeInstanceOf(Error);
+        expect((error as Error).message).toContain('capturePage timed out');
+        expect(wc.capturePage).toHaveBeenCalledWith(undefined, {
+          stayHidden: true,
+          stayAwake: true,
+        });
+      } finally {
+        vi.useRealTimers();
+        embeddedBrowserCdp.unregisterTab('tab-shot-hang');
+      }
+    });
+
+    it('returns the capturePage image when the fallback settles in time', async () => {
+      const image = capturedImage();
+      const wc = screenshotWebContents({ capturePage: vi.fn().mockResolvedValue(image) });
+      embeddedBrowserCdp.registerTab('tab-shot-ok', 402);
+      vi.useFakeTimers();
+      try {
+        const pending = embeddedBrowserCdp.screenshot('tab-shot-ok');
+        // Only the CDP path times out; the fallback resolves immediately.
+        await vi.advanceTimersByTimeAsync(5_000);
+        await expect(pending).resolves.toEqual({
+          base64: Buffer.from('jpeg-bytes').toString('base64'),
+          width: 1280,
+          height: 800,
+        });
+        expect(wc.capturePage).toHaveBeenCalledWith(undefined, {
+          stayHidden: true,
+          stayAwake: true,
+        });
+      } finally {
+        vi.useRealTimers();
+        embeddedBrowserCdp.unregisterTab('tab-shot-ok');
+      }
+    });
+
+    it('falls back when CDP reports a zero-sized layout viewport', async () => {
+      const image = capturedImage(640, 480);
+      const wc = screenshotWebContents({ capturePage: vi.fn().mockResolvedValue(image) });
+      wc.debugger.sendCommand.mockResolvedValue({
+        layoutViewport: { clientWidth: 0, clientHeight: 0 },
+      });
+      embeddedBrowserCdp.registerTab('tab-shot-zero-viewport', 403);
+
+      try {
+        await expect(embeddedBrowserCdp.screenshot('tab-shot-zero-viewport')).resolves.toEqual({
+          base64: Buffer.from('jpeg-bytes').toString('base64'),
+          width: 640,
+          height: 480,
+        });
+        expect(wc.debugger.sendCommand).not.toHaveBeenCalledWith(
+          'Page.captureScreenshot',
+          expect.anything(),
+        );
+        expect(wc.capturePage).toHaveBeenCalledOnce();
+      } finally {
+        embeddedBrowserCdp.unregisterTab('tab-shot-zero-viewport');
+      }
+    });
+
+    it('falls back when Page.captureScreenshot returns empty data', async () => {
+      const image = capturedImage(800, 600);
+      const wc = screenshotWebContents({ capturePage: vi.fn().mockResolvedValue(image) });
+      wc.debugger.sendCommand.mockImplementation((method: string) => {
+        if (method === 'Page.getLayoutMetrics') {
+          return Promise.resolve({ layoutViewport: { clientWidth: 800, clientHeight: 600 } });
+        }
+        return Promise.resolve({ data: '' });
+      });
+      embeddedBrowserCdp.registerTab('tab-shot-empty-cdp', 404);
+
+      try {
+        await expect(embeddedBrowserCdp.screenshot('tab-shot-empty-cdp')).resolves.toEqual({
+          base64: Buffer.from('jpeg-bytes').toString('base64'),
+          width: 800,
+          height: 600,
+        });
+        expect(wc.capturePage).toHaveBeenCalledOnce();
+      } finally {
+        embeddedBrowserCdp.unregisterTab('tab-shot-empty-cdp');
+      }
+    });
+
+    it('rejects when the capturePage fallback returns an empty NativeImage', async () => {
+      const image = {
+        isEmpty: () => true,
+        getSize: () => ({ width: 0, height: 0 }),
+        toJPEG: vi.fn(() => Buffer.alloc(0)),
+      };
+      const wc = screenshotWebContents({ capturePage: vi.fn().mockResolvedValue(image) });
+      wc.debugger.sendCommand.mockResolvedValue({
+        layoutViewport: { clientWidth: 0, clientHeight: 0 },
+      });
+      embeddedBrowserCdp.registerTab('tab-shot-empty-fallback', 405);
+
+      try {
+        await expect(embeddedBrowserCdp.screenshot('tab-shot-empty-fallback')).rejects.toThrow(
+          'Electron fallback stage: webContents.capturePage returned an empty image (0x0)',
+        );
+        expect(image.toJPEG).not.toHaveBeenCalled();
+      } finally {
+        embeddedBrowserCdp.unregisterTab('tab-shot-empty-fallback');
+      }
+    });
   });
 });

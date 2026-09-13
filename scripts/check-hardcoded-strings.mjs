@@ -20,6 +20,9 @@
 // Suppress a deliberate literal by putting `i18n-ignore` in a comment on the
 // same line or the line above.
 //
+// Component-catalog / test scaffolding files (see SCAFFOLDING_FILE_RE) are
+// excluded from the scan entirely — their strings are developer-facing.
+//
 // Usage: node scripts/check-hardcoded-strings.mjs [dir ...] [--baseline path]
 //   With no dirs, scans ENFORCED_DIRS and applies the checked-in debt baseline.
 //   Explicit dirs have no baseline unless --baseline is provided (used by tests).
@@ -84,9 +87,8 @@ const ENFORCED_DIRS = [
   'src/features/debug-export',
   'src/lib/services',
   // agent feature: renderer services + browser/services/utils and the two
-  // user-facing main-process files. main/instructions/, main/instruction-service,
-  // specialists/rules-loader (agent prompt content), testing/ (harness), and
-  // agent-launch-core (prompt building) are intentionally not enforced.
+  // user-facing main-process files. testing/ (harness) and agent-launch-core
+  // (prompt building) are intentionally not enforced.
   'src/features/agent/browser',
   'src/features/agent/services',
   'src/features/agent/utils',
@@ -103,7 +105,6 @@ const ENFORCED_DIRS = [
   'src/features/agent/chat-read-service.ts',
   'src/features/agent/interrupted-agents-service.ts',
   'src/features/agent/main/agent-missing.ipc.ts',
-  'src/features/agent/main/agent-validator.ts',
   'src/features/agent/main/stream-manager.ts',
   // provider integrations. acp-official main/server, parsers, and plans emit
   // agent-facing wire content; cortex/cortex-acp is a standalone stdio adapter
@@ -120,12 +121,11 @@ const ENFORCED_DIRS = [
   'src/features/opencode',
   'src/features/pi',
   'src/features/providers',
-  // remaining feature dirs (final flip). agent/main/instructions, agent/testing,
-  // agent/agent-launch-core, acp-official main/server + parsers/plans, and
-  // cortex/cortex-acp emit agent-facing prompt/wire content — intentionally
-  // not enforced.
+  'src/features/antigravity',
+  // remaining feature dirs (final flip). agent/testing, agent/agent-launch-core,
+  // acp-official main/server + parsers/plans, and cortex/cortex-acp emit
+  // agent-facing prompt/wire content — intentionally not enforced.
   'src/features/accept-changes',
-  'src/features/agent-testing',
   'src/features/auto-update',
   'src/features/backend',
   'src/features/cdp',
@@ -155,7 +155,6 @@ const ENFORCED_DIRS = [
   'src/features/scripts',
   'src/features/setup-scripts',
   'src/features/specialists',
-  'src/features/storage',
   'src/features/system',
   'src/features/tasks',
   'src/features/token-usage',
@@ -185,6 +184,20 @@ const SKIP_DIRS = new Set([
   '__mocks__',
 ]);
 
+// Developer-facing scaffolding excluded from the gate (intent-hq/monorepo#2248):
+// component-catalog visual harnesses (*Harness.svelte), component-test harnesses
+// (*.test-harness.svelte), catalog fixtures (*.fixtures.ts), preview definitions
+// (*.preview.ts / *.preview.svelte / *.preview-fixtures.ts), catalog metadata
+// (*.meta.ts), and playwright configs (*.playwright.config.ts). These files are
+// demo/test scaffolding, not product UI; strings surfacing in the in-app component
+// catalog (a developer tool) are accepted.
+const SCAFFOLDING_FILE_RE =
+  /(?:Harness\.svelte|\.test-harness\.svelte|\.fixtures\.ts|\.preview\.(?:svelte|ts)|\.preview-fixtures\.ts|\.meta\.ts|\.playwright\.config\.ts)$/;
+
+// Counted per run and reported so name-based exclusions stay visible in CI
+// logs (a product file accidentally matching the pattern shows up here).
+let excludedScaffoldingFiles = 0;
+
 const USER_FACING_ATTRS = [
   'placeholder',
   'title',
@@ -207,6 +220,10 @@ function isCheckedFile(absPath) {
   const norm = absPath.split('\\').join('/');
   if (norm.endsWith('.d.ts')) return false;
   if (/\.(test|spec)\.(ts|js|mjs|cjs)$/.test(norm)) return false;
+  if (SCAFFOLDING_FILE_RE.test(norm)) {
+    excludedScaffoldingFiles++;
+    return false;
+  }
   if (!/\.(svelte|ts)$/.test(norm)) return false;
   return true;
 }
@@ -764,6 +781,11 @@ async function main() {
 
   console.log(`${CYAN}=== Hardcoded user-facing string gate (i18n) ===${NC}`);
   const violations = await collectViolations(dirs);
+  if (excludedScaffoldingFiles > 0) {
+    console.log(
+      `Excluded ${excludedScaffoldingFiles} scaffolding file(s) (harnesses, fixtures, previews, catalog metadata, playwright configs).`,
+    );
+  }
 
   if (options.updateBaseline) {
     const entries = baselineEntries(violations);

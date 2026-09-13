@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { runSaga, stdChannel } from 'redux-saga';
 import { createCollection } from '@augmentcode/themis/utils/collections/collection-utils';
 
@@ -11,9 +11,37 @@ const mocks = vi.hoisted(() => ({
   stop: vi.fn(),
   rename: vi.fn(),
   toastInfo: vi.fn(),
+  toastError: vi.fn(),
+  // Retry-on-another-provider (#4455): the per-provider `models.list` catalog
+  // and the live-session provider switch are the two daemon round-trips the
+  // handler brackets; both are stubbed per-test.
+  getModelsForProvider: vi.fn(),
+  setModel: vi.fn(),
+  // Image pre-upload (monorepo#3338): default maps each inline block to a
+  // deterministic reference block; individual tests override to assert the
+  // failure path.
+  toImageReferenceBlocks: vi.fn(
+    async (_wsId: string, blocks: Array<{ attachmentId?: string; mimeType?: string }>) =>
+      blocks.map((block, i) => ({
+        type: 'image' as const,
+        attachmentId: block.attachmentId ?? `attach-${i}`,
+        ...(block.mimeType ? { mimeType: block.mimeType } : {}),
+      })),
+  ),
 }));
 vi.mock('$features/agent/agent-send', () => ({ sendMessage: mocks.send }));
-vi.mock('svelte-sonner', () => ({ toast: { info: mocks.toastInfo } }));
+vi.mock('svelte-sonner', () => ({
+  toast: { info: mocks.toastInfo, error: mocks.toastError },
+}));
+vi.mock('../../model/model-utils', () => ({
+  getModelsForProviderForLoadingState: mocks.getModelsForProvider,
+}));
+vi.mock('$features/agent/agent.client', () => ({
+  agentClient: { setModel: mocks.setModel },
+}));
+vi.mock('$lib/components/chat/input/image-attachment-placement', () => ({
+  toImageReferenceBlocks: mocks.toImageReferenceBlocks,
+}));
 vi.mock('$lib/client', () => ({
   appClient: {
     agents: {
@@ -38,8 +66,10 @@ import type { AgentSession, QueuedMessage, Workspace } from '$shared/types';
 import { AgentStatus, WorkspaceStatusEnum } from '$shared/types';
 import {
   agentSessionReducer,
+  agentSessionRetryFromStalledRequested,
   agentSessionRetryLastMessageRequested,
   agentSessionRetryWithModelRequested,
+  agentSessionRetryWithProviderRequested,
   agentSessionStopChatRequested,
   bulkUpsertSessions,
   initialState as sessionInitialState,
@@ -59,10 +89,13 @@ import {
   chatQueueProcessingReceived,
   chatQueuedRetryRecordSet,
   chatLastAttemptedMessageSet,
+  chatSendFailed,
   initialState as chatInitialState,
   chatStateReducer,
   refreshChatTranscriptRequested,
   sendMessage,
+  streamActivityReceived,
+  streamStatusReceived,
   transcriptHydrationSettled,
 } from '../chat-state-slice';
 import { chatSendSaga } from './chat-send-saga';
@@ -102,6 +135,12 @@ function harness(
   seedSession: AgentSession | AgentSession[] = session(),
   getStateError?: () => Error | undefined,
   workspaceRecord?: Workspace | null,
+  /**
+   * `model.providerDefaults` mirrored renderer-side — the user's configured
+   * model per provider. Seeded here so the quota-retry pick can assert that a
+   * user's own choice wins over the provider's advertised default.
+   */
+  providerModels: Record<string, string> = {},
 ) {
   const channel = stdChannel();
   const seedSessions = Array.isArray(seedSession) ? seedSession : [seedSession];
@@ -129,7 +168,7 @@ function harness(
       getState: () => {
         const error = getStateError?.();
         if (error) throw error;
-        return { agentSessions, chatState, agentQueue, workspace };
+        return { agentSessions, chatState, agentQueue, workspace, model: { providerModels } };
       },
     },
     chatSendSaga,
@@ -138,7 +177,10 @@ function harness(
     channel,
     dispatch,
     task,
-    setChat: (action: ReturnType<typeof chatLastAttemptedMessageSet>) => {
+    setChat: (
+      action:
+        ReturnType<typeof chatLastAttemptedMessageSet> | ReturnType<typeof streamStatusReceived>,
+    ) => {
       chatState = chatStateReducer(chatState, action);
     },
     settleTranscript: (agentId = AGENT) => {
@@ -221,13 +263,18 @@ describe('chatSendSaga', () => {
     await settle();
 
     expect(mocks.send).toHaveBeenCalledTimes(1);
+    // Inline image blocks are pre-uploaded and swapped to attachment
+    // references before the wire call (monorepo#3338).
+    expect(mocks.toImageReferenceBlocks).toHaveBeenCalledWith(WS, [
+      { type: 'image', data: 'abc', mimeType: 'image/png' },
+    ]);
     expect(mocks.send).toHaveBeenNthCalledWith(
       1,
       AGENT,
       'first',
       expect.objectContaining({ id: WS }),
       {
-        imageBlocks: [{ type: 'image', data: 'abc', mimeType: 'image/png' }],
+        imageBlocks: [{ type: 'image', attachmentId: 'attach-0', mimeType: 'image/png' }],
         noteIds: ['note-1'],
         userAppMessageId: 'app-message-first',
         priority: 'interrupt',
@@ -437,6 +484,30 @@ describe('chatSendSaga', () => {
     await run.task.toPromise();
   });
 
+  it('surfaces a direct-send RPC failure via chatSendFailed with the retry payload preserved (monorepo#3040)', async () => {
+    // Reaped-agent contract (intent-hq/intentd#1356): sends to an evicted
+    // process auto-restore, so a THROW from sendMessage is a genuine failure
+    // (agent deleted / RPC error) — it must surface in the chat, never render
+    // as silently accepted. `chatLastAttemptedMessageSet` was dispatched
+    // before the wire call, so the failure banner's "Try again" can resend.
+    mocks.send.mockRejectedValue(new Error('Agent not found: agent-send'));
+    const run = harness();
+    run.channel.put(sendMessage(AGENT, { wsId: WS, text: 'hello after reap' }));
+    await settle();
+
+    expect(run.dispatch).toHaveBeenCalledWith(
+      chatLastAttemptedMessageSet(AGENT, { text: 'hello after reap' }),
+    );
+    // The positive assertion above is satisfied by the pre-wire dispatch, so
+    // also pin the invariant: the direct-send catch must never null the retry
+    // record (the way the sendQueuedNow failure paths do) — that would break
+    // the failure banner's "Try again".
+    expect(run.dispatch).not.toHaveBeenCalledWith(chatLastAttemptedMessageSet(AGENT, null));
+    expect(run.dispatch).toHaveBeenCalledWith(chatSendFailed(AGENT, 'Agent not found: agent-send'));
+    run.task.cancel();
+    await run.task.toPromise();
+  });
+
   it('queues a normal send for a busy agent with the exact daemon payload', async () => {
     mocks.queue.mockResolvedValue({
       success: true,
@@ -459,8 +530,10 @@ describe('chatSendSaga', () => {
     );
     await settle();
 
+    // Queued sends carry the converted reference blocks too — the retry
+    // record matches the wire payload (no re-upload on retry).
     expect(mocks.queue).toHaveBeenCalledWith(AGENT, 'later', {
-      imageBlocks: [{ type: 'image', data: 'abc', mimeType: 'image/png' }],
+      imageBlocks: [{ type: 'image', attachmentId: 'attach-0', mimeType: 'image/png' }],
     });
     expect(mocks.send).not.toHaveBeenCalled();
     expect(run.dispatch).toHaveBeenCalledWith(
@@ -469,11 +542,36 @@ describe('chatSendSaga', () => {
         'queued-1',
         {
           text: 'later',
-          options: { imageBlocks: [{ type: 'image', data: 'abc', mimeType: 'image/png' }] },
+          options: {
+            imageBlocks: [{ type: 'image', attachmentId: 'attach-0', mimeType: 'image/png' }],
+          },
         },
         'turn-queued',
       ),
     );
+    run.task.cancel();
+    await run.task.toPromise();
+  });
+
+  it('forwards the Q&A answer tag on the busy-agent queue payload', async () => {
+    const messageMetadata = { type: 'question_answers', answeredQuestionsMessageId: 'msg-q1' };
+    mocks.queue.mockResolvedValue({
+      success: true,
+      turnId: 'turn-queued',
+      queuedMessage: { id: 'queued-1', content: 'Q: Auth method\nA: OAuth', timestamp: 1 },
+    });
+    const run = harness(
+      session({ status: AgentStatus.Active, isStreaming: true, isProcessing: true }),
+    );
+    run.channel.put(
+      sendMessage(AGENT, { wsId: WS, text: 'Q: Auth method\nA: OAuth', messageMetadata }),
+    );
+    await settle();
+
+    expect(mocks.queue).toHaveBeenCalledWith(AGENT, 'Q: Auth method\nA: OAuth', {
+      messageMetadata,
+    });
+    expect(mocks.send).not.toHaveBeenCalled();
     run.task.cancel();
     await run.task.toPromise();
   });
@@ -747,5 +845,355 @@ describe('chatSendSaga', () => {
     expect(mocks.toastInfo).not.toHaveBeenCalled();
     run.task.cancel();
     await run.task.toPromise();
+  });
+
+  it('retry-from-stalled stops the hung turn and re-sends the last attempt with interrupt priority', async () => {
+    mocks.stop.mockResolvedValue({ success: true });
+    mocks.send.mockResolvedValue(undefined);
+    const run = harness();
+    run.setChat(
+      streamStatusReceived(
+        AGENT,
+        { phase: 'stalled', message: 'No model activity', level: 'warn', timestamp: Date.now() },
+        false,
+      ),
+    );
+    run.setChat(chatLastAttemptedMessageSet(AGENT, { text: 'stalled send', options: {} }));
+
+    const retry = agentSessionRetryFromStalledRequested(AGENT, WS);
+    run.channel.put(retry);
+    await expect(retry.promise).resolves.toBeUndefined();
+
+    expect(mocks.stop).toHaveBeenCalledWith(AGENT);
+    expect(mocks.send).toHaveBeenCalledWith(
+      AGENT,
+      'stalled send',
+      expect.objectContaining({ id: WS }),
+      expect.objectContaining({ priority: 'interrupt' }),
+    );
+    run.task.cancel();
+    await run.task.toPromise();
+  });
+
+  it('retry-from-stalled abandons the re-send when the user cancels mid-retry', async () => {
+    // The retry's own stop RPC hangs while the user clicks Cancel: the
+    // concurrent agentSessionStopChatRequested must win the race so no
+    // message is re-sent after the user chose to stop.
+    let releaseRetryStop!: (value: { success: boolean }) => void;
+    mocks.stop
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            releaseRetryStop = resolve;
+          }),
+      )
+      .mockResolvedValue({ success: true });
+    mocks.send.mockResolvedValue(undefined);
+    const run = harness();
+    run.setChat(
+      streamStatusReceived(
+        AGENT,
+        { phase: 'stalled', message: 'No model activity', level: 'warn', timestamp: Date.now() },
+        false,
+      ),
+    );
+    run.setChat(chatLastAttemptedMessageSet(AGENT, { text: 'stalled send', options: {} }));
+
+    const retry = agentSessionRetryFromStalledRequested(AGENT, WS);
+    run.channel.put(retry);
+    await settle();
+    expect(mocks.stop).toHaveBeenCalledTimes(1);
+
+    const stop = agentSessionStopChatRequested(AGENT);
+    run.channel.put(stop);
+    releaseRetryStop({ success: true });
+
+    await expect(retry.promise).resolves.toBeUndefined();
+    await expect(stop.promise).resolves.toBeUndefined();
+    expect(mocks.send).not.toHaveBeenCalled();
+    run.task.cancel();
+    await run.task.toPromise();
+  });
+
+  it('retry-from-stalled is a no-op when the stall is no longer active', async () => {
+    const run = harness();
+    // Stalled event followed by a later stream chunk: stall superseded.
+    run.setChat(
+      streamStatusReceived(
+        AGENT,
+        { phase: 'stalled', message: 'No model activity', level: 'warn', timestamp: 1_000 },
+        false,
+      ),
+    );
+    run.setChat(chatLastAttemptedMessageSet(AGENT, { text: 'stalled send', options: {} }));
+    run.dispatch(streamActivityReceived(AGENT, true, 2_000));
+
+    const retry = agentSessionRetryFromStalledRequested(AGENT, WS);
+    run.channel.put(retry);
+    await expect(retry.promise).resolves.toBeUndefined();
+
+    expect(mocks.stop).not.toHaveBeenCalled();
+    expect(mocks.send).not.toHaveBeenCalled();
+    run.task.cancel();
+    await run.task.toPromise();
+  });
+
+  it('retry-from-stalled with no recorded attempt stops the turn and toasts', async () => {
+    mocks.stop.mockResolvedValue({ success: true });
+    const run = harness();
+    run.setChat(
+      streamStatusReceived(
+        AGENT,
+        { phase: 'stalled', message: 'No model activity', level: 'warn', timestamp: Date.now() },
+        false,
+      ),
+    );
+
+    const retry = agentSessionRetryFromStalledRequested(AGENT, WS);
+    run.channel.put(retry);
+    await expect(retry.promise).resolves.toBeUndefined();
+
+    expect(mocks.stop).toHaveBeenCalledWith(AGENT);
+    expect(mocks.send).not.toHaveBeenCalled();
+    await vi.waitFor(() => expect(mocks.toastInfo).toHaveBeenCalledTimes(1));
+    run.task.cancel();
+    await run.task.toPromise();
+  });
+  describe('retry on another provider (#4455)', () => {
+    const OTHER_PROVIDER = 'codex';
+
+    beforeEach(() => {
+      // `vi.clearAllMocks()` keeps mock implementations, so without an
+      // explicit per-test seed each case would silently inherit the previous
+      // test's catalog and fail when run in isolation (`-t`). Reset both
+      // saga-facing mocks and install the default catalog; tests that need a
+      // different shape override it below. Row order matters: the isDefault
+      // row must win over the first row, so the catalog deliberately puts a
+      // non-default first.
+      mocks.getModelsForProvider.mockReset();
+      mocks.setModel.mockReset();
+      mocks.send.mockReset();
+      mocks.queue.mockReset();
+      mocks.getModelsForProvider.mockResolvedValue({
+        models: [
+          { value: 'gpt-5-mini', label: 'Mini' },
+          { value: 'gpt-5-codex', label: 'Codex', isDefault: true },
+        ],
+      });
+      mocks.setModel.mockResolvedValue({ ok: true, data: { success: true } });
+      mocks.send.mockResolvedValue(undefined);
+    });
+
+    /** The wire sends issued by the redrive, as `[agentId, text, model]`. */
+    function sentTurns() {
+      return mocks.send.mock.calls.map(([agentId, text, , options]) => [
+        agentId,
+        text,
+        options?.model,
+      ]);
+    }
+
+    it('switches the session to the provider default model, then redrives the turn', async () => {
+      const run = harness();
+      run.setChat(chatLastAttemptedMessageSet(AGENT, { text: 'retry me', options: {} }));
+
+      const retry = agentSessionRetryWithProviderRequested(AGENT, WS, OTHER_PROVIDER);
+      run.channel.put(retry);
+      await expect(retry.promise).resolves.toBeUndefined();
+
+      expect(mocks.getModelsForProvider).toHaveBeenCalledWith(OTHER_PROVIDER);
+      expect(mocks.setModel).toHaveBeenCalledWith(AGENT, 'gpt-5-codex', WS, OTHER_PROVIDER);
+      // The redrive MUST carry the newly picked model as an explicit
+      // override on the wire: the plain last-message retry resolves the
+      // model from the recorded attempt (the exhausted provider's model) or
+      // the stale Redux session, either of which re-sends the model we just
+      // switched away from and defeats the recovery.
+      expect(sentTurns()).toEqual([[AGENT, 'retry me', 'gpt-5-codex']]);
+      // The redrive ran inline; it is not re-queued as its own command.
+      expect(
+        run.dispatch.mock.calls.filter(
+          ([action]) =>
+            action.type === agentSessionRetryWithModelRequested.type ||
+            action.type === agentSessionRetryLastMessageRequested.type,
+        ),
+      ).toHaveLength(0);
+      expect(mocks.toastError).not.toHaveBeenCalled();
+      run.task.cancel();
+      await run.task.toPromise();
+    });
+
+    it('a second provider click queued during the first switch cannot hijack the first redrive', async () => {
+      // The provider buttons stay rendered while the first click's catalog
+      // and setModel RPCs are in flight, so a second click is already queued
+      // on the per-agent FIFO by the time the first handler is ready to
+      // redrive. If that redrive were put back onto the FIFO it would run
+      // AFTER the second click's setModel, sending the first provider's
+      // model against the second provider's live session. Each click must
+      // therefore complete switch + send before the next click's switch.
+      //
+      // Once the first redrive's turn is live the session is responding, so
+      // the second click's redrive takes the ordinary enqueue path (the
+      // daemon drains it on the session's then-current provider) rather than
+      // a second direct send — the same rule as any send during a turn.
+      const SECOND_PROVIDER = 'claude-code';
+      mocks.getModelsForProvider.mockImplementation(async (providerId: string) => ({
+        models:
+          providerId === OTHER_PROVIDER
+            ? [{ value: 'gpt-5-codex', label: 'Codex', isDefault: true }]
+            : [{ value: 'claude-opus', label: 'Opus', isDefault: true }],
+      }));
+      mocks.queue.mockResolvedValue({ success: true });
+      const run = harness();
+      run.setChat(chatLastAttemptedMessageSet(AGENT, { text: 'retry me', options: {} }));
+
+      const first = agentSessionRetryWithProviderRequested(AGENT, WS, OTHER_PROVIDER);
+      const second = agentSessionRetryWithProviderRequested(AGENT, WS, SECOND_PROVIDER);
+      run.channel.put(first);
+      run.channel.put(second);
+      await expect(first.promise).resolves.toBeUndefined();
+      await expect(second.promise).resolves.toBeUndefined();
+
+      // The first provider's model is what went out on the first (and only
+      // direct) send; the second click did not hijack it.
+      expect(sentTurns()).toEqual([[AGENT, 'retry me', 'gpt-5-codex']]);
+      expect(mocks.setModel).toHaveBeenNthCalledWith(1, AGENT, 'gpt-5-codex', WS, OTHER_PROVIDER);
+      expect(mocks.setModel).toHaveBeenNthCalledWith(2, AGENT, 'claude-opus', WS, SECOND_PROVIDER);
+      // Interleaving on the wire: switch(1) → send(1) → switch(2) → queue(2),
+      // never switch(1) → switch(2) → send(1).
+      const [switch1, switch2] = mocks.setModel.mock.invocationCallOrder;
+      const [send1] = mocks.send.mock.invocationCallOrder;
+      const [queue2] = mocks.queue.mock.invocationCallOrder;
+      expect(switch1).toBeLessThan(send1);
+      expect(send1).toBeLessThan(switch2);
+      expect(switch2).toBeLessThan(queue2);
+      expect(mocks.queue).toHaveBeenCalledTimes(1);
+      expect(mocks.queue).toHaveBeenCalledWith(AGENT, 'retry me');
+      expect(mocks.toastError).not.toHaveBeenCalled();
+      run.task.cancel();
+      await run.task.toPromise();
+    });
+
+    it("honours the user's configured model for the target provider (#4455)", async () => {
+      // `model.providerDefaults` is where the user has already said which
+      // model this provider should use — the same setting the model picker
+      // and the daemon's creation-time chain honour. A failover that landed
+      // on the provider's advertised default instead would silently override
+      // an explicit preference.
+      const run = harness(session(), undefined, undefined, {
+        [OTHER_PROVIDER]: 'gpt-5-mini',
+      });
+      run.setChat(chatLastAttemptedMessageSet(AGENT, { text: 'retry me', options: {} }));
+
+      const retry = agentSessionRetryWithProviderRequested(AGENT, WS, OTHER_PROVIDER);
+      run.channel.put(retry);
+      await expect(retry.promise).resolves.toBeUndefined();
+
+      // 'gpt-5-codex' is the catalog's isDefault row; the user's choice wins.
+      expect(mocks.setModel).toHaveBeenCalledWith(AGENT, 'gpt-5-mini', WS, OTHER_PROVIDER);
+      expect(sentTurns()).toEqual([[AGENT, 'retry me', 'gpt-5-mini']]);
+      run.task.cancel();
+      await run.task.toPromise();
+    });
+
+    it('ignores a configured model the provider no longer serves (#4455)', async () => {
+      // A persisted id that has been renamed or retired must not reach
+      // agent.setModel, which would reject it — fall back to the catalog.
+      const run = harness(session(), undefined, undefined, {
+        [OTHER_PROVIDER]: 'model-that-no-longer-exists',
+      });
+      run.setChat(chatLastAttemptedMessageSet(AGENT, { text: 'retry me', options: {} }));
+
+      const retry = agentSessionRetryWithProviderRequested(AGENT, WS, OTHER_PROVIDER);
+      run.channel.put(retry);
+      await expect(retry.promise).resolves.toBeUndefined();
+
+      expect(mocks.setModel).toHaveBeenCalledWith(AGENT, 'gpt-5-codex', WS, OTHER_PROVIDER);
+      run.task.cancel();
+      await run.task.toPromise();
+    });
+
+    it('falls back to the first catalog row when no model is flagged default', async () => {
+      mocks.getModelsForProvider.mockResolvedValue({
+        models: [
+          { value: 'gpt-5-mini', label: 'Mini' },
+          { value: 'gpt-5-codex', label: 'Codex' },
+        ],
+      });
+      const run = harness();
+
+      const retry = agentSessionRetryWithProviderRequested(AGENT, WS, OTHER_PROVIDER);
+      run.channel.put(retry);
+      await expect(retry.promise).resolves.toBeUndefined();
+
+      expect(mocks.setModel).toHaveBeenCalledWith(AGENT, 'gpt-5-mini', WS, OTHER_PROVIDER);
+      run.task.cancel();
+      await run.task.toPromise();
+    });
+
+    it.each([
+      {
+        mode: 'transport failure',
+        result: { ok: false, error: 'IPC not available' },
+        expected: 'IPC not available',
+      },
+      {
+        mode: 'daemon rejection',
+        result: { ok: true, data: { success: false, error: 'provider not installed' } },
+        expected: 'provider not installed',
+      },
+    ])('does not redrive when setModel reports a $mode', async ({ result, expected }) => {
+      mocks.setModel.mockResolvedValue(result);
+      const run = harness();
+      run.setChat(chatLastAttemptedMessageSet(AGENT, { text: 'retry me', options: {} }));
+
+      const retry = agentSessionRetryWithProviderRequested(AGENT, WS, OTHER_PROVIDER);
+      await expect(
+        (async () => {
+          run.channel.put(retry);
+          return retry.promise;
+        })(),
+      ).rejects.toThrow(expected);
+
+      expect(
+        run.dispatch.mock.calls.filter(
+          ([action]) => action.type === agentSessionRetryLastMessageRequested.type,
+        ),
+      ).toHaveLength(0);
+      expect(mocks.send).not.toHaveBeenCalled();
+      await vi.waitFor(() => expect(mocks.toastError).toHaveBeenCalledTimes(1));
+      run.task.cancel();
+      await run.task.toPromise();
+    });
+
+    it.each([
+      {
+        mode: 'an empty catalog',
+        setup: () => mocks.getModelsForProvider.mockResolvedValue({ models: [] }),
+      },
+      {
+        mode: 'a failed catalog fetch',
+        setup: () => mocks.getModelsForProvider.mockRejectedValue(new Error('models.list failed')),
+      },
+    ])('never calls setModel on $mode', async ({ setup }) => {
+      setup();
+      const run = harness();
+      run.setChat(chatLastAttemptedMessageSet(AGENT, { text: 'retry me', options: {} }));
+
+      const retry = agentSessionRetryWithProviderRequested(AGENT, WS, OTHER_PROVIDER);
+      run.channel.put(retry);
+      // Resolves, not rejects: nothing was mutated, so this is a reported
+      // no-op rather than a broken command.
+      await expect(retry.promise).resolves.toBeUndefined();
+
+      expect(mocks.setModel).not.toHaveBeenCalled();
+      expect(
+        run.dispatch.mock.calls.filter(
+          ([action]) => action.type === agentSessionRetryLastMessageRequested.type,
+        ),
+      ).toHaveLength(0);
+      await vi.waitFor(() => expect(mocks.toastError).toHaveBeenCalledTimes(1));
+      run.task.cancel();
+      await run.task.toPromise();
+    });
   });
 });

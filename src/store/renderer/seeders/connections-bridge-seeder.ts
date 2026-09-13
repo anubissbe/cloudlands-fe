@@ -2,7 +2,8 @@
  * Connections IPC bridge — mock fallback for the multi-backend connect channels.
  *
  * Bridges the `connections:*` request/response channels (`list`,
- * `capture-fingerprint`, `add`, `forget`, `switch`) so the connections service
+ * `capture-fingerprint`, `add`, `forget`, `open`, `update`, `test`,
+ * `rotate-secret`) so the connections service
  * thunks resolve in bridge-less builds (browser mock) and tests instead of
  * rejecting with UnbridgedMockIpcChannelError.
  *
@@ -26,9 +27,16 @@ import type {
   AddConnectionResult,
   ForgetConnectionParams,
   ForgetConnectionResult,
-  SwitchConnectionParams,
-  SwitchConnectionResult,
-  ConnectionBootFallbackEvent,
+  OpenConnectionParams,
+  OpenConnectionResult,
+  UpdateBackendParams,
+  UpdateBackendResult,
+  KeychainSyncStateResult,
+  SetKeychainSyncEnabledParams,
+  PublishSelfResult,
+  RefreshSelfResult,
+  SelfPublishedStateResult,
+  UnpublishSelfResult,
 } from '$shared/types/connections';
 
 /** The always-present, non-forgettable local sidecar entry. */
@@ -41,12 +49,12 @@ const LOCAL_ENTRY: ConnectionRecord = {
   isLocal: true,
 };
 
-// Session-scoped in-memory store so add/forget/switch stay coherent with list.
+// Session-scoped in-memory store so add/forget/open stay coherent with list.
 let connections: ConnectionRecord[] = [LOCAL_ENTRY];
 let activeId: string = LOCAL_CONNECTION_ID;
 
 registerMockIpcHandler(CONNECTION_CHANNELS.LIST, async (): Promise<ConnectionsListResult> => {
-  return { connections: [...connections], activeId };
+  return { connections: [...connections], activeId, windowBackendId: LOCAL_CONNECTION_ID };
 });
 
 registerMockIpcHandler(
@@ -72,6 +80,8 @@ registerMockIpcHandler(CONNECTION_CHANNELS.ADD, async (arg): Promise<AddConnecti
     host: params.host,
     port: params.port,
     fingerprint: params.fingerprint,
+    // Mirrors the store's normalization: always a boolean on stored records.
+    syncExcluded: params.syncExcluded === true,
     isLocal: false,
   };
   connections = [...connections.filter((c) => c.id !== connection.id), connection];
@@ -88,18 +98,100 @@ registerMockIpcHandler(CONNECTION_CHANNELS.FORGET, async (arg): Promise<ForgetCo
   return { id };
 });
 
-registerMockIpcHandler(CONNECTION_CHANNELS.SWITCH, async (arg): Promise<SwitchConnectionResult> => {
-  const { id } = arg as SwitchConnectionParams;
-  if (connections.some((c) => c.id === id)) activeId = id;
-  return { activeId };
+const FORWARDED_DEVICE_CHANNELS = [
+  CONNECTION_CHANNELS.OPEN,
+  CONNECTION_CHANNELS.UPDATE,
+  CONNECTION_CHANNELS.TEST,
+  CONNECTION_CHANNELS.ROTATE_SECRET,
+] as const;
+
+for (const channel of FORWARDED_DEVICE_CHANNELS) {
+  registerMockIpcHandler(channel, async (arg) => {
+    const bridge = typeof window !== 'undefined' ? window.electronAPI : undefined;
+    const invoke = bridge?.invoke as
+      ((channel: string, payload?: unknown) => Promise<unknown>) | undefined;
+    if (invoke) return invoke(channel, arg);
+
+    if (channel === CONNECTION_CHANNELS.OPEN) {
+      const { id } = arg as OpenConnectionParams;
+      return { status: 'opened', id } satisfies OpenConnectionResult;
+    }
+    return { status: 'failed', reason: 'connect-failed' };
+  });
+}
+
+// Remote self-update request. The mock has no live pooled clients, so every
+// target reads as not connected — mirroring the main handler's gate.
+registerMockIpcHandler(
+  CONNECTION_CHANNELS.UPDATE_BACKEND,
+  async (arg): Promise<UpdateBackendResult> => {
+    const { id } = arg as UpdateBackendParams;
+    if (id === LOCAL_CONNECTION_ID) return { ok: false, reason: 'unsupported' };
+    return { ok: false, reason: 'not-connected' };
+  },
+);
+
+// iCloud-keychain sync (T4). The browser/mock environment has no macOS
+// keychain, so sync reads as unsupported; the pref round-trips in memory so
+// the toggle wiring stays testable.
+let keychainSyncEnabled = false;
+
+function keychainSyncState(): KeychainSyncStateResult {
+  return { supported: false, enabled: keychainSyncEnabled, status: null };
+}
+
+registerMockIpcHandler(
+  CONNECTION_CHANNELS.SYNC_GET_STATE,
+  async (): Promise<KeychainSyncStateResult> => keychainSyncState(),
+);
+
+registerMockIpcHandler(
+  CONNECTION_CHANNELS.SYNC_SET_ENABLED,
+  async (arg): Promise<KeychainSyncStateResult> => {
+    keychainSyncEnabled = (arg as SetKeychainSyncEnabledParams).enabled;
+    return keychainSyncState();
+  },
+);
+
+// Self-publish (publish THIS machine's backend to the synced registry). The
+// mock environment has no local daemon / keychain, so the state reads as
+// never-published and publish round-trips a synthetic self record in memory.
+let selfPublished = false;
+
+registerMockIpcHandler(
+  CONNECTION_CHANNELS.SELF_PUBLISHED_STATE,
+  async (): Promise<SelfPublishedStateResult> => {
+    return {
+      published: selfPublished,
+      suppressed: false,
+      selfConnectionId: selfPublished ? 'mock-self' : null,
+    };
+  },
+);
+
+registerMockIpcHandler(CONNECTION_CHANNELS.PUBLISH_SELF, async (): Promise<PublishSelfResult> => {
+  selfPublished = true;
+  const connection: ConnectionRecord = {
+    id: 'mock-self',
+    label: 'This machine',
+    host: '127.0.0.1',
+    port: 5181,
+    fingerprint: null,
+    isLocal: false,
+  };
+  return { connection };
 });
 
-// Boot-restore fallback notice (T19). The mock never falls back at boot, so
-// there is no notice to deliver — real fallbacks are latched in the main
-// process and pulled once via this channel (see backend.ipc.ts).
+registerMockIpcHandler(CONNECTION_CHANNELS.REFRESH_SELF, async (): Promise<RefreshSelfResult> => {
+  return { refreshed: selfPublished };
+});
+
 registerMockIpcHandler(
-  CONNECTION_CHANNELS.GET_BOOT_FALLBACK,
-  async (): Promise<{ bootFallback: ConnectionBootFallbackEvent | null }> => {
-    return { bootFallback: null };
+  CONNECTION_CHANNELS.UNPUBLISH_SELF,
+  async (): Promise<UnpublishSelfResult> => {
+    const removed = selfPublished;
+    selfPublished = false;
+    connections = connections.filter((c) => c.id !== 'mock-self');
+    return { removed };
   },
 );

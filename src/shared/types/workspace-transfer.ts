@@ -12,21 +12,18 @@
  * renderer, preload, and main.
  */
 
-import { IPC_CHANNELS } from '../ipc-registry';
-
-/** Request/response + push channel names for the transfer relay. */
-export const TRANSFER_CHANNELS = IPC_CHANNELS.TRANSFER;
-
 /**
- * Push-event channel (main → renderer). Mirrored as a literal in
- * `EVENT_CHANNELS` (ipc-registry.ts) so the preload allow-list includes it.
+ * Machine-readable rejection code: the invoking window does not own the
+ * active relay session (transfer/import sessions are pinned to the window
+ * that started them; see monorepo#3519).
  */
-export const TRANSFER_PROGRESS_EVENT = 'transfer:progress';
+export type SessionOwnershipErrorCode = 'not-session-owner';
 
 /** Where the transfer goes (mirrors the renderer's `TransferDestination`). */
-export type TransferRelayDestination =
-  | { kind: 'server'; connectionId: string }
-  | { kind: 'download' };
+type TransferRelayDestination = { kind: 'server'; connectionId: string } | { kind: 'download' };
+
+/** Whether a failed relay may have stopped source agents or failed before export began. */
+export type TransferFailurePhase = 'preflight' | 'post-export';
 
 /** `transfer:start` params. */
 export interface TransferStartParams {
@@ -41,7 +38,7 @@ export interface TransferStartParams {
  *  - `relaying` — chunks are moving source → main → target/file.
  *  - `committing` — target is reassembling/committing the import.
  */
-export type TransferRelayPhase = 'building' | 'relaying' | 'committing';
+type TransferRelayPhase = 'building' | 'relaying' | 'committing';
 
 /** `transfer:progress` push payload (counters only — never bytes). */
 export interface TransferProgressEvent {
@@ -65,6 +62,10 @@ export interface TransferStartResult {
   /** True when the user dismissed the save dialog (download destination). */
   canceled?: boolean;
   error?: string;
+  /** Present on failure so the renderer can describe source-agent impact accurately. */
+  failurePhase?: TransferFailurePhase;
+  /** Set when another window owns the active session. */
+  code?: SessionOwnershipErrorCode;
   /** Download destination: where the archive was written. */
   filePath?: string;
   /**
@@ -91,6 +92,8 @@ export interface TransferFinalizeParams {
 export interface TransferFinalizeResult {
   success: boolean;
   error?: string;
+  /** Set when another window owns the active session. */
+  code?: SessionOwnershipErrorCode;
   /** Agent ids the target failed to resume (fail-soft, never blocks finalize). */
   resumeFailed?: string[];
 }
@@ -99,13 +102,9 @@ export interface TransferFinalizeResult {
 export interface TransferCancelResult {
   success: boolean;
   error?: string;
+  /** Set when another window owns the active session. */
+  code?: SessionOwnershipErrorCode;
 }
-
-/**
- * Push-event channel (main → renderer) for the import-from-file flow.
- * Mirrored as a literal in `EVENT_CHANNELS` (ipc-registry.ts).
- */
-export const TRANSFER_IMPORT_PROGRESS_EVENT = 'transfer:import-progress';
 
 /** `transfer:import-start` params. */
 export interface ImportStartParams {
@@ -119,7 +118,7 @@ export interface ImportStartParams {
  *  - `uploading` — base64 chunks are moving file → main → current backend.
  *  - `committing` — the backend is reassembling/committing the import.
  */
-export type ImportRelayPhase = 'reading' | 'uploading' | 'committing';
+type ImportRelayPhase = 'reading' | 'uploading' | 'committing';
 
 /** `transfer:import-progress` push payload (counters only — never bytes). */
 export interface ImportProgressEvent {
@@ -139,6 +138,8 @@ export interface ImportStartResult {
   canceled?: boolean;
   /** Daemon error, verbatim (e.g. version mismatch names both versions). */
   error?: string;
+  /** Set when another window owns the active session. */
+  code?: SessionOwnershipErrorCode;
   /** The imported workspace's id + title, on success. */
   workspaceId?: string;
   workspaceTitle?: string;
@@ -150,4 +151,6 @@ export interface ImportStartResult {
 export interface ImportCancelResult {
   success: boolean;
   error?: string;
+  /** Set when another window owns the active session. */
+  code?: SessionOwnershipErrorCode;
 }

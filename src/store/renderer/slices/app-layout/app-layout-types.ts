@@ -19,34 +19,14 @@ export type AppLayoutState = {
   pendingLocateInSidebar: PendingSidebarLocate | null;
 };
 
-export type ShowAgentDetail = {
-  agentId: string;
-};
-
 export type OpenAgentTabDetail = {
   agentId: string;
   pin?: boolean;
   openInAdjacentPanel?: boolean;
   openInNewColumn?: boolean;
   sourcePanelId?: string;
+  targetPanelId?: string;
   panelLayoutId?: string;
   availablePanelCanvasWidth?: number;
   adaptiveFirstChat?: boolean;
-};
-
-export type OpenTerminalTabDetail = {
-  terminalId: string;
-  openInAdjacentPanel?: boolean;
-  sourcePanelId?: string;
-  panelLayoutId?: string;
-};
-
-export type CreateWorkspaceForRepoDetail = {
-  repositoryPath: string;
-  workspaceId?: string;
-  workspaceTitle?: string;
-};
-
-export type OpenNewSpaceModalDetail = {
-  initialRepo?: { repoPath?: string };
 };

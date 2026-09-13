@@ -21,6 +21,8 @@ describe('window appearance', () => {
 
   it('keeps opaque theme fallbacks on other platforms', () => {
     expect(getWindowAppearanceOptions(false, 'win32')).toEqual({ backgroundColor: '#ffffff' });
+    expect(getWindowAppearanceOptions(true, 'win32')).toEqual({ backgroundColor: '#0a0a0a' });
+    expect(getWindowAppearanceOptions(false, 'linux')).toEqual({ backgroundColor: '#ffffff' });
     expect(getWindowAppearanceOptions(true, 'linux')).toEqual({ backgroundColor: '#0a0a0a' });
   });
 
@@ -28,7 +30,7 @@ describe('window appearance', () => {
     expect(getWindowTitleBarOptions('darwin')).toEqual({
       titleBarStyle: 'hiddenInset',
       frame: false,
-      trafficLightPosition: { x: 9, y: 11 },
+      trafficLightPosition: { x: 12, y: 13 },
       tabbingIdentifier: 'intent',
     });
   });

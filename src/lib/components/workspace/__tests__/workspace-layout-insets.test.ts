@@ -1,3 +1,6 @@
+// @verify-changed-triggers: ../WorkspaceLayout.svelte,
+//   src/routes/(app)/workspace/[id]/WorkspaceSurface.svelte
+
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -21,39 +24,25 @@ describe('WorkspaceLayout panel insets', () => {
     )?.[1];
 
     expect(rightBranch).toContain('main-content-area flex h-full min-w-0 z-10 bg-sidebar');
-    expect(rightBranch).toContain("'pl-2 sm:pl-3'");
+    expect(rightBranch).toContain('bg-sidebar pl-2 sm:pl-3');
     expect(leftBranch).toContain('main-content-area flex h-full min-w-0 z-10');
-    expect(leftBranch).not.toContain('sm:pl-3');
+    expect(leftBranch).not.toContain('bg-sidebar pl-2 sm:pl-3');
   });
 
-  it('adds an 8px gutter beside a collapsed single-layout left sidebar', () => {
+  it('matches the responsive outer gutter beside a collapsed left sidebar', () => {
     const leftBranch = workspaceLayout.match(
       /\{#if sidebarSide === 'left'\}([\s\S]*?)\{\/if\}/,
     )?.[1];
 
     expect(workspaceLayout).toContain('const sidebarIsCollapsed = selectIsCollapsed();');
-    expect(leftBranch).toContain('class:pl-2={!columnMode && $sidebarIsCollapsed}');
+    expect(leftBranch).toMatch(/\{\$sidebarIsCollapsed\s*\?\s*'pl-2 sm:pl-3'\s*:\s*''\}/);
   });
 
-  it('forwards column mode so column layouts skip global collapse behavior and its gutter', () => {
+  it('uses only the standard workspace layout contract', () => {
     const workspaceLayoutCall = workspaceSurface.match(/<WorkspaceLayout([\s\S]*?)\/>/)?.[1];
 
-    expect(workspaceLayoutCall).toContain('{columnMode}');
-    expect(workspaceLayout).toContain('followSidebarCollapsed={!columnMode}');
-    expect(workspaceLayout).toContain('class:pl-2={!columnMode && $sidebarIsCollapsed}');
-  });
-
-  it('lets a panel-free workspace column own the full sidebar width', () => {
-    expect(workspaceSurface).toContain('const delayCompactFill =');
-    expect(workspaceSurface).toContain('let previousColumnPanelCount: number | null = null');
-    expect(workspaceSurface).toContain('{sidebarFillsAvailableWidth}');
-    expect(workspaceSurface).toContain('{onSidebarWidthChange}');
-    expect(workspaceSurface).toContain('disableSidebarWidthTransition={columnMode}');
-    expect(workspaceLayout).toContain('doSkipResize={sidebarFillsAvailableWidth}');
-    expect(workspaceLayout).toContain('disableWidthTransition={disableSidebarWidthTransition}');
-    expect(workspaceLayout).toContain('preserveFixedWidthAfterFill={columnMode}');
-    expect(workspaceLayout).toContain('notifyAutomaticWidthChanges={!columnMode}');
-    expect(workspaceLayout).toContain('clampStoredWidth={columnMode}');
-    expect(workspaceLayout).toContain('onWidthChange={onSidebarWidthChange}');
+    expect(workspaceLayoutCall).toContain('sidebarSide={$sidebarSide$}');
+    expect(workspaceLayout).toContain('maxWidth={sidebarMaxWidth}');
+    expect(workspaceLayout).toContain('defaultExpandedWidth={sidebarDefaultExpandedWidth}');
   });
 });

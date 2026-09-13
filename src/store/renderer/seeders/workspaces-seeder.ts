@@ -25,7 +25,9 @@
 import { registerMockIpcHandler } from '$shared/ipc-mock-router';
 import { WORKSPACE_CHANNELS } from '$shared/ipc/channels';
 import { appClient } from '$lib/client';
+import { workspaceClient } from '../slices/workspace/utils/workspace.client';
 import { backendRequest } from '$lib/client/live/backend-transport';
+import { readSetting, updateSettings } from '$lib/client/live/live-settings-client';
 import type { KnownRepo } from '$shared/types/known-repo';
 import { isDaemonManagedCheckoutPath } from '$shared/utils/daemon-managed-checkout';
 import type { Workspace } from '$shared/types';
@@ -36,6 +38,7 @@ import {
   replaceWorkspaceList,
   setWorkspaceHasLoaded,
 } from '../slices/workspace/workspace-slice';
+import { getActiveBackendId } from '../utils/backend-storage-namespace';
 import { openWorkspaceTab } from '../slices/tab-state/tab-state-slice';
 
 /** Read the `id` (preferred) or `workspaceId` field off the route loader's open payload. */
@@ -106,9 +109,7 @@ const REPOS_KNOWN_SETTING = 'repos.known';
 
 async function readReposKnownSetting(): Promise<KnownRepo[]> {
   try {
-    const setting = await backendRequest<{ value?: unknown }>('settings.get', {
-      path: REPOS_KNOWN_SETTING,
-    });
+    const setting = await readSetting(REPOS_KNOWN_SETTING);
     return Array.isArray(setting?.value) ? (setting.value as KnownRepo[]) : [];
   } catch {
     // Non-fatal: recents still serve the daemon repo.list registry.
@@ -169,9 +170,7 @@ registerMockIpcHandler(WORKSPACE_CHANNELS.ADD_RECENT_REPOSITORY, async (arg) => 
     } else {
       existing.push({ path: repository, name, owner, githubUrl, addedAt: now, lastUsedAt: now });
     }
-    await backendRequest('settings.update', {
-      changes: [{ path: REPOS_KNOWN_SETTING, value: existing }],
-    });
+    await updateSettings([{ path: REPOS_KNOWN_SETTING, value: existing }]);
     return { success: true };
   } catch (error) {
     return {
@@ -205,9 +204,7 @@ registerMockIpcHandler(WORKSPACE_CHANNELS.REMOVE_RECENT_REPOSITORY, async (arg) 
     const remaining = githubPicks.filter((repo) => repo.path !== repository);
     const removedFromSetting = remaining.length !== githubPicks.length;
     if (removedFromSetting) {
-      await backendRequest('settings.update', {
-        changes: [{ path: REPOS_KNOWN_SETTING, value: remaining }],
-      });
+      await updateSettings([{ path: REPOS_KNOWN_SETTING, value: remaining }]);
     }
     return {
       success: true,
@@ -253,17 +250,19 @@ registerMockSeeder('workspaces', async ({ store, client, workspaceId, getWorkspa
   // keep the UI functional with an empty list. Let unexpected in-process bugs
   // (reducer errors, bad data shapes) throw so they fail fast in tests/dev.
   try {
-    workspaces = await client.workspaces.list({ includeArchived: true });
+    const result = await workspaceClient.list({ lite: true });
+    if (!result.ok) throw new Error(result.error);
+    workspaces = result.data;
   } catch (error) {
     console.error('Workspaces seeder: client.workspaces.list() failed:', error);
     // Clear any stale workspaces from a previous seeding attempt (dev/HMR/tests)
     store.dispatch(replaceWorkspaceList([]));
-    store.dispatch(setWorkspaceHasLoaded(true));
+    store.dispatch(setWorkspaceHasLoaded(true, getActiveBackendId(store.state)));
     return;
   }
 
   store.dispatch(replaceWorkspaceList(workspaces));
-  store.dispatch(setWorkspaceHasLoaded(true));
+  store.dispatch(setWorkspaceHasLoaded(true, getActiveBackendId(store.state)));
 
   try {
     recentViews = await client.workspaces.recentViews();

@@ -5,35 +5,37 @@
    * Shows list of Sentry issues with search/filter.
    * Handles authentication flow if not authenticated.
    */
-  import type { SentryIssueResult } from '$store/renderer/slices/sentry-auth/sentry-auth-types';
   import {
-  selectSentryIsAuthenticated,
-  selectSentryIssues,
-  selectSentryIsLoadingIssues,
-  selectSentryIsConnecting,
-} from '$store/renderer/slices/sentry-auth/sentry-auth-selectors';
+    sentryAuthClient,
+    type SentryIssueResult,
+  } from '$features/sentry-auth/renderer/sentry-auth.client';
   import {
-  initializeSentryAuth,
-  connectSentry,
-  fetchSentryIssues,
-} from '$store/renderer/slices/sentry-auth/sentry-auth-slice';
+    selectSentryIsAuthenticated,
+    selectSentryIsConnecting,
+  } from '$store/renderer/slices/sentry-auth/sentry-auth-selectors';
+  import {
+    initializeSentryAuth,
+    connectSentry,
+  } from '$store/renderer/slices/sentry-auth/sentry-auth-slice';
 
   import SentryIcon from '$lib/components/icons/SentryIcon.svelte';
   import { Input } from '$lib/components/ui/input';
   import { Button } from '$lib/components/ui/button';
-  import {
-  faSpinner,
-  faSearch,
-} from '@fortawesome/free-solid-svg-icons';
+  import { faSpinner, faSearch } from '@fortawesome/free-solid-svg-icons';
   import Fa from 'svelte-fa';
   import { onMount } from 'svelte';
   import { store as appStore } from '$store/renderer/store';
   import { m } from '$shared/paraglide/messages.js';
 
-
   interface Props {
     workspaceId: string;
-    onSelect: (item: { type: string; title: string; url: string; identifier: string; metadata?: Record<string, unknown> }) => void;
+    onSelect: (item: {
+      type: string;
+      title: string;
+      url: string;
+      identifier: string;
+      metadata?: Record<string, unknown>;
+    }) => void;
     onClose: () => void;
   }
 
@@ -41,10 +43,11 @@
   let { workspaceId, onSelect, onClose }: Props = $props();
 
   const isAuthenticated$ = selectSentryIsAuthenticated();
-  const issues$ = selectSentryIssues();
-  const isLoadingIssues$ = selectSentryIsLoadingIssues();
   const storeIsConnecting$ = selectSentryIsConnecting();
 
+  let issues = $state<SentryIssueResult[]>([]);
+  let isLoadingIssues = $state(false);
+  let hasLoadedIssues = $state(false);
   let searchQuery = $state('');
   let pendingConnect = $state(false);
 
@@ -54,9 +57,9 @@
   let sentryToken = $state('');
 
   const filteredIssues = $derived.by(() => {
-    if (!searchQuery.trim()) return $issues$;
+    if (!searchQuery.trim()) return issues;
     const query = searchQuery.toLowerCase();
-    return $issues$.filter(
+    return issues.filter(
       (issue: SentryIssueResult) =>
         issue.title.toLowerCase().includes(query) ||
         issue.shortId.toLowerCase().includes(query) ||
@@ -64,13 +67,24 @@
     );
   });
 
+  async function loadIssues() {
+    if (isLoadingIssues) return;
+    isLoadingIssues = true;
+    try {
+      issues = await sentryAuthClient.fetchIssues();
+      hasLoadedIssues = true;
+    } finally {
+      isLoadingIssues = false;
+    }
+  }
+
   // When connect completes successfully, fetch issues
   $effect(() => {
     if (pendingConnect && !$storeIsConnecting$) {
       pendingConnect = false;
       if ($isAuthenticated$) {
         showConfigForm = false;
-        appStore.dispatch(fetchSentryIssues());
+        loadIssues();
       }
     }
   });
@@ -103,14 +117,14 @@
     appStore.dispatch(initializeSentryAuth());
     // Fetch issues if already authenticated (state may persist from previous mount)
     if ($isAuthenticated$) {
-      appStore.dispatch(fetchSentryIssues());
+      loadIssues();
     }
   });
 
   // When auth state becomes true (e.g. after init), fetch issues
   $effect(() => {
-    if ($isAuthenticated$ && $issues$.length === 0 && !$isLoadingIssues$) {
-      appStore.dispatch(fetchSentryIssues());
+    if ($isAuthenticated$ && !hasLoadedIssues && !isLoadingIssues) {
+      loadIssues();
     }
   });
 </script>
@@ -137,7 +151,11 @@
           <Button variant="outline" onclick={() => (showConfigForm = false)} class="flex-1">
             {m.workspace_prCreator_cancel_label()}
           </Button>
-          <Button onclick={handleConnect} disabled={$storeIsConnecting$ || !sentryOrg || !sentryToken} class="flex-1">
+          <Button
+            onclick={handleConnect}
+            disabled={$storeIsConnecting$ || !sentryOrg || !sentryToken}
+            class="flex-1"
+          >
             {#if $storeIsConnecting$}
               <Fa icon={faSpinner} class="animate-spin mr-2" />
             {/if}
@@ -151,7 +169,7 @@
       </Button>
     {/if}
   </div>
-{:else if $isLoadingIssues$}
+{:else if isLoadingIssues}
   <div class="p-8 flex justify-center">
     <Fa icon={faSpinner} class="animate-spin text-subtle" size="lg" />
   </div>

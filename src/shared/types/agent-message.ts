@@ -113,10 +113,18 @@ export interface MessageMetadata {
   contextReferences?: any[];
 
   // Queued-message delivery info stamped by the daemon on drained queue
-  // entries (PROTOCOL §5.5 "Dequeue-wait annotation")
+  // entries (PROTOCOL §5.5 "Dequeue-wait annotation"). `batchId` is shared by
+  // every row drained in one multi-message batch flush; absent on
+  // single-message deliveries and on rows from older daemons. Batch entries
+  // whose wait fell below the 5-second annotation threshold carry ONLY
+  // `batchId` (no `queuedAt`/`waitedMs`), so the wait fields are optional.
+  // `queuedMessageId` names the queue entry (`QueuedMessage.id`) the row was
+  // drained from; absent on rows from older daemons.
   queueInfo?: {
-    queuedAt: string;
-    waitedMs: number;
+    queuedAt?: string;
+    waitedMs?: number;
+    batchId?: string;
+    queuedMessageId?: string;
   };
 
   // Allow additional properties
@@ -140,6 +148,14 @@ export interface AgentMessage {
   // Timing
   timestamp: string | Date;
   turnNumber?: number;
+
+  // Daemon-assigned per-agent monotonic sequence number (PROTOCOL §5.5) —
+  // present on every daemon-persisted row (getConversation pages, §7.1
+  // snapshot rows, terminal-frame reconciles via `messageSeq`). Absent only
+  // on local-only rows: optimistic user rows before the daemon echo and
+  // in-flight assistant messages before the terminal frame. The transcript
+  // orders by this, not timestamps (clock-skew immune).
+  seq?: number;
 
   // Tool interactions
   toolCalls?: ToolCall[];

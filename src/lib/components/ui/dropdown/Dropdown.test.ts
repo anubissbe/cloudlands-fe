@@ -1,3 +1,4 @@
+// @ui-invariant
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/svelte';
 import Dropdown from './Dropdown.svelte';
@@ -210,6 +211,41 @@ describe('Dropdown compatibility modes', () => {
   beforeEach(setupDropdownEnv);
   afterEach(cleanupDropdownEnv);
 
+  it.each([false, true])('keeps owned popup interactions inside (portal=%s)', async (portal) => {
+    render(Dropdown, { props: { portal, options: [{ value: 'a', label: 'Alpha' }] } });
+    const trigger = screen.getByRole('button');
+    await fireEvent.click(trigger);
+    const listbox = await screen.findByRole('listbox');
+    const nestedTrigger = document.createElement('button');
+    nestedTrigger.setAttribute('aria-controls', 'nested-popup');
+    listbox.appendChild(nestedTrigger);
+    const popup = document.createElement('div');
+    popup.id = 'nested-popup';
+    const option = document.createElement('button');
+    popup.appendChild(option);
+    document.body.appendChild(popup);
+
+    await fireEvent.mouseDown(option);
+    expect(trigger.getAttribute('aria-expanded')).toBe('true');
+
+    const unrelatedPopup = document.createElement('div');
+    unrelatedPopup.setAttribute('role', 'listbox');
+    document.body.appendChild(unrelatedPopup);
+    await fireEvent.mouseDown(unrelatedPopup);
+    expect(trigger.getAttribute('aria-expanded')).toBe('false');
+  });
+
+  it('restores trigger focus when Escape dismisses the menu', async () => {
+    render(Dropdown, { props: { options: [{ value: 'a', label: 'Alpha' }] } });
+    const trigger = screen.getByRole('button');
+    await fireEvent.click(trigger);
+    const search = screen.getByRole('searchbox');
+    search.focus();
+    await fireEvent.keyDown(search, { key: 'Escape' });
+    expect(trigger.getAttribute('aria-expanded')).toBe('false');
+    expect(document.activeElement).toBe(trigger);
+  });
+
   it('preserves searchable keyboard selection and open-state callbacks', async () => {
     const onchange = vi.fn();
     const onopenchange = vi.fn();
@@ -230,6 +266,29 @@ describe('Dropdown compatibility modes', () => {
     expect(onchange).toHaveBeenCalledWith('b', undefined);
     expect(onopenchange).toHaveBeenNthCalledWith(1, true);
     expect(onopenchange).toHaveBeenNthCalledWith(2, false);
+  });
+
+  it('searches grouped options by both the display label and search label', async () => {
+    const { container } = render(Dropdown, {
+      props: {
+        groups: [
+          {
+            key: 'legacy',
+            label: 'Legacy models',
+            searchLabel: 'Auggie',
+            options: [{ value: 'opus', label: 'Opus 4.1' }],
+          },
+        ],
+      },
+    });
+    await fireEvent.click(container.querySelector('button')!);
+    const search = await screen.findByRole('searchbox', { name: 'Search options' });
+
+    await fireEvent.input(search, { target: { value: 'Legacy' } });
+    expect(screen.getByRole('option', { name: 'Opus 4.1' })).toBeTruthy();
+
+    await fireEvent.input(search, { target: { value: 'Auggie' } });
+    expect(screen.getByRole('option', { name: 'Opus 4.1' })).toBeTruthy();
   });
 
   it('preserves multi-select, toggle, action, separator, and submenu modes', async () => {

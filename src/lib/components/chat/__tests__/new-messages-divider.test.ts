@@ -7,6 +7,8 @@ import {
   resolveLatchedDividerAnchor,
   dividerVisibleWhenScrolledToBottom,
   dividerDefersToTurnBoundary,
+  dividerEntryScrollTop,
+  DIVIDER_ENTRY_VIEWPORT_FRACTION,
 } from '../new-messages-divider';
 import { indexConversationTurns } from '../conversation-turns';
 import type { AgentMessage } from '$shared/types';
@@ -142,8 +144,19 @@ describe('turn-boundary divider placement (ChatPanel contract)', () => {
       'utf8',
     ).replace(/<!--[\s\S]*?-->/g, '');
     const normalized = panel.replace(/\s+/g, ' ');
-    expect(normalized).toContain(
-      '{#if !isLastTurnInConversation} <ConversationTurnGap currentIsEventNotification={isEventNotification} currentHasAssistantMessages={turn.assistantMessages.length > 0} nextIsEventNotification={nextTurnIsEventNotification} nextHasUserMessage={nextTurnHasUserMessage} compactOperationalSeam={compactOperationalTurnBoundary} zeroToolSeam={zeroOperationalTurnBoundary} /> {/if} {#if dividerAtTurnBoundary} <NewMessagesDivider /> {/if}',
+    const gapStart = normalized.indexOf('<ConversationTurnGap');
+    const gapEnd = normalized.indexOf('/>', gapStart) + 2;
+    const dividerStart = normalized.indexOf('{#if dividerAtTurnBoundary}', gapEnd);
+    const gap = normalized.slice(gapStart, gapEnd);
+
+    expect(gapStart).toBeGreaterThan(-1);
+    expect(gap).toContain('compactOperationalSeam={compactOperationalTurnBoundary}');
+    expect(gap).toContain('zeroToolSeam={zeroOperationalTurnBoundary}');
+    expect(gap).toContain('batchedDeliverySeam={batchedDeliveryTurnSeam}');
+    expect(gap).toContain('attentionQuestionAnswerSeam={attentionQuestionAnswerTurnSeam}');
+    expect(normalized.slice(gapEnd, dividerStart).trim()).toBe('{/if}');
+    expect(normalized.slice(dividerStart)).toContain(
+      '{#if dividerAtTurnBoundary} <NewMessagesDivider /> {/if}',
     );
   });
 
@@ -163,6 +176,35 @@ describe('turn-boundary divider placement (ChatPanel contract)', () => {
       panel.match(/@render newMessagesDividerAfter\([^)]+,\s*dividerAtTurnBoundary,?\s*\)/g) ?? [];
     expect(allSites.length).toBe(4);
     expect(withFlag.length).toBe(allSites.length);
+  });
+});
+
+describe('dividerEntryScrollTop', () => {
+  // Expectations derive from the exported fraction so a placement tune
+  // updates them in lockstep. At the pinned 0.2 with a 600px viewport the
+  // divider lands 120px below the viewport top.
+  const entryOffset = DIVIDER_ENTRY_VIEWPORT_FRACTION * 600;
+
+  it('places the divider top at the entry fraction of the viewport height', () => {
+    expect(dividerEntryScrollTop(1000, 600, 5000)).toBe(1000 - entryOffset);
+  });
+
+  it('clamps at 0 when the divider is near the top of the content', () => {
+    // Ideal target 50 - entryOffset is negative.
+    expect(dividerEntryScrollTop(50, 600, 5000)).toBe(0);
+  });
+
+  it('clamps at max scrollTop when the divider is near the content bottom', () => {
+    // Ideal target 4900 - entryOffset exceeds max scrollTop 5000 - 600 = 4400.
+    expect(dividerEntryScrollTop(4900, 600, 5000)).toBe(4400);
+  });
+
+  it('returns 0 when the content is shorter than the viewport', () => {
+    expect(dividerEntryScrollTop(300, 600, 500)).toBe(0);
+  });
+
+  it('pins the entry placement contract at 20% of the viewport height', () => {
+    expect(DIVIDER_ENTRY_VIEWPORT_FRACTION).toBe(0.2);
   });
 });
 

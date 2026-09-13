@@ -21,9 +21,12 @@ vi.mock('$store/renderer/store', async () => {
 
 import {
   collapseCodexEffortModels,
+  filterDefaultPseudoOptions,
   findModelFallbackOption,
+  isDefaultPseudoModelId,
   isUserProviderSettled,
   normalizeModelIdForMatch,
+  toDropdownOptions,
 } from './model-picker-utils';
 
 const sampleModel: AuggieModel = { value: 'auggie:sonnet4.6', label: 'Sonnet 4.6' };
@@ -41,6 +44,19 @@ describe('normalizeModelIdForMatch', () => {
 
   it('preserves an explicit different provider', () => {
     expect(normalizeModelIdForMatch('codex:gpt5.6-sol', 'auggie')).toBe('codex:gpt5.6-sol');
+  });
+});
+
+describe('toDropdownOptions', () => {
+  it('preserves legacy metadata in option data', () => {
+    expect(
+      toDropdownOptions([{ value: 'opus4.1', label: 'Opus 4.1', isLegacyModel: true }]),
+    ).toEqual([
+      expect.objectContaining({
+        value: 'opus4.1',
+        data: expect.objectContaining({ isLegacyModel: true }),
+      }),
+    ]);
   });
 });
 
@@ -243,5 +259,41 @@ describe('findModelFallbackOption', () => {
     // codex:x is filtered out by the provider restriction, so the in-provider
     // CLI default wins over first-available.
     expect(result?.value).toBe('auggie:cli-default');
+  });
+
+  it('never falls back to a hidden default pseudo-row when real rows exist', () => {
+    const options = [option('auggie:default'), option('auggie:a')];
+    const result = findModelFallbackOption({ options, globallySelectedModel: null });
+    expect(result?.value).toBe('auggie:a');
+  });
+
+  it('falls back to the sole default pseudo-row when nothing else exists (D1)', () => {
+    const options = [option('auggie:default')];
+    const result = findModelFallbackOption({ options, globallySelectedModel: null });
+    expect(result?.value).toBe('auggie:default');
+  });
+});
+
+describe('isDefaultPseudoModelId', () => {
+  it('matches bare and provider-prefixed default ids case-insensitively', () => {
+    expect(isDefaultPseudoModelId('default')).toBe(true);
+    expect(isDefaultPseudoModelId('claude-code:default')).toBe(true);
+    expect(isDefaultPseudoModelId('claude-code:Default')).toBe(true);
+    expect(isDefaultPseudoModelId('auggie:sonnet')).toBe(false);
+    expect(isDefaultPseudoModelId('auggie:default-plus')).toBe(false);
+  });
+});
+
+describe('filterDefaultPseudoOptions', () => {
+  const opt = (value: string): DropdownOption => ({ value, label: value });
+
+  it('drops default pseudo-rows when real rows remain', () => {
+    expect(filterDefaultPseudoOptions([opt('auggie:default'), opt('auggie:a')])).toEqual([
+      opt('auggie:a'),
+    ]);
+  });
+
+  it('keeps the pseudo-row when it is the only row (D1)', () => {
+    expect(filterDefaultPseudoOptions([opt('auggie:default')])).toEqual([opt('auggie:default')]);
   });
 });

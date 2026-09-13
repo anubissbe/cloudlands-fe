@@ -11,6 +11,13 @@
  *
  * Fires for agents in ANY workspace — the daemon-events bridge feeds every
  * workspace's events through here without gating on the focused workspace.
+ * The one exception is the already-viewing suppression: when the window is
+ * focused AND the event's workspace is the current workspace tab AND the
+ * raising agent's conversation tab is the active tab of a visible panel in
+ * that workspace, the toast is skipped — the in-conversation notice (and
+ * banner/indicators) are already in view, so the toast would be redundant.
+ * Suppression only skips the toast; it never marks the request handled, and
+ * the session-field-derived surfaces (banner/badge) are untouched.
  * "Switch To" therefore routes cross-workspace: `goto(/workspace/{wsId})`
  * first, then `openAgentTabRequested` so the already-installed
  * `createAppLayoutNavigationMiddleware` hydrates the session and opens (or
@@ -59,7 +66,7 @@ export function agentAttentionToastId(agentId: string): string {
  * so the single wrapper border carries the kind-flavored tint.
  */
 function wrapperClass(kind: AgentAttentionRequest['kind']): string {
-  return kind === 'blocker' ? '!border-destructive/50' : '!border-primary/50';
+  return kind === 'blocker' ? '!border-danger/50' : '!border-primary/50';
 }
 
 /** Lazily pull the toast lib so this middleware-reachable module stays light.
@@ -119,10 +126,46 @@ function truncate(text: string, maxChars: number): string {
 }
 
 /**
+ * True when the user is already (likely) looking at the raising agent's
+ * conversation: the window is focused, the event's workspace is the current
+ * workspace tab, and the agent's conversation tab is the active tab of a
+ * visible panel in that workspace.
+ *
+ * Visibility comes from `panelLayout` — the slice that tab clicks actually
+ * update (`setActiveTab` → `panel.activeTabId`); `workspaceAgents.activeAgentId`
+ * is NOT synced by tab selection, so it must not be used here. "Viewing" means
+ * the agent tab is active in ANY visible panel (not just the focused one): a
+ * side-by-side column showing the conversation still puts the in-conversation
+ * notice in view. When a panel is expanded (`expandedPanelId`), only that
+ * panel is visible, so only it counts.
+ *
+ * Dependency-light per the module doc: state is read straight off
+ * `appStore.state` (no selector imports — `selectCurrentWorkspaceTabId` reads
+ * `tabState.currentTabId`, mirrored here; the `focus-first-unread-agent.ts`
+ * pattern). Focus parity note (see web-notification-service.ts): Electron
+ * keys suppression off the FOCUSED WINDOW viewing the workspace
+ * (multi-window); the toast renders in the single renderer window, so this
+ * collapses to `document.hasFocus()` + the active workspace/panel tabs.
+ */
+function isUserViewingAgent(workspaceId: string, agentId: string): boolean {
+  if (typeof document === 'undefined' || !document.hasFocus()) return false;
+  const state = appStore.state;
+  if (state.tabState?.currentTabId !== workspaceId) return false;
+  const layout = state.panelLayout?.byWorkspaceId[workspaceId];
+  if (!layout) return false;
+  const visiblePanels = layout.expandedPanelId
+    ? [layout.panels[layout.expandedPanelId]]
+    : Object.values(layout.panels);
+  return visiblePanels.some((panel) => {
+    const activeTab = panel?.tabs.find((tab) => tab.id === panel.activeTabId);
+    return activeTab?.type === 'agent' && activeTab.agentId === agentId;
+  });
+}
+
+/**
  * "Switch To": dismiss the toast, activate the reporting workspace, navigate
  * to it, then open/focus the agent's conversation tab. Explicit tab activation
- * is required in columns view: route navigation alone does not update
- * `currentTabId`, whose change scrolls the target column into view.
+ * keeps tab state synchronized with route navigation.
  */
 export async function switchToAttentionAgent(workspaceId: string, agentId: string): Promise<void> {
   const toast = await getToast();
@@ -141,14 +184,26 @@ export async function switchToAttentionAgent(workspaceId: string, agentId: strin
  * Show (or update in place) the sticky attention toast for one agent.
  * Kind-flavored: title, icon, and border tint differ for discussion vs
  * blocker. Never auto-dismisses (`duration: Infinity`).
+ *
+ * Skipped entirely when the user is already viewing the raising agent's
+ * conversation (see {@link isUserViewingAgent}) — the in-conversation notice
+ * is in view, so the toast is redundant. The skip does not dismiss an
+ * existing toast for the agent and does not mark the request handled.
  */
 export async function showAgentAttentionToast(request: AgentAttentionRequest): Promise<void> {
+  const { workspaceId, agentId, agentName, kind, reason, timestamp } = request;
+  if (isUserViewingAgent(workspaceId, agentId)) {
+    logger.debug('User is already viewing the agent — suppressing attention toast', {
+      workspaceId,
+      agentId,
+    });
+    return;
+  }
   const [toast, AgentAttentionToast, resolveConnectedWorkspaceKeySlot] = await Promise.all([
     getToast(),
     getToastComponent(),
     getKeySlotResolver(),
   ]);
-  const { workspaceId, agentId, agentName, kind, reason, timestamp } = request;
   const title =
     kind === 'blocker'
       ? m.agent_attentionToast_blocker_title({ name: agentName })
@@ -202,9 +257,8 @@ export async function showWorkspaceAutoUnarchiveToast(
   const toast = await getToast();
   let title: string | undefined;
   try {
-    const { selectWorkspaceById } = await import(
-      '$store/renderer/slices/workspace/workspace-selectors'
-    );
+    const { selectWorkspaceById } =
+      await import('$store/renderer/slices/workspace/workspace-selectors');
     title = selectWorkspaceById.select(appStore.state, workspaceId)?.title;
   } catch (error) {
     logger.warn('Workspace title resolution failed — toast uses fallback', { workspaceId, error });

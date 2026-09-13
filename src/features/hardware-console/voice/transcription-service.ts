@@ -39,6 +39,7 @@ import {
 } from '$features/voice/effective-voice-engine';
 import { store as appStore } from '$store/renderer/store';
 import { createLogger } from '$lib/utils/client-logger';
+import { writeTextToClipboard } from '$lib/utils/clipboard';
 import { getItem, type Collection } from '@augmentcode/themis/utils/collections/collection-utils';
 import { selectCurrentWorkspaceTabId } from '$store/renderer/slices/tab-state/tab-state-selectors';
 import { m } from '$shared/paraglide/messages.js';
@@ -53,6 +54,7 @@ import {
 import type { VoiceRecordingResult } from './voice-recorder';
 import { voiceSettingsToastAction } from './voice-setup-toast';
 import { focusAgentComposer } from '../actions/action-key-service';
+import { consumeComposerDictationTarget } from './composer-dictation-target';
 import {
   consumePromptDictationTarget,
   type PromptDictationTarget,
@@ -71,7 +73,7 @@ import {
 const logger = createLogger('HardwareConsoleVoiceTranscription');
 
 /** Re-show cadence for the in-flight HUD label (< ACTION_HUD_HIDE_MS). */
-export const TRANSCRIBING_HUD_REFRESH_MS = 800;
+const TRANSCRIBING_HUD_REFRESH_MS = 800;
 
 /**
  * Insertion retry delays after a successful transcription: the composer
@@ -79,7 +81,20 @@ export const TRANSCRIBING_HUD_REFRESH_MS = 800;
  * insertion attempts trail each focus dispatch (immediate attempt first for
  * an already-focused composer).
  */
-export const TRANSCRIPT_INSERT_DELAYS_MS = [250, 800] as const;
+const TRANSCRIPT_INSERT_DELAYS_MS = [250, 800] as const;
+
+/**
+ * Default composer focus for the dictation flow: the `source: 'dictation'`
+ * flag lets ChatPanel accept the request even when the user focused a
+ * different panel mid-dictation (the plain panel-navigation guard rejects
+ * unfocused panels, which would leave the insertion retries landing in
+ * whatever editable holds focus). Limitation: when the agent's tab is no
+ * longer the active tab in its panel the request still fails, and the
+ * insert-failed toast fallback preserves the transcript.
+ */
+function focusDictationComposer(agentId: string): void {
+  focusAgentComposer(agentId, { source: 'dictation' });
+}
 
 /** Shared id: transcription toasts replace one another instead of stacking. */
 const TRANSCRIPTION_TOAST_ID = 'hardware-console-voice-transcription';
@@ -180,6 +195,8 @@ export interface TranscriptionDeps {
   dispatch?: (action: unknown) => void;
   /** Current workspace-tab seam. */
   getCurrentWorkspaceId?: () => string | null;
+  /** Copy text to the clipboard (insert-failed fallback). Defaults to `writeTextToClipboard`. */
+  copyToClipboard?: (text: string) => Promise<void>;
 }
 
 /** Per-run flow options (gesture-decided, orthogonal to the injected deps). */
@@ -302,12 +319,12 @@ function errorDetail(error: unknown): string | undefined {
  * insertion goes straight into the currently focused editable (the radial
  * prompt picker semantics). Resolves `true` when some attempt inserted.
  */
-export function insertTranscript(
+function insertTranscript(
   text: string,
   targetAgentId: string | null,
   deps: TranscriptionDeps = {},
 ): Promise<boolean> {
-  const focusComposer = deps.focusComposer ?? focusAgentComposer;
+  const focusComposer = deps.focusComposer ?? focusDictationComposer;
   const insertText = deps.insertText ?? ((value: string) => insertTranscriptText(value));
   if (targetAgentId === null) return Promise.resolve(insertText(text));
   focusComposer(targetAgentId);
@@ -335,11 +352,11 @@ export function insertTranscript(
  * land. Without a target agent the send goes to the currently focused
  * editable. Resolves `true` when some attempt reached a focused editable.
  */
-export function triggerComposerSend(
+function triggerComposerSend(
   targetAgentId: string | null,
   deps: TranscriptionDeps = {},
 ): Promise<boolean> {
-  const focusComposer = deps.focusComposer ?? focusAgentComposer;
+  const focusComposer = deps.focusComposer ?? focusDictationComposer;
   const send = deps.sendComposer ?? (() => sendFocusedComposer());
   if (targetAgentId === null) return Promise.resolve(send());
   focusComposer(targetAgentId);
@@ -368,7 +385,7 @@ export function triggerComposerSend(
  * immediate attempt would race the focus landing). Resolves `true` when
  * some attempt inserted.
  */
-export function insertTranscriptIntoPrompt(
+function insertTranscriptIntoPrompt(
   text: string,
   target: PromptDictationTarget,
   deps: TranscriptionDeps = {},
@@ -416,6 +433,13 @@ export function insertTranscriptIntoPrompt(
  * stolen from the modal, and `autoSend` is suppressed for the same reason
  * as the prompt target (intent-hq/monorepo#1461).
  *
+ * The agent-composer routing itself prefers the composer dictation target —
+ * the agentId of the composer whose mic button started the session, also
+ * consumed one-shot up front — over the store-resolved active agent, so the
+ * transcript lands in the composer that started the dictation even when
+ * `activeAgentId` points elsewhere by finish time. Hardware-PTT sessions
+ * register no capture and keep the `resolveTargetAgentId` fallback.
+ *
  * The run registers itself with the cancellation seam
  * (transcription-cancellation): `cancelActiveTranscription` — the mic
  * buttons' cancel-while-transcribing affordance — settles the in-flight
@@ -430,6 +454,9 @@ export async function handleFinishedRecording(
   const dispatch = deps.dispatch ?? ((action: unknown) => appStore.dispatch(action as never));
   const transcribe = deps.transcribe ?? transcribeWithSelectedEngine;
   const promptTarget = consumePromptDictationTarget();
+  // Consumed unconditionally (one-shot) even when a higher-precedence route
+  // wins, so this session's capture can never leak into a later session.
+  const composerAgentId = consumeComposerDictationTarget();
   // Captured synchronously at recording-finish time, before any await —
   // the modal is what holds focus right now, whatever happens later.
   const dialogFocused = isFocusInsideDialog();
@@ -440,7 +467,9 @@ export async function handleFinishedRecording(
   )();
   // A focused modal keeps the insertion: null target → focused-editable
   // caret path, never `focusAgentComposer` stealing focus from the modal.
-  const targetAgentId = dialogFocused ? null : resolveTargetAgentId(state, routeWorkspaceId);
+  const targetAgentId = dialogFocused
+    ? null
+    : (composerAgentId ?? resolveTargetAgentId(state, routeWorkspaceId));
   const context = gatherTranscriptionContext(state, routeWorkspaceId);
   // The active workspace (chief excluded, same rule as the context) opts the
   // call into workspace-vocabulary biasing on both engines (§5.41 v5.1).
@@ -492,11 +521,29 @@ export async function handleFinishedRecording(
       : await insertTranscript(text, targetAgentId, deps);
     if (!inserted) {
       logger.warn('Transcript insertion failed: no focused composer after retries');
+      // Fail-soft clipboard fallback so the transcript is never stranded in
+      // the toast description alone: on a successful copy the toast says so;
+      // a clipboard failure degrades to the original insert-failed toast.
+      const copyToClipboard = deps.copyToClipboard ?? writeTextToClipboard;
+      let copied = false;
+      try {
+        await copyToClipboard(text);
+        copied = true;
+      } catch (clipboardError) {
+        logger.warn('Clipboard fallback for the failed insertion also failed', {
+          error: clipboardError,
+        });
+      }
       const toast = await getToast();
-      toast.error(m.hardwareConsole_voice_insertFailed_error(), {
-        id: TRANSCRIPTION_TOAST_ID,
-        description: text,
-      });
+      toast.error(
+        copied
+          ? m.hardwareConsole_voice_insertFailedCopied_error()
+          : m.hardwareConsole_voice_insertFailed_error(),
+        {
+          id: TRANSCRIPTION_TOAST_ID,
+          description: text,
+        },
+      );
       return;
     }
     // The successful insertion leaves the composer focused, so the send

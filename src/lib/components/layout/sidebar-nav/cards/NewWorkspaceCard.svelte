@@ -5,10 +5,7 @@
    * Shows WIP state if there's draft content, recent repos for quick access,
    * and a button to open the full creation modal.
    */
-  import {
-  faArrowRight,
-  faFolder,
-} from '@fortawesome/free-solid-svg-icons';
+  import { faArrowRight, faFolder } from '@fortawesome/free-solid-svg-icons';
   import Fa from 'svelte-fa';
   import { goto } from '$app/navigation';
   import { m } from '$shared/paraglide/messages.js';
@@ -17,15 +14,16 @@
 
   import { selectDraftPrompt } from '$store/renderer/slices/sidebar-nav/sidebar-nav-selectors';
   import {
-  closeAll,
-  setShowCreateModal,
-} from '$store/renderer/slices/sidebar-nav/sidebar-nav-slice';
+    closeAll,
+    setShowCreateModal,
+  } from '$store/renderer/slices/sidebar-nav/sidebar-nav-slice';
   import { selectWorkspaceItems } from '$store/renderer/slices/workspace/workspace-selectors';
 
   import type { Workspace } from '$shared/types';
   import { WorkspaceStatusEnum } from '$shared/types';
   import { compareWorkspaceActivityDisplayTimeDesc } from '$shared/utils/workspace-activity-time';
   import Header from '$lib/components/ui/Header.svelte';
+  import GitHubAvatar from '$lib/components/ui/GitHubAvatar.svelte';
   import { store as appStore } from '$store/renderer/store';
   import { deriveRecentRepoEntries } from './recent-repos';
 
@@ -35,7 +33,6 @@
   interface Props {
     expanded?: boolean;
   }
-
 
   let { expanded: _ = false }: Props = $props();
 
@@ -55,7 +52,10 @@
     ),
   );
 
-  function openModal(initialRepo?: { repoPath?: string; owner?: string; name?: string }, event?: MouseEvent) {
+  function openModal(
+    initialRepo?: { repoPath?: string; owner?: string; name?: string },
+    event?: MouseEvent,
+  ) {
     appStore.dispatch(closeAll(false));
     if (initialRepo?.repoPath) {
       sessionStorage.setItem(
@@ -79,17 +79,10 @@
   function openWithDraft() {
     const currentDraft = selectDraftPrompt.select(appStore.state);
     if (currentDraft.trim()) {
-      sessionStorage.setItem(
-        'workspace-prefill',
-        JSON.stringify({ prompt: currentDraft }),
-      );
+      sessionStorage.setItem('workspace-prefill', JSON.stringify({ prompt: currentDraft }));
     }
     appStore.dispatch(closeAll(false));
     appStore.dispatch(setShowCreateModal(true));
-  }
-
-  function getGitHubAvatarUrl(owner: string, size: number = 24): string {
-    return `https://github.com/${owner}.png?size=${size}`;
   }
 </script>
 
@@ -101,14 +94,16 @@
       onclick={openWithDraft}
     >
       <div class="flex items-center gap-2 mb-1">
-        <span class="text-ui font-semibold uppercase tracking-wider text-primary/70">{m.layout_newWorkspaceCard_draft_label()}</span
+        <span class="text-ui font-semibold uppercase tracking-wider text-primary/70"
+          >{m.layout_newWorkspaceCard_draft_label()}</span
         >
       </div>
       <p class="text-sm text-muted-foreground line-clamp-2">{$draftPrompt$.trim()}</p>
       <span
         class="text-ui text-muted-foreground mt-1 flex items-center gap-1 group-hover:text-foreground/60 transition-colors"
       >
-        {m.layout_newWorkspaceCard_continueEditing_label()} <Fa icon={faArrowRight} size="xs" />
+        {m.layout_newWorkspaceCard_continueEditing_label()}
+        <Fa icon={faArrowRight} size="xs" />
       </span>
     </button>
   {/if}
@@ -132,16 +127,14 @@
               )}
           >
             {#if repo.owner}
-              <img
-                src={getGitHubAvatarUrl(repo.owner)}
+              <GitHubAvatar
+                identity={repo.owner}
                 alt={repo.owner}
+                size={16}
                 class="size-4 rounded-full shrink-0"
-                loading="lazy"
-                onerror={(e) => ((e.currentTarget as HTMLImageElement).style.display = 'none')}
               />
             {:else}
-              <span class="text-ghost shrink-0"><Fa icon={faFolder} size="xs" /></span
-              >
+              <span class="text-ghost shrink-0"><Fa icon={faFolder} size="xs" /></span>
             {/if}
             <span class="text-sm text-muted-foreground truncate font-medium flex-1">
               {#if repo.source === 'local'}

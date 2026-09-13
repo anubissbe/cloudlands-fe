@@ -21,6 +21,8 @@
 import { Logger } from '$shared/logger';
 import type { SuggestedPrompt } from '$shared/types';
 import type { ContentBlock } from '$shared/types/content-block';
+import type { VideoSource } from '$shared/types/content-block';
+import { splitWorkspaceVideoMarkdown } from './workspace-file-video';
 
 const logger = new Logger('MessageParser');
 
@@ -40,6 +42,7 @@ export interface ParsedContent {
     | 'mermaid'
     | 'workspace_card'
     | 'nav_link'
+    | 'video'
     | 'patch'
     | 'reference'
     | 'cli'
@@ -58,6 +61,11 @@ export interface ParsedContent {
     diagramData?: unknown; // Parsed DiagramPrimitive data
     workspaceCardData?: { workspaceIds: string[] };
     navLinkData?: { target: string; label?: string };
+    videoData?: {
+      source: Extract<VideoSource, { kind: 'workspace' }>;
+      name?: string;
+      poster?: string;
+    };
     patchData?: { filePath: string; diff: string; description?: string }; // Parsed patch data
     referenceData?: {
       semanticId?: string;
@@ -119,7 +127,7 @@ const SPECIAL_BLOCK_PATTERNS = {
   navLink:
     // i18n-ignore (regex literal with backticks)
     /(?:(`{3,})nav-link\s*\n([\s\S]*?)^`{3,}\s*$|(~{3,})nav-link\s*\n([\s\S]*?)^~{3,}\s*$)/gm,
-  // Workspace card blocks - @@@workspace sentinel syntax
+  // Workspace card blocks - current sentinel syntax
   workspaceSentinel: /^@@@workspace[ \t]*\n([\s\S]*?)^@@@[ \t]*$/gm,
   // Agent digest - short summary for display
   agentDigest: /<agent_digest>([\s\S]*?)<\/agent_digest>/g,
@@ -132,7 +140,7 @@ const SPECIAL_BLOCK_PATTERNS = {
 // Closing fences are line-anchored (^) with multiline flag to prevent matching within content.
 // Separate branches for backtick vs tilde fences to prevent mismatched fence types.
 const COMBINED_SPECIAL_REGEX =
-  /(<augment_code_snippet\s+path="[^"]+"(?:\s+mode="[^"]+")?\s*>\s*(`{4,})\w*\s*\n[\s\S]*?\n\s*\2\s*<\/augment_code_snippet>|(`{4,})\w*\s+path=[^\s]+(?:\s+mode=[^\s\n]+)?\s*\n[\s\S]*?^`{4,}\s*$|(`{3,})\w*\s+path=[^\s]+(?:\s+mode=[^\s\n]+)?\s*\n[\s\S]*?^`{3,}\s*$|(?:`{3,}diff\n[\s\S]*?^`{3,}\s*$|~{3,}diff\n[\s\S]*?^~{3,}\s*$)|<COMMIT_MESSAGE>[\s\S]*?<\/COMMIT_MESSAGE>|(?:`{3,}(?:diagram|ws-block:diagram)\s*\n[\s\S]*?^`{3,}\s*$|~{3,}(?:diagram|ws-block:diagram)\s*\n[\s\S]*?^~{3,}\s*$)|(?:`{3,}ws-block:patch\s*\n[\s\S]*?^`{3,}\s*$|~{3,}ws-block:patch\s*\n[\s\S]*?^~{3,}\s*$)|(?:`{3,}ws-block:reference\s*\n[\s\S]*?^`{3,}\s*$|~{3,}ws-block:reference\s*\n[\s\S]*?^~{3,}\s*$)|(?:`{3,}ws-block:cli\s*\n[\s\S]*?^`{3,}\s*$|~{3,}ws-block:cli\s*\n[\s\S]*?^~{3,}\s*$)|(?:`{3,}ws-block:agent_action\s*\n[\s\S]*?^`{3,}\s*$|~{3,}ws-block:agent_action\s*\n[\s\S]*?^~{3,}\s*$)|^@@@workspace[ \t]*\n[\s\S]*?^@@@[ \t]*$|(?:`{3,}nav-link\s*\n[\s\S]*?^`{3,}\s*$|~{3,}nav-link\s*\n[\s\S]*?^~{3,}\s*$)|(?:`{3,}mermaid\s*\n[\s\S]*?^`{3,}\s*$|~{3,}mermaid\s*\n[\s\S]*?^~{3,}\s*$)|<agent_digest>[\s\S]*?<\/agent_digest>|<<<DETECTED_SCRIPTS>>>[\s\S]*?<<<\/DETECTED_SCRIPTS>>>)/gm;
+  /(<augment_code_snippet\s+path="[^"]+"(?:\s+mode="[^"]+")?\s*>\s*(`{4,})\w*\s*\n[\s\S]*?\n\s*\2\s*<\/augment_code_snippet>|(`{4,})\w*\s+path=[^\s]+(?:\s+mode=[^\s\n]+)?\s*\n[\s\S]*?^`{4,}\s*$|(`{3,})\w*\s+path=[^\s]+(?:\s+mode=[^\s\n]+)?\s*\n[\s\S]*?^`{3,}\s*$|(?:`{3,}diff\n[\s\S]*?^`{3,}\s*$|~{3,}diff\n[\s\S]*?^~{3,}\s*$)|<COMMIT_MESSAGE>[\s\S]*?<\/COMMIT_MESSAGE>|(?:`{3,}(?:diagram|ws-block:diagram)\s*\n[\s\S]*?^`{3,}\s*$|~{3,}(?:diagram|ws-block:diagram)\s*\n[\s\S]*?^~{3,}\s*$)|(?:`{3,}ws-block:patch\s*\n[\s\S]*?^`{3,}\s*$|~{3,}ws-block:patch\s*\n[\s\S]*?^~{3,}\s*$)|(?:`{3,}ws-block:reference\s*\n[\s\S]*?^`{3,}\s*$|~{3,}ws-block:reference\s*\n[\s\S]*?^~{3,}\s*$)|(?:`{3,}ws-block:cli\s*\n[\s\S]*?^`{3,}\s*$|~{3,}ws-block:cli\s*\n[\s\S]*?^~{3,}\s*$)|(?:`{3,}ws-block:agent_action\s*\n[\s\S]*?^`{3,}\s*$|~{3,}ws-block:agent_action\s*\n[\s\S]*?^~{3,}\s*$)|`{3,}workspace\s*\n[\s\S]*?^`{3,}\s*$|^@@@workspace[ \t]*\n[\s\S]*?^@@@[ \t]*$|(?:`{3,}nav-link\s*\n[\s\S]*?^`{3,}\s*$|~{3,}nav-link\s*\n[\s\S]*?^~{3,}\s*$)|(?:`{3,}mermaid\s*\n[\s\S]*?^`{3,}\s*$|~{3,}mermaid\s*\n[\s\S]*?^~{3,}\s*$)|<agent_digest>[\s\S]*?<\/agent_digest>|<<<DETECTED_SCRIPTS>>>[\s\S]*?<<<\/DETECTED_SCRIPTS>>>)/gm;
 
 const WORKSPACE_LINK_PREFIX = 'intent://local/workspace/';
 
@@ -604,6 +612,19 @@ function parseSpecialBlock(blockText: string): ParsedContent | null {
     }
   }
 
+  // The built-in Chief and persisted Chief transcripts use fenced workspace blocks.
+  if (/^`{3,}workspace/.test(blockText)) {
+    const match = blockText.match(/`{3,}workspace\s*\n([\s\S]*?)^`{3,}\s*$/m);
+    if (match) {
+      const workspaceIds = parseWorkspaceCardIds(match[1]);
+      if (workspaceIds.length === 0) return { type: 'text', content: blockText };
+      return {
+        type: 'workspace_card',
+        content: match[1],
+        metadata: { workspaceCardData: { workspaceIds } },
+      };
+    }
+  }
   // Check @@@workspace sentinel block
   if (blockText.startsWith('@@@workspace')) {
     const match = blockText.match(/^@@@workspace[ \t]*\n([\s\S]*?)^@@@[ \t]*$/m);
@@ -763,8 +784,32 @@ function parseSpecialBlock(blockText: string): ParsedContent | null {
   return null;
 }
 
-export function parseAgentMessage(content: string): ParsedContent[] {
+export function parseAgentMessage(content: string, workspaceId?: string): ParsedContent[] {
   if (!content) return [];
+
+  const mediaSegments = splitWorkspaceVideoMarkdown(content, workspaceId);
+  if (mediaSegments.some((segment) => segment.type === 'video')) {
+    return mergeConsecutiveTextBlocks(
+      mediaSegments.flatMap((segment): ParsedContent[] =>
+        segment.type === 'markdown'
+          ? parseAgentMessage(segment.content, workspaceId)
+          : [
+              {
+                type: 'video',
+                content: segment.name ?? '',
+                metadata: {
+                  videoData: {
+                    source: segment.source,
+                    name: segment.name,
+                    poster: segment.poster,
+                  },
+                },
+              },
+            ],
+      ),
+    );
+  }
+  content = mediaSegments[0]?.type === 'markdown' ? mediaSegments[0].content : content;
 
   // PERF: Single-pass extraction of all special blocks
   // Instead of running 5 separate regex passes, we find all special blocks at once
@@ -835,7 +880,6 @@ const LINE_PATTERNS = {
   fileWithLineNumbers: /^\s*\d+[→\t]/,
   // Command execution
   command: /^\$\s+(.+)$/,
-  commandAlt: /^>\s+(.+)$/,
   // Error messages
   error: /^(error|Error|ERROR)[\s:]/i,
   warning: /^(warning|Warning|WARNING)[\s:]/i,
@@ -886,7 +930,7 @@ function processRegularContent(content: string): ParsedContent[] {
     }
 
     // Check for command execution
-    const commandMatch = line.match(LINE_PATTERNS.command) || line.match(LINE_PATTERNS.commandAlt);
+    const commandMatch = line.match(LINE_PATTERNS.command);
     if (commandMatch) {
       flushBlock();
       currentBlock = {
@@ -1268,6 +1312,10 @@ export interface ContentBlockGroup {
   name: string;
   isStreaming: boolean;
   children: ContentBlock[];
+  /** Renderer-only normalization metadata for alternate-model reasoning groups. */
+  isReasoningPhase?: boolean;
+  sourceName?: string;
+  hasAdjacentReasoningHistory?: boolean;
 }
 
 export type RenderContentBlock = ContentBlock | ContentBlockGroup;
@@ -1497,28 +1545,9 @@ export function groupContentBlocks(
 }
 
 /**
- * Remove thinking blocks from grouped render output, both at the top level
- * and inside content_group children.
- *
- * This must run AFTER groupContentBlocks: legacy <think>…</think> text is
- * only converted into thinking blocks during grouping, so a pre-grouping
- * filter would miss them (the showReasoningBlocks preference would be
- * ineffective for external-provider or older messages).
- */
-export function stripThinkingBlocks(blocks: RenderContentBlock[]): RenderContentBlock[] {
-  return blocks
-    .filter((block) => block.type !== 'thinking')
-    .map((block) =>
-      block.type === 'content_group'
-        ? { ...block, children: block.children.filter((child) => child.type !== 'thinking') }
-        : block,
-    );
-}
-
-/**
  * Format parsed content blocks into markdown
  */
-export function formatParsedContent(blocks: ParsedContent[]): string {
+function formatParsedContent(blocks: ParsedContent[]): string {
   return blocks
     .map((block) => {
       switch (block.type) {
@@ -1610,288 +1639,6 @@ export function cleanAgentMessage(content: string): string {
 }
 
 /**
- * Extract tool calls from message content
- *
- * Uses Auggie CLI's standard patterns:
- * - Tool call: \x1b[90m🔧 Tool call: {name}\x1b[0m (grey ANSI)
- * - Tool result: 📋 {name} ✅/❌
- * - Parameters: Indented with 3 spaces after tool call
- */
-export function extractToolCalls(content: string): Array<{
-  id: string;
-  name: string;
-  input?: any;
-  output?: string;
-  error?: string;
-  phase: 'start' | 'result';
-}> {
-  logger.debug('[extractToolCalls] Starting extraction from content length:', content.length);
-  const toolCalls: Array<any> = [];
-  const lines = content.split('\n');
-  logger.debug('[extractToolCalls] Split into', lines.length, 'lines');
-
-  // Auggie CLI standard patterns (from auggie-cli-chat-ui-guide.md)
-  const patterns = {
-    // Tool call with ANSI grey color: \x1b[90m🔧 Tool call: name\x1b[0m
-    toolCallStart: /\x1b\[90m🔧\s+Tool call:\s+(.+?)\x1b\[0m/,
-    // Tool call without ANSI (fallback): 🔧 Tool call: name
-    toolCallStartNoAnsi: /🔧\s+Tool call:\s+(.+?)$/,
-    // Tool result compact format: 📋 name ✅/❌
-    toolResultCompact: /📋\s+(.+?)\s+(✅|❌)/,
-    // Tool result with ANSI: \x1b[90m📋 name\x1b[0m
-    toolResultStart: /\x1b\[90m📋\s+(.+?)\x1b\[0m/,
-    // Tool result without ANSI (fallback): 📋 name
-    toolResultStartNoAnsi: /📋\s+(.+?)$/,
-    // Tool parameters: 3 spaces indentation
-    toolParameter: /^ {3}(.+)$/,
-    // ANSI color codes (for stripping)
-    ansiColor: /\x1b\[[0-9;]*m/g,
-  };
-
-  let currentTool: any = null;
-  let outputLines: string[] = [];
-  let inputLines: string[] = [];
-  let inCodeBlock = false;
-  let codeBlockType = '';
-  let collectingInput = false;
-
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    const trimmed = line.trim();
-
-    // Check for Auggie CLI tool call start (with ANSI codes)
-    let toolCallStartMatch = line.match(patterns.toolCallStart);
-    // Fallback to non-ANSI version if needed
-    if (!toolCallStartMatch) {
-      toolCallStartMatch = trimmed.match(patterns.toolCallStartNoAnsi);
-    }
-
-    if (toolCallStartMatch) {
-      logger.debug('[extractToolCalls] Found tool call start:', toolCallStartMatch[1]);
-      // Save previous tool if exists
-      if (currentTool) {
-        if (outputLines.length > 0) {
-          currentTool.output = outputLines.join('\n');
-        }
-        toolCalls.push(currentTool);
-      }
-
-      const toolName = toolCallStartMatch[1].trim();
-      currentTool = {
-        id: `tool-${Date.now()}-${Math.random().toString(36).substring(2, 11)}`,
-        name: toolName,
-        phase: 'start' as const,
-        input: {},
-      };
-      outputLines = [];
-      inputLines = [];
-      collectingInput = true;
-      continue;
-    }
-
-    // Check for Auggie CLI tool result (compact format: 📋 name ✅/❌)
-    let toolResultMatch = trimmed.match(patterns.toolResultCompact);
-
-    // Fallback to detailed format with ANSI codes
-    if (!toolResultMatch) {
-      toolResultMatch = line.match(patterns.toolResultStart);
-    }
-
-    // Fallback to non-ANSI version
-    if (!toolResultMatch) {
-      toolResultMatch = trimmed.match(patterns.toolResultStartNoAnsi);
-    }
-
-    if (toolResultMatch) {
-      const toolName = toolResultMatch[1].trim();
-      // eslint-disable-next-line @typescript-eslint/no-unused-vars
-      const success = toolResultMatch[2] === '✅' || !toolResultMatch[2]; // Default to success if no status
-
-      if (currentTool && currentTool.name === toolName) {
-        // This is the result for the current tool call
-        // Parse input from collected lines if we haven't already
-        if (inputLines.length > 0 && Object.keys(currentTool.input || {}).length === 0) {
-          currentTool.input = parseToolInput(inputLines);
-        }
-        // Push the "start" phase
-        toolCalls.push({ ...currentTool });
-
-        // Now create the "result" phase with same input
-        currentTool = {
-          id: `tool-${Date.now()}-${Math.random().toString(36).substring(2, 11)}`,
-          name: toolName,
-          phase: 'result' as const,
-          input: currentTool.input,
-        };
-      } else {
-        // Save previous tool if exists
-        if (currentTool) {
-          if (inputLines.length > 0) {
-            currentTool.input = parseToolInput(inputLines);
-          }
-          toolCalls.push(currentTool);
-        }
-
-        // Start new result-only tool call
-        currentTool = {
-          id: `tool-${Date.now()}-${Math.random().toString(36).substring(2, 11)}`,
-          name: toolName,
-          phase: 'result' as const,
-          input: {},
-        };
-      }
-
-      outputLines = [];
-      inputLines = [];
-      collectingInput = false;
-      continue;
-    }
-
-    // Collect input parameters (3 spaces indentation per Auggie CLI standard)
-    const paramMatch = line.match(patterns.toolParameter);
-    if (collectingInput && currentTool && paramMatch) {
-      inputLines.push(paramMatch[1]);
-      continue;
-    } else if (collectingInput && trimmed && !trimmed.startsWith('...')) {
-      // Non-indented line means we're done collecting input
-      collectingInput = false;
-    }
-
-    // Check for code block markers
-    if (line.startsWith('```')) {
-      if (inCodeBlock) {
-        // End of code block
-        if (currentTool && outputLines.length > 0) {
-          currentTool.output = outputLines.join('\n');
-          toolCalls.push(currentTool);
-          currentTool = null;
-          outputLines = [];
-        }
-        inCodeBlock = false;
-        codeBlockType = '';
-      } else {
-        // Start of code block
-        inCodeBlock = true;
-        // eslint-disable-next-line @typescript-eslint/no-unused-vars
-        codeBlockType = line.slice(3).trim();
-      }
-      continue;
-    }
-
-    // If we're in a code block, collect the content
-    if (inCodeBlock) {
-      outputLines.push(line);
-      continue;
-    }
-
-    // Note: File viewing, directory listing, and file edit patterns are now
-    // handled by the AuggieTextParser which uses proper tool call markers.
-    // These hacky string matching patterns have been removed in favor of
-    // the standard Auggie CLI patterns (🔧 Tool call:, 📋 Tool result:, etc.)
-
-    // Collect output lines if we have a current tool and not collecting input
-    if (currentTool && !collectingInput && trimmed && !trimmed.startsWith('...')) {
-      outputLines.push(line);
-    }
-  }
-
-  // Save any remaining tool
-  if (currentTool) {
-    if (inputLines.length > 0 && currentTool.phase === 'start') {
-      currentTool.input = parseToolInput(inputLines);
-    }
-    if (outputLines.length > 0) {
-      currentTool.output = outputLines.join('\n');
-    }
-    toolCalls.push(currentTool);
-  }
-
-  logger.debug('[extractToolCalls] Extracted', toolCalls.length, 'tool calls:', toolCalls);
-  return toolCalls;
-}
-
-/**
- * Parse tool input parameters from indented lines
- */
-function parseToolInput(lines: string[]): any {
-  const input: any = {};
-  let currentKey: string | null = null;
-  let currentValue: string[] = [];
-  let inMultilineString = false;
-
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-
-    // Check if this line starts a new parameter (has a colon near the beginning)
-    // But not if we're inside a multi-line string value
-    const colonIndex = line.indexOf(':');
-    const potentialKey = colonIndex > 0 ? line.substring(0, colonIndex).trim() : '';
-
-    // A line is a new parameter if:
-    // 1. It has a colon within the first 30 chars
-    // 2. The part before the colon looks like a parameter name (alphanumeric, underscore, dash)
-    // 3. We're not currently inside a multi-line string
-    const isNewParam =
-      colonIndex > 0 &&
-      colonIndex < 30 &&
-      /^[a-zA-Z_][\w-]*$/.test(potentialKey) &&
-      !inMultilineString;
-
-    if (isNewParam) {
-      // Save previous parameter if exists
-      if (currentKey) {
-        let value = currentValue.join('\n').trim();
-        // Remove surrounding quotes if present
-        if (
-          (value.startsWith('"') && value.endsWith('"')) ||
-          (value.startsWith("'") && value.endsWith("'"))
-        ) {
-          value = value.slice(1, -1);
-          inMultilineString = false;
-        }
-        input[currentKey] = value;
-      }
-
-      // Start new parameter
-      currentKey = potentialKey;
-      const valueStart = line.substring(colonIndex + 1).trim();
-      currentValue = [valueStart];
-
-      // Check if this starts a multi-line string (starts with quote but doesn't end with one)
-      if (
-        (valueStart.startsWith('"') && !valueStart.endsWith('"')) ||
-        (valueStart.startsWith("'") && !valueStart.endsWith("'"))
-      ) {
-        inMultilineString = true;
-      }
-    } else if (currentKey) {
-      // Continue current parameter value (multi-line)
-      currentValue.push(line);
-
-      // Check if this line ends the multi-line string
-      if (inMultilineString && (line.trim().endsWith('"') || line.trim().endsWith("'"))) {
-        inMultilineString = false;
-      }
-    }
-  }
-
-  // Save last parameter
-  if (currentKey) {
-    let value = currentValue.join('\n').trim();
-    // Remove surrounding quotes if present
-    if (
-      (value.startsWith('"') && value.endsWith('"')) ||
-      (value.startsWith("'") && value.endsWith("'"))
-    ) {
-      value = value.slice(1, -1);
-    }
-    input[currentKey] = value;
-  }
-
-  return input;
-}
-
-/**
  * Matches the opening line of a suggested prompts block. The opener must be the
  * last thing on its line — trailing content means it is prose, not a block.
  * Format:
@@ -1908,29 +1655,30 @@ const SUGGESTED_PROMPTS_OPENER_REGEX = /<!--[ \t]*suggested-prompts[ \t]*$/;
  */
 const SUGGESTED_PROMPTS_CLOSER_REGEX = /^[ \t]*-->[ \t]*$/;
 
-/**
- * Lenient closer: a line whose non-empty remainder ends in `-->` (models
- * sometimes fuse the last prompt with the closer). The remainder becomes the
- * final body line and still passes through the body-text gate, so a `-->`
- * embedded mid-line (Mermaid edge `A --> B`) never closes a block.
- */
+/** A final prompt line can be fused with the closer by older model output. */
 const SUGGESTED_PROMPTS_TRAILING_CLOSER_REGEX = /^(.*\S)[ \t]*-->$/;
 
 /** Opening/closing markdown fence (backtick or tilde), optionally indented. */
 const FENCE_LINE_REGEX = /^ {0,3}(`{3,}|~{3,})(.*)$/;
 
-/** At most this many prompts are surfaced from a block. */
-const MAX_SUGGESTED_PROMPTS = 6;
+/** At most this many prompts surface as chips; extra lines are dropped. */
+const MAX_SUGGESTED_PROMPTS = 4;
 
 /** Prompts longer than this are treated as captured body text and dropped. */
 const MAX_SUGGESTED_PROMPT_LENGTH = 200;
 
 /**
  * Shapes that indicate the captured line is response body text rather than a
- * deliberate prompt: markdown headings, fence markers, table rows, and Mermaid
- * edges (`A --> B`).
+ * deliberate prompt: markdown headings, fence markers, table rows, HTML
+ * comments, and Mermaid edges (`A --> B`).
  */
-const BODY_TEXT_LINE_PATTERNS = [/^#{1,6}(?:\s|$)/, /^(?:`{3,}|~{3,})/, /^\|/, /\S[ \t]*--+>/];
+const BODY_TEXT_LINE_PATTERNS = [
+  /^#{1,6}(?:\s|$)/,
+  /^(?:`{3,}|~{3,})/,
+  /^\|/,
+  /^<!--/,
+  /\S[ \t]*--+>/,
+];
 
 /**
  * Regex to match the delay prefix in a prompt line.
@@ -1945,23 +1693,98 @@ interface SuggestedPromptsBlock {
   end: number;
   /** Raw lines between the opener and the closer. */
   body: string[];
+  prompts: SuggestedPrompt[];
+}
+
+interface SuggestedPromptsScan {
+  blocks: SuggestedPromptsBlock[];
+  withheldStart: number | null;
+}
+
+interface SuggestedPromptsParseOptions {
+  isStreaming?: boolean;
+}
+
+interface SuggestedPromptsParseResult {
+  prompts: SuggestedPrompt[];
+  cleanedContent: string;
+}
+
+function parseSuggestedPromptLine(line: string): SuggestedPrompt | null {
+  const fullDelayMatch = line.match(DELAY_PREFIX_REGEX);
+  if (fullDelayMatch) {
+    const text = fullDelayMatch[2].trim();
+    return text.length > 0 && text.length <= MAX_SUGGESTED_PROMPT_LENGTH ? text : null;
+  }
+
+  const pipeIndex = line.indexOf('|');
+  let promptPart = pipeIndex === -1 ? line : line.slice(pipeIndex + 1).trim();
+  const delayMatch = promptPart.match(DELAY_PREFIX_REGEX);
+  if (delayMatch) promptPart = delayMatch[2].trim();
+  return promptPart.length > 0 && promptPart.length <= MAX_SUGGESTED_PROMPT_LENGTH
+    ? promptPart
+    : null;
 }
 
 /**
- * Locate every accepted suggested-prompts block in the content, in order.
- *
- * A block is accepted only when all of the following hold:
- * - its opener ends its own line and sits outside any fenced code region;
- * - it is closed by a `-->` standing alone on its own line — or ending a line
- *   whose remainder becomes the final body line — also outside any fenced
- *   code region (fence state is tracked across the whole scan, so a `-->`
- *   inside a fenced example after an opener cannot close the block);
- * - none of its captured lines looks like response body text.
- *
- * Blocks that fail any of these are not returned at all, so callers never
- * strip them from the rendered content.
+ * Salvage prompts from a well-formed block's body. When any captured line is
+ * body-text-shaped the whole block yields no chips (the model clearly wrote
+ * prose, not prompts); otherwise invalid individual lines (empty after
+ * label/delay stripping, over-long) are dropped and the rest surface, capped
+ * at {@link MAX_SUGGESTED_PROMPTS}.
  */
-function findSuggestedPromptsBlocks(content: string): SuggestedPromptsBlock[] {
+function parseSuggestedPromptLines(body: string[]): SuggestedPrompt[] {
+  const lines = body.map((line) => line.trim()).filter(Boolean);
+  if (lines.some(looksLikeBodyText)) return [];
+  const prompts: SuggestedPrompt[] = [];
+  for (const line of lines) {
+    const prompt = parseSuggestedPromptLine(line);
+    if (prompt !== null) prompts.push(prompt);
+    if (prompts.length === MAX_SUGGESTED_PROMPTS) break;
+  }
+  return prompts;
+}
+
+function partialOpenerStart(line: string): number | null {
+  let index = line.lastIndexOf('<');
+  while (index >= 0) {
+    const suffix = line.slice(index);
+    if ('<!--'.startsWith(suffix)) return index;
+    if (suffix.startsWith('<!--')) {
+      const afterComment = suffix.slice(4);
+      const afterWhitespace = afterComment.replace(/^[ \t]+/, '');
+      if (afterWhitespace.length === 0 || 'suggested-prompts'.startsWith(afterWhitespace))
+        return index;
+      if (
+        afterWhitespace.startsWith('suggested-prompts') &&
+        /^[ \t]*$/.test(afterWhitespace.slice('suggested-prompts'.length))
+      ) {
+        return index;
+      }
+    }
+    if (index === 0) break;
+    index = line.lastIndexOf('<', index - 1);
+  }
+  return null;
+}
+
+/**
+ * Locate every well-formed suggested-prompts block in the content, in order.
+ *
+ * A block is well-formed when its opener ends its own line and sits outside
+ * any fenced code region, and it is closed by a `-->` standing alone on its
+ * own line or fused with the final prompt, also outside any fenced code
+ * region. Every well-formed block is returned (and thus stripped by callers)
+ * regardless of its content — raw block markup must never render — while
+ * content validity only gates whether the block contributes prompts.
+ *
+ * Structurally malformed markup (unclosed opener, fenced example, inline
+ * opener) is not returned, so callers never strip real body text.
+ */
+function scanSuggestedPrompts(
+  content: string,
+  { isStreaming = false }: SuggestedPromptsParseOptions = {},
+): SuggestedPromptsScan {
   const lines = content.split('\n');
   const offsets: number[] = [];
   let offset = 0;
@@ -2006,25 +1829,30 @@ function findSuggestedPromptsBlocks(content: string): SuggestedPromptsBlock[] {
 
     if (SUGGESTED_PROMPTS_CLOSER_REGEX.test(line)) {
       const body = lines.slice(openerIndex + 1, i);
-      if (!body.some((bodyLine) => looksLikeBodyText(bodyLine.trim()))) {
-        blocks.push({ start: openerStart, end: offsets[i] + lines[i].length, body });
-      }
+      blocks.push({
+        start: openerStart,
+        end: offsets[i] + lines[i].length,
+        body,
+        prompts: parseSuggestedPromptLines(body),
+      });
       openerIndex = -1;
       continue;
     }
 
     const trailingCloserMatch = line.match(SUGGESTED_PROMPTS_TRAILING_CLOSER_REGEX);
-    // An opener-shaped remainder (e.g. `<!-- suggested-prompts -->`) must not
-    // close the block: closing would strip real body text as prompts. Fall
-    // through to the second-opener rescan instead.
     if (trailingCloserMatch && !SUGGESTED_PROMPTS_OPENER_REGEX.test(trailingCloserMatch[1])) {
-      // The remainder before the trailing `-->` is the final body line; the
-      // body-text gate runs on the remainder, not the raw line (the raw line
-      // always matches the Mermaid-edge pattern).
+      // While streaming, a fused closer on the unterminated final line is
+      // ambiguous: the next chunk may extend it into an embedded arrow
+      // (`Run -->` → `Run --> tests`). Keep the block open until the newline
+      // confirms the line; the withholding pass below keeps it hidden.
+      if (isStreaming && i === lines.length - 1) continue;
       const body = [...lines.slice(openerIndex + 1, i), trailingCloserMatch[1]];
-      if (!body.some((bodyLine) => looksLikeBodyText(bodyLine.trim()))) {
-        blocks.push({ start: openerStart, end: offsets[i] + lines[i].length, body });
-      }
+      blocks.push({
+        start: openerStart,
+        end: offsets[i] + lines[i].length,
+        body,
+        prompts: parseSuggestedPromptLines(body),
+      });
       openerIndex = -1;
       continue;
     }
@@ -2037,7 +1865,19 @@ function findSuggestedPromptsBlocks(content: string): SuggestedPromptsBlock[] {
     }
   }
 
-  return blocks;
+  if (!isStreaming) return { blocks, withheldStart: null };
+  if (openerIndex !== -1) {
+    // An open block is always withheld while streaming: once it closes it is
+    // stripped no matter its content, so showing it mid-stream only flickers.
+    return { blocks, withheldStart: openerStart };
+  }
+  if (fence) return { blocks, withheldStart: null };
+  const lastLine = lines.at(-1) ?? '';
+  const partialStart = partialOpenerStart(lastLine);
+  return {
+    blocks,
+    withheldStart: partialStart === null ? null : offsets[offsets.length - 1] + partialStart,
+  };
 }
 
 /** True when a captured line looks like response body text rather than a prompt. */
@@ -2067,80 +1907,104 @@ function looksLikeBodyText(line: string): boolean {
  * Label|delay:30|Check build results
  * -->
  *
- * Only accepted blocks count: the opener and the `-->` closer (standalone, or
- * trailing a final body line) must both sit outside any code fence, and no
- * captured line may look like response body text. A block that fails any of these is left untouched in
- * `cleanedContent` rather than stripped, so a Mermaid diagram or table can
- * neither surface as prompt chips nor disappear from the rendered message. The
- * last accepted block wins.
+ * Only well-formed blocks count: the opener and the `-->` closer (standalone
+ * or fused with the final prompt) must both sit outside any code fence. Every
+ * well-formed block is stripped from `cleanedContent` — raw block markup never
+ * renders — while structurally malformed markup (unclosed opener, fenced
+ * example, inline opener) is left untouched, so real body text never
+ * disappears. Prompts come from the last well-formed block: nothing when any
+ * captured line looks like response body text, otherwise the valid lines with
+ * invalid ones dropped, capped at four.
  */
-export function parseSuggestedPrompts(content: string): {
-  prompts: SuggestedPrompt[];
-  cleanedContent: string;
-} {
+export function parseSuggestedPrompts(
+  content: string,
+  options: SuggestedPromptsParseOptions = {},
+): SuggestedPromptsParseResult {
   if (!content) {
     return { prompts: [], cleanedContent: content };
   }
 
-  const blocks = findSuggestedPromptsBlocks(content);
-  if (blocks.length === 0) {
+  const { blocks, withheldStart } = scanSuggestedPrompts(content, options);
+  if (blocks.length === 0 && withheldStart === null) {
     return { prompts: [], cleanedContent: content };
   }
 
-  // Remove every accepted block from the content (never body text).
+  // Remove every well-formed block from the content (never body text).
   let cleanedContent = '';
   let cursor = 0;
   for (const block of blocks) {
     cleanedContent += content.slice(cursor, block.start);
     cursor = block.end;
   }
-  cleanedContent = (cleanedContent + content.slice(cursor)).trim();
+  const visibleEnd = withheldStart === null ? content.length : withheldStart;
+  cleanedContent = (cleanedContent + content.slice(cursor, visibleEnd)).trim();
+  return { prompts: blocks.at(-1)?.prompts ?? [], cleanedContent };
+}
 
-  // The last accepted block wins; body-text rejection already happened during
-  // the scan, so every block here is safe to surface.
-  const lines = blocks[blocks.length - 1].body
-    .map((line) => line.trim())
-    .filter((line) => line.length > 0);
+export function parseSuggestedPromptsFromContentBlocks(
+  contentBlocks: readonly ContentBlock[],
+  options: SuggestedPromptsParseOptions = {},
+): { prompts: SuggestedPrompt[]; contentBlocks: ContentBlock[] } {
+  const textBlocks = contentBlocks.filter((block) => block.type === 'text');
+  const combined = textBlocks.map((block) => block.text ?? block.content ?? '').join('');
+  const { blocks, withheldStart } = scanSuggestedPrompts(combined, options);
+  const ranges = blocks.map(({ start, end }) => ({ start, end }));
+  if (withheldStart !== null) ranges.push({ start: withheldStart, end: combined.length });
+  if (ranges.length === 0) {
+    return {
+      prompts: blocks.at(-1)?.prompts ?? [],
+      contentBlocks: contentBlocks.slice(),
+    };
+  }
 
-  const prompts: SuggestedPrompt[] = lines
-    .map((line): SuggestedPrompt | null => {
-      // Strip delay:N| prefix on full line (case-insensitive), returning just the text
-      // This handles "delay:60|Check deployment" format
-      const fullDelayMatch = line.match(DELAY_PREFIX_REGEX);
-      if (fullDelayMatch) {
-        const text = fullDelayMatch[2].trim();
-        return text.length > 0 ? text : null;
-      }
+  let textOffset = 0;
+  const withCleanedText = (block: ContentBlock, text: string): ContentBlock => ({
+    ...block,
+    ...(block.text !== undefined || block.content === undefined ? { text } : {}),
+    ...(block.content !== undefined ? { content: text } : {}),
+  });
+  const nextBlocks = contentBlocks.map((block) => {
+    if (block.type !== 'text') return block;
+    const original = block.text ?? block.content ?? '';
+    const blockStart = textOffset;
+    const blockEnd = blockStart + original.length;
+    textOffset = blockEnd;
+    let localCursor = 0;
+    let nextText = '';
+    for (const range of ranges) {
+      if (range.end <= blockStart || range.start >= blockEnd) continue;
+      const localStart = Math.max(0, range.start - blockStart);
+      const localEnd = Math.min(original.length, range.end - blockStart);
+      nextText += original.slice(localCursor, localStart);
+      localCursor = Math.max(localCursor, localEnd);
+    }
+    nextText += original.slice(localCursor);
+    return withCleanedText(block, nextText);
+  });
 
-      // Support "Label|Full prompt" syntax - extract just the prompt part after the first pipe
-      const pipeIndex = line.indexOf('|');
-      let promptPart = line;
-      if (pipeIndex !== -1) {
-        promptPart = line.slice(pipeIndex + 1).trim();
-
-        // Strip delay:N| prefix after label (handles "Label|delay:30|text" format)
-        const delayMatch = promptPart.match(DELAY_PREFIX_REGEX);
-        if (delayMatch) {
-          const text = delayMatch[2].trim();
-          return text.length > 0 ? text : null;
-        }
-      }
-
-      // Return as plain string
-      return promptPart.length > 0 ? promptPart : null;
-    })
-    .filter((prompt): prompt is SuggestedPrompt => prompt !== null)
-    // Over-long entries are body text that slipped through, not prompts.
-    .filter((prompt) => prompt.length <= MAX_SUGGESTED_PROMPT_LENGTH)
-    .slice(0, MAX_SUGGESTED_PROMPTS);
-
-  return { prompts, cleanedContent };
+  const survivingTextIndices = nextBlocks
+    .map((block, index) =>
+      block.type === 'text' && (block.text ?? block.content ?? '').length > 0 ? index : -1,
+    )
+    .filter((index) => index >= 0);
+  const first = survivingTextIndices.at(0);
+  const last = survivingTextIndices.at(-1);
+  if (first !== undefined) {
+    const block = nextBlocks[first];
+    nextBlocks[first] = withCleanedText(block, (block.text ?? block.content ?? '').trimStart());
+  }
+  if (last !== undefined) {
+    const block = nextBlocks[last];
+    nextBlocks[last] = withCleanedText(block, (block.text ?? block.content ?? '').trimEnd());
+  }
+  return { prompts: blocks.at(-1)?.prompts ?? [], contentBlocks: nextBlocks };
 }
 
 /**
- * Check if content contains an accepted suggested prompts block
+ * Check if content contains a well-formed suggested prompts block (purely
+ * structural — the block may still contribute zero prompt chips).
  */
 export function hasSuggestedPrompts(content: string): boolean {
   if (!content) return false;
-  return findSuggestedPromptsBlocks(content).length > 0;
+  return scanSuggestedPrompts(content).blocks.length > 0;
 }

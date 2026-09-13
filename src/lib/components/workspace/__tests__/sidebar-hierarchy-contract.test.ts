@@ -1,8 +1,20 @@
+// @verify-changed-triggers: ../MultiSelectTabbedSidebar.svelte, ../multi-select-sidebar-tabs.ts,
+//   ../multi-select-sidebar-transitions.css, ../WorkspaceAgentsList.svelte,
+//   ../WorkspaceSidebarHeader.svelte, ../TaskStatusProgress.svelte, ../SidebarBrowserLauncher.svelte,
+//   ../sidebar/WorkspaceProgressCard.svelte, ../sidebar/FlameGraph.svelte,
+//   ../sidebar/ContextPanel.svelte, ../sidebar/NotesPanel.svelte, ../sidebar/SidebarChangesPanel.svelte,
+//   ../../layout/sidebar-nav/SidebarNav.svelte, ../../layout/sidebar-nav/cards/AllWorkspacesCard.svelte,
+//   ../../layout/WindowTitleBar.svelte, ../../../../routes/(app)/+layout.svelte
+
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 
 function source(relativePath: string) {
   return readFileSync(new URL(relativePath, import.meta.url), 'utf8');
+}
+
+function selfClosingTag(componentSource: string, componentName: string) {
+  return componentSource.match(new RegExp(`<${componentName}\\b[\\s\\S]*?/>`))?.[0] ?? '';
 }
 
 describe('workspace sidebar hierarchy presentation contract', () => {
@@ -18,27 +30,17 @@ describe('workspace sidebar hierarchy presentation contract', () => {
     expect(navigation).toContain('data-nav-item={item.id}');
     expect(navigation).toContain('name="dandelion"');
     expect(navigation).not.toContain('name="spaces"');
+    expect(navigation).not.toContain('SidebarNavHoverCard');
     expect(titleBar).toContain('<SidebarNav />');
     expect(titleBar.indexOf('<SidebarNav />')).toBeLessThan(titleBar.indexOf('<WorkspaceTabStrip'));
     expect(titleBar).not.toContain('ChiefTrigger');
     expect(titleBar).toContain('titlebar-left-drag-surface');
     expect(titleBar).toContain('data-titlebar-left-drag-handle');
-    expect(titleBar).toContain('class="flex min-w-0 items-center gap-1"');
+    expect(titleBar).toContain('titlebar-fixed-controls flex min-w-0 items-center gap-1');
     expect(titleBar).toContain('<WorkspaceTabStrip');
     expect(titleBar).toContain('activeWorkspaceId={routedWorkspaceId}');
     expect(titleBar).toContain('data-titlebar-settings');
     expect(appLayout).not.toContain('<SidebarNav />');
-  });
-
-  it('uses the recents-only spaces list from the plus hover target', () => {
-    const hoverCard = source('../../layout/sidebar-nav/SidebarNavHoverCard.svelte');
-
-    expect(hoverCard).toContain("$activeCard$ === 'new-workspace'");
-    expect(hoverCard).not.toContain("$activeCard$ === 'home'");
-    expect(hoverCard).toContain('<AllWorkspacesCard recentsOnly />');
-    expect(hoverCard).not.toContain('Find or switch spaces');
-    expect(hoverCard).not.toContain('pinAllWorkspacesPanel');
-    expect(hoverCard).not.toContain('shadow-lg');
   });
 
   it('opens a title-bar workspace tab before navigating from the spaces combobox', () => {
@@ -66,7 +68,10 @@ describe('workspace sidebar hierarchy presentation contract', () => {
     expect(metadata).toBeLessThan(progressSection);
     expect(progressSection).toBeLessThan(status);
     expect(fullMode).toContain('class="flex w-full flex-col" data-workspace-title-section');
-    expect(fullMode).toContain('type-caption mb-4 flex h-5 w-full min-w-0 items-center gap-2.5');
+    expect(fullMode).toContain(
+      'class="mb-4 flex w-full flex-col gap-1" data-sidebar-workspace-metadata',
+    );
+    expect(fullMode).toContain('type-caption flex h-5 w-full min-w-0 items-center gap-2.5');
     expect(fullMode).toContain('class="flex w-full flex-col pb-1"');
     expect(fullMode).toContain('flex w-full flex-col gap-3.5 pb-2 text-left');
     expect(fullMode).not.toContain('pb-1 pl-1');
@@ -122,7 +127,9 @@ describe('workspace sidebar hierarchy presentation contract', () => {
     expect(sidebar).toContain('shrink-0 px-6 pb-2 pt-5');
     expect(sidebar).toContain('data-workspace-title-region');
     expect(sidebar).toContain('<div class="px-4 pb-1 pt-4">');
-    expect(sidebar).toContain('<AddContextSection onAddNote={onCreateNote} compact />');
+    const addContext = selfClosingTag(sidebar, 'AddContextSection');
+    expect(addContext).toContain('onAddNote={onCreateNote}');
+    expect(addContext).toMatch(/\bcompact\b/);
     expect(sidebar).toContain('data-testid="agent-panel"');
     expect(sidebar).toContain('flex h-full flex-1 flex-col px-4');
     expect(agents).toContain('<div class="flex flex-col gap-0.5">');
@@ -172,8 +179,17 @@ describe('workspace sidebar hierarchy presentation contract', () => {
     expect(sidebar).toContain('m.ui_openCombo_openInApp_tooltip()');
     expect(sidebar).not.toContain('m.ui_openCombo_open_label()');
     expect(sidebar).not.toContain('faChevronDown');
-    expect(sidebar).toContain('handleOpenAgentInPanel(agent.id);');
-    expect(sidebar).toContain('onclick={() => handleOpenNoteInPanel(note.id as string)}');
+    expect(sidebar).toContain('const sourcePanelId = selectFocusedPanelId.select(');
+    expect(sidebar).toContain('openAgentTabRequested(workspaceId, {');
+    expect(sidebar).toContain('sourcePanelId,');
+    expect(sidebar).toContain('handleOpenAgentInPanel(agent.id, event);');
+    expect(sidebar).toContain('onSelect={({ agentId, event }) =>');
+    expect(sidebar).toContain('handleOpenAgentInPanel(agentId, event)}');
+    expect(sidebar).toContain('onOpenAgent={handleOpenAgentInPanel}');
+    expect(sidebar).toContain('onSelectAgent={handleOpenAgentInPanel}');
+    expect(sidebar).toContain(
+      'onclick={(event) => handleOpenNoteInPanel(note.id as string, event)}',
+    );
     expect(sidebar).toContain('rounded-sm outline-none transition-colors');
     expect(sidebar).toContain('rounded-lg border border-border bg-sidebar');
     expect(sidebar).not.toContain('focus-visible:ring-0');
@@ -203,10 +219,10 @@ describe('workspace sidebar hierarchy presentation contract', () => {
     expect(sidebar).toContain('getFixedContainingBlockOffset(node)');
     expect(sidebar).toContain('position: fixed; left: ${fixedLeft}px');
     expect(sidebar).toContain("direction === 'expand' ? cubicOut(t) : cubicIn(t)");
-    expect(sidebar).toContain('(t - 0.72) / 0.28');
     expect(sidebar).toContain('data-sidebar-expanded-content');
     expect(sidebar).toContain("window.matchMedia('(prefers-reduced-motion: reduce)').matches");
-    expect(transitions).toContain('opacity: var(--sidebar-card-content-opacity, 1)');
+    expect(sidebar).not.toContain('--sidebar-card-content-');
+    expect(transitions).not.toContain('--sidebar-card-content-');
     expect(transitions).not.toContain('grid-template-rows');
     expect(transitions).not.toContain('::view-transition');
   });

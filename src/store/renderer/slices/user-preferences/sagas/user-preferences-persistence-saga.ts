@@ -5,22 +5,28 @@ import { applyLanguagePreference } from '$lib/i18n/locale';
 import { SYSTEM_CHANNELS } from '$shared/ipc/channels';
 import { isGithubLinkDefaultAction } from '$shared/utils/link-helpers';
 import {
+  namespaceBackendKey,
+  selectActiveBackendId,
+} from '$store/renderer/utils/backend-storage-namespace';
+import {
   getLocalStorageJSON,
   setLocalStorageJSON,
 } from '$store/renderer/utils/safe-local-storage-saga';
+import { connectionsListReceived } from '../../connections/connections-slice';
 import {
   selectActivityLogPresets,
   selectAgentFontStyle,
+  selectChatAuroraEnabled,
   selectCodeFontFamily,
   selectGroupByRepo,
   selectGithubLinkDefaultAction,
   selectHasCompletedProviderSetup,
   selectLanguagePreference,
   selectNoteFontStyle,
-  selectPanelOpenMode,
-  selectPanelStackDirection,
   selectShowArchived,
   selectShowReasoningBlocks,
+  selectShellTransparencyEnabled,
+  selectShortcutOverrides,
   selectSpellcheckEnabled,
 } from '../user-preferences-selectors';
 import {
@@ -28,29 +34,34 @@ import {
   deleteActivityLogPreset,
   FONT_STYLES,
   hydrateActivityLogPresets,
+  hydrateShortcutOverrides,
+  resetAllShortcutOverrides,
+  resetShortcutOverride,
   saveActivityLogPreset,
   setAgentFontStyle,
+  setChatAuroraEnabled,
   setCodeFontFamily,
   setGroupByRepo,
   setGithubLinkDefaultAction,
   setHasCompletedProviderSetup,
   setLanguagePreference,
   setNoteFontStyle,
-  setPanelOpenMode,
-  setPanelStackDirection,
   setShowArchived,
   setShowReasoningBlocks,
+  setShellTransparencyEnabled,
+  setShortcutOverride,
   setSpellcheckEnabled,
   setSystemFonts,
   toggleGroupByRepo,
   toggleHasCompletedProviderSetup,
+  toggleChatAurora,
   toggleShowArchived,
   toggleShowReasoningBlocks,
+  toggleShellTransparency,
   toggleSpellcheck,
-  togglePanelOpenMode,
-  togglePanelStackDirection,
   type ActivityLogPresetPreference,
   type FontStyle,
+  type NoteFontStyle,
 } from '../user-preferences-slice';
 
 const SPELLCHECK_STORAGE_KEY = 'note-spellcheck-settings';
@@ -58,28 +69,47 @@ const SHOW_ARCHIVED_STORAGE_KEY = 'workspace-list:showArchived';
 const GROUP_BY_REPO_STORAGE_KEY = 'workspace-list:groupByRepo';
 const COMPLETED_PROVIDER_SETUP_STORAGE_KEY = 'workspace-list:completedProviderSetup';
 const SHOW_REASONING_BLOCKS_STORAGE_KEY = 'chat:showReasoningBlocks';
+const CHAT_AURORA_STORAGE_KEY = 'chat:auroraEnabled';
+const SHELL_TRANSPARENCY_STORAGE_KEY = 'appearance:shellTransparencyEnabled';
 const AGENT_STORAGE_KEY = 'agent-font-settings';
 const NOTE_STORAGE_KEY = 'note-font-settings';
 const CODE_STORAGE_KEY = 'code-font-settings';
 const ACTIVITY_LOG_PRESETS_STORAGE_KEY = 'activityLogPresets';
 const LANGUAGE_PREFERENCE_STORAGE_KEY = 'language-preference';
 const GITHUB_LINK_DEFAULT_ACTION_STORAGE_KEY = 'github-links:defaultAction';
-const PANEL_OPEN_MODE_STORAGE_KEY = 'panel-layout:openMode';
-const PANEL_STACK_DIRECTION_STORAGE_KEY = 'panel-layout:stackDirection';
+const SHORTCUT_OVERRIDES_STORAGE_KEY = 'keyboard-shortcut-overrides';
 
 type ListSystemFontsResponse = {
   success?: boolean;
   data?: unknown;
 };
 
-function validFont(value: unknown): value is { fontStyle: FontStyle } {
+function hasFontStyle(value: unknown): value is { fontStyle: string } {
   return (
     typeof value === 'object' &&
     value !== null &&
     'fontStyle' in value &&
-    typeof value.fontStyle === 'string' &&
-    FONT_STYLES.includes(value.fontStyle as FontStyle)
+    typeof value.fontStyle === 'string'
   );
+}
+
+function validAgentFont(value: unknown): value is { fontStyle: FontStyle } {
+  return hasFontStyle(value) && FONT_STYLES.includes(value.fontStyle as FontStyle);
+}
+
+function validNoteFont(value: unknown): value is { fontStyle: NoteFontStyle } {
+  return validAgentFont(value) || (hasFontStyle(value) && value.fontStyle === 'serif');
+}
+
+/**
+ * `workspace-list:completedProviderSetup` is backend-scoped: the flag answers
+ * "has provider setup been completed on THIS backend", so the local machine's
+ * value must not leak into remote-backend sessions. The local sidecar keeps
+ * the bare legacy key; remote backends get the `backend:<id>:` prefix.
+ */
+function* providerSetupStorageKey() {
+  const backendId = yield* selectActiveBackendId();
+  return namespaceBackendKey(COMPLETED_PROVIDER_SETUP_STORAGE_KEY, backendId);
 }
 
 function parseSystemFontsResponse(response: unknown): string[] | null {
@@ -116,7 +146,7 @@ export function* hydrateUserPreferencesWorker() {
   const groupByRepo = yield* getLocalStorageJSON<boolean>(GROUP_BY_REPO_STORAGE_KEY);
   if (typeof groupByRepo === 'boolean') yield* put(setGroupByRepo(groupByRepo));
 
-  const providerSetup = yield* getLocalStorageJSON<boolean>(COMPLETED_PROVIDER_SETUP_STORAGE_KEY);
+  const providerSetup = yield* getLocalStorageJSON<boolean>(yield* providerSetupStorageKey());
   if (typeof providerSetup === 'boolean') {
     yield* put(setHasCompletedProviderSetup(providerSetup));
   }
@@ -128,11 +158,23 @@ export function* hydrateUserPreferencesWorker() {
     yield* put(setShowReasoningBlocks(showReasoningBlocks));
   }
 
+  const chatAuroraEnabled = yield* getLocalStorageJSON<boolean>(CHAT_AURORA_STORAGE_KEY);
+  if (typeof chatAuroraEnabled === 'boolean') {
+    yield* put(setChatAuroraEnabled(chatAuroraEnabled));
+  }
+
+  const shellTransparencyEnabled = yield* getLocalStorageJSON<boolean>(
+    SHELL_TRANSPARENCY_STORAGE_KEY,
+  );
+  if (typeof shellTransparencyEnabled === 'boolean') {
+    yield* put(setShellTransparencyEnabled(shellTransparencyEnabled));
+  }
+
   const agentFont = yield* getLocalStorageJSON<unknown>(AGENT_STORAGE_KEY);
-  if (validFont(agentFont)) yield* put(setAgentFontStyle(agentFont.fontStyle));
+  if (validAgentFont(agentFont)) yield* put(setAgentFontStyle(agentFont.fontStyle));
 
   const noteFont = yield* getLocalStorageJSON<unknown>(NOTE_STORAGE_KEY);
-  if (validFont(noteFont)) yield* put(setNoteFontStyle(noteFont.fontStyle));
+  if (validNoteFont(noteFont)) yield* put(setNoteFontStyle(noteFont.fontStyle));
 
   const codeFont = yield* getLocalStorageJSON<{ fontFamily?: unknown }>(CODE_STORAGE_KEY);
   if (typeof codeFont?.fontFamily === 'string' && codeFont.fontFamily.trim()) {
@@ -165,65 +207,88 @@ export function* hydrateUserPreferencesWorker() {
     yield* put(setGithubLinkDefaultAction(githubLinkDefaultAction));
   }
 
-  const panelOpenMode = yield* getLocalStorageJSON<unknown>(PANEL_OPEN_MODE_STORAGE_KEY);
-  if (panelOpenMode === 'normal' || panelOpenMode === 'pin') {
-    yield* put(setPanelOpenMode(panelOpenMode));
-  }
-
-  const panelStackDirection = yield* getLocalStorageJSON<unknown>(
-    PANEL_STACK_DIRECTION_STORAGE_KEY,
-  );
-  if (panelStackDirection === 'left' || panelStackDirection === 'right') {
-    yield* put(setPanelStackDirection(panelStackDirection));
-  }
+  const shortcutOverrides = yield* getLocalStorageJSON<unknown>(SHORTCUT_OVERRIDES_STORAGE_KEY);
+  if (shortcutOverrides !== undefined) yield* put(hydrateShortcutOverrides(shortcutOverrides));
 }
 
-export function* persistSpellcheckWorker() {
+function* persistSpellcheckWorker() {
   const enabled = yield* selectSpellcheckEnabled.effect();
   yield* setLocalStorageJSON(SPELLCHECK_STORAGE_KEY, { enabled });
 }
 
-export function* persistShowArchivedWorker() {
+function* persistShowArchivedWorker() {
   yield* setLocalStorageJSON(SHOW_ARCHIVED_STORAGE_KEY, yield* selectShowArchived.effect());
 }
 
-export function* persistGroupByRepoWorker() {
+function* persistGroupByRepoWorker() {
   yield* setLocalStorageJSON(GROUP_BY_REPO_STORAGE_KEY, yield* selectGroupByRepo.effect());
 }
 
-export function* persistProviderSetupWorker() {
+function* persistProviderSetupWorker() {
   yield* setLocalStorageJSON(
-    COMPLETED_PROVIDER_SETUP_STORAGE_KEY,
+    yield* providerSetupStorageKey(),
     yield* selectHasCompletedProviderSetup.effect(),
   );
 }
 
-export function* persistShowReasoningBlocksWorker() {
+/**
+ * Boot hydration can run before the first `connections:list` result lands, so
+ * on a remote backend the flag may have hydrated from the local (bare) key.
+ * Re-hydrate from the backend-scoped key whenever the active backend id
+ * settles on a different value; an absent stored value resets to the slice
+ * default (false) so a fresh remote backend never inherits the local
+ * machine's completion state.
+ */
+function* watchBackendForProviderSetup() {
+  let hydratedBackendId = yield* selectActiveBackendId();
+  yield* takeEvery(connectionsListReceived, function* () {
+    const backendId = yield* selectActiveBackendId();
+    if (backendId === hydratedBackendId) return;
+    hydratedBackendId = backendId;
+    const stored = yield* getLocalStorageJSON<boolean>(
+      namespaceBackendKey(COMPLETED_PROVIDER_SETUP_STORAGE_KEY, backendId),
+    );
+    yield* put(setHasCompletedProviderSetup(stored === true));
+  });
+}
+
+function* persistShowReasoningBlocksWorker() {
   yield* setLocalStorageJSON(
     SHOW_REASONING_BLOCKS_STORAGE_KEY,
     yield* selectShowReasoningBlocks.effect(),
   );
 }
 
-export function* persistAgentFontWorker() {
+function* persistChatAuroraWorker() {
+  yield* setLocalStorageJSON(CHAT_AURORA_STORAGE_KEY, yield* selectChatAuroraEnabled.effect());
+}
+
+function* persistShellTransparencyWorker() {
+  yield* setLocalStorageJSON(
+    SHELL_TRANSPARENCY_STORAGE_KEY,
+    yield* selectShellTransparencyEnabled.effect(),
+  );
+}
+
+function* persistAgentFontWorker() {
   yield* setLocalStorageJSON(AGENT_STORAGE_KEY, {
     fontStyle: yield* selectAgentFontStyle.effect(),
   });
 }
 
-export function* persistNoteFontWorker() {
+function* persistNoteFontWorker() {
   yield* setLocalStorageJSON(NOTE_STORAGE_KEY, {
     fontStyle: yield* selectNoteFontStyle.effect(),
   });
 }
 
-export function* persistCodeFontWorker() {
+function* persistCodeFontWorker() {
   yield* setLocalStorageJSON(CODE_STORAGE_KEY, {
     fontFamily: yield* selectCodeFontFamily.effect(),
   });
 }
 
-export function* persistActivityLogPresetsWorker() {
+function* persistActivityLogPresetsWorker() {
   yield* setLocalStorageJSON(
     ACTIVITY_LOG_PRESETS_STORAGE_KEY,
     yield* selectActivityLogPresets.effect(),
@@ -247,21 +312,17 @@ export function* persistLanguagePreferenceWorker(action: ReturnType<typeof setLa
   yield* call(syncLanguagePreference, storedPreference);
 }
 
-export function* persistGithubLinkDefaultActionWorker() {
+function* persistGithubLinkDefaultActionWorker() {
   yield* setLocalStorageJSON(
     GITHUB_LINK_DEFAULT_ACTION_STORAGE_KEY,
     yield* selectGithubLinkDefaultAction.effect(),
   );
 }
 
-export function* persistPanelOpenModeWorker() {
-  yield* setLocalStorageJSON(PANEL_OPEN_MODE_STORAGE_KEY, yield* selectPanelOpenMode.effect());
-}
-
-export function* persistPanelStackDirectionWorker() {
+function* persistShortcutOverridesWorker() {
   yield* setLocalStorageJSON(
-    PANEL_STACK_DIRECTION_STORAGE_KEY,
-    yield* selectPanelStackDirection.effect(),
+    SHORTCUT_OVERRIDES_STORAGE_KEY,
+    yield* selectShortcutOverrides.effect(),
   );
 }
 
@@ -277,6 +338,11 @@ function* watchUserPreferenceWrites() {
     [setShowReasoningBlocks, toggleShowReasoningBlocks],
     persistShowReasoningBlocksWorker,
   );
+  yield* takeEvery([setChatAuroraEnabled, toggleChatAurora], persistChatAuroraWorker);
+  yield* takeEvery(
+    [setShellTransparencyEnabled, toggleShellTransparency],
+    persistShellTransparencyWorker,
+  );
   yield* takeEvery([setAgentFontStyle], persistAgentFontWorker);
   yield* takeEvery([setNoteFontStyle, cycleNoteFontStyle], persistNoteFontWorker);
   yield* takeEvery(setCodeFontFamily, persistCodeFontWorker);
@@ -286,10 +352,9 @@ function* watchUserPreferenceWrites() {
   );
   yield* takeEvery(setLanguagePreference, persistLanguagePreferenceWorker);
   yield* takeEvery(setGithubLinkDefaultAction, persistGithubLinkDefaultActionWorker);
-  yield* takeEvery([setPanelOpenMode, togglePanelOpenMode], persistPanelOpenModeWorker);
   yield* takeEvery(
-    [setPanelStackDirection, togglePanelStackDirection],
-    persistPanelStackDirectionWorker,
+    [setShortcutOverride, resetShortcutOverride, resetAllShortcutOverrides],
+    persistShortcutOverridesWorker,
   );
 }
 
@@ -297,5 +362,6 @@ function* watchUserPreferenceWrites() {
 export function* userPreferencesPersistenceSaga() {
   yield* fork(watchUserPreferenceWrites);
   yield* fork(hydrateUserPreferencesWorker);
+  yield* fork(watchBackendForProviderSetup);
   yield* fork(loadSystemFontsWorker);
 }

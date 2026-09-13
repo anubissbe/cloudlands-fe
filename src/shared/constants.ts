@@ -299,6 +299,17 @@ export const FILE_EXTENSIONS = {
 // Single source of truth for URL protocol validation across the app.
 // If you need to change which protocols are allowed, update ONLY this section.
 
+/**
+ * macOS System Settings deep link to Privacy & Security → Input Monitoring,
+ * where the user re-grants the HID permission the hardware console needs.
+ * The only non-http(s) URL allowed through the external opener (see
+ * BROWSER_PROTOCOLS.EXTERNAL_EXACT below); the scheme is a no-op on other
+ * platforms.
+ */
+// i18n-ignore (URL)
+export const MACOS_INPUT_MONITORING_SETTINGS_URL =
+  'x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent';
+
 export const BROWSER_PROTOCOLS = {
   /**
    * Protocols allowed in the embedded browser (webview).
@@ -320,15 +331,26 @@ export const BROWSER_PROTOCOLS = {
 
   /**
    * Protocols for external URL opening (system browser, shell:openExternal).
+   * http/https only — non-web schemes are never allowlisted wholesale here
+   * (every caller converges on the same opener, including the daemon→client
+   * host.openExternal reverse RPC); known OS deep links go in EXTERNAL_EXACT
+   * as full-string entries instead.
    */
   EXTERNAL: ['http:', 'https:'] as readonly string[],
+
+  /**
+   * Exact non-http(s) URLs allowed for external opening (full-string match,
+   * checked alongside EXTERNAL). Keeps hardcoded OS deep links working —
+   * e.g. the macOS Input Monitoring System Settings pane, which cannot
+   * inject code — without opening up their whole scheme to runtime URLs.
+   */
+  EXTERNAL_EXACT: [MACOS_INPUT_MONITORING_SETTINGS_URL] as readonly string[],
 
   /**
    * Internal app protocols (not user-facing).
    */
   INTERNAL: ['app:', 'workspace-asset:'] as readonly string[],
 } as const;
-
 
 /**
  * Browser panel session partition name.
@@ -413,20 +435,6 @@ export const RETRY = {
 } as const;
 
 // ============================================================================
-// TYPE EXPORTS
-// ============================================================================
-
-export type TimeoutKey = keyof typeof TIMEOUTS;
-export type LimitKey = keyof typeof LIMITS;
-export type DefaultKey = keyof typeof DEFAULTS;
-export type ThresholdKey = keyof typeof THRESHOLDS;
-export type PathKey = keyof typeof PATHS;
-export type FileExtensionKey = keyof typeof FILE_EXTENSIONS;
-export type PatternKey = keyof typeof PATTERNS;
-export type CacheTTLKey = keyof typeof CACHE_TTL;
-export type RetryKey = keyof typeof RETRY;
-
-// ============================================================================
 // HELPER FUNCTIONS
 // ============================================================================
 
@@ -457,54 +465,3 @@ export function isAtWarningThreshold(activeCount: number): boolean {
 export function isSessionTooLarge(sizeInBytes: number): boolean {
   return sizeInBytes > LIMITS.MAX_SESSION_SIZE;
 }
-
-// ============================================================================
-// RECOVERY CONFIGURATION
-// ============================================================================
-
-export const RECOVERY = {
-  /** Recovery state save debounce (milliseconds) */
-  DEBOUNCE: 1000, // 1 second
-
-  /** Recovery file retention (milliseconds) */
-  RETENTION: 24 * 60 * 60 * 1000, // 24 hours
-
-  /** Maximum recovery attempts */
-  MAX_ATTEMPTS: 3,
-
-  /** Recovery check interval (milliseconds) */
-  CHECK_INTERVAL: 5 * 1000, // 5 seconds
-} as const;
-
-// ============================================================================
-// DEFAULT MESSAGES
-// ============================================================================
-
-export const DEFAULT_MESSAGES = {
-  /** Recovery message */
-  RECOVERY_MESSAGE:
-    'Session was restored after an interruption. The previous response may be incomplete.',
-
-  /** Connection error message */
-  CONNECTION_ERROR: 'Unable to connect to the agent service. Please try again.',
-
-  /** Timeout error message */
-  TIMEOUT_ERROR: 'The operation timed out. Please try again.',
-
-  /** Generic error message */
-  GENERIC_ERROR: 'An unexpected error occurred. Please try again.',
-} as const;
-
-export default {
-  TIMEOUTS,
-  LIMITS,
-  DEFAULTS,
-  THRESHOLDS,
-  PATHS,
-  FILE_EXTENSIONS,
-  PATTERNS,
-  CACHE_TTL,
-  RETRY,
-  RECOVERY,
-  DEFAULT_MESSAGES,
-};

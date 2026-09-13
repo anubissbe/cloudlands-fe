@@ -11,37 +11,40 @@
 
   import { page } from '$app/state';
   import { m } from '$shared/paraglide/messages.js';
-  import { onMount } from 'svelte';
-  import { SvelteMap } from 'svelte/reactivity';
-
   import { invoke } from '$lib/electron-bridge';
   import { IPC_CHANNELS } from '$shared/ipc-registry';
   import { Tooltip } from '$lib/components/ui/tooltip';
   import { Button } from '$lib/components/ui/button';
   import { cn } from '$lib/utils';
   import { selectActiveTab } from '$store/renderer/slices/panel-layout/panel-layout-selectors';
-  import { activeStreamsTracker } from '$features/agent/services/active-streams-tracker';
   import { selectWorkspaceItems } from '$store/renderer/slices/workspace/workspace-selectors';
 
+  import { onMount } from 'svelte';
   import { writable } from 'svelte/store';
-  import { WorkspaceStatusEnum } from '$shared/types';
-  import { getLineStats, type LineStats } from '$features/file-tracking/file-tracking.client';
   import {
     selectZoomFactor,
     selectCounterScale,
   } from '$store/renderer/slices/user-preferences/user-preferences-selectors';
   import { navigateBackFromSettings, navigateToSettings } from '$lib/utils/workspace-navigation';
   import IntentNavigationIcon from '$lib/icons/IntentNavigationIcon.svelte';
-  import { selectWorkspaceViewMode } from '$store/renderer/slices/tab-state/tab-state-selectors';
   import {
     TITLEBAR_NAVIGATION_CONTROL_CLASS,
     TITLEBAR_NAVIGATION_GLYPH_CLASS,
   } from './titlebar-navigation';
-  import { getCounterScaledTitlebarHeight, WINDOW_TITLEBAR_HEIGHT_PX } from './titlebar-geometry';
+  import {
+    getCounterScaledTitlebarHeight,
+    getWorkspaceTabBorderMaskImage,
+    getWorkspaceTabLeadingInsetPx,
+    getWorkspaceTabScrollerMarginLeftPx,
+    TITLEBAR_LEFT_DRAG_SURFACE_CLASS,
+    WINDOW_TITLEBAR_HEIGHT_PX,
+    WORKSPACE_TAB_MOTION_DURATION_MS,
+    WORKSPACE_TAB_MOTION_EASING,
+    type WorkspaceTabBorderMaskBounds,
+  } from './titlebar-geometry';
   import DaemonStatusIndicator from './DaemonStatusIndicator.svelte';
   import WorkspaceTabStrip from './WorkspaceTabStrip.svelte';
   import WorkspaceRepoLauncher from './WorkspaceRepoLauncher.svelte';
-  import WorkspaceViewModeToggle from './WorkspaceViewModeToggle.svelte';
   import SidebarNav from './sidebar-nav/SidebarNav.svelte';
   import {
     selectOnboardingActive,
@@ -51,12 +54,12 @@
 
   interface Props {
     workspaceId?: string;
-    overlayWorkspaceColumns?: boolean;
   }
 
-  let { workspaceId, overlayWorkspaceColumns = false }: Props = $props();
-  let activeTabBounds = $state<{ left: number; width: number } | null>(null);
+  let { workspaceId }: Props = $props();
+  let activeTabBounds = $state<WorkspaceTabBorderMaskBounds | null>(null);
   let activeTabTracking = $state(false);
+  let prefersReducedMotion = $state(false);
   const routedWorkspaceId = $derived(
     page.url.pathname.startsWith('/workspace/') && page.params.id !== 'new'
       ? (page.params.id ?? null)
@@ -64,7 +67,6 @@
   );
   const panelItem$ = selectPanelItem();
   const panelWidth$ = selectPanelWidth();
-  const workspaceViewMode$ = selectWorkspaceViewMode();
   const onboardingActive$ = selectOnboardingActive();
 
   // Where the workspace controls naturally start (left edge, titlebar coords).
@@ -74,12 +76,14 @@
   const CONTROLS_GAP = 4; // gap-1 between titlebar control groups
   let fixedControlsEl = $state<HTMLDivElement | null>(null);
   let controlsBaseLeft = $state(0);
+  let fixedControlsTrailingInset = $state(0);
 
   $effect(() => {
     const el = fixedControlsEl;
     if (!el) return;
     const measure = () => {
       controlsBaseLeft = el.offsetLeft + el.offsetWidth + CONTROLS_GAP;
+      fixedControlsTrailingInset = Number.parseFloat(getComputedStyle(el).paddingRight) || 0;
     };
     measure();
     const observer = new ResizeObserver(measure);
@@ -89,12 +93,21 @@
 
   // Align the workspace controls (tabs) with the left panel's right edge
   // when a sidebar panel is open; tracks the panel width live.
+  const sidebarPanelOpen = $derived(Boolean($panelItem$));
+  const workspaceTabLeadingInsetPx = $derived(getWorkspaceTabLeadingInsetPx(sidebarPanelOpen));
+  const workspaceTabScrollerMarginLeftPx = $derived(
+    getWorkspaceTabScrollerMarginLeftPx(
+      workspaceTabLeadingInsetPx === getWorkspaceTabLeadingInsetPx(true),
+    ),
+  );
   const panelOffset = $derived(
-    $panelItem$ ? Math.max(0, $panelWidth$ + SIDEBAR_PANEL_LEFT_INSET - controlsBaseLeft) : 0,
+    sidebarPanelOpen
+      ? Math.max(0, $panelWidth$ + SIDEBAR_PANEL_LEFT_INSET - controlsBaseLeft)
+      : -fixedControlsTrailingInset,
   );
 
-  function handleActiveTabBoundsChange(bounds: { left: number; width: number } | null) {
-    activeTabBounds = bounds ? { left: bounds.left - panelOffset, width: bounds.width } : null;
+  function handleActiveTabBoundsChange(bounds: WorkspaceTabBorderMaskBounds | null) {
+    activeTabBounds = bounds;
   }
 
   function handleActiveTabTrackingChange(tracking: boolean) {
@@ -116,49 +129,6 @@
     );
   });
 
-  // Reactivity versions for subscriptions
-  let activeStreamsVersion = $state(0);
-
-  // Cache for line stats
-  let lineStatsCache = new SvelteMap<string, LineStats>();
-
-  // Fetch line stats for workspaces with activity and current workspace
-  async function refreshLineStats() {
-    // Capture workspaceId at start to guard against async race
-    const capturedWorkspaceId = workspaceId;
-
-    // Fetch for current workspace
-    if (capturedWorkspaceId) {
-      try {
-        const stats = await getLineStats(capturedWorkspaceId);
-        // Guard: only update cache if workspaceId hasn't changed
-        if (workspaceId === capturedWorkspaceId) {
-          lineStatsCache.set(capturedWorkspaceId, stats);
-        }
-      } catch {
-        if (workspaceId === capturedWorkspaceId && !lineStatsCache.has(capturedWorkspaceId)) {
-          lineStatsCache.set(capturedWorkspaceId, { additions: 0, deletions: 0 });
-        }
-      }
-    }
-    // Fetch for activity workspaces
-    for (const { workspace: ws } of workspacesWithActivity) {
-      // Capture workspaceId before each await to guard against async race
-      const wsIdBeforeFetch = workspaceId;
-      try {
-        const stats = await getLineStats(ws.id);
-        // Guard: only update cache if workspaceId hasn't changed
-        if (workspaceId === wsIdBeforeFetch) {
-          lineStatsCache.set(ws.id, stats);
-        }
-      } catch {
-        if (workspaceId === wsIdBeforeFetch && !lineStatsCache.has(ws.id)) {
-          lineStatsCache.set(ws.id, { additions: 0, deletions: 0 });
-        }
-      }
-    }
-  }
-
   // Get workspace data
   const workspace = $derived(
     $workspaceItems.find((candidate) => candidate.id === workspaceId) ?? null,
@@ -178,53 +148,16 @@
   // Get focused tab info
   const focusedTab = $derived($focusedTab$ ?? null);
 
-  // Get workspaces with activity (streaming or unread) - excluding current workspace
-  const workspacesWithActivity = $derived.by(() => {
-    // Touch reactive versions
-    void activeStreamsVersion;
-
-    const allWorkspaces = $workspaceItems.filter(
-      (w) => w.status !== WorkspaceStatusEnum.Archived && w.id !== workspaceId,
-    );
-
-    return allWorkspaces
-      .map((ws) => {
-        const streamingAgentIds = activeStreamsTracker.getStreamingAgentIdsForWorkspace(ws.id);
-        const streaming = streamingAgentIds.length > 0;
-        // BE-owned attention flag; streaming takes precedence over unread.
-        const hasUnread = !streaming && ws.attention === 'unread';
-
-        return { workspace: ws, streaming, hasUnread };
-      })
-      .filter(({ streaming, hasUnread }) => streaming || hasUnread)
-      .slice(0, 5); // Limit to 5 items to not crowd the title bar
-  });
-
-  let hasMounted = false;
-
   onMount(() => {
-    activeStreamsTracker.startPolling();
-    const unsubscribeStreams = activeStreamsTracker.subscribe(() => {
-      activeStreamsVersion++;
-      refreshLineStats(); // Refresh line stats when activity changes
-    });
-
-    // Initial fetch
-    refreshLineStats();
-    hasMounted = true;
+    const motionQuery = window.matchMedia('(prefers-reduced-motion: reduce)');
+    const updateMotionPreference = () => (prefersReducedMotion = motionQuery.matches);
+    updateMotionPreference();
+    motionQuery.addEventListener('change', updateMotionPreference);
 
     return () => {
-      unsubscribeStreams();
+      motionQuery.removeEventListener('change', updateMotionPreference);
     };
   });
-
-  // Refresh line stats when workspaceId changes (but not on initial mount, which is handled by onMount)
-  $effect(() => {
-    if (workspaceId && hasMounted) {
-      refreshLineStats();
-    }
-  });
-
   // Build display text for the search bar - show focused tab title and workspace
   const displayText = $derived.by(() => {
     if (focusedTab?.title && workspace?.title) {
@@ -238,6 +171,13 @@
     }
     return '';
   });
+
+  // i18n-ignore (development instance identifier supplied by the launcher)
+  const devTitleText = $derived(
+    import.meta.env.DEV && import.meta.env.VITE_DEV_NAME
+      ? `${displayText || 'Intent'} · [${import.meta.env.VITE_DEV_NAME}]`
+      : '',
+  );
 
   // Update the native window title when displayText changes
   $effect(() => {
@@ -282,7 +222,6 @@
 <!-- Counter-scale wrapper to maintain fixed position relative to macOS traffic lights -->
 <div
   class="window-title-bar-wrapper"
-  class:workspace-columns-titlebar={overlayWorkspaceColumns}
   style:height="{getCounterScaledTitlebarHeight($zoomFactor)}px"
   aria-label={m.layout_titleBar_ariaLabel()}
 >
@@ -299,45 +238,36 @@
     style:width="{100 * $zoomFactor}%"
   >
     <!-- Left column -->
-    <div
-      class="titlebar-left-drag-surface flex min-w-0 self-stretch items-center gap-1 overflow-hidden"
-      data-title-bar-navigation
-    >
+    <div class={TITLEBAR_LEFT_DRAG_SURFACE_CLASS} data-title-bar-navigation>
       <div
-        class="titlebar-left-drag-handle w-4 shrink-0 self-stretch"
+        class="titlebar-left-drag-handle shrink-0 self-stretch"
         data-titlebar-left-drag-handle
         aria-hidden="true"
       ></div>
       <div
-        class="flex min-w-0 items-center gap-1"
+        class="titlebar-fixed-controls flex min-w-0 items-center gap-1"
         bind:this={fixedControlsEl}
         data-titlebar-fixed-controls
       >
         <SidebarNav />
       </div>
       <div
-        class={cn(
-          'flex min-w-0 items-center gap-1 transition-[margin-left] duration-200 ease-[cubic-bezier(0.215,0.61,0.355,1)] motion-reduce:transition-none',
-          $workspaceViewMode$ === 'columns' ? 'self-center' : 'self-end',
-        )}
-        style:margin-left={`${$workspaceViewMode$ === 'columns' ? 0 : panelOffset}px`}
+        class="flex min-w-0 self-end items-center gap-1 transition-[margin-left] duration-200 ease-[cubic-bezier(0.215,0.61,0.355,1)] motion-reduce:transition-none"
+        style:margin-left={`${panelOffset}px`}
         data-titlebar-workspace-controls
       >
+        <WorkspaceTabStrip
+          onActiveTabBoundsChange={handleActiveTabBoundsChange}
+          onActiveTabTrackingChange={handleActiveTabTrackingChange}
+          activeWorkspaceId={routedWorkspaceId}
+          leadingInsetPx={workspaceTabLeadingInsetPx}
+          scrollerMarginLeftPx={workspaceTabScrollerMarginLeftPx}
+          horizontalPositionTrackingKey={panelOffset +
+            workspaceTabLeadingInsetPx +
+            workspaceTabScrollerMarginLeftPx}
+        />
         {#if !$onboardingActive$}
-          <WorkspaceViewModeToggle />
-        {/if}
-        {#if $workspaceViewMode$ === 'single'}
-          <WorkspaceTabStrip
-            onActiveTabBoundsChange={handleActiveTabBoundsChange}
-            onActiveTabTrackingChange={handleActiveTabTrackingChange}
-            activeWorkspaceId={routedWorkspaceId}
-          />
-          {#if !$onboardingActive$}
-            <WorkspaceRepoLauncher />
-          {/if}
-        {/if}
-        {#if $workspaceViewMode$ === 'columns'}
-          {@render titlebarUtilities(false)}
+          <WorkspaceRepoLauncher />
         {/if}
       </div>
       <div
@@ -347,19 +277,27 @@
     </div>
 
     <!-- Right column: global status and settings -->
-    {#if $workspaceViewMode$ === 'single'}
-      <div class="app-no-drag flex items-center justify-end pr-4 gap-1">
-        {@render titlebarUtilities(true)}
-      </div>
-    {/if}
-    {#if activeTabBounds && $workspaceViewMode$ === 'single'}
+    <div class="app-no-drag flex items-center justify-end pr-4 gap-1">
+      {#if devTitleText}
+        <span
+          class="max-w-[min(45vw,40rem)] truncate px-2 text-xs text-muted-foreground"
+          title={devTitleText}
+          data-dev-instance-title
+        >
+          {devTitleText}
+        </span>
+      {/if}
+      {@render titlebarUtilities(true)}
+    </div>
+    {#if activeTabBounds}
       <div
         class="pointer-events-none absolute -bottom-px z-[60] h-px bg-sidebar motion-reduce:transition-none"
-        style:left={`${activeTabBounds.left + panelOffset - 6}px`}
-        style:width={`${Math.max(0, activeTabBounds.width + 13)}px`}
-        style:transition={activeTabTracking
+        style:left={`${activeTabBounds.left}px`}
+        style:width={`${activeTabBounds.width}px`}
+        style:mask-image={getWorkspaceTabBorderMaskImage(activeTabBounds)}
+        style:transition={activeTabTracking || prefersReducedMotion
           ? 'none'
-          : 'left 200ms cubic-bezier(0.215, 0.61, 0.355, 1)'}
+          : `left ${WORKSPACE_TAB_MOTION_DURATION_MS}ms ${WORKSPACE_TAB_MOTION_EASING}, width ${WORKSPACE_TAB_MOTION_DURATION_MS}ms ${WORKSPACE_TAB_MOTION_EASING}`}
         data-active-tab-border-mask
         aria-hidden="true"
       ></div>
@@ -380,18 +318,6 @@
     background: transparent;
   }
 
-  .window-title-bar-wrapper.workspace-columns-titlebar {
-    position: absolute;
-    inset: 0 0 auto;
-    width: 100%;
-    pointer-events: none;
-  }
-
-  .workspace-columns-titlebar [data-titlebar-fixed-controls],
-  .workspace-columns-titlebar [data-titlebar-workspace-controls] {
-    pointer-events: auto;
-  }
-
   .window-title-bar {
     box-sizing: border-box;
     display: grid;
@@ -401,11 +327,13 @@
     position: relative;
     z-index: 50;
     padding-top: 2px;
+    --titlebar-control-shift: 0px;
     -webkit-app-region: drag;
   }
 
   .window-title-bar:global(.window-title-bar-mac) {
-    padding-left: 60px; /* Space for macOS traffic lights */
+    --titlebar-control-shift: 8px;
+    padding-left: 80px; /* Native traffic-light clearance inside the counter-scaled titlebar */
   }
 
   .window-title-bar:global(.window-title-bar-windows) {
@@ -419,6 +347,14 @@
   .titlebar-left-drag-surface,
   .titlebar-left-drag-handle {
     -webkit-app-region: drag;
+  }
+
+  .titlebar-left-drag-handle {
+    width: calc(16px - var(--titlebar-control-shift));
+  }
+
+  .titlebar-fixed-controls {
+    padding-right: var(--titlebar-control-shift);
   }
 
   /* Track the panel width directly (no easing) while it is being resized */

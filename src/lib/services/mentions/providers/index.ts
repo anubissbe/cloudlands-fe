@@ -93,8 +93,11 @@ export class NoteProvider implements Provider {
     }
 
     try {
-      const { appClient } = await import('$lib/client');
-      const allWorkspaces = await appClient.workspaces.list();
+      const [{ store: appStore }, { selectWorkspaceItems }] = await Promise.all([
+        import('$store/renderer/store'),
+        import('$store/renderer/slices/workspace/workspace-selectors'),
+      ]);
+      const allWorkspaces = selectWorkspaceItems.select(appStore.state);
       const currentWorkspace = allWorkspaces.find((w) => w.id === currentWorkspaceId);
 
       if (!currentWorkspace || !currentWorkspace.repositoryPath) {
@@ -121,7 +124,9 @@ export class NoteProvider implements Provider {
   ): Promise<Array<{ note: any; workspaceId: string; workspaceTitle?: string }>> {
     try {
       const { appClient } = await import('$lib/client');
-      const notes = await appClient.notes.list(workspaceId);
+      // Slim projection (§5.2): mention search matches/previews against the
+      // first ~500 chars (contentPreview) instead of pulling full bodies.
+      const notes = await appClient.notes.list(workspaceId, { projection: 'slim' });
       return notes.map((note) => ({
         note,
         workspaceId,
@@ -154,31 +159,37 @@ export class NoteProvider implements Provider {
       // Combine all notes
       const allNotesWithContext = [...currentWorkspaceNotes, ...siblingNotes];
 
-      // Filter and map to MentionCandidate using fuzzy matching
+      // Filter and map to MentionCandidate using fuzzy matching. Slim rows
+      // carry content in `contentPreview` (first ~500 chars) — matching and
+      // previews use it in place of the full body, so a match deep inside a
+      // very long note may be missed (accepted degradation).
       const notes = allNotesWithContext
-        .filter(
-          ({ note }) =>
+        .filter(({ note }) => {
+          const body = note.content || note.contentPreview;
+          return (
             !query ||
             (note.title && fuzzyMatch(query, note.title) !== null) ||
-            (note.content && fuzzyMatch(query, note.content) !== null),
-        )
+            (body && fuzzyMatch(query, body) !== null)
+          );
+        })
         .slice(0, 10)
         .map(({ note, workspaceId, workspaceTitle }) => {
           const isCurrentWorkspace = workspaceId === context.workspaceId;
           const subtitle = isCurrentWorkspace
             ? undefined
             : m.chat_mentions_fromWorkspace_subtitle({ workspace: workspaceTitle || workspaceId });
+          const body = note.content || note.contentPreview;
 
           return {
             id: note.id || `note-${note.id}`,
             type: 'note' as MentionType,
             label: note.title || note.id || m.chat_mentions_untitledNote_label(),
             subtitle,
-            description: `${note.content?.substring(0, 100)}...` || '',
+            description: `${body?.substring(0, 100)}...` || '',
             icon: '📝',
             uri: `devspace://note/${note.id}`,
             meta: {
-              preview: note.content?.substring(0, 200) || '',
+              preview: body?.substring(0, 200) || '',
               workspaceId,
             },
           };
@@ -222,7 +233,7 @@ export class NoteProvider implements Provider {
 }
 
 // External Source Provider
-export class ExternalSourceProvider implements Provider {
+class ExternalSourceProvider implements Provider {
   id = 'external';
   triggers = ['@docs', '@external'];
 
@@ -422,7 +433,7 @@ export class CommandProvider implements Provider {
 }
 
 // Terminal Provider
-export class TerminalProvider implements Provider {
+class TerminalProvider implements Provider {
   id = 'terminal';
   triggers = ['@terminal', '@term'];
 
@@ -503,7 +514,7 @@ export class TerminalProvider implements Provider {
 }
 
 // Script Provider
-export class ScriptProvider implements Provider {
+class ScriptProvider implements Provider {
   id = 'script';
   triggers = ['@script', '@scripts'];
 
@@ -569,7 +580,7 @@ export class ScriptProvider implements Provider {
 }
 
 // Specialist Provider - lists available specialist types
-export class SpecialistProvider implements Provider {
+class SpecialistProvider implements Provider {
   id = 'specialist';
   triggers = ['@specialist', '@spec'];
 
@@ -614,7 +625,7 @@ export class SpecialistProvider implements Provider {
 }
 
 // Agent Provider - lists other agents in the workspace
-export class AgentProvider implements Provider {
+class AgentProvider implements Provider {
   id = 'agent';
   triggers = ['@agent'];
 
@@ -707,7 +718,7 @@ export class AgentProvider implements Provider {
 }
 
 // Provider Registry
-export class ProviderRegistry {
+class ProviderRegistry {
   private providers = new Map<string, Provider>();
   private defaultProviders: string[] = [];
 

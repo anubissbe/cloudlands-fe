@@ -1,14 +1,11 @@
-import {
-  describe,
-  it,
-  expect,
-} from 'vitest';
+import { describe, it, expect } from 'vitest';
 import {
   computeBranchBaseCommittedFallbacks,
   computeBranchBaseCollapsedCommittedPaths,
   computeMergedDestinedPaths,
   getChangeCategory,
   applyNumstatStats,
+  isPathLocked,
 } from '../ChatChangesPanel.svelte';
 import type { LocalFileChange } from '../types';
 
@@ -85,7 +82,9 @@ describe('computeMergedDestinedPaths', () => {
     const changes: LocalFileChange[] = [];
     // 22 distinct single-stage files.
     for (let i = 0; i < 22; i++) {
-      changes.push(mkChange({ filePath: `file-${String(i).padStart(2, '0')}.ts`, category: 'unstaged' }));
+      changes.push(
+        mkChange({ filePath: `file-${String(i).padStart(2, '0')}.ts`, category: 'unstaged' }),
+      );
     }
     // File #23 (index 22) has mixed staged + unstaged parts.
     const target = 'file-23-merged.ts';
@@ -201,11 +200,41 @@ describe('applyNumstatStats', () => {
       mkChange({ filePath: 'src/a.ts', category: 'unstaged', additions: 5, deletions: 5 }),
     ];
 
-    const result = applyNumstatStats(changes, [{ filePath: 'src/a.ts', additions: 8, deletions: 2 }]);
+    const result = applyNumstatStats(changes, [
+      { filePath: 'src/a.ts', additions: 8, deletions: 2 },
+    ]);
 
     expect(result.map((change) => [change.additions, change.deletions])).toEqual([
       [8, 2],
       [0, 0],
     ]);
+  });
+});
+
+describe('isPathLocked', () => {
+  const locked: Record<string, true> = { 'src/foo.ts': true };
+
+  it('matches a repo-relative path directly', () => {
+    expect(isPathLocked(locked, 'src/foo.ts')).toBe(true);
+  });
+
+  it('matches an absolute path via the workspace prefix', () => {
+    expect(isPathLocked(locked, '/home/user/ws/src/foo.ts', '/home/user/ws')).toBe(true);
+  });
+
+  it('does not match an absolute path without a workspace path', () => {
+    expect(isPathLocked(locked, '/home/user/ws/src/foo.ts')).toBe(false);
+  });
+
+  it('does not match unlocked paths', () => {
+    expect(isPathLocked(locked, 'src/bar.ts', '/home/user/ws')).toBe(false);
+    expect(isPathLocked({}, 'src/foo.ts', '/home/user/ws')).toBe(false);
+  });
+
+  it('matches Windows-style paths against forward-slash lock keys', () => {
+    expect(isPathLocked(locked, 'C:\\ws\\src\\foo.ts', 'C:\\ws')).toBe(true);
+    expect(isPathLocked(locked, 'C:\\ws\\src\\foo.ts', 'C:/ws')).toBe(true);
+    expect(isPathLocked(locked, 'src\\foo.ts')).toBe(true);
+    expect(isPathLocked(locked, 'C:\\ws\\src\\bar.ts', 'C:\\ws')).toBe(false);
   });
 });

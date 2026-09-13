@@ -4,6 +4,7 @@ import {
   type AgentSession,
   type AgentMessage,
   type QueuedMessage,
+  type ToolUseBlock,
 } from '$shared/types';
 import { AgentActivationState, getAgentProvider } from '$shared/types/agent-session';
 import { getContentBlockText } from '$shared/utils/content-block-helpers';
@@ -12,8 +13,13 @@ import {
   type AgentAttentionRequest,
 } from '$shared/utils/agent-attention';
 import { isAgentBlockedWaitingState, isAgentRunningState } from '$shared/utils/agent-runtime-state';
+import { getAgentPeekData } from '$lib/utils/agent-peek-utils';
+import { classifyTool } from '$lib/utils/tool-classifier';
+import { deriveAgentCardPreview, type AgentCardPreview } from '$lib/utils/agent-preview';
+import { getLastMeaningfulLine, stripUserMessagePrefixes } from '$lib/utils/text-utils';
 import type { StoredAgentSession } from './agent-session-types';
 import { selectAgentQueueMessages } from '../agent-queue/agent-queue-selectors';
+import { selectChatReceivedFirstChunk } from '../chat-state/chat-state-selectors';
 import { selectEffectiveDefaultProviderId } from '../provider-catalog/provider-catalog-selectors';
 
 // ============================================================================
@@ -141,6 +147,17 @@ export const selectAgentSession = store.createSelector(
   },
 );
 
+/**
+ * FE-owned `tailCapPruned` latch (see StoredAgentSession): true once the
+ * client-side message cap dropped rows from the live tail. Scrollback
+ * triggers OR it into their `tailTruncated` input because the chat-init
+ * snapshot meta goes stale as the conversation grows past the cap.
+ */
+export const selectAgentTailCapPruned = store.createSelector((state, agentId?: string): boolean => {
+  if (!agentId) return false;
+  return state.agentSessions?.byAgentId[agentId]?.tailCapPruned === true;
+});
+
 /** Select the resolved provider for a given agent without materializing messages. */
 export const selectAgentProvider = store.createSelector(
   (state, agentId?: string): string | undefined => {
@@ -185,6 +202,17 @@ export const selectAgentHistoryMessages = store.createSelector(
     const segment = state.agentSessions?.historySegmentsByAgentId?.[agentId];
     return segment ? segment.messages : EMPTY_HISTORY_MESSAGES;
   },
+);
+
+/**
+ * True when a scrollback history segment RECORD exists for the agent — even
+ * with zero hydrated rows (a page whose rows were all tail-resident merges to
+ * an empty segment but keeps the record). Segment-clearing paths remove the
+ * record entirely.
+ */
+export const selectHasHistorySegment = store.createSelector(
+  (state, agentId: string): boolean =>
+    state.agentSessions?.historySegmentsByAgentId?.[agentId] !== undefined,
 );
 
 export interface HistorySegmentMeta {
@@ -274,28 +302,6 @@ export const selectAgentSessionStreamingContent = store.createSelector(
     const stored = state.agentSessions?.byAgentId[agentId];
     if (!stored) return '';
     return getCurrentStreamingText(getCurrentStreamingAssistantMessage(stored));
-  },
-);
-
-/**
- * Select whether the session holds a stream-owned assistant message — one the
- * standing `chat.subscribe` delta stream is actively growing (viewed agents
- * only). Distinguishes character-level live content from
- * `selectAgentSessionStreamingContent`'s session-flag fallback, which can
- * surface the last PERSISTED assistant message's text while a non-viewed
- * agent streams a new turn (its transcript never grows mid-turn). The
- * message-level flag stays accurate across navigate-away because
- * The chat-subscribe saga normalizes stale `isStreaming` /
- * `streamingComplete` flags when it tears down a mid-turn subscription.
- */
-export const selectAgentSessionHasStreamOwnedMessage = store.createSelector(
-  (state, agentId: string): boolean => {
-    const messages = state.agentSessions?.byAgentId[agentId]?.messages ?? [];
-    for (let i = messages.length - 1; i >= 0; i--) {
-      const message = messages[i];
-      if (message.role === 'assistant' && isStreamingMessage(message)) return true;
-    }
-    return false;
   },
 );
 
@@ -404,20 +410,6 @@ export const selectAgentQueuedMessages = store.createSelector(
   (state, agentId: string): QueuedMessage[] => selectAgentQueueMessages.select(state, agentId),
 );
 
-/** Select all agents that are currently streaming */
-export const selectAllStreamingAgents = store.createSelector((state): AgentSession[] => {
-  const byAgentId = state.agentSessions?.byAgentId ?? {};
-  const result: AgentSession[] = [];
-  for (const id of Object.keys(byAgentId)) {
-    const stored = byAgentId[id];
-    if (stored?.isStreaming === true) {
-      const materialized = materializeSession(stored);
-      if (materialized) result.push(materialized);
-    }
-  }
-  return result;
-});
-
 /** Select all agents with live work that should retain workspace interest. */
 export const selectAllRetainedAgentSessions = store.createSelector((state): AgentSession[] => {
   const byAgentId = state.agentSessions?.byAgentId ?? {};
@@ -517,3 +509,122 @@ export const selectAgentIsRunning = store.createSelector((state, agentId: string
   if (!stored) return false;
   return isActiveAgentThread(stored);
 });
+
+/**
+ * The selected canonical preview: the AgentCardPreview union plus the
+ * canonical responding flag. `isLive` is `selectAgentIsResponding` at
+ * derivation time — `live-text`/`live-tool` kinds always coincide with
+ * `isLive === true`, and consumers that need streaming affordances for
+ * persisted kinds (e.g. TaskAgentStatus's `last-tool` arm during a tool-only
+ * live stretch) read it directly instead of re-deriving responding state.
+ */
+export type AgentPreview = AgentCardPreview & { isLive: boolean };
+
+/**
+ * Select the canonical structured single-line preview for an agent, or null
+ * when the agent has no preview line. Collapses AgentCard's component-level
+ * `$derived` chain so every preview surface (AgentCard, TaskAgentStatus)
+ * consumes the same precedence chain: attention request → live streamed text
+ * → renderable in-flight tool → newest user line → digest/report → persisted
+ * transcript fallbacks. The derivation is byte-identical to AgentCard's,
+ * including the `classifyTool` hidden-tool gate and the per-turn
+ * `receivedFirstChunk` live-text gate (a leftover previous-turn
+ * `lastAgentResponse` must not masquerade as this turn's text in the
+ * pre-first-token window).
+ *
+ * All inputs are Redux state (AgentLite session fields, chat-state
+ * `receivedFirstChunk`, the canonical responding state). The two optional
+ * trailing args carry AgentCard's event-data props (`completionReport`,
+ * `lastResponseSummary`), which are component-side fallback inputs rather
+ * than store state — they slot into the idle report arm at exactly the
+ * positions AgentCard gives them. Missing sessions still derive (yielding
+ * the report arm when fallback args are provided, else null), mirroring
+ * AgentCard's behavior before the session lands in state.
+ */
+export const selectAgentPreview = store.createSelector(
+  (
+    state,
+    agentId: string,
+    completionReportFallback?: string,
+    lastResponseSummaryFallback?: string,
+  ): AgentPreview | null => {
+    const session = state.agentSessions?.byAgentId[agentId];
+    const agentData = getAgentPeekData(session);
+    const isLive = selectAgentIsResponding.select(state, agentId);
+    const receivedFirstChunk = selectChatReceivedFirstChunk.select(state, agentId);
+
+    // Pending attention request (discussion/blocker) from the daemon session
+    // fields; null when none is pending.
+    const attentionRequest = getAgentAttentionRequest(session);
+
+    // While a turn is live, the session's push-applied `lastAgentResponse` —
+    // gated on the per-turn `receivedFirstChunk` flag (reset by
+    // `agent:stream:end`, flipped by a text-bearing `agent:stream:activity`).
+    let liveResponseLine = '';
+    if (isLive && receivedFirstChunk && session?.lastAgentResponse) {
+      liveResponseLine = getLastMeaningfulLine(session.lastAgentResponse);
+    }
+    const lastResponse =
+      liveResponseLine ||
+      (agentData?.lastResponse ? getLastMeaningfulLine(agentData.lastResponse) : '');
+
+    // Freshness-wins source text: transcript-derived first (agent-peek-utils
+    // applies the wire fallback itself), then the direct session read as a
+    // belt-and-braces fallback.
+    const userFirstLine =
+      stripUserMessagePrefixes(agentData?.lastUserMessage || session?.lastUserMessage || '')
+        .split('\n')[0]
+        ?.trim() ?? '';
+
+    // Tool-use block to preview when the latest thing the agent did was a
+    // tool call (see agent-peek-utils). Hidden tool labels fall through.
+    // The live arm is gated on the canonical running evidence (`isLive`), not
+    // the FE-owned send-path `isStreaming` flag — background/delegated agents
+    // the user never messaged from this window still get the live tool chip
+    // during tool-only stretches. A previous turn's tool cannot render as
+    // live: the reducer clears `lastToolUse` on the fresh running edge (the
+    // sticky liveTurnOpen slot opening), and the bridge's new-turn wipe on
+    // the first activity ping covers the send path.
+    const lastToolUse = agentData?.lastToolUse;
+    const liveToolUse: ToolUseBlock | undefined =
+      isLive && session?.lastToolUse ? lastToolUse : undefined;
+    const liveToolDisplay = liveToolUse
+      ? classifyTool(liveToolUse.name, (liveToolUse.input as Record<string, unknown>) || {})
+      : null;
+    const hasRenderableLiveTool = !!liveToolUse && !liveToolDisplay?.hidden;
+
+    const showUserMessagePreview =
+      agentData?.lastMessageRole === 'user' &&
+      !!userFirstLine &&
+      !liveResponseLine &&
+      !hasRenderableLiveTool;
+
+    // While responding, only the live digest may serve as the report arm
+    // (previous-turn summaries must never be the preview mid-turn,
+    // monorepo#1327); idle agents fall back through digest → completion
+    // report (prop, then metadata) → lastResponseSummary.
+    const effectiveCompletionReport = isLive
+      ? session?.digest || undefined
+      : agentData?.digest ||
+        completionReportFallback ||
+        agentData?.completionReport ||
+        lastResponseSummaryFallback;
+
+    const lastUserMsg = stripUserMessagePrefixes(agentData?.lastUserMessage ?? '');
+
+    const preview = deriveAgentCardPreview({
+      attentionRequest,
+      liveResponseLine,
+      liveToolUse,
+      hasRenderableLiveTool,
+      showUserMessagePreview,
+      userFirstLine,
+      effectiveCompletionReport,
+      lastResponse,
+      lastToolUse,
+      lastUserMsg,
+    });
+
+    return preview ? { ...preview, isLive } : null;
+  },
+);

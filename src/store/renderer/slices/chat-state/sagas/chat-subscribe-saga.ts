@@ -14,7 +14,25 @@
  *    workspace subscriptions never close each other, because the Chief panel
  *    is a standing sidebar surface that stays open — and must keep rendering
  *    live — while the user views workspace chats (and vice versa). Viewing a
- *    chief thread still closes other chief threads' subscriptions.
+ *    chief thread still closes other chief threads' subscriptions. The
+ *    swap's sweep spares same-realm agents holding a chat interest lease
+ *    (chat-interest-leases.ts, monorepo#3295): a mounted ChatPanel instance
+ *    acquires its lease synchronously at the top of onMount and an
+ *    in-flight chat-read hydration holds one for the duration of its
+ *    bounded snapshot wait, so a sweep can never close a registration a
+ *    live consumer is waiting on. Leases replaced the heuristic spare
+ *    conditions (hydration `loading`, still-acquiring slot, open panel tab)
+ *    that were defeated one flush-ordering race at a time — the
+ *    #2864/#2917/#3073/#3185/#3295 strand family: each heuristic inferred
+ *    "still needed" from state that lagged the consumer's existence (the
+ *    read saga defers its loading flag by at least one microtask, chat
+ *    state survives workspace switches so flags go stale, and an
+ *    installed-but-not-yet-emitted reopen looks closable). The spare
+ *    defers the close, it never cancels it: each spared agent is recorded
+ *    and the deferred close runs when its LAST lease releases
+ *    (watchLeaseReleases) — a destroyed panel releases in onDestroy and a
+ *    settled, failed, or CANCELLED hydration releases in its finally, so
+ *    the subscription cannot leak even when no settle/fail action follows.
  *  - `transcriptHydrationSettled` re-applies the entry's last reconciled
  *    transcript: a slower chat-read hydrate whose pages predate a finalize
  *    would otherwise clobber the finalized row this stream already delivered
@@ -32,7 +50,17 @@
  *    non-chief subscriptions — but only when the clear actually applied (no
  *    agent remains viewed after the reducer). A background panel's trailing
  *    scoped clear is ignored by the reducer, so the viewed agent's
- *    subscription survives (monorepo#1215). A clear scoped to a
+ *    subscription survives (monorepo#1215). An applied clear still spares
+ *    leased agents (the same lease-based spare as the swap's): on a
+ *    same-agent ChatPanel remount the new instance re-initializes (deduped
+ *    against the standing subscription) before the old instance's trailing
+ *    clear lands, and closing the subscription then would drop the snapshot
+ *    meta and strand that hydration (monorepo#2864) — the remounted panel's
+ *    lease (and its in-flight hydration's) spares it, whatever the
+ *    hydration flag or acquisition state reads (monorepo#3185). Each spared
+ *    agent's deferred close runs at its LAST lease release when nothing
+ *    keeps it (not re-viewed, no session-level keep) — the spare defers the
+ *    teardown, it never cancels it. A clear scoped to a
  *    chief-workspace agent instead closes exactly that subscription,
  *    regardless of which agent remains viewed: the swap exempts chief
  *    subscriptions, so the Chief panel's own destroy (collapse /
@@ -98,29 +126,14 @@ import {
   chatSwitchBackRevealTimedOut,
   chatTranscriptSnapshotApplied,
   chatTranscriptSnapshotRerequested,
-  chatUtilityFooterReady,
   initializeChatRequested,
   refreshChatTranscriptRequested,
   transcriptHydrationSettled,
 } from '$store/renderer/slices/chat-state/chat-state-slice';
 import {
   selectAwaitingSwitchBackSnapshot,
-  selectAwaitingUtilityFooter,
   selectTranscriptHydration,
 } from '$store/renderer/slices/chat-state/chat-state-selectors';
-import {
-  setSubscriptionSnapshot,
-  subscriptionSnapshotFetchFailed,
-} from '$store/renderer/slices/agent-subscription-ui/agent-subscription-ui-slice';
-import { selectSubscriptionSnapshotFetched } from '$store/renderer/slices/agent-subscription-ui/agent-subscription-ui-selectors';
-import {
-  backgroundHooksCleared,
-  backgroundHooksUpdated,
-} from '$store/renderer/slices/background-hooks/background-hooks-slice';
-import { selectBackgroundHooksSnapshotDelivered } from '$store/renderer/slices/background-hooks/background-hooks-selectors';
-import { prMonitorsUpdated } from '$store/renderer/slices/pr-monitor/pr-monitor-slice';
-import { selectPrMonitorsSnapshotDelivered } from '$store/renderer/slices/pr-monitor/pr-monitor-selectors';
-import { isUtilityFooterReady } from '$lib/components/chat/chat-panel-visibility';
 import {
   bulkUpsertSessions,
   clearAllSessions,
@@ -128,7 +141,6 @@ import {
   removeWorkspaceSessions,
   replaceMessages,
   updateSession,
-  upsertSession,
 } from '$store/renderer/slices/agent-session/agent-session-slice';
 import { workspaceDeleted } from '$store/renderer/slices/workspace-lifecycle/workspace-lifecycle-slice';
 import {
@@ -136,14 +148,25 @@ import {
   markAgentAsViewed,
 } from '$store/renderer/slices/unread-tracking/unread-tracking-slice';
 import { deduplicateAgentMessages } from '$shared/utils/message-dedup';
-import { CHIEF_WORKSPACE_ID } from '$shared/types/branded-ids';
 import { createLogger } from '$lib/utils/client-logger';
 import { isAgentDeletionPending } from '$features/agent/utils/pending-agent-deletions';
+import { CHIEF_WORKSPACE_ID } from '$shared/types/branded-ids';
 import {
+  clearChatSubscriptionAcquiring,
   clearStandingChatSubscription,
+  markChatSubscriptionAcquiring,
   markStandingChatSubscription,
+  setReplayableChatSnapshot,
 } from '$features/agent/utils/chat-subscription-registry';
 import { seedStreamFromSnapshot } from '$features/events/daemon-events-bridge.client';
+import {
+  reportStreamLifecycle,
+  streamTurnCorrelation,
+} from '$lib/utils/stream-lifecycle-telemetry';
+import {
+  hasChatInterestLease,
+  onLastChatInterestLeaseReleased,
+} from '$features/agent/utils/chat-interest-leases';
 import {
   selectAgentMessages,
   selectAgentSession,
@@ -217,6 +240,23 @@ interface SubscriptionCoordinator {
   locallyStartedTurns: Set<string>;
   /** One bounded reveal-gate watcher per agent (see revealGateWatcher). */
   revealGateWatchers: Map<string, Task>;
+  /**
+   * LAST-lease releases forwarded from the chat-interest-lease registry
+   * (monorepo#3295) into the saga runtime; drained by watchLeaseReleases.
+   */
+  leaseReleases: Channel<string>;
+  /**
+   * Agents spared from a sweep — the viewed-agent swap's, an applied
+   * clear's close-all, or a scoped clear's own-slot close — because a live
+   * consumer held a chat interest lease at sweep time (a mounted ChatPanel
+   * instance, an in-flight chat-read hydration; monorepo#3295, replacing
+   * the heuristic loading/acquiring/panel-tab spares of the
+   * #2864/#2917/#3073/#3185 family). Revisited when the agent's LAST lease
+   * releases (watchLeaseReleases): with nothing depending on it and no
+   * re-view, the deferred close runs then instead of leaking the
+   * subscription. The spare defers the close, it never cancels it.
+   */
+  pendingSweepCloses: Set<string>;
 }
 
 function createCompletion(): TransitionCompletion {
@@ -356,7 +396,15 @@ function* applyTranscript(
   discardStoreOnly = false,
 ): SagaGenerator<void> {
   const session = yield* selectAgentSession.effect(agentId);
-  if (!isCurrentSubscription(coordinator, agentId, entry)) return;
+  if (!isCurrentSubscription(coordinator, agentId, entry)) {
+    // A supersede landing across the select yield above: the drop is correct,
+    // but a dropped snapshot must not vanish unlogged (see reportSnapshotGuard).
+    reportSnapshotGuard(transcript, 'snapshot-dropped-superseded-mid-apply', 'ignored');
+    return;
+  }
+  // Read before the flag reconcile below consumes the marker: a snapshot that
+  // may predate a locally-started turn is not authoritative about liveness.
+  const racesLocalStart = coordinator.locallyStartedTurns.has(agentId);
   if (session) {
     const transcriptIds = new Set<string>();
     for (const message of transcript.messages) {
@@ -370,12 +418,34 @@ function* applyTranscript(
             !(typeof message.id === 'string' && transcriptIds.has(message.id)) &&
             !(typeof message.appMessageId === 'string' && transcriptIds.has(message.appMessageId)),
         );
+    // A snapshot is the authoritative newest page with the in-flight turn
+    // MERGED INTO IT (§7.1), so a retained row the page does not cover cannot
+    // still be in flight — settle its streaming flags, exactly as the
+    // close-time teardown does (flags only; content is never touched).
+    // Otherwise a partial row evicted from the served window (the slim page
+    // budget re-mints `truncated` after the live-turn merge) keeps rendering
+    // as a live turn beside the daemon's real one, and the firehose cannot
+    // clear it while this registration is the sole writer.
+    // Trade-off of the `racesLocalStart` exemption: a snapshot pending since
+    // before a local send may predate the turn the renderer just started, so
+    // it must not settle the optimistic in-flight row — but skipping the
+    // settle also spares a frozen PRIOR-turn row, and when that snapshot is
+    // itself `isStreaming: true` the flag reconcile below consumes the
+    // marker, so the frozen row persists until some LATER snapshot arrives
+    // (which a healthy standing registration may never emit). Protecting the
+    // optimistic row matters more than closing that residual window.
+    const retained =
+      transcript.fromSnapshot === true && !racesLocalStart
+        ? storeOnly.map((message) => (claimsLiveness(message) ? settleStreaming(message) : message))
+        : storeOnly;
     const merged =
-      storeOnly.length === 0
+      retained.length === 0
         ? transcript.messages
-        : deduplicateAgentMessages([...storeOnly, ...transcript.messages]);
+        : deduplicateAgentMessages([...retained, ...transcript.messages]);
     if (isCurrentSubscription(coordinator, agentId, entry)) {
       yield* put(replaceMessages(agentId, merged));
+    } else {
+      reportSnapshotGuard(transcript, 'snapshot-dropped-superseded-mid-apply', 'ignored');
     }
   }
 
@@ -404,6 +474,16 @@ function* applyTranscript(
   }
 }
 
+/** True while a row still presents itself as mid-stream. */
+function claimsLiveness(message: AgentMessage): boolean {
+  return message.isStreaming === true || message.streamingComplete === false;
+}
+
+/** The same row with its streaming flags settled; content untouched. */
+function settleStreaming(message: AgentMessage): AgentMessage {
+  return { ...message, isStreaming: false, streamingComplete: true };
+}
+
 /**
  * Clear stale message-level streaming flags left behind when a standing
  * subscription closes mid-turn. Message content is untouched; a re-view's
@@ -413,16 +493,43 @@ function* clearStaleStreamingMessageFlags(agentId: string): SagaGenerator<void> 
   const session = yield* selectAgentSession.effect(agentId);
   const messages = session?.messages;
   if (!messages?.length) return;
-  const hasStale = messages.some(
-    (message) => message.isStreaming === true || message.streamingComplete === false,
-  );
-  if (!hasStale) return;
+  if (!messages.some(claimsLiveness)) return;
   const normalized = messages.map((message) =>
-    message.isStreaming === true || message.streamingComplete === false
-      ? { ...message, isStreaming: false, streamingComplete: true }
-      : message,
+    claimsLiveness(message) ? settleStreaming(message) : message,
   );
   yield* put(replaceMessages(agentId, normalized));
+}
+
+/**
+ * One `stream-lifecycle` breadcrumb for a snapshot a guard below drops or
+ * holds. A snapshot is the only emit that can displace a stale in-flight turn
+ * (§7.1 serves the newest page with the live turn merged in), so each guard
+ * names itself — a distinct event per structurally distinct guard — instead
+ * of returning silently: the next stuck-transcript report is then
+ * diagnosable from the log. The transcript's own liveness is implied by
+ * `pushKind: 'snapshot'` plus the `turnCorrelation`/`blockCount` presence;
+ * `storeStreamState` is deliberately omitted — its other producers report
+ * the store's actual state, which this callback cannot cheaply read.
+ * Content-free: the correlation is the hashed message id, never its text.
+ */
+function reportSnapshotGuard(
+  transcript: ChatTranscript,
+  event: string,
+  callbackResult: 'ignored' | 'buffered',
+): void {
+  if (transcript.fromSnapshot !== true) return;
+  const inFlight = transcript.messages.find(
+    (message) => message.role === 'assistant' && message.isStreaming === true,
+  );
+  reportStreamLifecycle({
+    stage: 'subscription',
+    event,
+    ...(inFlight ? { turnCorrelation: streamTurnCorrelation(inFlight.id) } : {}),
+    correlationBasis: inFlight ? 'assistant-message' : 'unjoinable',
+    pushKind: 'snapshot',
+    ...(inFlight?.contentBlocks ? { blockCount: inFlight.contentBlocks.length } : {}),
+    callbackResult,
+  });
 }
 
 function* handleSubscriptionEvent(
@@ -430,8 +537,24 @@ function* handleSubscriptionEvent(
   event: ChatSubscriptionEvent,
 ): SagaGenerator<void> {
   const entry = coordinator.subscriptions.get(event.agentId);
-  if (!entry || entry.token !== event.token) return;
-  if (!isCurrentSubscription(coordinator, event.agentId, entry)) return;
+  if (!entry || entry.token !== event.token) {
+    if (event.kind === 'transcript') {
+      // A queued event whose registration rotated before the saga drained it
+      // (vs `-emit`: a wire callback outliving its registration).
+      reportSnapshotGuard(
+        event.transcript,
+        'snapshot-dropped-stale-registration-queued',
+        'ignored',
+      );
+    }
+    return;
+  }
+  if (!isCurrentSubscription(coordinator, event.agentId, entry)) {
+    if (event.kind === 'transcript') {
+      reportSnapshotGuard(event.transcript, 'snapshot-dropped-superseded-registration', 'ignored');
+    }
+    return;
+  }
   try {
     if (event.kind === 'phase') {
       if (isCurrentSubscription(coordinator, event.agentId, entry)) {
@@ -439,8 +562,14 @@ function* handleSubscriptionEvent(
       }
       return;
     }
-    if (yield* call(isAgentDeletionPending, event.agentId)) return;
-    if (!isCurrentSubscription(coordinator, event.agentId, entry)) return;
+    if (yield* call(isAgentDeletionPending, event.agentId)) {
+      reportSnapshotGuard(event.transcript, 'snapshot-dropped-deletion-pending', 'ignored');
+      return;
+    }
+    if (!isCurrentSubscription(coordinator, event.agentId, entry)) {
+      reportSnapshotGuard(event.transcript, 'snapshot-dropped-superseded-registration', 'ignored');
+      return;
+    }
     entry.hasEmitted = true;
     entry.lastTranscript = event.transcript;
     // Pre-session seq-0 race: `initializeChatRequested` starts this saga and
@@ -455,10 +584,20 @@ function* handleSubscriptionEvent(
       const preSession = yield* selectAgentSession.effect(event.agentId);
       if (!preSession) {
         entry.pendingSnapshot = event.transcript;
+        setReplayableChatSnapshot(event.agentId, true);
+        reportSnapshotGuard(event.transcript, 'snapshot-held-pre-session', 'buffered');
         return;
       }
       entry.pendingSnapshot = undefined;
     }
+    // Mirror of emitOrCycleSnapshot's no-wire paths: a held pre-session
+    // snapshot or a snapshot-typed lastTranscript can answer a re-request
+    // without a fresh emit. The chat-read saga consults this to escalate
+    // immediately instead of stranding a wait window (monorepo#2864).
+    setReplayableChatSnapshot(
+      event.agentId,
+      entry.pendingSnapshot !== undefined || event.transcript.fromSnapshot === true,
+    );
     // §7.1 `resumed: false` snapshot: the retained transcript MUST be
     // discarded (see applyTranscript). Snapshot emits only — the settled
     // re-apply of the same transcript must not wipe the background
@@ -566,6 +705,7 @@ function* openSubscription(
     if (slot.desiredToken === transition.token) {
       slot.desiredToken = undefined;
       slot.wsId = undefined;
+      clearChatSubscriptionAcquiring(agentId);
     }
     return;
   }
@@ -573,7 +713,19 @@ function* openSubscription(
   const pending: ChatSubscriptionEvent[] = [];
   let ready = false;
   const emit = (event: ChatSubscriptionEvent) => {
-    if (slot.desiredToken !== transition.token) return;
+    if (slot.desiredToken !== transition.token) {
+      // A superseded registration still holding the wire callback: the drop
+      // is correct, but a dropped SNAPSHOT is the one emit that could have
+      // displaced a stale in-flight turn, so it leaves a breadcrumb.
+      if (event.kind === 'transcript') {
+        reportSnapshotGuard(
+          event.transcript,
+          'snapshot-dropped-stale-registration-emit',
+          'ignored',
+        );
+      }
+      return;
+    }
     if (ready) coordinator.events.put(event);
     else pending.push(event);
   };
@@ -608,6 +760,9 @@ function* openSubscription(
     // install — the seq-0 snapshot that follows is canonical for anything
     // the firehose would have written in between.
     markStandingChatSubscription(agentId);
+    // Standing coverage supersedes the acquiring marker: the read saga's
+    // probe now reads the standing registration directly.
+    clearChatSubscriptionAcquiring(agentId);
     installed = true;
     ready = true;
     for (const event of pending) coordinator.events.put(event);
@@ -621,6 +776,13 @@ function* openSubscription(
     if (!installed && slot.desiredToken === transition.token) {
       slot.desiredToken = undefined;
       slot.wsId = undefined;
+    }
+    // An open that never installed (cancelled acquisition, deletion race, or
+    // thrown error) leaves no acquisition in flight — clear the marker,
+    // unless a NEWER open superseded this one (its desiredToken remains set
+    // and it re-marked its own acquisition).
+    if (!installed && !slot.desiredToken) {
+      clearChatSubscriptionAcquiring(agentId);
     }
   }
 }
@@ -797,6 +959,11 @@ function* enqueueOpen(
   const token = {};
   slot.desiredToken = token;
   slot.wsId = wsId;
+  // Record the acquisition as in flight (intent-hq/monorepo#3295): a
+  // concurrent chat-read hydration probes this to tell a cold open (seq-0
+  // emit still coming — keep the plain wait) apart from a dead wait (no
+  // standing registration AND no open in flight — escalate immediately).
+  markChatSubscriptionAcquiring(agentId);
   const completion = createCompletion();
   return enqueue(slot, { kind: 'open', token, wsId, waitFor, completion });
 }
@@ -813,6 +980,14 @@ function enqueueClose(
   }
   slot.desiredToken = undefined;
   slot.acquisition?.cancelPending();
+  // The open this close supersedes is no longer desired — drop its acquiring
+  // marker synchronously (a still-queued open transition early-returns at its
+  // token check before its own finally can clear it). A force-cycle's paired
+  // enqueueOpen re-marks right after, so the net state stays correct.
+  clearChatSubscriptionAcquiring(agentId);
+  // Any close retires a pending deferred sweep-close — the teardown it
+  // deferred is now happening through this path.
+  coordinator.pendingSweepCloses.delete(agentId);
   const completion = createCompletion();
   return enqueue(slot, { kind: 'close', clearResumeAnchor, completion });
 }
@@ -862,101 +1037,35 @@ export const SWITCH_BACK_REVEAL_WAIT_MS =
   SNAPSHOT_TIMEOUT_MS + INITIAL_RETRY_DELAY_MS + SWITCH_BACK_REVEAL_MARGIN_MS;
 
 /**
- * Composed utility-footer readiness for one (workspace, agent): the agent's
- * `agent.getSubscriptions` read plus the workspace's `hook.list` and
- * `prMonitor.list` seeds have all settled (success or failure both latch —
- * a failed read renders the same as empty). The chief virtual workspace is
- * EXEMPT (always ready): its footer seeds come only from the two
- * active-workspace watchers keyed on `currentTabId`, and the Chief panel is
- * a standing surface outside the tab strip — the seeds would never arrive
- * ahead of the card mount, so gating a chief thread on them could only ever
- * resolve via the bounded fallback (a full-length skeleton on every open).
- * Chief threads keep the pre-gate behavior: reveal on transcript readiness,
- * with the footer populating from the card's own mount-time fetches. The
- * same short-circuit is deliberately NOT applied to ordinary non-active-tab
- * workspaces (multi-panel layouts): their entries seed on tab activation and
- * are retained (pr-monitors) or re-seeded by the card mount (hooks), so the
- * gate still converges without the fallback in the common case.
- */
-function* isFooterReadyForReveal(wsId: string, agentId: string): SagaGenerator<boolean> {
-  if (wsId === CHIEF_WORKSPACE_ID) return true;
-  const subscriptionSnapshotFetched = yield* selectSubscriptionSnapshotFetched.effect(
-    wsId,
-    agentId,
-  );
-  const backgroundHooksSnapshotDelivered =
-    yield* selectBackgroundHooksSnapshotDelivered.effect(wsId);
-  const prMonitorsSnapshotDelivered = yield* selectPrMonitorsSnapshotDelivered.effect(wsId);
-  return isUtilityFooterReady({
-    subscriptionSnapshotFetched,
-    backgroundHooksSnapshotDelivered,
-    prMonitorsSnapshotDelivered,
-  });
-}
-
-/**
- * Saga-owned watcher for the armed transcript reveal gates (the switch-back
- * snapshot gate and/or the utility-footer gate — both first open and
- * switch-back share it). One bounded timer per agent: it clears the footer
- * gate (`chatUtilityFooterReady`) the moment the footer data sources are all
- * settled, exits once every gate is clear (snapshot applied / subscription
- * closed already clear their gates in the reducer), and on timeout with any
- * gate STILL armed dispatches the fallback clear — the transcript reveals
- * without the footer (today's behavior) rather than an indefinite skeleton.
+ * Saga-owned watcher for the switch-back transcript snapshot gate. One bounded
+ * timer per agent exits when the fresh snapshot applies (or the subscription
+ * closes), and clears the gate on timeout so recovery cannot wedge reveal.
  * `startRevealGateWatcher` cancels a superseded watcher before forking a
  * fresh one, so exactly one runs per agent instead of duplicates racing; the
  * reducer additionally no-ops a stale timeout dispatch, so a superseded
  * watcher can never re-clear a re-armed gate.
  */
-function* revealGateWatcher(agentId: string, wsId: string): SagaGenerator<void> {
-  const mayChangeGates = (action: { type: string; payload?: unknown }): boolean => {
+function* revealGateWatcher(agentId: string): SagaGenerator<void> {
+  const mayChangeGate = (action: { type: string; payload?: unknown }): boolean => {
     switch (action.type) {
       case chatTranscriptSnapshotApplied.type:
       case chatLiveStreamPhaseChanged.type:
       case chatSwitchBackRevealTimedOut.type:
-      case chatUtilityFooterReady.type:
         return Array.isArray(action.payload) && action.payload[0] === agentId;
-      case setSubscriptionSnapshot.type: {
-        const payload = action.payload as { workspaceId?: string; agentId?: string } | undefined;
-        return payload?.workspaceId === wsId && payload?.agentId === agentId;
-      }
-      case subscriptionSnapshotFetchFailed.type:
-        return (
-          Array.isArray(action.payload) &&
-          action.payload[0] === wsId &&
-          action.payload[1] === agentId
-        );
-      case backgroundHooksUpdated.type:
-      case backgroundHooksCleared.type:
-      case prMonitorsUpdated.type:
-        return Array.isArray(action.payload) && action.payload[0] === wsId;
       default:
         return false;
     }
   };
-  function* gatesSettled(): SagaGenerator<void> {
-    while (true) {
-      if (
-        (yield* selectAwaitingUtilityFooter.effect(agentId)) &&
-        (yield* isFooterReadyForReveal(wsId, agentId))
-      ) {
-        yield* put(chatUtilityFooterReady(agentId));
-      }
-      const snapshotArmed = yield* selectAwaitingSwitchBackSnapshot.effect(agentId);
-      const footerArmed = yield* selectAwaitingUtilityFooter.effect(agentId);
-      if (!snapshotArmed && !footerArmed) return;
-      yield* take(mayChangeGates);
+  function* snapshotSettled(): SagaGenerator<void> {
+    while (yield* selectAwaitingSwitchBackSnapshot.effect(agentId)) {
+      yield* take(mayChangeGate);
     }
   }
   const { timedOut } = yield* race({
-    settled: call(gatesSettled),
+    settled: call(snapshotSettled),
     timedOut: delay(SWITCH_BACK_REVEAL_WAIT_MS),
   });
-  if (
-    timedOut &&
-    ((yield* selectAwaitingSwitchBackSnapshot.effect(agentId)) ||
-      (yield* selectAwaitingUtilityFooter.effect(agentId)))
-  ) {
+  if (timedOut && (yield* selectAwaitingSwitchBackSnapshot.effect(agentId))) {
     yield* put(chatSwitchBackRevealTimedOut(agentId));
   }
 }
@@ -966,21 +1075,11 @@ function* startRevealGateWatcher(
   coordinator: SubscriptionCoordinator,
   agentId: string,
 ): SagaGenerator<void> {
-  const wsId =
-    coordinator.slots.get(agentId)?.wsId ??
-    coordinator.subscriptions.get(agentId)?.wsId ??
-    (yield* selectAgentSession.effect(agentId))?.workspaceId;
-  if (!wsId) {
-    // No workspace to watch footer readiness for — fail OPEN (clear both
-    // gates immediately) rather than leaving an armed gate with no watcher.
-    yield* put(chatSwitchBackRevealTimedOut(agentId));
-    return;
-  }
   const existing = coordinator.revealGateWatchers.get(agentId);
   if (existing?.isRunning()) yield* cancel(existing);
   const task = yield* fork(function* runWatcher(): SagaGenerator<void> {
     try {
-      yield* call(revealGateWatcher, agentId, wsId);
+      yield* call(revealGateWatcher, agentId);
     } finally {
       // Self-prune on completion (settled, timed out, or cancelled) so the
       // map holds only live watchers; a superseded watcher's cancellation
@@ -995,25 +1094,77 @@ function* startRevealGateWatcher(
 }
 
 /**
- * The viewed-agent swap is global within its realm: all related closes settle
- * before the newly viewed agent opens. Chief and ordinary workspace realms
- * remain independent because their standing surfaces intentionally coexist.
+ * The viewed-agent swap is realm-scoped: it sweeps every other same-realm
+ * agent's subscription and opens the newly viewed agent's IMMEDIATELY — the
+ * open never waits on the swept agents' closes. `chat.subscribe` is
+ * agent-scoped (PROTOCOL §7.1): registrations for different agents are
+ * independent on the wire, so gating the new subscribe behind another
+ * agent's unsubscribe only added its round-trip to the swap's critical
+ * path. Same-agent close→open ordering is unaffected: each agent's
+ * transitions run serially through its own slot channel, so a re-viewed
+ * agent's reopen still queues behind its own pending close. Chief and
+ * ordinary workspace realms remain independent because their standing
+ * surfaces intentionally coexist.
  */
 function* handleViewed(coordinator: SubscriptionCoordinator, agentId: string): SagaGenerator<void> {
   const viewedIsChief = yield* isChiefChatAgent(coordinator, agentId);
-  const closes = closeMatchingSlots(
+  // Spare same-realm agents holding a chat interest lease (monorepo#3295):
+  // a mounted ChatPanel instance or an in-flight chat-read hydration is a
+  // live consumer of the standing registration, and sweeping it clears the
+  // slot's desiredToken (token-dropping the seq-0 snapshot of a
+  // still-acquiring or installed-but-not-yet-emitted open) — the
+  // #2864/#2917/#3073/#3185/#3295 strand family. Leases are maintained
+  // synchronously by the consumers themselves (panel onMount before its
+  // init/viewed dispatches, hydration worker before its bounded wait), so
+  // unlike the heuristic spares they replaced (hydration `loading`,
+  // still-acquiring slot, hosted panel tab — each defeated by a
+  // flush-ordering race in turn) they cannot lag the consumer's existence
+  // at sweep time. Unleased agents (nothing mounted, nothing hydrating)
+  // keep closing as before, and their resume anchor makes the eventual
+  // re-view cheap. The spare defers the close, it never cancels it: each
+  // spared agent is recorded and revisited when its LAST lease releases
+  // (runDeferredSweepCloseIfUnleased), so a panel genuinely closed
+  // mid-load still tears the subscription down.
+  const spared = new Set<string>();
+  for (const [slotAgentId, slot] of [...coordinator.slots.entries()]) {
+    if (slotAgentId === agentId) continue;
+    if ((slot.wsId === CHIEF_WORKSPACE_ID) !== viewedIsChief) continue;
+    if (yield* call(hasChatInterestLease, slotAgentId)) spared.add(slotAgentId);
+  }
+  for (const slotAgentId of spared) coordinator.pendingSweepCloses.add(slotAgentId);
+  closeMatchingSlots(
     coordinator,
-    (otherId, slot) => otherId !== agentId && (slot.wsId === CHIEF_WORKSPACE_ID) === viewedIsChief,
+    (otherId, slot) =>
+      otherId !== agentId &&
+      (slot.wsId === CHIEF_WORKSPACE_ID) === viewedIsChief &&
+      !spared.has(otherId),
   );
   const session = yield* selectAgentSession.effect(agentId);
   if (session) {
-    yield* enqueueOpen(
-      coordinator,
-      agentId,
-      session.workspaceId,
-      closes.length > 0 ? closes : undefined,
-    );
+    yield* enqueueOpen(coordinator, agentId, session.workspaceId);
   }
+}
+
+/**
+ * Revisit an agent spared from a sweep because a lease was held, now that
+ * its LAST lease has released (every panel instance destroyed, every
+ * hydration settled/failed/cancelled). A re-viewed agent stays: the view is
+ * an authoritative keep the swap will retire on the next switch. A tab
+ * persisted in a panel layout without a live lease holds nothing open — an
+ * unmounted (backgrounded/cached) panel is not waiting on the subscription,
+ * and its remount re-initializes the chat. Otherwise the sweep's deferred
+ * close runs now instead of leaking the subscription until an unrelated
+ * swap or session teardown.
+ */
+function* runDeferredSweepCloseIfUnleased(
+  coordinator: SubscriptionCoordinator,
+  agentId: string,
+): SagaGenerator<void> {
+  if (!coordinator.pendingSweepCloses.has(agentId)) return;
+  if (yield* call(hasChatInterestLease, agentId)) return;
+  coordinator.pendingSweepCloses.delete(agentId);
+  if ((yield* selectCurrentlyViewedAgentId.effect()) === agentId) return;
+  enqueueClose(coordinator, agentId);
 }
 
 /**
@@ -1120,7 +1271,6 @@ type ChatSubscribeAction =
   | ReturnType<typeof refreshChatTranscriptRequested>
   | ReturnType<typeof chatTranscriptSnapshotRerequested>
   | ReturnType<typeof clearCurrentlyViewedAgent>
-  | ReturnType<typeof upsertSession>
   | ReturnType<typeof bulkUpsertSessions>
   | ReturnType<typeof removeSession>
   | ReturnType<typeof removeWorkspaceSessions>
@@ -1141,28 +1291,16 @@ function* routeLifecycleAction(
     if (coordinator.slots.has(agentId)) coordinator.locallyStartedTurns.add(agentId);
   } else if (action.type === markAgentAsViewed.type) {
     const [agentId] = action.payload as ReturnType<typeof markAgentAsViewed>['payload'];
-    // The reducer armed the switch-back reveal gates synchronously with this
+    // The reducer armed the switch-back snapshot gate synchronously with this
     // action (when the transcript hydrated before and no current-subscription
-    // snapshot exists); own their bounded fallback here so a snapshot or
-    // footer seed that never arrives cannot leave an indefinite skeleton.
-    if (
-      (yield* selectAwaitingSwitchBackSnapshot.effect(agentId)) ||
-      (yield* selectAwaitingUtilityFooter.effect(agentId))
-    ) {
+    // snapshot exists); own its bounded fallback here so a missing snapshot
+    // cannot leave an indefinite skeleton.
+    if (yield* selectAwaitingSwitchBackSnapshot.effect(agentId)) {
       yield* startRevealGateWatcher(coordinator, agentId);
     }
     yield* handleViewed(coordinator, agentId);
   } else if (action.type === transcriptHydrationSettled.type) {
     const [agentId] = action.payload as ReturnType<typeof transcriptHydrationSettled>['payload'];
-    // The FIRST settle armed the utility-footer reveal gate (same-paint
-    // reveal of transcript + footer on first open); own its bounded wait
-    // unless a switch-back watcher already runs for this agent.
-    if (
-      (yield* selectAwaitingUtilityFooter.effect(agentId)) &&
-      !coordinator.revealGateWatchers.get(agentId)?.isRunning()
-    ) {
-      yield* startRevealGateWatcher(coordinator, agentId);
-    }
     enqueueHydrationSettled(coordinator, agentId);
   } else if (action.type === refreshChatTranscriptRequested.type) {
     const [wsId, agentId] = action.payload as ReturnType<
@@ -1181,12 +1319,61 @@ function* routeLifecycleAction(
     if (scopeAgentId && (yield* isChiefChatAgent(coordinator, scopeAgentId))) {
       enqueueClose(coordinator, scopeAgentId);
     } else if ((yield* selectCurrentlyViewedAgentId.effect()) === null) {
-      closeMatchingSlots(coordinator, (_agentId, slot) => slot.wsId !== CHIEF_WORKSPACE_ID);
+      // Same-agent remount hole in the monorepo#1215 guard (monorepo#2864):
+      // on a ChatPanel remount for the SAME agent, the new instance's
+      // initializeChatRequested dedupes against the standing subscription and
+      // its markAgentAsViewed is a reducer no-op (already viewed) — so the
+      // old instance's trailing scoped clear APPLIES (viewed → null) and
+      // would close the very subscription the remounted panel depends on,
+      // dropping the snapshot meta with no seq-0 emit coming (the remount's
+      // open was consumed by the dedup). Spare leased agents: the remounted
+      // panel acquired its lease synchronously at mount (before this
+      // trailing clear could land in any flush ordering) and its in-flight
+      // hydration holds one too, while the departing instance released its
+      // OWN lease before dispatching this clear — so a genuine final close
+      // leaves the agent unleased and the sweep closes it immediately. The
+      // spare defers the close, it never cancels it: each spared agent is
+      // revisited when its last lease releases
+      // (runDeferredSweepCloseIfUnleased), so a close-mid-load still tears
+      // the subscription down instead of leaking it.
+      const leased = new Set<string>();
+      for (const slotAgentId of coordinator.slots.keys()) {
+        if (yield* call(hasChatInterestLease, slotAgentId)) leased.add(slotAgentId);
+      }
+      for (const [slotAgentId, slot] of coordinator.slots.entries()) {
+        if (slot.wsId !== CHIEF_WORKSPACE_ID && leased.has(slotAgentId)) {
+          coordinator.pendingSweepCloses.add(slotAgentId);
+        }
+      }
+      closeMatchingSlots(
+        coordinator,
+        (agentId, slot) => slot.wsId !== CHIEF_WORKSPACE_ID && !leased.has(agentId),
+      );
+    } else if (scopeAgentId) {
+      // Another agent is still viewed, so this scoped clear was a reducer
+      // no-op (monorepo#1215's cross-agent guard) — but the CLEARED agent's
+      // own slot may still be standing: a sibling spared from the viewed
+      // -agent swap (monorepo#2917) whose subscription outlived the swap.
+      // When its tab later deactivates or its panel destroys (both dispatch
+      // this scoped clear), no sweep would otherwise reach the sibling and
+      // its subscription would leak until an unrelated swap or session
+      // teardown. Close the scoped agent's OWN slot — never the viewed
+      // agent's, preserving the #1215 guard: immediately when no lease
+      // remains (the dispatching panel was the last consumer and released
+      // in onDestroy first), deferred through the spare-then-revisit
+      // contract while a lease is still held (a cached-but-mounted
+      // deactivated panel, a remounting instance, or an in-flight
+      // hydration).
+      if (!(yield* call(hasChatInterestLease, scopeAgentId))) {
+        enqueueClose(coordinator, scopeAgentId);
+      } else {
+        coordinator.pendingSweepCloses.add(scopeAgentId);
+      }
     }
-  } else if (action.type === upsertSession.type) {
-    const [session] = action.payload as [AgentSession];
-    replayPendingSnapshot(coordinator, session.id);
   } else if (action.type === bulkUpsertSessions.type) {
+    // Reducers commit the entire session batch before saga observers receive
+    // this action. It is the sole shell-ready signal for pending snapshots;
+    // membership-only per-agent upserts must not replay against a missing shell.
     const [sessions] = action.payload as [AgentSession[]];
     for (const session of sessions) replayPendingSnapshot(coordinator, session.id);
   } else if (action.type === removeSession.type) {
@@ -1215,13 +1402,31 @@ function* watchSubscriptionEvents(coordinator: SubscriptionCoordinator): SagaGen
   }
 }
 
+/**
+ * Drain LAST-lease releases into the deferred sweep-close revisit. The lease
+ * registry notifies synchronously (a panel's onDestroy, a hydration worker's
+ * finally — including on saga CANCELLATION, where no settle/fail action
+ * follows); the channel re-enters the saga runtime so the revisit runs with
+ * ordinary effect semantics after the release completes.
+ */
+function* watchLeaseReleases(coordinator: SubscriptionCoordinator): SagaGenerator<void> {
+  while (true) {
+    const agentId = yield* take(coordinator.leaseReleases);
+    yield* runDeferredSweepCloseIfUnleased(coordinator, agentId);
+  }
+}
+
 function disposeCoordinator(coordinator: SubscriptionCoordinator): string[] {
   const agentIds = [...coordinator.subscriptions.keys()];
   coordinator.events.close();
-  for (const slot of coordinator.slots.values()) {
+  for (const [slotAgentId, slot] of coordinator.slots.entries()) {
     slot.desiredToken = undefined;
     slot.channel.close();
     slot.acquisition?.dispose();
+    // Slots may hold an open in flight that never installed a standing
+    // registration — clear its acquiring marker so the read-saga probe
+    // cannot see a stale acquisition after the coordinator is torn down.
+    clearChatSubscriptionAcquiring(slotAgentId);
   }
   for (const entry of coordinator.subscriptions.values()) entry.acquisition.dispose();
   for (const agentId of agentIds) clearStandingChatSubscription(agentId);
@@ -1230,6 +1435,7 @@ function disposeCoordinator(coordinator: SubscriptionCoordinator): string[] {
   // Watcher tasks are forked children of the root saga — cancellation
   // retires them; only the bookkeeping map needs clearing.
   coordinator.revealGateWatchers.clear();
+  coordinator.pendingSweepCloses.clear();
   return agentIds;
 }
 
@@ -1241,7 +1447,12 @@ export function* chatSubscribeSaga(): SagaGenerator<void> {
     events: createChannel(buffers.expanding<ChatSubscriptionEvent>()),
     locallyStartedTurns: new Set(),
     revealGateWatchers: new Map(),
+    leaseReleases: createChannel(buffers.expanding<string>()),
+    pendingSweepCloses: new Set(),
   };
+  const unsubscribeLeaseReleases = onLastChatInterestLeaseReleased((agentId) =>
+    coordinator.leaseReleases.put(agentId),
+  );
   const lifecycleActions = yield* actionChannel(
     [
       initializeChatRequested,
@@ -1251,7 +1462,6 @@ export function* chatSubscribeSaga(): SagaGenerator<void> {
       refreshChatTranscriptRequested,
       chatTranscriptSnapshotRerequested,
       clearCurrentlyViewedAgent,
-      upsertSession,
       bulkUpsertSessions,
       removeSession,
       removeWorkspaceSessions,
@@ -1261,6 +1471,7 @@ export function* chatSubscribeSaga(): SagaGenerator<void> {
     buffers.expanding<ChatSubscribeAction>(),
   );
   yield* fork(watchSubscriptionEvents, coordinator);
+  yield* fork(watchLeaseReleases, coordinator);
   try {
     while (true) {
       const action = (yield* take(lifecycleActions)) as ChatSubscribeAction;
@@ -1271,7 +1482,9 @@ export function* chatSubscribeSaga(): SagaGenerator<void> {
       }
     }
   } finally {
+    unsubscribeLeaseReleases();
     lifecycleActions.close();
+    coordinator.leaseReleases.close();
     const agentIds = disposeCoordinator(coordinator);
     for (const agentId of agentIds) {
       yield* put(chatLiveStreamPhaseChanged(agentId, null));

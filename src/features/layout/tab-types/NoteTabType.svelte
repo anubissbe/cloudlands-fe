@@ -24,12 +24,16 @@
     selectWorkspaceNotesState,
   } from '$store/renderer/slices/workspace-notes/workspace-notes-selectors';
   import { createNote, deleteNote } from '$features/notes/notes-write-service';
+  import { ensureNoteContentLoaded } from '$features/notes/notes-read-service';
   import { isSpecNote } from '$shared/constants/notes';
+  import { isNoteContentStale } from '$shared/utils/note-content';
   import { invoke } from '$lib/electron-bridge';
   import { createLogger } from '$lib/utils/client-logger';
   import NoteWithComments from '$lib/components/workspace/NoteWithComments.svelte';
   import NoteVersionHistory from '$lib/components/workspace/NoteVersionHistory.svelte';
   import SpecWritingOnboarding from '$lib/components/workspace/SpecWritingOnboarding.svelte';
+  import { Button } from '$lib/components/ui/button';
+  import { withToastCountdown } from '$lib/components/ui/toast';
   import { Skeleton } from '$lib/components/ui/skeleton';
   import * as Menu from '$lib/components/ui/menu';
   import OpenComboButton from '$features/external-editors/components/OpenComboButton.svelte';
@@ -73,10 +77,31 @@
     }
   });
 
+  // Slim note.list rows carry no content (§5.2); fetch the full body when this
+  // tab shows a note whose content has not been loaded yet. A failed fetch
+  // leaves the row stale (notes.get swallows errors), so track it locally and
+  // surface an error state with retry instead of a permanent loading state.
+  const noteContentStale = $derived(isNoteContentStale($note));
+  let contentLoadFailedNoteId = $state<string | null>(null);
+  const noteContentLoadFailed = $derived(
+    noteContentStale && contentLoadFailedNoteId === tab.noteId,
+  );
+  $effect(() => {
+    const noteId = tab.noteId;
+    if (!isActive || !noteId || !noteContentStale || contentLoadFailedNoteId === noteId) return;
+    void ensureNoteContentLoaded(workspaceId, noteId).then((loaded) => {
+      if (!loaded && tab.noteId === noteId) contentLoadFailedNoteId = noteId;
+    });
+  });
+
+  function retryNoteContentLoad() {
+    contentLoadFailedNoteId = null;
+  }
+
   // Get actual workspace root for file path
   let actualWorkspaceRoot = $state<string | null>(null);
   $effect(() => {
-    if (workspaceId) {
+    if (isActive && workspaceId) {
       invoke<string>('workspace:get-root', { workspaceId }).then((rootPath) => {
         if (rootPath) actualWorkspaceRoot = rootPath;
       });
@@ -139,6 +164,8 @@
   const noteContentState = $derived.by<NoteContentState>(() => {
     if (!tab.noteId) return 'missing';
     if (!$note) return $notesState.loading || !$notesState.initialized ? 'loading' : 'missing';
+    if (noteContentLoadFailed) return 'error';
+    if (noteContentStale) return 'loading';
     if (!noteEditable) return 'read-only';
     if (!$note.content?.trim()) return 'empty';
     return 'editor';
@@ -177,30 +204,36 @@
 
       // Show undo toast
       const { toast } = await import('svelte-sonner');
-      const toastId = toast.warning(m.layout_noteTab_deletedNote_toast({ title: noteTitle }), {
-        duration: 15000,
-        action: savedNote
-          ? {
-              label: m.ui_workspaceActions_undo_label(),
-              onClick: () => {
-                try {
-                  void createNote(savedNote.workspaceId, {
-                    title: savedNote.title,
-                    content: savedNote.content,
-                    contentType: savedNote.contentType,
-                    tags: savedNote.tags,
-                    parentId: savedNote.parentId,
-                    visibility: savedNote.visibility,
-                  });
-                  toast.dismiss(toastId);
-                } catch (err) {
-                  logger.error('Failed to restore note', err);
-                  toast.error(m.layout_noteTab_restoreFailed_error());
+      const toastId = toast.warning(
+        m.layout_noteTab_deletedNote_toast({ title: noteTitle }),
+        withToastCountdown(
+          {
+            duration: 15000,
+            action: savedNote
+              ? {
+                  label: m.ui_workspaceActions_undo_label(),
+                  onClick: () => {
+                    try {
+                      void createNote(savedNote.workspaceId, {
+                        title: savedNote.title,
+                        content: savedNote.content,
+                        contentType: savedNote.contentType,
+                        tags: savedNote.tags,
+                        parentId: savedNote.parentId,
+                        visibility: savedNote.visibility,
+                      });
+                      toast.dismiss(toastId);
+                    } catch (err) {
+                      logger.error('Failed to restore note', err);
+                      toast.error(m.layout_noteTab_restoreFailed_error());
+                    }
+                  },
                 }
-              },
-            }
-          : undefined,
-      });
+              : undefined,
+          },
+          { pauseOnHover: false },
+        ),
+      );
     } catch (error) {
       logger.error('Failed to delete note', error);
       const { toast } = await import('svelte-sonner');
@@ -229,19 +262,6 @@
     label={noteCopyFeedback || m.layout_noteTab_copyFullNote_tooltip()}
     onclick={handleCopyNote}
   />
-  <!-- Version history toggle hidden for now -->
-  <!-- <Button
-    variant="ghost-light"
-    size="icon-xs"
-    onclick={() => (showVersionHistory = !showVersionHistory)}
-    tooltip={showVersionHistory
-      ? m.layout_noteTab_hideVersionHistory_tooltip()
-      : m.layout_noteTab_showVersionHistory_tooltip()}
-    tooltipSide="bottom"
-    class={showVersionHistory ? 'text-foreground' : 'text-muted-foreground'}
-  >
-    <Fa icon={faClockRotateLeft} size="xs" />
-  </Button> -->
   {#if noteFilePath}
     <OpenComboButton filePath={noteFilePath} {workspaceId} isDirectory={false} embedded />
   {/if}
@@ -258,7 +278,14 @@
 
 <NoteContentSurface state={noteContentState}>
   {#if tab.noteId}
-    {#if !$note}
+    {#if noteContentLoadFailed}
+      <div class="flex flex-col items-center justify-center h-full text-subtle gap-3">
+        <p>{m.layout_noteTab_contentLoadFailed_error()}</p>
+        <Button variant="outline" size="sm" onclick={retryNoteContentLoad}>
+          {m.ui_errorToast_retry_label()}
+        </Button>
+      </div>
+    {:else if !$note}
       <div class="flex flex-col h-full">
         <div class="flex-1 p-4 space-y-4">
           <Skeleton class="h-8 w-3/4" />

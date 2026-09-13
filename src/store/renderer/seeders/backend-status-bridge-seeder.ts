@@ -12,8 +12,8 @@
  * In production (live electronAPI), these are handled by main-process code;
  * in tests (mock router), this seeder provides fallback responses.
  */
-import { registerMockIpcHandler } from "$shared/ipc-mock-router";
-import { IPC_CHANNELS } from "$shared/ipc-registry";
+import { registerMockIpcHandler } from '$shared/ipc-mock-router';
+import { IPC_CHANNELS } from '$shared/ipc-registry';
 
 const BACKEND = IPC_CHANNELS.BACKEND;
 
@@ -26,8 +26,8 @@ const BACKEND = IPC_CHANNELS.BACKEND;
  */
 registerMockIpcHandler(BACKEND.GET_STATUS, async () => {
   return {
-    status: "connected",
-    transport: { mode: "sidecar-uds" as const },
+    status: 'connected',
+    transport: { mode: 'sidecar-uds' as const },
   };
 });
 
@@ -42,23 +42,23 @@ registerMockIpcHandler(BACKEND.SPAWN_SIDECAR, async () => {
   return {
     ok: false,
     spawned: false,
-    reason: "Sidecar spawn is not available in this build",
+    reason: 'Sidecar spawn is not available in this build',
   };
 });
 
 /**
- * Atomic "Start local intentd" recovery (T22 review). Only the Electron main
- * process can switch the active backend and spawn the sidecar (ipcMain handler
- * in features/backend/main/backend.ipc.ts); in bridge-less builds and tests the
+ * Open-only "Open local" recovery. Only the Electron main process can spawn
+ * the sidecar and open the local backend's windows (ipcMain handler in
+ * features/backend/main/backend.ipc.ts); in bridge-less builds and tests the
  * mock router answers with the real handler's failure shape so the daemon-loss
  * UI surfaces the error instead of the invoke rejecting. Tests override via
  * `registerMockIpcHandler`.
  */
-registerMockIpcHandler(BACKEND.SWITCH_LOCAL_AND_SPAWN, async () => {
+registerMockIpcHandler(BACKEND.OPEN_LOCAL_AND_SPAWN, async () => {
   return {
     ok: false,
     spawned: false,
-    reason: "Sidecar spawn is not available in this build",
+    reason: 'Sidecar spawn is not available in this build',
   };
 });
 
@@ -74,7 +74,7 @@ registerMockIpcHandler(BACKEND.RESTART_ORPHANED_SIDECAR, async () => {
   return {
     ok: false,
     spawned: false,
-    reason: "Orphaned-sidecar recovery is not available in this build",
+    reason: 'Orphaned-sidecar recovery is not available in this build',
   };
 });
 

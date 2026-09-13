@@ -86,16 +86,31 @@ export interface ActionKeyDeps {
   getCurrentWorkspaceId?: () => string | null;
 }
 
+export interface ComposerFocusOptions {
+  /**
+   * `'dictation'` marks the request as targeted by the dictation flow:
+   * ChatPanel then accepts it even when the target panel is not the focused
+   * panel (a mid-dictation panel switch must not misroute the transcript).
+   * Panel keyboard-navigation dispatches never set this.
+   */
+  source?: 'dictation';
+}
+
 /**
  * Focus the chat composer of an agent's conversation tab by re-dispatching
  * the existing `panel:focus-content` seam ChatPanel already listens on
  * (panel keyboard navigation). Retried per COMPOSER_FOCUS_DELAYS_MS so a
  * still-mounting tab catches a later dispatch.
  */
-export function focusAgentComposer(agentId: string): void {
+export function focusAgentComposer(agentId: string, options?: ComposerFocusOptions): void {
+  const source = options?.source;
   for (const delay of COMPOSER_FOCUS_DELAYS_MS) {
     setTimeout(() => {
-      dispatchWindowEvent('panel:focus-content', { tabType: 'agent', agentId });
+      dispatchWindowEvent('panel:focus-content', {
+        tabType: 'agent',
+        agentId,
+        ...(source ? { source } : {}),
+      });
     }, delay);
   }
 }
@@ -109,7 +124,7 @@ export function focusAgentComposer(agentId: string): void {
 let composerFocusArmedUntil = 0;
 
 /** Arm the one-shot new-agent composer focus. Exported for tests. */
-export function armComposerFocusOnNextAgentTab(now = Date.now()): void {
+function armComposerFocusOnNextAgentTab(now = Date.now()): void {
   composerFocusArmedUntil = now + COMPOSER_FOCUS_ARM_TTL_MS;
 }
 

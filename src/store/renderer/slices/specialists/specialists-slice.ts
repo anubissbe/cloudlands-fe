@@ -1,10 +1,14 @@
-import { createAction } from "@augmentcode/themis/utils/store/create-action";
-import { createReducer } from "@augmentcode/themis/utils/store/create-reducer";
+import { createAction, createAsyncAction } from '@augmentcode/themis/utils/store/create-action';
+import { createReducer } from '@augmentcode/themis/utils/store/create-reducer';
 import {
   createCollection,
   type Collection,
-} from "@augmentcode/themis/utils/collections/collection-utils";
-import type { SpecialistFileScope, SpecialistModelOption } from "$shared/specialist-file-types";
+} from '@augmentcode/themis/utils/collections/collection-utils';
+import type {
+  SpecialistFileScope,
+  SpecialistModelOption,
+  SpecialistRole,
+} from '$shared/specialist-file-types';
 
 // ============================================================================
 // Types (re-exported for consumers)
@@ -52,6 +56,16 @@ export interface FileSpecialist {
    */
   resolvedModel?: string;
   resolvedProvider?: string;
+  /**
+   * Orchestration role (PROTOCOL §5.11 `role`): 'orchestrator' powers the
+   * New Workspace modal's team card; 'internal' is excluded from the modal's
+   * single-agent dropdown only. Undefined for standard specialists.
+   */
+  role?: SpecialistRole;
+  /** Specialist ids the orchestrator delegates to (advisory/render-only). */
+  teamAgents?: string[];
+  /** Built-in avatar design id; unknown/absent degrades to the fallback. */
+  icon?: string;
 }
 
 export interface FileSpecialistWritePayload {
@@ -82,8 +96,8 @@ export interface FileSpecialistReference {
 
 export type SpecialistsState = {
   bundledSpecialists: import('$lib/constants/specialists').Specialist[];
-  customSpecialists: Collection<CustomSpecialist, "id">;
-  fileSpecialists: Collection<FileSpecialist, "id">;
+  customSpecialists: Collection<CustomSpecialist, 'id'>;
+  fileSpecialists: Collection<FileSpecialist, 'id'>;
   userOverrides: SpecialistOverrides;
   providerModelOverrides: Record<string, Record<string, string>>;
   overridesLoaded: boolean;
@@ -91,15 +105,12 @@ export type SpecialistsState = {
   fileSpecialistsLoaded: boolean;
   bundledSpecialistsLoaded: boolean;
   specialistsFolderPath: string | null;
+  /**
+   * Daemon `specialists.default` setting (PROTOCOL §5.12): specialist applied
+   * when none is chosen (e.g. task Run). Empty string means unset.
+   */
+  defaultSpecialistId: string;
 };
-
-// ============================================================================
-// Constants
-// ============================================================================
-
-export const SPECIALISTS_OVERRIDES_KEY = 'specialists-overrides';
-export const CUSTOM_SPECIALISTS_KEY = 'custom-specialists';
-export const PROVIDER_MODEL_OVERRIDES_KEY = 'specialists-model-overrides-per-provider';
 
 // ============================================================================
 // Initial State
@@ -107,8 +118,8 @@ export const PROVIDER_MODEL_OVERRIDES_KEY = 'specialists-model-overrides-per-pro
 
 export const initialState: SpecialistsState = {
   bundledSpecialists: [],
-  customSpecialists: createCollection<CustomSpecialist, "id">("id"),
-  fileSpecialists: createCollection<FileSpecialist, "id">("id"),
+  customSpecialists: createCollection<CustomSpecialist, 'id'>('id'),
+  fileSpecialists: createCollection<FileSpecialist, 'id'>('id'),
   userOverrides: {
     codingAgentOverrides: {},
     modelOverrides: {},
@@ -120,21 +131,43 @@ export const initialState: SpecialistsState = {
   fileSpecialistsLoaded: false,
   bundledSpecialistsLoaded: false,
   specialistsFolderPath: null,
+  defaultSpecialistId: '',
 };
 
 // ============================================================================
 // Reducer Actions (pure state updates)
 // ============================================================================
 
-export const setBundledSpecialists = createAction<[specialists: import('$lib/constants/specialists').Specialist[]]>("specialists/setBundledSpecialists");
-export const setFileSpecialists = createAction<[specialists: FileSpecialist[]]>("specialists/setFileSpecialists");
-export const setOverridesLoaded = createAction<[loaded: boolean]>("specialists/setOverridesLoaded");
-export const setCustomSpecialistsLoaded = createAction<[loaded: boolean]>("specialists/setCustomSpecialistsLoaded");
-export const setFileSpecialistsLoaded = createAction<[loaded: boolean]>("specialists/setFileSpecialistsLoaded");
-export const setBundledSpecialistsLoaded = createAction<[loaded: boolean]>("specialists/setBundledSpecialistsLoaded");
-export const saveFileSpecialist = createAction<[specialist: FileSpecialistWritePayload]>("specialists/saveFileSpecialist");
-export const deleteFileSpecialist = createAction<[specialist: FileSpecialistReference]>("specialists/deleteFileSpecialist");
-
+export const setBundledSpecialists = createAction<
+  [specialists: import('$lib/constants/specialists').Specialist[]]
+>('specialists/setBundledSpecialists');
+export const setFileSpecialists = createAction<[specialists: FileSpecialist[]]>(
+  'specialists/setFileSpecialists',
+);
+export const setOverridesLoaded = createAction<[loaded: boolean]>('specialists/setOverridesLoaded');
+export const setCustomSpecialistsLoaded = createAction<[loaded: boolean]>(
+  'specialists/setCustomSpecialistsLoaded',
+);
+export const setFileSpecialistsLoaded = createAction<[loaded: boolean]>(
+  'specialists/setFileSpecialistsLoaded',
+);
+export const setBundledSpecialistsLoaded = createAction<[loaded: boolean]>(
+  'specialists/setBundledSpecialistsLoaded',
+);
+export const setDefaultSpecialistId = createAction<[specialistId: string]>(
+  'specialists/setDefaultSpecialistId',
+);
+export const refetchSpecialistsRequested = createAction<[]>('specialists/refetchRequested');
+// Async actions: the specialists saga settles the per-dispatch promise with the
+// daemon write outcome so callers (e.g. the proposal lifecycle) can await it.
+export const saveFileSpecialist = createAsyncAction<[specialist: FileSpecialistWritePayload], void>(
+  'specialists/saveFile',
+  'specialists/saveFileSpecialist',
+);
+export const deleteFileSpecialist = createAsyncAction<[specialist: FileSpecialistReference], void>(
+  'specialists/deleteFile',
+  'specialists/deleteFileSpecialist',
+);
 
 // ============================================================================
 // Reducer
@@ -142,27 +175,30 @@ export const deleteFileSpecialist = createAction<[specialist: FileSpecialistRefe
 
 export const specialistsReducer = createReducer<SpecialistsState>(initialState);
 specialistsReducer.with(setBundledSpecialists, (state, { payload: [specialists] }) => ({
-    ...state,
-    bundledSpecialists: specialists,
-  }));
+  ...state,
+  bundledSpecialists: specialists,
+}));
 specialistsReducer.with(setFileSpecialists, (state, { payload: [specialists] }) => ({
-    ...state,
-    fileSpecialists: createCollection<FileSpecialist, "id">("id", specialists),
-  }));
+  ...state,
+  fileSpecialists: createCollection<FileSpecialist, 'id'>('id', specialists),
+}));
 specialistsReducer.with(setOverridesLoaded, (state, { payload: [loaded] }) => ({
-    ...state,
-    overridesLoaded: loaded,
-  }));
+  ...state,
+  overridesLoaded: loaded,
+}));
 specialistsReducer.with(setCustomSpecialistsLoaded, (state, { payload: [loaded] }) => ({
-    ...state,
-    customSpecialistsLoaded: loaded,
-  }));
+  ...state,
+  customSpecialistsLoaded: loaded,
+}));
 specialistsReducer.with(setFileSpecialistsLoaded, (state, { payload: [loaded] }) => ({
-    ...state,
-    fileSpecialistsLoaded: loaded,
-  }));
+  ...state,
+  fileSpecialistsLoaded: loaded,
+}));
 specialistsReducer.with(setBundledSpecialistsLoaded, (state, { payload: [loaded] }) => ({
-    ...state,
-    bundledSpecialistsLoaded: loaded,
-  }));
-
+  ...state,
+  bundledSpecialistsLoaded: loaded,
+}));
+specialistsReducer.with(setDefaultSpecialistId, (state, { payload: [specialistId] }) => ({
+  ...state,
+  defaultSpecialistId: specialistId,
+}));

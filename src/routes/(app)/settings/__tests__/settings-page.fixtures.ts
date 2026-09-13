@@ -1,124 +1,116 @@
 export const SETTINGS_TABS = [
   {
-    id: 'accounts',
+    id: 'display',
+    label: 'Display',
+    stateOwners: ['Redux theme', 'Redux userPreferences'],
+    saveModes: ['immediate'],
+    states: ['default', 'selected', 'validation', 'success', 'disabled'],
+  },
+  {
+    id: 'app-behavior',
+    label: 'App Behavior',
+    stateOwners: ['Redux autoUpdate', 'Redux notifications'],
+    saveModes: ['immediate', 'confirmation'],
+    states: ['empty', 'update-available', 'success', 'error', 'disabled', 'confirmation'],
+  },
+  {
+    id: 'agent-behavior',
+    label: 'Agent Behavior',
+    stateOwners: ['Redux specialists', 'Redux model', 'Redux providerSettings', 'local draft'],
+    saveModes: ['autosave', 'explicit destructive confirmation'],
+    states: ['empty', 'global-prompt', 'validation', 'saving', 'error', 'confirmation'],
+  },
+  {
+    id: 'providers',
     label: 'Providers',
-    heading: '',
     stateOwners: ['Redux providerSettings', 'Redux auth', 'local availability'],
     saveModes: ['immediate'],
     states: ['loading', 'installed', 'missing', 'auth-required', 'active', 'disabled', 'error'],
   },
   {
-    id: 'agents',
-    label: 'Agents',
-    heading: '',
-    stateOwners: ['Redux specialists', 'Redux model', 'Redux providerSettings', 'local draft'],
-    saveModes: ['autosave', 'explicit destructive confirmation'],
-    states: [
-      'empty',
-      'global-prompt',
-      'file-specialist',
-      'validation',
-      'saving',
-      'error',
-      'confirmation',
-    ],
+    id: 'connections',
+    label: 'Connections',
+    stateOwners: ['Redux auth', 'Redux MCP', 'local availability'],
+    saveModes: ['immediate', 'explicit'],
+    states: ['loading', 'empty', 'success', 'error'],
+  },
+  {
+    id: 'devices',
+    label: 'Devices',
+    stateOwners: ['daemon settings', 'local pairing'],
+    saveModes: ['immediate', 'explicit'],
+    states: ['loading', 'disabled', 'success', 'error'],
   },
   {
     id: 'setup',
-    label: 'Tools',
-    heading: '',
+    label: 'Setup',
     stateOwners: ['daemon settings', 'Redux MCP', 'Redux externalEditors', 'local pairing'],
     saveModes: ['immediate', 'blur-or-enter', 'explicit'],
     states: ['loading', 'empty', 'validation', 'disabled', 'saving', 'success', 'error'],
   },
   {
-    id: 'fonts-colors',
-    label: 'Appearance',
-    heading: 'Appearance',
-    stateOwners: ['Redux theme', 'Redux userPreferences'],
-    saveModes: ['immediate'],
-    states: ['default', 'selected', 'imported', 'validation', 'long-content', 'compact'],
+    id: 'advanced',
+    label: 'Advanced',
+    stateOwners: ['daemon settings'],
+    saveModes: ['immediate', 'blur-or-enter'],
+    states: ['loading', 'disabled', 'success', 'error'],
   },
   {
-    id: 'notifications',
-    label: 'General',
-    heading: 'Notifications',
-    stateOwners: ['Redux notifications'],
-    saveModes: ['immediate'],
-    states: ['default', 'disabled', 'success', 'error'],
-  },
-  {
-    id: 'general',
-    label: 'General',
-    heading: 'Updates',
-    stateOwners: ['Redux autoUpdate'],
-    saveModes: ['immediate', 'confirmation'],
-    states: ['empty', 'installed', 'update-available', 'success', 'confirmation', 'developer'],
+    id: 'input',
+    label: 'Input',
+    stateOwners: ['Redux userPreferences', 'local draft'],
+    saveModes: ['immediate', 'autosave'],
+    states: ['default', 'validation', 'success', 'error'],
   },
 ] as const;
 
-export type SettingsTabId = (typeof SETTINGS_TABS)[number]['id'];
-export type SettingsTheme = 'light' | 'dark';
-export type SettingsViewport = 'desktop' | 'compact';
-
-const VIEWPORTS = {
-  desktop: { width: 1440, height: 1000 },
-  compact: { width: 900, height: 760 },
-} as const;
-
-const SETTINGS_TAB_QUERY: Partial<Record<SettingsTabId, string>> = {
-  accounts: 'providers',
-  setup: 'tools',
-  'fonts-colors': 'appearance',
-  notifications: 'general',
-};
-
 const CAPTURE_CASES = [
-  ['accounts', 'light', 'desktop', 'loading', 'Redux providerSettings', 'immediate'],
-  ['accounts', 'light', 'compact', 'error', 'local availability', 'immediate'],
-  ['accounts', 'dark', 'desktop', 'disabled', 'Redux providerSettings', 'immediate'],
-  ['accounts', 'dark', 'compact', 'success', 'Redux auth', 'immediate'],
-  ['agents', 'light', 'desktop', 'empty', 'Redux specialists', 'autosave'],
-  ['agents', 'light', 'compact', 'validation', 'local draft', 'autosave'],
-  ['agents', 'dark', 'desktop', 'confirmation', 'Redux model', 'explicit destructive confirmation'],
-  [
-    'agents',
-    'dark',
-    'compact',
-    'success',
-    'Redux providerSettings',
-    'explicit destructive confirmation',
-  ],
-  ['setup', 'light', 'desktop', 'loading', 'daemon settings', 'immediate'],
-  ['setup', 'light', 'compact', 'disabled', 'Redux externalEditors', 'blur-or-enter'],
-  ['setup', 'dark', 'desktop', 'error', 'Redux MCP', 'immediate'],
-  ['setup', 'dark', 'compact', 'success', 'local pairing', 'explicit'],
-  ['fonts-colors', 'light', 'desktop', 'disabled', 'Redux theme', 'immediate'],
-  ['fonts-colors', 'light', 'compact', 'validation', 'Redux userPreferences', 'immediate'],
-  ['fonts-colors', 'dark', 'desktop', 'success', 'Redux theme', 'immediate'],
-  ['fonts-colors', 'dark', 'compact', 'empty', 'Redux userPreferences', 'immediate'],
-  ['notifications', 'light', 'desktop', 'disabled', 'Redux notifications', 'immediate'],
-  ['notifications', 'light', 'compact', 'disabled', 'Redux notifications', 'immediate'],
-  ['notifications', 'dark', 'desktop', 'success', 'Redux notifications', 'immediate'],
-  ['notifications', 'dark', 'compact', 'disabled', 'Redux notifications', 'immediate'],
-  ['general', 'light', 'desktop', 'empty', 'Redux autoUpdate', 'immediate'],
-  ['general', 'light', 'compact', 'confirmation', 'Redux autoUpdate', 'confirmation'],
-  ['general', 'dark', 'desktop', 'success', 'Redux autoUpdate', 'immediate'],
-  ['general', 'dark', 'compact', 'loading', 'Redux autoUpdate', 'confirmation'],
+  ['display', 'default', 'Redux theme', 'immediate'],
+  ['display', 'validation', 'Redux userPreferences', 'immediate'],
+  ['display', 'success', 'Redux theme', 'immediate'],
+  ['display', 'disabled', 'Redux userPreferences', 'immediate'],
+  ['app-behavior', 'empty', 'Redux autoUpdate', 'immediate'],
+  ['app-behavior', 'confirmation', 'Redux autoUpdate', 'confirmation'],
+  ['app-behavior', 'success', 'Redux notifications', 'immediate'],
+  ['app-behavior', 'disabled', 'Redux notifications', 'immediate'],
+  ['agent-behavior', 'empty', 'Redux specialists', 'autosave'],
+  ['agent-behavior', 'validation', 'local draft', 'autosave'],
+  ['agent-behavior', 'confirmation', 'Redux model', 'explicit destructive confirmation'],
+  ['agent-behavior', 'success', 'Redux providerSettings', 'explicit destructive confirmation'],
+  ['providers', 'loading', 'Redux providerSettings', 'immediate'],
+  ['providers', 'error', 'local availability', 'immediate'],
+  ['providers', 'disabled', 'Redux providerSettings', 'immediate'],
+  ['providers', 'success', 'Redux auth', 'immediate'],
+  ['connections', 'loading', 'Redux MCP', 'immediate'],
+  ['connections', 'empty', 'Redux auth', 'explicit'],
+  ['connections', 'success', 'local availability', 'immediate'],
+  ['connections', 'error', 'Redux MCP', 'explicit'],
+  ['devices', 'loading', 'daemon settings', 'immediate'],
+  ['devices', 'disabled', 'local pairing', 'explicit'],
+  ['devices', 'error', 'daemon settings', 'immediate'],
+  ['devices', 'success', 'local pairing', 'explicit'],
+  ['setup', 'loading', 'daemon settings', 'immediate'],
+  ['setup', 'disabled', 'Redux externalEditors', 'blur-or-enter'],
+  ['setup', 'error', 'Redux MCP', 'immediate'],
+  ['setup', 'success', 'local pairing', 'explicit'],
+  ['advanced', 'loading', 'daemon settings', 'immediate'],
+  ['advanced', 'disabled', 'daemon settings', 'blur-or-enter'],
+  ['advanced', 'error', 'daemon settings', 'immediate'],
+  ['advanced', 'success', 'daemon settings', 'blur-or-enter'],
+  ['input', 'default', 'Redux userPreferences', 'immediate'],
+  ['input', 'validation', 'local draft', 'autosave'],
+  ['input', 'success', 'Redux userPreferences', 'immediate'],
+  ['input', 'error', 'local draft', 'autosave'],
 ] as const;
 
 export const SETTINGS_CAPTURE_FIXTURES = CAPTURE_CASES.map(
-  ([tabId, theme, viewport, state, stateOwner, saveMode]) => {
+  ([tabId, state, stateOwner, saveMode], index) => {
     const tab = SETTINGS_TABS.find(({ id }) => id === tabId)!;
     return {
-      id: `${tabId}-${theme}-${viewport}`,
+      id: `${tabId}-${index}`,
       tab: tabId,
       label: tab.label,
-      heading: tab.heading,
-      theme,
-      viewport,
-      ...VIEWPORTS[viewport],
-      url: `/settings?tab=${SETTINGS_TAB_QUERY[tabId] ?? tabId}`,
+      url: `/settings?tab=${tabId}`,
       state,
       stateOwner,
       saveMode,
@@ -128,7 +120,7 @@ export const SETTINGS_CAPTURE_FIXTURES = CAPTURE_CASES.map(
 
 export type SettingsCaptureFixture = (typeof SETTINGS_CAPTURE_FIXTURES)[number];
 export type SettingsFixtureState = SettingsCaptureFixture['state'];
-export type SettingsFixtureTransition = 'add' | 'retry' | 'confirm' | 'save';
+type SettingsFixtureTransition = 'add' | 'retry' | 'confirm' | 'save';
 export const SETTINGS_STATE_FIXTURE_CONTEXT = 'settings-state-fixture-context';
 
 export type SettingsOwnerSnapshot = {
@@ -145,7 +137,7 @@ export type SettingsStateFixtureContext = {
 };
 
 export function createSettingsFixtureUpdate(value: string) {
-  const change = { path: 'providers.active', value };
+  const change = { path: 'model.defaultProvider', value };
   return {
     request: { method: 'settings.update', params: { changes: [change] } },
     response: { applied: [change] },
@@ -158,10 +150,10 @@ export const SETTINGS_PROTOCOL_FIXTURES = {
     response: {
       settings: [
         {
-          path: 'providers.active',
-          label: 'Active provider',
+          path: 'model.defaultProvider',
+          label: 'Default provider',
           description: '',
-          category: 'providers',
+          category: 'agents',
           type: 'string',
           defaultValue: 'auggie',
           value: 'codex',
@@ -247,6 +239,25 @@ export const SETTINGS_PROTOCOL_FIXTURES = {
       },
     },
   },
+  // With the config key absent the daemon reports `value: null` and the
+  // catalog default is what spawns actually use (PROTOCOL §5.12).
+  acpNodeMaxOldSpaceMb: {
+    request: { method: 'settings.get', params: { path: 'agents.acpNodeMaxOldSpaceMb' } },
+    response: {
+      path: 'agents.acpNodeMaxOldSpaceMb',
+      value: null,
+      definition: {
+        path: 'agents.acpNodeMaxOldSpaceMb',
+        label: 'ACP Node heap limit (MB)',
+        description: '',
+        category: 'agents',
+        type: 'number',
+        min: 1024,
+        max: 65536,
+        defaultValue: 8192,
+      },
+    },
+  },
   resetMaxConcurrent: {
     request: { method: 'settings.reset', params: { path: 'agents.maxConcurrent' } },
     response: { path: 'agents.maxConcurrent', value: 0 },
@@ -297,6 +308,7 @@ export const UNDOCUMENTED_SERVER_FIXTURES = {
       path: '/ws',
       localIps: ['192.0.2.10'],
       hostname: 'fixture-host',
+      availableIps: ['192.0.2.10', '198.51.100.7'],
     },
   },
 } as const;

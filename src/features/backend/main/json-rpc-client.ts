@@ -19,6 +19,9 @@ import {
   type BackendConnectionConfig,
   createBackendSocket,
   describeBackendConfig,
+  type ConnectedVia,
+  type HostCertMismatch,
+  type RaceConnectInfo,
   resolveBackendConfig,
 } from './backend-connection';
 
@@ -112,7 +115,9 @@ const HELLO_HANDSHAKE_TIMEOUT_MS = 5_000;
  * `reconnected` (void — fires when a successful connect follows an earlier
  * connected state so consumers can replay `events.subscribe` calls and
  * refresh coarse state after a daemon restart), `error` (Error),
- * `heartbeat` (void).
+ * `heartbeat` (void), `cert-warning` ({@link HostCertMismatch} — a NON-FATAL
+ * per-host pin mismatch observed by the multi-host connection race (#1746);
+ * informative only, never treated as a connection failure).
  */
 export class JsonRpcClient extends EventEmitter {
   private readonly config: BackendConnectionConfig;
@@ -127,6 +132,10 @@ export class JsonRpcClient extends EventEmitter {
   private readonly onHelloResult?: (result: unknown) => void;
 
   private socket: Duplex | null = null;
+  // How the current connection's winning candidate reached the daemon
+  // (multi-host race only; null for a single-host dial and whenever no socket
+  // is connected).
+  private connectedVia: ConnectedVia | null = null;
   // Decoded text awaiting a newline. Raw bytes are run through `decoder` first so
   // a multi-byte UTF-8 character split across two `data` events reassembles
   // correctly before we split on '\n'.
@@ -188,6 +197,16 @@ export class JsonRpcClient extends EventEmitter {
   /** Connection config (transport type and target). */
   getConfig(): BackendConnectionConfig {
     return this.config;
+  }
+
+  /**
+   * Whether the current connection won through the tailcat tunnel or a direct
+   * host dial. Only known for a multi-host race (the facade reports its
+   * winner); `null` for a single-host dial and whenever not connected. Reset
+   * on every (re)connect, since a reconnect can flip the winner.
+   */
+  getConnectedVia(): ConnectedVia | null {
+    return this.connectedVia;
   }
 
   /** Begin connecting (idempotent). */
@@ -338,16 +357,23 @@ export class JsonRpcClient extends EventEmitter {
       return;
     }
     this.socket = socket;
-    const onConnect = () => this.onConnected();
+    const onConnect = (info?: RaceConnectInfo) => this.onConnected(info);
     socket.once('connect', onConnect);
     socket.once('secureConnect', onConnect);
     socket.on('data', (chunk: Buffer | string) => this.onData(chunk));
+    // Non-fatal per-host pin mismatches from the multi-host connection race
+    // (#1746): re-emit for observers (backend.ipc's renderer warnings) without
+    // touching the connection lifecycle — the race itself decides fatality.
+    socket.on('pin-mismatch', (info: HostCertMismatch) => this.emit('cert-warning', info));
     socket.once('error', (error: Error) => this.onConnectionFailure(error));
     socket.once('close', () => this.onConnectionFailure(new Error('Connection closed')));
     logger.info('Connecting to backend', { target: describeBackendConfig(this.config) });
   }
 
-  private onConnected(): void {
+  private onConnected(info?: RaceConnectInfo): void {
+    // Record the race winner BEFORE the status flips to `connected` so the
+    // `status` broadcast already carries the right tunnel/direct marker.
+    this.connectedVia = info?.via === 'tunnel' || info?.via === 'direct' ? info.via : null;
     // §5.17: when a hello provider is configured, present the persisted
     // identity as the FIRST frame on the fresh socket and hold the status at
     // `connecting` until the daemon answers — queued scoped work (`drafts.*`,
@@ -604,6 +630,7 @@ export class JsonRpcClient extends EventEmitter {
     if (!this.socket) return;
     const socket = this.socket;
     this.socket = null;
+    this.connectedVia = null;
     this.buffer = '';
     // Drop any partially-decoded multi-byte sequence so a reconnect starts clean.
     this.decoder = new StringDecoder('utf8');

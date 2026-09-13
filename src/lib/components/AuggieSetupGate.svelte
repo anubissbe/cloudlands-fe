@@ -3,7 +3,7 @@
   import { Button } from '$lib/components/ui/button';
   import { toast } from '$lib/components/ui/toast';
   import { invoke, shell } from '$lib/electron-bridge';
-  import { retryLoadModels } from '$store/renderer/slices/model/model-slice';
+  import { reloadModelsForProvider } from '$store/renderer/slices/model/model-slice';
   import AuggieInstructionsPanel from '$lib/components/AuggieInstructionsPanel.svelte';
 
   import { createLogger } from '$lib/utils/client-logger';
@@ -95,7 +95,7 @@
         authenticated: result.data?.authenticated === true,
       };
       if (status.installed && status.authenticated) {
-        appStore.dispatch(retryLoadModels());
+        appStore.dispatch(reloadModelsForProvider());
       }
     } catch (err) {
       logger.error('Failed to check Auggie status', { error: err });
@@ -561,8 +561,8 @@
 
   .error-message {
     padding: 0.5rem;
-    background: hsl(var(--destructive) / 0.1);
-    color: hsl(var(--destructive));
+    background: hsl(var(--danger-background) / 0.1);
+    color: hsl(var(--danger));
     border-radius: 0.5rem;
     font-size: 0.75rem;
     font-family: monospace;

@@ -43,6 +43,9 @@ vi.mock('$app/stores', () => ({
 vi.mock('$store/renderer/root-store-lifecycle', () => ({
   startRootStoreLifecycle: () => () => {},
 }));
+vi.mock('$store/renderer/app-store-lifecycle', () => ({
+  startAppStoreLifecycle: () => () => {},
+}));
 vi.mock('$store/renderer/sagas', () => ({ startAllAppSagas: () => [] }));
 vi.mock('$store/renderer/seeders', () => ({}));
 vi.mock('$features/layout/tab-types/register-all', () => ({ registerAllTabTypes: () => {} }));
@@ -103,6 +106,9 @@ vi.mock('$features/stats/StatsOverlay.svelte', async () => ({
   default: (await import('./mocks/Marker.svelte')).default,
 }));
 vi.mock('$features/daemon-status/DaemonStoppedOverlay.svelte', async () => ({
+  default: (await import('./mocks/Marker.svelte')).default,
+}));
+vi.mock('$features/daemon-status/DaemonUpdatingOverlay.svelte', async () => ({
   default: (await import('./mocks/Marker.svelte')).default,
 }));
 vi.mock('$lib/components/terminal/RootQuakeTerminalOverlay.svelte', async () => ({

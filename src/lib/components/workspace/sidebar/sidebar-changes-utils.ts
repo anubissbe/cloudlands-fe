@@ -4,7 +4,7 @@
  */
 
 import type { TrackedChange, CommitInfo } from '$features/file-tracking/types';
-import type { PullRequestInfo } from '$shared/types';
+import type { PullRequestInfo, Workspace } from '$shared/types';
 import { PullRequestStatus } from '$shared/types';
 import type { PrMonitorRow } from '$features/pr-monitor/pr-monitor-service';
 import type {
@@ -123,10 +123,7 @@ export function getCommitsToUndoCount(allCommits: CommitInfo[], commitIndex: num
 }
 
 /** Get the number of unpushed (local) commits from index 0 to commitIndex (inclusive). */
-export function getLocalCommitsToUndoCount(
-  allCommits: CommitInfo[],
-  commitIndex: number,
-): number {
+export function getLocalCommitsToUndoCount(allCommits: CommitInfo[], commitIndex: number): number {
   if (allCommits.length === 0 || commitIndex < 0) return 0;
   const clampedIndex = Math.min(commitIndex, allCommits.length - 1);
   let count = 0;
@@ -179,8 +176,6 @@ export function getUndoTooltip(
       });
 }
 
-
-
 /** Get tooltip text for the undo commit button (local commits). */
 export function getUndoCommitTooltip(allCommits: CommitInfo[], commitIndex: number): string {
   const count = getLocalCommitsToUndoCount(allCommits, commitIndex);
@@ -207,11 +202,7 @@ export function isFileActive(
 }
 
 /** Check if a file is selected in the multi-select set. */
-export function isFileSelected(
-  path: string,
-  staged: boolean,
-  selectedFiles: Set<string>,
-): boolean {
+export function isFileSelected(path: string, staged: boolean, selectedFiles: Set<string>): boolean {
   const key = `${staged ? 'staged' : 'unstaged'}:${path}`;
   return selectedFiles.has(key);
 }
@@ -295,39 +286,97 @@ export function computeTotalStats(
   return { totalFilesChanged: uniquePaths.size, totalAdditions, totalDeletions };
 }
 
+/** Repo `owner/name` parsed from a canonical GitHub PR URL (the form the
+ * daemon synthesizes for merged `pullRequests` entries — see the protocol's
+ * workspace.md PR-field ownership section), or undefined for any other URL. */
+export function prRepoFromUrl(url: string | undefined): string | undefined {
+  const match = url?.match(/^https?:\/\/github\.com\/([^/]+)\/([^/]+)\/pull\/\d+/i);
+  return match ? `${match[1]}/${match[2]}` : undefined;
+}
+
 /**
  * Map workspace pull requests to PRInfo[] for display.
  * Falls back to activePullRequest if workspace.pullRequests is empty.
+ *
+ * On the list emit paths `workspace.pullRequests` is a daemon-merged pool
+ * (stored + git-root + monitor PRs, deduped by URL — intent-hq/intentd#1330),
+ * so entries can be cross-repo and each entry's `url` is authoritative for
+ * which repo it belongs to: a present `url` is kept as-is and `buildPrUrl`
+ * only constructs one for entries lacking a URL. Entries whose URL points at
+ * a different repo than `workspaceRepo` are annotated with
+ * `crossRepo`/`crossRepoDisplay`, giving downstream merge/section identity
+ * matching the correct repo context.
  */
 export function mapWorkspacePRs(
   workspacePRs: PullRequestInfo[] | undefined,
   activePR: PullRequestInfo | null | undefined,
   buildPrUrl: (prNumber: number, fallbackUrl?: string) => string,
   getDisplayTitle: (pr: PullRequestInfo) => string,
+  workspaceRepo?: string,
 ): PRInfo[] {
   if (workspacePRs && workspacePRs.length > 0) {
-    return workspacePRs.map((pr) => ({
-      number: pr.number,
-      title: getDisplayTitle(pr),
-      url: buildPrUrl(pr.number, pr.url),
-      htmlUrl: buildPrUrl(pr.number, pr.url),
-      status: toPRDisplayStatus(pr.status),
-      createdAt: pr.createdAt,
-      updatedAt: pr.updatedAt,
-    }));
+    const workspaceOwner = workspaceRepo?.split('/')[0];
+    return workspacePRs.map((pr) => {
+      const url = pr.url || buildPrUrl(pr.number);
+      const repo = prRepoFromUrl(pr.url);
+      const crossRepo =
+        repo !== undefined &&
+        workspaceRepo !== undefined &&
+        repo.toLowerCase() !== workspaceRepo.toLowerCase()
+          ? repo
+          : undefined;
+      return {
+        number: pr.number,
+        title: getDisplayTitle(pr),
+        url,
+        htmlUrl: url,
+        status: toPRDisplayStatus(pr.status),
+        createdAt: pr.createdAt,
+        updatedAt: pr.updatedAt,
+        crossRepo,
+        crossRepoDisplay: crossRepo ? shortRepoDisplay(crossRepo, workspaceOwner) : undefined,
+      };
+    });
   }
   if (activePR) {
-    return [{
-      number: activePR.number,
-      title: getDisplayTitle(activePR),
-      url: buildPrUrl(activePR.number, activePR.url),
-      htmlUrl: buildPrUrl(activePR.number, activePR.url),
-      status: toPRDisplayStatus(activePR.status),
-      createdAt: activePR.createdAt,
-      updatedAt: activePR.updatedAt,
-    }];
+    return [
+      {
+        number: activePR.number,
+        title: getDisplayTitle(activePR),
+        url: buildPrUrl(activePR.number, activePR.url),
+        htmlUrl: buildPrUrl(activePR.number, activePR.url),
+        status: toPRDisplayStatus(activePR.status),
+        createdAt: activePR.createdAt,
+        updatedAt: activePR.updatedAt,
+      },
+    ];
   }
   return [];
+}
+
+/**
+ * The still-supported legacy `Workspace.prNumber`/`prUrl` fields as a
+ * `PullRequestInfo`, or null when either is absent. Mirrors the fallback
+ * `selectWorkspaceActivePrSummary` applies, so a workspace hydrated with only
+ * the legacy fields keeps a route to its PR now that the Changes launcher
+ * dropdown is the sidebar's PR surface. Callers pass the result as the
+ * `activePR` fallback; `prStatus` is honored when the daemon sent it and the
+ * row otherwise reads as open, the only state the legacy link ever recorded.
+ */
+export function legacyWorkspacePullRequest(
+  workspace: Pick<Workspace, 'prNumber' | 'prUrl' | 'prStatus' | 'updatedAt'>,
+): PullRequestInfo | null {
+  const { prNumber, prUrl } = workspace;
+  if (prNumber === undefined || prNumber === null || !prUrl) return null;
+  return {
+    id: `legacy-pr-${prNumber}`, // i18n-ignore (synthetic identifier)
+    number: prNumber,
+    url: prUrl,
+    title: '',
+    status: workspace.prStatus ?? PullRequestStatus.Open,
+    createdAt: workspace.updatedAt,
+    updatedAt: workspace.updatedAt,
+  };
 }
 
 /** Display status for a monitored PR row (PROTOCOL §6.9): active monitors
@@ -347,10 +396,14 @@ export function monitorDisplayStatus(
 
 /**
  * Merge agent-monitored PRs (PROTOCOL §6.9) into the workspace PR list.
- * A monitor that duplicates an existing row's repo-qualified identity
- * (`crossRepo ? "repo#number" : "number"`, mirroring PRSection's `prKey`)
- * only annotates it with the owning agent; same-repo lookups only match
- * bare (non-`crossRepo`) rows, so a same-repo monitor never annotates a
+ * The PR `url` is the primary dedup key (case-insensitive): the daemon's
+ * merged `pullRequests` pool is itself deduped by URL
+ * (intent-hq/intentd#1330), so a monitor whose PR already reached the list
+ * that way only annotates the existing row — opening a workspace never
+ * duplicates it. Rows without a comparable URL fall back to the
+ * repo-qualified identity match (`crossRepo ? "repo#number" : "number"`,
+ * mirroring PRSection's `prKey`); same-repo lookups only match bare
+ * (non-`crossRepo`) rows, so a same-repo monitor never annotates a
  * cross-repo row sharing a PR number. Unmatched monitors append as new
  * rows carrying agent attribution (and the `<owner>/<name>` repo context
  * when it differs from the workspace repo).
@@ -366,10 +419,14 @@ export function mergeMonitoredPRs(
   const merged = basePRs.map((pr) => ({ ...pr }));
   for (const monitor of monitors) {
     const sameRepo = !workspaceRepo || monitor.repo === workspaceRepo;
-    const existing = merged.find((pr) =>
-      sameRepo
-        ? !pr.crossRepo && pr.number === monitor.prNumber
-        : pr.crossRepo === monitor.repo && pr.number === monitor.prNumber,
+    const url = monitor.url ?? `https://github.com/${monitor.repo}/pull/${monitor.prNumber}`;
+    const urlLower = url.toLowerCase();
+    const existing = merged.find(
+      (pr) =>
+        pr.url.toLowerCase() === urlLower ||
+        (sameRepo
+          ? !pr.crossRepo && pr.number === monitor.prNumber
+          : pr.crossRepo === monitor.repo && pr.number === monitor.prNumber),
     );
     if (existing) {
       existing.monitorAgentId = monitor.agentId;
@@ -378,7 +435,6 @@ export function mergeMonitoredPRs(
       existing.monitorSnapshot = monitor.lastSnapshot ?? existing.monitorSnapshot;
       continue;
     }
-    const url = monitor.url ?? `https://github.com/${monitor.repo}/pull/${monitor.prNumber}`;
     merged.push({
       number: monitor.prNumber,
       title: monitor.title ?? `${monitor.repo}#${monitor.prNumber}`,
@@ -386,8 +442,9 @@ export function mergeMonitoredPRs(
       htmlUrl: url,
       status: monitorDisplayStatus(monitor),
       // Monitor-row timestamps stand in for the PR's own (the snapshot does
-      // not carry them) so selectPrimaryPr's oldest-created / latest-updated
-      // ordering works when multiple monitored PRs compete.
+      // not carry them) so recency ordering (sortPRsByRecency, and the
+      // sidebar row's same-status tie-breaker in workspace-pr-presentation)
+      // works when multiple monitored PRs compete.
       createdAt: monitor.createdAt,
       updatedAt: monitor.updatedAt,
       monitorAgentId: monitor.agentId,
@@ -434,16 +491,22 @@ export interface SectionedPRs {
  * Section the Changes tab PR pool (monorepo#2053): the workspace's own PRs
  * first (with monitors on the workspace repo merged in — byte-identical to
  * the pre-sectioning `mergeMonitoredPRs` output when the other sections are
- * empty), then secondary-root PRs, then unattributable monitors. Monitors
- * are attributed by exact repo `owner/name` match — workspace repo first
- * (a monitor on the workspace repo always groups under the primary root,
- * even when a secondary root points at the same repo), then registered
- * roots; when the workspace repo is unknown every monitor stays in `own`,
- * mirroring `mergeMonitoredPRs`. Roots without a detected `owner/name`
- * contribute no rows (the PR sweep cannot discover PRs for them). Root rows
- * duplicating an `own` row's repo-qualified identity (or an earlier root's)
- * are dropped; root-attributed monitors annotate their matching root row or
- * append as monitor-only rows, exactly like `mergeMonitoredPRs`.
+ * empty), then secondary-root PRs, then unattributable monitors. Base rows
+ * carrying `crossRepo` context (the daemon-merged `pullRequests` pool can
+ * include git-root and monitor PRs from other repos —
+ * intent-hq/intentd#1330) are partitioned out of `own` the same way
+ * monitors are: into `otherRoots` when a registered root matches their
+ * repo, else `otherTracked`. Monitors are attributed by exact repo
+ * `owner/name` match — workspace repo first (a monitor on the workspace
+ * repo always groups under the primary root, even when a secondary root
+ * points at the same repo), then registered roots; when the workspace repo
+ * is unknown every monitor stays in `own`, mirroring `mergeMonitoredPRs`.
+ * Roots without a detected `owner/name` contribute no rows (the PR sweep
+ * cannot discover PRs for them). Root rows duplicating an `own` row's
+ * repo-qualified identity (or a cross-repo base row's, or an earlier
+ * root's) are dropped; root-attributed monitors annotate their matching
+ * root row or append as monitor-only rows, exactly like
+ * `mergeMonitoredPRs`.
  */
 export function sectionPRs(
   basePRs: PRInfo[],
@@ -461,6 +524,18 @@ export function sectionPRs(
       rootRepos.add(`${root.repoOwner}/${root.repoName}`.toLowerCase());
   }
 
+  let ownBase = basePRs;
+  const rootBase: PRInfo[] = [];
+  const trackedBase: PRInfo[] = [];
+  if (basePRs.some((pr) => pr.crossRepo)) {
+    ownBase = [];
+    for (const pr of basePRs) {
+      if (!pr.crossRepo) ownBase.push(pr);
+      else if (rootRepos.has(pr.crossRepo.toLowerCase())) rootBase.push(pr);
+      else trackedBase.push(pr);
+    }
+  }
+
   const primaryMonitors: PrMonitorRow[] = [];
   const rootMonitors: PrMonitorRow[] = [];
   const trackedMonitors: PrMonitorRow[] = [];
@@ -472,23 +547,28 @@ export function sectionPRs(
     else trackedMonitors.push(monitor);
   }
 
-  const own = mergeMonitoredPRs(basePRs, primaryMonitors, workspaceRepo);
+  const own = mergeMonitoredPRs(ownBase, primaryMonitors, workspaceRepo);
 
   const workspaceOwner = workspaceRepo?.split('/')[0];
-  const seen = new Set(own.map((pr) => `${pr.crossRepo ?? workspaceRepo ?? ''}#${pr.number}`));
-  const rootRows: PRInfo[] = [];
+  const seen = new Set(
+    [...own, ...rootBase, ...trackedBase].map(
+      (pr) => `${(pr.crossRepo ?? workspaceRepo ?? '').toLowerCase()}#${pr.number}`,
+    ),
+  );
+  const rootRows: PRInfo[] = [...rootBase];
   for (const root of secondaryRoots) {
     if (!root.repoOwner || !root.repoName) continue;
     const repo = `${root.repoOwner}/${root.repoName}`;
     for (const pr of root.pullRequests ?? []) {
-      const identity = `${repo}#${pr.number}`;
+      const identity = `${repo.toLowerCase()}#${pr.number}`;
       if (seen.has(identity)) continue;
       seen.add(identity);
       const url = pr.url || `https://github.com/${repo}/pull/${pr.number}`;
       // A root on the workspace repo (e.g. a subtree checkout) needs no repo
       // context; otherwise keep the full identity for row keys, as
       // mergeMonitoredPRs does for cross-repo monitors.
-      const sameRepo = workspaceRepoLower !== undefined && repo.toLowerCase() === workspaceRepoLower;
+      const sameRepo =
+        workspaceRepoLower !== undefined && repo.toLowerCase() === workspaceRepoLower;
       rootRows.push({
         number: pr.number,
         title: getDisplayTitle(pr),
@@ -506,7 +586,7 @@ export function sectionPRs(
   return {
     own,
     otherRoots: mergeMonitoredPRs(rootRows, rootMonitors, workspaceRepo),
-    otherTracked: mergeMonitoredPRs([], trackedMonitors, workspaceRepo),
+    otherTracked: mergeMonitoredPRs(trackedBase, trackedMonitors, workspaceRepo),
   };
 }
 
@@ -594,31 +674,12 @@ function compareMissingLast(
 }
 
 /**
- * Pick the primary PR for single-PR surfaces (workspace card/row pill, the
- * summarized Changes card) from the combined branch-linked + monitored pool
- * (see {@link mergeMonitoredPRs}): the oldest unmerged (open/draft) PR
- * (`createdAt` asc, PR number asc as tiebreak); otherwise the latest merged
- * PR (`updatedAt` desc, PR number desc); otherwise the first remaining
- * (closed) row. Missing timestamps sort last within their bucket.
+ * Whether an open PR row sits in its host's merge queue. Only an open row can
+ * be queued — a stale `isInMergeQueue` on a draft/merged/closed snapshot is
+ * ignored — and the additive flag is presence-detected (absent = not queued).
  */
-export function selectPrimaryPr(prs: PRInfo[]): PRInfo | undefined {
-  const unmerged = prs.filter((pr) => pr.status === 'open' || pr.status === 'draft');
-  if (unmerged.length > 0) {
-    return [...unmerged].sort(
-      (a, b) =>
-        compareMissingLast(a.createdAt, b.createdAt, (x, y) => x.localeCompare(y)) ||
-        a.number - b.number,
-    )[0];
-  }
-  const merged = prs.filter((pr) => pr.status === 'merged');
-  if (merged.length > 0) {
-    return [...merged].sort(
-      (a, b) =>
-        compareMissingLast(a.updatedAt, b.updatedAt, (x, y) => y.localeCompare(x)) ||
-        b.number - a.number,
-    )[0];
-  }
-  return prs[0];
+export function isPRQueued(pr: Pick<PRInfo, 'status' | 'monitorSnapshot'>): boolean {
+  return pr.status === 'open' && pr.monitorSnapshot?.isInMergeQueue === true;
 }
 
 /**
@@ -634,7 +695,9 @@ export function getPRStatusTooltip(pr: PRInfo): string {
         ? m.workspace_prSection_closed_label()
         : pr.status === 'draft'
           ? m.workspace_prSection_statusDraft_label()
-          : m.workspace_prSection_statusOpen_label();
+          : isPRQueued(pr)
+            ? m.workspace_prSection_statusQueued_label()
+            : m.workspace_prSection_statusOpen_label();
   const lines: string[] = [stateLine];
   // Merged/closed rows no longer have merge requirements — the snapshot
   // detail lines would just be stale noise on a settled PR.
@@ -701,28 +764,24 @@ export function monitorPillStatus(monitor: PrMonitorRow): PullRequestStatus {
 }
 
 /**
- * Count monitored PRs (PROTOCOL §6.9) beyond the primary PR pill/badge —
- * the "+N" indicator on the workspace card surfaces. A monitor is excluded
- * only when it matches the primary PR by number in the primary PR's repo —
- * `primaryCrossRepo` when the primary is a cross-repo monitored row, else
- * the workspace repo (an unknown repo matches by number alone).
+ * Count pool PRs beyond the primary PR pill/badge — the "+N" indicator on
+ * the workspace card surfaces. Counts the combined deduped pool
+ * ({@link mergeMonitoredPRs} over the daemon-merged `pullRequests` plus
+ * live monitor rows — intent-hq/intentd#1330) minus the primary, so the
+ * count is stable across opening the workspace: a PR present both in the
+ * merged list and as a monitor is one row, never two. The primary is
+ * matched by URL (case-insensitive) — the pool's canonical identity —
+ * falling back to its repo-qualified number.
  */
-export function countOtherMonitors(
-  monitors: PrMonitorRow[],
-  primaryPrNumber: number | undefined,
-  repositoryOwner: string | undefined,
-  repositoryName: string | undefined,
-  primaryCrossRepo?: string,
-): number {
-  const workspaceRepo =
-    repositoryOwner && repositoryName ? `${repositoryOwner}/${repositoryName}` : undefined;
-  const primaryRepo = primaryCrossRepo ?? workspaceRepo;
-  return monitors.filter(
-    (mon) =>
+export function countOtherPrs(pool: PRInfo[], primaryPr: PRInfo | undefined): number {
+  if (!primaryPr) return pool.length;
+  const primaryUrlLower = primaryPr.url.toLowerCase();
+  const primaryCrossRepoLower = primaryPr.crossRepo?.toLowerCase();
+  return pool.filter(
+    (pr) =>
       !(
-        primaryPrNumber !== undefined &&
-        mon.prNumber === primaryPrNumber &&
-        (!primaryRepo || mon.repo === primaryRepo)
+        (pr.url && pr.url.toLowerCase() === primaryUrlLower) ||
+        (pr.number === primaryPr.number && pr.crossRepo?.toLowerCase() === primaryCrossRepoLower)
       ),
   ).length;
 }

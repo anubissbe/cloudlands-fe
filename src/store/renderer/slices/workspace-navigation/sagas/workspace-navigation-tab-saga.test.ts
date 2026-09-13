@@ -4,7 +4,12 @@ import { createCollection } from '@augmentcode/themis/utils/collections/collecti
 
 import { ChangeStage, type TrackedChange } from '$features/file-tracking/types';
 import { m } from '$shared/paraglide/messages.js';
-import { panelLayoutReducer } from '../../panel-layout/panel-layout-slice';
+import {
+  emptyWorkspaceState,
+  openTabInRightmostColumn,
+  panelLayoutReducer as rawPanelLayoutReducer,
+} from '../../panel-layout/panel-layout-slice';
+import { withPanelLayoutInvariants } from '../../panel-layout/panel-layout-invariants.test-helpers';
 import type { PanelLayoutSliceState } from '../../panel-layout/panel-layout-types';
 import {
   openWorkspaceActivityChanges,
@@ -35,10 +40,27 @@ vi.mock('svelte-sonner', () => ({
   toast: { error: mocks.toastError, success: mocks.toastSuccess },
 }));
 
+const panelLayoutReducer = withPanelLayoutInvariants(rawPanelLayoutReducer);
+
 const settle = async () => {
   await Promise.resolve();
   await Promise.resolve();
 };
+
+const noFocusedPanelState = {
+  panelLayout: { byWorkspaceId: { 'ws-1': { focusedPanelId: null } } },
+};
+
+function reducePanelAction(state: PanelLayoutSliceState, action: any): PanelLayoutSliceState {
+  if (action.type !== 'panelLayout/openTabInRightmostColumnRequested') {
+    return panelLayoutReducer(state, action);
+  }
+  const { wsId, tab, force, allowDuplicate, newTabId, timestamp } = action.payload;
+  return panelLayoutReducer(
+    state,
+    openTabInRightmostColumn(wsId, tab, { force, allowDuplicate, newTabId }, timestamp),
+  );
+}
 
 // The attachment worker awaits a backend lookup and a dynamic toast import;
 // flush macrotasks so those async chains settle before asserting.
@@ -48,14 +70,17 @@ describe('workspaceNavigationTabSaga', () => {
   it('opens the sidebar all-changes request as a local-changes panel tab', async () => {
     const channel = stdChannel();
     const dispatch = vi.fn();
-    const task = runSaga({ channel, dispatch, getState: () => ({}) }, workspaceNavigationTabSaga);
+    const task = runSaga(
+      { channel, dispatch, getState: () => noFocusedPanelState },
+      workspaceNavigationTabSaga,
+    );
 
     channel.put(openWorkspaceLocalChanges('ws-1'));
     await settle();
 
     expect(dispatch).toHaveBeenCalledWith(
       expect.objectContaining({
-        type: 'panelLayout/openTabInNewRootColumn',
+        type: 'panelLayout/openTabInRightmostColumnRequested',
         payload: expect.objectContaining({
           wsId: 'ws-1',
           force: true,
@@ -63,6 +88,7 @@ describe('workspaceNavigationTabSaga', () => {
             type: 'local-changes',
             workspaceId: 'ws-1',
             closable: true,
+            data: { gitRootId: undefined },
           }),
         }),
       }),
@@ -71,10 +97,66 @@ describe('workspaceNavigationTabSaga', () => {
     await task.toPromise();
   });
 
+  it('threads gitRootId into a secondary-root all-changes tab', async () => {
+    const channel = stdChannel();
+    const dispatch = vi.fn();
+    const task = runSaga(
+      { channel, dispatch, getState: () => noFocusedPanelState },
+      workspaceNavigationTabSaga,
+    );
+
+    channel.put(openWorkspaceLocalChanges('ws-1', { gitRootId: 'root-9' }));
+    await vi.waitFor(() => expect(dispatch).toHaveBeenCalledTimes(1));
+
+    expect(dispatch).toHaveBeenCalledWith(
+      expect.objectContaining({
+        payload: expect.objectContaining({
+          tab: expect.objectContaining({
+            type: 'local-changes',
+            data: { gitRootId: 'root-9' },
+          }),
+        }),
+      }),
+    );
+    task.cancel();
+    await task.toPromise();
+  });
+
+  it('clears secondary-root identity when the singleton all-changes tab returns to primary', async () => {
+    let layoutState: PanelLayoutSliceState = { byWorkspaceId: {} };
+    const channel = stdChannel();
+    const dispatch = vi.fn((action: { type: string; payload: unknown }) => {
+      layoutState = reducePanelAction(layoutState, action);
+      return action;
+    });
+    const task = runSaga(
+      { channel, dispatch, getState: () => ({ panelLayout: layoutState }) },
+      workspaceNavigationTabSaga,
+    );
+
+    channel.put(openWorkspaceLocalChanges('ws-1', { gitRootId: 'root-9' }));
+    await settle();
+    channel.put(openWorkspaceLocalChanges('ws-1'));
+    await settle();
+
+    const tabs = Object.values(layoutState.byWorkspaceId['ws-1']!.panels).flatMap(
+      (panel) => panel.tabs,
+    );
+    expect(tabs.filter((tab) => tab.type === 'local-changes')).toHaveLength(1);
+    expect(tabs.find((tab) => tab.type === 'local-changes')?.data?.gitRootId).toBeUndefined();
+    task.cancel();
+    await task.toPromise();
+  });
+
   it('routes other panel-backed workspace navigation actions through the panel layout', async () => {
     const channel = stdChannel();
     const dispatch = vi.fn();
-    const task = runSaga({ channel, dispatch, getState: () => ({}) }, workspaceNavigationTabSaga);
+    const state = {
+      panelLayout: {
+        byWorkspaceId: { 'ws-1': { focusedPanelId: 'panel-focused' } },
+      },
+    };
+    const task = runSaga({ channel, dispatch, getState: () => state }, workspaceNavigationTabSaga);
     const event = { id: 'event-1', type: 'file:changed', timestamp: 42 } as never;
 
     channel.put(openWorkspaceBrowser('ws-1', 'https://example.com'));
@@ -91,19 +173,21 @@ describe('workspaceNavigationTabSaga', () => {
     await settle();
 
     expect(dispatch.mock.calls.map(([action]) => action.type)).toEqual([
-      'panelLayout/openTabInNewRootColumn',
-      'panelLayout/openTabInNewRootColumn',
-      'panelLayout/openTabInNewRootColumn',
-      'panelLayout/openTabInNewRootColumn',
+      'panelLayout/openTab',
+      'panelLayout/openTab',
+      'panelLayout/openTab',
+      'panelLayout/openTab',
     ]);
     expect(dispatch.mock.calls[0]?.[0]).toMatchObject({
       payload: {
+        panelId: 'panel-focused',
         tab: { type: 'browser', browserUrl: 'https://example.com' },
       },
     });
     expect(dispatch.mock.calls[1]?.[0]).toMatchObject({
       payload: {
-        sourcePanelId: 'panel-agent',
+        panelId: 'panel-agent',
+        force: true,
         tab: {
           type: 'chat-changes',
           data: {
@@ -116,10 +200,14 @@ describe('workspaceNavigationTabSaga', () => {
       },
     });
     expect(dispatch.mock.calls[2]?.[0]).toMatchObject({
-      payload: { tab: { type: 'activity-changes', data: { event } } },
+      payload: {
+        panelId: 'panel-focused',
+        tab: { type: 'activity-changes', data: { event } },
+      },
     });
     expect(dispatch.mock.calls[3]?.[0]).toMatchObject({
       payload: {
+        panelId: 'panel-focused',
         tab: { type: 'code-review', data: { status: 'completed', result: 'Looks good' } },
       },
     });
@@ -127,7 +215,7 @@ describe('workspaceNavigationTabSaga', () => {
     await task.toPromise();
   });
 
-  it('requests a fresh adjacent split for note links', async () => {
+  it('requests fixed-column-safe adjacent routing for note links', async () => {
     const channel = stdChannel();
     const dispatch = vi.fn();
     const state = {
@@ -147,9 +235,10 @@ describe('workspaceNavigationTabSaga', () => {
     await settle();
 
     expect(dispatch.mock.calls[0]?.[0]).toMatchObject({
-      type: 'panelLayout/openTabInNewRootColumn',
+      type: 'panelLayout/openTabInAdjacentOrSplit',
       payload: {
         sourcePanelId: 'panel-note',
+        force: true,
         tab: { type: 'note', noteId: 'note-1' },
       },
     });
@@ -157,7 +246,7 @@ describe('workspaceNavigationTabSaga', () => {
     await task.toPromise();
   });
 
-  it('forces note adjacency beside an agent and preserves file jump metadata', async () => {
+  it('keeps an unmodified agent note in its source panel and preserves adjacent file metadata', async () => {
     vi.spyOn(Date, 'now').mockReturnValue(42);
     const channel = stdChannel();
     const dispatch = vi.fn();
@@ -203,10 +292,10 @@ describe('workspaceNavigationTabSaga', () => {
     await settle();
 
     expect(dispatch.mock.calls[0]?.[0]).toMatchObject({
-      type: 'panelLayout/openTabInNewRootColumn',
+      type: 'panelLayout/openTab',
       payload: {
         wsId: 'ws-1',
-        sourcePanelId: 'panel-1',
+        panelId: 'panel-1',
         force: true,
         tab: {
           type: 'note',
@@ -218,7 +307,7 @@ describe('workspaceNavigationTabSaga', () => {
       },
     });
     expect(dispatch.mock.calls[1]?.[0]).toMatchObject({
-      type: 'panelLayout/openTabInNewRootColumn',
+      type: 'panelLayout/openTabInAdjacentOrSplit',
       payload: {
         wsId: 'ws-1',
         sourcePanelId: 'panel-1',
@@ -238,7 +327,226 @@ describe('workspaceNavigationTabSaga', () => {
     vi.restoreAllMocks();
   });
 
-  it('opens exact commit and tracked-diff tabs with forced source routing', async () => {
+  it.each([
+    ['docs/chl-spec.md:2471', undefined, 'docs/chl-spec.md', 'chl-spec.md', 2471],
+    ['src/a.ts:10:5', undefined, 'src/a.ts', 'a.ts', 10],
+    ['src/a.ts#L10-20', undefined, 'src/a.ts', 'a.ts', 10],
+    ['src/a.ts:10', { line: 3 }, 'src/a.ts', 'a.ts', 3],
+  ])(
+    'normalizes a line suffix before opening %s',
+    async (filePath, options, expectedPath, expectedTitle, expectedLine) => {
+      vi.spyOn(Date, 'now').mockReturnValue(42);
+      const channel = stdChannel();
+      const dispatch = vi.fn();
+      const task = runSaga(
+        { channel, dispatch, getState: () => noFocusedPanelState },
+        workspaceNavigationTabSaga,
+      );
+
+      channel.put(openWorkspaceFile('ws-1', filePath, options));
+      await settle();
+
+      expect(dispatch.mock.calls[0]?.[0]).toMatchObject({
+        payload: {
+          tab: {
+            type: 'file',
+            title: expectedTitle,
+            filePath: expectedPath,
+            data: { line: expectedLine, jumpTimestamp: 42 },
+          },
+        },
+      });
+      task.cancel();
+      await task.toPromise();
+      vi.restoreAllMocks();
+    },
+  );
+
+  // Regression tests for intent-hq/monorepo#3398: a mod-clicked note-task link
+  // (openInNewAdjacentPanel) must open a NEW column right of the source panel,
+  // even when an equivalent note tab is already open in another column.
+  describe('mod-click note routing into a new adjacent column (monorepo#3398)', () => {
+    const notesState = {
+      byWorkspaceId: {
+        'ws-1': { notes: createCollection('id', [{ id: 'note-1', title: 'Plan' }]) },
+      },
+    };
+
+    function runWithLayout(workspaceLayout: Record<string, unknown>) {
+      const channel = stdChannel();
+      let state: any = {
+        workspaceNotes: notesState,
+        panelLayout: { byWorkspaceId: { 'ws-1': { ...emptyWorkspaceState, ...workspaceLayout } } },
+      };
+      const dispatch = vi.fn((action: any) => {
+        state = { ...state, panelLayout: reducePanelAction(state.panelLayout, action) };
+      });
+      const task = runSaga(
+        { channel, dispatch, getState: () => state },
+        workspaceNavigationTabSaga,
+      );
+      return { channel, task, getLayout: () => state.panelLayout.byWorkspaceId['ws-1'] };
+    }
+
+    it('creates a new column right of the source even when the note is open in another column', async () => {
+      const { channel, task, getLayout } = runWithLayout({
+        root: {
+          type: 'split',
+          direction: 'horizontal',
+          children: [
+            { type: 'panel', panelId: 'left' },
+            { type: 'panel', panelId: 'right' },
+          ],
+          sizes: [50, 50],
+        },
+        panels: {
+          left: {
+            id: 'left',
+            tabs: [{ id: 'spec-tab', type: 'note', title: 'Spec', noteId: 'spec' }],
+            activeTabId: 'spec-tab',
+          },
+          right: {
+            id: 'right',
+            tabs: [
+              { id: 'existing-note', type: 'note', title: 'Plan', noteId: 'note-1' },
+              { id: 'right-file', type: 'file', title: 'a.ts', filePath: 'a.ts' },
+            ],
+            activeTabId: 'right-file',
+          },
+        },
+        focusedPanelId: 'left',
+        columnCount: 2,
+      });
+
+      channel.put(
+        openWorkspaceNote('ws-1', 'note-1', {
+          sourcePanelId: 'left',
+          openInAdjacentPanel: true,
+          openInNewAdjacentPanel: true,
+        }),
+      );
+      await settle();
+
+      const ws = getLayout();
+      const order = ws.root.children.map((child: any) => child.panelId);
+      expect(order).toHaveLength(3);
+      expect(order[0]).toBe('left');
+      expect(order[2]).toBe('right');
+      const middle = ws.panels[order[1]];
+      expect(middle.tabs).toEqual([
+        expect.objectContaining({ type: 'note', noteId: 'note-1', title: 'Plan' }),
+      ]);
+      expect(middle.activeTabId).toBe(middle.tabs[0].id);
+      // The pre-existing copy in the right column must not be hijacked.
+      expect(ws.panels.right.activeTabId).toBe('right-file');
+      task.cancel();
+      await task.toPromise();
+    });
+
+    it('creates a new column right of the source when the note is not open anywhere', async () => {
+      const { channel, task, getLayout } = runWithLayout({
+        root: {
+          type: 'split',
+          direction: 'horizontal',
+          children: [
+            { type: 'panel', panelId: 'left' },
+            { type: 'panel', panelId: 'right' },
+          ],
+          sizes: [50, 50],
+        },
+        panels: {
+          left: {
+            id: 'left',
+            tabs: [{ id: 'spec-tab', type: 'note', title: 'Spec', noteId: 'spec' }],
+            activeTabId: 'spec-tab',
+          },
+          right: {
+            id: 'right',
+            tabs: [{ id: 'right-file', type: 'file', title: 'a.ts', filePath: 'a.ts' }],
+            activeTabId: 'right-file',
+          },
+        },
+        focusedPanelId: 'left',
+        columnCount: 2,
+      });
+
+      channel.put(
+        openWorkspaceNote('ws-1', 'note-1', {
+          sourcePanelId: 'left',
+          openInAdjacentPanel: true,
+          openInNewAdjacentPanel: true,
+        }),
+      );
+      await settle();
+
+      const ws = getLayout();
+      const order = ws.root.children.map((child: any) => child.panelId);
+      expect(order).toHaveLength(3);
+      expect(order[0]).toBe('left');
+      expect(order[2]).toBe('right');
+      expect(ws.panels[order[1]].tabs).toEqual([
+        expect.objectContaining({ type: 'note', noteId: 'note-1' }),
+      ]);
+      task.cancel();
+      await task.toPromise();
+    });
+
+    it('falls back to a duplicate tab in the next column at the four-column limit', async () => {
+      const panel = (id: string) => ({
+        id,
+        tabs: [{ id: `${id}-tab`, type: 'file', title: `${id}.ts`, filePath: `${id}.ts` }],
+        activeTabId: `${id}-tab`,
+      });
+      const { channel, task, getLayout } = runWithLayout({
+        root: {
+          type: 'split',
+          direction: 'horizontal',
+          children: [
+            { type: 'panel', panelId: 'p1' },
+            { type: 'panel', panelId: 'p2' },
+            { type: 'panel', panelId: 'p3' },
+            { type: 'panel', panelId: 'p4' },
+          ],
+          sizes: [25, 25, 25, 25],
+        },
+        panels: {
+          p1: panel('p1'),
+          p2: panel('p2'),
+          p3: panel('p3'),
+          p4: {
+            id: 'p4',
+            tabs: [{ id: 'existing-note', type: 'note', title: 'Plan', noteId: 'note-1' }],
+            activeTabId: 'existing-note',
+          },
+        },
+        focusedPanelId: 'p1',
+        columnCount: 4,
+      });
+
+      channel.put(
+        openWorkspaceNote('ws-1', 'note-1', {
+          sourcePanelId: 'p1',
+          openInAdjacentPanel: true,
+          openInNewAdjacentPanel: true,
+        }),
+      );
+      await settle();
+
+      const ws = getLayout();
+      expect(ws.root.children.map((child: any) => child.panelId)).toEqual(['p1', 'p2', 'p3', 'p4']);
+      expect(ws.panels.p2.tabs).toEqual([
+        expect.objectContaining({ id: 'p2-tab' }),
+        expect.objectContaining({ type: 'note', noteId: 'note-1' }),
+      ]);
+      expect(ws.panels.p2.activeTabId).toBe(ws.panels.p2.tabs[1].id);
+      // The far column's copy stays untouched.
+      expect(ws.panels.p4.tabs).toEqual([expect.objectContaining({ id: 'existing-note' })]);
+      task.cancel();
+      await task.toPromise();
+    });
+  });
+
+  it('uses source context for adjacent commit and same-panel diff routing', async () => {
     const change = {
       id: 'change-1',
       file: 'src/foo.ts',
@@ -250,7 +558,10 @@ describe('workspaceNavigationTabSaga', () => {
     } as TrackedChange;
     const channel = stdChannel();
     const dispatch = vi.fn();
-    const task = runSaga({ channel, dispatch, getState: () => ({}) }, workspaceNavigationTabSaga);
+    const task = runSaga(
+      { channel, dispatch, getState: () => noFocusedPanelState },
+      workspaceNavigationTabSaga,
+    );
     channel.put(
       openWorkspaceCommitChangeset('ws-1', 'abcdef123456', 'feat: exact shape', {
         sourcePanelId: 'panel-a',
@@ -263,12 +574,14 @@ describe('workspaceNavigationTabSaga', () => {
         sourcePanelId: 'panel-b',
         branchBaseRef: 'main',
         branchBaseCommitSha: 'base-sha',
+        gitRootId: 'root-9',
+        gitRootPath: '/repo/packages/sub',
       }),
     );
     await settle();
 
     expect(dispatch.mock.calls[0]?.[0]).toMatchObject({
-      type: 'panelLayout/openTabInNewRootColumn',
+      type: 'panelLayout/openTabInAdjacentOrSplit',
       payload: {
         wsId: 'ws-1',
         sourcePanelId: 'panel-a',
@@ -283,10 +596,10 @@ describe('workspaceNavigationTabSaga', () => {
       },
     });
     expect(dispatch.mock.calls[1]?.[0]).toMatchObject({
-      type: 'panelLayout/openTabInNewRootColumn',
+      type: 'panelLayout/openTab',
       payload: {
         wsId: 'ws-1',
-        sourcePanelId: 'panel-b',
+        panelId: 'panel-b',
         force: true,
         tab: {
           type: 'diff',
@@ -294,7 +607,13 @@ describe('workspaceNavigationTabSaga', () => {
           diffPath: 'src/foo.ts',
           workspaceId: 'ws-1',
           closable: true,
-          data: { change, branchBaseRef: 'main', branchBaseCommitSha: 'base-sha' },
+          data: {
+            change,
+            branchBaseRef: 'main',
+            branchBaseCommitSha: 'base-sha',
+            gitRootId: 'root-9',
+            gitRootPath: '/repo/packages/sub',
+          },
         },
       },
     });
@@ -305,19 +624,22 @@ describe('workspaceNavigationTabSaga', () => {
   it('threads gitRootId into the commit changeset tab data and omits it when absent', async () => {
     const channel = stdChannel();
     const dispatch = vi.fn();
-    const task = runSaga({ channel, dispatch, getState: () => ({}) }, workspaceNavigationTabSaga);
+    const task = runSaga(
+      { channel, dispatch, getState: () => noFocusedPanelState },
+      workspaceNavigationTabSaga,
+    );
 
     channel.put(
       openWorkspaceCommitChangeset('ws-1', 'abcdef123456', 'feat: scoped', {
         gitRootId: 'root-1',
       }),
     );
-    await settle();
+    await vi.waitFor(() => expect(dispatch).toHaveBeenCalledTimes(1));
     channel.put(openWorkspaceCommitChangeset('ws-1', 'abcdef123456', 'feat: primary'));
-    await settle();
+    await vi.waitFor(() => expect(dispatch).toHaveBeenCalledTimes(2));
 
     expect(dispatch.mock.calls[0]?.[0]).toMatchObject({
-      type: 'panelLayout/openTabInNewRootColumn',
+      type: 'panelLayout/openTabInRightmostColumnRequested',
       payload: {
         wsId: 'ws-1',
         force: true,
@@ -344,7 +666,10 @@ describe('workspaceNavigationTabSaga', () => {
   it('supports an options-only runtime diff and preserves the undefined change field', async () => {
     const channel = stdChannel();
     const dispatch = vi.fn();
-    const task = runSaga({ channel, dispatch, getState: () => ({}) }, workspaceNavigationTabSaga);
+    const task = runSaga(
+      { channel, dispatch, getState: () => noFocusedPanelState },
+      workspaceNavigationTabSaga,
+    );
     channel.put(
       openWorkspaceDiff('ws-1', undefined as never, {
         filePath: 'overrides/runtime.ts',
@@ -354,7 +679,7 @@ describe('workspaceNavigationTabSaga', () => {
     );
     await settle();
     expect(dispatch.mock.calls[0]?.[0]).toMatchObject({
-      type: 'panelLayout/openTabInNewRootColumn',
+      type: 'panelLayout/openTabInAdjacentOrSplit',
       payload: {
         wsId: 'ws-1',
         sourcePanelId: 'panel-runtime',
@@ -380,7 +705,10 @@ describe('workspaceNavigationTabSaga', () => {
     ];
     const channel = stdChannel();
     const dispatch = vi.fn();
-    const task = runSaga({ channel, dispatch, getState: () => ({}) }, workspaceNavigationTabSaga);
+    const task = runSaga(
+      { channel, dispatch, getState: () => noFocusedPanelState },
+      workspaceNavigationTabSaga,
+    );
     channel.put(
       openWorkspaceChatChanges('ws-1', changes, '2 files changed', {
         messageId: 'msg-1',
@@ -391,7 +719,7 @@ describe('workspaceNavigationTabSaga', () => {
     );
     await settle();
     expect(dispatch.mock.calls[0]?.[0]).toMatchObject({
-      type: 'panelLayout/openTabInNewRootColumn',
+      type: 'panelLayout/openTabInRightmostColumnRequested',
       payload: {
         wsId: 'ws-1',
         force: true,
@@ -419,7 +747,10 @@ describe('workspaceNavigationTabSaga', () => {
     const changes: JsonValue[] = [{ file: 'src/a.ts' }];
     const channel = stdChannel();
     const dispatch = vi.fn();
-    const task = runSaga({ channel, dispatch, getState: () => ({}) }, workspaceNavigationTabSaga);
+    const task = runSaga(
+      { channel, dispatch, getState: () => noFocusedPanelState },
+      workspaceNavigationTabSaga,
+    );
     channel.put(openWorkspaceChatChanges('ws-1', changes, '1 file changed'));
     await settle();
     const payload = dispatch.mock.calls[0]?.[0]?.payload as {
@@ -436,7 +767,10 @@ describe('workspaceNavigationTabSaga', () => {
     const changes: JsonValue[] = [{ file: 'src/a.ts' }];
     const channel = stdChannel();
     const dispatch = vi.fn();
-    const task = runSaga({ channel, dispatch, getState: () => ({}) }, workspaceNavigationTabSaga);
+    const task = runSaga(
+      { channel, dispatch, getState: () => noFocusedPanelState },
+      workspaceNavigationTabSaga,
+    );
     channel.put(
       openWorkspaceChatChanges('ws-1', changes, '1 file changed', {
         isAggregate: true,
@@ -466,7 +800,10 @@ describe('workspaceNavigationTabSaga', () => {
     const changes: JsonValue[] = [{ file: 'src/a.ts' }];
     const channel = stdChannel();
     const dispatch = vi.fn();
-    const task = runSaga({ channel, dispatch, getState: () => ({}) }, workspaceNavigationTabSaga);
+    const task = runSaga(
+      { channel, dispatch, getState: () => noFocusedPanelState },
+      workspaceNavigationTabSaga,
+    );
     channel.put(
       openWorkspaceChatChanges('ws-1', changes, 'Changes from Task A', {
         isAggregate: true,
@@ -512,7 +849,7 @@ describe('workspaceNavigationTabSaga', () => {
     let layoutState: PanelLayoutSliceState = { byWorkspaceId: {} };
     const channel = stdChannel();
     const dispatch = vi.fn((action: { type: string; payload: unknown }) => {
-      layoutState = panelLayoutReducer(layoutState, action as never);
+      layoutState = reducePanelAction(layoutState, action);
       return action;
     });
     const task = runSaga(
@@ -567,7 +904,7 @@ describe('workspaceNavigationTabSaga', () => {
     let layoutState: PanelLayoutSliceState = { byWorkspaceId: {} };
     const channel = stdChannel();
     const dispatch = vi.fn((action: { type: string; payload: unknown }) => {
-      layoutState = panelLayoutReducer(layoutState, action as never);
+      layoutState = reducePanelAction(layoutState, action);
       return action;
     });
     const task = runSaga(
@@ -629,7 +966,7 @@ describe('workspaceNavigationTabSaga', () => {
     let layoutState: PanelLayoutSliceState = { byWorkspaceId: {} };
     const channel = stdChannel();
     const dispatch = vi.fn((action: { type: string; payload: unknown }) => {
-      layoutState = panelLayoutReducer(layoutState, action as never);
+      layoutState = reducePanelAction(layoutState, action);
       return action;
     });
     const task = runSaga(
@@ -670,11 +1007,14 @@ describe('workspaceNavigationTabSaga', () => {
   it('opens the singleton local-changes tab with the i18n title', async () => {
     const channel = stdChannel();
     const dispatch = vi.fn();
-    const task = runSaga({ channel, dispatch, getState: () => ({}) }, workspaceNavigationTabSaga);
+    const task = runSaga(
+      { channel, dispatch, getState: () => noFocusedPanelState },
+      workspaceNavigationTabSaga,
+    );
     channel.put(openWorkspaceLocalChanges('ws-1'));
     await settle();
     expect(dispatch.mock.calls[0]?.[0]).toMatchObject({
-      type: 'panelLayout/openTabInNewRootColumn',
+      type: 'panelLayout/openTabInRightmostColumnRequested',
       payload: {
         wsId: 'ws-1',
         force: true,
@@ -686,7 +1026,7 @@ describe('workspaceNavigationTabSaga', () => {
         },
       },
     });
-    expect(dispatch.mock.calls[0]?.[0]?.payload?.tab?.data).toBeUndefined();
+    expect(dispatch.mock.calls[0]?.[0]?.payload?.tab?.data).toEqual({ gitRootId: undefined });
     task.cancel();
     await task.toPromise();
   });

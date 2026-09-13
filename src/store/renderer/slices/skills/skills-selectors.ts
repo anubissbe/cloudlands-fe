@@ -1,12 +1,11 @@
-import { store } from "../../store";
-import { emptyWorkspaceSkillsState } from "./skills-slice";
-import type { SkillInfo } from "./skills-types";
+import { store } from '../../store';
+import { emptyWorkspaceSkillsState } from './skills-slice';
+import type { SkillInfo, SkillsWorkspaceState } from './skills-types';
 
-export const selectSkillsWorkspaceState = store.createSelector(
-  (state, workspaceId: string) => {
-    return state.skills.byWorkspaceId[workspaceId] ?? emptyWorkspaceSkillsState;
-  },
-);
+const selectSkillsWorkspaceState = store.createSelector<
+  [workspaceId: string],
+  SkillsWorkspaceState
+>((state, workspaceId) => state.skills.byWorkspaceId[workspaceId] ?? emptyWorkspaceSkillsState);
 
 export const selectSkills = store.createSelector<[workspaceId: string], SkillInfo[]>(
   (state, workspaceId) => {
@@ -14,3 +13,10 @@ export const selectSkills = store.createSelector<[workspaceId: string], SkillInf
   },
 );
 
+export const selectSkillsLoading = store.createSelector<[workspaceId: string], boolean>(
+  (state, workspaceId) => selectSkillsWorkspaceState.select(state, workspaceId).loading,
+);
+
+export const selectSkillsError = store.createSelector<[workspaceId: string], string | null>(
+  (state, workspaceId) => selectSkillsWorkspaceState.select(state, workspaceId).error,
+);

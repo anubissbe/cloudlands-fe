@@ -10,10 +10,7 @@
 import type { JSONContent } from '@tiptap/core';
 import { v4 as uuidv4 } from 'uuid';
 import { Logger } from '../../shared/logger';
-import {
-  type NotePrimitive,
-  NotePrimitiveSchema,
-} from '../../shared/types/notes-primitives';
+import { type NotePrimitive, NotePrimitiveSchema } from '../../shared/types/notes-primitives';
 
 const logger = new Logger('NotesPrimitivesSerializer');
 
@@ -181,9 +178,31 @@ function parseMarkdownToPrimitives(
 
         // Normalize reference primitives
         if (parsed.type === 'reference') {
-          // Ensure target exists with required fields
+          let hoistedShortFormField = false;
+
+          // Ensure target exists and hoist the documented short-form fields when needed
           if (!parsed.target) {
-            parsed.target = { kind: 'symbol', semanticId: '' };
+            parsed.target = {};
+          }
+          if (!parsed.target.semanticId && !parsed.target.filePath) {
+            if (parsed.semanticId) {
+              parsed.target.semanticId = parsed.semanticId;
+              hoistedShortFormField = true;
+            }
+            if (parsed.filePath || parsed.path) {
+              parsed.target.filePath = parsed.filePath || parsed.path;
+              hoistedShortFormField = true;
+            }
+            if (
+              (parsed.startLine !== undefined || parsed.endLine !== undefined) &&
+              !parsed.target.range
+            ) {
+              parsed.target.range = {
+                startLine: parsed.startLine ?? 1,
+                endLine: parsed.endLine ?? parsed.startLine ?? 1,
+              };
+              hoistedShortFormField = true;
+            }
           }
 
           // Normalize simplified target format:
@@ -204,17 +223,13 @@ function parseMarkdownToPrimitives(
             delete parsed.target.endLine;
           }
 
-          // Normalize kind: convert "line-range" to "file_range"
-          if (parsed.target.kind === 'line-range') {
-            parsed.target.kind = 'file_range';
-          }
-
-          // Ensure target.kind exists - infer from context
-          if (!parsed.target.kind) {
-            // If has range or semanticId contains line range markers (e.g., #L7-40), it's a file_range
-            const hasRange = !!parsed.target.range;
-            const hasLineRange = parsed.target.semanticId?.includes('#L');
-            parsed.target.kind = hasRange || hasLineRange ? 'file_range' : 'symbol';
+          // Match the daemon's reference kind rule for hoisted or incomplete targets
+          const hasValidKind =
+            parsed.target.kind === 'symbol' || parsed.target.kind === 'file_range';
+          if (hoistedShortFormField || !hasValidKind) {
+            parsed.target.kind = parsed.target.semanticId?.includes('#symbol:')
+              ? 'symbol'
+              : 'file_range';
           }
         }
 
@@ -323,7 +338,7 @@ function parseMarkdownToPrimitives(
 /**
  * Extract all primitives from markdown, preserving surrounding text
  */
-export function extractPrimitivesWithContext(markdown: string): {
+function extractPrimitivesWithContext(markdown: string): {
   primitives: ParsedPrimitive[];
   segments: Array<{ type: 'text' | 'primitive'; content: string; primitive?: NotePrimitive }>;
 } {
@@ -447,7 +462,7 @@ function serializePrimitivesToMarkdown(
 /**
  * Serialize multiple primitives with text segments
  */
-export function serializePrimitivesWithText(
+function serializePrimitivesWithText(
   segments: Array<{ type: 'text' | 'primitive'; content: string; primitive?: NotePrimitive }>,
   options: SerializationOptions = {},
 ): string {
@@ -497,201 +512,6 @@ function primitiveToTiptapNode(primitive: NotePrimitive): JSONContent {
   };
 }
 
-/**
- * Convert TipTap document to markdown with primitives
- */
-export function tipTapToMarkdown(doc: JSONContent): string {
-  const parts: string[] = [];
-
-  function processNode(node: JSONContent) {
-    // Handle primitive blocks
-    if (node.type && node.type.endsWith('_block')) {
-      const primitive = node.attrs?.data as NotePrimitive;
-      if (primitive) {
-        parts.push(serializePrimitiveToMarkdown(primitive));
-        return;
-      }
-    }
-
-    // Handle text nodes
-    if (node.type === 'text') {
-      parts.push(node.text || '');
-      return;
-    }
-
-    // Handle paragraph nodes
-    if (node.type === 'paragraph') {
-      if (node.content) {
-        for (const child of node.content) {
-          processNode(child);
-        }
-      }
-      parts.push(''); // Add blank line after paragraph
-      return;
-    }
-
-    // Handle heading nodes
-    if (node.type === 'heading') {
-      const level = node.attrs?.level || 1;
-      const prefix = '#'.repeat(level);
-      parts.push(`${prefix} `);
-      if (node.content) {
-        for (const child of node.content) {
-          processNode(child);
-        }
-      }
-      parts.push('');
-      return;
-    }
-
-    // Handle list nodes
-    if (node.type === 'bulletList' || node.type === 'orderedList') {
-      if (node.content) {
-        for (let i = 0; i < node.content.length; i++) {
-          const item = node.content[i];
-          const prefix = node.type === 'bulletList' ? '- ' : `${i + 1}. `;
-          parts.push(prefix);
-          if (item.content) {
-            for (const child of item.content) {
-              processNode(child);
-            }
-          }
-        }
-      }
-      parts.push('');
-      return;
-    }
-
-    // Handle code blocks
-    if (node.type === 'codeBlock') {
-      const lang = node.attrs?.language || '';
-      parts.push(`\`\`\`${lang}`);
-      if (node.content) {
-        for (const child of node.content) {
-          processNode(child);
-        }
-      }
-      parts.push('```');
-      parts.push('');
-      return;
-    }
-
-    // Recursively process other nodes
-    if (node.content) {
-      for (const child of node.content) {
-        processNode(child);
-      }
-    }
-  }
-
-  if (doc.content) {
-    for (const node of doc.content) {
-      processNode(node);
-    }
-  }
-
-  return parts.join('\n').trim();
-}
-
-/**
- * Parse markdown to TipTap document with primitives
- */
-export function markdownToTipTap(markdown: string): JSONContent {
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  const { primitives, segments } = extractPrimitivesWithContext(markdown);
-  const nodes: JSONContent[] = [];
-
-  for (const segment of segments) {
-    if (segment.type === 'text') {
-      // Parse regular markdown text
-      const textNodes = parseMarkdownText(segment.content);
-      nodes.push(...textNodes);
-    } else if (segment.primitive) {
-      // Add primitive node
-      nodes.push(primitiveToTiptapNode(segment.primitive));
-    }
-  }
-
-  return {
-    type: 'doc',
-    content: nodes,
-  };
-}
-
-/**
- * Parse regular markdown text to TipTap nodes
- * This is a simplified parser - in production, use the existing TipTap markdown parser
- */
-function parseMarkdownText(text: string): JSONContent[] {
-  const nodes: JSONContent[] = [];
-  const lines = text.split('\n');
-
-  for (const line of lines) {
-    if (line.trim() === '') {
-      continue;
-    }
-
-    // Handle headings
-    const headingMatch = line.match(/^(#{1,6})\s+(.+)$/);
-    if (headingMatch) {
-      nodes.push({
-        type: 'heading',
-        attrs: { level: headingMatch[1].length },
-        content: [{ type: 'text', text: headingMatch[2] }],
-      });
-      continue;
-    }
-
-    // Handle list items
-    if (line.match(/^[-*+]\s+/)) {
-      const text = line.replace(/^[-*+]\s+/, '');
-      nodes.push({
-        type: 'bulletList',
-        content: [
-          {
-            type: 'listItem',
-            content: [
-              {
-                type: 'paragraph',
-                content: [{ type: 'text', text }],
-              },
-            ],
-          },
-        ],
-      });
-      continue;
-    }
-
-    // Handle ordered list items
-    const orderedMatch = line.match(/^(\d+)\.\s+(.+)$/);
-    if (orderedMatch) {
-      nodes.push({
-        type: 'orderedList',
-        content: [
-          {
-            type: 'listItem',
-            content: [
-              {
-                type: 'paragraph',
-                content: [{ type: 'text', text: orderedMatch[2] }],
-              },
-            ],
-          },
-        ],
-      });
-      continue;
-    }
-
-    // Default to paragraph
-    nodes.push({
-      type: 'paragraph',
-      content: [{ type: 'text', text: line }],
-    });
-  }
-
-  return nodes;
-}
-
 // ============================================================================
 // Validation & Helpers
 // ============================================================================
@@ -699,7 +519,7 @@ function parseMarkdownText(text: string): JSONContent[] {
 /**
  * Validate a primitive against its schema
  */
-export function validatePrimitive(primitive: unknown): NotePrimitive | null {
+function validatePrimitive(primitive: unknown): NotePrimitive | null {
   const result = NotePrimitiveSchema.safeParse(primitive);
   if (result.success) {
     return result.data;
@@ -715,14 +535,14 @@ export function validatePrimitive(primitive: unknown): NotePrimitive | null {
 /**
  * Generate a new primitive ID
  */
-export function generatePrimitiveId(): string {
+function generatePrimitiveId(): string {
   return uuidv4();
 }
 
 /**
  * Create a base primitive with common fields
  */
-export function createBasePrimitive(
+function createBasePrimitive(
   type: NotePrimitive['type'],
   createdBy: NotePrimitive['createdBy'] = 'user',
 ): Omit<NotePrimitive, 'type'> & { type: NotePrimitive['type'] } {

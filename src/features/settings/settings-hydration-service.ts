@@ -20,14 +20,15 @@
 import type { AppliedSettingChange } from '$lib/client/app-client';
 import { appClient } from '$lib/client';
 import { createLogger } from '$lib/utils/client-logger';
+import { LOCAL_CONNECTION_ID } from '$shared/types/connections';
 import { store as appStore } from '$store/renderer/store';
+import { getActiveBackendId } from '$store/renderer/utils/backend-storage-namespace';
 import { settingsChanged } from '$store/renderer/slices/settings-events/settings-events-slice';
 import {
   ensureEnabledIfUnset,
-  hydrateActiveProvider,
   loadEnabledProvidersFromStorage,
 } from '$store/renderer/slices/provider-settings/provider-settings-slice';
-import { splitCompoundModelId } from '$shared/utils/compound-model-id';
+import { splitLegacyCompoundId } from '$shared/utils/legacy-model-id';
 import {
   hydrateSettings as hydrateBackgroundAgentSettings,
   type BackgroundAgentType,
@@ -39,9 +40,11 @@ import {
 } from '$store/renderer/slices/mcp-settings/mcp-settings-slice';
 import type { McpServerConfig } from '$store/renderer/slices/mcp-settings/mcp-settings-types';
 import {
+  hydrateDefaultProvider,
   loadDefaultReasoningEffortFromStorage,
   loadProviderModelsFromStorage,
 } from '$store/renderer/slices/model/model-slice';
+import { setDefaultSpecialistId } from '$store/renderer/slices/specialists/specialists-slice';
 
 const logger = createLogger('SettingsHydrationService');
 
@@ -49,9 +52,11 @@ const logger = createLogger('SettingsHydrationService');
 function applyOne(change: AppliedSettingChange): void {
   const { path, value } = change;
   switch (path) {
-    case 'providers.active': {
+    case 'model.defaultProvider': {
+      // The reducer's pending-local-intent guard keeps a newer local pick
+      // over a stale snapshot/echo until the daemon confirms it.
       if (typeof value === 'string' && value.length > 0) {
-        appStore.dispatch(hydrateActiveProvider(value));
+        appStore.dispatch(hydrateDefaultProvider(value));
       }
       return;
     }
@@ -86,6 +91,15 @@ function applyOne(change: AppliedSettingChange): void {
     case 'model.defaultReasoningEffort': {
       if (typeof value === 'string') {
         appStore.dispatch(loadDefaultReasoningEffortFromStorage(value));
+      }
+      return;
+    }
+    case 'specialists.default': {
+      // The daemon setting is Option<String>: null/unset clears the default.
+      if (typeof value === 'string') {
+        appStore.dispatch(setDefaultSpecialistId(value.trim()));
+      } else if (value === null) {
+        appStore.dispatch(setDefaultSpecialistId(''));
       }
       return;
     }
@@ -174,9 +188,9 @@ function migrateLegacyBackgroundModel(
  * persisted an entry for their default provider (the special case covered
  * it), so after upgrading it resolves disabled until manually re-enabled.
  * When `providers.enabled` hydrates without an entry for the effective
- * default provider (the active provider's model prefix when it is a known
- * catalog row, else `providers.active`), seed it to `true` and persist the map
- * back so the daemon's stored settings are migrated too. When legacy state has
+ * default provider (the default provider's model prefix when it is a known
+ * catalog row, else `model.defaultProvider`), seed it to `true` and persist
+ * the map back so the daemon's stored settings are migrated too. When legacy state has
  * no active provider but exactly one persisted `model.providerDefaults` key,
  * that sole key is the only unambiguous migration candidate. An explicit
  * persisted entry (e.g. a deliberate `false`) always wins — the seed only
@@ -190,6 +204,33 @@ function migrateLegacyBackgroundModel(
  * rows need no entry (always enabled).
  */
 let enablementSeedInFlight = false;
+let enablementSeedDeferred = false;
+
+/**
+ * Boot race guard: `connections.activeId` stays at its boot-time local default
+ * until the connections saga's async `connections:list` IPC resolves, while
+ * the settings snapshot can hydrate first — so the local-only gate in
+ * `seedDefaultProviderEnablement` cannot trust `getActiveBackendId` yet (a
+ * remote boot would pass it and seed stale local renderer state into the
+ * remote daemon). Defer the seed until `hasReceivedList` flips, then re-run
+ * the full gate against the settled active backend.
+ */
+function deferEnablementSeedUntilConnectionsList(): void {
+  if (enablementSeedDeferred) return;
+  enablementSeedDeferred = true;
+  let settled = false;
+  const unsubscribe = appStore.getReadableState().subscribe((state) => {
+    if (settled || !state.connections?.hasReceivedList) return;
+    settled = true;
+    // Microtask: the subscriber fires synchronously on subscribe, before
+    // `unsubscribe` is assigned.
+    queueMicrotask(() => {
+      unsubscribe();
+      enablementSeedDeferred = false;
+      seedDefaultProviderEnablement();
+    });
+  });
+}
 
 function resolveDefaultProviderCandidate(
   activeProviderId: string,
@@ -200,27 +241,43 @@ function resolveDefaultProviderCandidate(
   const persistedProviderId =
     activeProviderId || (providerModelIds.length === 1 ? providerModelIds[0] : '');
   const model = persistedProviderId ? providerModels[persistedProviderId] : undefined;
-  const prefix = model?.includes(':') ? splitCompoundModelId(model).providerId : undefined;
+  const prefix = model?.includes(':') ? splitLegacyCompoundId(model).providerId : undefined;
   if (prefix && (!knownProviderIds || knownProviderIds.includes(prefix))) return prefix;
   return persistedProviderId;
 }
 
 function seedDefaultProviderEnablement(): void {
-  const { activeProviderId, enabledProviders } = appStore.state.providerSettings;
-  const providerModels = appStore.state.model?.providerModels ?? {};
+  const state = appStore.state;
+  const { enabledProviders } = state.providerSettings;
+  const activeProviderId = state.model?.defaultProviderId ?? '';
+  const providerModels = state.model?.providerModels ?? {};
   const candidate = resolveDefaultProviderCandidate(activeProviderId, providerModels);
   // Cheap sync gate: only hit the wire when some default-provider candidate
   // actually lacks an entry. The async body re-resolves against the catalog.
   if (!candidate || enabledProviders[candidate] !== undefined) return;
+  // The backend gate below cannot be trusted until the connections list has
+  // landed (activeId is still the boot-time local default) — defer and re-run
+  // once it settles. Absent slice (bridge-less test stores) counts as local,
+  // matching getActiveBackendId's own fallback.
+  if (state.connections && !state.connections.hasReceivedList) {
+    deferEnablementSeedUntilConnectionsList();
+    return;
+  }
+  // Local sidecar only: the monorepo#1947 migration exists for pre-2.17 LOCAL
+  // installs whose default provider never got a persisted enablement entry. A
+  // remote backend's daemon has no such legacy state, and the renderer-side
+  // candidate (activeProviderId / model.providerModels) can still reflect the
+  // local machine mid-switch — seeding would write that stale local default
+  // into the fresh remote daemon's `providers.enabled`.
+  if (getActiveBackendId(state) !== LOCAL_CONNECTION_ID) return;
   if (enablementSeedInFlight) return;
   enablementSeedInFlight = true;
   void (async () => {
     try {
       const catalog = await appClient.providers.catalog();
-      const settings = appStore.state.providerSettings;
       const row = (id: string) => catalog.providers.find((entry) => entry.id === id);
       const defaultProviderId = resolveDefaultProviderCandidate(
-        settings.activeProviderId,
+        appStore.state.model?.defaultProviderId ?? '',
         appStore.state.model?.providerModels ?? {},
         catalog.providers.map((entry) => entry.id),
       );

@@ -238,6 +238,13 @@ export const IPC_CHANNELS = {
     GET_MODELS: 'unsloth:get-models',
   },
 
+  // Google Antigravity Integration
+  ANTIGRAVITY: {
+    GET_MODELS: 'antigravity:get-models',
+    SETUP: 'antigravity:setup',
+    CLOSE_SETUP: 'antigravity:close-setup',
+  },
+
   // Provider Availability (aggregates all ACP providers)
   PROVIDERS: {
     GET_AVAILABILITY: 'providers:get-availability',
@@ -311,6 +318,19 @@ export const IPC_CHANNELS = {
     HISTORY_NAVIGATE: 'app:history-navigate',
   },
 
+  // Quit confirmation (renderer-rendered "agents still working" prompt).
+  // Payload contracts live in src/shared/ipc/quit-confirmation.ts.
+  QUIT_CONFIRMATION: {
+    /** Main → renderer: show the quit-confirmation modal for a request. */
+    SHOW: 'quit-confirmation:show',
+    /** Renderer → main (invoke): modal mounted — acknowledges receipt of SHOW. */
+    ACK: 'quit-confirmation:ack',
+    /** Renderer → main (invoke): the user's proceed/cancel decision. */
+    RESPONSE: 'quit-confirmation:response',
+    /** Main → renderer: close the modal for a settled/superseded request. */
+    DISMISS: 'quit-confirmation:dismiss',
+  },
+
   // Window Management
   WINDOW: {
     RELOAD: 'window:reload',
@@ -328,6 +348,10 @@ export const IPC_CHANNELS = {
     SET_BROWSER_FOCUSED: 'window:set-browser-focused',
     SET_FULL_SCREEN: 'window:set-full-screen',
     GET_FULL_SCREEN: 'window:get-full-screen',
+    // Renderer → main invoke: focus the next open app window (wraps; skips
+    // destroyed, hidden, and HUD pop-out windows; minimized windows are
+    // restored) → { cycled: boolean, windowCount: number }
+    CYCLE_FOCUS: 'window:cycle-focus',
   },
 
   // Terminal
@@ -405,6 +429,7 @@ export const IPC_CHANNELS = {
 
   // User MCP Settings — HTTP/SSE server auth checks.
   USER_MCP: {
+    AUTHENTICATE: 'user-mcp:authenticate', // Run interactive OAuth for a saved hosted server
     CHECK_AUTH: 'user-mcp:check-auth', // Check if URL requires auth and if we have credentials
     TEST_CONNECTION: 'user-mcp:test-connection', // Test connection to HTTP/SSE server, returns status
   },
@@ -476,12 +501,20 @@ export const IPC_CHANNELS = {
     REGISTER_TAB: 'browser:register-tab',
     /** Unregister a browser tab when it's closed */
     UNREGISTER_TAB: 'browser:unregister-tab',
+    /** Report a visible webview element's bounds for viewport scale-to-fit */
+    REPORT_TAB_BOUNDS: 'browser:report-tab-bounds',
+    /** Set a browser tab's persisted viewport mode */
+    SET_TAB_VIEWPORT: 'browser:set-tab-viewport',
+    /** Open DevTools for a browser tab and select a panel */
+    OPEN_DEVTOOLS_PANEL: 'browser:open-devtools-panel',
     /** Execute code with access to browser CDP API */
     EXEC: 'browser:exec',
     /** Resolve a URL through the loopback rewrite → probe → tunnel pipeline */
     RESOLVE_URL: 'browser:resolve-url',
     /** Focus a browser tab (bring to front) - main->renderer event */
     FOCUS_TAB: 'browser:focus-tab',
+    /** Reveal a hidden agent-owned tab into a panel (monorepo#3045) - main->renderer event */
+    SHOW_TAB: 'browser:show-tab',
     /** Request browser tab list from renderer (main->renderer event) */
     LIST_TABS_REQUEST: 'browser:list-tabs-request',
     /** Response with browser tab list (renderer->main) */
@@ -494,6 +527,8 @@ export const IPC_CHANNELS = {
     TAB_NAVIGATED: 'browser:tab-navigated',
     /** A tab's owner agent changed (claim/agent open) - main->renderer event */
     TAB_OWNER_CHANGED: 'browser:tab-owner-changed',
+    /** Clear main's registrations for a deleted agent's owned tabs (renderer->main) */
+    CLEAR_AGENT_TABS: 'browser:clear-agent-tabs',
   },
 
   // File Tracking
@@ -781,8 +816,10 @@ export const IPC_CHANNELS = {
   RELEASE_NOTES: {
     GET: 'release-notes:get',
     GET_PENDING: 'release-notes:get-pending',
-    // Event channel (main → renderer)
+    DISMISS: 'release-notes:dismiss',
+    // Event channels (main → renderer)
     SHOW: 'release-notes:show',
+    CLOSE: 'release-notes:close',
   },
 
   // Picture-in-Picture Windows
@@ -826,13 +863,12 @@ export const IPC_CHANNELS = {
     NOTIFICATION: 'backend:notification',
     STATUS: 'backend:status',
     SPAWN_SIDECAR: 'backend:spawn-sidecar',
-    // Atomic recovery from external/remote mode: switch the active backend to
-    // local AND spawn the app-managed sidecar in ONE main-process action. The
-    // switch destroys every window (captureAndClose) before the switch IPC
-    // returns, so a renderer that switched then dispatched the spawn separately
-    // could be torn down before the second step runs — this single handler keeps
-    // both steps in main so recovery survives the window teardown.
-    SWITCH_LOCAL_AND_SPAWN: 'backend:switch-local-and-spawn',
+    // Open-only recovery from a remote window's stopped overlay: spawn the
+    // app-managed local sidecar (if needed) AND open/focus the local backend's
+    // windows in ONE main-process action. No window is ever retargeted — the
+    // initiating window keeps its own backend — and both steps stay in main so
+    // recovery completes even if the initiating renderer goes away mid-flight.
+    OPEN_LOCAL_AND_SPAWN: 'backend:open-local-and-spawn',
     GET_SIDECAR_RUN_LOG: 'backend:get-sidecar-run-log',
     // Kill-and-restart recovery for an orphaned sidecar (#2444): the adopted
     // daemon's executable lives inside our own bundle (leftover from a
@@ -844,23 +880,51 @@ export const IPC_CHANNELS = {
 
   // Multi-backend connect: the "Connect to another intentd" registry.
   // Request/response channels for the connections list + TOFU pairing +
-  // switch. Handlers land in T3; the renderer-facing contract types live in
+  // open. Handlers land in T3; the renderer-facing contract types live in
   // `shared/types/connections.ts`. CHANGED / CERT_MISMATCH are main→renderer
   // push events (also listed in EVENT_CHANNELS for the preload allow-list).
   CONNECTIONS: {
     LIST: 'connections:list',
     CAPTURE_FINGERPRINT: 'connections:capture-fingerprint',
     ADD: 'connections:add',
+    UPDATE: 'connections:update',
+    TEST: 'connections:test',
+    ROTATE_SECRET: 'connections:rotate-secret',
+    OPEN: 'connections:open',
     FORGET: 'connections:forget',
-    SWITCH: 'connections:switch',
+    // Ask one connected remote backend's daemon to self-update (routes
+    // `system.requestUpdate` to that backend's pooled client). Structured
+    // result — never throws for daemon-side failures (unsupported/old daemon,
+    // unsupervised) so the renderer can toast a specific message.
+    UPDATE_BACKEND: 'connections:update-backend',
     CHANGED: 'connections:changed',
     CERT_MISMATCH: 'connections:cert-mismatch',
+    // Non-fatal per-host cert warnings observed by the multi-host connection
+    // race (#1746) — informative push, never blocks the connection.
+    CERT_WARNINGS: 'connections:cert-warnings',
     PROTOCOL_MISMATCH: 'connections:protocol-mismatch',
     AUTH_REJECTED: 'connections:auth-rejected',
-    // Pull the one-shot boot-restore fallback notice latched in main (T19),
-    // consume-once. The renderer fetches this once on mount and surfaces a
-    // non-blocking toast; the notice never becomes connections-slice state.
-    GET_BOOT_FALLBACK: 'connections:get-boot-fallback',
+    // iCloud-keychain backend sync (T4): read the opt-in pref + availability
+    // status, and set the pref (enabling requests an immediate reconcile).
+    // SYNC_STATUS_CHANGED is a main→renderer push (also in EVENT_CHANNELS).
+    SYNC_GET_STATE: 'connections:sync-get-state',
+    SYNC_SET_ENABLED: 'connections:sync-set-enabled',
+    SYNC_STATUS_CHANGED: 'connections:sync-status-changed',
+    // Self-publish: upsert THIS machine's own backend into the connections
+    // store (keychain sync then pushes it to the user's other devices), and
+    // read whether a self entry exists / auto-publish is suppressed. Main
+    // queries `server.pairingInfo` itself over the local client, so the
+    // bearer token never crosses to the renderer.
+    PUBLISH_SELF: 'connections:publish-self',
+    SELF_PUBLISHED_STATE: 'connections:self-published-state',
+    // Refresh the published self entry after a local change to its published
+    // fields (token rotation, WSS port change). Strict no-op while
+    // unpublished or while the "do not auto-publish" marker is set.
+    REFRESH_SELF: 'connections:refresh-self',
+    // Unpublish the self entry: remove this machine's published record (with
+    // tombstone, so keychain sync propagates the deletion) WITHOUT setting
+    // the "do not auto-publish" marker — unlike forgetting the self entry.
+    UNPUBLISH_SELF: 'connections:unpublish-self',
   },
 
   // Workspace transfer relay (main-process, wizard steps 3–4). The renderer
@@ -1024,8 +1088,10 @@ export const EVENT_CHANNELS = [
   'auto-update:error',
   'auto-update:show-toast',
   'auto-update:up-to-date',
-  // Release-notes modal push (startup after an update, or Help menu)
+  // Release-notes modal push (startup after an update, or Help menu) and the
+  // cross-window close broadcast after any window dismisses it
   'release-notes:show',
+  'release-notes:close',
   // Picture-in-Picture events
   'pip:opened',
   'pip:closed',
@@ -1049,6 +1115,8 @@ export const EVENT_CHANNELS = [
   'menu:reset-zoom',
   // Browser tab focus request from main process (CDP agent wants to focus a tab)
   'browser:focus-tab',
+  // Reveal a hidden agent-owned browser tab into a panel (monorepo#3045)
+  'browser:show-tab',
   // Browser tab list request from main process (CDP agent wants to list all browser tabs)
   'browser:list-tabs-request',
   // Browser tab open request from main process (agent wants to open a browser tab)
@@ -1074,14 +1142,18 @@ export const EVENT_CHANNELS = [
   // Hardware console ownership push (main → renderer, per-window { isOwner })
   'hardware-console:owner-changed',
   // Multi-backend connect (main → renderer): connections list/active changed,
-  // a pinned-cert mismatch that must block with a failure modal, and a
+  // a pinned-cert mismatch that must block with a failure modal, non-fatal
+  // per-host cert warnings from the connection race (#1746), and a
   // protocol-version mismatch that warns non-blockingly (connect still proceeds).
   'connections:changed',
   'connections:cert-mismatch',
+  'connections:cert-warnings',
   'connections:protocol-mismatch',
   // A 401/403 WebSocket-upgrade rejection (bad token / WS API disabled)
   // surfaced as a distinct auth failure instead of a generic transport error.
   'connections:auth-rejected',
+  // Keychain-sync availability changed after a reconcile (T4 settings UI).
+  'connections:sync-status-changed',
   // Workspace transfer relay progress (main → renderer): byte/chunk counters
   // for the wizard's step-3 progress UI. Never carries archive bytes.
   'transfer:progress',
@@ -1115,7 +1187,7 @@ export type ElectronEventName = (typeof EVENT_CHANNELS)[number];
 export type DynamicElectronEventName = `${(typeof DYNAMIC_CHANNEL_PATTERNS)[number]}${string}`;
 
 // Helper function to get all static channels
-export function getAllChannels(): string[] {
+function getAllChannels(): string[] {
   const channels: string[] = [];
 
   function extractChannels(obj: any) {

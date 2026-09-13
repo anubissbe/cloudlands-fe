@@ -5,18 +5,18 @@
  * seam at a time), this exercises the WHOLE user journey through the registered
  * `connections:*` IPC handlers against the REAL {@link connectionsStore} — a
  * temp `userData` dir with a reversible `safeStorage` double — so token
- * encryption-at-rest, decryption at switch time, active-id persistence, and the
- * window teardown/reload hooks all run as one flow:
+ * encryption-at-rest, decryption at open time, active-id persistence, and the
+ * window open/focus hooks all run as one flow:
  *
- *   add remote → capture + confirm fingerprint → switch (windows close + reload)
- *   → switch back to local → cert mismatch → failure modal.
+ *   add remote → capture + confirm fingerprint → open (remote window alongside
+ *   local) → cert mismatch → failure modal.
  *
- * A second scenario is the T9 regression guard (Wave-4): a main-process service
- * that attached its daemon-notification / status / reconnect listener ONCE (via
+ * A second scenario is the T9 regression guard: a main-process service that
+ * attached its daemon-notification / status / reconnect listener ONCE (via
  * `onBackendNotification` / `onBackendStatus` / `onBackendReconnected`) keeps
- * receiving events after a full switch cycle (local → remote → local), so
+ * receiving events after a remote client is built, disposed, and rebuilt, so
  * terminal output/exit, script state, `agent:idle`, and `settings:changed`
- * still drive the app on the post-switch client.
+ * still drive the app on the current client.
  *
  * FE-only: no daemon/protocol involvement. See PROTOCOL.md §1.1–2.3 for the
  * daemon-side wire contract this rides on (WSS + self-signed-cert fingerprint +
@@ -37,14 +37,16 @@ import * as path from 'path';
 // ---------------------------------------------------------------------------
 // Electron: temp userData + reversible safeStorage + inspectable ipcMain /
 // BrowserWindow. Provided in-file (overriding the global test-setup stub) so
-// the REAL connections store persists to a temp dir and the switch broadcasts
-// reach observable window doubles.
+// the REAL connections store persists to a temp dir and the changed-list
+// broadcasts reach observable window doubles.
 // ---------------------------------------------------------------------------
 
 interface FakeWindow {
   id: number;
+  backendId: string;
   destroyed: boolean;
   isDestroyed(): boolean;
+  focus(): void;
   webContents: { send: ReturnType<typeof vi.fn> };
 }
 
@@ -52,6 +54,14 @@ const electronState = vi.hoisted(() => ({
   userDataDir: '',
   windows: [] as unknown[],
   handlers: new Map<string, (event: unknown, data: unknown) => unknown>(),
+  // When true, safeStorage.decryptString throws — simulates a locked keychain
+  // / undecryptable stored secret for the secret-unavailable open path.
+  decryptShouldFail: false,
+}));
+
+/** Steerable per-method RPC responder for the fake client (tests override). */
+const rpc = vi.hoisted(() => ({
+  handler: (async () => ({})) as (method: string) => Promise<unknown>,
 }));
 
 vi.mock('electron', () => ({
@@ -60,6 +70,9 @@ vi.mock('electron', () => ({
     getPath: () => electronState.userDataDir,
     isPackaged: false,
     emit: () => {},
+    // Keychain-sync lifecycle focus trigger (T3); inert here (pref off).
+    on: () => {},
+    removeListener: () => {},
   },
   ipcMain: {
     handle: (channel: string, handler: (event: unknown, data: unknown) => unknown) => {
@@ -70,20 +83,25 @@ vi.mock('electron', () => ({
   },
   BrowserWindow: {
     getAllWindows: () => (electronState.windows as FakeWindow[]).filter((w) => !w.isDestroyed()),
+    fromWebContents: (webContents: FakeWindow['webContents']) =>
+      (electronState.windows as FakeWindow[]).find((w) => w.webContents === webContents) ?? null,
   },
   safeStorage: {
     isEncryptionAvailable: () => true,
     // Reversible "encryption" so we can assert the token round-trips through
-    // real encrypt-at-rest → decrypt-at-switch without a keyring.
+    // real encrypt-at-rest → decrypt-at-open without a keyring.
     encryptString: (s: string) => Buffer.from(`enc:${s}`, 'utf8'),
-    decryptString: (b: Buffer) => b.toString('utf8').replace(/^enc:/, ''),
+    decryptString: (b: Buffer) => {
+      if (electronState.decryptShouldFail) throw new Error('keychain locked');
+      return b.toString('utf8').replace(/^enc:/, '');
+    },
   },
 }));
 
 // ---------------------------------------------------------------------------
 // Fake JSON-RPC client (no live socket) — same shape the unit suites use, plus
-// getConfig() returns the config it was built with so we can assert the live
-// transport followed the switch (uds/ws → wss → back).
+// getConfig() returns the config it was built with so we can assert each
+// pooled client's transport (uds/ws for local, pinned wss for remotes).
 // ---------------------------------------------------------------------------
 
 vi.mock('../json-rpc-client', () => {
@@ -109,7 +127,7 @@ vi.mock('../json-rpc-client', () => {
     }
     start(): void {}
     dispose(): void {}
-    request = vi.fn(async () => ({}));
+    request = vi.fn(async (method: string) => rpc.handler(method));
     registerMethod(): () => void {
       return () => {};
     }
@@ -118,6 +136,9 @@ vi.mock('../json-rpc-client', () => {
     }
     getStatus(): string {
       return 'disconnected';
+    }
+    getConnectedVia(): null {
+      return null;
     }
     getReconnectAttempts(): number {
       return 0;
@@ -141,6 +162,12 @@ vi.mock('../intentd-sidecar', () => ({
 
 vi.mock('../../../browser/main/browser-exec-reverse', () => ({
   registerBrowserExecReverseHandler: vi.fn(),
+}));
+
+// Deterministic intentd version pin (the real reader would read the repo's
+// live intentd.version file, making list-shape assertions drift on every bump).
+vi.mock('../intentd-version-pin', () => ({
+  readPinnedVersion: vi.fn(() => '0.1.0'),
 }));
 
 // Keep the real PinMismatchError + resolveBackendConfig; stub only the network
@@ -167,14 +194,16 @@ const REMOTE_INPUT = {
 const FINGERPRINT = 'AA:BB:CC:DD';
 
 /** Add a live renderer-window double; returns its `send` spy. */
-function openWindow(): ReturnType<typeof vi.fn> {
+function openWindow(backendId = 'local'): ReturnType<typeof vi.fn> {
   const send = vi.fn();
   const win: FakeWindow = {
     id: electronState.windows.length + 1,
+    backendId,
     destroyed: false,
     isDestroyed() {
       return this.destroyed;
     },
+    focus: vi.fn(),
     webContents: { send },
   };
   electronState.windows.push(win);
@@ -188,30 +217,34 @@ function liveWindowSend(): ReturnType<typeof vi.fn> {
 }
 
 /**
- * Import a fresh backend.ipc and install window hooks that SIMULATE the T4
- * teardown/reload against the window doubles: capture destroys every live
- * window (windows close), restore opens a fresh one (reload). This lets the
- * integration flow observe close+reload and route post-switch broadcasts to the
- * new window, without pulling in the heavy real window module (covered by
+ * Import a fresh backend.ipc and install an openOrFocus window hook that
+ * SIMULATES the open action against the window doubles: focus an existing
+ * window for the backend, or open a fresh one. This lets the integration flow
+ * observe opens without pulling in the heavy real window module (covered by
  * window-sessions-multibackend.test.ts).
  */
 async function loadModule() {
   const mod = await import('../backend.ipc');
-  const captureAndClose = vi.fn(async () => {
-    for (const w of electronState.windows as FakeWindow[]) w.destroyed = true;
+  const openOrFocus = vi.fn(async (backendId: string) => {
+    const existing = (electronState.windows as FakeWindow[]).find(
+      (window) => !window.isDestroyed() && window.backendId === backendId,
+    );
+    if (existing) existing.focus();
+    else openWindow(backendId);
   });
-  const restore = vi.fn(async () => {
-    openWindow();
-  });
-  mod.__setBackendWindowHooksForTesting({ captureAndClose, restore });
-  return { mod, captureAndClose, restore };
+  mod.__setBackendWindowHooksForTesting({ openOrFocus });
+  return { mod, openOrFocus };
 }
 
 /** Invoke a registered IPC handler by channel (params validated as in prod). */
-function invoke<T = unknown>(channel: string, params?: unknown): Promise<T> {
+function invoke<T = unknown>(
+  channel: string,
+  params?: unknown,
+  sender?: FakeWindow['webContents'],
+): Promise<T> {
   const handler = electronState.handlers.get(channel);
   if (!handler) throw new Error(`no handler registered for ${channel}`);
-  return Promise.resolve(handler({}, params)) as Promise<T>;
+  return Promise.resolve(handler(sender ? { sender } : {}, params)) as Promise<T>;
 }
 
 let tmpDir: string;
@@ -221,9 +254,15 @@ beforeEach(async () => {
   electronState.userDataDir = tmpDir;
   electronState.windows = [];
   electronState.handlers = new Map();
+  electronState.decryptShouldFail = false;
+  rpc.handler = async () => ({});
   vi.resetModules();
   vi.clearAllMocks();
-  mockCaptureFingerprint.mockResolvedValue({ ok: true, fingerprint: FINGERPRINT, tokenValid: true });
+  mockCaptureFingerprint.mockResolvedValue({
+    ok: true,
+    fingerprint: FINGERPRINT,
+    tokenValid: true,
+  });
 });
 
 afterEach(async () => {
@@ -234,12 +273,44 @@ afterEach(async () => {
 });
 
 // ---------------------------------------------------------------------------
-// Full journey: add → confirm → switch → back → mismatch → failure modal
+// Full journey: add → confirm → open → mismatch → failure modal
 // ---------------------------------------------------------------------------
 
 describe('multi-backend connect — end-to-end journey', () => {
-  it('adds a remote, confirms its fingerprint, switches (close+reload), and back to local', async () => {
-    const { mod, captureAndClose, restore } = await loadModule();
+  it('opens a remote window without destroying the local window or client', async () => {
+    const { mod, openOrFocus } = await loadModule();
+    mod.registerBackendHandlers();
+    openWindow('local');
+    const localClient = mod.getBackendClient();
+
+    const added = await invoke<{ connection: { id: string } }>('connections:add', {
+      ...REMOTE_INPUT,
+      fingerprint: FINGERPRINT,
+    });
+    const remoteId = added.connection.id;
+
+    await expect(invoke('connections:open', { id: remoteId })).resolves.toEqual({
+      status: 'opened',
+      id: remoteId,
+    });
+
+    const live = (electronState.windows as FakeWindow[]).filter((window) => !window.isDestroyed());
+    expect(live.map((window) => window.backendId)).toEqual(['local', remoteId]);
+    expect(openOrFocus).toHaveBeenCalledWith(remoteId);
+    expect(mod.getBackendClient()).toBe(localClient);
+    expect(mod.getBackendClientForConnection('local')).toBe(localClient);
+    expect(mod.getBackendClientForConnection(remoteId)).toBeDefined();
+    const [localWindow, remoteWindow] = live;
+    await expect(
+      invoke('connections:list', undefined, localWindow.webContents),
+    ).resolves.toMatchObject({ activeId: 'local', windowBackendId: 'local' });
+    await expect(
+      invoke('connections:list', undefined, remoteWindow.webContents),
+    ).resolves.toMatchObject({ activeId: 'local', windowBackendId: remoteId });
+  });
+
+  it('adds a remote, confirms its fingerprint, and opens it with the decrypted stored token', async () => {
+    const { mod, openOrFocus } = await loadModule();
     mod.registerBackendHandlers();
 
     // Boot: only the synthesized local entry exists and it is active. No remote
@@ -247,8 +318,13 @@ describe('multi-backend connect — end-to-end journey', () => {
     await expect(invoke('connections:list')).resolves.toEqual({
       connections: [expect.objectContaining({ id: 'local', isLocal: true })],
       activeId: 'local',
+      windowBackendId: 'local',
       protocolMismatch: null,
       authRejected: null,
+      certMismatch: null,
+      certWarnings: null,
+      pinnedVersion: '0.1.0',
+      connectedIds: [],
     });
 
     // Trust-on-first-use: capture the remote's presented fingerprint.
@@ -289,19 +365,19 @@ describe('multi-backend connect — end-to-end journey', () => {
     expect(listed.connections.map((c) => c.id)).toEqual(['local', remoteId]);
     expect(listed.activeId).toBe('local');
 
-    // A live (local) window is up before the switch.
-    openWindow();
+    // A live (local) window is up before the open.
+    openWindow('local');
     mod.getBackendClient(); // client #1 (local)
 
-    // Switch to the remote: windows close + reload, and the live transport
-    // becomes the pinned wss target built from the DECRYPTED stored token.
-    await expect(invoke('connections:switch', { id: remoteId })).resolves.toEqual({
-      activeId: remoteId,
+    // Open the remote: its window opens alongside local's, and its pooled
+    // client is the pinned wss target built from the DECRYPTED stored token.
+    await expect(invoke('connections:open', { id: remoteId })).resolves.toEqual({
+      status: 'opened',
+      id: remoteId,
     });
-    expect(captureAndClose).toHaveBeenCalledWith('local');
-    expect(restore).toHaveBeenCalledWith(remoteId);
+    expect(openOrFocus).toHaveBeenCalledWith(remoteId);
 
-    const remoteConfig = mod.getBackendClient().getConfig() as Record<string, unknown>;
+    const remoteConfig = mod.getBackendClientForId(remoteId).getConfig() as Record<string, unknown>;
     expect(remoteConfig).toMatchObject({
       transport: 'wss',
       host: '10.0.0.5',
@@ -310,37 +386,46 @@ describe('multi-backend connect — end-to-end journey', () => {
       token: 'secret-token', // decrypted end-to-end from the real store
     });
 
-    // Active selection persisted through the real store.
-    await expect(invoke('connections:list')).resolves.toMatchObject({ activeId: remoteId });
-
-    // Switch back to local: fast path, transport is no longer the pinned wss.
-    await expect(invoke('connections:switch', { id: 'local' })).resolves.toEqual({
-      activeId: 'local',
-    });
+    // The open never flips the persisted whole-app selection; the always-on
+    // local member (never a wss transport) keeps serving local windows.
+    await expect(invoke('connections:list')).resolves.toMatchObject({ activeId: 'local' });
     const localConfig = mod.getBackendClient().getConfig() as Record<string, unknown>;
     expect(localConfig.transport).not.toBe('wss');
-    await expect(invoke('connections:list')).resolves.toMatchObject({ activeId: 'local' });
   });
 
-  it('re-pairing a pre-existing ACTIVE duplicate collapses the duplicates and reconnects (switched: true)', async () => {
+  it('re-pairing an active duplicate refreshes its client without window teardown', async () => {
     // Earlier app versions allowed repeated host:port entries. Seed such a file
     // where a NON-first duplicate is the active backend, then re-pair the same
     // host:port: the collapse must keep the ACTIVE record's id so the add
-    // handler takes the active-reconnect path (full switch, switched: true)
+    // handler takes the active client-refresh path (switched: true)
     // instead of treating it as a non-active upsert.
     await fs.writeFile(
       path.join(tmpDir, 'backend-connections.json'),
       JSON.stringify({
         connections: [
-          { id: 'dup-1', label: 'Old pairing', host: REMOTE_INPUT.host, port: REMOTE_INPUT.port, fingerprint: 'OLD:FP', encToken: { encrypted: false, value: 'stale-token' } },
-          { id: 'dup-2', label: 'Active pairing', host: REMOTE_INPUT.host, port: REMOTE_INPUT.port, fingerprint: 'OLD:FP', encToken: { encrypted: false, value: 'stale-token' } },
+          {
+            id: 'dup-1',
+            label: 'Old pairing',
+            host: REMOTE_INPUT.host,
+            port: REMOTE_INPUT.port,
+            fingerprint: 'OLD:FP',
+            encToken: { encrypted: false, value: 'stale-token' },
+          },
+          {
+            id: 'dup-2',
+            label: 'Active pairing',
+            host: REMOTE_INPUT.host,
+            port: REMOTE_INPUT.port,
+            fingerprint: 'OLD:FP',
+            encToken: { encrypted: false, value: 'stale-token' },
+          },
         ],
         activeId: 'dup-2',
       }),
       'utf8',
     );
 
-    const { mod, captureAndClose, restore } = await loadModule();
+    const { mod, openOrFocus } = await loadModule();
     mod.registerBackendHandlers();
     openWindow();
     mod.getBackendClient();
@@ -351,13 +436,12 @@ describe('multi-backend connect — end-to-end journey', () => {
     );
 
     // The ACTIVE duplicate's id survived the collapse and the live client was
-    // rebuilt via a switch to itself (windows closed + restored on the same id).
+    // rebuilt without opening or closing any window.
     expect(result).toMatchObject({ connection: { id: 'dup-2' }, switched: true });
-    expect(captureAndClose).toHaveBeenCalledWith('dup-2');
-    expect(restore).toHaveBeenCalledWith('dup-2');
+    expect(openOrFocus).not.toHaveBeenCalled();
 
     // The rebuilt client carries the rotated token, and only one record remains.
-    const config = mod.getBackendClient().getConfig() as Record<string, unknown>;
+    const config = mod.getBackendClientForId('dup-2').getConfig() as Record<string, unknown>;
     expect(config).toMatchObject({ transport: 'wss', token: 'rotated-token' });
     const listed = await invoke<{ connections: Array<{ id: string }>; activeId: string }>(
       'connections:list',
@@ -383,10 +467,12 @@ describe('multi-backend connect — end-to-end journey', () => {
     const remoteId = added.connection.id;
 
     openWindow();
-    await invoke('connections:switch', { id: remoteId }); // now pinned to the remote
+    await invoke('connections:open', { id: remoteId }); // remote client now live
 
     const { PinMismatchError } = await import('../backend-connection');
-    const client = mod.getBackendClient() as unknown as { emit(e: string, arg: unknown): void };
+    const client = mod.getBackendClientForId(remoteId) as unknown as {
+      emit(e: string, arg: unknown): void;
+    };
 
     // The pinned wss transport re-raises the mismatch on every reconnect retry;
     // the renderer must see exactly ONE blocking failure modal.
@@ -404,14 +490,113 @@ describe('multi-backend connect — end-to-end journey', () => {
       actualFingerprint: 'EE:FF:00:11',
     });
   });
+
+  it('opens the remote window even when the probe finds the remote unreachable', async () => {
+    // The saved backend is down at open time: the open must still resolve,
+    // create the window, and RETAIN the pooled client (its reconnect loop
+    // keeps retrying) so the renderer's connection-lost overlay owns recovery.
+    rpc.handler = async (method) => {
+      if (method === 'host.status') throw new Error('connect ETIMEDOUT');
+      return {};
+    };
+    const { mod, openOrFocus } = await loadModule();
+    mod.registerBackendHandlers();
+    openWindow('local');
+
+    const added = await invoke<{ connection: { id: string } }>('connections:add', {
+      ...REMOTE_INPUT,
+      fingerprint: FINGERPRINT,
+    });
+    const remoteId = added.connection.id;
+
+    await expect(invoke('connections:open', { id: remoteId })).resolves.toEqual({
+      status: 'opened',
+      id: remoteId,
+    });
+
+    expect(openOrFocus).toHaveBeenCalledWith(remoteId);
+    const live = (electronState.windows as FakeWindow[]).filter((window) => !window.isDestroyed());
+    expect(live.map((window) => window.backendId)).toEqual(['local', remoteId]);
+    expect(mod.getBackendClientForConnection(remoteId)).toBeDefined();
+  });
+
+  it('opens the window on a cert-mismatch probe failure and replays the latched modal to it', async () => {
+    // Pair, then the remote presents a changed cert at open time: the probe
+    // fails but the window opens; the retained client's transport raises the
+    // typed mismatch, whose latched event is replayed to the new window via
+    // its initial connections:list fetch — trust modal instead of a dead click.
+    const { PinMismatchError } = await import('../backend-connection');
+    rpc.handler = async (method) => {
+      if (method === 'host.status') throw new PinMismatchError(FINGERPRINT, 'EE:FF:00:11');
+      return {};
+    };
+    const { mod, openOrFocus } = await loadModule();
+    mod.registerBackendHandlers();
+
+    const added = await invoke<{ connection: { id: string } }>('connections:add', {
+      ...REMOTE_INPUT,
+      fingerprint: FINGERPRINT,
+    });
+    const remoteId = added.connection.id;
+
+    await expect(invoke('connections:open', { id: remoteId })).resolves.toEqual({
+      status: 'opened',
+      id: remoteId,
+    });
+    expect(openOrFocus).toHaveBeenCalledWith(remoteId);
+
+    // The retained client's reconnect loop re-raises the mismatch as a
+    // transport error; the window created by the open learns it from the
+    // sticky replay on its initial list fetch.
+    const client = mod.getBackendClientForId(remoteId) as unknown as {
+      emit(e: string, arg: unknown): void;
+    };
+    client.emit('error', new PinMismatchError(FINGERPRINT, 'EE:FF:00:11'));
+    const remoteWindow = (electronState.windows as FakeWindow[]).find(
+      (window) => window.backendId === remoteId,
+    )!;
+    await expect(
+      invoke('connections:list', undefined, remoteWindow.webContents),
+    ).resolves.toMatchObject({
+      certMismatch: {
+        id: remoteId,
+        host: '10.0.0.5',
+        port: 8443,
+        expectedFingerprint: FINGERPRINT,
+        actualFingerprint: 'EE:FF:00:11',
+      },
+    });
+  });
+
+  it('keeps the no-window structured failure when the stored secret is unavailable', async () => {
+    // A locked keychain / undecryptable secret means there is nothing for a
+    // window to retry against: the open returns the structured
+    // secret-unavailable result and opens NO window.
+    const { mod, openOrFocus } = await loadModule();
+    mod.registerBackendHandlers();
+
+    const added = await invoke<{ connection: { id: string } }>('connections:add', {
+      ...REMOTE_INPUT,
+      fingerprint: FINGERPRINT,
+    });
+    const remoteId = added.connection.id;
+
+    electronState.decryptShouldFail = true;
+    await expect(invoke('connections:open', { id: remoteId })).resolves.toEqual({
+      status: 'secret-unavailable',
+    });
+    expect(openOrFocus).not.toHaveBeenCalled();
+    const live = (electronState.windows as FakeWindow[]).filter((window) => !window.isDestroyed());
+    expect(live).toHaveLength(0);
+  });
 });
 
 // ---------------------------------------------------------------------------
-// T9 regression guard (Wave-4): daemon events survive a full switch cycle
+// T9 regression guard: daemon events survive a remote client's build/dispose
 // ---------------------------------------------------------------------------
 
-describe('multi-backend connect — notifications survive a switch (T9 guard)', () => {
-  it('keeps delivering terminal/script/idle/settings events after local → remote → local', async () => {
+describe('multi-backend connect — notifications survive client churn (T9 guard)', () => {
+  it('keeps delivering terminal/script/idle/settings events after a remote client comes and goes', async () => {
     const { mod } = await loadModule();
     mod.registerBackendHandlers();
     mod.getBackendClient(); // client #1 (local)
@@ -426,8 +611,8 @@ describe('multi-backend connect — notifications survive a switch (T9 guard)', 
     mod.onBackendStatus(onStatus);
     mod.onBackendReconnected(onReconnect);
 
-    // Pair a remote and run a full switch cycle: local → remote → local. Each
-    // hop disposes the live client and builds a fresh one.
+    // Pair a remote, open it (builds its pooled client), then dispose it —
+    // the local member persists throughout.
     await invoke('connections:capture-fingerprint', {
       host: REMOTE_INPUT.host,
       port: REMOTE_INPUT.port,
@@ -438,16 +623,11 @@ describe('multi-backend connect — notifications survive a switch (T9 guard)', 
       fingerprint: FINGERPRINT,
     });
     openWindow();
-    await invoke('connections:switch', { id: added.connection.id });
-    await invoke('connections:switch', { id: 'local' });
+    await invoke('connections:open', { id: added.connection.id });
+    mod.disconnectBackendClient(added.connection.id);
 
-    // Each switch nudges the reconnect forwarder once so services resubscribe
-    // against the new target.
-    expect(onReconnect).toHaveBeenCalledTimes(2);
-
-    // The four representative daemon event kinds must still reach the handler
-    // that was registered BEFORE any client swap — on the current (post-switch)
-    // client.
+    // The representative daemon event kinds must still reach the handler that
+    // was registered BEFORE any client churn — on the always-on local client.
     const client = mod.getBackendClient() as unknown as { emit(e: string, arg: unknown): void };
     const events = [
       { method: 'events.event', params: { event: { type: 'terminal:data' } } },
@@ -461,8 +641,11 @@ describe('multi-backend connect — notifications survive a switch (T9 guard)', 
     expect(onNotification).toHaveBeenCalledTimes(events.length);
     for (const ev of events) expect(onNotification).toHaveBeenCalledWith(ev);
 
-    // The connect-retry status listener likewise survives the swaps.
+    // The connect-retry status listener likewise survives the churn, and the
+    // local reconnect forwarder still reaches the handler.
     client.emit('status', 'connected');
     expect(onStatus).toHaveBeenCalledWith('connected');
+    client.emit('reconnected');
+    expect(onReconnect).toHaveBeenCalledTimes(1);
   });
 });

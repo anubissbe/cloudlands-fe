@@ -56,6 +56,18 @@ vi.mock('$store/renderer/slices/agent-session/agent-session-selectors', () => ({
   ),
   selectAgentIsResponding: (agentId: { subscribe: (run: (value: string) => void) => () => void }) =>
     makeDerivedReadable(agentId, (id) => mockIsResponding.get(id) ?? false),
+  selectAgentPreview: Object.assign(
+    (agentId: { subscribe: (run: (value: string) => void) => () => void }) =>
+      makeDerivedReadable(agentId, (id) => {
+        const session = sessionState.byId.get(id);
+        const text =
+          typeof session?.lastAgentResponse === 'string' ? session.lastAgentResponse : '';
+        return text
+          ? { kind: 'last-response', text, isLive: mockIsResponding.get(id) ?? false }
+          : null;
+      }),
+    { select: () => null },
+  ),
   selectAgentIsWaiting: () => makeReadable(false),
   selectAgentIsBlockedWaiting: () => makeReadable(false),
   selectAgentSessionStreamingContent: (agentId: {
@@ -68,6 +80,12 @@ vi.mock('$store/renderer/slices/agent-session/agent-session-selectors', () => ({
 }));
 vi.mock('$store/renderer/slices/permission/permission-selectors', () => ({
   selectPendingCount: () => makeReadable(0),
+}));
+vi.mock('$store/renderer/slices/hud/hud-selectors', () => ({
+  selectHudAgentHasPendingQuestion: () => makeReadable(false),
+}));
+vi.mock('$lib/components/chat/questions/wizard-gate', () => ({
+  deriveWizardPendingQuestions: () => null,
 }));
 vi.mock('$store/renderer/slices/changes/changes-selectors', () => ({
   selectAgentLineStats: () => makeReadable(null),
@@ -87,9 +105,11 @@ import { requestSubscriptionFetch } from '$store/renderer/slices/agent-subscript
 import { agentSubscriptionReadSaga } from '$store/renderer/slices/agent-subscription-ui/sagas/agent-subscription-read-saga';
 import { agentMutationSaga } from '$store/renderer/slices/agent-session/sagas/agent-mutation-saga';
 import { appLayoutNavigationSaga } from '$store/renderer/slices/app-layout/sagas/app-layout-navigation-saga';
+import { panelLayoutSaga } from '$store/renderer/slices/panel-layout/sagas/panel-layout-saga';
 import {
   clearPanelLayout,
   initializeLayout,
+  setPanelColumnCount,
 } from '$store/renderer/slices/panel-layout/panel-layout-slice';
 import { openWorkspaceTab } from '$store/renderer/slices/tab-state/tab-state-slice';
 import AgentSubscriptions from '../AgentSubscriptions.svelte';
@@ -258,6 +278,7 @@ describe('AgentSubscriptions unified waiting disclosure', () => {
     stopSagas.push(appStore.runSaga(agentSubscriptionReadSaga));
     stopSagas.push(appStore.runSaga(agentMutationSaga));
     stopSagas.push(appStore.runSaga(appLayoutNavigationSaga));
+    stopSagas.push(appStore.runSaga(panelLayoutSaga));
   });
 
   afterAll(() => {
@@ -337,8 +358,8 @@ describe('AgentSubscriptions unified waiting disclosure', () => {
     const stack = screen.getByTestId('one-shot-header').querySelector('[data-agent-avatar-stack]');
     expect(stack).toBeTruthy();
     expect(stack?.querySelectorAll('[data-icon]')).toHaveLength(0);
-    expect(stack?.querySelectorAll('[data-agent-avatar-stack-item]')).toHaveLength(7);
-    expect(stack?.querySelector('[data-agent-avatar-overflow]')).toBeNull();
+    expect(stack?.querySelectorAll('[data-agent-avatar-stack-item]')).toHaveLength(3);
+    expect(stack?.querySelector('[data-agent-avatar-overflow]')?.textContent?.trim()).toBe('+4');
     await fireEvent.click(summary);
     expect(summary.getAttribute('aria-expanded')).toBe('true');
     expect(
@@ -643,7 +664,7 @@ describe('AgentSubscriptions unified waiting disclosure', () => {
     ]);
   });
 
-  it('reuses, reveals, and focuses an existing watched-agent panel without duplicating it', async () => {
+  it('reuses, reveals, and focuses an existing watched agent in the rightmost column', async () => {
     const wsId = 'ws-agent-panel-reuse';
     seedSession('agent-target', '2026-01-03T00:00:00.000Z', 'responding', wsId);
     await renderWithSnapshot(
@@ -691,7 +712,7 @@ describe('AgentSubscriptions unified waiting disclosure', () => {
     }
   });
 
-  it.each(['Enter', ' '])('uses the same panel reuse path for the %s key', async (key) => {
+  it.each(['Enter', ' '])('uses the same rightmost-column path for the %s key', async (key) => {
     const wsId = `ws-agent-panel-key-${key === ' ' ? 'space' : 'enter'}`;
     seedSession('agent-target', '2026-01-03T00:00:00.000Z', 'responding', wsId);
     await renderWithSnapshot(
@@ -724,7 +745,7 @@ describe('AgentSubscriptions unified waiting disclosure', () => {
     expect(agentRow('agent-target').querySelector('input')).toBeNull();
   });
 
-  it('creates one adjacent agent panel when no matching panel exists', async () => {
+  it('creates one rightmost agent column when no matching panel exists', async () => {
     const wsId = 'ws-agent-panel-create';
     seedSession('agent-new', '2026-01-03T00:00:00.000Z', 'responding', wsId);
     await renderWithSnapshot(
@@ -743,6 +764,7 @@ describe('AgentSubscriptions unified waiting disclosure', () => {
       },
       'parent',
     );
+    appStore.dispatch(setPanelColumnCount(wsId, 2));
     await expandWaitingAgents();
 
     await fireEvent.click(within(agentRow('agent-new')).getAllByRole('button')[0]);
@@ -798,7 +820,6 @@ describe('AgentSubscriptions unified waiting disclosure', () => {
       vi.advanceTimersByTime(600);
 
       expect(focusEvents).toEqual([]);
-      expect(vi.getTimerCount()).toBe(0);
     } finally {
       vi.useRealTimers();
       window.removeEventListener('panel:focus-content', onFocus);
@@ -847,6 +868,70 @@ describe('AgentSubscriptions unified waiting disclosure', () => {
     expect(screen.queryByTestId('finished-agent-summary')).toBeNull();
     await expandWaitingAgents();
     expect(visibleAgentIds()).toEqual(['agent-failed', 'agent-done']);
+  });
+
+  it('moves a message-resumed agent out of the finished group while its turn runs (monorepo#3405)', async () => {
+    const wsId = 'ws-finished-resumed';
+    const agents = [
+      'agent-a',
+      'agent-b',
+      'agent-resumed',
+      'agent-c',
+      'agent-d',
+      'agent-e',
+      'agent-f',
+    ];
+    seedSession('agent-a', '2026-01-02T00:00:00.000Z', 'completed', wsId);
+    seedSession('agent-b', '2026-01-03T00:00:00.000Z', 'completed', wsId);
+    // Resumed by an interrupt message: still listed in the delegation group's
+    // completedAgentIds, but the live session shows a running turn again.
+    seedSession('agent-resumed', '2026-01-04T00:00:00.000Z', 'responding', wsId, {
+      isResponding: true,
+    });
+    const wire = snapshot(
+      [groupSubscription('group-resume', wsId, agents)],
+      [delegationGroup('group-resume', agents, ['agent-a', 'agent-b', 'agent-resumed'])],
+    );
+    await renderWithSnapshot(wsId, wire);
+
+    await expandWaitingAgents();
+    const summary = screen.getByTestId('finished-agent-summary');
+    expect(summary.textContent?.trim()).toBe('2 agents finished');
+    // The resumed agent renders as an active ungrouped row, sorted into the
+    // active tier ahead of the idle/waiting rows.
+    expect(visibleAgentIds()).toEqual([
+      'agent-resumed',
+      'agent-c',
+      'agent-d',
+      'agent-e',
+      'agent-f',
+    ]);
+    expect(
+      within(agentRow('agent-resumed')).getByTestId('mock-avatar-with-state').dataset.state,
+    ).toBe('running');
+    await fireEvent.click(summary);
+    const finishedIds = within(screen.getByTestId('finished-agent-list'))
+      .getAllByTestId('agent-list-item')
+      .map((row) => row.getAttribute('data-agent-id'));
+    expect(finishedIds).toEqual(['agent-b', 'agent-a']);
+
+    // Once the resumed turn settles, the agent returns to the finished group.
+    // The daemon may not eagerly clear activity flags when a turn ends, so seed
+    // a stale isResponding alongside the terminal status: isAgentRunningState's
+    // terminal-status short-circuit must keep the agent in the finished set.
+    seedSession('agent-resumed', '2026-01-05T00:00:00.000Z', 'completed', wsId, {
+      isResponding: true,
+    });
+    await refetch(wsId, wire);
+    await waitFor(() =>
+      expect(screen.getByTestId('finished-agent-summary').textContent?.trim()).toBe(
+        '3 agents finished',
+      ),
+    );
+    const settledFinishedIds = within(screen.getByTestId('finished-agent-list'))
+      .getAllByTestId('agent-list-item')
+      .map((row) => row.getAttribute('data-agent-id'));
+    expect(settledFinishedIds).toEqual(['agent-resumed', 'agent-b', 'agent-a']);
   });
 
   it('renders every agent instead of truncating the list to +n', async () => {

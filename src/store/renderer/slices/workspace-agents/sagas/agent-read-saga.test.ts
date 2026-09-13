@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { runSaga, stdChannel } from 'redux-saga';
 
-const mocks = vi.hoisted(() => ({ get: vi.fn() }));
+const mocks = vi.hoisted(() => ({ get: vi.fn(), invoke: vi.fn(() => Promise.resolve()) }));
 const loggerMocks = vi.hoisted(() => ({
   debug: vi.fn(),
   info: vi.fn(),
@@ -10,6 +10,7 @@ const loggerMocks = vi.hoisted(() => ({
 }));
 
 vi.mock('$lib/client', () => ({ appClient: { agents: { get: mocks.get } } }));
+vi.mock('$lib/electron-bridge', () => ({ invoke: mocks.invoke }));
 vi.mock('$lib/utils/client-logger', () => ({
   createLogger: () => loggerMocks,
   logger: loggerMocks,
@@ -24,7 +25,7 @@ import {
   bulkUpsertSessions,
   initialState as initialAgentSessionState,
 } from '../../agent-session/agent-session-slice';
-import { closeTabsByAgentId } from '../../panel-layout/panel-layout-slice';
+import { closeTabsByAgentId, destroyTabsByOwnerAgent } from '../../panel-layout/panel-layout-slice';
 import {
   clearPendingAgentDeletions,
   removePendingAgentDeletion,
@@ -34,11 +35,9 @@ import { agentReadSaga } from './agent-read-saga';
 
 const WS = 'ws-read';
 const AGENT = 'agent-read';
-const settle = async () => {
-  await Promise.resolve();
-  await Promise.resolve();
-  await Promise.resolve();
-};
+// Macrotask hop: drains every pending microtask regardless of how many
+// promise hops the read seam chains internally.
+const settle = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
 
 function session(overrides: Partial<AgentSession> = {}): AgentSession {
   return {
@@ -186,50 +185,39 @@ describe('agentReadSaga', () => {
     await task.toPromise();
   });
 
-  it.each([
-    ['equal', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z'],
-    ['invalid', 'older-invalid', 'newer-invalid'],
-  ])(
-    'does not let a superseded same-agent response overwrite newer metadata with %s timestamps',
-    async (_label, olderUpdatedAt, newerUpdatedAt) => {
-      let resolveOlder!: (value: AgentSession) => void;
-      mocks.get
-        .mockImplementationOnce(
-          () =>
-            new Promise((done) => {
-              resolveOlder = done;
-            }),
-        )
-        .mockResolvedValueOnce(session({ name: 'newer', updatedAt: newerUpdatedAt }));
-      const channel = stdChannel();
-      let agentSessions = initialAgentSessionState;
-      const dispatch = vi.fn((action) => {
-        agentSessions = agentSessionReducer(agentSessions, action);
-      });
-      const task = runSaga(
-        { channel, dispatch, getState: () => ({ agentSessions }) },
-        agentReadSaga,
-      );
+  it('shares one in-flight request between superseding same-agent callers', async () => {
+    let resolveShared!: (value: AgentSession) => void;
+    mocks.get.mockImplementationOnce(
+      () =>
+        new Promise((done) => {
+          resolveShared = done;
+        }),
+    );
+    const channel = stdChannel();
+    let agentSessions = initialAgentSessionState;
+    const dispatch = vi.fn((action) => {
+      agentSessions = agentSessionReducer(agentSessions, action);
+    });
+    const task = runSaga({ channel, dispatch, getState: () => ({ agentSessions }) }, agentReadSaga);
 
-      channel.put(ensureAgentSessionLoaded(WS, AGENT));
-      channel.put(ensureAgentSessionLoaded(WS, AGENT));
-      await settle();
+    channel.put(ensureAgentSessionLoaded(WS, AGENT));
+    channel.put(ensureAgentSessionLoaded(WS, AGENT));
+    await settle();
 
-      expect(mocks.get).toHaveBeenCalledTimes(2);
-      expect(agentSessions.byAgentId[AGENT]?.name).toBe('newer');
+    expect(mocks.get).toHaveBeenCalledTimes(1);
+    expect(agentSessions.byAgentId[AGENT]).toBeUndefined();
 
-      resolveOlder(session({ name: 'older', updatedAt: olderUpdatedAt }));
-      await settle();
+    resolveShared(session({ name: 'shared' }));
+    await settle();
 
-      const upserts = dispatch.mock.calls.filter(
-        ([action]) => action.type === bulkUpsertSessions.type,
-      );
-      expect(upserts).toHaveLength(1);
-      expect(agentSessions.byAgentId[AGENT]?.name).toBe('newer');
-      task.cancel();
-      await task.toPromise();
-    },
-  );
+    const upserts = dispatch.mock.calls.filter(
+      ([action]) => action.type === bulkUpsertSessions.type,
+    );
+    expect(upserts).toHaveLength(1);
+    expect(agentSessions.byAgentId[AGENT]?.name).toBe('shared');
+    task.cancel();
+    await task.toPromise();
+  });
 
   it('loads after a pending deletion clears', async () => {
     setPendingAgentDeletion({ wsId: WS, agentId: AGENT, snapshot: session(), timer: null });
@@ -307,6 +295,14 @@ describe('agentReadSaga', () => {
       ([action]) => action.type === closeTabsByAgentId.type,
     )?.[0];
     expect(close?.payload).toMatchObject({ wsId: WS, agentId: AGENT });
+    // Missed-deletion recovery (monorepo#2857): the dead agent's owned
+    // browser tabs are destroyed and main's CDP/ownership registrations
+    // cleared — a pre-purge list-tabs reply may already have rehydrated them.
+    const destroy = dispatch.mock.calls.find(
+      ([action]) => action.type === destroyTabsByOwnerAgent.type,
+    )?.[0];
+    expect(destroy?.payload).toMatchObject({ wsId: WS, agentId: AGENT });
+    expect(mocks.invoke).toHaveBeenCalledWith('browser:clear-agent-tabs', { agentId: AGENT });
     expect(dispatch.mock.calls.some(([action]) => action.type === bulkUpsertSessions.type)).toBe(
       false,
     );

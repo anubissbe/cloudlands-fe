@@ -4,7 +4,9 @@
  * Shared types for the auto-update feature between main and renderer processes.
  */
 
-export const UPDATE_CHANNELS = ['stable', 'beta', 'alpha'] as const;
+// 'disabled' is a pseudo-channel: it is persisted like the others but has no
+// feed (no /disabled directory exists) and suppresses all update activity.
+export const UPDATE_CHANNELS = ['stable', 'beta', 'alpha', 'disabled'] as const;
 
 export type UpdateChannel = (typeof UPDATE_CHANNELS)[number];
 
@@ -13,13 +15,7 @@ export function isUpdateChannel(value: unknown): value is UpdateChannel {
 }
 
 export type UpdateStatus =
-  | 'idle'
-  | 'checking'
-  | 'available'
-  | 'not-available'
-  | 'downloading'
-  | 'downloaded'
-  | 'error';
+  'idle' | 'checking' | 'available' | 'not-available' | 'downloading' | 'downloaded' | 'error';
 
 export interface UpdateInfo {
   version: string;

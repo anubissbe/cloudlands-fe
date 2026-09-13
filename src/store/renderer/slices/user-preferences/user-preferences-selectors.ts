@@ -50,6 +50,14 @@ export const selectShowReasoningBlocks = store.createSelector((state) => {
   return state.userPreferences?.showReasoningBlocks ?? false;
 });
 
+export const selectChatAuroraEnabled = store.createSelector((state) => {
+  return state.userPreferences?.chatAuroraEnabled ?? true;
+});
+
+export const selectShellTransparencyEnabled = store.createSelector((state) => {
+  return state.userPreferences?.shellTransparencyEnabled ?? true;
+});
+
 export const selectCounterScale = store.createSelector((state) => {
   return 1 / state.userPreferences.zoomFactor;
 });
@@ -146,12 +154,8 @@ export const selectGithubLinkDefaultAction = store.createSelector((state) => {
   return state.userPreferences?.githubLinkDefaultAction ?? 'show-choices';
 });
 
-export const selectPanelOpenMode = store.createSelector((state) => {
-  return state.userPreferences?.panelOpenMode ?? 'normal';
-});
-
-export const selectPanelStackDirection = store.createSelector((state) => {
-  return state.userPreferences?.panelStackDirection ?? 'right';
+export const selectShortcutOverrides = store.createSelector((state) => {
+  return state.userPreferences.shortcutOverrides;
 });
 
 /** The concrete catalog locale the preference resolves to (explicit → system → en). */

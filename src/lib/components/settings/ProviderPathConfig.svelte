@@ -2,16 +2,14 @@
   /**
    * ProviderPathConfig
    *
-   * A dropdown panel for configuring a provider's CLI executable path. It can
-   * render its default folder trigger or be controlled by a parent menu.
+   * A controlled dropdown panel for configuring a provider's CLI executable path.
    */
   import { appClient } from '$lib/client';
-  import { faFolder, faCheck } from '@fortawesome/free-solid-svg-icons';
+  import { faCheck } from '@fortawesome/free-solid-svg-icons';
   import Fa from 'svelte-fa';
   import { toast } from 'svelte-sonner';
   import { m } from '$shared/paraglide/messages.js';
   import * as Menu from '$lib/components/ui/menu';
-  import { Button } from '$lib/components/ui/button';
   import PathSettingField from './PathSettingField.svelte';
   import { createLogger } from '$lib/utils/client-logger';
 
@@ -52,14 +50,21 @@
      * `runtimeCliCommand`, when it resolved.
      */
     runtimeResolvedPath?: string;
+    /**
+     * npx-only providers only (claude-code, pi): the pinned package spec the
+     * daemon launches via npx by default (e.g. `pkg@1.2.3`). For these
+     * providers `resolvedPath` is the npx binary, not `cliCommand`, so the
+     * status row describes the pinned npx launch instead of an auto-detected
+     * `cliCommand`, and the hint explains that a configured path runs in
+     * place of the pin (monorepo#4352).
+     */
+    npxPackage?: string;
     /** Whether the provider is currently installed */
     isInstalled?: boolean;
     /** Callback when path changes */
     onPathChange?: (path: string) => void;
-    /** Whether the path dropdown is open */
-    open?: boolean;
-    /** Whether to render the default folder trigger */
-    showTrigger?: boolean;
+    /** Controlled path dropdown state */
+    open: boolean;
   }
 
   let {
@@ -70,10 +75,10 @@
     resolvedPath = '',
     runtimeCliCommand,
     runtimeResolvedPath,
+    npxPackage,
     isInstalled = false,
     onPathChange,
-    open = $bindable(false),
-    showTrigger = true,
+    open = $bindable(),
   }: Props = $props();
 
   async function savePath(path: string) {
@@ -100,9 +105,13 @@
     }
   }
 
-  // Determine the display path (configured > resolved > placeholder)
+  // Determine the display path (configured > resolved > placeholder). For
+  // npx-only providers `resolvedPath` is npx, not the adapter the override
+  // targets, so the placeholder names the adapter command instead.
   const placeholderText = $derived(
-    resolvedPath ? resolvedPath : m.settings_providerPath_placeholder({ command: cliCommand }),
+    resolvedPath && !npxPackage
+      ? resolvedPath
+      : m.settings_providerPath_placeholder({ command: cliCommand }),
   );
 
   // Remote daemons route browsing to the in-app DirectoryPickerModal, which
@@ -110,6 +119,11 @@
   // on outside interaction/Escape/focus loss nor unmount the subtree that
   // renders the modal.
   let pickerOpen = $state(false);
+
+  // This panel is opened from the provider overflow menu, so bits-ui has no
+  // trigger element to position against. An invisible custom anchor keeps the
+  // floating content beside the overflow trigger instead of off-screen.
+  let anchorEl = $state<HTMLElement | null>(null);
 </script>
 
 <Menu.Root
@@ -123,27 +137,12 @@
     }
   }
 >
-  {#if showTrigger}
-    <Menu.Trigger>
-      {#snippet child({ props })}
-        <span class="contents" {...props}>
-          <Button
-            variant="ghost-light"
-            size="icon-xs"
-            tooltip={m.settings_providerPath_configureTitle({ name: providerName })}
-            title={m.settings_providerPath_configureTitle({ name: providerName })}
-            aria-label={m.settings_providerPath_configureTitle({ name: providerName })}
-          >
-            <Fa icon={faFolder} size={11} />
-          </Button>
-        </span>
-      {/snippet}
-    </Menu.Trigger>
-  {/if}
+  <span bind:this={anchorEl} aria-hidden="true"></span>
   <Menu.Content
     align="end"
     side="bottom"
     portal={true}
+    customAnchor={anchorEl}
     interactOutsideBehavior={pickerOpen ? 'ignore' : 'close'}
     escapeKeydownBehavior={pickerOpen ? 'ignore' : 'close'}
     onFocusOutside={(event) => {
@@ -158,7 +157,11 @@
           {m.settings_providerPath_header({ name: providerName })}
         </p>
         <p class="text-xs text-subtle">
-          {#if isInstalled}
+          {#if npxPackage && resolvedPath}
+            {m.settings_providerPath_npxOverrideHint_before({ package: npxPackage })}
+            <code class="px-1 py-0.5 bg-muted rounded text-ui">{cliCommand}</code>
+            {m.settings_providerPath_npxOverrideHint_after()}
+          {:else if isInstalled}
             {m.settings_providerPath_overrideHint()}
           {:else}
             {m.settings_providerPath_specifyHint_before()}
@@ -183,9 +186,10 @@
 
       <!-- Status indicator: full (wrapped) auto-detected paths; the primary
            row stays visible when an override is configured, marked as
-           overridden. Dual-binary providers additionally get a read-only
-           labeled runtime row that follows the runtime provider's own
-           configuration. -->
+           overridden. npx-only providers describe the pinned npx launch
+           (the path is npx) instead of an auto-detected adapter. Dual-binary
+           providers additionally get a read-only labeled runtime row that
+           follows the runtime provider's own configuration. -->
       {#snippet autoDetectedRow(command: string | undefined, path: string, overridden: boolean)}
         <div class="text-ui text-subtle min-w-0">
           <p class="flex items-center gap-1 flex-wrap">
@@ -195,7 +199,9 @@
               size="xs"
             />
             <span>
-              {#if command}
+              {#if npxPackage}
+                {m.settings_providerPath_npxPinnedAt({ package: npxPackage })}
+              {:else if command}
                 {m.settings_providerPath_autoDetectedCommandAt({ command })}
               {:else}
                 {m.settings_providerPath_autoDetectedAt()}

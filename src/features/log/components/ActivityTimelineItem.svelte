@@ -64,7 +64,7 @@
 
   const statusColors: Record<Status, string> = {
     success: 'text-green-500',
-    error: 'text-error-foreground',
+    error: 'text-danger',
     pending: 'text-amber-500 animate-spin',
     neutral: '',
   };
@@ -113,7 +113,7 @@
       class="shrink-0 opacity-70 hover:opacity-100 transition-opacity"
       onclick={onAgentClick}
     >
-      <AgentAvatar size={20} {agentId} />
+      <AgentAvatar variant="standard" {agentId} />
     </button>
   {/if}
 </div>

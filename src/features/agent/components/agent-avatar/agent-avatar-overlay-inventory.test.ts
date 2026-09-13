@@ -1,3 +1,5 @@
+// @verify-changed-triggers: src/**/*.svelte
+
 import { readdirSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -29,7 +31,6 @@ const consumerFiles = [
   'src/lib/components/chat/input/EnhancedMentionList.svelte',
   'src/lib/components/file-explorer/VirtualizedFileTree.svelte',
   'src/lib/components/file-tracking/TreeNode.svelte',
-  'src/lib/components/file-tracking/accept-changes/ChangeTimeline.svelte',
   'src/lib/components/layout/panel-system/PanelTabBar.svelte',
   'src/lib/components/notes/primitives/AgentActionBlock.svelte',
   'src/lib/components/notes/primitives/CliBlock.svelte',
@@ -41,7 +42,6 @@ const consumerFiles = [
   'src/lib/components/tiptap/LineAttributionGutter.svelte',
   'src/lib/components/tiptap/TaskAgentStatus.svelte',
   'src/lib/components/tiptap/comments/AgentPeekCard.svelte',
-  'src/lib/components/ui/toast/NotificationNavigateToast.svelte',
   'src/lib/components/workspace/MultiSelectTabbedSidebar.svelte',
   'src/lib/components/workspace/NoteMetadataBar.svelte',
   'src/lib/components/workspace/TaskProgressBar.svelte',
@@ -67,7 +67,6 @@ const canonicalStackConsumers = [
   'src/lib/components/chat/AgentSubscriptions.svelte',
   'src/lib/components/chat/DelegationGroupSection.svelte',
   'src/lib/components/chat/EventWakeupBanner.svelte',
-  'src/lib/components/workspace/WorkspaceHoverCard.svelte',
   'src/lib/components/workspace/MultiSelectTabbedSidebar.svelte',
 ] as const;
 
@@ -87,7 +86,7 @@ function productionSvelteFiles(directory = 'src'): string[] {
 
 describe('agent avatar overlay inventory', () => {
   it('keeps every audited consumer on the icon-free canonical avatar surface', () => {
-    expect(consumerFiles).toHaveLength(51);
+    expect(consumerFiles).toHaveLength(49);
     for (const path of consumerFiles) {
       const contents = source(path);
       expect(contents, path).not.toContain('/auggie-avatar/');
@@ -122,13 +121,13 @@ describe('agent avatar overlay inventory', () => {
     expect(contents).not.toMatch(/<AgentAvatar[\s\S]{0,180}\bsize=/);
   });
 
-  it('keeps every avatar-stack overflow count intrinsic and transparent', () => {
+  it('keeps every avatar-stack overflow count filled and rounded', () => {
     for (const path of overflowFiles) {
       const contents = source(path);
       expect(contents, path).toContain('data-agent-avatar-overflow');
       expect(contents, path).toMatch(/(?:text-xs|font-size:\s*0\.(?:6875|75)rem)/);
-      expect(contents, path).toMatch(/(?:bg-transparent|background:\s*transparent)/);
-      expect(contents, path).not.toMatch(/agent-avatar-overflow[^}]*border-radius/s);
+      expect(contents, path).toMatch(/(?:bg-muted|background:\s*hsl\(var\(--muted\)\))/);
+      expect(contents, path).toMatch(/(?:rounded|border-radius)/);
     }
   });
 
@@ -159,6 +158,8 @@ describe('agent avatar overlay inventory', () => {
     expect(contents).toContain('border-radius: var(--agent-avatar-corner-radius)');
     expect(contents).not.toContain('radial-gradient');
     expect(contents).toContain('z-index: ${index + 1}');
+    expect(contents).toContain('agent-avatar-stack-item--before-overflow');
+    expect(contents).toContain('min-width: var(--agent-avatar-surface-size)');
     expect(contents).toContain('font-size: 0.75rem');
     expect(contents).toContain("x='17' y='-1' width='26' height='26'");
     expect(contents).not.toContain('svelte-fa');

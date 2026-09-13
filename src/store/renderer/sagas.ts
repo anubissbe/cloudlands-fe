@@ -16,6 +16,7 @@ import { agentFailureToastSaga } from './slices/agent-session/sagas/agent-failur
 import { agentMutationSaga } from './slices/agent-session/sagas/agent-mutation-saga';
 import { agentStreamSaga } from './slices/agent-session/sagas/agent-stream-saga';
 import { editRegenerateSaga } from './slices/agent-session/sagas/edit-regenerate-saga';
+import { regenerateFromMessageSaga } from './slices/agent-session/sagas/regenerate-from-message-saga';
 import { agentSubscriptionReadSaga } from './slices/agent-subscription-ui/sagas/agent-subscription-read-saga';
 import { appLayoutNavigationSaga } from './slices/app-layout/sagas/app-layout-navigation-saga';
 import { browserIpcSaga } from './slices/app-layout/sagas/browser-ipc-saga';
@@ -24,11 +25,12 @@ import { autoUpdateSaga } from './slices/auto-update/sagas/auto-update-saga';
 import { backgroundAgentSettingsSaga } from './slices/background-agent-settings/sagas/background-agent-settings-saga';
 import { backgroundHooksSaga } from './slices/background-hooks/sagas/background-hooks-saga';
 import { browserPersistenceSaga } from './slices/browser/sagas/browser-persistence-saga';
+import { browserClientsSaga } from './slices/browser-clients/sagas/browser-clients-saga';
 import { chatReadSaga } from './slices/chat-state/sagas/chat-read-saga';
 import { chatScrollbackSaga } from './slices/chat-state/sagas/chat-scrollback-saga';
 import { chatSendSaga } from './slices/chat-state/sagas/chat-send-saga';
 import { chatSubscribeSaga } from './slices/chat-state/sagas/chat-subscribe-saga';
-import { bootFallbackToastSaga } from './slices/connections/sagas/boot-fallback-toast-saga';
+import { switchTimingSaga } from './slices/chat-state/sagas/switch-timing-saga';
 import { connectionsSaga } from './slices/connections/sagas/connections-saga';
 import { contextSaga } from './slices/context/sagas/context-saga';
 import { daemonHealthSaga } from './slices/daemon-health/sagas/daemon-health-saga';
@@ -40,6 +42,7 @@ import { filesReadSaga } from './slices/files/sagas/files-read-saga';
 import { filesWriteSaga } from './slices/files/sagas/files-write-saga';
 import { gitEventsIpcSaga } from './slices/git-events/sagas/git-events-ipc-saga';
 import { gitReadSaga } from './slices/git/sagas/git-read-saga';
+import { acceptChangesStatusSaga } from './slices/git/sagas/accept-changes-status-saga';
 import { gitRootsSaga } from './slices/git-roots/sagas/git-roots-saga';
 import { githubAuthSaga } from './slices/github-auth/sagas/github-auth-saga';
 import { githubRepoSearchSaga } from './slices/github-repo-search/sagas/github-repo-search-saga';
@@ -55,25 +58,35 @@ import { mcpSettingsSaga } from './slices/mcp-settings/sagas/mcp-settings-saga';
 import { modelBootSaga } from './slices/model/sagas/model-boot-saga';
 import { modelReloadSaga } from './slices/model/sagas/model-reload-saga';
 import { modelSelectionSaga } from './slices/model/sagas/model-selection-saga';
+import { noteReadTrackingSaga } from './slices/note-read-tracking/sagas/note-read-tracking-saga';
 import {
   notificationIpcSaga,
   webNotificationSaga,
 } from './slices/notifications/sagas/notifications-saga';
+import { browserTabRegistrySaga } from './slices/panel-layout/sagas/browser-tab-registry-saga';
 import { panelLayoutSaga } from './slices/panel-layout/sagas/panel-layout-saga';
 import { permissionResponseSaga } from './slices/permission/sagas/permission-response-saga';
+import { proposalLifecycleSaga } from './slices/proposal-lifecycle/sagas/proposal-lifecycle-saga';
 import { providerSettingsSaga } from './slices/provider-settings/sagas/provider-settings-saga';
+import { antigravitySetupSaga } from './slices/antigravity-setup/sagas/antigravity-setup-saga';
 import { prMonitorSaga } from './slices/pr-monitor/sagas/pr-monitor-saga';
 import { releaseNotesSaga } from './slices/release-notes/sagas/release-notes-saga';
 import { sentryAuthSaga } from './slices/sentry-auth/sagas/sentry-auth-saga';
 import { scriptsOperationSaga } from './slices/scripts/sagas/scripts-operation-saga';
 import { settingsHydrationSaga } from './slices/settings-events/sagas/settings-hydration-saga';
+import { settingsProposalHistorySaga } from './slices/settings-proposal-history/sagas/settings-proposal-history-saga';
 import { setupPromptSaga } from './slices/setup-prompt/sagas/setup-prompt-saga';
 import { sidebarNavSaga } from './slices/sidebar-nav/sagas/sidebar-nav-saga';
+import { specialistProposalHistorySaga } from './slices/specialist-proposal-history/sagas/specialist-proposal-history-saga';
 import { specialistsSaga } from './slices/specialists/sagas/specialists-saga';
 import { statsReadSaga } from './slices/stats/sagas/stats-read-saga';
 import { tabStateSaga } from './slices/tab-state/sagas/tab-state-saga';
+import { workspaceTabReconciliationSaga } from './slices/tab-state/sagas/workspace-tab-reconciliation-saga';
 import { workspaceTabCleanupSaga } from './slices/workspace-lifecycle/sagas/workspace-tab-cleanup-saga';
+import { workspaceLoadSaga } from './slices/workspace-lifecycle/sagas/workspace-load-saga';
+import { workspaceReconnectSaga } from './slices/workspace-lifecycle/sagas/workspace-reconnect-saga';
 import { taskAgentAssociationsSaga } from './slices/task-agent-associations/sagas/task-agent-associations-saga';
+import { terminalCommandsSaga } from './slices/terminals/sagas/terminal-commands-saga';
 import { terminalPersistenceSaga } from './slices/terminals/sagas/terminal-persistence-saga';
 import { themeSaga } from './slices/theme/sagas/theme-saga';
 import { uiLayoutPersistenceSaga } from './slices/ui-layout/sagas/ui-layout-persistence-saga';
@@ -117,7 +130,6 @@ export const sagas = [
   daemonEventsSaga,
   daemonHealthSaga,
   connectionsSaga,
-  bootFallbackToastSaga,
   settingsHydrationSaga,
   activeStreamsSaga,
   agentReadSaga,
@@ -126,18 +138,22 @@ export const sagas = [
   chatSubscribeSaga,
   chatSendSaga,
   chatScrollbackSaga,
+  switchTimingSaga,
   permissionResponseSaga,
   agentStreamSaga,
   agentCreationSaga,
   backgroundExecutorSaga,
   agentMutationSaga,
   editRegenerateSaga,
+  regenerateFromMessageSaga,
   agentFailureToastSaga,
   gitReadSaga,
+  acceptChangesStatusSaga,
   fileExplorerSaga,
   filesReadSaga,
   filesWriteSaga,
   workspaceNotesSaga,
+  noteReadTrackingSaga,
   contextSaga,
   taskAgentAssociationsSaga,
   appLayoutNavigationSaga,
@@ -149,9 +165,12 @@ export const sagas = [
   scriptsOperationSaga,
   lifecycleReadSaga,
   lifecycleIpcReadSaga,
+  workspaceLoadSaga,
+  workspaceReconnectSaga,
   modelSelectionSaga,
   backgroundAgentSettingsSaga,
   providerSettingsSaga,
+  antigravitySetupSaga,
   modelBootSaga,
   modelReloadSaga,
   providerAvailabilitySaga,
@@ -163,6 +182,9 @@ export const sagas = [
   themeSaga,
   autoUpdateSaga,
   specialistsSaga,
+  proposalLifecycleSaga,
+  settingsProposalHistorySaga,
+  specialistProposalHistorySaga,
   githubAuthSaga,
   githubRepoSearchSaga,
   sentryAuthSaga,
@@ -175,14 +197,18 @@ export const sagas = [
   gitRootsSaga,
   uiLayoutPersistenceSaga,
   tabStateSaga,
+  workspaceTabReconciliationSaga,
   workspaceTabCleanupSaga,
   sidebarNavSaga,
   panelLayoutSaga,
+  browserTabRegistrySaga,
   unreadTrackingSaga,
   releaseNotesSaga,
   browserPersistenceSaga,
+  browserClientsSaga,
   fileContentPruneSaga,
   terminalPersistenceSaga,
+  terminalCommandsSaga,
   externalEditorsPersistenceSaga,
   workspaceSettingsSaga,
   updateChannelSaga,

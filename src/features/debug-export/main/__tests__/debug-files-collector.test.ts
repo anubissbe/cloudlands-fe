@@ -6,6 +6,7 @@
 import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { app } from 'electron';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const sidecarMock = vi.hoisted(() => ({
@@ -139,6 +140,29 @@ describe('intentd daemon log collection', () => {
   });
 });
 
+describe('renderer lifecycle telemetry export', () => {
+  it('includes persisted late-session lifecycle records from renderer.log', async () => {
+    const logsDir = path.join(app.getPath('userData'), 'logs');
+    const rendererLog = path.join(logsDir, 'renderer.log');
+    await fs.mkdir(logsDir, { recursive: true });
+    await fs.writeFile(
+      rendererLog,
+      '{"message":"stream-lifecycle","event":"agent-failed-received"}\n',
+      'utf8',
+    );
+
+    try {
+      const result = await collectDebugFiles();
+      expect(result.files).toContainEqual({
+        sourcePath: rendererLog,
+        relativePath: path.join('logs', 'renderer.log'),
+      });
+    } finally {
+      await fs.unlink(rendererLog).catch(() => {});
+    }
+  });
+});
+
 describe('sidecar run log collection', () => {
   it('includes the last run record as a content entry when available', async () => {
     sidecarMock.runLog = {
@@ -163,9 +187,7 @@ describe('sidecar run log collection', () => {
   it('records an omission when no sidecar run was captured', async () => {
     const { files, omissions } = await collectDebugFiles();
     expect(files.some((f) => f.relativePath.endsWith('sidecar-run-log.json'))).toBe(false);
-    expect(
-      omissions.some((o) => o.startsWith('intentd/sidecar-run-log.json: skipped')),
-    ).toBe(true);
+    expect(omissions.some((o) => o.startsWith('intentd/sidecar-run-log.json: skipped'))).toBe(true);
   });
 });
 
@@ -215,7 +237,6 @@ describe('copyDebugFile', () => {
   });
 });
 
-
 describe('resolveIntentdDataDir', () => {
   it('honors INTENTD_DATA_DIR', () => {
     expect(resolveIntentdDataDir({ INTENTD_DATA_DIR: '/custom/data ' }, 'darwin')).toBe(
@@ -260,7 +281,12 @@ describe('resolveIntentdDataDir', () => {
 describe('memory metrics collection', () => {
   const MB = 1024 * 1024;
 
-  function processSample(pid: number, kind: ProcessMemorySample['kind'], rssMB: number, name?: string): ProcessMemorySample {
+  function processSample(
+    pid: number,
+    kind: ProcessMemorySample['kind'],
+    rssMB: number,
+    name?: string,
+  ): ProcessMemorySample {
     return { pid, kind, rssBytes: rssMB * MB, ...(name === undefined ? {} : { name }) };
   }
 
@@ -302,14 +328,24 @@ describe('memory metrics collection', () => {
 
   it('reports a peak that has already drained by capture time', async () => {
     const { recordMemorySample } = await import('../../../../main/memory-monitor');
-    recordMemorySample(snapshotWith([processSample(90, 'agent', 16_000, 'claude')]), '2026-08-12T00:00:00.000Z');
+    recordMemorySample(
+      snapshotWith([processSample(90, 'agent', 16_000, 'claude')]),
+      '2026-08-12T00:00:00.000Z',
+    );
     memoryMock.snapshot = snapshotWith([processSample(90, 'agent', 10, 'claude')]);
 
     const { metrics } = await collectMemoryMetrics();
 
     expect(metrics.capturedAt.byKind.agent.rssBytes).toBe(10 * MB);
-    expect(metrics.peaks.byKind.agent).toEqual({ rssBytes: 16_000 * MB, at: '2026-08-12T00:00:00.000Z' });
-    expect(metrics.peaks.singleProcess).toMatchObject({ pid: 90, name: 'claude', rssBytes: 16_000 * MB });
+    expect(metrics.peaks.byKind.agent).toEqual({
+      rssBytes: 16_000 * MB,
+      at: '2026-08-12T00:00:00.000Z',
+    });
+    expect(metrics.peaks.singleProcess).toMatchObject({
+      pid: 90,
+      name: 'claude',
+      rssBytes: 16_000 * MB,
+    });
   });
 
   it('keeps the retained window when the capture-time sample fails, and records the omission', async () => {
@@ -319,7 +355,10 @@ describe('memory metrics collection', () => {
     vi.useFakeTimers();
     try {
       vi.setSystemTime(new Date('2026-08-12T00:00:00.000Z'));
-      recordMemorySample(snapshotWith([processSample(90, 'agent', 5_000, 'claude')]), '2026-08-12T00:00:00.000Z');
+      recordMemorySample(
+        snapshotWith([processSample(90, 'agent', 5_000, 'claude')]),
+        '2026-08-12T00:00:00.000Z',
+      );
       memoryMock.snapshot = null;
 
       const { metrics, memorySnapshot, omissions } = await collectMemoryMetrics();
@@ -329,7 +368,9 @@ describe('memory metrics collection', () => {
       expect(metrics.peaks.total.rssBytes).toBe((330 + 719 + 200 + 5_000) * MB);
       expect(memorySnapshot).toBeNull();
       expect(
-        omissions.some((o) => o.startsWith('memory-metrics.json: capture-time snapshot unavailable')),
+        omissions.some((o) =>
+          o.startsWith('memory-metrics.json: capture-time snapshot unavailable'),
+        ),
       ).toBe(true);
     } finally {
       vi.useRealTimers();
@@ -340,7 +381,10 @@ describe('memory metrics collection', () => {
     const { recordMemorySample } = await import('../../../../main/memory-monitor');
     vi.useFakeTimers();
     try {
-      recordMemorySample(snapshotWith([processSample(90, 'agent', 16_000, 'claude')]), '2026-08-12T00:00:00.000Z');
+      recordMemorySample(
+        snapshotWith([processSample(90, 'agent', 16_000, 'claude')]),
+        '2026-08-12T00:00:00.000Z',
+      );
       // Suspended well past the retention window, and the capture also fails
       vi.setSystemTime(new Date(Date.parse('2026-08-12T00:00:00.000Z') + 48 * 60 * 60 * 1000));
       memoryMock.snapshot = null;

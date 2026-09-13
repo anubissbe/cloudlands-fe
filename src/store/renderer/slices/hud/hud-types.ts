@@ -90,7 +90,7 @@ export function isWaitingWireStatus(status: string): boolean {
  * clears it, so treating it as attention would flag genuinely idle workspaces
  * (no pending question/blocker/discussion) as NEEDS ATTENTION. `none` clears.
  */
-export const HUD_ATTENTION_VALUES = ['review_required'] as const;
+const HUD_ATTENTION_VALUES = ['review_required'] as const;
 
 /** Whether a wire attention value constitutes HUD attention (see allowlist). */
 export function isHudAttentionValue(value: string): boolean {
@@ -124,6 +124,7 @@ export const HUD_CARD_STATE_KEYS = [
   'in_progress',
   'pr_open',
   'pr_ready',
+  'pr_queued',
   'pr_merged',
   'wait',
   'blocked',

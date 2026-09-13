@@ -1,6 +1,7 @@
 import type { StoreState } from '$store/renderer/types';
 import {
   closeWorkspaceTab,
+  moveWorkspace,
   reopenLastClosedWorkspaceTab,
   switchToWorkspaceTabByIndex,
   switchToNextWorkspaceTab,
@@ -10,18 +11,18 @@ import {
   selectCurrentWorkspaceTabId,
   selectLastClosedWorkspaceTab,
   selectWorkspaceTabOrder,
-  selectWorkspaceViewMode,
 } from '$store/renderer/slices/tab-state/tab-state-selectors';
 import {
-  closePanel,
-  closeActiveTab,
+  closeFocusedPanelTab,
   openBlankWorkingPanel,
+  reopenClosedPanelColumn,
   reopenClosedTab,
 } from '$store/renderer/slices/panel-layout/panel-layout-slice';
-import { selectPanelStackDirection } from '$store/renderer/slices/user-preferences/user-preferences-selectors';
 import {
-  selectPanels,
+  selectPanelColumnCount,
+  selectFocusedPanel,
   selectFocusedPanelId,
+  selectLastClosedPanelColumn,
   selectRecentlyClosed,
 } from '$store/renderer/slices/panel-layout/panel-layout-selectors';
 import { selectWorkspaceItems } from '$store/renderer/slices/workspace/workspace-selectors';
@@ -30,31 +31,11 @@ import { resolveEmptyWindowDestination } from './empty-window-destination';
 import type { KeyboardShortcut } from '$lib/utils/keyboardShortcuts';
 import { m } from '$shared/paraglide/messages.js';
 import { SHORTCUTS, getShortcutChord } from '$lib/utils/shortcuts';
-import { isWorkspaceViewModeRoute } from '$features/workspace/workspace-view-mode-action';
+import type { ShortcutId } from '$lib/utils/shortcut-bindings';
+import { getPanelKeyboardShortcuts } from '$features/layout/panel-keyboard-shortcuts.svelte';
+import type { WorkspaceTabMovedEventDetail } from './workspace-tab-move-event';
 
 export type WorkspaceTabDirection = 'next' | 'previous';
-
-export function findAdjacentWorkspaceColumnId(
-  stacks: string[][],
-  currentWorkspaceId: string,
-  direction: WorkspaceTabDirection,
-): string | null {
-  const navigableStacks = stacks
-    .map((stack) => stack.filter((workspaceId) => workspaceId !== 'new'))
-    .filter((stack) => stack.length > 0);
-  if (navigableStacks.length < 2) return null;
-  const currentStackIndex = navigableStacks.findIndex((stack) =>
-    stack.includes(currentWorkspaceId),
-  );
-  if (currentStackIndex < 0) return null;
-
-  const currentRowIndex = navigableStacks[currentStackIndex].indexOf(currentWorkspaceId);
-  const offset = direction === 'next' ? 1 : -1;
-  const targetStackIndex =
-    (currentStackIndex + offset + navigableStacks.length) % navigableStacks.length;
-  const targetStack = navigableStacks[targetStackIndex];
-  return targetStack?.[Math.min(currentRowIndex, targetStack.length - 1)] ?? null;
-}
 
 interface WorkspaceTabNavigationStore {
   readonly state: StoreState;
@@ -64,16 +45,36 @@ interface WorkspaceTabNavigationStore {
       | ReturnType<typeof switchToPreviousWorkspaceTab>
       | ReturnType<typeof switchToWorkspaceTabByIndex>
       | ReturnType<typeof closeWorkspaceTab>
+      | ReturnType<typeof moveWorkspace>
       | ReturnType<typeof reopenLastClosedWorkspaceTab>
-      | ReturnType<typeof closePanel>
-      | ReturnType<typeof closeActiveTab>
+      | ReturnType<typeof closeFocusedPanelTab>
       | ReturnType<typeof openBlankWorkingPanel>
+      | ReturnType<typeof reopenClosedPanelColumn>
       | ReturnType<typeof reopenClosedTab>
       | ReturnType<typeof toggleSidebar>,
   ): unknown;
 }
 
 type RegisterShortcut = (shortcut: KeyboardShortcut) => void;
+
+export type WorkspaceTabMoveDirection = 'left' | 'right';
+
+export function moveActiveWorkspaceTab(
+  store: WorkspaceTabNavigationStore,
+  direction: WorkspaceTabMoveDirection,
+): string | null {
+  const order = selectWorkspaceTabOrder.select(store.state);
+  const workspaceId = selectCurrentWorkspaceTabId.select(store.state);
+  if (!workspaceId) return null;
+  const currentIndex = order.indexOf(workspaceId);
+  const targetIndex = currentIndex + (direction === 'left' ? -1 : 1);
+  const targetWorkspaceId = order[targetIndex];
+  if (currentIndex < 0 || !targetWorkspaceId) return null;
+  store.dispatch(
+    moveWorkspace(workspaceId, targetWorkspaceId, direction === 'left' ? 'before' : 'after'),
+  );
+  return workspaceId;
+}
 
 interface RegisterWorkspaceTabShortcutsOptions {
   isMac: boolean;
@@ -82,7 +83,8 @@ interface RegisterWorkspaceTabShortcutsOptions {
   getCurrentPath: () => string;
   navigate: (path: string) => unknown;
   openNewWorkspace: () => void;
-  toggleWorkspaceViewMode: () => void;
+  onWorkspaceTabMoved?: (detail: WorkspaceTabMovedEventDetail) => void;
+  resolveBinding?: (id: ShortcutId) => string;
 }
 
 function navigateToSelectedWorkspace(
@@ -109,18 +111,15 @@ function closeWorkspaceTabById(
   return workspaceId;
 }
 
-function resolveCloseTarget(
+function resolveWorkspaceTabToClose(
   store: WorkspaceTabNavigationStore,
   currentPath: string,
-): { workspaceId: string; layoutId: string } | null {
-  if (selectWorkspaceViewMode.select(store.state) === 'columns') {
-    const workspaceId = selectCurrentWorkspaceTabId.select(store.state);
-    return workspaceId ? { workspaceId, layoutId: workspaceId } : null;
-  }
-
+): string | null {
   const match = currentPath.match(/^\/workspace\/([^/]+)/);
   const workspaceId = match?.[1];
-  return workspaceId && workspaceId !== 'new' ? { workspaceId, layoutId: workspaceId } : null;
+  if (workspaceId) return workspaceId === 'new' ? null : workspaceId;
+
+  return null;
 }
 
 export function cycleWorkspaceTab(
@@ -145,44 +144,36 @@ export function closeActiveWorkspaceTab(
   currentPath: string,
   navigate: (path: string) => unknown,
 ): string | null {
-  const match = currentPath.match(/^\/workspace\/([^/]+)/);
-  const workspaceId = match?.[1];
-  if (!workspaceId || workspaceId === 'new') return null;
+  const workspaceId = resolveWorkspaceTabToClose(store, currentPath);
+  if (!workspaceId) return null;
 
   return closeWorkspaceTabById(store, workspaceId, currentPath, navigate);
 }
 
-/**
- * Contextual Cmd+W: close the focused panel first; when only one panel
- * remains, close its tabs; once nothing is open, close the workspace tab.
- */
-export function closePanelOrWorkspaceTab(
+/** Close focused content, or remove its already-empty structural column. */
+export function closeActivePanelTab(
   store: WorkspaceTabNavigationStore,
   currentPath: string,
-  navigate: (path: string) => unknown,
-): 'panel' | 'tab' | 'workspace' | null {
-  const target = resolveCloseTarget(store, currentPath);
-  if (!target) return null;
-  const { workspaceId, layoutId } = target;
+  availableCanvasWidth?: number,
+): string | null {
+  const workspaceId = resolveWorkspaceTabToClose(store, currentPath);
+  if (!workspaceId) return null;
 
-  const panels = selectPanels.select(store.state, layoutId);
-  const panelIds = Object.keys(panels);
-  const focusedPanelId = selectFocusedPanelId.select(store.state, layoutId);
+  const panel = selectFocusedPanel.select(store.state, workspaceId);
+  if (!panel) return null;
 
-  if (panelIds.length > 1) {
-    const targetId = focusedPanelId && panels[focusedPanelId] ? focusedPanelId : panelIds[0];
-    store.dispatch(closePanel(layoutId, targetId));
-    return 'panel';
-  }
+  const activeTab = panel.tabs.find((tab) => tab.id === panel.activeTabId);
+  const isEmpty = panel.tabs.length === 0 && panel.activeTabId === null;
+  const canRemoveEmptyColumn =
+    isEmpty && selectPanelColumnCount.select(store.state, workspaceId) > 1;
+  if ((!activeTab || activeTab.closable === false) && !canRemoveEmptyColumn) return null;
 
-  const lastPanel = (focusedPanelId ? panels[focusedPanelId] : undefined) ?? panels[panelIds[0]];
-  if (lastPanel && lastPanel.tabs.length > 0) {
-    store.dispatch(closeActiveTab(layoutId, lastPanel.id));
-    return 'tab';
-  }
-
-  closeWorkspaceTabById(store, workspaceId, currentPath, navigate);
-  return 'workspace';
+  const measuredWidth =
+    availableCanvasWidth ??
+    getPanelKeyboardShortcuts(workspaceId)?.availableCanvasWidth ??
+    undefined;
+  store.dispatch(closeFocusedPanelTab(workspaceId, undefined, measuredWidth));
+  return activeTab?.id ?? panel.id;
 }
 
 export function reopenWorkspaceTab(
@@ -195,15 +186,14 @@ export function reopenWorkspaceTab(
 }
 
 /**
- * Contextual Cmd+Shift+T: reopen whichever closed most recently — a panel tab
- * (including tabs recorded when a whole panel closed) or a workspace tab —
- * by comparing close timestamps across both slices.
+ * Contextual Cmd+Shift+T: reopen the newest panel column, panel tab, or
+ * workspace tab by comparing close timestamps across both slices.
  */
 export function reopenPanelOrWorkspaceTab(
   store: WorkspaceTabNavigationStore,
   currentPath: string,
   navigate: (path: string) => unknown,
-): 'tab' | 'workspace' | null {
+): 'column' | 'tab' | 'workspace' | null {
   const match = currentPath.match(/^\/workspace\/([^/]+)/);
   const workspaceId = match && match[1] !== 'new' ? match[1] : null;
 
@@ -211,14 +201,28 @@ export function reopenPanelOrWorkspaceTab(
   const lastClosedPanelTab = workspaceId
     ? (selectRecentlyClosed.select(store.state, workspaceId)[0] ?? null)
     : null;
+  const lastClosedPanelColumn = workspaceId
+    ? selectLastClosedPanelColumn.select(store.state, workspaceId)
+    : null;
+  const lastPanelClose =
+    lastClosedPanelColumn &&
+    (!lastClosedPanelTab || lastClosedPanelColumn.closedAt >= lastClosedPanelTab.closedAt)
+      ? { kind: 'column' as const, closedAt: lastClosedPanelColumn.closedAt }
+      : lastClosedPanelTab
+        ? { kind: 'tab' as const, closedAt: lastClosedPanelTab.closedAt }
+        : null;
 
   if (
     workspaceId &&
-    lastClosedPanelTab &&
-    (!lastClosedWorkspace || lastClosedPanelTab.closedAt >= lastClosedWorkspace.closedAt)
+    lastPanelClose &&
+    (!lastClosedWorkspace || lastPanelClose.closedAt >= lastClosedWorkspace.closedAt)
   ) {
+    if (lastPanelClose.kind === 'column') {
+      store.dispatch(reopenClosedPanelColumn(workspaceId));
+      return 'column';
+    }
     store.dispatch(reopenClosedTab(workspaceId));
-    return 'tab';
+    return lastPanelClose.kind;
   }
 
   if (lastClosedWorkspace) {
@@ -229,9 +233,7 @@ export function reopenPanelOrWorkspaceTab(
   return null;
 }
 
-/**
- * Cmd+T: clear or create the reusable working panel on the current workspace route.
- */
+/** Cmd+T: insert a pristine blank column immediately right of the focused column. */
 export function openNewPanel(
   store: WorkspaceTabNavigationStore,
   currentPath: string,
@@ -240,11 +242,7 @@ export function openNewPanel(
   const workspaceId = match && match[1] !== 'new' ? match[1] : null;
   if (!workspaceId) return null;
 
-  const action = openBlankWorkingPanel(
-    workspaceId,
-    undefined,
-    selectPanelStackDirection.select(store.state),
-  );
+  const action = openBlankWorkingPanel(workspaceId);
   store.dispatch(action);
   return selectFocusedPanelId.select(store.state, workspaceId);
 }
@@ -270,14 +268,17 @@ export function registerWorkspaceTabShortcuts({
   getCurrentPath,
   navigate,
   openNewWorkspace,
-  toggleWorkspaceViewMode,
+  onWorkspaceTabMoved,
+  resolveBinding,
 }: RegisterWorkspaceTabShortcutsOptions): void {
   const mod = isMac ? { meta: true } : { ctrl: true };
   const sidebarChord = getShortcutChord('TOGGLE_SIDEBAR', isMac);
-  const workspaceViewModeChord = getShortcutChord('WORKSPACE_VIEW_MODE', isMac);
   const withRoute = (action: (currentPath: string) => unknown) => () => action(getCurrentPath());
+  const effective = (id: ShortcutId) =>
+    resolveBinding ? { binding: () => resolveBinding(id) } : {};
 
   register({
+    ...effective('global.new-space'),
     ...mod,
     key: 'n',
     global: true,
@@ -285,19 +286,14 @@ export function registerWorkspaceTabShortcuts({
     action: openNewWorkspace,
   });
   register({
+    ...effective('panel.toggle-sidebar'),
     ...sidebarChord,
     global: true,
     description: SHORTCUTS.TOGGLE_SIDEBAR.label,
     action: () => store.dispatch(toggleSidebar()),
   });
   register({
-    ...workspaceViewModeChord,
-    description: SHORTCUTS.WORKSPACE_VIEW_MODE.label,
-    ignoreRepeat: true,
-    enabled: () => isWorkspaceViewModeRoute(getCurrentPath()),
-    action: toggleWorkspaceViewMode,
-  });
-  register({
+    ...effective('navigation.new-tab'),
     ...mod,
     key: 't',
     global: true,
@@ -305,13 +301,24 @@ export function registerWorkspaceTabShortcuts({
     action: withRoute((path) => openNewPanel(store, path)),
   });
   register({
+    ...effective('navigation.close-tab'),
     ...mod,
     key: 'w',
     global: true,
-    description: m.workspace_shortcuts_closePanelTabOrSpace_description(),
-    action: withRoute((path) => closePanelOrWorkspaceTab(store, path, navigate)),
+    description: m.workspace_shortcuts_closePanelTab_description(),
+    action: withRoute((path) => closeActivePanelTab(store, path)),
   });
   register({
+    ...effective('navigation.close-space-tab'),
+    ...mod,
+    key: 'w',
+    shift: true,
+    global: true,
+    description: m.workspace_shortcuts_closeSpaceTab_description(),
+    action: withRoute((path) => closeActiveWorkspaceTab(store, path, navigate)),
+  });
+  register({
+    ...effective('navigation.reopen-tab'),
     ...mod,
     key: 't',
     shift: true,
@@ -320,11 +327,47 @@ export function registerWorkspaceTabShortcuts({
     action: withRoute((path) => reopenPanelOrWorkspaceTab(store, path, navigate)),
   });
 
+  register({
+    ...effective('navigation.move-space-tab-left'),
+    ...mod,
+    key: 'ArrowLeft',
+    alt: true,
+    shift: true,
+    global: true,
+    description: SHORTCUTS.MOVE_SPACE_TAB_LEFT.label,
+    action: () => {
+      const workspaceId = moveActiveWorkspaceTab(store, 'left');
+      if (!workspaceId) return;
+      onWorkspaceTabMoved?.({
+        workspaceId,
+        position: selectWorkspaceTabOrder.select(store.state).indexOf(workspaceId) + 1,
+      });
+    },
+  });
+  register({
+    ...effective('navigation.move-space-tab-right'),
+    ...mod,
+    key: 'ArrowRight',
+    alt: true,
+    shift: true,
+    global: true,
+    description: SHORTCUTS.MOVE_SPACE_TAB_RIGHT.label,
+    action: () => {
+      const workspaceId = moveActiveWorkspaceTab(store, 'right');
+      if (!workspaceId) return;
+      onWorkspaceTabMoved?.({
+        workspaceId,
+        position: selectWorkspaceTabOrder.select(store.state).indexOf(workspaceId) + 1,
+      });
+    },
+  });
+
   for (const [direction, shift] of [
     ['next', false],
     ['previous', true],
   ] as const) {
     register({
+      ...effective(direction === 'next' ? 'global.next-space' : 'global.previous-space'),
       key: 'Tab',
       ctrl: true,
       shift,
@@ -339,6 +382,14 @@ export function registerWorkspaceTabShortcuts({
 
   for (let digit = 1; digit <= 9; digit++) {
     register({
+      ...(resolveBinding
+        ? {
+            binding: () => {
+              const pattern = resolveBinding('navigation.go-to-tab');
+              return pattern.replace(/([1-8])-9$/, String(digit));
+            },
+          }
+        : {}),
       ...mod,
       key: String(digit),
       global: true,

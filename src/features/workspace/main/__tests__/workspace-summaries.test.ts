@@ -1,10 +1,4 @@
-import {
-  beforeEach,
-  describe,
-  expect,
-  it,
-  vi,
-} from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Note, WorkspaceId } from '../../../../shared/types';
 
 const mocks = vi.hoisted(() => ({
@@ -54,11 +48,22 @@ describe('getWorkspaceTasks', () => {
       // Non-task note is excluded
       makeTaskNote('plain-note', { metadata: {} } as Partial<Note>),
     ];
-    mocks.request.mockResolvedValue({ notes });
+    mocks.request.mockImplementation((method: string) =>
+      method === 'note.list'
+        ? Promise.resolve({ notes })
+        : Promise.resolve({ note: makeTaskNote('spec', { metadata: {} } as Partial<Note>) }),
+    );
 
     const tasks = await getWorkspaceTasks(WORKSPACE_ID);
 
-    expect(mocks.request).toHaveBeenCalledWith('note.list', { workspaceId: WORKSPACE_ID });
+    expect(mocks.request).toHaveBeenCalledWith('note.list', {
+      workspaceId: WORKSPACE_ID,
+      projection: 'slim',
+    });
+    expect(mocks.request).toHaveBeenCalledWith('note.get', {
+      workspaceId: WORKSPACE_ID,
+      noteId: 'spec',
+    });
     expect(tasks).toEqual([
       {
         id: 'task-1',
@@ -111,4 +116,3 @@ describe('getWorkspaceTasks', () => {
     await expect(getWorkspaceTasks(WORKSPACE_ID)).rejects.toThrow('notes unavailable');
   });
 });
-

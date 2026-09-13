@@ -15,7 +15,7 @@ export interface ValidationResult {
   suggestion?: string;
 }
 
-export interface DirectoryStatus {
+interface DirectoryStatus {
   exists: boolean;
   isDirectory: boolean;
   isEmpty: boolean;
@@ -62,7 +62,7 @@ export async function validateRepoPath(
 /**
  * Check if a string looks like a GitHub URL
  */
-export function isGitHubUrl(url: string): boolean {
+function isGitHubUrl(url: string): boolean {
   const patterns = [
     /^https?:\/\/github\.com\//i,
     /^git@github\.com:/i,
@@ -81,22 +81,24 @@ export function parseGitHubUrl(url: string): { owner: string; repo: string } | n
 
   // Handle various GitHub URL formats
   const patterns = [
-    /^https?:\/\/github\.com\/([^\/]+)\/([^\/\.]+)(\.git)?$/i,
-    /^git@github\.com:([^\/]+)\/([^\/\.]+)(\.git)?$/i,
-    /^github\.com\/([^\/]+)\/([^\/\.]+)(\.git)?$/i,
+    /^https?:\/\/github\.com\/([^\/]+)\/([^\/]+)$/i,
+    /^git@github\.com:([^\/]+)\/([^\/]+)$/i,
+    /^github\.com\/([^\/]+)\/([^\/]+)$/i,
   ];
 
   for (const pattern of patterns) {
     const match = trimmed.match(pattern);
     if (match) {
-      return { owner: match[1], repo: match[2].replace(/\.git$/, '') };
+      const repo = match[2].replace(/\.git$/, '');
+      return repo ? { owner: match[1], repo } : null;
     }
   }
 
   // Check for simple owner/repo format
   const simpleMatch = trimmed.match(/^([a-zA-Z0-9\-_]+)\/([a-zA-Z0-9\-_\.]+)$/);
   if (simpleMatch && !trimmed.includes('\\') && !trimmed.includes(':')) {
-    return { owner: simpleMatch[1], repo: simpleMatch[2] };
+    const repo = simpleMatch[2].replace(/\.git$/, '');
+    return repo ? { owner: simpleMatch[1], repo } : null;
   }
 
   return null;
@@ -426,31 +428,6 @@ export function validateBranchName(branch: string): ValidationResult {
   }
 
   return { valid: true };
-}
-
-/**
- * Sanitize a branch name to make it valid
- */
-export function sanitizeBranchName(branch: string): string {
-  return branch
-    .trim()
-    .replace(/[\s~^:?*\[\]\\]/g, '-') // Replace invalid chars with hyphen
-    .replace(/\.{2,}/g, '-') // Replace consecutive dots
-    .replace(/\/{2,}/g, '/') // Replace consecutive slashes
-    .replace(/^\/|\/$/g, '') // Remove leading/trailing slashes
-    .replace(/\.lock$/, '') // Remove .lock suffix
-    .replace(/-{2,}/g, '-') // Replace multiple hyphens with single
-    .toLowerCase();
-}
-
-/**
- * Generate a unique workspace branch name
- */
-export function generateWorkspaceBranchName(baseBranch?: string): string {
-  const timestamp = Date.now();
-  const random = Math.random().toString(36).substring(2, 8);
-  const base = baseBranch ? sanitizeBranchName(baseBranch) : 'workspace';
-  return `${base}-${timestamp}-${random}`;
 }
 
 /**

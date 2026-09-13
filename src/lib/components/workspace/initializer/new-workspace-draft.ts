@@ -1,8 +1,10 @@
 /**
- * New Workspace modal draft persistence via the daemon drafts API
- * (PROTOCOL §5.16 `drafts.*`).
+ * New Workspace draft persistence via the daemon drafts API
+ * (PROTOCOL §5.16 `drafts.*`), shared by the New Workspace modal and the
+ * onboarding page (both draft the first prompt for a workspace that does not
+ * exist yet).
  *
- * The modal drafts a prompt + image attachments before any workspace or agent
+ * The prompt + image attachments are drafted before any workspace or agent
  * exists, so the draft is keyed under the reserved sentinel IDs documented in
  * PROTOCOL §5.16 ("Opaque keys & reserved sentinels"). The daemon treats draft
  * keys as opaque, and the `__…__` form cannot collide with real workspace IDs
@@ -26,6 +28,10 @@ export const NEW_WORKSPACE_DRAFT_AGENT_ID = '__initializer__';
 
 /** Legacy sessionStorage text-draft key — read once for migration, then removed. */
 export const LEGACY_PROMPT_SESSION_KEY = 'compact-workspace-initializer-state-prompt';
+
+/** Legacy onboarding-page sessionStorage text-draft key — read once for
+ * migration, then removed. */
+export const LEGACY_ONBOARDING_PROMPT_SESSION_KEY = 'onboarding-prompt';
 
 /**
  * Size guard for the serialized draft payload (text + attachments combined):
@@ -56,24 +62,26 @@ export type NewWorkspaceDraftRestore =
   | { status: 'error' };
 
 /**
- * Restore the modal draft from the daemon. When the daemon has no draft,
- * falls back once to the legacy sessionStorage text draft: the legacy value
- * is persisted to the daemon immediately (fire-and-forget `drafts.set`) and
- * the key removed, so the one-time migration does not depend on the caller's
- * debounced save path. A failed `drafts.get` is non-fatal, returns
- * `{ status: 'error' }`, and skips the migration so the legacy value
- * survives for a later attempt.
+ * Restore the draft from the daemon. When the daemon has no draft, falls
+ * back once to the legacy sessionStorage text draft (`options.legacyKey`,
+ * default the modal's): the legacy value is persisted to the daemon
+ * immediately (fire-and-forget `drafts.set`) and the key removed, so the
+ * one-time migration does not depend on the caller's debounced save path.
+ * A failed `drafts.get` is non-fatal, returns `{ status: 'error' }`, and
+ * skips the migration so the legacy value survives for a later attempt.
  */
 export async function restoreNewWorkspaceDraft(
   drafts: DraftsClient,
+  options: { legacyKey?: string } = {},
 ): Promise<NewWorkspaceDraftRestore> {
+  const legacyKey = options.legacyKey ?? LEGACY_PROMPT_SESSION_KEY;
   try {
     const draft = await drafts.get(NEW_WORKSPACE_DRAFT_WORKSPACE_ID, NEW_WORKSPACE_DRAFT_AGENT_ID);
     if (draft) {
       // The daemon draft supersedes any legacy value — drop the legacy key so
       // a stale prompt can't be "migrated" back in after the draft is cleared.
       try {
-        sessionStorage.removeItem(LEGACY_PROMPT_SESSION_KEY);
+        sessionStorage.removeItem(legacyKey);
       } catch {
         // sessionStorage unavailable — nothing to remove
       }
@@ -94,8 +102,8 @@ export async function restoreNewWorkspaceDraft(
 
   let legacyPrompt: string | null = null;
   try {
-    legacyPrompt = sessionStorage.getItem(LEGACY_PROMPT_SESSION_KEY);
-    if (legacyPrompt !== null) sessionStorage.removeItem(LEGACY_PROMPT_SESSION_KEY);
+    legacyPrompt = sessionStorage.getItem(legacyKey);
+    if (legacyPrompt !== null) sessionStorage.removeItem(legacyKey);
   } catch {
     // sessionStorage unavailable — nothing to migrate
   }
@@ -110,10 +118,14 @@ export async function restoreNewWorkspaceDraft(
 /**
  * Build the debounced `drafts.set` payload from the current prompt text and
  * context items. Serializes image attachments (empty ⇒ field omitted) and
- * applies the size guard to text + attachments combined: oversized
- * attachments are dropped so text still persists, and a pathologically large
- * text returns `null` (skip the wire call entirely). Empty text with no
- * attachments is the documented clear.
+ * applies the size guard to text + attachments combined: attachments that
+ * don't fit are dropped greedily (in item order) so text and every
+ * attachment that fits still persist — one oversized image (the accepted
+ * image cap, `REFERENCE_IMAGE_MAX_BYTES` = 30 MiB, exceeds this draft
+ * guard; such images survive the send but not a reload) doesn't wipe the
+ * rest from the draft. A pathologically large text returns `null` (skip the
+ * wire call entirely). Empty text with no attachments is the documented
+ * clear.
  */
 export function buildNewWorkspaceDraftPayload(
   text: string,
@@ -128,16 +140,28 @@ export function buildNewWorkspaceDraftPayload(
   }
   const attachments = serializeDraftAttachments(contextItems);
   if (attachments.length === 0) return { text };
-  const serializedBytes = text.length + JSON.stringify(attachments).length;
-  if (serializedBytes > MAX_DRAFT_ATTACHMENTS_BYTES) {
-    logger.warn('Draft text + attachments exceed the size guard; persisting text only', {
-      serializedBytes,
+  // Greedy fit: keep each attachment whose serialized size still fits under
+  // the guard alongside the text and the attachments already kept.
+  const kept: DraftAttachment[] = [];
+  let usedBytes = text.length + 2; // '[' + ']' of the serialized array
+  let droppedCount = 0;
+  for (const attachment of attachments) {
+    const attachmentBytes = JSON.stringify(attachment).length + 1; // + separator
+    if (usedBytes + attachmentBytes > MAX_DRAFT_ATTACHMENTS_BYTES) {
+      droppedCount += 1;
+      continue;
+    }
+    kept.push(attachment);
+    usedBytes += attachmentBytes;
+  }
+  if (droppedCount > 0) {
+    logger.warn('Draft attachments exceed the size guard; persisting the ones that fit', {
       limit: MAX_DRAFT_ATTACHMENTS_BYTES,
       attachmentCount: attachments.length,
+      droppedCount,
     });
-    return { text };
   }
-  return { text, attachments };
+  return kept.length > 0 ? { text, attachments: kept } : { text };
 }
 
 /** Fire-and-forget `drafts.set` under the sentinel keys; failures log only.
@@ -160,7 +184,7 @@ export function persistNewWorkspaceDraft(
 }
 
 /** Debounce window for the modal draft save (`drafts.set`, PROTOCOL §5.16). */
-export const NEW_WORKSPACE_DRAFT_DEBOUNCE_MS = 300;
+const NEW_WORKSPACE_DRAFT_DEBOUNCE_MS = 300;
 
 /** Debounced draft saver with an explicit flush for unload/destroy. */
 export interface NewWorkspaceDraftSaver {
@@ -168,6 +192,10 @@ export interface NewWorkspaceDraftSaver {
   schedule(text: string, contextItems: ContextItem[]): void;
   /** Persist a pending debounced save immediately; no-op when none is pending. */
   flush(): void;
+  /** Drop a pending debounced save without persisting it — for the clear
+   * paths, so an already-armed timer can't fire `drafts.set` after
+   * `drafts.clear` and resurrect the draft. */
+  cancel(): void;
 }
 
 /**
@@ -217,16 +245,27 @@ export function createNewWorkspaceDraftSaver(
       }
       save();
     },
+    cancel() {
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+      }
+      pending = null;
+    },
   };
 }
 
 /**
  * Fire-and-forget `drafts.clear` under the sentinel keys (called after a
- * successful workspace create); also removes the legacy sessionStorage key.
+ * successful workspace create); also removes BOTH known legacy sessionStorage
+ * keys — the daemon draft is shared between the modal and the onboarding
+ * page, so a stale key left by the other surface could migrate a cleared
+ * draft back in on its next restore.
  */
 export function clearNewWorkspaceDraft(drafts: DraftsClient): void {
   try {
     sessionStorage.removeItem(LEGACY_PROMPT_SESSION_KEY);
+    sessionStorage.removeItem(LEGACY_ONBOARDING_PROMPT_SESSION_KEY);
   } catch {
     // sessionStorage unavailable — nothing to remove
   }

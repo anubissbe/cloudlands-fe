@@ -1,5 +1,6 @@
 import type { Component } from 'svelte';
 import AppleLogoIcon from 'phosphor-svelte/lib/AppleLogoIcon';
+import AlienIcon from 'phosphor-svelte/lib/AlienIcon';
 import ArchiveIcon from 'phosphor-svelte/lib/ArchiveIcon';
 import ArrowBendUpLeftIcon from 'phosphor-svelte/lib/ArrowBendUpLeftIcon';
 import ArrowClockwiseIcon from 'phosphor-svelte/lib/ArrowClockwiseIcon';
@@ -24,6 +25,7 @@ import BrainIcon from 'phosphor-svelte/lib/BrainIcon';
 import BrowserIcon from 'phosphor-svelte/lib/BrowserIcon';
 import BugIcon from 'phosphor-svelte/lib/BugIcon';
 import CakeIcon from 'phosphor-svelte/lib/CakeIcon';
+import CatIcon from 'phosphor-svelte/lib/CatIcon';
 import CalendarIcon from 'phosphor-svelte/lib/CalendarIcon';
 import CameraIcon from 'phosphor-svelte/lib/CameraIcon';
 import CaretDownIcon from 'phosphor-svelte/lib/CaretDownIcon';
@@ -47,6 +49,7 @@ import ClockCounterClockwiseIcon from 'phosphor-svelte/lib/ClockCounterClockwise
 import ClockIcon from 'phosphor-svelte/lib/ClockIcon';
 import CloudArrowUpIcon from 'phosphor-svelte/lib/CloudArrowUpIcon';
 import CloudIcon from 'phosphor-svelte/lib/CloudIcon';
+import CoffeeIcon from 'phosphor-svelte/lib/CoffeeIcon';
 import CodeIcon from 'phosphor-svelte/lib/CodeIcon';
 import ColumnsIcon from 'phosphor-svelte/lib/ColumnsIcon';
 import CopyIcon from 'phosphor-svelte/lib/CopyIcon';
@@ -60,6 +63,7 @@ import CursorTextIcon from 'phosphor-svelte/lib/CursorTextIcon';
 import HandIcon from 'phosphor-svelte/lib/HandIcon';
 import DatabaseIcon from 'phosphor-svelte/lib/DatabaseIcon';
 import DesktopIcon from 'phosphor-svelte/lib/DesktopIcon';
+import DogIcon from 'phosphor-svelte/lib/DogIcon';
 import DotsSixIcon from 'phosphor-svelte/lib/DotsSixIcon';
 import DotsThreeIcon from 'phosphor-svelte/lib/DotsThreeIcon';
 import DotsThreeVerticalIcon from 'phosphor-svelte/lib/DotsThreeVerticalIcon';
@@ -91,6 +95,8 @@ import GitMergeIcon from 'phosphor-svelte/lib/GitMergeIcon';
 import GithubLogoIcon from 'phosphor-svelte/lib/GithubLogoIcon';
 import GitPullRequestIcon from 'phosphor-svelte/lib/GitPullRequestIcon';
 import GlobeIcon from 'phosphor-svelte/lib/GlobeIcon';
+import GhostIcon from 'phosphor-svelte/lib/GhostIcon';
+import GameControllerIcon from 'phosphor-svelte/lib/GameControllerIcon';
 import HammerIcon from 'phosphor-svelte/lib/HammerIcon';
 import HardDriveIcon from 'phosphor-svelte/lib/HardDriveIcon';
 import HardDrivesIcon from 'phosphor-svelte/lib/HardDrivesIcon';
@@ -126,6 +132,8 @@ import PaperPlaneTiltIcon from 'phosphor-svelte/lib/PaperPlaneTiltIcon';
 import PauseIcon from 'phosphor-svelte/lib/PauseIcon';
 import PenIcon from 'phosphor-svelte/lib/PenIcon';
 import PenNibIcon from 'phosphor-svelte/lib/PenNibIcon';
+import PlanetIcon from 'phosphor-svelte/lib/PlanetIcon';
+import PottedPlantIcon from 'phosphor-svelte/lib/PottedPlantIcon';
 import PencilSimpleIcon from 'phosphor-svelte/lib/PencilSimpleIcon';
 import PersonSimpleRunIcon from 'phosphor-svelte/lib/PersonSimpleRunIcon';
 import PlayIcon from 'phosphor-svelte/lib/PlayIcon';
@@ -171,6 +179,23 @@ import WaveformIcon from 'phosphor-svelte/lib/WaveformIcon';
 import WrenchIcon from 'phosphor-svelte/lib/WrenchIcon';
 import XCircleIcon from 'phosphor-svelte/lib/XCircleIcon';
 import XIcon from 'phosphor-svelte/lib/XIcon';
+
+export {
+  AlienIcon,
+  CatIcon,
+  CloudIcon,
+  CoffeeIcon,
+  DesktopIcon,
+  DogIcon,
+  GameControllerIcon,
+  GhostIcon,
+  HardDrivesIcon,
+  LaptopIcon,
+  PlanetIcon,
+  PottedPlantIcon,
+  RobotIcon,
+  RocketIcon,
+};
 
 export interface IconDefinition {
   iconName: string;
@@ -437,7 +462,6 @@ export const faCircleXmark = icon('circle-xmark');
 export const faClipboard = icon('clipboard');
 export const faClipboardCheck = icon('clipboard-check');
 export const faClock = icon('clock');
-export const faClockRotateLeft = icon('clock-rotate-left');
 export const faCloud = icon('cloud');
 export const faCloudArrowUp = icon('cloud-arrow-up');
 export const faCode = icon('code');
@@ -494,12 +518,10 @@ export const faFolder = icon('folder');
 export const faFolderOpen = icon('folder-open');
 export const faFolderPlus = icon('folder-plus');
 export const faFolderTree = icon('folder-tree');
-export const faGaugeHigh = icon('gauge-high');
 export const faGear = icon('gear');
 export const faGithub = icon('github');
 export const faGlobe = icon('globe');
 export const faGripLines = icon('grip-lines');
-export const faGripVertical = icon('grip-vertical');
 export const faHammer = icon('hammer');
 export const faHardDrive = icon('hard-drive');
 export const faHistory = icon('clock-rotate-left');
@@ -520,9 +542,7 @@ export const faLink = icon('link');
 export const faLinkSlash = icon('link-slash');
 export const faList = icon('list');
 export const faListCheck = icon('list-check');
-export const faListOl = icon('list-ol');
 export const faLock = icon('lock');
-export const faLockOpen = icon('lock-open');
 export const faMagic = icon('wand-magic');
 export const faMagicWandSparkles = icon('wand-magic-sparkles');
 export const faMagnifyingGlass = icon('magnifying-glass');
@@ -567,9 +587,7 @@ export const faSettings = icon('gear');
 export const faShield = icon('shield');
 export const faShieldAlt = icon('shield-halved');
 export const faShieldHalved = faShieldAlt;
-export const faSitemap = icon('sitemap');
 export const faSliders = icon('sliders');
-export const faSpellCheck = icon('spell-check');
 export const faSpinner = icon('spinner');
 export const faSquare = icon('square');
 export const faSquareCheck = icon('square-check');
@@ -601,6 +619,5 @@ export const faWaveSquare = icon('wave-square');
 export const faWindowMaximize = icon('window-maximize');
 export const faWindowRestore = icon('window-restore');
 export const faWrench = icon('wrench');
-export const faX = icon('x');
 export const faXmark = icon('xmark');
 export const faXmarkCircle = faCircleXmark;

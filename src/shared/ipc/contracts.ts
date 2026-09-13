@@ -14,21 +14,8 @@
  */
 
 /* eslint-disable @typescript-eslint/no-namespace */
-import type { AgentId, SessionId, WorkspaceId, MessageId } from '../types/branded-ids';
+import type { AgentId, WorkspaceId, MessageId } from '../types/branded-ids';
 import type { AgentSession } from '../types';
-
-// ============================================================================
-// Base IPC Types
-// ============================================================================
-
-/**
- * Base request type for all IPC calls
- */
-export interface IpcRequest<T = any> {
-  id: string;
-  timestamp: number;
-  payload: T;
-}
 
 /**
  * Base response type for all IPC calls
@@ -55,7 +42,7 @@ export namespace AgentIpc {
    * but are IGNORED by the backend. Frontend interfaces (UnifiedAgentConfig, CreateAgentOptions)
    * have these fields removed to prevent their use.
    *
-   * Backend builds system prompt from agentType via InstructionService.
+   * The intentd daemon builds the system prompt from agentType.
    */
   export interface CreateRequest {
     workspaceId: WorkspaceId;
@@ -75,7 +62,7 @@ export namespace AgentIpc {
      */
     skipInitialPrompt?: boolean;
     contextReferences?: any[];
-    imageBlocks?: Array<{ type: 'image'; data: string; mimeType: string }>;
+    imageBlocks?: Array<{ type: 'image'; data?: string; mimeType?: string; attachmentId?: string }>;
     metadata?: Record<string, any>;
     workspaceContext?: {
       openPanels: Array<{ type: string; title: string; id?: string; path?: string }>;
@@ -115,14 +102,6 @@ export namespace AgentIpc {
     streamId: AgentId;
   }
 
-  export interface StreamChunkData {
-    /** Typed as AgentId because agentId === sessionId in this architecture */
-    sessionId: AgentId;
-    chunk: string;
-    sequenceNumber: number;
-    isComplete: boolean;
-  }
-
   export interface ListRequest {
     workspaceId: WorkspaceId;
     includeDeleted?: boolean;
@@ -130,56 +109,6 @@ export namespace AgentIpc {
 
   export interface ListResponse {
     agents: AgentSession[];
-  }
-
-  export interface DeleteRequest {
-    agentId: AgentId;
-    workspaceId: WorkspaceId;
-  }
-
-  export interface DeleteResponse {
-    success: boolean;
-  }
-
-  export interface StopRequest {
-    agentId: AgentId;
-  }
-
-  export interface StopResponse {
-    success: boolean;
-  }
-
-  export interface SaveRequest {
-    agentId: AgentId;
-    workspaceId: WorkspaceId;
-  }
-
-  export interface SaveResponse {
-    success: boolean;
-  }
-
-  export interface LoadRequest {
-    agentId: AgentId;
-    workspaceId: WorkspaceId;
-  }
-
-  export interface LoadResponse {
-    agent?: AgentSession;
-    success: boolean;
-  }
-
-  export interface ListSavedRequest {
-    workspaceId: WorkspaceId;
-  }
-
-  export interface ListSavedResponse {
-    agents: AgentSession[];
-  }
-
-  export interface ActivateRequest {
-    agentId: AgentId;
-    workspaceId?: WorkspaceId; // Optional for backward compatibility
-    sessionId?: SessionId; // Optional for session tracking
   }
 
   export interface SetModelRequest {
@@ -193,12 +122,6 @@ export namespace AgentIpc {
     success: boolean;
     modelId?: string;
     error?: string;
-  }
-
-  export interface ActivateResponse {
-    success: boolean;
-    backendSessionId?: string;
-    agent?: AgentSession; // The full activated agent session
   }
 }
 

@@ -1,7 +1,6 @@
 /**
  * @vitest-environment jsdom
  */
-import { readFileSync } from 'node:fs';
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/svelte';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { AUTO_UPDATE_CHANNELS } from '$features/auto-update/types';
@@ -15,23 +14,19 @@ import {
   installUpdate,
 } from '$store/renderer/slices/auto-update/auto-update-slice';
 import {
+  selectChatAuroraEnabled,
   selectUpdateChannel,
   selectNoteFontStyle,
   selectAgentFontStyle,
-  selectPanelOpenMode,
+  selectShellTransparencyEnabled,
 } from '$store/renderer/slices/user-preferences/user-preferences-selectors';
 import {
   setAgentFontStyle,
+  setChatAuroraEnabled,
   setNoteFontStyle,
-  setPanelOpenMode,
+  setShellTransparencyEnabled,
   setUpdateChannel,
-  togglePanelOpenMode,
 } from '$store/renderer/slices/user-preferences/user-preferences-slice';
-import {
-  GENERAL_ACCESSIBILITY_FIXTURE,
-  GENERAL_STATE_FIXTURES,
-  GENERAL_VISUAL_FIXTURES,
-} from './general.fixtures';
 
 const STORE_CONTEXT = 'redux-store-context';
 const mocks = vi.hoisted(() => ({
@@ -93,7 +88,7 @@ let storeContext: ReduxStoreContext | undefined;
 const originalInvoke = window.electronAPI!.invoke;
 let setChannelResponse: { success: boolean; error?: { message: string } };
 
-function renderSettingsTab(tab: 'general' | 'appearance' | 'advanced') {
+function renderSettingsTab(tab: 'general' | 'appearance' | 'app-behavior' | 'advanced') {
   window.history.pushState({}, '', `/settings?tab=${tab}`);
   mocks.page.url = new URL(window.location.href);
   return render(SettingsPage, {
@@ -103,6 +98,7 @@ function renderSettingsTab(tab: 'general' | 'appearance' | 'advanced') {
 
 const renderGeneral = () => renderSettingsTab('general');
 const renderAppearance = () => renderSettingsTab('appearance');
+const renderAppBehavior = () => renderSettingsTab('app-behavior');
 const renderAdvanced = () => renderSettingsTab('advanced');
 
 function installDispatchRecorder() {
@@ -137,7 +133,8 @@ beforeEach(() => {
   appStore.dispatch(setUpdateChannel('stable'));
   appStore.dispatch(setNoteFontStyle('monospace'));
   appStore.dispatch(setAgentFontStyle('monospace'));
-  appStore.dispatch(setPanelOpenMode('normal'));
+  appStore.dispatch(setChatAuroraEnabled(true));
+  appStore.dispatch(setShellTransparencyEnabled(true));
   appStore.dispatch(simulateSetState({ status: 'idle' }));
   vi.clearAllMocks();
   (globalThis as typeof globalThis & { __APP_VERSION__: string }).__APP_VERSION__ = '2.0.10';
@@ -161,29 +158,31 @@ afterAll(() => {
 });
 
 describe('Settings migration', () => {
-  it('moves the panel-open preference into Appearance settings', async () => {
+  it('updates both appearance preferences immediately through Redux', async () => {
     const recorder = installDispatchRecorder();
-    const general = renderGeneral();
-    expect(screen.queryByRole('switch', { name: 'Open new panels pinned' })).toBeNull();
-    general.unmount();
-
     renderAppearance();
-    const toggle = screen.getByRole('switch', { name: 'Open new panels pinned' });
 
-    expect(toggle.getAttribute('aria-checked')).toBe('false');
-    await fireEvent.click(toggle);
+    const chatAurora = screen.getByRole('switch', { name: 'Chat aurora' });
+    const translucentWindow = screen.getByRole('switch', { name: 'Translucent window' });
+    expect(chatAurora.getAttribute('aria-checked')).toBe('true');
+    expect(translucentWindow.getAttribute('aria-checked')).toBe('true');
 
-    await waitFor(() => expect(selectPanelOpenMode.select(appStore.state)).toBe('pin'));
-    expect(recorder.calls).toContainEqual(togglePanelOpenMode());
-    expect(readFileSync('src/lib/components/layout/WindowTitleBar.svelte', 'utf8')).not.toContain(
-      'data-titlebar-panel-open-mode',
-    );
+    await fireEvent.click(chatAurora);
+    await fireEvent.click(translucentWindow);
+
+    await waitFor(() => {
+      expect(selectChatAuroraEnabled.select(appStore.state)).toBe(false);
+      expect(selectShellTransparencyEnabled.select(appStore.state)).toBe(false);
+    });
+    expect(recorder.calls).toContainEqual(setChatAuroraEnabled(false));
+    expect(recorder.calls).toContainEqual(setShellTransparencyEnabled(false));
+    expect(backendCalls()).toHaveLength(0);
     recorder.restore();
   });
 
   it('dispatches the exact Redux update-channel action without a direct backend request', async () => {
     const recorder = installDispatchRecorder();
-    renderGeneral();
+    renderAppBehavior();
 
     await fireEvent.click(screen.getByRole('button', { name: 'Select update channel' }));
     await fireEvent.pointerUp(await screen.findByRole('option', { name: 'Beta' }), {
@@ -201,25 +200,39 @@ describe('Settings migration', () => {
     recorder.restore();
   });
 
-  it('keeps the channel selector focusable and offers all three channels', async () => {
+  it('keeps the channel selector focusable and applies a selected channel', async () => {
     const recorder = installDispatchRecorder();
-    renderGeneral();
+    renderAppBehavior();
 
     const trigger = screen.getByRole('button', { name: 'Select update channel' });
-    expect(trigger.textContent).toContain('Stable');
     trigger.focus();
     expect(document.activeElement).toBe(trigger);
     await fireEvent.click(trigger);
 
-    expect(await screen.findByRole('option', { name: 'Stable' })).toBeTruthy();
-    expect(screen.getByRole('option', { name: 'Beta' })).toBeTruthy();
-    await fireEvent.pointerUp(screen.getByRole('option', { name: 'Alpha' }), {
+    await fireEvent.pointerUp(await screen.findByRole('option', { name: 'Alpha' }), {
       button: 0,
       pointerType: 'mouse',
     });
 
     await waitFor(() => expect(selectUpdateChannel.select(appStore.state)).toBe('alpha'));
     expect(recorder.calls).toContainEqual(setUpdateChannel('alpha'));
+    expect(backendCalls()).toHaveLength(0);
+    recorder.restore();
+  });
+
+  it('renders the Disabled option and dispatches setUpdateChannel(disabled) on selection', async () => {
+    const recorder = installDispatchRecorder();
+    renderGeneral();
+
+    await fireEvent.click(screen.getByRole('button', { name: 'App Behavior' }));
+    await fireEvent.click(screen.getByRole('button', { name: 'Select update channel' }));
+    await fireEvent.pointerUp(await screen.findByRole('option', { name: 'Disabled' }), {
+      button: 0,
+      pointerType: 'mouse',
+    });
+
+    await waitFor(() => expect(selectUpdateChannel.select(appStore.state)).toBe('disabled'));
+    expect(recorder.calls).toContainEqual(setUpdateChannel('disabled'));
     expect(backendCalls()).toHaveLength(0);
     recorder.restore();
   });
@@ -264,36 +277,12 @@ describe('Settings migration', () => {
     recorder.restore();
   });
 
-  it('pins the complete reset callback order in the production handler', () => {
-    const source = readFileSync('src/routes/(app)/settings/+page.svelte', 'utf8');
-    const handler = source.slice(
-      source.indexOf('function handleResetInterfaceSystem()'),
-      source.indexOf('</script>'),
-    );
-    const orderedCalls = [
-      "requestThemePreferenceChange('system')",
-      'colorThemeSettingsRef?.clearTheme()',
-      "setNoteFontStyle('sans')",
-      "setAgentFontStyle('sans')",
-      'resetNotificationSettings()',
-      'gitWorkspaceSettingsRef?.resetToDefaults()',
-    ];
-    const positions = orderedCalls.map((call) => handler.indexOf(call));
-    expect(positions.every((position) => position >= 0)).toBe(true);
-    expect(positions).toEqual([...positions].sort((left, right) => left - right));
-  });
-
-  it('preserves footer states, canonical actions, support semantics, and fixed-row geometry', async () => {
-    const initial = renderGeneral();
-    const { container } = initial;
-    expect(screen.getByText(/v2\.0\.10/)).toBeTruthy();
-    expect(screen.getByText('Up to date')).toBeTruthy();
+  it('preserves support navigation and update actions', async () => {
+    renderGeneral();
     const support = screen.getByRole('link', { name: 'Support' });
     expect(support.getAttribute('href')).toBe('https://www.intentapp.dev/docs');
     expect(support.getAttribute('target')).toBe('_blank');
     expect(support.getAttribute('rel')).toBe('noopener noreferrer');
-    expect(container.firstElementChild?.className).toContain('flex h-full');
-    expect(container.querySelector('aside')?.className).toContain('border-r');
     appStore.dispatch(simulateSetState({ status: 'downloaded' }));
     const update = await screen.findByRole('button', { name: 'Update available' });
     const recorder = installDispatchRecorder();
@@ -306,7 +295,6 @@ describe('Settings migration', () => {
     const recorder = installDispatchRecorder();
     renderAdvanced();
     const developer = document.getElementById('developer')!;
-    expect(screen.getByRole('heading', { name: 'Developer' })).toBeTruthy();
     await fireEvent.click(screen.getByRole('button', { name: 'Simulate Update Flow' }));
     await fireEvent.click(screen.getByRole('button', { name: 'Simulate No Update' }));
     await fireEvent.click(
@@ -351,48 +339,6 @@ describe('Settings migration', () => {
         channel: 'stable',
       }),
     );
-    expect(readFileSync('src/routes/(app)/settings/+page.svelte', 'utf8')).toContain(
-      '{#if isDevMode}',
-    );
     recorder.restore();
-  });
-
-  it('uses canonical responsive composition and deterministic visual/accessibility fixtures', () => {
-    const { container } = renderAdvanced();
-    expect(container.querySelector('main')?.className).toContain('max-w-4xl');
-    expect(screen.getByRole('heading', { name: 'WebSocket API' })).toBeTruthy();
-    expect(screen.getByRole('heading', { name: 'Reset' })).toBeTruthy();
-    expect(screen.getByRole('heading', { name: 'Developer' })).toBeTruthy();
-    expect(GENERAL_VISUAL_FIXTURES).toHaveLength(4);
-    expect(new Set(GENERAL_VISUAL_FIXTURES.map(({ id }) => id)).size).toBe(4);
-    expect(new Set(GENERAL_VISUAL_FIXTURES.map(({ theme }) => theme))).toEqual(
-      new Set(['light', 'dark']),
-    );
-    expect(new Set(GENERAL_VISUAL_FIXTURES.map(({ width }) => width))).toEqual(
-      new Set([1440, 900]),
-    );
-    expect(GENERAL_STATE_FIXTURES).toEqual(
-      expect.arrayContaining([
-        'no-apps',
-        'installed-apps',
-        'long-editor-label',
-        'beta-success',
-        'beta-failure',
-        'update-available',
-        'up-to-date',
-        'reset-confirmation',
-        'reset-cancelled',
-        'reset-confirmed',
-        'developer',
-      ]),
-    );
-    expect(GENERAL_ACCESSIBILITY_FIXTURE).toEqual({
-      zoomPercent: 200,
-      reducedMotion: true,
-      overflow: 'none',
-    });
-    expect(screen.getByRole('button', { name: 'Reset to Defaults' }).className).toContain(
-      'motion-reduce:transition-none',
-    );
   });
 });

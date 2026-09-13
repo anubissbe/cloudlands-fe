@@ -4,7 +4,6 @@ import type { Node as ProseMirrorNode } from '@tiptap/pm/model';
 import StarterKit from '@tiptap/starter-kit';
 import Placeholder from '@tiptap/extension-placeholder';
 import Mention from '@tiptap/extension-mention';
-import Image from '@tiptap/extension-image';
 import { Table } from '@tiptap/extension-table';
 import { TableRow } from '@tiptap/extension-table-row';
 import { TableHeader } from '@tiptap/extension-table-header';
@@ -58,14 +57,17 @@ import { logger } from './client-logger';
 import SmoothScroll from './smoothScroll';
 import { detectFilePathFromClick } from './file-path-detector';
 import { handleLink } from '$features/navigation/link-handler';
+import { isCmdClickModifier } from '$shared/utils/link-helpers';
 import { FilePathDecorations } from '$lib/components/tiptap/FilePathDecorations';
 import { CodeBlockCopyButton } from '$lib/components/tiptap/CodeBlockCopyButton';
+import { NoteImage } from '$lib/components/tiptap/NoteImage';
+import { NoteVideo } from '$lib/components/tiptap/NoteVideo';
 import { handleNoteEditorCopyAsMarkdown } from './selected-note-markdown-copy';
 import { store as appStore } from '$store/renderer/store';
 const lowlight = safeLowlight;
 
 // Extend Mention to parse our span[data-mention] chips back into nodes
-export const MentionFromSpan = Mention.extend({
+const MentionFromSpan = Mention.extend({
   parseHTML() {
     return [{ tag: 'span[data-mention]' }];
   },
@@ -418,13 +420,15 @@ export function createEditorConfig(options: EditorConfigOptions): EditorOptions 
         FilePathDecorations.configure({
           onFilePathClick,
         }),
-        Image.configure({
+        NoteImage.configure({
           inline: false,
           allowBase64: true,
+          workspaceId: workspace?.id,
           HTMLAttributes: {
             class: 'note-image max-w-full rounded-md',
           },
         }),
+        NoteVideo.configure({ workspaceId: workspace?.id }),
 
         // Table support
         Table.configure({
@@ -830,13 +834,15 @@ export function createEditorConfig(options: EditorConfigOptions): EditorOptions 
         FilePathDecorations.configure({
           onFilePathClick,
         }),
-        Image.configure({
+        NoteImage.configure({
           inline: false,
           allowBase64: true,
+          workspaceId: workspace?.id,
           HTMLAttributes: {
             class: 'note-image max-w-full rounded-md',
           },
         }),
+        NoteVideo.configure({ workspaceId: workspace?.id }),
 
         // Table support
         Table.configure({
@@ -1059,7 +1065,7 @@ export function createEditorConfig(options: EditorConfigOptions): EditorOptions 
       handleDOMEvents: copySelectionAsMarkdown
         ? {
             copy: (view: any, event: Event) =>
-              handleNoteEditorCopyAsMarkdown(view, event as ClipboardEvent),
+              handleNoteEditorCopyAsMarkdown(view, event as ClipboardEvent, workspace?.id),
           }
         : undefined,
       handleClick: (_view: any, _pos: any, event: any) => {
@@ -1075,8 +1081,6 @@ export function createEditorConfig(options: EditorConfigOptions): EditorOptions 
             handleLink(anchor.href, {
               workspaceId: workspace.id,
               sourcePanelId,
-              openInAdjacentPanel: true,
-              openInNewAdjacentPanel: true,
               event,
             });
           }
@@ -1159,7 +1163,7 @@ export function createEditorConfig(options: EditorConfigOptions): EditorOptions 
         const filePath = detectFilePathFromClick(target);
         if (filePath && workspace?.id) {
           event.preventDefault();
-          const openInAdjacentPanel = event.metaKey || event.ctrlKey;
+          const openInAdjacentPanel = isCmdClickModifier({ event });
           logger.debug('[EditorConfig] File path clicked', { filePath, openInAdjacentPanel });
           appStore.dispatch(openWorkspaceFile(workspace.id, filePath, { openInAdjacentPanel }));
           return true;

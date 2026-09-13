@@ -208,13 +208,96 @@ describe('subscribePrMonitors (prMonitor:* events.subscribe + fold)', () => {
 
   const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
 
-  it('emits the cached (empty) list when the initial prMonitor.list seed fails (ready-with-empty)', async () => {
+  it('preserves cached rows and reports when the initial prMonitor.list seed fails', async () => {
     mockedRequest.mockRejectedValueOnce(new Error('list failed'));
+    const seen: PrMonitorRow[][] = [];
+    const statuses: string[] = [];
+    const { dispose } = subscribePrMonitors(
+      'ws-1',
+      (monitors) => seen.push(monitors),
+      (status) => statuses.push(status),
+    );
+    await flush();
+
+    expect(seen.at(-1)).toEqual([]);
+    expect(statuses).toEqual(['failed']);
+    dispose();
+  });
+
+  it('issues the prMonitor.list seed concurrently with events.subscribe (single RTT)', async () => {
+    let resolveSubscribe: ((value: { subscriptionId: string }) => void) | undefined;
+    mockedSubscribe.mockImplementationOnce(
+      () => new Promise((resolve) => (resolveSubscribe = resolve)),
+    );
+    mockedRequest.mockResolvedValue({ monitors: [makeMonitor()] });
+    const seen: PrMonitorRow[][] = [];
+    const { dispose } = subscribePrMonitors('ws-1', (monitors) => seen.push(monitors));
+
+    // Both wire calls leave immediately — the seed does not wait for the ack.
+    expect(mockedSubscribe).toHaveBeenCalledWith({
+      eventTypes: ['prMonitor:*'],
+      workspaceId: 'ws-1',
+    });
+    expect(mockedRequest).toHaveBeenCalledWith('prMonitor.list', { workspaceId: 'ws-1' });
+    await flush();
+    // The seed emits before the subscribe ack lands.
+    expect(seen.at(-1)).toEqual([makeMonitor()]);
+    resolveSubscribe?.({ subscriptionId: 'ws-sub-7' });
+    await flush();
+    dispose();
+    expect(mockedUnsubscribe).toHaveBeenCalledWith('ws-sub-7');
+  });
+
+  it('re-lists after the ack when the seed settled before the subscription window opened (event-gap race)', async () => {
+    let resolveSubscribe: ((value: { subscriptionId: string }) => void) | undefined;
+    mockedSubscribe.mockImplementationOnce(
+      () => new Promise((resolve) => (resolveSubscribe = resolve)),
+    );
+    // The gap: mon-1 was registered between the list snapshot and the
+    // subscription window — only the trailing re-list can observe it.
+    mockedRequest
+      .mockResolvedValueOnce({ monitors: [] })
+      .mockResolvedValueOnce({ monitors: [makeMonitor()] });
+    const seen: PrMonitorRow[][] = [];
+    const { dispose } = subscribePrMonitors('ws-1', (monitors) => seen.push(monitors));
+    await flush();
+    expect(mockedRequest).toHaveBeenCalledTimes(1);
+    expect(seen.at(-1)).toEqual([]);
+
+    resolveSubscribe?.({ subscriptionId: 'ws-sub-7' });
+    await flush();
+    expect(mockedRequest).toHaveBeenCalledTimes(2);
+    expect(mockedRequest).toHaveBeenNthCalledWith(2, 'prMonitor.list', { workspaceId: 'ws-1' });
+    expect(seen.at(-1)).toEqual([makeMonitor()]);
+    dispose();
+  });
+
+  it('re-lists once (coalesced) even when the ack lands before the seed settles', async () => {
+    // Response ordering proves nothing about snapshot ordering — the seed
+    // can snapshot before the subscription window opens yet respond after
+    // the ack — so the post-ack re-list is unconditional, coalesced into
+    // exactly one trailing prMonitor.list.
+    mockedRequest.mockResolvedValue({ monitors: [makeMonitor()] });
+    const seen: PrMonitorRow[][] = [];
+    const { dispose } = subscribePrMonitors('ws-1', (monitors) => seen.push(monitors));
+    await flush();
+    await flush();
+
+    expect(mockedRequest).toHaveBeenCalledTimes(2);
+    expect(mockedRequest).toHaveBeenNthCalledWith(2, 'prMonitor.list', { workspaceId: 'ws-1' });
+    expect(seen.at(-1)).toEqual([makeMonitor()]);
+    dispose();
+  });
+
+  it('still serves the one-shot seed when events.subscribe fails', async () => {
+    mockedSubscribe.mockRejectedValueOnce(new Error('subscribe failed'));
+    mockedRequest.mockResolvedValue({ monitors: [makeMonitor()] });
     const seen: PrMonitorRow[][] = [];
     const { dispose } = subscribePrMonitors('ws-1', (monitors) => seen.push(monitors));
     await flush();
 
-    expect(seen.at(-1)).toEqual([]);
+    expect(mockedRequest).toHaveBeenCalledTimes(1);
+    expect(seen.at(-1)).toEqual([makeMonitor()]);
     dispose();
   });
 
@@ -324,9 +407,7 @@ describe('subscribePrMonitors (prMonitor:* events.subscribe + fold)', () => {
     let resolveSecondList: ((value: unknown) => void) | undefined;
     mockedRequest
       .mockResolvedValueOnce({ monitors: [makeMonitor()] })
-      .mockImplementationOnce(
-        () => new Promise((resolve) => (resolveSecondList = resolve)),
-      );
+      .mockImplementationOnce(() => new Promise((resolve) => (resolveSecondList = resolve)));
     const seen: PrMonitorRow[][] = [];
     const { refetch, dispose } = subscribePrMonitors('ws-1', (monitors) => seen.push(monitors));
     await flush();
@@ -358,9 +439,7 @@ describe('subscribePrMonitors (prMonitor:* events.subscribe + fold)', () => {
     let resolveSecondList: ((value: unknown) => void) | undefined;
     mockedRequest
       .mockResolvedValueOnce({ monitors: [makeMonitor()] })
-      .mockImplementationOnce(
-        () => new Promise((resolve) => (resolveSecondList = resolve)),
-      )
+      .mockImplementationOnce(() => new Promise((resolve) => (resolveSecondList = resolve)))
       .mockResolvedValueOnce({
         monitors: [makeMonitor({ pendingChanges: [], hasPendingChanges: false })],
       });
@@ -399,19 +478,23 @@ describe('subscribePrMonitors (prMonitor:* events.subscribe + fold)', () => {
       lastSnapshot: { ...makeMonitor().lastSnapshot!, state: 'merged' },
       state: 'completed',
     });
+    // Seed + unconditional post-ack re-list, then the explicit refetch.
     mockedRequest
+      .mockResolvedValueOnce({ monitors: [makeMonitor()] })
       .mockResolvedValueOnce({ monitors: [makeMonitor()] })
       .mockResolvedValueOnce({ monitors: [refreshed] });
     const seen: PrMonitorRow[][] = [];
     const { refetch, dispose } = subscribePrMonitors('ws-1', (monitors) => seen.push(monitors));
     await flush();
+    await flush();
+    expect(mockedRequest).toHaveBeenCalledTimes(2);
     expect(seen.at(-1)?.[0].state).toBe('active');
 
     refetch();
     await flush();
 
-    expect(mockedRequest).toHaveBeenCalledTimes(2);
-    expect(mockedRequest).toHaveBeenNthCalledWith(2, 'prMonitor.list', { workspaceId: 'ws-1' });
+    expect(mockedRequest).toHaveBeenCalledTimes(3);
+    expect(mockedRequest).toHaveBeenNthCalledWith(3, 'prMonitor.list', { workspaceId: 'ws-1' });
     expect(seen.at(-1)).toEqual([refreshed]);
     dispose();
   });

@@ -40,7 +40,10 @@
   import { handleLink, openInBrowserPanel } from '$features/navigation/link-handler';
   import type { WorkspaceId } from '$shared/types/branded-ids';
   import type { PrMonitorRow } from '$features/pr-monitor/pr-monitor-service';
-  import { selectAgentPrMonitors } from '$store/renderer/slices/pr-monitor/pr-monitor-selectors';
+  import {
+    selectAgentPrMonitors,
+    selectPrMonitorsSnapshotStatus,
+  } from '$store/renderer/slices/pr-monitor/pr-monitor-selectors';
   import { selectWorkspaceById } from '$store/renderer/slices/workspace/workspace-selectors';
   import {
     cancelPrMonitorRequested,
@@ -101,6 +104,7 @@
   });
 
   const monitors$ = selectAgentPrMonitors(workspaceIdStore, agentIdStore);
+  const snapshotStatus$ = selectPrMonitorsSnapshotStatus(workspaceIdStore);
   const workspace$ = selectWorkspaceById(workspaceIdStore);
 
   // Only ACTIVE monitors get chips; completed rows live on the PR-list
@@ -108,7 +112,7 @@
   const activeMonitors = $derived($monitors$.filter((mon) => mon.state === 'active'));
 
   $effect(() => {
-    visible = activeMonitors.length > 0;
+    visible = activeMonitors.length > 0 || $snapshotStatus$ !== 'ready';
     count = activeMonitors.length;
   });
 
@@ -243,6 +247,9 @@
   function readinessSummary(monitor: PrMonitorRow): string {
     const snapshot = monitor.lastSnapshot;
     if (snapshot?.isDraft) return m.chat_monitoredPrs_status_draft();
+    if (snapshot?.state === 'open' && snapshot.isInMergeQueue) {
+      return m.chat_monitoredPrs_status_mergeQueue();
+    }
     const blocker = inferredBlocker(monitor);
     if (blocker) return m.chat_monitoredPrs_status_blocked({ reason: blocker });
     if (
@@ -257,6 +264,24 @@
     return m.chat_monitoredPrs_status_unknown();
   }
 </script>
+
+{#if activeMonitors.length === 0 && $snapshotStatus$ !== 'ready'}
+  <div
+    class="flex min-h-10 items-center gap-2 px-3 py-2 text-muted-foreground {SUBSCRIPTION_ROW_TYPOGRAPHY_CLASS}"
+    data-testid="pr-monitors-snapshot-status"
+    data-snapshot-status={$snapshotStatus$}
+    role={$snapshotStatus$ === 'failed' ? 'alert' : 'status'}
+  >
+    {#if $snapshotStatus$ === 'loading'}
+      <span
+        class="size-3 shrink-0 animate-spin rounded-full border-2 border-muted-foreground/30 border-t-muted-foreground"
+      ></span>
+      <span>{m.chat_chatMessage_loading_label()}</span>
+    {:else}
+      <span>{m.chat_streamingStatus_responseFailed_label()}</span>
+    {/if}
+  </div>
+{/if}
 
 {#if activeMonitors.length > 0}
   <div
@@ -330,7 +355,7 @@
                 <Button
                   variant="ghost-light"
                   size="xs"
-                  class="h-auto min-h-7 w-full min-w-0 items-start justify-start whitespace-normal text-left min-[284px]:whitespace-nowrap"
+                  class="h-auto min-h-7 w-full min-w-0 items-start justify-start whitespace-normal py-1.5 text-left min-[284px]:whitespace-nowrap"
                   data-testid="monitored-pr-check-flush-item"
                   onclick={() => handleCheckAndFlush(monitor, close)}
                 >
@@ -342,7 +367,7 @@
                 <Button
                   variant="ghost-light"
                   size="xs"
-                  class="h-auto min-h-7 w-full min-w-0 items-start justify-start whitespace-normal text-left min-[284px]:whitespace-nowrap"
+                  class="h-auto min-h-7 w-full min-w-0 items-start justify-start whitespace-normal py-1.5 text-left min-[284px]:whitespace-nowrap"
                   data-testid="monitored-pr-open-in-app-item"
                   onclick={() => handleOpenInApp(monitor, close)}
                 >
@@ -354,7 +379,7 @@
                 <Button
                   variant="ghost-light"
                   size="xs"
-                  class="h-auto min-h-7 w-full min-w-0 items-start justify-start whitespace-normal text-left min-[284px]:whitespace-nowrap"
+                  class="h-auto min-h-7 w-full min-w-0 items-start justify-start whitespace-normal py-1.5 text-left min-[284px]:whitespace-nowrap"
                   data-testid="monitored-pr-open-external-item"
                   onclick={() => handleOpenExternal(monitor, close)}
                 >
@@ -366,7 +391,7 @@
                 <Button
                   variant="ghost-light"
                   size="xs"
-                  class="h-auto min-h-7 w-full min-w-0 items-start justify-start whitespace-normal text-left min-[284px]:whitespace-nowrap"
+                  class="h-auto min-h-7 w-full min-w-0 items-start justify-start whitespace-normal py-1.5 text-left min-[284px]:whitespace-nowrap"
                   data-testid="monitored-pr-cancel-item"
                   onclick={() => handleCancel(monitor, close)}
                 >

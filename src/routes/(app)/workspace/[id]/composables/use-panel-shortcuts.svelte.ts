@@ -16,13 +16,15 @@
  * - Cmd+Alt+1/2/3: Layout presets (focus/split/full)
  *
  * Note: Panel-specific shortcuts are in panel-keyboard-shortcuts.svelte.ts:
- * - Cmd+[: Go back in panel history
- * - Cmd+]: Go forward in panel history
- * - Cmd+\: Split horizontally
- * - Cmd+Shift+\: Split vertically
+ * - Mod+[/]: Select the previous/next pane
+ * - Mod+Shift+[/]: Focus the previous/next column
+ * - Mod+Alt+PageUp/PageDown: Move the active pane between columns
+ * - Mod+\: Create a column to the right
  */
 
 import { createLogger } from '$lib/utils/client-logger';
+import { matchesShortcut, resolveShortcut } from '$lib/utils/shortcut-bindings';
+import { store as appStore } from '$store/renderer/store';
 const logger = createLogger('PanelShortcuts');
 
 export interface UsePanelShortcutsOptions {
@@ -54,6 +56,25 @@ export function usePanelShortcuts(options: UsePanelShortcutsOptions) {
       /Mac|iPhone|iPad|iPod/.test(navigator.userAgent);
 
     const handleKeydown = (event: KeyboardEvent) => {
+      const target = event.target instanceof Element ? event.target : null;
+      if (target?.closest('[data-shortcut-input], [data-shortcut-entry]')) return;
+
+      if (
+        matchesShortcut(
+          event,
+          resolveShortcut(
+            'panel.maximize',
+            appStore.state.userPreferences?.shortcutOverrides ?? {},
+          ),
+          isMac,
+        )
+      ) {
+        event.preventDefault();
+        logger.debug('Maximizing panel');
+        options.onMaximizePanel?.();
+        return;
+      }
+
       const cmdOrCtrl = isMac ? event.metaKey : event.ctrlKey;
 
       // Only handle if cmd/ctrl is pressed
@@ -100,14 +121,6 @@ export function usePanelShortcuts(options: UsePanelShortcutsOptions) {
         return;
       }
 
-      // Cmd+Shift+M: Maximize panel
-      if ((event.key === 'm' || event.key === 'M') && event.shiftKey && !event.altKey) {
-        event.preventDefault();
-        logger.debug('Maximizing panel');
-        options.onMaximizePanel?.();
-        return;
-      }
-
       // Layout presets (Cmd+Alt+1/2/3)
       if (event.altKey && !event.shiftKey) {
         if (event.key === '1') {
@@ -129,9 +142,6 @@ export function usePanelShortcuts(options: UsePanelShortcutsOptions) {
           return;
         }
       }
-
-      // NOTE: Cmd+[ / Cmd+] are now used for panel layout back/forward navigation
-      // (handled in panel-keyboard-shortcuts.svelte.ts)
     };
 
     logger.debug('Panel shortcuts effect running, attaching keydown listener');

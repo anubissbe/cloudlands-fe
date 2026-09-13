@@ -4,11 +4,11 @@
  * Ports the design's `grids()` gridline helper (Agent Stats Share design)
  * and derives the histogram bar geometry + hero stats from real
  * `stats.getUsage` cells. Cache counters fold into the "input" bar segment;
- * reasoning `thoughtTokens` (optional-when-zero, §5.23) get a dedicated
- * segment stacked above output, mirroring the HUD's in/out/thoughts order
- * (§5.39); the separate counters live on the passport card (Spec D6,
- * assumption in the workspace spec). Token formatting comes from
- * `stats-format.ts`.
+ * reasoning `thoughtTokens` (a disjoint counter, omitted when zero, §5.23 /
+ * §5.36) get a dedicated segment stacked above output, mirroring the HUD's
+ * in/out/thoughts order (§5.39); the separate counters live on the passport
+ * card. Bar totals and segment shares use the five-counter sum
+ * (`totalTokens`). Token formatting comes from `stats-format.ts`.
  */
 import type { UsageHourStats, UsageMonthStats } from '$lib/client/app-client';
 import { formatDatePattern } from '$lib/i18n/format';
@@ -56,7 +56,7 @@ export function hourAmPm(hour: number): string {
 
 export const pad2 = (n: number) => String(n).padStart(2, '0');
 
-export interface HourBar {
+interface HourBar {
   heightPct: number;
   outPct: number;
   /** Reasoning tokens' share of the bar; 0 when the cell reported none. */
@@ -165,7 +165,7 @@ export function hourCardModel(
   };
 }
 
-export interface MonthBar {
+interface MonthBar {
   heightPct: number;
   outPct: number;
   /** Reasoning tokens' share of the bar; 0 when the cell reported none. */

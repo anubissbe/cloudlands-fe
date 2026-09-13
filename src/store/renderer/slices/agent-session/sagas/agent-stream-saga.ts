@@ -1,16 +1,13 @@
 import { buffers } from 'redux-saga';
-import {
-  actionChannel,
-  call,
-  flush,
-  put,
-  take,
-  type SagaGenerator,
-} from 'typed-redux-saga';
+import { actionChannel, call, flush, put, take, type SagaGenerator } from 'typed-redux-saga';
 
 import { createLogger } from '$lib/utils/client-logger';
+import {
+  reportStreamLifecycle,
+  streamTurnCorrelation,
+} from '$lib/utils/stream-lifecycle-telemetry';
 import { hasStandingChatSubscription } from '$features/agent/utils/chat-subscription-registry';
-import type { AgentMessage, AgentSession } from '$shared/types';
+import type { AgentMessage, AgentSession, MessageMetadata } from '$shared/types';
 import { streamCompleted, streamTimedOut } from '../../chat-state/chat-state-slice';
 import { selectChatAgentState } from '../../chat-state/chat-state-selectors';
 import {
@@ -30,16 +27,33 @@ const logger = createLogger('AgentStreamSaga');
 function isStreamUpdateAction(
   action: unknown,
 ): action is ReturnType<typeof agentStreamUpdateReceived> {
-  return !!action && typeof action === 'object' && 'type' in action &&
-    action.type === agentStreamUpdateReceived.type;
+  return (
+    !!action &&
+    typeof action === 'object' &&
+    'type' in action &&
+    action.type === agentStreamUpdateReceived.type
+  );
 }
 
+/**
+ * Interrupted-row metadata for a terminal `complete` carrying
+ * `stopReason: "interrupted"` (PROTOCOL §7.2): the `interrupted` marker plus
+ * the wire's `interruptReason` / `interruptedBy` when present, so the live
+ * Stopped label resolves to the same reason-specific variant the persisted
+ * row renders after a reload. Absent wire fields stay absent — never `null`.
+ */
 function interruptedMetadata(
   payload: AgentStreamUpdatePayload,
-): { interrupted: true; stopReason: string } | undefined {
-  return payload.eventType === 'complete' && payload.stopReason === 'interrupted'
-    ? { interrupted: true, stopReason: payload.stopReason }
-    : undefined;
+):
+  | Pick<MessageMetadata, 'interrupted' | 'stopReason' | 'interruptReason' | 'interruptedBy'>
+  | undefined {
+  if (payload.eventType !== 'complete' || payload.stopReason !== 'interrupted') return undefined;
+  return {
+    interrupted: true,
+    stopReason: payload.stopReason,
+    ...(payload.interruptReason ? { interruptReason: payload.interruptReason } : {}),
+    ...(payload.interruptedBy ? { interruptedBy: payload.interruptedBy } : {}),
+  };
 }
 
 /**
@@ -48,9 +62,7 @@ function interruptedMetadata(
  * (PROTOCOL §7.3 — refusal / max_tokens / max_turn_requests notice). Mirrors
  * what the daemon persists on the row, so live and reloaded transcripts agree.
  */
-function finalizedMetadata(
-  payload: AgentStreamUpdatePayload,
-): Record<string, unknown> | undefined {
+function finalizedMetadata(payload: AgentStreamUpdatePayload): Record<string, unknown> | undefined {
   const interrupted = interruptedMetadata(payload);
   const finishReason =
     payload.eventType === 'complete' && payload.finishReason
@@ -79,6 +91,36 @@ function* clearSessionStreaming(
   }
 }
 
+function* reportAppliedStoreState(
+  payload: AgentStreamUpdatePayload,
+  event: 'update-applied' | 'update-ignored',
+): SagaGenerator<void> {
+  const session: AgentSession | undefined = yield* selectAgentSession.effect(payload.agentId);
+  const message = session?.messages.find(
+    (candidate) =>
+      candidate.role === 'assistant' &&
+      ((payload.assistantMessageId && candidate.id === payload.assistantMessageId) ||
+        (payload.assistantAppMessageId &&
+          candidate.appMessageId === payload.assistantAppMessageId)),
+  );
+  const chatState = yield* selectChatAgentState.effect(payload.agentId);
+  const storeStreamState = chatState.error
+    ? 'error'
+    : !message
+      ? 'missing'
+      : message.isStreaming === true || message.streamingComplete === false
+        ? 'streaming'
+        : 'idle';
+  reportStreamLifecycle({
+    stage: 'store',
+    event,
+    turnCorrelation: streamTurnCorrelation(payload.assistantMessageId),
+    callbackResult: event === 'update-applied' ? 'observed' : 'ignored',
+    storeStreamState,
+    ...(message?.contentBlocks ? { blockCount: message.contentBlocks.length } : {}),
+  });
+}
+
 function* applyStreamPayload(payload: AgentStreamUpdatePayload): SagaGenerator<void> {
   const { agentId, eventType, assistantMessageId, assistantAppMessageId } = payload;
   if (!agentId) return;
@@ -101,19 +143,24 @@ function* applyStreamPayload(payload: AgentStreamUpdatePayload): SagaGenerator<v
 
   if (eventType === 'error' || eventType === 'timeout') {
     if (existing) {
-      yield* put(updateMessage(agentId, existing.id, { isStreaming: false, streamingComplete: true }));
+      yield* put(
+        updateMessage(agentId, existing.id, { isStreaming: false, streamingComplete: true }),
+      );
     }
     yield* call(clearSessionStreaming, agentId, eventType);
+    yield* reportAppliedStoreState(payload, 'update-applied');
     return;
   }
 
   if (!existing) {
     if (isStaleFinalizedAssistantStream(session, assistantAppMessageId)) {
       if (isFinalize) yield* call(clearSessionStreaming, agentId, eventType);
+      yield* reportAppliedStoreState(payload, 'update-ignored');
       return;
     }
     if (!assistantMessageId) {
       if (isFinalize) yield* call(clearSessionStreaming, agentId, eventType);
+      yield* reportAppliedStoreState(payload, 'update-ignored');
       return;
     }
     const metadata = finalizedMetadata(payload);
@@ -134,6 +181,7 @@ function* applyStreamPayload(payload: AgentStreamUpdatePayload): SagaGenerator<v
     };
     yield* put(addMessage(agentId, placeholder));
     if (isFinalize) yield* call(clearSessionStreaming, agentId, eventType);
+    yield* reportAppliedStoreState(payload, 'update-applied');
     return;
   }
 
@@ -145,12 +193,18 @@ function* applyStreamPayload(payload: AgentStreamUpdatePayload): SagaGenerator<v
     if (metadata) updates.metadata = { ...existing.metadata, ...metadata };
     yield* put(updateMessage(agentId, existing.id, updates));
     yield* call(clearSessionStreaming, agentId, eventType);
+    yield* reportAppliedStoreState(payload, 'update-applied');
     return;
   }
 
   if (nextBlocks && nextBlocks !== existing.contentBlocks) {
-    yield* put(updateMessage(agentId, existing.id, { contentBlocks: nextBlocks, isStreaming: true }));
+    yield* put(
+      updateMessage(agentId, existing.id, { contentBlocks: nextBlocks, isStreaming: true }),
+    );
+    yield* reportAppliedStoreState(payload, 'update-applied');
+    return;
   }
+  yield* reportAppliedStoreState(payload, 'update-ignored');
 }
 
 function* safelyApply(payload: AgentStreamUpdatePayload): SagaGenerator<void> {
@@ -158,6 +212,12 @@ function* safelyApply(payload: AgentStreamUpdatePayload): SagaGenerator<void> {
     yield* call(applyStreamPayload, payload);
   } catch (error) {
     logger.error('Failed to apply agent stream update', error);
+    reportStreamLifecycle({
+      stage: 'store',
+      event: 'update-threw',
+      turnCorrelation: streamTurnCorrelation(payload.assistantMessageId),
+      callbackResult: 'threw',
+    });
   }
 }
 

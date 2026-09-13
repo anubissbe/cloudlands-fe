@@ -16,7 +16,9 @@ import {
   setPendingAgentDeletion,
   type PendingAgentDeletion,
 } from '$features/agent/utils/pending-agent-deletions';
+import { readAgentSession } from '$features/agent/agent-read-service';
 import { appClient } from '$lib/client';
+import { withToastCountdown } from '$lib/components/ui/toast';
 import { createLogger } from '$lib/utils/client-logger';
 import { m } from '$shared/paraglide/messages.js';
 import type { AgentSession } from '$shared/types';
@@ -28,7 +30,15 @@ import {
   refreshWorkspaceSubscriptionEntriesRequested,
   removeWatchedAgent,
 } from '../../agent-subscription-ui/agent-subscription-ui-slice';
-import { agentSessionDismissQuestionsRequested, updateSession } from '../agent-session-slice';
+import {
+  agentProposalResolveRequested,
+  agentSessionDismissQuestionsRequested,
+  updateSession,
+} from '../agent-session-slice';
+import {
+  agentScopedProposalKey,
+  proposalResolutionReconciled,
+} from '../../proposal-lifecycle/proposal-lifecycle-slice';
 import {
   activateAgentRequested,
   deleteAgentSessionRequested,
@@ -36,6 +46,7 @@ import {
   removeAgent,
   renameAgentSessionRequested,
   restoreAgentSessionRequested,
+  restoreRetiredAgentRequested,
   saveAgentSessionRequested,
   stopAgentSessionRequested,
   undoAgentDeletionRequested,
@@ -75,13 +86,16 @@ async function showUndoToast(wsId: string, agentId: string, agentName?: string):
       agentName
         ? m.agent_mutation_deletedAgent_message({ name: agentName })
         : m.agent_mutation_deletedAgentGeneric_message(),
-      {
-        duration: UNDO_DURATION_MS,
-        action: {
-          label: m.agent_mutation_undo_label(),
-          onClick: () => store.dispatch(undoAgentDeletionRequested(wsId, agentId)),
+      withToastCountdown(
+        {
+          duration: UNDO_DURATION_MS,
+          action: {
+            label: m.agent_mutation_undo_label(),
+            onClick: () => store.dispatch(undoAgentDeletionRequested(wsId, agentId)),
+          },
         },
-      },
+        { pauseOnHover: false },
+      ),
     );
   } catch (error) {
     logger.error('Failed to show agent deletion undo toast', error);
@@ -115,6 +129,42 @@ function* restoreHiddenSession(wsId: string, session: AgentSession): SagaGenerat
   yield* put(refreshWorkspaceSubscriptionEntriesRequested(wsId));
 }
 
+/**
+ * Un-retire a soft-retired agent (`agent.restore`, §5.5 soft retire). The
+ * daemon clears `retiredAt` and emits `agent:restored`; the events bridge
+ * refreshes the metadata, which moves the agent out of the Retired bin. The
+ * local patch below makes the move immediate rather than event-latency-bound.
+ */
+function* restoreRetiredAgent(
+  action: ReturnType<typeof restoreRetiredAgentRequested>,
+): SagaGenerator<void> {
+  const [wsId, agentId] = action.payload;
+  let settled = false;
+  try {
+    const result = yield* call([appClient.agents, appClient.agents.restore], agentId, wsId);
+    if (!result.success) {
+      const failure = new Error(result.error || m.agent_mutation_restoreRetiredFailed_error());
+      yield* call(showError, failure.message);
+      yield* put(action.failure(failure));
+      settled = true;
+      return;
+    }
+    const existing = yield* selectAgentSession.effect(agentId);
+    if (existing?.retiredAt) {
+      yield* call(persistSession, { ...existing, retiredAt: undefined });
+    }
+    yield* put(action.success(undefined as never));
+    settled = true;
+  } catch (error) {
+    yield* put(action.failure(mutationError(error, m.agent_mutation_restoreRetiredFailed_error())));
+    settled = true;
+  } finally {
+    if (!settled && (yield* cancelled())) {
+      yield* put(action.failure(new Error(m.agent_mutation_restoreRetiredFailed_error())));
+    }
+  }
+}
+
 function* restoreAgent(
   action: ReturnType<typeof restoreAgentSessionRequested>,
 ): SagaGenerator<void> {
@@ -125,7 +175,7 @@ function* restoreAgent(
     if (hasUsableSession(existing)) {
       yield* put(action.success(existing));
     } else {
-      const fetched = yield* call([appClient.agents, appClient.agents.get], agentId);
+      const fetched = yield* call(readAgentSession, agentId);
       if (!fetched) {
         yield* put(action.success(existing ?? null));
       } else {
@@ -167,7 +217,7 @@ function* activateAgent(action: ReturnType<typeof activateAgentRequested>): Saga
         activationAttempts,
       });
     }
-    const fetched = yield* call([appClient.agents, appClient.agents.get], agentId);
+    const fetched = yield* call(readAgentSession, agentId);
     const source = fetched ? preserveMessages(fetched, existing) : existing;
     if (!source) {
       yield* put(action.success(null));
@@ -300,6 +350,47 @@ function* dismissQuestions(
   } finally {
     if (!settled && (yield* cancelled())) {
       yield* put(action.failure(new Error(m.agent_mutation_dismissQuestionsFailed_error())));
+    }
+  }
+}
+
+function* resolveProposal(
+  action: ReturnType<typeof agentProposalResolveRequested>,
+): SagaGenerator<void> {
+  const [agentId, workspaceId, request] = action.payload;
+  let settled = false;
+  try {
+    const result = yield* call([appClient.agents, appClient.agents.resolveProposal], {
+      agentId,
+      workspaceId,
+      proposalId: request.proposalId,
+      outcome: request.outcome,
+      ...(request.detail !== undefined ? { detail: request.detail } : {}),
+    });
+    if (!result.success)
+      throw new Error(result.error || m.agent_mutation_resolveProposalFailed_error());
+    // Reconcile local lifecycle immediately — the tray retires the box
+    // without waiting for the `agent:updated` metadata convergence. Keyed
+    // per agent: daemon ids fall back to `preview.title` for id-less
+    // proposals, so a global key would retire another agent's identically
+    // titled proposal too.
+    yield* put(
+      proposalResolutionReconciled({
+        proposalId: agentScopedProposalKey(agentId, request.proposalId),
+        outcome: request.outcome,
+        completedAt: Date.now(),
+      }),
+    );
+    yield* put(action.success(undefined as never));
+    settled = true;
+  } catch (error) {
+    const failure = mutationError(error, m.agent_mutation_resolveProposalFailed_error());
+    yield* call(showError, failure.message);
+    yield* put(action.failure(failure));
+    settled = true;
+  } finally {
+    if (!settled && (yield* cancelled())) {
+      yield* put(action.failure(new Error(m.agent_mutation_resolveProposalFailed_error())));
     }
   }
 }
@@ -497,11 +588,13 @@ function* deleteImmediately(
 export function* agentMutationSaga(): SagaGenerator<void> {
   yield* all([
     takeEvery(restoreAgentSessionRequested, restoreAgent),
+    takeEvery(restoreRetiredAgentRequested, restoreRetiredAgent),
     takeEvery(activateAgentRequested, activateAgent),
     takeEvery(saveAgentSessionRequested, saveAgent),
     takeEvery(renameAgentSessionRequested, renameAgent),
     takeEvery(stopAgentSessionRequested, stopAgent),
     takeEvery(agentSessionDismissQuestionsRequested, dismissQuestions),
+    takeEvery(agentProposalResolveRequested, resolveProposal),
     takeEvery(cancelAgentSubscriptionsRequested, cancelAgentSubscriptions),
     takeEvery(deleteAgentWithUndoRequested, deleteWithUndo),
     takeEvery(undoAgentDeletionRequested, undoDeletion),

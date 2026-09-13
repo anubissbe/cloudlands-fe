@@ -32,6 +32,7 @@ import {
   type SpecialistFilesResult,
   type SpecialistFileScope,
   type SpecialistModelOption,
+  type SpecialistRole,
   type SpecialistSource,
   SPECIALISTS_FOLDER,
   SPECIALIST_FILE_EXTENSIONS,
@@ -61,7 +62,7 @@ export function getProjectSpecialistsDirectory(workspacePath: string): string {
  * In development: ./resources/specialists
  * In production: app.getAppPath()/resources/specialists (unpacked)
  */
-export function getBundledSpecialistsDirectory(): string {
+function getBundledSpecialistsDirectory(): string {
   const isDev = !app.isPackaged;
 
   if (isDev) {
@@ -101,7 +102,7 @@ export async function ensureSpecialistsDirectory(): Promise<string> {
   }
 }
 
-export async function ensureProjectSpecialistsDirectory(workspacePath: string): Promise<string> {
+async function ensureProjectSpecialistsDirectory(workspacePath: string): Promise<string> {
   const dir = getProjectSpecialistsDirectory(workspacePath);
   try {
     await fs.mkdir(dir, { recursive: true });
@@ -331,10 +332,18 @@ function parseFrontmatter(content: string): {
  * Parse a frontmatter `modelOptions` scalar (single-line JSON array) with the
  * daemon's lenient read semantics (PROTOCOL §5.11): an unparseable scalar or
  * non-array is treated as an omitted key (undefined ⇒ inherits); unusable
- * entries — non-objects, or no non-empty string `model` — are skipped
- * individually; a non-string/empty `reasoningEffort` reads as omitted on the
+ * entries — non-objects, or no non-empty (non-whitespace) string `model` —
+ * are skipped individually; `provider` is carried when it is a non-empty
+ * string; a non-string/empty `reasoningEffort` reads as omitted on the
  * entry; only a literal `[]` yields an explicit empty list, and a non-empty
  * array whose entries are ALL unusable is treated as omitted.
+ *
+ * Legacy compound `model` ids split on read: `provider:model` becomes the
+ * explicit `provider` plus the bare `model` (both halves trimmed), the
+ * prefix winning over an entry-level `provider` field (mirroring the spawn
+ * precedence compound ids had). A compound id with an empty prefix or an
+ * empty rest is unusable. Writes emit the triple shape only, and a bare
+ * model id never contains a colon, so the re-split on every read is safe.
  * Exported for testing purposes.
  */
 export function parseModelOptionsScalar(
@@ -352,23 +361,103 @@ export function parseModelOptionsScalar(
   const options: SpecialistModelOption[] = [];
   for (const entry of parsed) {
     if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) continue;
-    const { model, hint, reasoningEffort } = entry as {
+    const {
+      provider: rawProvider,
+      model: rawModel,
+      hint,
+      reasoningEffort,
+    } = entry as {
+      provider?: unknown;
       model?: unknown;
       hint?: unknown;
       reasoningEffort?: unknown;
     };
-    if (typeof model !== 'string' || model === '') continue;
+    if (typeof rawModel !== 'string' || rawModel.trim() === '') continue;
+    let provider: string | undefined;
+    let model: string;
+    const colonIndex = rawModel.indexOf(':');
+    if (colonIndex >= 0) {
+      const prefix = rawModel.slice(0, colonIndex).trim();
+      const rest = rawModel.slice(colonIndex + 1).trim();
+      // A compound with an empty prefix or empty rest is unusable.
+      if (prefix === '' || rest === '') continue;
+      provider = prefix;
+      model = rest;
+    } else {
+      provider =
+        typeof rawProvider === 'string' && rawProvider.trim() !== '' ? rawProvider : undefined;
+      model = rawModel;
+    }
     options.push({
+      ...(provider !== undefined ? { provider } : {}),
       model,
       hint: typeof hint === 'string' ? hint : '',
       // A non-string or empty level reads as an omitted key (inherits).
-      ...(typeof reasoningEffort === 'string' && reasoningEffort !== ''
+      ...(typeof reasoningEffort === 'string' && reasoningEffort.trim() !== ''
         ? { reasoningEffort }
         : {}),
     });
   }
   // All entries unusable ⇒ treated as omitted (inherits), never a clear.
   return options.length > 0 ? options : undefined;
+}
+
+/**
+ * Parse a frontmatter `role` scalar with lenient read semantics (PROTOCOL
+ * §5.11): only the known enum values are kept; unknown/empty values read as
+ * an omitted key (standard specialist) — the parse never rejects.
+ * Exported for testing purposes.
+ */
+export function parseRoleScalar(raw: string | undefined): SpecialistRole | undefined {
+  return raw === 'orchestrator' || raw === 'internal' ? raw : undefined;
+}
+
+/**
+ * Parse a frontmatter `teamAgents` scalar (single-line JSON array of
+ * specialist ids) with the same lenient read semantics as `modelOptions`:
+ * an unparseable scalar or non-array reads as omitted; unusable entries
+ * (non-strings, blank/whitespace-only strings) are skipped individually; a
+ * literal `[]` yields an explicit empty list, and a non-empty array whose
+ * entries are ALL unusable reads as omitted.
+ * Exported for testing purposes.
+ */
+export function parseTeamAgentsScalar(raw: string | undefined): string[] | undefined {
+  if (raw === undefined || raw.trim() === '') return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return undefined;
+  }
+  if (!Array.isArray(parsed)) return undefined;
+  if (parsed.length === 0) return [];
+  const ids = parsed.filter(
+    (entry): entry is string => typeof entry === 'string' && entry.trim() !== '',
+  );
+  return ids.length > 0 ? ids : undefined;
+}
+
+/**
+ * Lenient read normalization of a legacy compound frontmatter `model` scalar
+ * (PROTOCOL §5.11): `model: "provider:model"` splits into the bare `model`
+ * plus a `codingAgent` set to the prefix — the prefix WINS over any
+ * `codingAgent` the same file declares, preserving the spawn precedence
+ * compound ids had. A compound with an empty prefix or empty rest is
+ * unusable and reads as an omitted key (which inherits). Writes emit bare
+ * model ids only, and a bare id never contains a colon, so the re-split on
+ * every read is safe. Exported for testing purposes.
+ */
+export function splitCompoundModelScalar(
+  model: string | undefined,
+  codingAgent: string | undefined,
+): { model: string | undefined; codingAgent: string | undefined } {
+  if (model === undefined) return { model, codingAgent };
+  const colonIndex = model.indexOf(':');
+  if (colonIndex < 0) return { model, codingAgent };
+  const prefix = model.slice(0, colonIndex).trim();
+  const rest = model.slice(colonIndex + 1).trim();
+  if (prefix === '' || rest === '') return { model: undefined, codingAgent };
+  return { model: rest, codingAgent: prefix };
 }
 
 /**
@@ -406,18 +495,27 @@ export function parseSpecialistFile(
 
   const { frontmatter, body } = parsed;
 
+  // Legacy compound `model` ids split into bare model + codingAgent on read.
+  const { model, codingAgent } = splitCompoundModelScalar(
+    frontmatter.model,
+    frontmatter.codingAgent,
+  );
+
   // Retired `modelTier:` keys in existing files are tolerated and ignored
   // (dropped on the next rewrite) — never rejected.
   const specialistFrontmatter: SpecialistFileFrontmatter = {
     name: frontmatter.name || nameFromFilename,
     description: frontmatter.description || '',
-    codingAgent: frontmatter.codingAgent,
-    model: frontmatter.model,
+    codingAgent,
+    model,
     roleReminder: frontmatter.roleReminder,
     agentType: frontmatter.agentType,
     hidden: frontmatter.hidden === 'true' ? true : undefined,
     modelOptions: parseModelOptionsScalar(frontmatter.modelOptions),
     reasoningEffort: frontmatter.reasoningEffort || undefined,
+    role: parseRoleScalar(frontmatter.role),
+    teamAgents: parseTeamAgentsScalar(frontmatter.teamAgents),
+    icon: frontmatter.icon || undefined,
   };
 
   return {
@@ -541,6 +639,9 @@ export async function writeSpecialistFile(specialist: {
   hidden?: boolean;
   modelOptions?: SpecialistModelOption[];
   reasoningEffort?: string;
+  role?: SpecialistRole;
+  teamAgents?: string[];
+  icon?: string;
   behaviorPrompt: string;
   scope?: SpecialistFileScope;
   workspacePath?: string;
@@ -563,18 +664,26 @@ export async function writeSpecialistFile(specialist: {
     const filename = specialistIdToFilename(specialist.id);
     const filePath = path.join(dir, filename);
 
+    // Writes emit the triple shape only (PROTOCOL §5.11): a legacy compound
+    // `model` id from a stale caller is split into bare model + codingAgent
+    // (the prefix winning) so a compound id never persists to disk.
+    const { model, codingAgent } = splitCompoundModelScalar(
+      specialist.model,
+      specialist.codingAgent,
+    );
+
     // Build frontmatter with properly escaped values
     const frontmatterParts = [
       `name: "${escapeYamlValue(specialist.name)}"`,
       `description: "${escapeYamlValue(specialist.description)}"`,
     ];
 
-    if (specialist.codingAgent) {
-      frontmatterParts.push(`codingAgent: "${escapeYamlValue(specialist.codingAgent)}"`);
+    if (codingAgent) {
+      frontmatterParts.push(`codingAgent: "${escapeYamlValue(codingAgent)}"`);
     }
 
-    if (specialist.model) {
-      frontmatterParts.push(`model: "${escapeYamlValue(specialist.model)}"`);
+    if (model) {
+      frontmatterParts.push(`model: "${escapeYamlValue(model)}"`);
     }
 
     if (specialist.roleReminder) {
@@ -587,12 +696,41 @@ export async function writeSpecialistFile(specialist: {
 
     // Single-line JSON-array scalar (PROTOCOL §5.11). An explicit [] is the
     // inherit-clearing form and is written verbatim; undefined writes no key.
+    // Entries are normalized to the triple shape (compound ids split, the
+    // prefix winning over the entry-level provider) so writes never persist a
+    // compound `model`; a compound with an empty prefix, an empty rest, or a
+    // rest that itself still contains a colon (multi-colon id — the daemon
+    // rejects these at write) is malformed and is dropped instead of
+    // persisting a colon-bearing model.
     if (specialist.modelOptions !== undefined) {
-      frontmatterParts.push(`modelOptions: ${JSON.stringify(specialist.modelOptions)}`);
+      const normalizedOptions = specialist.modelOptions.flatMap((opt) => {
+        const colonIndex = opt.model.indexOf(':');
+        if (colonIndex < 0) return [opt];
+        const prefix = opt.model.slice(0, colonIndex).trim();
+        const rest = opt.model.slice(colonIndex + 1).trim();
+        if (prefix === '' || rest === '' || rest.includes(':')) return [];
+        const { provider: _provider, ...restFields } = opt;
+        return [{ provider: prefix, ...restFields, model: rest }];
+      });
+      frontmatterParts.push(`modelOptions: ${JSON.stringify(normalizedOptions)}`);
     }
 
     if (specialist.reasoningEffort) {
       frontmatterParts.push(`reasoningEffort: "${escapeYamlValue(specialist.reasoningEffort)}"`);
+    }
+
+    if (specialist.role) {
+      frontmatterParts.push(`role: "${escapeYamlValue(specialist.role)}"`);
+    }
+
+    // Single-line JSON-array scalar like modelOptions: an explicit [] is
+    // written verbatim; undefined writes no key.
+    if (specialist.teamAgents !== undefined) {
+      frontmatterParts.push(`teamAgents: ${JSON.stringify(specialist.teamAgents)}`);
+    }
+
+    if (specialist.icon) {
+      frontmatterParts.push(`icon: "${escapeYamlValue(specialist.icon)}"`);
     }
 
     const content = `---\n${frontmatterParts.join('\n')}\n---\n\n${specialist.behaviorPrompt}`;

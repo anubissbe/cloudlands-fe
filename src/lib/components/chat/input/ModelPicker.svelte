@@ -2,7 +2,6 @@
   /* eslint-disable max-lines */
   import { onMount, tick, untrack } from 'svelte';
   import { writable } from 'svelte/store';
-  import { slide } from 'svelte/transition';
 
   import { agentClient } from '$features/agent/agent.client';
   import {
@@ -28,6 +27,7 @@
   import EffortGauge from './EffortGauge.svelte';
   import EffortPicker from './EffortPicker.svelte';
   import ModelPickerGroupHeader from './ModelPickerGroupHeader.svelte';
+  import ModelPickerLegacyGroupHeader from './ModelPickerLegacyGroupHeader.svelte';
   import ModelPickerProviderNotice, {
     createProviderWarningNotice,
     type ProviderWarningNotice,
@@ -48,7 +48,6 @@
   } from '$store/renderer/slices/model/model-selectors';
   import {
     clearModelFallbackInfo,
-    requestHydrateModelFallbackInfo,
     selectModel,
     setLoadingStateForProvider,
     setModelFallbackInfo,
@@ -60,8 +59,9 @@
   import { ensureProvidersChecked } from '$store/renderer/slices/agent-availability/agent-availability-slice';
   import {
     selectActiveProviderId,
-    selectEnabledProviderIds,
     selectAvailableEnabledProviderIds,
+    selectIsProviderModelAccessAllowed,
+    selectModelFetchProviderIds,
   } from '$store/renderer/slices/provider-settings/provider-settings-selectors';
   import {
     getModelsForProvider,
@@ -74,7 +74,7 @@
     selectProviderModelsClearEpoch,
   } from '$store/renderer/slices/provider-models/provider-models-selectors';
 
-  import { parseCompoundModelId as parseCompoundModelIdWithDefault } from '$shared/utils/compound-model-id';
+  import { splitLegacyCompoundId } from '$shared/utils/legacy-model-id';
   import {
     selectEffectiveDefaultProviderId,
     selectNormalizedProviderId,
@@ -82,8 +82,9 @@
   } from '$store/renderer/slices/provider-catalog/provider-catalog-selectors';
   import { getAgentProvider } from '$shared/types/agent-session';
   import { formatProviderLoadError, type ProviderLoadError } from './model-picker-provider-errors';
-  import { buildGroupedModelOptions } from './model-picker-groups';
+  import { AUGGIE_LEGACY_GROUP_KEY, buildGroupedModelOptions } from './model-picker-groups';
   import {
+    filterDefaultPseudoOptions,
     findModelFallbackOption,
     isProviderEnabled,
     isUserProviderSettled,
@@ -97,6 +98,7 @@
   import { toast } from 'svelte-sonner';
   import { m } from '$shared/paraglide/messages.js';
   import {
+    faArrowsRotate,
     faCheck,
     faChevronDown,
     faLock,
@@ -122,11 +124,16 @@
     providerId: string;
     modelId: string;
   } {
-    return parseCompoundModelIdWithDefault(compoundModelId, $defaultProviderId$);
+    const { providerId, modelId } = splitLegacyCompoundId(compoundModelId);
+    return { providerId: providerId ?? $defaultProviderId$, modelId };
   }
 
   const activeProviderId$ = selectActiveProviderId();
-  const enabledProviderIds$ = selectEnabledProviderIds();
+  const modelFetchProviderIds$ = selectModelFetchProviderIds();
+  const antigravityModelsAllowed$ = selectIsProviderModelAccessAllowed('antigravity');
+  function canUseProviderModels(providerId: string): boolean {
+    return normalizeProviderId(providerId) !== 'antigravity' || $antigravityModelsAllowed$;
+  }
   const availableEnabledProviderIds$ = selectAvailableEnabledProviderIds();
   const selectedModel$ = selectSelectedModel();
   const availableModels$ = selectAvailableModels();
@@ -150,7 +157,15 @@
 
   interface Props {
     selectedModel?: string | null;
-    onModelChange?: (model: string) => void;
+    /**
+     * Called on every user pick. `model` keeps the picked row's raw value for
+     * backward compatibility (bare for the default provider, legacy
+     * `provider:model` otherwise); `pick` carries the resolved triple legs —
+     * the bare model id and its owning provider — so consumers never parse
+     * the model string for a provider. Absent on the "use default" pick
+     * (`model === ''`).
+     */
+    onModelChange?: (model: string, pick?: { providerId: string; modelId: string }) => void;
     /**
      * Optional go/no-go gate invoked before a user-picked model change is
      * applied. Called with the current and target model ids when they differ;
@@ -328,6 +343,7 @@
   const seededProviderModels: Record<string, DropdownOption[]> = {};
   const seededProviderLoading: Record<string, boolean> = {};
   for (const [pid, entry] of Object.entries(cachedProviderCatalogs)) {
+    if (!canUseProviderModels(pid)) continue;
     seededProviderModels[pid] = toDropdownOptions(entry.models);
     seededProviderLoading[pid] = false;
   }
@@ -344,8 +360,16 @@
   let allProviderErrors = $state<Record<string, ProviderLoadError>>({});
   let allProviderLoading = $state<Record<string, boolean>>(seededProviderLoading);
   let fetchGeneration = 0;
+  const providerFetchGenerations = new Map<string, number>();
+  const refreshingProviderEpochs = new Map<string, number>();
   let allProvidersLoaded = $state(seededAllProvidersLoaded);
   let lastFetchedProviderIds = '';
+
+  function advanceProviderFetchGeneration(providerId: string): number {
+    const generation = (providerFetchGenerations.get(providerId) ?? 0) + 1;
+    providerFetchGenerations.set(providerId, generation);
+    return generation;
+  }
 
   function hasProviderResult(providerId: string): boolean {
     return (
@@ -364,6 +388,7 @@
   }
 
   async function fetchAllProviderModels(enabledIds: string[]) {
+    enabledIds = enabledIds.filter(canUseProviderModels);
     const key = enabledIds.slice().sort().join(',');
     if (key === lastFetchedProviderIds && allProvidersLoaded) return;
     lastFetchedProviderIds = key;
@@ -384,7 +409,6 @@
       Object.entries(allProviderModels).filter(([providerId]) => providerIds.includes(providerId)),
     );
     allProviderErrors = {};
-    allProviderLoading = Object.fromEntries(providerIds.map((providerId) => [providerId, true]));
 
     // Epoch at fetch start: a reconnect clear that lands while these
     // responses are in flight makes them stale — the settle-time isStale()
@@ -392,12 +416,24 @@
     // bump can run after a pending response settles) and the reducer drops
     // any pre-clear write-through stamped below as a second line of defense.
     const cacheEpoch = selectProviderModelsClearEpoch.select(appStore.state);
-    const isStale = () =>
-      fetchGeneration !== currentGen ||
-      selectProviderModelsClearEpoch.select(appStore.state) !== cacheEpoch;
+    const providerIdsToFetch = providerIds.filter(
+      (providerId) =>
+        !refreshingProviders.has(providerId) ||
+        refreshingProviderEpochs.get(providerId) !== cacheEpoch,
+    );
+    const fetchingProviderIds = new Set(providerIdsToFetch);
+    allProviderLoading = Object.fromEntries(
+      providerIds.map((providerId) => [providerId, fetchingProviderIds.has(providerId)]),
+    );
+    allProvidersLoaded = providerIdsToFetch.length === 0;
 
     await Promise.allSettled(
-      providerIds.map(async (providerId) => {
+      providerIdsToFetch.map(async (providerId) => {
+        const providerGeneration = advanceProviderFetchGeneration(providerId);
+        const isStale = () =>
+          fetchGeneration !== currentGen ||
+          providerFetchGenerations.get(providerId) !== providerGeneration ||
+          selectProviderModelsClearEpoch.select(appStore.state) !== cacheEpoch;
         try {
           const result = await getModelsForProviderForLoadingState(providerId);
           if (isStale()) return;
@@ -435,7 +471,9 @@
   // aren't already covered by the all-providers fetch because the agent's
   // provider is since unavailable. Skipping it otherwise avoids a duplicate fetch.
   const usesAgentProviderFetch = $derived(
-    effectiveProviderId !== $activeProviderId$ && !isEffectiveProviderAvailable,
+    canUseProviderModels(effectiveProviderId) &&
+      effectiveProviderId !== $activeProviderId$ &&
+      !isEffectiveProviderAvailable,
   );
 
   // Separate generation counter from fetchAllProviderModels: in unlocked mode
@@ -443,6 +481,7 @@
   let agentFetchGeneration = 0;
   async function fetchAgentProviderModels(providerId: string) {
     const currentGen = ++agentFetchGeneration;
+    if (!canUseProviderModels(providerId)) return;
     // Hydrate from the session cache (stale-while-revalidate): a cached
     // catalog renders immediately with no loading state — the all-provider
     // fetch prunes disabled providers from allProviderModels, so this path is
@@ -498,9 +537,10 @@
 
   let fetchDebounceTimer: ReturnType<typeof setTimeout> | undefined;
   $effect(() => {
-    const providerIds = $hasCheckedOnce$ ? $availableEnabledProviderIds$ : $enabledProviderIds$;
+    const providerIds = $modelFetchProviderIds$;
     clearTimeout(fetchDebounceTimer);
     fetchDebounceTimer = setTimeout(() => fetchAllProviderModels(providerIds), 50);
+    return () => clearTimeout(fetchDebounceTimer);
   });
 
   // React to the session cache being cleared (backend reconnect, RESUB-1):
@@ -531,7 +571,9 @@
   // Models for the effective provider: the per-agent fetch result when the
   // agent's provider differs from the active one, the global store otherwise.
   const availableModels = $derived(
-    agentProviderLoading
+    !canUseProviderModels(
+      agentProviderModels ? effectiveProviderId : $availableModelsProviderId$,
+    ) || agentProviderLoading
       ? []
       : (agentProviderModels ?? (agentProviderError ? [] : $availableModels$)),
   );
@@ -544,9 +586,10 @@
       : $availableModelsProviderId$,
   );
   const isLoadingModels = $derived(
-    agentProviderLoading ||
-      (!hasProviderResult(effectiveProviderId) &&
-        ($isLoadingModels$ || allProviderLoading[effectiveProviderId] || !allProvidersLoaded)),
+    canUseProviderModels(effectiveProviderId) &&
+      (agentProviderLoading ||
+        (!hasProviderResult(effectiveProviderId) &&
+          ($isLoadingModels$ || allProviderLoading[effectiveProviderId] || !allProvidersLoaded))),
   );
   const loadError = $derived($loadError$);
 
@@ -562,14 +605,16 @@
   let refreshingProviders = $state<Set<string>>(new Set());
 
   async function handleRefreshProvider(providerId: string) {
+    if (!canUseProviderModels(providerId)) return;
     if (refreshingProviders.has(providerId)) return;
-    refreshingProviders = new Set([...refreshingProviders, providerId]);
-    const gen = fetchGeneration;
     // Epoch at fetch start: a reconnect clear mid-flight makes this response
     // stale for local state as well as for the reducer write-through.
     const cacheEpoch = selectProviderModelsClearEpoch.select(appStore.state);
+    const providerGeneration = advanceProviderFetchGeneration(providerId);
+    refreshingProviderEpochs.set(providerId, cacheEpoch);
+    refreshingProviders = new Set([...refreshingProviders, providerId]);
     const isStale = () =>
-      fetchGeneration !== gen ||
+      providerFetchGenerations.get(providerId) !== providerGeneration ||
       selectProviderModelsClearEpoch.select(appStore.state) !== cacheEpoch;
     try {
       // True force refresh: the daemon skips its cache and awaits a fresh
@@ -599,6 +644,7 @@
       setProviderErrorState(providerId, providerError.displayText);
       logger.warn('Failed to refresh models for provider', { providerId, error: err });
     } finally {
+      refreshingProviderEpochs.delete(providerId);
       const next = new Set(refreshingProviders);
       next.delete(providerId);
       refreshingProviders = next;
@@ -668,14 +714,41 @@
     }
   });
 
+  // Resolve the provider owning a picked row. Catalog groups carry bare ids
+  // for every provider, so a bare pick is attributed to the loaded group that
+  // contains the row rather than blanket-attributed to the default provider.
+  // A legacy compound prefix (persisted ids) still wins outright; when several
+  // groups own the same bare id — or no loaded group owns it — the default
+  // provider keeps priority (the intent-hq/monorepo#1657 contract).
+  function resolvePickedTriple(model: string): { providerId: string; modelId: string } {
+    const { providerId: legacyProviderId, modelId } = splitLegacyCompoundId(model);
+    if (legacyProviderId) return { providerId: legacyProviderId, modelId };
+    const matchesIn = (rowProviderId: string, options: { value: string }[] | undefined) =>
+      Boolean(
+        options?.some(
+          (opt) =>
+            normalizeModelIdForMatch(opt.value, rowProviderId) ===
+            normalizeModelIdForMatch(modelId, rowProviderId),
+        ),
+      );
+    const defaultNormalized = normalizeProviderId($defaultProviderId$);
+    if (defaultNormalized && matchesIn(defaultNormalized, allProviderModels[defaultNormalized])) {
+      return { providerId: defaultNormalized, modelId };
+    }
+    for (const [rowProviderId, options] of Object.entries(allProviderModels)) {
+      if (matchesIn(rowProviderId, options)) return { providerId: rowProviderId, modelId };
+    }
+    return { providerId: $defaultProviderId$, modelId };
+  }
+
   async function applyBackendModelUpdate(model: string) {
     if (agentId && workspaceId) {
       try {
-        // Send the picked model's provider explicitly: the parsed compound
-        // prefix, or the effective default provider for bare ids. Without it
-        // the daemon resolves a bare id against the session's current
-        // provider, rejecting cross-provider picks of default-provider models.
-        const pickedProviderId = parseCompoundModelId(model).providerId || undefined;
+        // Send the picked model's provider explicitly: the owning catalog
+        // group's provider (legacy compound prefix wins). Without it the
+        // daemon resolves a bare id against the session's current provider,
+        // rejecting cross-provider picks.
+        const pickedProviderId = resolvePickedTriple(model).providerId || undefined;
         const result = await agentClient.setModel(agentId, model, workspaceId, pickedProviderId);
         if (result.ok && result.data.success) {
           logger.info('Updated agent model via IPC:', { agentId, model });
@@ -708,6 +781,10 @@
   }
 
   async function handleModelSelect(model: string | undefined) {
+    if (model !== undefined && !canUseProviderModels(resolvePickedTriple(model).providerId)) {
+      dropdownValue = localModel ?? USE_DEFAULT_VALUE;
+      return;
+    }
     logger.debug('Model selected:', { model, previousModel: localModel, workspaceId, agentId });
     logger.debug('Model pick flags:', { deferUpdate, updateGlobalStore, updateGlobalDefault });
     // Update local state before async work so the UI responds immediately.
@@ -726,11 +803,15 @@
       return;
     }
 
-    onModelChange?.(model);
+    // Resolve the pick's triple legs once at the emit boundary: the legacy
+    // compound prefix when present, else the provider whose loaded catalog
+    // group owns the picked bare row.
+    const { providerId: pickedProviderId, modelId: pickedModelId } = resolvePickedTriple(model);
+    onModelChange?.(model, { providerId: pickedProviderId, modelId: pickedModelId });
 
     await tick();
 
-    if (updateGlobalDefault) appStore.dispatch(selectModel(model));
+    if (updateGlobalDefault) appStore.dispatch(selectModel(pickedModelId, pickedProviderId));
     if (!updateGlobalStore) return;
 
     if (agentId && workspaceId) {
@@ -760,6 +841,10 @@
 
   // Get the label for a model ID from available models list; undefined when
   // the id resolves to no loaded model (callers pick the fallback).
+  // Catalog rows now carry bare ids for every provider, while a session id
+  // may be daemon-pinned bare or stored legacy-compound, so ids are compared
+  // via normalizeModelIdForMatch (like selectedCatalogOption), not exact
+  // string equality.
   // Legacy codex compound ids (`{model}/{effort}`) no longer exist as catalog
   // rows (the daemon collapses them to one base row + effortLevels), so on an
   // exact-id miss the base model's label is rendered with the effort suffix
@@ -768,11 +853,16 @@
   function getModelLabel(modelId: string | undefined): string | undefined {
     if (!modelId) return undefined;
     const lookup = (id: string): string | undefined => {
-      for (const models of Object.values(allProviderModels)) {
-        const found = models.find((m) => m.value === id);
+      const target = normalizeModelIdForMatch(id, effectiveProviderId);
+      for (const [rowProviderId, models] of Object.entries(allProviderModels)) {
+        const found = models.find(
+          (m) => normalizeModelIdForMatch(m.value, rowProviderId) === target,
+        );
         if (found) return found.label;
       }
-      return availableModels.find((m) => m.value === id)?.label;
+      return availableModels.find(
+        (m) => normalizeModelIdForMatch(m.value, availableModelsProviderId) === target,
+      )?.label;
     };
     const exact = lookup(modelId);
     if (exact) return exact;
@@ -817,32 +907,71 @@
       : undefined,
   );
 
-  // Legacy persisted `<provider>:default` selections (picked while the daemon
-  // still listed a 'default' pseudo-row): with no catalog row of their own
-  // they map to the provider's isDefault row, rendering as that model instead
-  // of an unavailable selection. An actual `:default` catalog row (older
-  // daemon) still wins via the exact-id lookup.
-  const legacyDefaultMappedOption = $derived.by(() => {
-    if (!hasExplicitModel || !localModel) return undefined;
-    const { providerId: modelProviderId, modelId } = parseCompoundModelId(localModel);
-    if (modelId !== 'default') return undefined;
-    if (getModelLabel(localModel) !== undefined) return undefined;
-    return findCatalogDefaultOption(modelProviderId);
-  });
+  // The provider's first known model row (pseudo-rows filtered; a sole
+  // pseudo-row survives per D1). Prefers the first non-legacy row — the group
+  // builder splits isLegacyModel rows into a separate legacy subgroup, so the
+  // first *rendered* current row is the non-legacy one. Undefined while the
+  // catalog is cold.
+  function findFirstCatalogModelOption(providerId: string): DropdownOption | undefined {
+    const normalizedId = normalizeProviderId(providerId);
+    if (!normalizedId) return undefined;
+    const firstCurrentRow = (options: DropdownOption[]): DropdownOption | undefined => {
+      const filtered = filterDefaultPseudoOptions(options);
+      return filtered.find((opt) => opt.data?.isLegacyModel !== true) ?? filtered[0];
+    };
+    const fromAll = allProviderModels[normalizedId];
+    if (fromAll && fromAll.length > 0) return firstCurrentRow(fromAll);
+    if (
+      availableModelsProviderId !== '' &&
+      normalizeProviderId(availableModelsProviderId) === normalizedId &&
+      availableModels.length > 0
+    ) {
+      return firstCurrentRow(toDropdownOptions(availableModels));
+    }
+    return undefined;
+  }
+
+  // A `<provider>:default` id has no rendered row of its own (the picker
+  // filters the pseudo-row from the list): it maps to the provider's
+  // isDefault row, falling back to the first known model row (D2, mirroring
+  // the daemon's cached_default_or_first_model) so the selection never
+  // renders as dead/unavailable. Undefined for non-pseudo ids and while the
+  // catalog is cold.
+  function mapDefaultPseudoSelection(compoundId: string): DropdownOption | undefined {
+    const { providerId: modelProviderId, modelId } = parseCompoundModelId(compoundId);
+    if (modelId.toLowerCase() !== 'default') return undefined;
+    return (
+      findCatalogDefaultOption(modelProviderId) ?? findFirstCatalogModelOption(modelProviderId)
+    );
+  }
+
+  // D2 mapping for a persisted `<provider>:default` selection.
+  const legacyDefaultMappedOption = $derived.by(() =>
+    hasExplicitModel && localModel ? mapDefaultPseudoSelection(localModel) : undefined,
+  );
+
+  // D2 mapping for a daemon-resolved `<provider>:default` preview
+  // (defaultModelId from an older daemon) — same exposure as the explicit
+  // selection: an exact-id match would resolve to the hidden pseudo-row.
+  const defaultModelIdMappedOption = $derived.by(() =>
+    defaultModelId ? mapDefaultPseudoSelection(defaultModelId) : undefined,
+  );
 
   const currentModelLabel = $derived.by(() => {
     if (hasExplicitModel) {
       return localModel
-        ? (getModelLabel(localModel) ??
-            legacyDefaultMappedOption?.label ??
+        ? (legacyDefaultMappedOption?.label ??
+            getModelLabel(localModel) ??
             parseCompoundModelId(localModel).modelId)
         : (defaultModelLabel ?? m.chat_modelPicker_defaultModel_label());
     }
 
     // Unresolvable defaultModelId (models not loaded yet): prefer the caller's
-    // defaultModelLabel (e.g. "Provider default"), then the bare model id.
+    // defaultModelLabel (e.g. "Provider default"), then the bare model id. A
+    // `<provider>:default` preview maps to its D2 row's label first.
     if (defaultModelId) {
       const resolvedLabel =
+        defaultModelIdMappedOption?.label ??
         getModelLabel(defaultModelId) ??
         defaultModelLabel ??
         parseCompoundModelId(defaultModelId).modelId;
@@ -858,7 +987,9 @@
 
   const triggerProviderId = $derived.by(() => {
     if (localModel && hasExplicitModel) {
-      return parseCompoundModelId(localModel).providerId;
+      // Catalog-ownership attribution so a bare cross-provider selection
+      // shows its own provider's icon, not the default provider's.
+      return resolvePickedTriple(localModel).providerId;
     }
     if (explicitProviderId) return explicitProviderId;
     // No explicit provider or model — show the displayed default model's provider.
@@ -871,6 +1002,9 @@
 
   const isTriggerLabelResolved = $derived.by(() => {
     if (!hasExplicitModel || !localModel) return true; // "Default model" text, no need for skeleton
+    // A `<provider>:default` selection mapped to its D2 row renders that
+    // row's label — resolved even while other providers are still loading.
+    if (legacyDefaultMappedOption) return true;
     if (!isLoadingModels && allProvidersLoaded) return true;
     for (const models of Object.values(allProviderModels)) {
       if (models.some((m) => m.value === localModel)) return true;
@@ -878,9 +1012,6 @@
     return availableModels.some((m) => m.value === localModel);
   });
 
-  const lockedButtonTitle = $derived(
-    lockedTitle?.trim() || m.chat_modelPicker_modelLocked_title({ model: currentModelLabel }),
-  );
   const shouldShowLockIconWhenLocked = $derived(isCompact || showLockIconWhenLocked);
 
   const buttonSize = $derived(isCompact ? 'icon' : size);
@@ -927,11 +1058,12 @@
   const selectedCatalogOption = $derived.by(() => {
     const selectedId = hasExplicitModel ? localModel : defaultModelId;
     if (!selectedId) return catalogDefaultFallbackOption;
-    return (
-      flatModelOptions.find(
-        (option) =>
-          normalizeModelIdForMatch(option.value) === normalizeModelIdForMatch(selectedId),
-      ) ?? (hasExplicitModel ? legacyDefaultMappedOption : undefined)
+    // The mapped row wins for `<provider>:default` — an exact-id match would
+    // resolve to the hidden pseudo-row when an older daemon still serves one.
+    const mappedOption = hasExplicitModel ? legacyDefaultMappedOption : defaultModelIdMappedOption;
+    if (mappedOption) return mappedOption;
+    return flatModelOptions.find(
+      (option) => normalizeModelIdForMatch(option.value) === normalizeModelIdForMatch(selectedId),
     );
   });
 
@@ -1059,8 +1191,20 @@
       allProviderLoading,
       allProviderErrors,
       allProviderWarnings: $allProviderWarnings$,
-    }),
+    }).filter(
+      (group) => group.key === 'default' || canUseProviderModels(group.parentKey ?? group.key),
+    ),
   );
+  let legacyModelsExpanded = $state(false);
+  let modelSearchValue = $state('');
+  const onlyLegacyAuggieModels = $derived(
+    groupedModelOptions.some((group) => group.key === AUGGIE_LEGACY_GROUP_KEY) &&
+      !groupedModelOptions.some((group) => group.key === 'auggie'),
+  );
+  const legacyToggleDisabled = $derived(
+    modelSearchValue.trim().length > 0 || onlyLegacyAuggieModels,
+  );
+  const legacyModelsVisible = $derived(legacyModelsExpanded || legacyToggleDisabled);
 
   // The value bound to the dropdown (convert undefined to USE_DEFAULT_VALUE).
   // Bound state rather than derived so a rejected confirmModelChange can
@@ -1073,16 +1217,20 @@
   });
 
   // Provider the explicitly selected model belongs to ('' when inheriting).
+  // Catalog rows are bare for every provider, so ownership is resolved from
+  // the loaded groups (legacy compound prefix wins) — not by parsing the id.
   const selectedModelProviderId = $derived(
     hasExplicitModel && localModel
-      ? normalizeProviderId(parseCompoundModelId(localModel).providerId)
+      ? normalizeProviderId(resolvePickedTriple(localModel).providerId)
       : '',
   );
 
   const providerTabIds = $derived.by(() => [
     ...new Set([
       ...$availableEnabledProviderIds$.map((id) => normalizeProviderId(id)),
-      ...groupedModelOptions.map((group) => group.key).filter((key) => key !== 'default'),
+      ...groupedModelOptions
+        .filter((group) => group.key !== 'default')
+        .map((group) => group.parentKey ?? group.key),
     ]),
   ]);
   const providerTabsEnabled = $derived(showReasoning && providerTabIds.length > 1);
@@ -1108,15 +1256,24 @@
   });
 
   // Display groups — provider tabs replace the tall group stack in the chat picker.
-  const displayGroups = $derived(
+  const displayGroups = $derived.by(() =>
     groupedModelOptions
-      .filter(
-        (group) =>
-          !providerTabsEnabled || group.key === 'default' || group.key === activeBrowseProviderId,
-      )
+      .filter((group) => {
+        const providerKey = group.parentKey ?? group.key;
+        return (
+          !providerTabsEnabled || group.key === 'default' || providerKey === activeBrowseProviderId
+        );
+      })
       .map((group) => ({
         ...group,
-        options: providerTabsEnabled || !collapsedGroups.has(group.key) ? group.options : [],
+        options:
+          group.key === AUGGIE_LEGACY_GROUP_KEY
+            ? legacyModelsVisible
+              ? group.options
+              : []
+            : providerTabsEnabled || !collapsedGroups.has(group.key)
+              ? group.options
+              : [],
       })),
   );
 
@@ -1128,6 +1285,7 @@
   const isSelectedModelProviderPending = $derived.by(() => {
     const modelProvider = selectedModelProviderId;
     if (!modelProvider) return false;
+    if (!canUseProviderModels(modelProvider)) return false;
     if (hasProviderResult(modelProvider)) return false;
     if (allProviderLoading[modelProvider]) return true;
     // Availability hasn't been probed yet — an empty enabled list is "unknown".
@@ -1154,6 +1312,7 @@
   });
 
   const isSelectedModelUnavailable = $derived.by(() => {
+    if (!canUseProviderModels(selectedModelProviderId || effectiveProviderId)) return true;
     if (!$hasCheckedOnce$) return false;
     if (isLoadingModels) return false;
     if (!allProvidersLoaded) return false;
@@ -1189,6 +1348,7 @@
   });
 
   const LEVEL_LABELS: Record<string, () => string> = {
+    none: () => m.chat_shared_valueOff_label(),
     minimal: () => m.chat_effortPicker_level_minimal(),
     low: () => m.chat_effortPicker_level_low(),
     medium: () => m.chat_effortPicker_level_medium(),
@@ -1202,6 +1362,7 @@
   }
 
   const reasoningLevels = $derived(showReasoning ? selectedModelEffortLevels : []);
+  const showReasoningFooter = $derived(showReasoning && reasoningLevels.length > 0);
   const persistedReasoningEffort = $derived(
     onReasoningChange ? (reasoningEffort ?? null) : ($reasoningEffort$ ?? null),
   );
@@ -1213,57 +1374,37 @@
   const currentReasoningLabel = $derived(
     currentReasoningEffort
       ? reasoningLevelLabel(currentReasoningEffort)
-      : m.chat_effortPicker_level_default(),
+      : m.chat_effortPicker_level_auto(),
+  );
+  const currentReasoningLevelIndex = $derived(
+    currentReasoningEffort ? reasoningLevels.indexOf(currentReasoningEffort) : -1,
+  );
+  const showTriggerReasoningGauge = $derived(
+    currentReasoningEffort !== null &&
+      currentReasoningEffort !== 'none' &&
+      currentReasoningLevelIndex >= 0,
   );
   const triggerLabel = $derived(currentModelLabel);
   const triggerAccessibleLabel = $derived(
-    currentReasoningEffort ? `${currentModelLabel} · ${currentReasoningLabel}` : currentModelLabel,
+    showReasoningFooter ? `${currentModelLabel} · ${currentReasoningLabel}` : currentModelLabel,
   );
-  const currentReasoningGaugeValue = $derived(
-    currentReasoningEffort ? reasoningLevels.indexOf(currentReasoningEffort) : 0,
+  const lockedButtonTitle = $derived(
+    lockedTitle?.trim() || m.chat_modelPicker_modelLocked_title({ model: triggerAccessibleLabel }),
   );
+  // The in-flight commit window is announced with `aria-busy` and re-entry is
+  // ignored in `handleReasoningSelect`; it must not feed the HTML `disabled`
+  // attribute, which would drop focus from the effort trigger (intent#4159).
   let updatingReasoningEffort = $state(false);
-  let reasoningExpanded = $state(false);
   const reasoningControlDisabled = $derived(
     reasoningDisabled ||
-      updatingReasoningEffort ||
       (!onReasoningChange && (!agentId || !workspaceId)) ||
       reasoningLevels.length === 0,
   );
-
-  $effect(() => {
-    void dropdownOpen;
-    reasoningExpanded = false;
-  });
-
-  $effect(() => {
-    if (reasoningLevels.length === 0) reasoningExpanded = false;
-  });
-
-  function handleReasoningToggleKeydown(event: KeyboardEvent) {
-    if (reasoningControlDisabled) return;
-    if (event.key === 'Enter' || event.key === ' ') {
-      event.preventDefault();
-      event.stopPropagation();
-      reasoningExpanded = true;
-      return;
-    }
-    if (event.key === 'Escape') {
-      event.preventDefault();
-      event.stopPropagation();
-      dropdownOpen = false;
-    }
-  }
-
-  function handleReasoningSliderKeydown(event: KeyboardEvent) {
-    if (event.key === 'Escape') {
-      event.preventDefault();
-      event.stopPropagation();
-      reasoningExpanded = false;
-      return;
-    }
-    event.stopPropagation();
-  }
+  const showDropdownFooter = $derived(
+    showReasoningFooter ||
+      (!allProvidersLoaded && Object.keys(allProviderModels).length > 0) ||
+      nonBlockingProviderWarnings.length > 0,
+  );
 
   function selectProviderTab(providerId: string) {
     activeBrowseProviderId = providerId;
@@ -1292,7 +1433,7 @@
   }
 
   async function handleReasoningSelect(value: string | null): Promise<boolean> {
-    if (reasoningControlDisabled) return false;
+    if (reasoningControlDisabled || updatingReasoningEffort) return false;
     const previous = persistedReasoningEffort;
     if (value === previous) return true;
 
@@ -1308,13 +1449,8 @@
     }
   }
 
-  // Load persisted fallback info for this agent
   $effect(() => {
     agentIdStore.set(agentId ?? '');
-    if (!agentId) {
-      return;
-    }
-    appStore.dispatch(requestHydrateModelFallbackInfo(agentId));
   });
 
   function setFallbackInfo(info: ModelFallbackInfo) {
@@ -1388,6 +1524,7 @@
   // Only applies to pickers tied to an existing agent — onboarding doesn't need this.
   $effect(() => {
     if (!agentId) return;
+    if (!canUseProviderModels(selectedModelProviderId || effectiveProviderId)) return;
     if (!isSelectedModelUnavailable) return;
     if (flatModelOptions.length === 0) return;
 
@@ -1496,6 +1633,7 @@
 
   $effect(() => {
     if (!silentFallback) return;
+    if (!canUseProviderModels(selectedModelProviderId || effectiveProviderId)) return;
     if (!isSelectedModelUnavailable) return;
     if (!isLoadingModels && flatModelOptions.length === 0) return;
 
@@ -1631,6 +1769,7 @@
     class={cn(buttonClass, 'cursor-default')}
     title={lockedButtonTitle}
     tooltip={lockedButtonTitle}
+    aria-label={triggerAccessibleLabel}
     disabled={true}
   >
     {#if isCompact}
@@ -1643,12 +1782,16 @@
         <ProviderIcon providerId={triggerProviderId} class="size-3.5" />
       {/if}
       <span class="flex-1 text-left truncate">{triggerLabel}</span>
-      {#if currentReasoningEffort}
+      {#if showReasoningFooter && currentReasoningEffort === null}
+        <span class="shrink-0 text-xs" data-testid="model-reasoning-strength"
+          >· {currentReasoningLabel}</span
+        >
+      {:else if showTriggerReasoningGauge}
         <EffortGauge
-          value={currentReasoningGaugeValue}
-          max={reasoningLevels.length - 1}
-          centered={false}
-          size="compact"
+          value={currentReasoningLevelIndex}
+          max={Math.max(1, reasoningLevels.length - 1)}
+          testId="model-reasoning-effort-gauge"
+          class="[&_line]:transition-none!"
         />
       {/if}
     {:else}
@@ -1660,13 +1803,16 @@
           <ProviderIcon providerId={triggerProviderId} class="size-3.5" />
         {/if}
         <span class="text-xs truncate">{triggerLabel}</span>
-        {#if currentReasoningEffort}
+        {#if showReasoningFooter && currentReasoningEffort === null}
+          <span class="shrink-0 text-xs" data-testid="model-reasoning-strength"
+            >· {currentReasoningLabel}</span
+          >
+        {:else if showTriggerReasoningGauge}
           <EffortGauge
-            value={currentReasoningGaugeValue}
-            max={reasoningLevels.length - 1}
-            centered={false}
-            size="compact"
-            class="ml-1"
+            value={currentReasoningLevelIndex}
+            max={Math.max(1, reasoningLevels.length - 1)}
+            testId="model-reasoning-effort-gauge"
+            class="[&_line]:transition-none!"
           />
         {/if}
       </span>
@@ -1674,7 +1820,17 @@
   </Button>
 {:else}
   {#snippet groupHeader({ group, groupIndex }: DropdownGroupProps)}
-    {#if !providerTabsEnabled}
+    {#if group.key === AUGGIE_LEGACY_GROUP_KEY}
+      <ModelPickerLegacyGroupHeader
+        {group}
+        {groupIndex}
+        expanded={legacyModelsVisible}
+        disabled={legacyToggleDisabled}
+        onToggle={() => {
+          if (!legacyToggleDisabled) legacyModelsExpanded = !legacyModelsExpanded;
+        }}
+      />
+    {:else if !providerTabsEnabled}
       <ModelPickerGroupHeader
         {group}
         {groupIndex}
@@ -1686,10 +1842,54 @@
     {/if}
   {/snippet}
 
+  {#snippet dropdownFooter()}
+    {#if showReasoningFooter}
+      <div class="px-2 py-2" data-testid="model-reasoning-section">
+        <EffortPicker
+          mode="embedded"
+          {agentId}
+          {workspaceId}
+          effortLevels={reasoningLevels}
+          effort={persistedReasoningEffort}
+          disabled={reasoningControlDisabled}
+          busy={updatingReasoningEffort}
+          {modalAware}
+          onEffortChange={handleReasoningSelect}
+        />
+      </div>
+    {/if}
+    {#if !allProvidersLoaded && Object.keys(allProviderModels).length > 0}
+      <div class="px-3 py-2 flex items-center gap-2 text-xs text-muted-foreground">
+        <div
+          class="size-3 border-2 border-muted-foreground/30 border-t-muted-foreground rounded-full animate-spin"
+        ></div>
+        <span>{m.chat_modelPicker_loadingMore_label()}</span>
+      </div>
+    {/if}
+    {#if nonBlockingProviderWarnings.length > 0}
+      <div class="px-3 py-2 space-y-1.5 text-xs">
+        {#each nonBlockingProviderWarnings as warning (warning.providerId)}
+          <div class="flex items-start gap-2 text-muted-foreground" role="status">
+            <ModelProviderErrorItem
+              providerId={warning.providerId}
+              providerLabel={warning.providerName}
+              error={warning.message}
+              hint={warning.hint}
+              compact={true}
+            />
+          </div>
+        {/each}
+      </div>
+    {/if}
+  {/snippet}
+
   <Dropdown
     bind:this={dropdownRef}
     bind:value={dropdownValue}
-    defaultHighlightValue={defaultModelId ?? catalogDefaultFallbackOption?.value}
+    bind:searchValue={modelSearchValue}
+    defaultHighlightValue={defaultModelIdMappedOption?.value ??
+      defaultModelId ??
+      catalogDefaultFallbackOption?.value}
     bind:open={dropdownOpen}
     groups={displayGroups}
     onchange={handleModelChange}
@@ -1698,21 +1898,24 @@
     searchable={!hasNoAvailableProvider}
     placeholder={m.chat_modelPicker_searchModels_placeholder()}
     class="min-w-0"
-    headerClass="border-b-0!"
+    headerClass={providerTabsEnabled ? 'bg-popover! border-b!' : 'border-b-0!'}
     triggerClass={cn(
       'max-w-full',
-      (variant === 'outline' || variant === 'default') && 'w-full justify-between',
+      (variant === 'outline' || variant === 'default') &&
+        'w-full justify-between border-border! focus-visible:border-ring! focus-visible:ring-2 focus-visible:ring-ring/40',
       triggerClass,
     )}
     contentClass={cn(
-      'max-w-[calc(100vw-32px)]',
-      showReasoning ? 'w-85 min-h-90 max-h-90 flex flex-col' : 'w-[332px]',
+      'max-w-[calc(100vw-32px)] bg-background! text-foreground!',
+      '[&_[role=searchbox]]:border-b! [&_[role=searchbox]]:border-solid! [&_[role=searchbox]]:border-border!',
+      showReasoning ? 'w-85 h-90 min-h-0 max-h-90 flex flex-col' : 'w-[332px]',
     )}
     contentMaxHeight={showReasoning ? 360 : undefined}
     fillContentHeight={showReasoning}
     {portal}
     {collisionBoundary}
     {groupHeader}
+    footer={showDropdownFooter ? dropdownFooter : undefined}
   >
     {#snippet trigger({
       open: _open,
@@ -1747,12 +1950,16 @@
             <ProviderIcon providerId={triggerProviderId} class="size-3.5" />
           {/if}
           <span class="truncate">{triggerLabel}</span>
-          {#if currentReasoningEffort}
+          {#if showReasoningFooter && currentReasoningEffort === null}
+            <span class="shrink-0 text-xs" data-testid="model-reasoning-strength"
+              >· {currentReasoningLabel}</span
+            >
+          {:else if showTriggerReasoningGauge}
             <EffortGauge
-              value={currentReasoningGaugeValue}
-              max={reasoningLevels.length - 1}
-              centered={false}
-              size="compact"
+              value={currentReasoningLevelIndex}
+              max={Math.max(1, reasoningLevels.length - 1)}
+              testId="model-reasoning-effort-gauge"
+              class="[&_line]:transition-none!"
             />
           {/if}
         {:else}
@@ -1801,6 +2008,33 @@
             onclick={openProviderSettings}
           >
             <Fa icon={faPlus} class="size-3 text-muted-foreground/50" />
+          </Button>
+          <Button
+            variant="ghost"
+            size="xs"
+            iconOnly={true}
+            title={m.chat_modelPicker_refreshGroup_title({
+              group: providerDisplayName(activeBrowseProviderId),
+            })}
+            aria-label={m.chat_modelPicker_refreshGroup_title({
+              group: providerDisplayName(activeBrowseProviderId),
+            })}
+            class={cn(
+              'ml-auto text-subtle hover:bg-muted/40',
+              refreshingProviders.has(activeBrowseProviderId) && 'opacity-50! cursor-not-allowed',
+            )}
+            data-testid="model-provider-refresh-button"
+            disabled={refreshingProviders.has(activeBrowseProviderId)}
+            onclick={() => void handleRefreshProvider(activeBrowseProviderId)}
+          >
+            <Fa
+              icon={faArrowsRotate}
+              size={10}
+              class={cn(
+                'text-subtle transition-transform duration-500',
+                refreshingProviders.has(activeBrowseProviderId) && 'animate-spin',
+              )}
+            />
           </Button>
         </div>
       {/if}
@@ -1867,77 +2101,6 @@
           </div>
         {/if}
       </div>
-    {/snippet}
-
-    {#snippet footer()}
-      {#if showReasoning}
-        <div class="px-2 py-2" data-testid="model-reasoning-section">
-          <Button
-            variant="ghost"
-            size="default"
-            aria-expanded={reasoningExpanded}
-            aria-disabled={reasoningControlDisabled}
-            disabled={reasoningControlDisabled}
-            class={cn(
-              'flex w-full items-center justify-between rounded bg-transparent px-2 py-1.5 text-left text-xs focus:bg-transparent focus:outline-none',
-              reasoningControlDisabled
-                ? 'cursor-not-allowed text-muted-foreground/50'
-                : 'hover:bg-muted/20',
-            )}
-            data-testid="model-reasoning-toggle"
-            onclick={() => {
-              if (!reasoningControlDisabled) reasoningExpanded = !reasoningExpanded;
-            }}
-            onkeydown={handleReasoningToggleKeydown}
-          >
-            <span class="truncate">
-              {m.chat_effortPicker_title_label()} · {currentReasoningLabel}
-            </span>
-          </Button>
-          {#if reasoningExpanded && reasoningLevels.length > 0}
-            <div
-              class="px-2 pb-1 pt-2"
-              role="group"
-              aria-label={m.chat_effortPicker_popover_ariaLabel()}
-              transition:slide={{ duration: 180, axis: 'y' }}
-            >
-              <EffortPicker
-                mode="embedded"
-                {agentId}
-                {workspaceId}
-                effortLevels={reasoningLevels}
-                effort={currentReasoningEffort}
-                disabled={reasoningControlDisabled}
-                onEffortChange={handleReasoningSelect}
-                onkeydown={handleReasoningSliderKeydown}
-              />
-            </div>
-          {/if}
-        </div>
-      {/if}
-      {#if !allProvidersLoaded && Object.keys(allProviderModels).length > 0}
-        <div class="px-3 py-2 flex items-center gap-2 text-xs text-muted-foreground">
-          <div
-            class="size-3 border-2 border-muted-foreground/30 border-t-muted-foreground rounded-full animate-spin"
-          ></div>
-          <span>{m.chat_modelPicker_loadingMore_label()}</span>
-        </div>
-      {/if}
-      {#if nonBlockingProviderWarnings.length > 0}
-        <div class="px-3 py-2 space-y-1.5 text-xs">
-          {#each nonBlockingProviderWarnings as warning (warning.providerId)}
-            <div class="flex items-start gap-2 text-muted-foreground" role="status">
-              <ModelProviderErrorItem
-                providerId={warning.providerId}
-                providerLabel={warning.providerName}
-                error={warning.message}
-                hint={warning.hint}
-                compact={true}
-              />
-            </div>
-          {/each}
-        </div>
-      {/if}
     {/snippet}
 
     {#snippet empty()}

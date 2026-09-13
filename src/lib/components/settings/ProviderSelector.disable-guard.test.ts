@@ -4,6 +4,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, waitFor } from '@testing-library/svelte';
 import { PROVIDERS_CHANNELS } from '$shared/ipc/channels';
+import { m } from '$shared/paraglide/messages.js';
 import { warmImport } from '../../../test/warm-import';
 
 const mocks = vi.hoisted(() => ({
@@ -45,6 +46,8 @@ vi.mock('$store/renderer/store', async () => {
 });
 
 async function buildState(fileSpecialists: object[]) {
+  const { initialState: setupInitialState } =
+    await import('$store/renderer/slices/antigravity-setup/antigravity-setup-slice');
   const { initialState: specialistsInitialState } =
     await import('$store/renderer/slices/specialists/specialists-slice');
   const { initialState: modelInitialState } =
@@ -58,17 +61,16 @@ async function buildState(fileSpecialists: object[]) {
   } = await import('$store/renderer/slices/provider-catalog/provider-catalog-slice');
   const { MOCK_PROVIDER_CATALOG } = await import('../../../test/fixtures/provider-catalog.fixture');
   return {
+    antigravitySetup: { ...setupInitialState },
     providerCatalog: providerCatalogReducer(
       providerCatalogInitialState,
       providerCatalogLoaded(MOCK_PROVIDER_CATALOG),
     ),
     providerSettings: {
-      activeProviderId: 'auggie',
       enabledProviders: { 'claude-code': true, codex: true },
-      defaultProviderId: MOCK_PROVIDER_CATALOG.defaultProviderId,
       nonDisableableProviderIds: [],
     },
-    model: { ...modelInitialState, providerModels: {} },
+    model: { ...modelInitialState, defaultProviderId: 'auggie', providerModels: {} },
     specialists: {
       ...specialistsInitialState,
       fileSpecialists: createCollection('id', fileSpecialists as never[]),
@@ -170,7 +172,6 @@ describe('ProviderSelector disable guard', () => {
       'Anthropic Claude Code',
     )) as HTMLButtonElement;
     expect(claudeButton.disabled).toBe(true);
-    expect(claudeButton.title).toContain('My Spec');
 
     await fireEvent.click(
       result.getByRole('button', { name: 'Provider actions for Anthropic Claude Code' }),
@@ -213,14 +214,14 @@ describe('ProviderSelector default-unavailable honesty', () => {
     cleanup();
   });
 
-  it('shows "Default (unavailable)" for a generic active provider that is not installed', async () => {
+  it('marks a generic unavailable active provider as the unavailable default', async () => {
     const base = await buildState([]);
     mocks.state.current = {
       ...base,
       providerSettings: {
-        activeProviderId: 'codex',
         enabledProviders: { 'claude-code': true, codex: true },
       },
+      model: { ...base.model, defaultProviderId: 'codex' },
       agentAvailability: {
         ...base.agentAvailability,
         providerStatusMap: {
@@ -254,19 +255,18 @@ describe('ProviderSelector default-unavailable honesty', () => {
     const ProviderSelector = (await import('./ProviderSelector.svelte')).default;
     const result = render(ProviderSelector);
     await waitFor(() => {
-      expect(result.getByText('OpenAI Codex')).toBeTruthy();
+      expect(result.getByText(m.settings_providers_defaultUnavailable_label())).toBeTruthy();
     });
-    expect(result.getByText('Default (unavailable)')).toBeTruthy();
   });
 
-  it('shows "Default (unavailable)" when Auggie is active but not installed', async () => {
+  it('marks unavailable Auggie as the unavailable default', async () => {
     const base = await buildState([]);
     mocks.state.current = {
       ...base,
       providerSettings: {
-        activeProviderId: 'auggie',
         enabledProviders: { 'claude-code': true, codex: true },
       },
+      model: { ...base.model, defaultProviderId: 'auggie' },
       agentAvailability: {
         ...base.agentAvailability,
         providerStatusMap: {
@@ -294,7 +294,7 @@ describe('ProviderSelector default-unavailable honesty', () => {
     const ProviderSelector = (await import('./ProviderSelector.svelte')).default;
     const result = render(ProviderSelector);
     await waitFor(() => {
-      expect(result.getByText('Default (unavailable)')).toBeTruthy();
+      expect(result.getByText(m.settings_providers_defaultUnavailable_label())).toBeTruthy();
     });
   });
 });

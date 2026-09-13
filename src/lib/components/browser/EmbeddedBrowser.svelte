@@ -1,4 +1,5 @@
 <script lang="ts">
+  /* eslint-disable max-lines */
   /**
    * EmbeddedBrowser - Main content component using Electron's webview tag
    *
@@ -10,19 +11,21 @@
    */
   import { onMount, tick } from 'svelte';
   import { createLogger } from '$lib/utils/client-logger';
-  import { hasCapability } from '$lib/utils/platform-capabilities';
   import { Button } from '$lib/components/ui/button';
   import { toast } from '$lib/components/ui/toast';
-  import { invoke } from '$shared/generated/ipc-client';
+  import type { BrowserTabViewport } from '$shared/ipc/workspace-command-payloads';
   import { BROWSER_PANEL_PARTITION, BROWSER_PROTOCOLS } from '../../../shared/constants';
   import { writeTextToClipboard } from '$lib/utils/clipboard';
 
   import {
     addRecentUrl,
+    browserElementCaptured,
     clearBrowserTabZoomRequest,
     updateUrlMetadata,
   } from '$store/renderer/slices/browser/browser-slice';
+  import type { BrowserElement } from '$store/renderer/slices/browser/browser-types';
   import { selectPendingBrowserZoom } from '$store/renderer/slices/browser/browser-selectors';
+  import { selectMostRecentAgentTab } from '$store/renderer/slices/panel-layout/panel-layout-selectors';
   import {
     createEmbeddedBrowserNavigationSyncState,
     navigateEmbeddedBrowserWebview,
@@ -30,23 +33,40 @@
     reconcileEmbeddedBrowserUrlProp,
     recordEmbeddedBrowserNavigation,
   } from './embedded-browser-navigation-sync';
-  import { isValidBrowserUrl } from './embedded-browser-url-validation';
+  import { reportTabBounds } from './tab-bounds-action';
+  import {
+    isValidBrowserUrl,
+    normalizeBrowserAddressInput,
+  } from './embedded-browser-url-validation';
+  import { navigateToAgent } from '$lib/utils/workspace-navigation';
+  import InlineAgentAvatar from '$lib/components/chat/InlineAgentAvatar.svelte';
   import Fa from 'svelte-fa';
   import {
     faArrowLeft,
     faArrowRight,
     faRefresh,
-    faExternalLinkAlt,
     faLock,
     faExclamationTriangle,
     faTimes,
-    faCode,
   } from '@fortawesome/free-solid-svg-icons';
   import Input from '../ui/input/input.svelte';
   import { store as appStore } from '$store/renderer/store';
   import { m } from '$shared/paraglide/messages.js';
+  import { matchesShortcut } from '$lib/utils/shortcut-bindings';
+  import { effectiveShortcutReadable } from '$lib/utils/effective-shortcuts';
+  import { invoke } from '$lib/electron-bridge';
+  import BrowserOverflowMenu from './BrowserOverflowMenu.svelte';
+  import BrowserViewportMenu from './BrowserViewportMenu.svelte';
+  import BrowserDeviceFrame from './BrowserDeviceFrame.svelte';
+  import BrowserElementPickerButton from './BrowserElementPickerButton.svelte';
+  import { toWebviewCaptureRect } from './element-picker-coordinates';
+  import { parseElementPickerMessage } from './element-picker-payload';
+  import { elementPickerScript } from './element-picker-script';
+  import type { EmbeddedBrowserWebview } from './embedded-browser-webview';
+  import { observeToolbarCollapse, type ToolbarCollapseState } from './toolbar-collapse';
 
   const logger = createLogger('EmbeddedBrowser');
+  const copyBrowserUrlShortcut$ = effectiveShortcutReadable('panel.copy-browser-url');
 
   // Use shared protocol constants — single source of truth in src/shared/constants.ts
   const ALLOWED_PROTOCOLS = BROWSER_PROTOCOLS.NAVIGATION_ALLOWED;
@@ -67,6 +87,13 @@
     isFocused?: boolean;
     /** Whether this tab is visible; inactive cached tabs remain mounted but muted. */
     isActive?: boolean;
+    /** Agent owning this tab (monorepo#2857); absent for unowned (user) tabs. */
+    ownerAgentId?: string;
+    /** Resolved display name of the owning agent for the toolbar chip. */
+    ownerAgentName?: string;
+    /** Persisted viewport mode for this tab; legacy tabs default to fit. */
+    viewport?: BrowserTabViewport;
+    onViewportChange?: (viewport: BrowserTabViewport) => void;
   }
 
   let {
@@ -81,6 +108,10 @@
     focusUrlBarOnMount = false,
     isFocused = false,
     isActive = true,
+    ownerAgentId,
+    ownerAgentName,
+    viewport = { mode: 'fit' },
+    onViewportChange,
   }: Props = $props();
 
   // Reactive readable for per-tab pending zoom requests dispatched by the
@@ -127,48 +158,35 @@
     appStore.dispatch(clearBrowserTabZoomRequest(_workspaceId, tabId));
   });
 
-  // Reference to the URL input for focusing
+  // Reference to the URL input for focusing while the identity is in edit mode.
   // The Input component exports focus, blur, select methods
   let urlInputRef: { focus: () => void; blur: () => void; select: () => void } | null =
     $state(null);
 
-  // State
-  // Electron's webview element type - using any since Electron types aren't available in renderer
-  let webviewRef:
-    | (HTMLElement & {
-        src: string;
-        canGoBack: () => boolean;
-        canGoForward: () => boolean;
-        goBack: () => void;
-        goForward: () => void;
-        reload: () => void;
-        stop: () => void;
-        loadURL: (url: string) => Promise<void>;
-        executeJavaScript: (code: string) => Promise<unknown>;
-        addEventListener: (event: string, handler: (e: any) => void) => void;
-        removeEventListener?: (event: string, handler: (e: any) => void) => void;
-        openDevTools: () => void;
-        closeDevTools: () => void;
-        isDevToolsOpened: () => boolean;
-        getURL?: () => string;
-        getWebContentsId: () => number;
-        getZoomLevel: () => number;
-        setZoomLevel: (level: number) => void;
-        getZoomFactor: () => number;
-        setZoomFactor: (factor: number) => void;
-        setAudioMuted?: (muted: boolean) => void;
-      })
-    | null = $state(null);
-  // displayUrl tracks the URL shown in the URL bar - can differ from prop `url` after navigation
+  // Electron webview types are unavailable in the renderer build.
+  let webviewRef: EmbeddedBrowserWebview | null = $state(null);
+  // displayUrl tracks the loaded URL and can differ from prop `url` after navigation.
   // Initialize from url prop so it's correct on first render (intentionally captures initial value)
   // svelte-ignore state_referenced_locally - intentional: we want initial value, effect syncs later changes
   let displayUrl = $state(url || '');
+  let urlDraft = $state('');
+  let isEditingUrl = $state(false);
+  let pageTitle = $state('');
+  let faviconUrl = $state('');
   let canGoBack = $state(false);
   let canGoForward = $state(false);
   let isLoading = $state(false);
-  let isSecure = $state(false);
+  // svelte-ignore state_referenced_locally - intentional initial capture; navigation events keep this current
+  let isSecure = $state(url?.startsWith('https://') ?? false);
   let errorMessage = $state('');
   let webviewReady = $state(false);
+  let consoleErrorCount = $state(0);
+  let isPickingElement = $state(false);
+  let toolbarCollapse = $state<ToolbarCollapseState>('full');
+
+  function handleToolbarCollapse(state: ToolbarCollapseState): void {
+    toolbarCollapse = state;
+  }
 
   // Flag to hide webview during URL switch to force recreation
   let isRecreatingWebview = $state(false);
@@ -199,16 +217,55 @@
   // svelte-ignore state_referenced_locally - intentional initial capture (see comment above)
   const navigationSync = createEmbeddedBrowserNavigationSyncState(url);
 
-  // Focus URL bar on mount if requested
-  $effect(() => {
-    if (focusUrlBarOnMount && urlInputRef) {
-      // Use a small delay to ensure the input is fully mounted
-      requestAnimationFrame(() => {
-        urlInputRef?.focus();
-        urlInputRef?.select();
-      });
+  function getHostname(value: string): string {
+    if (!value || value === 'about:blank') return '';
+    try {
+      return new URL(value).hostname;
+    } catch {
+      return '';
     }
-  });
+  }
+
+  const pageHostname = $derived(getHostname(displayUrl));
+  const identityTitle = $derived(
+    pageTitle ||
+      pageHostname ||
+      (displayUrl && displayUrl !== 'about:blank'
+        ? displayUrl
+        : m.browser_embedded_url_placeholder()),
+  );
+
+  async function focusUrlInput() {
+    urlDraft = displayUrl;
+    isEditingUrl = true;
+    await tick();
+    requestAnimationFrame(() => {
+      urlInputRef?.focus();
+      urlInputRef?.select();
+    });
+  }
+
+  function exitUrlEditMode() {
+    isEditingUrl = false;
+    urlDraft = '';
+  }
+
+  function handleUrlInputKeydown(event: KeyboardEvent) {
+    if (
+      (event.metaKey || event.ctrlKey) &&
+      !event.shiftKey &&
+      !event.altKey &&
+      event.key.toLowerCase() === 'l'
+    ) {
+      event.preventDefault();
+      urlInputRef?.select();
+      return;
+    }
+    if (event.key !== 'Escape') return;
+    event.preventDefault();
+    event.stopPropagation();
+    exitUrlEditMode();
+  }
 
   // Check if we have a valid URL to display in the webview
   // Use currentWebviewUrl since that's what we actually load (can differ from url prop after user navigation)
@@ -235,10 +292,18 @@
   // Store listener references for cleanup
   let webviewListeners: Array<{ event: string; handler: (e: any) => void }> = [];
 
+  // The guest webContentsId last registered for CDP. dom-ready fires on
+  // every top-level navigation AND when a reparented <webview> recreates
+  // its guest (a panel drag does this, monorepo#3170); gating on the id
+  // keeps registration once-per-guest — same-guest navigations skip, a new
+  // guest re-registers (registerTab re-applies viewport emulation).
+  let lastRegisteredWebContentsId: number | undefined;
+
   // Keyboard interceptor script to inject into webview
   // Since webview runs in a separate process, keyboard events don't bubble up.
   // We inject a script that captures keyboard shortcuts and logs special messages
   // that we can intercept via the console-message event.
+  // i18n-ignore: This script is an internal webview protocol, not user-facing text.
   const keyboardInterceptorScript = `
     (function() {
       if (window.__augmentKeyboardInterceptorInstalled) return;
@@ -257,17 +322,20 @@
           e.stopPropagation();
           console.log('__INTENT_REFRESH__');
         }
-        // Cmd+[ / Ctrl+[ - go back
-        if (isMod && e.key === '[') {
+        // Cmd+L / Ctrl+L - edit the current address
+        if (isMod && !e.shiftKey && !e.altKey && (e.key === 'l' || e.key === 'L')) {
           e.preventDefault();
           e.stopPropagation();
-          console.log('__INTENT_GO_BACK__');
+          console.log('__INTENT_FOCUS_URL__');
         }
-        // Cmd+] / Ctrl+] - go forward
-        if (isMod && e.key === ']') {
+        // Forward pane and column bracket shortcuts to the panel system.
+        if (isMod && !e.altKey && ['[', ']', '{', '}'].includes(e.key)) {
           e.preventDefault();
           e.stopPropagation();
-          console.log('__INTENT_GO_FORWARD__');
+          console.log(
+            '__INTENT_PANEL_BRACKET__:' +
+              [e.key, e.shiftKey ? '1' : '0', e.metaKey ? '1' : '0', e.ctrlKey ? '1' : '0'].join(':')
+          );
         }
         // Cmd+Shift+C / Ctrl+Shift+C - copy current browser URL
         if (isMod && e.shiftKey && !e.altKey && (e.key === 'c' || e.key === 'C')) {
@@ -327,27 +395,44 @@
         // Inject keyboard interceptor on initial load
         injectKeyboardInterceptor();
 
-        // Register this webview for CDP access (browser:exec)
-        if (tabId && webviewRef) {
+        // Register this webview for CDP access (browser:exec). Runs on
+        // every dom-ready so a recreated guest re-registers, but skips
+        // same-guest navigations to avoid stacking redundant registerTab
+        // calls and destroyed-hooks in the main process.
+        if (tabId) {
           try {
-            const webContentsId = webviewRef.getWebContentsId();
-            logger.info('Registering browser tab for CDP', { tabId, webContentsId });
-            window.electronAPI
-              ?.invoke('browser:register-tab', { tabId, webContentsId })
-              .catch((err) => {
-                logger.error('Failed to register browser tab for CDP', {
-                  tabId,
-                  webContentsId,
-                  error: err,
+            const webContentsId = currentWebview.getWebContentsId();
+            if (webContentsId !== lastRegisteredWebContentsId) {
+              lastRegisteredWebContentsId = webContentsId;
+              logger.info('Registering browser tab for CDP', { tabId, webContentsId });
+              window.electronAPI
+                ?.invoke('browser:register-tab', { tabId, webContentsId })
+                .catch((err) => {
+                  logger.error('Failed to register browser tab for CDP', {
+                    tabId,
+                    webContentsId,
+                    error: err,
+                  });
+                  // Allow a later dom-ready from this guest to retry the
+                  // registration instead of leaving the tab unregistered
+                  // until the guest is recreated.
+                  if (lastRegisteredWebContentsId === webContentsId) {
+                    lastRegisteredWebContentsId = undefined;
+                  }
                 });
-              });
+            }
           } catch {
             // WebView may have been destroyed between dom-ready and callback execution
             logger.debug('Failed to get webContentsId for CDP registration', { tabId });
           }
         }
       };
-      currentWebview.addEventListener('dom-ready', handleDomReady, { once: true });
+      // NOT { once: true }: reparenting the <webview> (panel drag) makes
+      // Electron destroy and re-create the guest webContents, and the new
+      // guest fires dom-ready again — registration must follow the live
+      // guest or the tab loses CDP access and viewport emulation
+      // (monorepo#3170).
+      currentWebview.addEventListener('dom-ready', handleDomReady);
       webviewListeners.push({ event: 'dom-ready', handler: handleDomReady });
 
       // Re-inject keyboard interceptor after every navigation (page changes clear the injected script)
@@ -373,6 +458,8 @@
   });
 
   onMount(() => {
+    if (focusUrlBarOnMount) void focusUrlInput();
+
     // Keyboard shortcuts - use capture phase to intercept before panel shortcuts
     const handleKeydown = (e: KeyboardEvent) => {
       // Don't intercept shortcuts when typing in an input field
@@ -381,47 +468,37 @@
         target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable;
 
       const isMod = e.metaKey || e.ctrlKey;
+      const isMac = /Mac|iPhone|iPad|iPod/.test(navigator.userAgent);
 
-      // Cmd+Shift+C / Ctrl+Shift+C - Copy current browser URL when this panel is focused.
+      // Escape cancels element picking when focus is in the app chrome.
+      if (isPickingElement && e.key === 'Escape') {
+        e.preventDefault();
+        e.stopPropagation();
+        cancelElementPicker();
+        return;
+      }
+
+      // Cmd+L / Ctrl+L - edit the current address when this panel is focused.
       if (
         focusRef.current &&
         !isInInput &&
         isMod &&
-        e.shiftKey &&
+        !e.shiftKey &&
         !e.altKey &&
-        e.key.toLowerCase() === 'c'
+        e.key.toLowerCase() === 'l'
       ) {
+        e.preventDefault();
+        e.stopPropagation();
+        void focusUrlInput();
+        return;
+      }
+
+      // Cmd+Shift+C / Ctrl+Shift+C - Copy current browser URL when this panel is focused.
+      if (focusRef.current && !isInInput && matchesShortcut(e, $copyBrowserUrlShortcut$, isMac)) {
         e.preventDefault();
         e.stopPropagation();
         void copyCurrentUrl();
         return;
-      }
-
-      // Only handle shortcuts when this browser panel is focused
-      if (focusRef.current && webviewReady && webviewRef) {
-        try {
-          // Cmd+[ / Ctrl+[ - Go back in browser history
-          if (isMod && e.key === '[' && !e.shiftKey && !e.altKey) {
-            if (webviewRef.canGoBack?.()) {
-              e.preventDefault();
-              e.stopPropagation();
-              goBack();
-              return;
-            }
-          }
-
-          // Cmd+] / Ctrl+] - Go forward in browser history
-          if (isMod && e.key === ']' && !e.shiftKey && !e.altKey) {
-            if (webviewRef.canGoForward?.()) {
-              e.preventDefault();
-              e.stopPropagation();
-              goForward();
-              return;
-            }
-          }
-        } catch {
-          // WebView may have been detached between the guard check and method call
-        }
       }
 
       // Alt+Arrow shortcuts work regardless of focus
@@ -488,6 +565,7 @@
     // Loading events
     addWebviewListener('did-start-loading', () => {
       isLoading = true;
+      isPickingElement = false;
     });
 
     addWebviewListener('did-stop-loading', () => {
@@ -500,7 +578,11 @@
     // Navigation events - the webview reports the URL it actually loaded,
     // which is exactly what the address bar shows.
     addWebviewListener('did-navigate', (e: any) => {
+      consoleErrorCount = 0;
+      currentWebviewUrl = e.url;
       displayUrl = e.url;
+      pageTitle = '';
+      faviconUrl = '';
       isSecure = e.url?.startsWith('https://');
       errorMessage = '';
       // Update previousUrlProp to prevent the prop-change effect from re-triggering a load
@@ -511,7 +593,9 @@
     });
 
     addWebviewListener('did-navigate-in-page', (e: any) => {
+      currentWebviewUrl = e.url;
       displayUrl = e.url;
+      isSecure = e.url?.startsWith('https://');
       // Update previousUrlProp to prevent the prop-change effect from re-triggering a load
       recordEmbeddedBrowserNavigation(navigationSync, e.url);
       // Also call onNavigate for in-page navigation (e.g., clicking links that don't reload)
@@ -521,12 +605,14 @@
 
     // Title and favicon
     addWebviewListener('page-title-updated', (e: any) => {
+      pageTitle = e.title ?? '';
       appStore.dispatch(updateUrlMetadata(_workspaceId, displayUrl, e.title, undefined));
       onTitleChange?.(e.title);
     });
 
     addWebviewListener('page-favicon-updated', (e: any) => {
       if (e.favicons?.length > 0) {
+        faviconUrl = e.favicons[0];
         appStore.dispatch(updateUrlMetadata(_workspaceId, displayUrl, undefined, e.favicons[0]));
         onFaviconChange?.(e.favicons[0]);
       }
@@ -571,6 +657,7 @@
     // The keyboard interceptor script injected on dom-ready logs special messages
     // when keyboard shortcuts are pressed inside the webview
     addWebviewListener('console-message', (e: any) => {
+      if (e.level === 3) consoleErrorCount += 1;
       const message = e.message;
       if (message === '__INTENT_CLOSE_TAB__') {
         // Cmd+W was pressed - dispatch synthetic event for the panel system to handle
@@ -586,18 +673,41 @@
       } else if (message === '__INTENT_REFRESH__') {
         // Cmd+R/F5 was pressed inside webview - refresh the browser
         refresh();
-      } else if (message === '__INTENT_GO_BACK__') {
-        // Cmd+[ was pressed - navigate back in browser history
-        goBack();
-      } else if (message === '__INTENT_GO_FORWARD__') {
-        // Cmd+] was pressed - navigate forward in browser history
-        goForward();
+      } else if (message === '__INTENT_FOCUS_URL__') {
+        void focusUrlInput();
+      } else if (message.startsWith('__INTENT_PANEL_BRACKET__:')) {
+        const [, key, shiftKey, metaKey, ctrlKey] = message.split(':');
+        window.dispatchEvent(
+          new KeyboardEvent('keydown', {
+            key,
+            shiftKey: shiftKey === '1',
+            metaKey: metaKey === '1',
+            ctrlKey: ctrlKey === '1',
+            bubbles: true,
+            cancelable: true,
+          }),
+        );
       } else if (message === '__INTENT_COPY_URL__') {
         // Cmd+Shift+C / Ctrl+Shift+C was pressed - copy current browser URL
         void copyCurrentUrl();
       } else if (message === '__INTENT_DEVTOOLS__') {
         // Cmd+Option+I / Ctrl+Shift+I was pressed - toggle devtools
         toggleDevTools();
+      } else {
+        const pickerMessage = parseElementPickerMessage(message);
+        if (pickerMessage && !isPickingElement) {
+          logger.debug('Ignored element picker message while picker was inactive');
+          return;
+        }
+        if (pickerMessage?.type === 'cancelled') isPickingElement = false;
+        if (pickerMessage?.type === 'malformed') {
+          isPickingElement = false;
+          logger.warn('Ignored malformed element picker payload', { issues: pickerMessage.issues });
+        }
+        if (pickerMessage?.type === 'picked') {
+          isPickingElement = false;
+          void capturePickedElement(pickerMessage.element);
+        }
       }
     });
   }
@@ -729,20 +839,14 @@
     }
   }
 
-  function openExternal() {
-    if (displayUrl && hasCapability('shellIntegration')) {
-      void invoke('shell:openExternal', { url: displayUrl });
-    }
+  function currentLoadedUrl(): string {
+    const loadedUrl = webviewRef?.getURL?.();
+    if (loadedUrl && loadedUrl !== 'about:blank') return loadedUrl;
+    return currentWebviewUrl !== 'about:blank' ? currentWebviewUrl : '';
   }
 
   async function copyCurrentUrl() {
-    const loadedUrl = webviewRef?.getURL?.();
-    let urlToCopy = '';
-    if (loadedUrl && loadedUrl !== 'about:blank') {
-      urlToCopy = loadedUrl;
-    } else if (currentWebviewUrl !== 'about:blank') {
-      urlToCopy = currentWebviewUrl;
-    }
+    const urlToCopy = currentLoadedUrl();
     if (!urlToCopy) {
       toast.error(m.browser_embedded_noUrlToCopy_error());
       return;
@@ -753,6 +857,140 @@
     } catch (error) {
       logger.error('Failed to copy browser URL', error, { url: urlToCopy });
       toast.error(m.browser_embedded_copyFailed_error());
+    }
+  }
+
+  async function openInExternalBrowser() {
+    const targetUrl = currentLoadedUrl();
+    if (!targetUrl) {
+      toast.error(m.browser_embedded_noUrlToOpen_error());
+      return;
+    }
+    try {
+      await invoke('shell:openExternal', { url: targetUrl });
+    } catch (error) {
+      logger.error('Failed to open browser URL externally', error, { url: targetUrl });
+      toast.error(m.browser_embedded_openExternalFailed_error());
+    }
+  }
+
+  function parseCapturedImage(dataUrl: string): { data: string; mimeType: string } {
+    const prefix = 'data:';
+    const marker = ';base64,';
+    const markerIndex = dataUrl.indexOf(marker, prefix.length);
+    const mimeType = dataUrl.slice(prefix.length, markerIndex);
+    const data = dataUrl.slice(markerIndex + marker.length);
+    if (!dataUrl.startsWith(prefix) || markerIndex < 0 || !mimeType.startsWith('image/') || !data) {
+      throw new Error('Captured image did not produce a valid base64 data URL');
+    }
+    return { data, mimeType };
+  }
+
+  function dispatchBrowserCapture(
+    image: { data: string; mimeType: string },
+    element?: BrowserElement,
+  ) {
+    if (!tabId || !webviewRef) return;
+    const pageUrl = element?.pageUrl || currentLoadedUrl();
+    const targetAgentId =
+      selectMostRecentAgentTab.select(appStore.state, _workspaceId)?.agentId ?? ownerAgentId;
+    if (!targetAgentId) {
+      toast.error(m.browser_embedded_noTargetAgent_error());
+      return;
+    }
+    appStore.dispatch(
+      browserElementCaptured(_workspaceId, {
+        tabId,
+        ownerAgentId,
+        targetAgentId,
+        pageUrl,
+        title: pageTitle || getHostname(pageUrl) || pageUrl,
+        viewport:
+          viewport.mode === 'fit'
+            ? { width: webviewRef.clientWidth, height: webviewRef.clientHeight }
+            : { width: viewport.width, height: viewport.height },
+        image,
+        ...(element ? { element } : {}),
+      }),
+    );
+  }
+
+  async function captureScreenshot() {
+    if (!webviewRef?.capturePage || !webviewReady || !tabId) return;
+    try {
+      const image = await webviewRef.capturePage();
+      dispatchBrowserCapture(parseCapturedImage(image.toDataURL()));
+    } catch (error) {
+      logger.error('Failed to capture browser screenshot', error);
+      toast.error(m.browser_embedded_screenshotFailed_error());
+    }
+  }
+
+  async function capturePickedElement(element: BrowserElement) {
+    if (!webviewRef?.capturePage || !webviewReady || !tabId) return;
+    const clientSize = { width: webviewRef.clientWidth, height: webviewRef.clientHeight };
+    const effectiveEmulatedSize =
+      viewport.mode === 'fit' ? clientSize : { width: viewport.width, height: viewport.height };
+    const captureRect = toWebviewCaptureRect(element.rect, clientSize, effectiveEmulatedSize);
+    if (captureRect.width <= 0 || captureRect.height <= 0) {
+      logger.warn('Ignored offscreen element picker rectangle', { rect: element.rect });
+      return;
+    }
+    try {
+      const image = await webviewRef.capturePage(captureRect);
+      dispatchBrowserCapture(parseCapturedImage(image.toDataURL()), element);
+    } catch (error) {
+      logger.error('Failed to capture selected browser element', error);
+      toast.error(m.browser_embedded_screenshotFailed_error());
+    }
+  }
+
+  async function toggleElementPicker() {
+    if (isPickingElement) {
+      cancelElementPicker();
+      return;
+    }
+    if (!webviewRef || !webviewReady || !tabId) return;
+    try {
+      await webviewRef.executeJavaScript(elementPickerScript);
+      isPickingElement = true;
+      webviewRef.focus?.();
+    } catch (error) {
+      logger.debug('Failed to inject element picker', { error });
+      isPickingElement = false;
+    }
+  }
+
+  function cancelElementPicker() {
+    isPickingElement = false;
+    void webviewRef
+      ?.executeJavaScript(
+        "typeof window.__intentElementPickerCleanup === 'function' && window.__intentElementPickerCleanup()",
+      )
+      .catch((error: unknown) => logger.debug('Failed to clean up element picker', { error }));
+  }
+
+  async function openDevToolsPanel(panel: 'console' | 'sources' | 'elements') {
+    if (!webviewRef || !webviewReady) return;
+    if (!tabId) {
+      webviewRef.openDevTools?.();
+      return;
+    }
+    try {
+      await window.electronAPI?.invoke('browser:open-devtools-panel', { tabId, panel });
+    } catch (error) {
+      logger.warn('Failed to select DevTools panel; opening plain DevTools', { panel, error });
+      webviewRef.openDevTools?.();
+    }
+  }
+
+  function reloadWithoutCache() {
+    if (!webviewRef || !webviewReady) return;
+    try {
+      webviewRef.reloadIgnoringCache?.();
+      webviewRef.focus?.();
+    } catch {
+      // WebView not yet attached to DOM
     }
   }
 
@@ -772,24 +1010,21 @@
   function handleFormSubmit(e: Event) {
     e.preventDefault();
     logger.info('Form submitted', {
-      displayUrl,
+      urlDraft,
       currentWebviewUrl,
       previousUrlProp: navigationSync.previousUrlProp,
       webviewReady,
       webviewRef: !!webviewRef,
     });
 
-    if (displayUrl) {
-      let urlToLoad = displayUrl.trim();
-      // Only prepend a protocol if the input doesn't already have one (scheme://...).
-      // This avoids turning "file:///path" into "https://file:///path" (ERR_NAME_NOT_RESOLVED).
+    if (urlDraft) {
       // loadUrl() will reject disallowed protocols with a clear error message.
-      if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(urlToLoad)) {
-        const isLocalhost =
-          urlToLoad.includes('localhost') ||
-          urlToLoad.includes('127.0.0.1') ||
-          urlToLoad.includes('0.0.0.0');
-        urlToLoad = (isLocalhost ? 'http://' : 'https://') + urlToLoad;
+      const urlToLoad = normalizeBrowserAddressInput(urlDraft);
+      if (urlToLoad === null) {
+        errorMessage = m.browser_embedded_invalidUrlFormat_error();
+        logger.warn('Invalid URL format', { url: urlDraft });
+        exitUrlEditMode();
+        return;
       }
       logger.info('Loading URL from form', { urlToLoad });
       loadUrl(urlToLoad);
@@ -797,40 +1032,62 @@
         addRecentUrl(_workspaceId, urlToLoad, undefined, undefined, new Date().toISOString()),
       );
       // Blur the input to indicate the action was taken
-      urlInputRef?.blur();
+      exitUrlEditMode();
     }
   }
 </script>
 
+{#snippet browserWebview()}
+  <!--
+    Workaround for Electron bug #43314: Hide webview during URL switch.
+    When isRecreatingWebview is true, the webview is removed from DOM.
+    When it becomes false, a fresh webview is created with the new URL.
+  -->
+  <webview
+    bind:this={webviewRef}
+    class="w-full h-full border-none"
+    src={currentWebviewUrl}
+    partition={BROWSER_PANEL_PARTITION}
+    allowpopups
+    use:reportTabBounds={tabId}
+  ></webview>
+{/snippet}
+
 <div class="flex flex-col h-full bg-background">
   <!-- Browser Toolbar -->
-  <div class="flex items-center gap-1 px-2 py-1.5 border-b border-border bg-muted/30">
+  <div
+    class="browser-toolbar flex h-12 shrink-0 items-center gap-1 border-b border-border bg-muted/30 px-2"
+    data-browser-toolbar
+    use:observeToolbarCollapse={handleToolbarCollapse}
+  >
     <!-- Navigation controls -->
     <div class="flex gap-0.5">
-      <Button
-        variant="ghost-light"
-        size="icon-xs"
-        onclick={goBack}
-        disabled={!canGoBack}
-        tooltip={m.browser_embedded_goBack_tooltip()}
-        tooltipShortcut="alt+←"
-        tooltipSide="bottom"
-        aria-label={m.browser_embedded_goBack_ariaLabel()}
-      >
-        <Fa icon={faArrowLeft} size="xs" />
-      </Button>
-      <Button
-        variant="ghost-light"
-        size="icon-xs"
-        onclick={goForward}
-        disabled={!canGoForward}
-        tooltip={m.browser_embedded_goForward_tooltip()}
-        tooltipShortcut="alt+→"
-        tooltipSide="bottom"
-        aria-label={m.browser_embedded_goForward_ariaLabel()}
-      >
-        <Fa icon={faArrowRight} size="xs" />
-      </Button>
+      <div class="browser-toolbar-history flex gap-0.5">
+        <Button
+          variant="ghost-light"
+          size="icon-xs"
+          onclick={goBack}
+          disabled={!canGoBack}
+          tooltip={m.browser_embedded_goBack_tooltip()}
+          tooltipShortcut="alt+←"
+          tooltipSide="bottom"
+          aria-label={m.browser_embedded_goBack_ariaLabel()}
+        >
+          <Fa icon={faArrowLeft} size="xs" />
+        </Button>
+        <Button
+          variant="ghost-light"
+          size="icon-xs"
+          onclick={goForward}
+          disabled={!canGoForward}
+          tooltip={m.browser_embedded_goForward_tooltip()}
+          tooltipShortcut="alt+→"
+          tooltipSide="bottom"
+          aria-label={m.browser_embedded_goForward_ariaLabel()}
+        >
+          <Fa icon={faArrowRight} size="xs" />
+        </Button>
+      </div>
       <Button
         variant="ghost-light"
         size="icon-xs"
@@ -845,48 +1102,111 @@
       </Button>
     </div>
 
-    <!-- URL bar -->
-    <form
-      onsubmit={handleFormSubmit}
-      class="flex-1 flex items-center gap-2 bg-background border border-border rounded px-2 py-1 text-sm"
-    >
-      {#if isSecure}
-        <Fa icon={faLock} class="text-emerald-500 shrink-0" size="xs" />
+    <!-- Page identity / editable address -->
+    <div class="flex min-w-0 flex-1 items-center gap-2">
+      {#if ownerAgentId}
+        <span data-browser-owner-chip={ownerAgentId} class="flex shrink-0">
+          <InlineAgentAvatar
+            agentId={ownerAgentId}
+            agentName={ownerAgentName}
+            onclick={() => void navigateToAgent(ownerAgentId)}
+          />
+        </span>
+      {:else if faviconUrl}
+        <img src={faviconUrl} alt="" class="size-5 shrink-0 rounded-sm" data-browser-page-favicon />
       {/if}
-      <Input
-        bind:this={urlInputRef}
-        type="text"
-        bind:value={displayUrl}
-        class="flex-1 border-none py-0 h-auto px-0"
-        noFocusStyle
-        placeholder={m.browser_embedded_url_placeholder()}
+
+      <div class="relative flex h-8 min-w-0 flex-1 items-center rounded-md bg-background px-2">
+        {#if isEditingUrl}
+          <form
+            onsubmit={handleFormSubmit}
+            class="relative z-10 flex h-full min-w-0 flex-1 items-center"
+          >
+            <Input
+              bind:this={urlInputRef}
+              type="text"
+              bind:value={urlDraft}
+              onkeydown={handleUrlInputKeydown}
+              onblur={exitUrlEditMode}
+              noFocusStyle
+              class="inline-edit-input h-full flex-1 rounded-none border-0 bg-transparent px-0 hover:border-transparent"
+              placeholder={m.browser_embedded_url_placeholder()}
+              aria-label={m.browser_embedded_addressInput_ariaLabel()}
+            />
+            <button type="submit" class="sr-only">{m.browser_embedded_go_label()}</button>
+          </form>
+        {:else}
+          <button
+            type="button"
+            class="relative z-10 flex h-full min-w-0 flex-1 cursor-text items-center gap-1.5 rounded-sm text-left outline-none hover:bg-muted/30 focus-visible:ring-1 focus-visible:ring-ring"
+            onclick={() => void focusUrlInput()}
+            aria-label={m.browser_embedded_editAddress_ariaLabel()}
+          >
+            {#if isSecure}
+              <Fa icon={faLock} class="shrink-0 text-muted-foreground" size="sm" />
+            {/if}
+            <span class="min-w-0 flex-1 truncate text-sm font-medium text-foreground"
+              >{identityTitle}</span
+            >
+            {#if pageTitle && pageHostname && pageHostname !== pageTitle}
+              <span class="browser-toolbar-hostname truncate text-xs text-muted-foreground"
+                >{pageHostname}</span
+              >
+            {/if}
+          </button>
+        {/if}
+        <span
+          aria-hidden="true"
+          class="pointer-events-none absolute z-0 rounded-(--radius-small) border transition-[inset,border-color,background-color] duration-(--motion-standard) ease-(--ease-standard) motion-reduce:transition-none {isEditingUrl
+            ? '-inset-x-2 -inset-y-1.5 border-ring/60 bg-background'
+            : '-inset-x-1 -inset-y-0.5 border-transparent bg-transparent'}"
+        ></span>
+      </div>
+    </div>
+
+    <!-- Element picker -->
+    <div class="browser-toolbar-picker h-7 w-7 shrink-0" data-browser-select-element-slot>
+      <BrowserElementPickerButton
+        active={isPickingElement}
+        disabled={!webviewReady || !tabId}
+        onToggle={() => void toggleElementPicker()}
       />
-      <button type="submit" class="sr-only">{m.browser_embedded_go_label()}</button>
-    </form>
+    </div>
+
+    <!-- Viewport mode -->
+    <div class="browser-toolbar-viewport flex shrink-0 items-center" data-browser-viewport-slot>
+      <BrowserViewportMenu
+        {viewport}
+        onViewportChange={(nextViewport) => onViewportChange?.(nextViewport)}
+      />
+    </div>
+
+    <div class="flex h-7 w-7 shrink-0 items-center" data-browser-overflow-slot>
+      <BrowserOverflowMenu
+        errorCount={consoleErrorCount}
+        disabled={!webviewReady}
+        collapsed={toolbarCollapse === 'controls-collapsed'}
+        {canGoBack}
+        {canGoForward}
+        canSelectElement={webviewReady && !!tabId}
+        selectingElement={isPickingElement}
+        {viewport}
+        onGoBack={goBack}
+        onGoForward={goForward}
+        onToggleElementPicker={() => void toggleElementPicker()}
+        onViewportChange={(nextViewport) => onViewportChange?.(nextViewport)}
+        onOpenExternal={openInExternalBrowser}
+        onCopyUrl={copyCurrentUrl}
+        onScreenshot={captureScreenshot}
+        onOpenConsole={() => openDevToolsPanel('console')}
+        onOpenSource={() => openDevToolsPanel('sources')}
+        onOpenInspector={() => openDevToolsPanel('elements')}
+        onReloadWithoutCache={reloadWithoutCache}
+      />
+    </div>
 
     <!-- Actions -->
     <div class="flex gap-0.5">
-      <Button
-        variant="ghost-light"
-        size="icon-xs"
-        onclick={toggleDevTools}
-        tooltip={m.browser_embedded_devtools_tooltip()}
-        tooltipShortcut="mod+alt+i"
-        tooltipSide="bottom"
-        aria-label={m.browser_embedded_devtools_ariaLabel()}
-      >
-        <Fa icon={faCode} size="xs" />
-      </Button>
-      <Button
-        variant="ghost-light"
-        size="icon-xs"
-        onclick={openExternal}
-        tooltip={m.browser_embedded_openExternal_tooltip()}
-        tooltipSide="bottom"
-        aria-label={m.browser_embedded_openExternal_ariaLabel()}
-      >
-        <Fa icon={faExternalLinkAlt} size="xs" />
-      </Button>
       {#if onClose}
         <Button
           variant="ghost-light"
@@ -906,7 +1226,7 @@
   <!-- Error banner -->
   {#if errorMessage}
     <div
-      class="flex items-center gap-2 px-3 py-2 bg-destructive/10 text-error-foreground text-sm border-b border-destructive/20"
+      class="flex items-center gap-2 px-3 py-2 bg-danger-background/10 text-danger text-sm border-b border-danger/20"
     >
       <Fa icon={faExclamationTriangle} />
       <span>{errorMessage}</span>
@@ -916,18 +1236,12 @@
   <!-- Browser content -->
   <div class="flex-1 relative overflow-hidden">
     {#if isUrlValid && !isRecreatingWebview}
-      <!--
-        Workaround for Electron bug #43314: Hide webview during URL switch.
-        When isRecreatingWebview is true, the webview is removed from DOM.
-        When it becomes false, a fresh webview is created with the new URL.
-      -->
-      <webview
-        bind:this={webviewRef}
-        class="w-full h-full border-none"
-        src={currentWebviewUrl}
-        partition={BROWSER_PANEL_PARTITION}
-        allowpopups
-      ></webview>
+      <BrowserDeviceFrame
+        {viewport}
+        onViewportChange={(nextViewport) => onViewportChange?.(nextViewport)}
+      >
+        {@render browserWebview()}
+      </BrowserDeviceFrame>
     {:else if url && !isRecreatingWebview}
       <!-- URL is invalid or blocked - show error with details -->
       <div class="flex items-center justify-center h-full text-subtle">
@@ -955,3 +1269,25 @@
     {/if}
   </div>
 </div>
+
+<style>
+  :global(input.inline-edit-input::selection) {
+    background: hsl(var(--ring) / 0.3);
+  }
+
+  .browser-toolbar {
+    container-type: inline-size;
+  }
+
+  .browser-toolbar-hostname {
+    max-width: 40%;
+  }
+
+  @container (max-width: 399px) {
+    .browser-toolbar-history,
+    .browser-toolbar-picker,
+    .browser-toolbar-viewport {
+      display: none;
+    }
+  }
+</style>

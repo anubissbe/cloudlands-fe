@@ -21,12 +21,13 @@ import { formatDate } from '$lib/i18n/format';
 import { m } from '$shared/paraglide/messages.js';
 import { IPC_CHANNELS } from '$shared/ipc-registry';
 import type {
+  SessionOwnershipErrorCode,
   TransferFinalizeResult,
   TransferProgressEvent,
   TransferStartResult,
 } from '$shared/types/workspace-transfer';
 import { takeEveryFromElectronChannel } from '../../../utils/ipc-channel';
-import { switchConnectionRequested } from '../../connections/connections-slice';
+import { openConnectionRequested } from '../../connections/connections-slice';
 import {
   closeTransferModal,
   transferFinalizeFailed,
@@ -57,13 +58,19 @@ function toMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+/** Localized message for a failed relay result, keyed by machine code. */
+function failureMessage(result: { error?: string; code?: SessionOwnershipErrorCode }): string {
+  if (result.code === 'not-session-owner') return m.workspace_transfer_notSessionOwner_error();
+  return result.error ?? m.workspace_transfer_unknown_error();
+}
+
 async function invokeTransfer<T>(channel: string, params?: unknown): Promise<T> {
   const api = typeof window !== 'undefined' ? window.electronAPI : undefined;
   if (!api?.invoke) throw new Error('transfer bridge unavailable');
   return (await api.invoke(channel, params)) as T;
 }
 
-export function* fetchTransferPlan(): SagaGenerator<void> {
+function* fetchTransferPlan(): SagaGenerator<void> {
   const workspaceId = yield* selectTransferWorkspaceId.effect();
   if (!workspaceId) return;
   try {
@@ -78,7 +85,7 @@ export function* fetchTransferPlan(): SagaGenerator<void> {
 }
 
 /** Step 3: run the main-process relay and settle the run state. */
-export function* runTransfer(): SagaGenerator<void> {
+function* runTransfer(): SagaGenerator<void> {
   const workspaceId = yield* selectTransferWorkspaceId.effect();
   const destination = yield* selectTransferDestinationValue.effect();
   if (!workspaceId || !destination) return;
@@ -97,16 +104,21 @@ export function* runTransfer(): SagaGenerator<void> {
     } else if (result.canceled) {
       yield* put(transferRunCancelled());
     } else {
-      yield* put(transferRunFailed(result.error ?? m.workspace_transfer_unknown_error()));
+      yield* put(
+        transferRunFailed({
+          error: failureMessage(result),
+          failurePhase: result.failurePhase ?? null,
+        }),
+      );
     }
   } catch (error) {
     logger.error('transfer:start failed', { workspaceId, error });
-    yield* put(transferRunFailed(toMessage(error)));
+    yield* put(transferRunFailed({ error: toMessage(error), failurePhase: null }));
   }
 }
 
 /** `transfer:progress` counter frames from main → progress dispatches. */
-export function* handleTransferProgress(event: TransferProgressEvent): SagaGenerator<void> {
+function* handleTransferProgress(event: TransferProgressEvent): SagaGenerator<void> {
   const workspaceId = yield* selectTransferWorkspaceId.effect();
   if (!workspaceId || event.workspaceId !== workspaceId) return;
   yield* put(
@@ -152,11 +164,11 @@ function* resolveDestinationLabel(): SagaGenerator<string> {
   );
 }
 
-/** Step 4: settle the source, optionally resume target agents + switch. */
-export function* finalizeTransfer(
+/** Step 4: settle the source, optionally resume target agents + open target. */
+function* finalizeTransfer(
   action: ReturnType<typeof transferFinalizeRequested>,
 ): SagaGenerator<void> {
-  const [{ switchToTarget }] = action.payload;
+  const [{ openTarget }] = action.payload;
   const destination = yield* selectTransferDestinationValue.effect();
   const archiveSource = yield* selectTransferArchiveSource.effect();
   const restartAgents = yield* selectTransferRestartAgents.effect();
@@ -177,7 +189,7 @@ export function* finalizeTransfer(
       ...(finalStatusMessage ? { finalStatusMessage } : {}),
     });
     if (!result.success) {
-      yield* put(transferFinalizeFailed(result.error ?? m.workspace_transfer_unknown_error()));
+      yield* put(transferFinalizeFailed(failureMessage(result)));
       return;
     }
     yield* put(transferFinalizeSucceeded());
@@ -189,8 +201,8 @@ export function* finalizeTransfer(
       yield* call(showResumeFailedToast, resumeFailed.length);
     }
     yield* put(closeTransferModal());
-    if (switchToTarget && destination?.kind === 'server') {
-      yield* put(switchConnectionRequested(destination.connectionId));
+    if (openTarget && destination?.kind === 'server') {
+      yield* put(openConnectionRequested(destination.connectionId));
     }
   } catch (error) {
     logger.error('transfer:finalize failed', { error });
@@ -203,7 +215,7 @@ export function* finalizeTransfer(
  * and aborts a committed-but-unfinalized export's staging on the source.
  * Idempotent in main — a close with no live session is a no-op.
  */
-export function* cancelTransferOnClose(): SagaGenerator<void> {
+function* cancelTransferOnClose(): SagaGenerator<void> {
   try {
     yield* call(invokeTransfer, TRANSFER.CANCEL);
   } catch (error) {

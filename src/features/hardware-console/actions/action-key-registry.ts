@@ -3,7 +3,8 @@
  * workspace top-level agents, the global cross-workspace cycle family
  * (in-progress, attention, idle, unread, failed agents), stop agent, see
  * spec, toggle workspace sidebar tabs, new agent, new workspace, switch
- * panel layouts, push to talk (hold-capable), and none/unassigned.
+ * panel layouts, cycle open windows, push to talk (hold-capable), and
+ * none/unassigned.
  *
  * Each entry carries a label (i18n getter), an icon, an availability
  * predicate, and an execute function. Both evaluate against an
@@ -28,6 +29,7 @@ import {
   faRobot,
   faStop,
   faTableColumns,
+  faWindowMaximize,
   faWindowRestore,
 } from '@fortawesome/free-solid-svg-icons';
 import { m } from '$shared/paraglide/messages.js';
@@ -39,6 +41,7 @@ import type { StoredAgentSession } from '$store/renderer/slices/agent-session/ag
 import { agentSessionStopChatRequested } from '$store/renderer/slices/agent-session/agent-session-slice';
 import { openAgentTabRequested } from '$store/renderer/slices/app-layout/app-layout-slice';
 import { actionHudShown } from '$store/renderer/slices/hardware-console/hardware-console-slice';
+import { closeTab } from '$store/renderer/slices/panel-layout/panel-layout-slice';
 import {
   setMultiSelectSidebarSelectedTabs,
   setShowCreateModal,
@@ -53,6 +56,7 @@ import {
   resolveEffectiveVoiceEngine,
   type EffectiveVoiceEngineInputs,
 } from '$features/voice/effective-voice-engine';
+import { isElectronPlatform } from '$lib/utils/platform-capabilities';
 import { createLogger } from '$lib/utils/client-logger';
 import { isVoiceRecordingSupported } from '../voice/voice-recorder';
 import {
@@ -79,6 +83,7 @@ import {
   type SessionAttentionPriority,
 } from './agent-cycle';
 import type { CycleScope, CycleScopeFamilyId } from './cycle-scope';
+import { cycleOpenWindows } from './window-cycle';
 
 const logger = createLogger('HardwareConsoleActionKeyRegistry');
 
@@ -99,6 +104,22 @@ export interface ActionKeyState {
   };
   agentSessions: { byAgentId: Record<string, StoredAgentSession> };
   hardwareConsole: { cycleScopeByFamily: Record<CycleScopeFamilyId, CycleScope> };
+  /** Structural view of the panel layout for the see-spec toggle. */
+  panelLayout: {
+    byWorkspaceId: Record<
+      string,
+      {
+        panels: Record<
+          string,
+          {
+            id: string;
+            tabs: readonly { id: string; type: string; noteId?: string }[];
+            activeTabId: string | null;
+          }
+        >;
+      }
+    >;
+  };
   sidebarNav: {
     multiSelectTabOrder: string[];
     multiSelectSelectedTabIdsByWorkspaceId: Record<string, string[]>;
@@ -221,16 +242,20 @@ function inProgressAgents(state: ActionKeyState): CycleAgentEntry[] {
  * question → discussion (`sessionAttentionPriority`; an agent with several
  * signals classifies at its highest bucket), following the
  * `cycle-attention-agents` configured scope so the settings toggle also
- * governs this portion; then (b) one stop per unread workspace
- * (`collectUnreadWorkspaceStops`) — its last active top-level agent when
- * sessions are hydrated (intent-hq/monorepo#1779), else a workspace-level
- * stop (intent-hq/monorepo#2438) — since visiting the workspace clears its
- * whole unread flag anyway. `attentionAgentIds` records walk (a)
- * membership independent of dedup position, for the remaining-stop count.
+ * governs this portion; then (b) the unread-workspace stops
+ * (`collectUnreadWorkspaceStops`) — one per unread top-level agent when the
+ * daemon serves per-agent unread, else the workspace's single fallback
+ * stop: its last active top-level agent when sessions are hydrated
+ * (intent-hq/monorepo#1779), else a workspace-level stop
+ * (intent-hq/monorepo#2438). `attentionAgentIds` records walk (a)
+ * membership independent of dedup position, and `workspaceClearingWsIds`
+ * the workspaces whose stop keeps the workspace-clearing semantics — both
+ * for the remaining-stop count.
  */
 function collectUnreadCycleEntries(state: ActionKeyState): {
   entries: CycleStopEntry[];
   attentionAgentIds: Set<string>;
+  workspaceClearingWsIds: Set<string>;
 } {
   const unreadEntries = collectUnreadWorkspaceStops(state);
   const attentionEntries = collectCycleAgents(
@@ -260,7 +285,13 @@ function collectUnreadCycleEntries(state: ActionKeyState): {
     seen.add(key);
     return true;
   });
-  return { entries, attentionAgentIds: new Set(attentionEntries.map((entry) => entry.agentId)) };
+  return {
+    entries,
+    attentionAgentIds: new Set(attentionEntries.map((entry) => entry.agentId)),
+    workspaceClearingWsIds: new Set(
+      unreadEntries.filter((entry) => entry.clearsWorkspace).map((entry) => entry.wsId),
+    ),
+  };
 }
 
 /**
@@ -284,9 +315,31 @@ function focusAgent(context: ActionKeyContext, wsId: string, agentId: string): v
  */
 const lastCycledStopByAction = new Map<ActionKeyActionId, string>();
 
+/**
+ * Per-family stop whose side effects failed on the last press — either threw
+ * mid-way, or its async workspace switch rejected after the cursor advanced.
+ * A partial failure can leave the state anchor already moved
+ * (`setActiveAgentId` reduced, then `openAgentTabRequested` threw), so
+ * anchoring the next press on the focused agent would step past the stop that
+ * never finished. The next press targets this stop directly instead; it is
+ * dropped once consumed or when the stop is no longer a candidate.
+ */
+const retryStopByAction = new Map<ActionKeyActionId, string>();
+
+/**
+ * Per-family press counter. Each press is one attempt; an async workspace
+ * switch that rejects after a newer press (successful or not) is stale and
+ * must not arm the retry target. The cursor key cannot stand in for this:
+ * a later press can fail synchronously without moving the cursor, or the
+ * walk can wrap back onto the same stop key.
+ */
+const cycleAttemptByAction = new Map<ActionKeyActionId, number>();
+
 /** Reset the cycle cursors (test isolation). */
 export function resetActionKeyCycleCursors(): void {
   lastCycledStopByAction.clear();
+  retryStopByAction.clear();
+  cycleAttemptByAction.clear();
   layoutPresetCursor.clear();
 }
 
@@ -341,10 +394,19 @@ function makeGlobalCycleAction(spec: GlobalCycleSpec): ActionKeyDefinition {
     },
     execute(context) {
       const { state } = context;
+      const attempt = (cycleAttemptByAction.get(spec.id) ?? 0) + 1;
+      cycleAttemptByAction.set(spec.id, attempt);
       const entries = spec.collect(state);
       if (entries.length === 0) return;
+      const retryKey = retryStopByAction.get(spec.id);
+      retryStopByAction.delete(spec.id);
+      const retryIndex =
+        retryKey === undefined ? -1 : entries.findIndex((e) => cycleStopKey(e) === retryKey);
       const focused = focusedAgentId(context);
+      // A pending retry takes precedence over the "already there" hint: the
+      // focus may already sit on that stop while its tab never opened.
       const alreadyThere =
+        retryIndex === -1 &&
         entries.length === 1 &&
         (entries[0].agentId !== null
           ? entries[0].agentId === focused
@@ -360,35 +422,68 @@ function makeGlobalCycleAction(spec: GlobalCycleSpec): ActionKeyDefinition {
         context.showHint(spec.getSingleCandidateHint());
         return;
       }
-      const cursor = lastCycledStopByAction.get(spec.id);
-      let index = cursor === undefined ? -1 : entries.findIndex((e) => cycleStopKey(e) === cursor);
-      if (index === -1 && cursor !== undefined && cursor.startsWith(WORKSPACE_STOP_KEY_PREFIX)) {
-        // The stored cursor was a workspace-level stop whose workspace has
-        // since hydrated (its stop now keys by agent id): resume from that
-        // workspace's stop instead of restarting the walk.
-        const cursorWsId = cursor.slice(WORKSPACE_STOP_KEY_PREFIX.length);
-        index = entries.findIndex((e) => e.wsId === cursorWsId);
+      let next: CycleStopEntry;
+      if (retryIndex !== -1) {
+        next = entries[retryIndex];
+      } else {
+        const cursor = lastCycledStopByAction.get(spec.id);
+        let index =
+          cursor === undefined ? -1 : entries.findIndex((e) => cycleStopKey(e) === cursor);
+        if (index === -1 && cursor !== undefined && cursor.startsWith(WORKSPACE_STOP_KEY_PREFIX)) {
+          // The stored cursor was a workspace-level stop whose workspace has
+          // since hydrated (its stop now keys by agent id): resume from that
+          // workspace's stop instead of restarting the walk.
+          const cursorWsId = cursor.slice(WORKSPACE_STOP_KEY_PREFIX.length);
+          index = entries.findIndex((e) => e.wsId === cursorWsId);
+        }
+        if (index === -1 && focused !== null) {
+          index = entries.findIndex((e) => e.agentId === focused);
+        }
+        next = entries[(index + 1) % entries.length];
       }
-      if (index === -1 && focused !== null) {
-        index = entries.findIndex((e) => e.agentId === focused);
+      const nextKey = cycleStopKey(next);
+      try {
+        if (next.wsId !== activeWorkspaceId(context)) {
+          // Route switching is async and can fail (a stalled `goto` on a
+          // remote window): log it instead of swallowing the rejection so a
+          // press that never leaves the current view is visible. The cursor
+          // has already advanced by the time the rejection settles, so pin
+          // the next press back to this stop — unless a newer press has
+          // happened since, in which case the rejection is stale.
+          void context.navigate(`/workspace/${next.wsId}`).catch((error: unknown) => {
+            logger.warn('Failed to switch workspace for cycle step', {
+              actionId: spec.id,
+              workspaceId: next.wsId,
+              stopKey: nextKey,
+              error,
+            });
+            if (cycleAttemptByAction.get(spec.id) === attempt) {
+              retryStopByAction.set(spec.id, nextKey);
+            }
+          });
+        }
+        if (next.agentId !== null) {
+          focusAgent(context, next.wsId, next.agentId);
+        } else {
+          // Workspace-level stop (no hydrated sessions yet): visiting the
+          // workspace clears its unread flag; hydrating converges the local
+          // session cache so later stops can target a concrete agent.
+          context.dispatch(hydrateAgentsRequested(next.wsId));
+        }
+      } catch (error) {
+        // A partial step may already have moved the focused agent: pin the
+        // next press to this stop rather than to whatever the anchor says.
+        retryStopByAction.set(spec.id, nextKey);
+        throw error;
       }
-      const next = entries[(index + 1) % entries.length];
-      lastCycledStopByAction.set(spec.id, cycleStopKey(next));
-      // Successful step: surface what the button did in the bottom-center
-      // HUD (the middleware hides it after inactivity).
+      // Only a step whose synchronous side effects ran advances the cursor
+      // and surfaces what the button did in the bottom-center HUD (the
+      // middleware hides it after inactivity): a throw above leaves the
+      // cursor on the previous stop so the next press retries this one
+      // instead of skipping it.
+      lastCycledStopByAction.set(spec.id, nextKey);
       const remaining = spec.countRemaining?.(state, entries, next) ?? entries.length - 1;
       context.dispatch(actionHudShown(spec.getHudLabel?.(remaining) ?? spec.getLabel()));
-      if (next.wsId !== activeWorkspaceId(context)) {
-        void context.navigate(`/workspace/${next.wsId}`);
-      }
-      if (next.agentId !== null) {
-        focusAgent(context, next.wsId, next.agentId);
-      } else {
-        // Workspace-level stop (no hydrated sessions yet): visiting the
-        // workspace clears its unread flag; hydrating converges the local
-        // session cache so later stops can target a concrete agent.
-        context.dispatch(hydrateAgentsRequested(next.wsId));
-      }
     },
   };
 }
@@ -447,19 +542,21 @@ export const ACTION_KEY_REGISTRY: readonly ActionKeyDefinition[] = [
           ? m.hardwareConsole_actionKey_cycleUnreadAgents_hudRemaining_one({ count: remaining })
           : m.hardwareConsole_actionKey_cycleUnreadAgents_hudRemaining_many({ count: remaining }),
     countRemaining: (state, entries, next) => {
-      // Stepping to `next` visits its workspace, which clears the whole
-      // workspace's unread flag — that workspace's unread entry (one per
-      // unread workspace) stops being a candidate along with it. Attention
-      // entries persist individually until handled, so they always count as
-      // their own stop.
-      const { attentionAgentIds } = collectUnreadCycleEntries(state);
+      // Per-agent unread stops (new daemons) count individually — visiting
+      // one agent marks only that agent seen, so its unread siblings stay
+      // candidates. Fallback stops (older-daemon last-active, unhydrated
+      // workspace-level) keep the workspace-clearing semantics: stepping
+      // anywhere into their workspace clears the whole unread flag, so that
+      // workspace's stop drops out along with it. Attention entries persist
+      // individually until handled, so they always count as their own stop.
+      const { attentionAgentIds, workspaceClearingWsIds } = collectUnreadCycleEntries(state);
       const nextKey = cycleStopKey(next);
-      return entries.filter(
-        (entry) =>
-          cycleStopKey(entry) !== nextKey &&
-          ((entry.agentId !== null && attentionAgentIds.has(entry.agentId)) ||
-            entry.wsId !== next.wsId),
-      ).length;
+      return entries.filter((entry) => {
+        if (cycleStopKey(entry) === nextKey) return false;
+        if (entry.agentId !== null && attentionAgentIds.has(entry.agentId)) return true;
+        if (!workspaceClearingWsIds.has(entry.wsId)) return true;
+        return entry.wsId !== next.wsId;
+      }).length;
     },
     collect: (state) => collectUnreadCycleEntries(state).entries,
   }),
@@ -511,9 +608,32 @@ export const ACTION_KEY_REGISTRY: readonly ActionKeyDefinition[] = [
       return activeWorkspaceId(context) !== null;
     },
     execute(context) {
-      const { dispatch } = context;
+      const { state, dispatch } = context;
       const wsId = activeWorkspaceId(context);
       if (wsId === null) return;
+      const panels = Object.values(state.panelLayout.byWorkspaceId[wsId]?.panels ?? {});
+      for (const panel of panels) {
+        const activeTab = panel.tabs.find((tab) => tab.id === panel.activeTabId);
+        if (activeTab?.type === 'note' && activeTab.noteId === SPEC_NOTE_ID) {
+          // The spec is currently visible → toggle it off.
+          dispatch(closeTab(wsId, activeTab.id, panel.id));
+          return;
+        }
+      }
+      // Not open (or a background tab): open/reveal it. With a single open
+      // panel, split it so the spec lands beside the current content. A
+      // backgrounded spec tab also takes this branch: openTabInAdjacentOrSplit
+      // finds the equivalent tab across all panels and activates it in place
+      // instead of splitting, so this reveals rather than duplicates.
+      if (panels.length === 1) {
+        dispatch(
+          openWorkspaceNote(wsId, SPEC_NOTE_ID, {
+            openInAdjacentPanel: true,
+            sourcePanelId: panels[0].id,
+          }),
+        );
+        return;
+      }
       dispatch(openWorkspaceNote(wsId, SPEC_NOTE_ID));
     },
   },
@@ -607,6 +727,36 @@ export const ACTION_KEY_REGISTRY: readonly ActionKeyDefinition[] = [
         })
         .catch((error: unknown) => {
           logger.error('Failed to apply layout preset', { presetId, wsId, error });
+        });
+    },
+  },
+  {
+    id: 'cycle-open-windows',
+    get label() {
+      return m.hardwareConsole_actionKey_cycleOpenWindows_label();
+    },
+    icon: faWindowMaximize,
+    isAvailable() {
+      // Window cycling needs the Electron main process (BrowserWindow focus);
+      // web builds have no other app windows to cycle to.
+      return isElectronPlatform();
+    },
+    execute(context) {
+      // The IPC invoke lives in window-cycle.ts (not inline) so this
+      // registry — imported by Svelte components for labels/icons — stays
+      // free of bridge references per intent/no-component-async-data-fetch.
+      void cycleOpenWindows()
+        .then((result) => {
+          if (result?.cycled) {
+            context.dispatch(actionHudShown(m.hardwareConsole_actionKey_cycleOpenWindows_label()));
+          } else {
+            // One (or zero) cycleable window: nothing to switch to — say so
+            // instead of a silent no-op.
+            context.showHint(m.hardwareConsole_actionKey_noOtherOpenWindows_message());
+          }
+        })
+        .catch((error: unknown) => {
+          logger.error('Failed to cycle open windows', { error });
         });
     },
   },

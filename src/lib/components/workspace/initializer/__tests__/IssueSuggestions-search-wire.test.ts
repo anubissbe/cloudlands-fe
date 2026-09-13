@@ -9,10 +9,7 @@
  */
 import { cleanup, fireEvent, render, screen } from '@testing-library/svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import {
-  registerMockIpcHandler,
-  unregisterMockIpcHandler,
-} from '$shared/ipc-mock-router';
+import { registerMockIpcHandler, unregisterMockIpcHandler } from '$shared/ipc-mock-router';
 
 const mocks = vi.hoisted(() => {
   const readable = <T>(value: T) => ({
@@ -26,9 +23,8 @@ const mocks = vi.hoisted(() => {
 });
 
 vi.mock('$store/renderer/store', async () => {
-  const { createAppStoreMockModule } = await import(
-    '$store/renderer/utils/test-helpers/store-mock'
-  );
+  const { createAppStoreMockModule } =
+    await import('$store/renderer/utils/test-helpers/store-mock');
   return createAppStoreMockModule({ state: () => ({ theme: { name: 'dark' } }) });
 });
 
@@ -77,7 +73,7 @@ vi.mock('$lib/components/ui/skeleton', async () => ({
   Skeleton: (await import('./mocks/MockComponent.svelte')).default,
 }));
 vi.mock('$lib/components/ui/tooltip', async () => ({
-  TooltipRich: (await import('./mocks/MockComponent.svelte')).default,
+  TooltipRich: (await import('./mocks/MockTooltipRich.svelte')).default,
 }));
 vi.mock('$lib/components/ui/Header.svelte', async () => ({
   default: (await import('./mocks/MockComponent.svelte')).default,
@@ -98,7 +94,9 @@ class MockIntersectionObserver {
     observers.push({ callback, elements: [], instance: this as unknown as IntersectionObserver });
   }
   observe(el: Element) {
-    observers.find((o) => o.instance === (this as unknown as IntersectionObserver))?.elements.push(el);
+    observers
+      .find((o) => o.instance === (this as unknown as IntersectionObserver))
+      ?.elements.push(el);
   }
   disconnect() {}
   unobserve() {}
@@ -111,7 +109,9 @@ function intersectLatestSentinel(): void {
   const latest = observers.at(-1);
   if (!latest) throw new Error('no IntersectionObserver was created');
   latest.callback(
-    latest.elements.map((el) => ({ isIntersecting: true, target: el }) as IntersectionObserverEntry),
+    latest.elements.map(
+      (el) => ({ isIntersecting: true, target: el }) as IntersectionObserverEntry,
+    ),
     latest.instance,
   );
 }
@@ -138,6 +138,7 @@ const ghPull = (id: string, number: number) => ({
 // billed to the first test's timeout (intent-hq/monorepo#1464).
 warmImport(() => import('../../../ui/__tests__/mocks/Fa.svelte'));
 warmImport(() => import('./mocks/MockComponent.svelte'));
+warmImport(() => import('./mocks/MockTooltipRich.svelte'));
 
 describe('IssueSuggestions server-side search + pagination wire contract', () => {
   beforeEach(() => {
@@ -240,6 +241,43 @@ describe('IssueSuggestions server-side search + pagination wire contract', () =>
 
     // Exhausted: the sentinel is gone once nextToken is null
     expect(container.querySelector('[aria-hidden="true"].h-px')).toBeNull();
+  });
+
+  it('row trigger wrappers carry width-constraining classes so long titles truncate', async () => {
+    registerMockIpcHandler('git-tracking:search-github-issues', () => ({
+      success: true,
+      data: [ghIssue('i-1', 1)],
+      nextToken: null,
+    }));
+    registerMockIpcHandler('git-tracking:search-pull-requests', () => ({
+      success: true,
+      data: [ghPull('p-1', 10)],
+      nextToken: null,
+    }));
+
+    for (const initialSource of ['github-issues', 'github-prs'] as const) {
+      const { container } = render(IssueSuggestions, {
+        props: {
+          repositoryOwner: 'owner-a',
+          repositoryName: 'repo-a',
+          initiallyExpanded: true,
+          initialSource,
+          hideSourceTabs: true,
+        },
+      });
+      await settle();
+
+      const wrappers = container.querySelectorAll('span[data-mock-tooltip-trigger]');
+      expect(wrappers.length).toBeGreaterThan(0);
+      for (const wrapper of wrappers) {
+        expect(wrapper.classList.contains('flex')).toBe(true);
+        expect(wrapper.classList.contains('w-full')).toBe(true);
+        expect(wrapper.classList.contains('min-w-0')).toBe(true);
+        // tailwind-merge must drop the default inline-flex in favor of flex
+        expect(wrapper.classList.contains('inline-flex')).toBe(false);
+      }
+      cleanup();
+    }
   });
 
   it('debounced typing sends a server search with the exact request shape (GH PRs)', async () => {

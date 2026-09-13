@@ -2,6 +2,8 @@ import { Store } from '@augmentcode/themis/svelte-store';
 import type { StoreMiddleware, StoreStateFromReducers } from '@augmentcode/themis/types';
 import { readable, type Readable } from 'svelte/store';
 
+import { safeLocalStorage } from '$lib/utils/safe-storage';
+import { REDUX_DEBUG_LS_KEY } from './constants';
 import { middleware } from './middleware';
 import { reducers } from './reducer';
 
@@ -10,7 +12,19 @@ type RendererBaseStore = Store<RendererStateMap, typeof reducers>;
 type RendererBoundState = ReturnType<RendererBaseStore['getStoreStateSnapshot']>;
 
 function isTestEnvironment(): boolean {
-  return typeof process !== 'undefined' && process.env.NODE_ENV === 'test';
+  if (typeof process !== 'undefined' && process.env.NODE_ENV === 'test') return true;
+  // Playwright CT bundle: playwright/index.ts sets this flag before calling
+  // store.init() outside Svelte component initialization (monorepo#2224).
+  return (
+    typeof window !== 'undefined' &&
+    (window as { __PLAYWRIGHT_CT_STORE_BOOTSTRAP__?: boolean })
+      .__PLAYWRIGHT_CT_STORE_BOOTSTRAP__ === true
+  );
+}
+
+function isReduxActionLoggingEnabled(): boolean {
+  const { value, hadError } = safeLocalStorage.getItemWithStatus(REDUX_DEBUG_LS_KEY);
+  return !hadError && value === 'true';
 }
 
 class RendererStore extends Store<RendererStateMap, typeof reducers> {
@@ -55,4 +69,6 @@ class RendererStore extends Store<RendererStateMap, typeof reducers> {
   }
 }
 
-export const store = new RendererStore(reducers, middleware as unknown as StoreMiddleware[]);
+export const store = new RendererStore(reducers, middleware as unknown as StoreMiddleware[], {
+  logReduxActions: isReduxActionLoggingEnabled(),
+});

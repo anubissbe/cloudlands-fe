@@ -239,6 +239,7 @@ export const WORKSPACE_DISPLAY_STATUS_VALUES = [
   'in_progress',
   'idle',
   'complete',
+  'pr_queued',
   'pr_ready',
   'pr_open',
   'pr_merged',
@@ -339,6 +340,10 @@ export interface Workspace {
   prStatus?: PullRequestStatus;
   pullRequests?: PullRequestInfo[];
   activePullRequest?: PullRequestInfo | null;
+  /** Issue/PR context links persisted at create (PROTOCOL §5.1). Write-once —
+   *  supplied on `workspace.create`, never mutated after insert — and omitted
+   *  on the wire when there are none. */
+  contextLinks?: ContextLink[];
   environmentConfig?: EnvironmentConfig;
   archived?: boolean;
   archivedAt?: string;
@@ -348,6 +353,11 @@ export interface Workspace {
    *  a daemon restart (the workspace survives). Rows carrying it are hidden
    *  from the FE workspace list. */
   pendingDeleteAt?: string;
+  /** Persisted REV-2 browser-client pin (PROTOCOL §5.1 / §5.17): the logical
+   *  `clientId` whose embedded browser serves agent `browser.exec` in this
+   *  workspace. Omitted when unpinned (default routing); cleared via
+   *  `workspace.setBrowserClient { clientId: null }`. */
+  browserClientId?: string;
   defaultModel?: string; // Default model for new agents in this workspace
   /** IDs-only agent membership summary; derive counts from `agentIds.length` and fetch agent details from agent/session sources. */
   agentSummary?: WorkspaceAgentIdSummary;
@@ -434,9 +444,6 @@ export enum PlanStatus {
   Failed = 'Failed',
   Skipped = 'Skipped',
 }
-
-// Alias for backward compatibility
-export const PlanNodeStatus = PlanStatus;
 
 export enum WorkspaceStatus {
   Active = 'Active',
@@ -623,6 +630,13 @@ export interface WorkspaceAgentInfo {
    * for root agents, so clients can rebuild the delegation tree.
    */
   parentAgentId?: string;
+  /**
+   * The session's persisted background flag (PROTOCOL §5.1, additive —
+   * intent-hq/intent#3789): the same value as `metadata.isBackground` on
+   * §5.5 loads, omitted when false, so the HUD can gate background agents
+   * from the summary alone before session hydration.
+   */
+  isBackground?: boolean;
 }
 
 /**
@@ -836,6 +850,15 @@ export interface Note {
    * daemons) — callers then omit `expectedVersion` and last-writer-wins applies.
    */
   rev?: number;
+  /**
+   * Slim `note.list` projection fields (§5.2 `projection: "slim"`): first
+   * ~500 chars of the content and the full content length in characters
+   * (Unicode scalar values, not bytes). Present only on slim rows, where
+   * `content` is `""`; `contentLength > 0 && content === ""` marks a row whose
+   * full content has not been fetched yet (see `isNoteContentStale`).
+   */
+  contentPreview?: string;
+  contentLength?: number;
   createdAt: string;
   updatedAt: string;
   is_pinned?: boolean; // Legacy compatibility
@@ -1068,6 +1091,16 @@ export interface AgentProgress {
   description: string;
 }
 
+// One entry of the daemon-persisted `pendingProposals` session-metadata set
+// (PROTOCOL §5.5): the proposal's stable identity (`applyToolCallId ??
+// preview.title` — same identity as the proposal resource uri and the FE
+// lifecycle slice key) plus the id of the assistant message carrying the
+// proposal resource block.
+export interface PendingProposalRef {
+  proposalId: string;
+  messageId: string;
+}
+
 // AgentMetadata definition
 // Note: Also defined in agent.types.ts but we define it here to avoid circular dependency
 export interface AgentMetadata {
@@ -1097,6 +1130,26 @@ export interface AgentMetadata {
   // by the daemon in session metadata so the dismissed question set never
   // re-surfaces (survives reload).
   dismissedQuestionsMessageId?: string;
+  // Authoritative pending-question marker (PROTOCOL §5.5): absent on legacy
+  // sessions, the question-bearing assistant message id while pending, and an
+  // empty string after the daemon has cleared the pending set.
+  pendingQuestionsMessageId?: string;
+  // Ordered pending-proposal set (PROTOCOL §5.5): one entry per unresolved
+  // lifted proposal resource block, persisted by the daemon in session
+  // metadata and served on AgentLite (`agent.list` / `agent.get`), converged
+  // via `agent:updated`. Unlike the single-slot question marker this is a
+  // SET — proposals across turns stay pending together — and it does NOT
+  // clear while the agent runs later turns: entries leave only on
+  // `agent.resolveProposal`. Absent on legacy daemons (FE degrades to
+  // transcript-only cards).
+  pendingProposals?: PendingProposalRef[];
+  // Resolved-proposal outcomes (PROTOCOL §5.5, `agent.resolveProposal`):
+  // proposalId → "applied" | "dismissed", persisted by the daemon in session
+  // metadata (capped at 100 entries, oldest evicted), served on AgentLite and
+  // converged via `agent:updated`. Drives the resolved transcript-card
+  // rendering so state agrees across reloads and clients. Absent on legacy
+  // daemons and while nothing has been resolved.
+  proposalResolutions?: Record<string, 'applied' | 'dismissed'>;
   // Per-conversation seen marker (PROTOCOL §5.5, `agent.markSeen`): id of the
   // newest message the user had seen. Persisted by the daemon in session
   // metadata, served on AgentLite / agent.getSession, converged via
@@ -1106,8 +1159,21 @@ export interface AgentMetadata {
   // agent.get / agent.list AgentLite metadata (PROTOCOL §5.5); feeds
   // AgentCard's effectiveCompletionReport preview.
   completionReport?: string;
+  // Id of the parent agent that delegated/created this session (PROTOCOL §5.5,
+  // served on AgentLite metadata). Absent on top-level agents; drives the
+  // Agents-panel tree nesting, hud-selectors' top-level gating, and the
+  // per-agent unread suppression for delegated children.
+  createdByAgentId?: string;
   // Allow additional properties for flexibility with proper typing
-  [key: string]: string | number | boolean | null | undefined | any[] | ContextReference[];
+  [key: string]:
+    | string
+    | number
+    | boolean
+    | null
+    | undefined
+    | any[]
+    | ContextReference[]
+    | Record<string, 'applied' | 'dismissed'>;
 }
 
 /**
@@ -1486,7 +1552,21 @@ export interface WorkspaceUIContext {
 // Request/Response Types
 // ============================================================================
 
+/**
+ * Issue/PR context link supplied at `workspace.create` and persisted on the
+ * workspace row (PROTOCOL §5.1 `contextLinks`). Write-once at create; at most
+ * 20 entries per request.
+ */
+export interface ContextLink {
+  kind: 'issue' | 'pr';
+  url: string;
+  owner: string;
+  repo: string;
+  number: number;
+}
+
 export interface CreateWorkspaceRequest {
+  idempotencyKey?: string;
   title?: string;
   statusMessage?: string;
   repositoryPath?: string;
@@ -1502,6 +1582,7 @@ export interface CreateWorkspaceRequest {
   skipIsolation?: boolean; // If true, skip the isolated checkout (worktree or CoW clone) and work directly in the repo folder (wire: canonical for the deprecated skipWorktree alias)
   executionEnvironment?: 'direct' | 'worktree' | 'cow' | 'microvm'; // Explicit execution-environment selection (PROTOCOL §5.1, v3.3); validated daemon-side against enabled profiles + host capabilities
   progressId?: string; // FE-minted correlation id echoed on git:clone:progress/done frames emitted during this create (PROTOCOL §5.1)
+  contextLinks?: ContextLink[]; // Issue/PR context links persisted on the workspace row (PROTOCOL §5.1); omitted when there are none — older daemons ignore the field
   initialAgent?: {
     /**
      * DEPRECATED: the daemon assigns the initial agent's id and returns it on
@@ -1519,7 +1600,7 @@ export interface CreateWorkspaceRequest {
     behaviorPrompt?: string; // Custom behavior instructions (from team coordinator or specialist)
     provider?: string; // ACP provider ID (auggie, claude-code, codex)
     contextReferences?: any[];
-    imageBlocks?: Array<{ type: 'image'; data: string; mimeType: string }>;
+    imageBlocks?: Array<{ type: 'image'; data?: string; mimeType?: string; attachmentId?: string }>;
     metadata?: Record<string, any>;
   };
   /** Linear issue to link to this workspace */

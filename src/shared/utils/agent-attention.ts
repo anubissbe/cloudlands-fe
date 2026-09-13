@@ -12,10 +12,21 @@
  * next responds, i.e. on a user-origin delivery (`agent.sendMessage`,
  * `agent.sendQueuedMessageNow`, `agent.editAndRegenerate`, or a drained
  * user-origin queue entry), emitting `agent:updated` with
- * `attentionRequestCleared: true`; automatic deliveries (A2A sends,
- * parent/subscription wakes) do not clear them. An absent kind means no
- * pending request and the indicator retires.
+ * `attentionRequestCleared: true`. Automatic deliveries (A2A sends,
+ * parent/subscription wakes, hook wakes) also clear them for child and
+ * background sessions, whose attention surface is the parent/coordinator;
+ * only top-level foreground sessions keep the request pending across an
+ * automatic delivery. An absent kind means no pending request and the
+ * indicator retires.
+ *
+ * A pending request is surfaced regardless of turn activity: for a top-level
+ * foreground agent an automatic delivery restarts the turn with the request
+ * still pending, and whenever the daemon has not cleared the fields the
+ * request is genuinely pending, so attention must trump in-progress on every
+ * surface (failed > attention > running > idle).
  */
+
+import type { AgentRuntimeStateInput } from './agent-runtime-state';
 
 export type AgentAttentionKind = 'discussion' | 'blocker';
 
@@ -26,7 +37,7 @@ export interface AgentAttentionRequest {
 }
 
 /** Structural subset of AgentSession/AgentLite this derivation reads. */
-export interface AgentAttentionFieldsLike {
+export interface AgentAttentionFieldsLike extends AgentRuntimeStateInput {
   attentionRequestKind?: unknown;
   attentionRequestReason?: unknown;
   attentionRequestTimestamp?: unknown;
@@ -41,7 +52,8 @@ function isAttentionKind(value: unknown): value is AgentAttentionKind {
  * Derive the pending attention request for a session, or null when none is
  * pending. Reads the top-level fields first (full `AgentSession` projection),
  * falling back to `metadata` (the `AgentLite` list/get projection). Unknown
- * kinds are treated as no pending request rather than guessed at.
+ * kinds are treated as no pending request rather than guessed at. Live-turn
+ * activity flags do not suppress the request.
  */
 export function getAgentAttentionRequest(
   session?: AgentAttentionFieldsLike | null,

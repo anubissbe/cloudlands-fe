@@ -4,12 +4,10 @@
  * Actions and reducer for tracking ACP provider availability status.
  */
 
-import { createAction } from '@augmentcode/themis/utils/store/create-action';
+import { createAction, createAsyncAction } from '@augmentcode/themis/utils/store/create-action';
+import { antigravitySetupVerified } from '../antigravity-setup/antigravity-setup-slice';
 import { createReducer } from '@augmentcode/themis/utils/store/create-reducer';
-import type {
-  AgentAvailabilityState,
-  ProviderStatus,
-} from './agent-availability-types';
+import type { AgentAvailabilityState, ProviderStatus } from './agent-availability-types';
 import type { NpxStatus } from '$shared/types/provider-availability';
 
 // ---------------------------------------------------------------------------
@@ -33,6 +31,15 @@ export const initialState: AgentAvailabilityState = {
 /** Request a single provider availability check. Saga handles IPC + dispatch. */
 export const checkSingleProviderRequested = createAction<[providerId: string]>(
   'agentAvailability/checkSingleProviderRequested',
+);
+
+export const claudeLoginRequested = createAsyncAction<[], void>(
+  'agentAvailability/claudeLogin',
+  'agentAvailability/claudeLoginRequested',
+);
+
+export const claudeLoginStarted = createAction<[terminalId: string]>(
+  'agentAvailability/claudeLoginStarted',
 );
 
 /**
@@ -64,32 +71,30 @@ export const setAllProvidersLoading = createAction<[loadingMap: Record<string, b
 );
 
 /** Fetch user info for a provider (saga trigger). */
-export const fetchProviderUserInfoRequested = createAction<[providerId: string]>(
+const fetchProviderUserInfoRequested = createAction<[providerId: string]>(
   'agentAvailability/fetchProviderUserInfoRequested',
 );
 
-export const fetchProviderUserInfoSuccess = createAction<[providerId: string, status: ProviderStatus]>(
+const fetchProviderUserInfoSuccess = createAction<[providerId: string, status: ProviderStatus]>(
   'agentAvailability/fetchProviderUserInfoSuccess',
 );
 
-export const fetchProviderUserInfoComplete = createAction<[providerId: string]>(
+const fetchProviderUserInfoComplete = createAction<[providerId: string]>(
   'agentAvailability/fetchProviderUserInfoComplete',
 );
 
 /** Track a terminal that's installing a provider. */
-export const trackInstallTerminal = createAction<[terminalId: string]>(
+const trackInstallTerminal = createAction<[terminalId: string]>(
   'agentAvailability/trackInstallTerminal',
 );
 
 /** Remove a watched terminal (e.g. on exit). */
-export const removeWatchedTerminal = createAction<[terminalId: string]>(
+const removeWatchedTerminal = createAction<[terminalId: string]>(
   'agentAvailability/removeWatchedTerminal',
 );
 
 /** Ensure providers have been checked at least once (saga trigger). */
-export const ensureProvidersChecked = createAction(
-  'agentAvailability/ensureProvidersChecked',
-);
+export const ensureProvidersChecked = createAction('agentAvailability/ensureProvidersChecked');
 
 /** Set npx availability status from host.providerDiscovery response. */
 export const setNpxStatus = createAction<[npxStatus: NpxStatus | null]>(
@@ -101,6 +106,18 @@ export const setNpxStatus = createAction<[npxStatus: NpxStatus | null]>(
 // ---------------------------------------------------------------------------
 
 export const agentAvailabilityReducer = createReducer<AgentAvailabilityState>(initialState);
+agentAvailabilityReducer.with(antigravitySetupVerified, (state) => ({
+  ...state,
+  providerStatusMap: {
+    ...state.providerStatusMap,
+    antigravity: { available: true, authenticated: true },
+  },
+  providerLoadingMap: { ...state.providerLoadingMap, antigravity: false },
+  providerCheckEpochMap: {
+    ...state.providerCheckEpochMap,
+    antigravity: (state.providerCheckEpochMap.antigravity ?? 0) + 1,
+  },
+}));
 
 /** Whether a result carrying `epoch` is stale (a newer check started since). */
 function isStaleResult(

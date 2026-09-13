@@ -67,6 +67,17 @@ vi.mock('$store/renderer/slices/ui-layout/ui-layout-slice', () => ({
   toggleSidebarSide: vi.fn(() => ({ type: 'uiLayout/toggleSidebarSide' })),
 }));
 
+vi.mock('$store/renderer/slices/panel-layout/panel-layout-selectors', () => ({
+  selectPanelColumnCount: mocks.selector(2),
+}));
+
+vi.mock('$store/renderer/slices/panel-layout/panel-layout-slice', () => ({
+  setPanelColumnCount: vi.fn((workspaceId: string, count: number) => ({
+    type: 'panelLayout/setPanelColumnCount',
+    payload: [workspaceId, count],
+  })),
+}));
+
 vi.mock('$store/renderer/slices/workspace/workspace-slice', () => ({
   beginWorkspaceTitleMutation: vi.fn(
     (id: string, token: number, optimisticTitle: string, previousTitle: string) => ({
@@ -117,7 +128,7 @@ vi.mock('$lib/components/ui/tooltip', async () => ({
 }));
 
 vi.mock('$features/workspace/components/WorkspaceActionsMenu.svelte', async () => ({
-  default: (await import('../sidebar/__tests__/mocks/MockSimple.svelte')).default,
+  default: (await import('../sidebar/__tests__/mocks/MockWorkspaceActionsMenu.svelte')).default,
 }));
 
 vi.mock('$lib/components/modals/DeleteWarningDialog.svelte', async () => ({
@@ -156,6 +167,7 @@ async function renderHeader(overrides: Partial<Workspace> = {}) {
 // billed to the first test's timeout (intent-hq/monorepo#1464).
 warmImport(() => import('../../terminal/__tests__/mocks/MockButton.svelte'));
 warmImport(() => import('../sidebar/__tests__/mocks/MockSimple.svelte'));
+warmImport(() => import('../sidebar/__tests__/mocks/MockWorkspaceActionsMenu.svelte'));
 warmImport(() => import('../sidebar/__tests__/mocks/Fa.svelte'));
 warmImport(() => import('../WorkspaceSidebarHeader.svelte'));
 
@@ -172,6 +184,15 @@ describe('WorkspaceSidebarHeader status message', () => {
       value: { writeText: mocks.clipboardWrite },
       configurable: true,
     });
+  });
+
+  it('does not render the panel column control in the workspace title header', async () => {
+    const { container } = await renderHeader();
+    const controls = container.querySelector('[data-sidebar-header-controls]')!;
+    const actionsTrigger = controls.querySelector('[data-workspace-actions-trigger]')!;
+
+    expect(controls.querySelector('[data-panel-column-count-trigger]')).toBeNull();
+    expect(actionsTrigger).toBeTruthy();
   });
 
   it('renders the workspace status message under the title', async () => {
@@ -314,6 +335,39 @@ describe('WorkspaceSidebarHeader status message', () => {
     expect(titleInput.style.width).toBe('');
   });
 
+  it('applies the sidebar title decoration classes in display and edit modes', async () => {
+    await renderHeader();
+    const titleButton = screen.getByRole('button', { name: 'Status Workspace' });
+    const decoration = titleButton.parentElement?.querySelector<HTMLElement>(
+      ':scope > [aria-hidden="true"]',
+    );
+
+    expect(decoration).toBeTruthy();
+    expect(decoration!.className.split(/\s+/)).toEqual(
+      expect.arrayContaining([
+        '-inset-x-1',
+        '-inset-y-0.5',
+        'border-transparent',
+        'bg-transparent',
+        'motion-reduce:transition-none',
+        'transition-[inset,border-color,background-color]',
+      ]),
+    );
+
+    await fireEvent.click(titleButton);
+
+    expect(decoration!.className.split(/\s+/)).toEqual(
+      expect.arrayContaining([
+        '-inset-x-2',
+        '-inset-y-1.5',
+        'border-ring/60',
+        'bg-sidebar',
+        'motion-reduce:transition-none',
+        'transition-[inset,border-color,background-color]',
+      ]),
+    );
+  });
+
   it('shows a discoverable add status affordance when empty', async () => {
     await renderHeader({ statusMessage: undefined });
 
@@ -441,5 +495,34 @@ describe('WorkspaceSidebarHeader status message', () => {
       expect(screen.queryByRole('menu')).toBeNull();
       expect(trigger.getAttribute('aria-expanded')).toBe('false');
     });
+  });
+
+  it('offers Transfer for the loaded workspace and opens its transfer modal', async () => {
+    await renderHeader();
+    const trigger = screen.getByRole('button', { name: 'Workspace actions' });
+
+    await fireEvent.keyDown(trigger, { key: 'Enter' });
+    const transfer = await screen.findByRole('button', { name: 'Transfer/Download…' });
+
+    expect(transfer.getAttribute('data-icon-name')).toBe('right-left');
+    await fireEvent.click(transfer);
+
+    expect(mocks.dispatch).toHaveBeenCalledWith({
+      type: 'workspaceTransfer/openModal',
+      payload: [{ workspaceId: 'ws-1', workspaceTitle: 'Status Workspace' }],
+    });
+    await waitFor(() => expect(screen.queryByRole('menu')).toBeNull());
+  });
+
+  it('does not offer Transfer while workspace data is unavailable', async () => {
+    const WorkspaceSidebarHeader = (await import('../WorkspaceSidebarHeader.svelte')).default;
+    render(WorkspaceSidebarHeader, { props: { workspace: null, workspaceId: 'ws-1' } });
+
+    await fireEvent.keyDown(screen.getByRole('button', { name: 'Workspace actions' }), {
+      key: 'Enter',
+    });
+    await screen.findByRole('menu');
+
+    expect(screen.queryByRole('button', { name: 'Transfer/Download…' })).toBeNull();
   });
 });

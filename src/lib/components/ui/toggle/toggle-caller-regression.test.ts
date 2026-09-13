@@ -1,4 +1,5 @@
 // @vitest-environment node
+// @ui-invariant
 import { readdirSync, readFileSync } from 'node:fs';
 import { dirname, join, relative, resolve, sep } from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -97,6 +98,7 @@ describe('B2 caller metadata regression', () => {
         'src/lib/component-catalog/renderers/ProposalCatalogPreview.svelte',
         'src/lib/components/chat/input/ContextPickerButton.svelte',
         'src/lib/components/chat/proposals/BulkProposalItems.svelte',
+        'src/lib/components/layout/ConnectBackendModal.svelte',
         'src/lib/components/modals/TransferWorkspaceModal.svelte',
         'src/lib/components/settings/HardwareConsoleSettings.svelte',
         'src/lib/components/tiptap/TaskItemNodeView.svelte',
@@ -108,24 +110,24 @@ describe('B2 caller metadata regression', () => {
         'src/lib/component-catalog/ChatPolishGeometryControls.svelte',
         'src/lib/component-catalog/renderers/BasicCatalogPreview.svelte',
         'src/lib/components/debug/DebugPanel.svelte',
-        'src/lib/components/file-tracking/CodeChangesPanel.svelte',
         'src/lib/components/settings/AgentBackendSettings.svelte',
+        'src/lib/components/settings/BackendSyncSettings.svelte',
+        'src/lib/components/settings/DeviceRow.svelte',
         'src/lib/components/settings/OpenInAppsSettings.svelte',
         'src/lib/components/settings/mcp/McpServerCard.svelte',
         'src/lib/components/workspace/sidebar/McpServersSection.svelte',
         'src/lib/components/workspace/sidebar/MergePanel.svelte',
+        'src/routes/(app)/settings/+page.svelte',
       ],
       toggle: [
         'src/lib/component-catalog/renderers/BasicCatalogPreview.svelte',
-        'src/lib/components/layout/WorkspaceViewModeToggle.svelte',
-        'src/lib/components/settings/AdditionalAgentsSettings.svelte',
         'src/lib/components/settings/AgentFeaturesSettings.svelte',
         'src/lib/components/settings/ExecutionEnvironmentSettings.svelte',
+        'src/lib/components/settings/GitWorkspaceSettings.svelte',
         'src/lib/components/settings/HardwareConsoleSettings.svelte',
         'src/lib/components/settings/LegacyImportSettings.svelte',
         'src/lib/components/settings/McpServersSettings.svelte',
         'src/lib/components/settings/NotificationSettings.svelte',
-        'src/lib/components/settings/PanelOpenModeSettings.svelte',
         'src/lib/components/settings/RtkSettings.svelte',
         'src/lib/components/settings/WebSocketApiSettings.svelte',
         'src/lib/components/settings/WorkspaceApiSettings.svelte',
@@ -137,7 +139,6 @@ describe('B2 caller metadata regression', () => {
         'src/features/layout/tab-types/NoteViewSettingsDropdown.svelte',
         'src/lib/component-catalog/CatalogControls.svelte',
         'src/lib/component-catalog/renderers/BasicCatalogPreview.svelte',
-        'src/lib/components/file-tracking/CodeChangesPanel.svelte',
         'src/lib/components/settings/ColorThemeSettings.svelte',
       ],
     };
@@ -147,9 +148,6 @@ describe('B2 caller metadata regression', () => {
     for (const aggregator of structuralAggregatorPaths) {
       expect(Object.values(discovered).flat()).not.toContain(aggregator);
     }
-    expect(discovered['toggle-group']).toContain(
-      'src/lib/components/file-tracking/CodeChangesPanel.svelte',
-    );
     expect({
       checkbox: checkboxMetadata.callers,
       switch: switchMetadata.callers,
@@ -171,16 +169,15 @@ describe('B2 caller metadata regression', () => {
       ],
       indicator: [
         { path: 'src/lib/component-catalog/renderers/BasicCatalogPreview.svelte', count: 1 },
-        { path: 'src/lib/components/settings/AdditionalAgentsSettings.svelte', count: 1 },
         { path: 'src/lib/components/settings/AgentFeaturesSettings.svelte', count: 1 },
         { path: 'src/lib/components/settings/ExecutionEnvironmentSettings.svelte', count: 1 },
+        { path: 'src/lib/components/settings/GitWorkspaceSettings.svelte', count: 2 },
         { path: 'src/lib/components/settings/HardwareConsoleSettings.svelte', count: 1 },
         { path: 'src/lib/components/settings/LegacyImportSettings.svelte', count: 1 },
         { path: 'src/lib/components/settings/McpServersSettings.svelte', count: 1 },
         { path: 'src/lib/components/settings/NotificationSettings.svelte', count: 3 },
-        { path: 'src/lib/components/settings/PanelOpenModeSettings.svelte', count: 2 },
         { path: 'src/lib/components/settings/RtkSettings.svelte', count: 1 },
-        { path: 'src/lib/components/settings/WebSocketApiSettings.svelte', count: 1 },
+        { path: 'src/lib/components/settings/WebSocketApiSettings.svelte', count: 3 },
         { path: 'src/lib/components/settings/WorkspaceApiSettings.svelte', count: 1 },
       ],
     };

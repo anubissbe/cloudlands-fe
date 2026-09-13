@@ -1,3 +1,14 @@
+// @verify-changed-triggers: ../ChatPanel.svelte, ../ChatMessage.svelte, ../LazyTurn.svelte,
+//   ../PinnedUserPrompt.svelte, ../pinned-prompt.ts, ../user-message-surface.ts,
+//   ../ConversationTurnGap.svelte, ../MessageContent.svelte, ../StreamingMessageContent.svelte,
+//   ../ResponseGroup.svelte, ../operational-disclosure-row.ts, ../ChatOperationalRow.svelte,
+//   ../StreamingStatus.svelte, ../StreamingTypingIndicator.svelte, ../EventWakeupBanner.svelte,
+//   ../InlineAgentAvatar.svelte, ../SuggestedPrompts.svelte, ../message-action-surface.ts,
+//   ../ToolCall.svelte, ../ThinkingBlock.svelte, ../ContextEngineToolCall.svelte,
+//   ../chat-queue-edge-layout.ts, ../input/SimpleRichInput.svelte,
+//   ../../markdown/MarkdownViewer.svelte, ../../ui/indicators/IntentMarkLoader.svelte,
+//   ../../ui/indicators/index.ts, ../../../../features/layout/tab-types/AgentTabType.svelte
+
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -8,6 +19,17 @@ function source(relativePath: string) {
 
 function hasUnqualifiedClassToken(content: string, token: string) {
   return content.split(/[\s'"`]+/u).includes(token);
+}
+
+function openingTagAfter(content: string, anchor: string) {
+  const anchorIndex = content.indexOf(anchor);
+  const tagStart = content.indexOf('<div', anchorIndex);
+  const tagClose = content.slice(tagStart).match(/\n\s*>/u);
+  if (anchorIndex < 0 || tagStart < 0 || !tagClose || tagClose.index === undefined) {
+    throw new Error(`Opening div not found after contract anchor: ${anchor}`);
+  }
+  const tagEnd = tagStart + tagClose.index + tagClose[0].length;
+  return content.slice(tagStart, tagEnd);
 }
 
 describe('editorial conversation presentation contract', () => {
@@ -37,7 +59,7 @@ describe('editorial conversation presentation contract', () => {
     expect(hasUnqualifiedClassToken(primarySurfaceClasses, 'text-primary-foreground')).toBe(true);
   });
 
-  it('caps transcript, questions, and composer content at the approved 70em measure', () => {
+  it('caps transcript, questions, and composer content at the approved 140em measure', () => {
     const panel = source('src/lib/components/chat/ChatPanel.svelte');
 
     expect(panel).toContain(
@@ -45,10 +67,11 @@ describe('editorial conversation presentation contract', () => {
     );
     expect(panel).not.toContain('max-w-[var(--content-measure-wide)]');
     expect(panel).toContain('<div class="w-full" data-testid="question-wizard-slot">');
-    expect(panel).toContain("? 'w-full px-1.5!'");
-    expect(panel).toContain(": 'w-full px-4 sm:px-6'");
+    expect(panel).toContain("? 'w-full px-3!'");
     expect(panel).toContain('conversation-composer relative z-10 w-full');
-    expect(panel).toContain('class="chat-content-measure mx-auto w-full min-w-0"');
+    expect(panel).toContain(
+      'class="composer-prompt-lane chat-content-measure mx-auto w-full min-w-0"',
+    );
     expect(panel).toContain('data-testid="chat-composer-controls-inner"');
     expect(panel).toContain('edgeDocked');
     expect(panel).not.toContain("'px-[5%]'");
@@ -79,8 +102,13 @@ describe('editorial conversation presentation contract', () => {
     expect(pinned).toContain('USER_MESSAGE_TEXT_CLASS');
     expect(pinned).toContain('truncate whitespace-nowrap');
     expect(message).toContain(': USER_MESSAGE_TEXT_CLASS}');
-    expect(surface).toContain('bg-secondary');
+    expect(hasUnqualifiedClassToken(surface, 'bg-sidebar')).toBe(true);
     expect(surface).toContain('text-secondary-foreground');
+    expect(surface).not.toMatch(/(?:dark|light):bg-/);
+    expect(hasUnqualifiedClassToken(surface, 'bg-muted')).toBe(false);
+    expect(hasUnqualifiedClassToken(surface, 'bg-secondary')).toBe(false);
+    expect(hasUnqualifiedClassToken(surface, 'border')).toBe(false);
+    expect(hasUnqualifiedClassToken(surface, 'border-border')).toBe(false);
     expect(hasUnqualifiedClassToken(surface, 'bg-primary')).toBe(false);
     expect(hasUnqualifiedClassToken(surface, 'text-primary-foreground')).toBe(false);
   });
@@ -95,7 +123,7 @@ describe('editorial conversation presentation contract', () => {
 
     // The overlay is derived from source-row geometry, so compaction cannot
     // change the source row's height or restart pin detection.
-    expect(panel).toContain('enabled: containerHeight >= 400');
+    expect(panel).toContain('enabled: isActive && containerHeight >= 400');
     const pinned = source('src/lib/components/chat/pinned-prompt.ts');
     expect(pinned).toContain(
       "const SELECTOR = '[data-pinnable-user-prompt][data-pinned-prompt-id]';",
@@ -103,8 +131,8 @@ describe('editorial conversation presentation contract', () => {
     expect(pinned).toContain("source.closest<HTMLElement>('[data-conversation-turn]')");
     expect(pinned).toContain('candidate.sourceBottom <= containerTop - ENTER_OFFSET');
     expect(pinned).toContain('candidate.turnBottom > containerTop + ENTER_OFFSET');
-    expect(pinned).toContain('const resizeObserver = new ResizeObserver(schedule);');
-    expect(pinned).toContain('const mutationObserver = new MutationObserver(() => {');
+    expect(pinned).toContain('resizeObserver = new ResizeObserver(schedule);');
+    expect(pinned).toContain('mutationObserver = new MutationObserver(() => {');
 
     // With native anchoring off, LazyTurn owns scroll compensation for ALL of
     // its height changes above the reader's viewport — placeholder <-> content
@@ -124,15 +152,17 @@ describe('editorial conversation presentation contract', () => {
     // (the bottom-of-chat snap-back; behavioral coverage in
     // lazy-turn-scroll-ledger.test.ts).
     expect(lazyTurn).toContain('const preSwap = snapshotScroller(scrollRoot);');
-    expect(lazyTurn).toMatch(/void tick\(\)\.then\(\(\) => ledger\.account\(preSwap\)\);/);
+    expect(lazyTurn).toContain('void tick().then(() => ledger.request(preSwap));');
     expect(lazyTurn).toContain('setVisibleWithScrollCompensation(true);');
     expect(lazyTurn).toContain('setVisibleWithScrollCompensation(false);');
     // The ResizeObserver path must reconcile the ledger FIRST on EVERY fire
     // (before the shouldRenderContent early-return) so post-swap settles are
     // caught in the same frame.
-    expect(lazyTurn).toMatch(/if \(!entry\) return;\s*\n[\s\S]{0,700}?ledger\.account\(\);/);
     expect(lazyTurn).toMatch(
-      /ledger\.account\(\);[\s\S]{0,1600}?if \(!shouldRenderContent\) return;/,
+      /if \(!entry\) return;\s*\n[\s\S]{0,700}?ledger\.requestBeforePaint\(\);/,
+    );
+    expect(lazyTurn).toMatch(
+      /ledger\.requestBeforePaint\(\);[\s\S]{0,1600}?if \(!shouldRenderContent\) return;/,
     );
     // Cached heights are panel-scoped and wrap-width-dependent. ChatPanel
     // owns the bounded cache, while each LazyTurn validates reads and writes.
@@ -171,7 +201,7 @@ describe('editorial conversation presentation contract', () => {
     expect(panel).not.toContain('<hr class="border-t border-border/50 mb-3" />');
   });
 
-  it('uses the soft secondary user prompt surface and semantic body typography', () => {
+  it('uses the canonical sidebar user prompt surface and semantic body typography', () => {
     const message = source('src/lib/components/chat/ChatMessage.svelte');
     const markdown = source('src/lib/components/markdown/MarkdownViewer.svelte');
 
@@ -194,19 +224,13 @@ describe('editorial conversation presentation contract', () => {
 
     expect(staticContent).toContain('<div class="flex flex-col gap-0"');
     expect(streamingContent).toContain('class="relative flex flex-col gap-0"');
-    expect(staticContent).toContain(
-      'getOperationalClusterSpacingClass(\n        groupedBlocks,\n        blockIndex,\n        isVisibleOperationalBlock,',
-    );
-    expect(staticContent).toContain(
-      'isAdjacentOperationalClusterRow(groupedBlocks, blockIndex, isVisibleOperationalBlock)',
-    );
-    expect(staticContent).toContain(
-      'getOperationalClusterSpacingClass(\n                    group.children,\n                    childIndex,\n                    isVisibleOperationalBlock,',
-    );
+    expect(staticContent.match(/{@render renderResponseGroupChild\(/g)).toHaveLength(2);
+    expect(staticContent).toContain('{#if shouldRenderResponseGroupInline(group)}');
     expect(streamingContent).toContain('getOperationalClusterSpacingClass(');
     expect(streamingContent).toContain(
-      "getOperationalClusterSpacingClass(\n                    group.children,\n                    childIndex,\n                    (candidate) => candidate.type !== 'tool_result',",
+      '{@render renderResponseGroupChild(group, blockIndex, childBlock, childIndex)}',
     );
+    expect(streamingContent).toContain('{#if shouldRenderResponseGroupInline(group)}');
     expect(streamingContent).toContain('isAdjacentOperationalClusterRow(');
     expect(streamingContent).toContain('isVisibleTopLevelBlock,');
     expect(streamingContent).toContain('data-operational-cluster-row=');
@@ -224,34 +248,35 @@ describe('editorial conversation presentation contract', () => {
     expect(staticContent).toContain('OPERATIONAL_GROUP_CHILD_ROW_CLASS');
     expect(streamingContent).toContain('OPERATIONAL_GROUP_CHILD_ROW_CLASS');
     expect(responseGroup).not.toContain('pl-4.5');
-    expect(staticContent).toMatch(/true,\s+isAdjacentOperationalClusterRow\(\s+group\.children,/);
+    expect(staticContent).toMatch(/nested,\s+isAdjacentOperationalClusterRow\(\s*group\.children,/);
     expect(streamingContent).toMatch(
-      /true,\s+isAdjacentOperationalClusterRow\(\s+group\.children,/,
+      /nested,\s+isAdjacentOperationalClusterRow\(\s*group\.children,/,
     );
   });
 
-  it('uses quieter Chief message surfaces and neutral proposal borders', () => {
+  it('uses quieter Chief message surfaces and renders proposals inline in the transcript', () => {
     const panel = source('src/lib/components/chat/ChatPanel.svelte');
     const streaming = source('src/lib/components/chat/StreamingMessageContent.svelte');
     const messageContent = source('src/lib/components/chat/MessageContent.svelte');
 
-    expect(panel).toContain('class:bg-sidebar={isChiefWorkspace}');
+    expect(panel).not.toContain('class:bg-sidebar={isChiefWorkspace}');
     expect(panel).toContain("<div class={isChiefWorkspace ? 'mx-1 sm:mx-2' : ''}>");
     expect(panel.match(/message=\{pendingMessage\}[\s\S]{0,80}\{workspace\}/g)).toHaveLength(2);
-    expect(streaming).toContain('neutralBorder={workspaceId === CHIEF_WORKSPACE_ID}');
-    expect(
-      messageContent.match(/neutralBorder=\{workspaceId === CHIEF_WORKSPACE_ID\}/g),
-    ).toHaveLength(2);
+    // Both transcript renderers mount the shared inline proposal host.
+    expect(streaming).toContain('InlineProposal');
+    expect(messageContent).toContain('InlineProposal');
   });
 
-  it('keeps the accepted opaque user surface in Chief sticky rows', () => {
+  it('keeps user rows transparent with the opaque surface on the bubble itself', () => {
     const panel = source('src/lib/components/chat/ChatPanel.svelte');
     const message = source('src/lib/components/chat/ChatMessage.svelte');
 
-    expect(panel).toContain('class:bg-sidebar={isChiefWorkspace}');
-    expect(panel).toContain('class:bg-card={!isChiefWorkspace}');
+    expect(panel).not.toContain('class:bg-sidebar={isChiefWorkspace}');
+    expect(panel).not.toContain('class:bg-card={!isChiefWorkspace}');
+    // The window spans the LazyTurn virtualization wrapper between the
+    // always-mounted nav-target div and the inner bubble surface.
     expect(panel).toMatch(
-      /class:bg-card=\{!isChiefWorkspace\}[\s\S]{0,220}<div class=\{isChiefWorkspace \? 'mx-1 sm:mx-2' : ''\}>/,
+      /message-nav-target relative z-20[\s\S]{0,1400}<div class=\{isChiefWorkspace \? 'mx-1 sm:mx-2' : ''\}>/,
     );
     expect(panel).not.toContain('chief-sticky-message-mask');
     expect(panel).not.toContain('backdrop-filter: blur(24px)');
@@ -259,18 +284,31 @@ describe('editorial conversation presentation contract', () => {
     expect(message).not.toContain('stickySurfaceClass');
   });
 
-  it('uses the original Thinking indicator without the staged hydration line', () => {
+  it('uses the shared 16px five-arm Intent mark instead of the legacy square spinner', () => {
     const panel = source('src/lib/components/chat/ChatPanel.svelte');
     const status = source('src/lib/components/chat/StreamingStatus.svelte');
     const indicator = source('src/lib/components/chat/StreamingTypingIndicator.svelte');
+    const loader = source('src/lib/components/ui/indicators/IntentMarkLoader.svelte');
+    const indicators = source('src/lib/components/ui/indicators/index.ts');
 
     expect(panel).toContain("import StreamingStatus from './StreamingStatus.svelte'");
     expect(panel).not.toContain('LiveStreamPhaseIndicator');
     expect(status).toContain(
       "import StreamingTypingIndicator from './StreamingTypingIndicator.svelte'",
     );
-    expect(indicator).toContain('--duration: 800ms');
-    expect(indicator).toContain('animation: legacy-spinner-wave');
+    expect(indicators).toContain(
+      "export { default as IntentMarkLoader } from './IntentMarkLoader.svelte';",
+    );
+    expect(indicator).toContain('<IntentMarkLoader {variant} size={16} playing={visible} />');
+    expect(loader.match(/data-mark-arm=/g)).toHaveLength(5);
+    expect(loader).toContain('stroke: currentColor');
+    for (const legacyToken of [
+      'legacy-streaming-spinner',
+      'legacy-spinner-square',
+      'legacy-spinner-wave',
+    ]) {
+      expect(indicator).not.toContain(legacyToken);
+    }
   });
 
   it('renders wake-up details as one compact disclosure surface', () => {
@@ -278,12 +316,36 @@ describe('editorial conversation presentation contract', () => {
     const wakeup = source('src/lib/components/chat/EventWakeupBanner.svelte');
     const avatar = source('src/lib/components/chat/InlineAgentAvatar.svelte');
 
-    expect(panel).toMatch(
-      /data-message-index=\{globalIndex\}[\s\S]{0,220}message-nav-target relative z-10[\s\S]{0,280}class:bg-sidebar=\{isChiefWorkspace\}[\s\S]{0,80}class:bg-card=\{!isChiefWorkspace\}/,
+    const wakeupWrapper = openingTagAfter(
+      panel,
+      '<!-- Source wake-up row remains owned by this transcript turn. -->',
     );
-    expect(panel).toContain('class:mb-8={turn.assistantMessages.length > 0}');
-    expect(panel).toContain('class:mb-5={isAutomatedMessage(message)}');
-    expect(panel).toContain('class:mb-7={!isAutomatedMessage(message)}');
+    expect(wakeupWrapper).toContain('data-message-id={message.id}');
+    expect(wakeupWrapper).toContain('data-message-index={globalIndex}');
+    expect(wakeupWrapper).toContain('message-nav-target relative z-10');
+    expect(wakeupWrapper).toContain('data-pinned-prompt-id={message.id}');
+    expect(wakeupWrapper).toContain('use:attachPinnedPromptMessage={message}');
+    expect(wakeupWrapper).toContain('eventCardAssistantMarginClass(');
+    expect(wakeupWrapper).toContain('turn.assistantMessages.length > 0');
+    expect(panel).toContain('class:mb-0={batchedDeliveryTurnSeam}');
+    expect(panel).toContain('class:mb-5={!batchedDeliveryTurnSeam && isAutomatedMessage(message)}');
+    expect(panel).toContain(
+      'class:mb-7={!batchedDeliveryTurnSeam && !isAutomatedMessage(message)}',
+    );
+    expect(panel).toContain(
+      '{@const prevTurn =\n' +
+        '                    turns[turnIndex - 1] ??\n' +
+        '                    conversationTurnIndex.groups[groupIndex - 1]?.turns.at(-1)}',
+    );
+    expect(panel).toContain(
+      '{@const batchedSeamBefore = Boolean(\n' +
+        '                    prevTurn &&\n' +
+        '                    !isAttentionQuestionAnswerSeam(prevTurn, turn) &&\n' +
+        '                    isBatchedDeliverySeam(prevTurn, turn),\n' +
+        '                  )}',
+    );
+    expect(panel).toContain('suppressTopGap={batchedSeamBefore}');
+    expect(panel).toContain('suppressAutomatedWakeTopSpacing={batchedSeamBefore}');
     expect(panel).not.toContain('data-testid="chat-scroll-to-bottom-button"');
     expect(panel).toContain('showAgentCards={!isDelegatedBackgroundTaskAgent}');
     expect(panel).not.toContain('agentEventsForCards');
@@ -314,13 +376,11 @@ describe('editorial conversation presentation contract', () => {
     expect(suggestions).not.toContain('faPaperPlane');
   });
 
-  it('supports a top-divider-only docked composer without changing edit-mode chrome', () => {
+  it('supports the nested ChatPanel composer without changing standalone chrome', () => {
     const input = source('src/lib/components/chat/input/SimpleRichInput.svelte');
 
     expect(input).toMatch(/edgeDocked\s*\?/);
-    expect(input).toContain(
-      'rounded-none border-x-0 border-b-0 border-t border-border bg-transparent shadow-none',
-    );
+    expect(input).toContain('rounded-lg border-0 bg-sidebar shadow-none');
     expect(input).toContain('rounded-lg border border-border shadow-(--elevation-raised)');
     expect(input).not.toContain(':global(.panel:not(.focused) .rich-input-container) {');
     expect(input).toContain('@media (prefers-reduced-motion: reduce)');
@@ -393,14 +453,35 @@ describe('editorial conversation presentation contract', () => {
     expect(panel).not.toContain('w-full pt-8 pb-12');
   });
 
-  it('keeps the tall streaming Aurora below queued messages in the stacking order', () => {
+  it('keeps the regular and Chief streaming Aurora backgrounds below queued messages', () => {
     const panel = source('src/lib/components/chat/ChatPanel.svelte');
 
-    expect(panel).toContain('class="conversation-composer relative z-10 w-full"');
-    expect(panel).toContain(
-      'class="pointer-events-none absolute -inset-x-2 -bottom-2 z-0 overflow-hidden"',
-    );
+    const auroraBackground = '<AuroraBackground {agentId} />';
+    const regularAurora =
+      'class="composer-aurora-host regular-panel-aurora-host pointer-events-none absolute inset-x-0 bottom-0 z-0 overflow-hidden"';
+    const transcript = 'data-testid="chat-transcript-scroll-viewport"';
+    const composer = 'class="conversation-composer relative z-10 w-full"';
+    const chiefAurora =
+      'class="composer-aurora-host pointer-events-none absolute -left-4 -right-2 -bottom-4 z-0 overflow-hidden"';
+    const regularAuroraIndex = panel.indexOf(regularAurora);
+    const regularBackgroundIndex = panel.indexOf(auroraBackground, regularAuroraIndex);
+    const transcriptIndex = panel.indexOf(transcript);
+    const composerIndex = panel.indexOf(composer);
+    const chiefAuroraIndex = panel.indexOf(chiefAurora);
+    const chiefBackgroundIndex = panel.indexOf(auroraBackground, chiefAuroraIndex);
+
+    expect(regularAuroraIndex).toBeGreaterThan(-1);
+    expect(regularBackgroundIndex).toBeGreaterThan(regularAuroraIndex);
+    expect(regularBackgroundIndex).toBeLessThan(transcriptIndex);
+    expect(transcriptIndex).toBeGreaterThan(regularAuroraIndex);
+    expect(composerIndex).toBeGreaterThan(transcriptIndex);
+    expect(chiefAuroraIndex).toBeGreaterThan(composerIndex);
+    expect(chiefBackgroundIndex).toBeGreaterThan(chiefAuroraIndex);
+    expect(panel.match(/<AuroraBackground \{agentId\} \/>/g)).toHaveLength(2);
+    expect(panel).not.toContain('AuroraSofteningLayer');
+    expect(panel).toContain('style:height={`calc(${composerHeight}px + 10rem)`}');
     expect(panel).toContain('height: calc(100% + 10rem)');
     expect(panel).toContain('class="relative z-20 mt-6 {isChiefWorkspace');
+    expect(panel).not.toContain('regular-composer-aurora-host');
   });
 });

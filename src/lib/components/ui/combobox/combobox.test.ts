@@ -1,3 +1,4 @@
+// @ui-invariant
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/svelte';
 import { tick } from 'svelte';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -6,12 +7,13 @@ import { invalidControlContrastCases } from '../../../../../tests/helpers/invali
 import ComboboxHarness from './combobox.test-harness.svelte';
 
 describe('Combobox inventory', () => {
-  it('owns the canonical pattern and resolves every legacy searchable family to it', () => {
+  it('owns the canonical pattern with every legacy searchable family barrel removed', () => {
     const inventory = buildUiComponentInventory();
     const canonical = inventory.components.find(
       (component) => component.publicImport === '$lib/components/ui/combobox',
     );
     expect(canonical).toMatchObject({ category: 'pattern', owner: '007-B6', replacement: null });
+    expect(canonical?.source).toBeTruthy();
 
     for (const publicImport of [
       '$lib/components/ui/grouped-combobox',
@@ -21,8 +23,7 @@ describe('Combobox inventory', () => {
       const legacy = inventory.components.find(
         (component) => component.publicImport === publicImport,
       );
-      expect(legacy?.replacement).toBe('$lib/components/ui/combobox');
-      expect(canonical?.source).toBeTruthy();
+      expect(legacy, publicImport).toBeUndefined();
     }
   });
 });
@@ -129,8 +130,8 @@ describe('Combobox behavior', () => {
   it('uses a contrast-validated invalid border and ring', () => {
     render(ComboboxHarness, { props: { invalid: true } });
     const input = screen.getByRole('combobox', { name: 'Search people' });
-    expect(input.className.split(/\s+/)).toContain('border-destructive-foreground');
-    expect(input.className.split(/\s+/)).toContain('ring-destructive-foreground/25');
+    expect(input.className.split(/\s+/)).toContain('border-danger');
+    expect(input.className.split(/\s+/)).toContain('ring-danger/25');
     for (const { label, ratio } of invalidControlContrastCases()) {
       expect(ratio, label).toBeGreaterThanOrEqual(3);
     }

@@ -1,10 +1,16 @@
 import type { ContentBlock } from '$shared/types';
 import { marked } from 'marked';
+import { strikethroughDoubleTilde } from '$lib/utils/marked-strikethrough';
+
+// Restrict strikethrough to the double-tilde form (~~text~~) on the global
+// marked singleton at module load, so exports are covered regardless of
+// whether any other consumer configured the singleton first.
+marked.use(strikethroughDoubleTilde);
 
 /**
  * Render a text block to HTML using markdown processing
  */
-export function renderTextBlock(text: string): string {
+function renderTextBlock(text: string): string {
   if (!text || text.trim() === '') {
     return '';
   }
@@ -25,7 +31,7 @@ export function renderTextBlock(text: string): string {
 /**
  * Render a code block to HTML with syntax highlighting
  */
-export function renderCodeBlock(code: string, language?: string): string {
+function renderCodeBlock(code: string, language?: string): string {
   const lang = language || 'plaintext';
   const escapedCode = escapeHtml(code);
 
@@ -35,11 +41,7 @@ export function renderCodeBlock(code: string, language?: string): string {
 /**
  * Render a tool call block as a collapsible details element
  */
-export function renderToolCall(
-  name: string,
-  input: Record<string, any>,
-  toolUseId?: string,
-): string {
+function renderToolCall(name: string, input: Record<string, any>, toolUseId?: string): string {
   const cleanName = cleanToolName(name);
   // Strip internal metadata fields (e.g., _acpTitle) from exported input
   const cleanInput = Object.fromEntries(Object.entries(input).filter(([k]) => !k.startsWith('_')));
@@ -58,14 +60,14 @@ export function renderToolCall(
 /**
  * Render a tool result block
  */
-export function renderToolResult(
-  output: any,
-  isError: boolean = false,
-  toolUseId?: string,
-): string {
+function renderToolResult(output: any, isError: boolean = false, toolUseId?: string): string {
   // Return empty string for empty results (hide completely)
-  if (output === null || output === undefined || output === '' ||
-      (typeof output === 'string' && output.trim() === '')) {
+  if (
+    output === null ||
+    output === undefined ||
+    output === '' ||
+    (typeof output === 'string' && output.trim() === '')
+  ) {
     return '';
   }
 
@@ -82,7 +84,7 @@ export function renderToolResult(
 /**
  * Render a thinking block as a collapsible section
  */
-export function renderThinkingBlock(content: string): string {
+function renderThinkingBlock(content: string): string {
   const escapedContent = escapeHtml(content);
 
   return `<details class="thinking-block">

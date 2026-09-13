@@ -7,6 +7,12 @@
  * rows — no WorkspaceSetupCard. The pure-predicate tests in
  * chat-panel-visibility.test.ts cannot catch the card being reintroduced
  * inside the skeleton branch, so this suite renders ChatPanel itself.
+ *
+ * ChatPanel must be imported statically: a dynamic `import()` inside a test
+ * body charges the Vite transform of ChatPanel's whole module graph to that
+ * test's `testTimeout`, which times out under multi-worker load
+ * (intent-hq/intent#3082). A static import pays the same cost during file
+ * collection, where no per-test timeout applies.
  */
 import { cleanup, render, screen, waitFor } from '@testing-library/svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -43,7 +49,10 @@ const testState = vi.hoisted(() => {
 vi.mock('$store/renderer/store', async () => {
   const { createAppStoreMockModule } =
     await import('$store/renderer/utils/test-helpers/store-mock');
-  return createAppStoreMockModule({ state: () => ({}), dispatch: testState.dispatch });
+  return createAppStoreMockModule({
+    state: () => ({ browser: { byWorkspaceId: {} } }),
+    dispatch: testState.dispatch,
+  });
 });
 
 vi.mock('$features/layout/panel-layout-adapter', () => ({
@@ -56,7 +65,7 @@ vi.mock('$lib/client', () => ({
       set: vi.fn().mockResolvedValue({ ok: true }),
       clear: vi.fn().mockResolvedValue({ ok: true }),
     },
-    agents: { retry: vi.fn(), editQueued: vi.fn() },
+    agents: { retry: vi.fn(), editQueued: vi.fn(), getQueue: vi.fn().mockResolvedValue([]) },
   },
 }));
 vi.mock('$lib/electron-bridge', () => ({
@@ -68,6 +77,8 @@ vi.mock('svelte-fa', async () => ({ default: (await import('./mocks/SlotOnly.sve
 
 vi.mock('$store/renderer/slices/panel-layout/panel-layout-selectors', () => ({
   selectAllTabs: vi.fn(() => testState.readable([] as unknown[])),
+  selectPanels: testState.selector({}),
+  selectHiddenTabs: testState.selector([] as unknown[]),
 }));
 vi.mock('$store/renderer/slices/agent-session/agent-session-selectors', () => ({
   selectAgentSession: testState.selector(null),
@@ -83,14 +94,16 @@ vi.mock('$store/renderer/slices/agent-session/agent-session-selectors', () => ({
     historyCount: 0,
     tailCount: 0,
   }),
+  selectAgentTailCapPruned: testState.selector(false),
 }));
 vi.mock('$store/renderer/slices/chat-state/chat-state-selectors', () => ({
   selectAwaitingSwitchBackSnapshot: testState.selector(false),
-  selectAwaitingUtilityFooter: testState.selector(false),
   selectChatError: testState.selector(null),
+  selectChatFailureCorrelation: testState.selector(undefined),
   selectChatLastChunkTime: testState.selector(null),
   selectChatLiveStreamPhase: testState.selector(null),
   selectChatModelUnavailable: testState.selector(null),
+  selectChatQuotaExceeded: testState.selector(null),
   selectChatReceivedFirstChunk: testState.selector(false),
   selectChatStatusEvents: testState.selector([]),
   selectChatStreamingStartTime: testState.selector(null),
@@ -99,6 +112,8 @@ vi.mock('$store/renderer/slices/chat-state/chat-state-selectors', () => ({
   selectFetchingOlderHistory: testState.selector(false),
   selectHistoryExhausted: testState.selector(false),
   selectHistorySeekUnsupported: testState.selector(false),
+  selectPendingProposalRecovery: testState.selector(undefined),
+  selectPendingQuestionRecovery: testState.selector(undefined),
   selectTranscriptHydration: testState.selectorFrom(() => testState.transcriptHydration),
   selectTranscriptHydratedOnce: testState.selectorFrom(() => testState.transcriptHydratedOnce),
   selectTranscriptSnapshotMeta: testState.selector(undefined),
@@ -130,6 +145,7 @@ vi.mock('$store/renderer/slices/permission/permission-selectors', () => ({
   selectPermissionRequests: testState.selector([]),
 }));
 vi.mock('$store/renderer/slices/user-preferences/user-preferences-selectors', () => ({
+  selectChatAuroraEnabled: testState.selector(true),
   selectIsAgentMonospace: testState.selector(false),
 }));
 vi.mock('$store/renderer/slices/specialists/specialists-selectors', () => ({
@@ -139,6 +155,11 @@ vi.mock('$store/renderer/slices/specialists/specialists-selectors', () => ({
 }));
 vi.mock('$store/renderer/slices/provider-catalog/provider-catalog-selectors', () => ({
   selectEffectiveDefaultProviderId: testState.selector(''),
+  selectProviderCatalogLoaded: testState.selector(false),
+  selectProviderCatalogEntries: testState.selector([] as unknown[]),
+  selectProviderAuthFailureGuidance: { select: () => null },
+  selectProviderDisplayName: { select: (_state: unknown, id: string) => id },
+  selectNormalizedProviderId: { select: (_state: unknown, id: string) => id },
 }));
 
 vi.mock('../input/SimpleRichInput.svelte', async () => ({
@@ -215,6 +236,8 @@ vi.mock('$features/onboarding/messages/WorkspaceSetupCard.svelte', async () => (
   default: (await import('./mocks/MockWorkspaceSetupCard.svelte')).default,
 }));
 
+import ChatPanel from '../ChatPanel.svelte';
+
 // Workspace with a repository name so ChatPanel reconstructs onboardingContext
 // on mount (no initial prompt is persisted — the reopened-workspace shape).
 const workspace = {
@@ -226,7 +249,6 @@ const workspace = {
 };
 
 async function renderInitialWorkspaceChatPanel() {
-  const ChatPanel = (await import('../ChatPanel.svelte')).default;
   render(ChatPanel, {
     props: { workspace, agentId: 'agent-1', isActive: true, isInitialWorkspaceAgent: true },
   });
@@ -256,9 +278,7 @@ describe('ChatPanel skeleton branch vs WorkspaceSetupCard', () => {
 
     await renderInitialWorkspaceChatPanel();
 
-    await waitFor(() =>
-      expect(screen.getByTestId('chat-transcript-skeleton')).toBeTruthy(),
-    );
+    await waitFor(() => expect(screen.getByTestId('chat-transcript-skeleton')).toBeTruthy());
     expect(screen.queryByTestId('mock-workspace-setup-card')).toBeNull();
   });
 
@@ -270,9 +290,7 @@ describe('ChatPanel skeleton branch vs WorkspaceSetupCard', () => {
 
     await renderInitialWorkspaceChatPanel();
 
-    await waitFor(() =>
-      expect(screen.getByTestId('mock-workspace-setup-card')).toBeTruthy(),
-    );
+    await waitFor(() => expect(screen.getByTestId('mock-workspace-setup-card')).toBeTruthy());
     expect(screen.queryByTestId('chat-transcript-skeleton')).toBeNull();
   });
 });

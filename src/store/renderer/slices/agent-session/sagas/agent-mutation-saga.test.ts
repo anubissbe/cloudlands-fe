@@ -8,6 +8,8 @@ const mocks = vi.hoisted(() => ({
   deleteAgent: vi.fn(),
   cancelDelete: vi.fn(),
   dismissQuestions: vi.fn(),
+  resolveProposal: vi.fn(),
+  restore: vi.fn(),
   warning: vi.fn(),
   error: vi.fn(),
 }));
@@ -20,6 +22,8 @@ vi.mock('$lib/client', () => ({
       delete: mocks.deleteAgent,
       cancelDelete: mocks.cancelDelete,
       dismissQuestions: mocks.dismissQuestions,
+      resolveProposal: mocks.resolveProposal,
+      restore: mocks.restore,
     },
   },
 }));
@@ -43,14 +47,21 @@ import {
   deleteAgentSessionRequested,
   renameAgentSessionRequested,
   restoreAgentSessionRequested,
+  restoreRetiredAgentRequested,
   saveAgentSessionRequested,
   undoAgentDeletionRequested,
 } from '../../workspace-agents/workspace-agents-slice';
 import {
+  agentProposalResolveRequested,
   agentSessionDismissQuestionsRequested,
   bulkUpsertSessions,
   updateSession,
 } from '../agent-session-slice';
+import {
+  agentScopedProposalKey,
+  proposalResolutionReconciled,
+} from '../../proposal-lifecycle/proposal-lifecycle-slice';
+import { TOAST_COUNTDOWN_CLASS } from '$lib/components/ui/toast';
 import { AGENT_DELETION_TOMBSTONE_TTL_MS, agentMutationSaga } from './agent-mutation-saga';
 
 const WS = 'ws-mutation';
@@ -124,6 +135,39 @@ describe('agentMutationSaga', () => {
     expect(mocks.get).toHaveBeenCalledWith(A1);
     const upsert = dispatched.find((candidate) => candidate.type === bulkUpsertSessions.type);
     expect(upsert.payload[0][0]).toEqual(expect.objectContaining({ id: A1, messages }));
+    await stop(task);
+  });
+
+  it('un-retires through agent.restore and clears retiredAt locally on success', async () => {
+    const existing = session(A1, { retiredAt: '2026-01-02T00:00:00.000Z' });
+    mocks.restore.mockResolvedValue({ success: true });
+    const { channel, dispatched, task } = start({ [A1]: existing });
+    const action = restoreRetiredAgentRequested(WS, A1);
+    channel.put(action);
+
+    await expect(action.promise).resolves.toBeUndefined();
+    expect(mocks.restore).toHaveBeenCalledWith(A1, WS);
+    const upsert = dispatched.find((candidate) => candidate.type === bulkUpsertSessions.type);
+    expect(upsert.payload[0][0]).toEqual(expect.objectContaining({ id: A1, retiredAt: undefined }));
+    await stop(task);
+  });
+
+  it('surfaces an agent.restore daemon failure as an error toast and rejects', async () => {
+    // Per §5.5 a non-retired restore is a no-op success; the documented failure
+    // shape is a thrown wire error (e.g. cross-workspace NotFound) that
+    // LiveAgentsClient.restore folds into { success: false, error }.
+    const existing = session(A1, { retiredAt: '2026-01-02T00:00:00.000Z' });
+    mocks.restore.mockResolvedValue({ success: false, error: 'agent not found' });
+    const { channel, dispatched, task } = start({ [A1]: existing });
+    const action = restoreRetiredAgentRequested(WS, A1);
+    channel.put(action);
+
+    await expect(action.promise).rejects.toThrow('agent not found');
+    await settle();
+    expect(mocks.error).toHaveBeenCalled();
+    expect(
+      dispatched.find((candidate) => candidate.type === bulkUpsertSessions.type),
+    ).toBeUndefined();
     await stop(task);
   });
 
@@ -287,6 +331,91 @@ describe('agentMutationSaga', () => {
     await stop(task);
   });
 
+  it('resolveProposal success reconciles lifecycle state and resolves without a toast', async () => {
+    mocks.resolveProposal.mockResolvedValue({ success: true });
+    const { channel, dispatched, task } = start();
+    const action = agentProposalResolveRequested(A1, WS, {
+      proposalId: 'toolu-1',
+      outcome: 'dismissed',
+    });
+    channel.put(action);
+
+    await expect(action.promise).resolves.toBeUndefined();
+    expect(mocks.resolveProposal).toHaveBeenCalledExactlyOnceWith({
+      agentId: A1,
+      workspaceId: WS,
+      proposalId: 'toolu-1',
+      outcome: 'dismissed',
+    });
+    const reconciled = dispatched.filter(
+      (candidate) => candidate.type === proposalResolutionReconciled.type,
+    );
+    expect(reconciled).toHaveLength(1);
+    // Reconciled under the agent-scoped key: daemon ids fall back to
+    // preview.title, which can collide across agents.
+    expect(reconciled[0].payload[0]).toMatchObject({
+      proposalId: agentScopedProposalKey(A1, 'toolu-1'),
+      outcome: 'dismissed',
+    });
+    expect(mocks.error).not.toHaveBeenCalled();
+    await stop(task);
+  });
+
+  it('resolveProposal forwards detail on applied outcomes', async () => {
+    mocks.resolveProposal.mockResolvedValue({ success: true });
+    const { channel, task } = start();
+    const action = agentProposalResolveRequested(A1, WS, {
+      proposalId: 'toolu-2',
+      outcome: 'applied',
+      detail: 'created workspace ws-new',
+    });
+    channel.put(action);
+
+    await expect(action.promise).resolves.toBeUndefined();
+    expect(mocks.resolveProposal).toHaveBeenCalledExactlyOnceWith({
+      agentId: A1,
+      workspaceId: WS,
+      proposalId: 'toolu-2',
+      outcome: 'applied',
+      detail: 'created workspace ws-new',
+    });
+    await stop(task);
+  });
+
+  it('surfaces a resolveProposal failure as an error toast, rejects, and does NOT reconcile', async () => {
+    mocks.resolveProposal.mockResolvedValue({ success: false, error: 'resolve rejected' });
+    const { channel, dispatched, task } = start();
+    const action = agentProposalResolveRequested(A1, WS, {
+      proposalId: 'toolu-1',
+      outcome: 'dismissed',
+    });
+    channel.put(action);
+
+    await expect(action.promise).rejects.toThrow('resolve rejected');
+    expect(mocks.error).toHaveBeenCalledWith('resolve rejected');
+    expect(
+      dispatched.filter((candidate) => candidate.type === proposalResolutionReconciled.type),
+    ).toHaveLength(0);
+    await stop(task);
+  });
+
+  it('surfaces a resolveProposal RPC error as an error toast and rejects', async () => {
+    mocks.resolveProposal.mockRejectedValue(new Error('socket closed'));
+    const { channel, dispatched, task } = start();
+    const action = agentProposalResolveRequested(A1, WS, {
+      proposalId: 'toolu-1',
+      outcome: 'applied',
+    });
+    channel.put(action);
+
+    await expect(action.promise).rejects.toThrow('socket closed');
+    expect(mocks.error).toHaveBeenCalledWith('socket closed');
+    expect(
+      dispatched.filter((candidate) => candidate.type === proposalResolutionReconciled.type),
+    ).toHaveLength(0);
+    await stop(task);
+  });
+
   it('sends agent.delete with undoDelayMs immediately and undo issues the race-safe cancelDelete', async () => {
     mocks.deleteAgent.mockResolvedValue({
       success: true,
@@ -300,6 +429,16 @@ describe('agentMutationSaga', () => {
     await expect(deletion.promise).resolves.toEqual(session());
     expect(mocks.deleteAgent).toHaveBeenCalledExactlyOnceWith(A1, WS, { undoDelayMs: 15_000 });
     expect(dispatched).toContainEqual(removeWatchedAgent(WS, A1));
+    await vi.waitFor(() =>
+      expect(mocks.warning).toHaveBeenCalledExactlyOnceWith(
+        expect.any(String),
+        expect.objectContaining({
+          duration: 15_000,
+          class: expect.stringContaining(TOAST_COUNTDOWN_CLASS),
+          style: expect.stringContaining('--toast-countdown-duration: 15000ms'),
+        }),
+      ),
+    );
 
     const undo = undoAgentDeletionRequested(WS, A1);
     channel.put(undo);

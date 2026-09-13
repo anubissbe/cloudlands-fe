@@ -29,6 +29,7 @@ import {
   SystemExecuteCommandSchema,
   SystemExecuteCommandStreamingSchema,
   SystemWriteClipboardSchema,
+  UserMcpAuthenticateSchema,
   UserMcpCheckAuthSchema,
   UserMcpTestConnectionSchema,
   VscodeOpenDiffSchema,
@@ -48,7 +49,7 @@ import { createSafeValidatedHandler } from '../../../main/ipc-validation-middlew
 import { broadcastToBrowserIpcClients } from '../../../main/browser-ipc-broadcast-adapter';
 import { execFileAsync } from '../../../shared/git/git-env';
 import { findBinary } from '../../../shared/main/find-binary';
-import { getBackendClient } from '../../backend/main/backend.ipc';
+import { getBackendClient, getBackendIdForIpcSender } from '../../backend/main/backend.ipc';
 import { hostExec } from '../../../shared/main/host-exec';
 import { hostExecStream } from '../../../shared/main/host-exec-stream';
 import {
@@ -76,6 +77,14 @@ import {
 } from '../../../shared/main/window-appearance';
 import { meetsMinimumVersion } from '../../../shared/utils/version-compare';
 import { posixSingleQuote } from '../../../shared/utils/posix-single-quote';
+import { resolveAppIconPath } from '../../../main/utils/resolve-app-icon';
+import {
+  decorateWindowTitle,
+  registerWindowTitleListener,
+} from '../../../main/utils/resolve-app-title';
+import { isHudWindow, isTrackedHudWindow } from '../../../main/hud-window';
+import { LOCAL_CONNECTION_ID } from '../../../shared/types/connections';
+import { CHIEF_WORKSPACE_ID } from '../../../shared/types/branded-ids';
 
 // ESM-compatible __dirname
 const __filename = fileURLToPath(import.meta.url);
@@ -85,6 +94,14 @@ const require = createRequire(import.meta.url);
 
 const logger = new Logger('SystemIPC');
 let nativeThemeBackgroundSyncInstalled = false;
+const WINDOW_OPEN_REQUEST_RETENTION_MS = 5 * 60 * 1000;
+const MAX_TRACKED_WINDOW_OPEN_REQUESTS = 256;
+
+type WindowOpenResult = { success: true; windowId: number } | { success: false; error: string };
+type WindowOpenRequestEntry = {
+  result: Promise<WindowOpenResult>;
+  settledAt?: number;
+};
 
 function refreshNativeWindowBackgrounds(): void {
   const backgroundColor = getWindowBackgroundColor(nativeTheme.shouldUseDarkColors);
@@ -157,6 +174,11 @@ function getPayloadWorkspaceId(data: unknown): string | undefined {
 const windowWorkspaceState = new Map<number, boolean>();
 /** Track which workspace ID each window is viewing */
 const windowWorkspaceIds = new Map<number, string>();
+/**
+ * Diagnostic only: the last workspace each window ever reported, kept when the
+ * window leaves the workspace so hang/crash logs still carry context.
+ */
+const lastKnownWindowWorkspaceIds = new Map<number, string>();
 /** Track which workspace tabs are open per window */
 const windowOpenWorkspaceTabs = new Map<number, string[]>();
 
@@ -180,10 +202,14 @@ export function getFocusedWindowWorkspaceId(): string | undefined {
   return windowWorkspaceIds.get(focusedWindow.id);
 }
 
-export function getOpenWorkspaceTabsForFocusedWindow(): string[] {
-  const focusedWindow = BrowserWindow.getFocusedWindow();
-  if (!focusedWindow) return [];
-  return windowOpenWorkspaceTabs.get(focusedWindow.id) ?? [];
+/**
+ * Get the last-known workspace ID viewed by a specific window, for diagnostics.
+ * Unlike the current-workspace maps this survives the window navigating away
+ * from the workspace; it returns undefined only when the window has never
+ * reported a workspace view.
+ */
+export function getWorkspaceIdForWindow(windowId: number): string | undefined {
+  return lastKnownWindowWorkspaceIds.get(windowId);
 }
 
 /**
@@ -338,6 +364,7 @@ app.on('browser-window-created', (_event, window) => {
   window.on('closed', () => {
     windowWorkspaceState.delete(window.id);
     windowWorkspaceIds.delete(window.id);
+    lastKnownWindowWorkspaceIds.delete(window.id);
     clearWindowBrowserFocusOwner(window.id);
     windowOpenWorkspaceTabs.delete(window.id);
     // A close changes the set of open workspaces: notify listeners (menu
@@ -352,6 +379,14 @@ app.on('browser-window-created', (_event, window) => {
   });
   window.on('leave-full-screen', () => {
     if (!window.isDestroyed()) window.webContents.send('window:fullscreen', false);
+  });
+  // Renderer DOM blur also fires when focus enters an embedded webview. Use
+  // BrowserWindow focus instead so the renderer tracks the native app window.
+  window.on('focus', () => {
+    if (!window.isDestroyed()) window.webContents.send('window:focus', true);
+  });
+  window.on('blur', () => {
+    if (!window.isDestroyed()) window.webContents.send('window:focus', false);
   });
 });
 
@@ -564,6 +599,7 @@ export async function autoRepairCliSymlink(): Promise<void> {
 
 export function setupSystemIPC() {
   installNativeThemeBackgroundSync();
+  const handledWindowOpenRequests = new Map<string, WindowOpenRequestEntry>();
 
   // App info
   ipcMain.handle(
@@ -624,8 +660,14 @@ export function setupSystemIPC() {
       AppSetLanguagePreferenceSchema,
       async (_event, validated) => {
         try {
-          const { setMainLanguagePreference } = await import('../../../main/main-locale');
+          const { setMainLanguagePreference, getMainActiveLocale } =
+            await import('../../../main/main-locale');
           const changed = setMainLanguagePreference(validated.preference);
+          logger.info('Language preference synced from renderer', {
+            preference: validated.preference,
+            activeLocale: getMainActiveLocale(),
+            changed,
+          });
           if (changed) {
             app.emit('main-locale-changed');
           }
@@ -777,7 +819,7 @@ export function setupSystemIPC() {
         try {
           const window = BrowserWindow.fromWebContents(event.sender);
           if (window) {
-            window.setTitle(validated.title);
+            window.setTitle(decorateWindowTitle(validated.title));
           }
           return { success: true };
         } catch (error) {
@@ -806,6 +848,7 @@ export function setupSystemIPC() {
             windowWorkspaceState.set(windowId, validated.inWorkspace);
             if (validated.workspaceId) {
               windowWorkspaceIds.set(windowId, validated.workspaceId);
+              lastKnownWindowWorkspaceIds.set(windowId, validated.workspaceId);
             } else if (!validated.inWorkspace) {
               windowWorkspaceIds.delete(windowId);
             }
@@ -875,28 +918,42 @@ export function setupSystemIPC() {
    * All new windows should use this to avoid config drift.
    * Keep in sync with createWindow / createWindowForSession in main/index.ts.
    *
-   * The HUD pop-out (`/hud`) is a singleton: when a live HUD window already
-   * exists it is restored/focused and returned instead of creating a second
-   * one (see main/hud-window.ts).
+   * The HUD pop-out (`/hud`) is a per-backend singleton bound to the opener's
+   * backend: when a live HUD window for that backend already exists it is
+   * restored/focused and returned instead of creating a second one (see
+   * main/hud-window.ts). HUDs for different backends coexist.
    */
-  async function createAppWindow(route?: string): Promise<BrowserWindow> {
+  async function createAppWindow(
+    route: string | undefined,
+    openerBackendId: string,
+  ): Promise<BrowserWindow> {
     const { BrowserWindow } = await import('electron');
     const path = await import('path');
-    const { forwardRendererConsoleToMainLog } = await import('../../../main/window');
+    const { forwardRendererConsoleToMainLog, stampWindowWithBackend } =
+      await import('../../../main/window');
     const { HUD_ROUTE_PREFIX, findExistingHudWindow, focusHudWindow, registerHudWindow } =
       await import('../../../main/hud-window');
 
     const isHudRoute = typeof route === 'string' && route.startsWith(HUD_ROUTE_PREFIX);
+    const isChiefRoute = route === `/workspace/${CHIEF_WORKSPACE_ID}`;
     if (isHudRoute) {
-      const existing = findExistingHudWindow();
+      const existing = findExistingHudWindow(openerBackendId);
       if (existing) {
         focusHudWindow(existing);
-        logger.info('Reusing existing HUD window (singleton)', { windowId: existing.id });
+        logger.info('Reusing existing HUD window (per-backend singleton)', {
+          windowId: existing.id,
+          backendId: openerBackendId,
+        });
         return existing;
       }
     }
 
     const isDarkMode = nativeTheme.shouldUseDarkColors;
+    const iconPath = resolveAppIconPath({
+      isPackaged: app.isPackaged,
+      nodeEnv: process.env.NODE_ENV,
+      platform: process.platform,
+    });
     const newWindow = new BrowserWindow({
       width: 1920,
       height: 1080,
@@ -913,11 +970,17 @@ export function setupSystemIPC() {
       ...getWindowTitleBarOptions(),
       title: 'Intent',
       ...getWindowAppearanceOptions(isDarkMode),
+      ...(iconPath && { icon: iconPath }),
     });
+    registerWindowTitleListener(newWindow);
+    // The HUD inherits the opener's backend (its data reflects that backend);
+    // only the local-only chief route stays pinned to the local backend.
+    stampWindowWithBackend(newWindow, isChiefRoute ? LOCAL_CONNECTION_ID : openerBackendId);
     forwardRendererConsoleToMainLog(newWindow);
 
-    // Register BEFORE loadURL so a concurrent HUD-open request reuses this
-    // window even while its URL is still about:blank (mid-navigation race).
+    // Register AFTER stamping (the registry keys off the backend stamp) and
+    // BEFORE loadURL so a concurrent HUD-open request reuses this window even
+    // while its URL is still about:blank (mid-navigation race).
     if (isHudRoute) {
       registerHudWindow(newWindow);
     }
@@ -950,9 +1013,12 @@ export function setupSystemIPC() {
     WINDOW_CHANNELS.CREATE,
     createSafeValidatedHandler(
       WindowCreateSchema,
-      async (_event, validated) => {
+      async (event, validated) => {
         try {
-          const newWindow = await createAppWindow(validated.route);
+          const newWindow = await createAppWindow(
+            validated.route,
+            getBackendIdForIpcSender(event.sender),
+          );
           logger.info('New window created', { route: validated.route });
           return { success: true, windowId: newWindow.id };
         } catch (error) {
@@ -972,18 +1038,66 @@ export function setupSystemIPC() {
     WINDOW_CHANNELS.OPEN_NEW,
     createSafeValidatedHandler(
       WindowOpenNewSchema,
-      async (_event, validated) => {
-        try {
-          const newWindow = await createAppWindow(validated.route);
-          return { success: true, windowId: newWindow.id };
-        } catch (error) {
-          logger.error('Failed to open new window', error as Error);
-          return {
-            success: false,
-            error:
-              error instanceof Error ? error.message : m.system_ipc_openNewWindowFailed_error(),
-          };
+      async (event, validated) => {
+        const openWindow = async (): Promise<WindowOpenResult> => {
+          try {
+            const newWindow = await createAppWindow(
+              validated.route,
+              getBackendIdForIpcSender(event.sender),
+            );
+            return { success: true, windowId: newWindow.id };
+          } catch (error) {
+            logger.error('Failed to open new window', error as Error);
+            return {
+              success: false,
+              error:
+                error instanceof Error ? error.message : m.system_ipc_openNewWindowFailed_error(),
+            };
+          }
+        };
+
+        if (!validated.requestId) return openWindow();
+
+        const now = Date.now();
+        for (const [requestId, entry] of handledWindowOpenRequests) {
+          if (
+            entry.settledAt !== undefined &&
+            entry.settledAt + WINDOW_OPEN_REQUEST_RETENTION_MS <= now
+          ) {
+            handledWindowOpenRequests.delete(requestId);
+          }
         }
+
+        const existing = handledWindowOpenRequests.get(validated.requestId);
+        if (existing) return existing.result;
+
+        while (handledWindowOpenRequests.size >= MAX_TRACKED_WINDOW_OPEN_REQUESTS) {
+          let oldestRequestId: string | undefined;
+          let oldestSettledAt = Number.POSITIVE_INFINITY;
+          for (const [requestId, entry] of handledWindowOpenRequests) {
+            if (entry.settledAt !== undefined && entry.settledAt < oldestSettledAt) {
+              oldestRequestId = requestId;
+              oldestSettledAt = entry.settledAt;
+            }
+          }
+          if (!oldestRequestId) {
+            return { success: false, error: m.system_ipc_openNewWindowFailed_error() };
+          }
+          handledWindowOpenRequests.delete(oldestRequestId);
+        }
+
+        const result = openWindow();
+        const entry: WindowOpenRequestEntry = { result };
+        handledWindowOpenRequests.set(validated.requestId, entry);
+        void result.then(
+          () => {
+            entry.settledAt = Date.now();
+          },
+          () => {
+            entry.settledAt = Date.now();
+          },
+        );
+        return result;
       },
       WINDOW_CHANNELS.OPEN_NEW,
     ),
@@ -1019,6 +1133,40 @@ export function setupSystemIPC() {
     ),
   );
 
+  // Focus the next open app window in list order, wrapping around. Destroyed,
+  // hidden, and HUD pop-out windows (URL-detected or tracked pre-navigation)
+  // are excluded from the cycle. Minimized windows are included — macOS
+  // reports them as not visible while Windows/Linux keep them visible, so the
+  // isMinimized() check makes the cycle platform-consistent — and restored
+  // before focusing. Returns whether a window was focused plus the cycleable
+  // window count so the renderer can show a hint when there is nothing to
+  // cycle to.
+  ipcMain.handle(
+    WINDOW_CHANNELS.CYCLE_FOCUS,
+    createSafeValidatedHandler(
+      EmptySchema,
+      async (event) => {
+        const windows = BrowserWindow.getAllWindows().filter(
+          (w) =>
+            !w.isDestroyed() &&
+            (w.isVisible() || w.isMinimized()) &&
+            !isHudWindow(w) &&
+            !isTrackedHudWindow(w),
+        );
+        if (windows.length < 2) {
+          return { cycled: false, windowCount: windows.length };
+        }
+        const senderWindow = BrowserWindow.fromWebContents(event.sender);
+        const senderIndex = senderWindow ? windows.indexOf(senderWindow) : -1;
+        const next = windows[(senderIndex + 1) % windows.length];
+        if (next.isMinimized()) next.restore();
+        next.focus();
+        return { cycled: true, windowCount: windows.length };
+      },
+      WINDOW_CHANNELS.CYCLE_FOCUS,
+    ),
+  );
+
   // Dialog message box
   ipcMain.handle(
     DIALOG_CHANNELS.MESSAGE,
@@ -1051,11 +1199,16 @@ export function setupSystemIPC() {
       async (event, validated) => {
         const focusedWindow = BrowserWindow.getFocusedWindow();
         const targetWindow = focusedWindow || BrowserWindow.fromWebContents(event.sender);
+        // File mode passes `noResolveAliases` so a picked symlink (e.g.
+        // ~/.local/bin/claude) is stored as-is instead of its versioned
+        // target, which goes stale on the next update (monorepo#4352).
         const options: Electron.OpenDialogOptions = {
           title: validated.title,
           defaultPath: validated.defaultPath,
           properties:
-            validated.mode === 'file' ? ['openFile'] : ['openDirectory', 'createDirectory'],
+            validated.mode === 'file'
+              ? ['openFile', 'noResolveAliases']
+              : ['openDirectory', 'createDirectory'],
         };
         const result = targetWindow
           ? await dialog.showOpenDialog(targetWindow, options)
@@ -2177,6 +2330,57 @@ export function setupSystemIPC() {
   // handler is needed in the daemon-backed build. The `SETTINGS_CHANNELS`
   // constants remain exported for the bridge seeder + its tests.
 
+  // Run interactive OAuth for a daemon-saved hosted MCP server. The OAuth
+  // target URL is resolved from the daemon's server record by `serverId`
+  // (PROTOCOL §5.22 `mcp.servers.list`); the renderer-supplied `url` is
+  // advisory and rejected when it disagrees with the daemon record.
+  ipcMain.handle(
+    USER_MCP_CHANNELS.AUTHENTICATE,
+    createSafeValidatedHandler(
+      UserMcpAuthenticateSchema,
+      async (_event, validated) => {
+        const { servers } = await getBackendClient().request<{
+          servers?: Array<{ id?: string; url?: string }>;
+        }>('mcp.servers.list');
+        const record = servers?.find((server) => server.id === validated.serverId);
+        if (!record) {
+          return {
+            success: false,
+            error: {
+              code: 'MCP_SERVER_NOT_FOUND',
+              message: m.system_ipc_mcpAuthServerNotFound_error(),
+            },
+          };
+        }
+        if (typeof record.url !== 'string' || !record.url) {
+          return {
+            success: false,
+            error: {
+              code: 'MCP_SERVER_URL_MISSING',
+              message: m.system_ipc_mcpAuthServerUrlMissing_error(),
+            },
+          };
+        }
+        if (validated.url !== undefined && validated.url !== record.url) {
+          logger.warn('MCP OAuth URL from renderer disagrees with daemon record', {
+            serverId: validated.serverId,
+          });
+          return {
+            success: false,
+            error: {
+              code: 'MCP_SERVER_URL_MISMATCH',
+              message: m.system_ipc_mcpAuthServerUrlMismatch_error(),
+            },
+          };
+        }
+        const { initiateMcpOAuth } = await import('../../mcp/main/mcp-oauth');
+        const result = await initiateMcpOAuth(validated.serverId, record.url);
+        return { success: true, data: result };
+      },
+      USER_MCP_CHANNELS.AUTHENTICATE,
+    ),
+  );
+
   // Check MCP server auth requirements
   ipcMain.handle(
     USER_MCP_CHANNELS.CHECK_AUTH,
@@ -2284,7 +2488,7 @@ export function setupSystemIPC() {
     SYSTEM_CHANNELS.EXECUTE_COMMAND,
     createSafeValidatedHandler(
       SystemExecuteCommandSchema,
-      async (_event, validated) => {
+      async (event, validated) => {
         try {
           const { command, cwd, workspaceId } = validated;
 
@@ -2302,6 +2506,7 @@ export function setupSystemIPC() {
             cwd,
             workspaceId,
             timeoutMs: 30_000,
+            backendId: getBackendIdForIpcSender(event.sender),
           });
 
           if (result.exitCode === 0) {
@@ -2360,6 +2565,7 @@ export function setupSystemIPC() {
             process.platform === 'win32' ? ['cmd.exe', '/c'] : ['/bin/sh', '-c'];
 
           const handle = await hostExecStream(shellCmd, {
+            backendId: getBackendIdForIpcSender(event.sender),
             args: [shellFlag, command],
             cwd,
             workspaceId,

@@ -5,17 +5,17 @@
  * and agents actively working.
  */
 
-import { createAction } from "@augmentcode/themis/utils/store/create-action";
-import { createReducer } from "@augmentcode/themis/utils/store/create-reducer";
-import { createWorkspaceScopedHelpers } from "../../utils/workspace-scoped";
-import { workspaceUnmounted } from "../workspace-lifecycle/workspace-lifecycle-slice";
-import type { AgentLockState, AgentLockWorkspaceState } from "./agent-lock-types";
+import { createAction } from '@augmentcode/themis/utils/store/create-action';
+import { createReducer } from '@augmentcode/themis/utils/store/create-reducer';
+import { createWorkspaceScopedHelpers } from '../../utils/workspace-scoped';
+import { workspaceUnmounted } from '../workspace-lifecycle/workspace-lifecycle-slice';
+import type { AgentLockState, AgentLockWorkspaceState } from './agent-lock-types';
 
 // ---------------------------------------------------------------------------
 // Empty / Initial State
 // ---------------------------------------------------------------------------
 
-export const emptyWorkspaceState: AgentLockWorkspaceState = {
+const emptyWorkspaceState: AgentLockWorkspaceState = {
   lockedAgentIds: {},
   lockedFilePaths: {},
 };
@@ -31,15 +31,14 @@ const { getWorkspaceState, setWorkspaceState, clearWorkspaceState } =
 // Actions
 // ---------------------------------------------------------------------------
 
-/** Trigger recomputation of agent locks for a workspace */
-export const recomputeAgentLocks = createAction<[workspaceId: string]>(
-  "agentLock/recomputeAgentLocks",
-);
-
-/** Set the computed lock state for a workspace */
+/** Set the daemon-computed lock state for a workspace (PROTOCOL §5.19 / §6.5) */
 export const setAgentLockState = createAction(
-  "agentLock/setAgentLockState",
-  (workspaceId: string, lockedAgentIds: Record<string, true>, lockedFilePaths: Record<string, true>) => ({
+  'agentLock/setAgentLockState',
+  (
+    workspaceId: string,
+    lockedAgentIds: Record<string, true>,
+    lockedFilePaths: Record<string, true>,
+  ) => ({
     workspaceId,
     lockedAgentIds,
     lockedFilePaths,

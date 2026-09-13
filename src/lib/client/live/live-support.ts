@@ -11,6 +11,7 @@
  *    workspace without an extra parameter; when the cache misses they fall back
  *    to scanning the workspace list.
  */
+import { isProjectionRejected } from '$shared/utils/note-content';
 import type { MutationResult, Unsubscribe } from '../app-client';
 import { backendRequest, onBackendNotification, onBackendReconnected } from './backend-transport';
 
@@ -49,7 +50,7 @@ export function mutationErrorMessage(error: unknown): string {
 }
 
 /** Numeric JSON-RPC code the daemon returns for an optimistic-concurrency conflict (§11.4-D). */
-export const CONFLICT_RPC_CODE = -32005;
+const CONFLICT_RPC_CODE = -32005;
 
 /**
  * Detect the daemon's optimistic-concurrency conflict response EXACTLY: numeric
@@ -82,12 +83,28 @@ function extractNoteRev(result: unknown): number | undefined {
 }
 
 /**
+ * Extract the full-content write echo from a `note.setContent` response: the
+ * authoritative merged `newContent` and, on daemons that report it, the
+ * post-write `rev` (additive — after a merge the stored rev is not
+ * `sentRev + 1`, so callers cannot infer it). `rev` is only read alongside
+ * `newContent` so unrelated mutation results never surface a stray `rev`.
+ */
+function extractContentEcho(result: unknown): { newContent: string; rev?: number } | undefined {
+  if (!result || typeof result !== 'object') return undefined;
+  const { newContent, rev } = result as { newContent?: unknown; rev?: unknown };
+  if (typeof newContent !== 'string') return undefined;
+  return typeof rev === 'number' && Number.isFinite(rev) ? { newContent, rev } : { newContent };
+}
+
+/**
  * Issue a mutating JSON-RPC request and fold the outcome into a `MutationResult`:
  * success on resolve, `{ success: false, error }` on any transport/daemon error.
  * An optimistic-concurrency conflict (§11.4-D) additionally carries the raw
  * `conflict.current` so callers can reload-to-latest. When the daemon echoes an
  * authoritative `noteRev` (#638), it is surfaced on the result so rev
- * bookkeeping can consume it instead of inferring `rev + 1`. The seam never
+ * bookkeeping can consume it instead of inferring `rev + 1`; a `note.setContent`
+ * echo (`newContent` + optional `rev`) is surfaced as `newContent` / `noteRev`
+ * so the save path can apply the daemon's merged text. The seam never
  * throws from a mutation. State convergence is otherwise left to the existing
  * subscribe→refetch loops driven by daemon events.
  *
@@ -105,8 +122,13 @@ export async function runMutation(
     const result = await (options !== undefined
       ? backendRequest(method, params, options)
       : backendRequest(method, params));
-    const noteRev = extractNoteRev(result);
-    return noteRev !== undefined ? { success: true, noteRev } : { success: true };
+    const echo = extractContentEcho(result);
+    const noteRev = extractNoteRev(result) ?? echo?.rev;
+    return {
+      success: true,
+      ...(noteRev !== undefined ? { noteRev } : {}),
+      ...(echo !== undefined ? { newContent: echo.newContent } : {}),
+    };
   } catch (error) {
     const conflict = extractConflict(error);
     if (conflict) return { success: false, error: mutationErrorMessage(error), conflict };
@@ -610,7 +632,18 @@ async function scanForNoteWorkspace(noteId: string): Promise<string | null> {
   let scanComplete = true;
   for (const workspaceId of workspaceIds) {
     try {
-      const result = await backendRequest<{ notes?: unknown[] }>('note.list', { workspaceId });
+      // Only ids are needed — request the slim projection (§5.2), falling back
+      // to a plain full list on daemons that reject the unknown param (-32602).
+      let result: { notes?: unknown[] };
+      try {
+        result = await backendRequest<{ notes?: unknown[] }>('note.list', {
+          workspaceId,
+          projection: 'slim',
+        });
+      } catch (error) {
+        if (!isProjectionRejected(error)) throw error;
+        result = await backendRequest<{ notes?: unknown[] }>('note.list', { workspaceId });
+      }
       const notes = Array.isArray(result?.notes) ? result.notes : [];
       let found = false;
       for (const note of notes) {

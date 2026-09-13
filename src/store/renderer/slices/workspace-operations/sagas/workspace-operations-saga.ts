@@ -15,6 +15,7 @@ import {
 
 import { invoke } from '$lib/electron-bridge';
 import { getProposalId } from '$lib/components/chat/proposals/proposal-id';
+import { withToastCountdown } from '$lib/components/ui/toast';
 import { getActiveWorkNames, type ActiveWorkNames } from '$lib/utils/delete-warning-utils';
 import { createLogger } from '$lib/utils/client-logger';
 import type { WorkspaceProposalApplyPayload } from '$shared/app-workspace-operations';
@@ -33,6 +34,7 @@ import {
   proposalFailed,
 } from '../../proposal-lifecycle/proposal-lifecycle-slice';
 import { selectProposalLifecycleEntry } from '../../proposal-lifecycle/proposal-lifecycle-selectors';
+import { selectSpecialists } from '../../specialists/specialists-selectors';
 import {
   bulkUpdateWorkspaceEntities,
   clearWorkspacePendingDeletion,
@@ -115,10 +117,22 @@ function activeForRepo(repoKey: string, workspaces: Workspace[]): Workspace[] {
   );
 }
 
-function hasActiveWork({ agentNames, hookNames }: ActiveWorkNames): boolean {
-  return agentNames.length > 0 || hookNames.length > 0;
+function hasActiveWork({ agentNames, hookNames, openPrs, localChanges }: ActiveWorkNames): boolean {
+  return (
+    agentNames.length > 0 ||
+    hookNames.length > 0 ||
+    openPrs.length > 0 ||
+    Boolean(localChanges?.hasUnpushedCommits || localChanges?.hasUncommittedChanges)
+  );
 }
 
+// Single-workspace gating: the only path that fetches `workspace.localChanges`.
+function getSingleWorkspaceActiveWork(workspaceId: string): Promise<ActiveWorkNames> {
+  return getActiveWorkNames(workspaceId, { includeLocalChanges: true });
+}
+
+// Bulk flows count only agents/hooks — open PRs never change bulk counts and
+// local changes are never fetched (no `workspace.localChanges` fan-out).
 function countActiveWork(items: ActiveWorkNames[]): { agentCount: number; hookCount: number } {
   return items.reduce(
     (counts, item) => ({
@@ -194,10 +208,13 @@ function* deleteWithUndo(workspace: Workspace): SagaGenerator<void> {
 
     toast.warning(
       m.workspace_ops_deleted_toast({ title: workspace.title || m.workspace_ops_space_fallback() }),
-      {
-        duration: WORKSPACE_OPERATION_UNDO_DURATION_MS,
-        action: { label: m.workspace_ops_undo_label(), onClick: () => undo.put(true) },
-      },
+      withToastCountdown(
+        {
+          duration: WORKSPACE_OPERATION_UNDO_DURATION_MS,
+          action: { label: m.workspace_ops_undo_label(), onClick: () => undo.put(true) },
+        },
+        { pauseOnHover: false },
+      ),
     );
     const outcome = yield* race({
       undo: take(undo),
@@ -237,7 +254,7 @@ function* requestDelete(action: ReturnType<typeof requestDeleteWorkspace>): Saga
   const [workspaceId] = action.payload;
   const workspace = yield* selectWorkspaceById.effect(workspaceId);
   if (!workspace) return;
-  const activeWork = yield* call(getActiveWorkNames, workspaceId);
+  const activeWork = yield* call(getSingleWorkspaceActiveWork, workspaceId);
   if (hasActiveWork(activeWork)) {
     yield* put(openDeleteWarning({ workspaceId, ...activeWork }));
     return;
@@ -296,7 +313,7 @@ function* archive(action: ReturnType<typeof requestArchiveWorkspace>): SagaGener
   const [workspaceId] = action.payload;
   const workspace = yield* selectWorkspaceById.effect(workspaceId);
   if (!workspace) return;
-  const activeWork = yield* call(getActiveWorkNames, workspaceId);
+  const activeWork = yield* call(getSingleWorkspaceActiveWork, workspaceId);
   if (hasActiveWork(activeWork)) {
     yield* put(openArchiveWarning({ workspaceId, ...activeWork }));
     return;
@@ -326,10 +343,13 @@ function* archiveWorkspaceById(workspaceId: string): SagaGenerator<void> {
       m.workspace_ops_archived_toast({
         title: workspace?.title || m.workspace_ops_space_fallback(),
       }),
-      {
-        duration: WORKSPACE_OPERATION_UNDO_DURATION_MS,
-        action: { label: m.workspace_ops_undo_label(), onClick: () => undo.put(true) },
-      },
+      withToastCountdown(
+        {
+          duration: WORKSPACE_OPERATION_UNDO_DURATION_MS,
+          action: { label: m.workspace_ops_undo_label(), onClick: () => undo.put(true) },
+        },
+        { pauseOnHover: false },
+      ),
     );
   } catch (error) {
     logger.error('workspace.archive failed', { workspaceId, error });
@@ -422,10 +442,16 @@ function* bulkArchive(): SagaGenerator<void> {
       archivedIds.length === 1
         ? m.workspace_ops_archivedCount_one({ count: archivedIds.length })
         : m.workspace_ops_archivedCount_many({ count: archivedIds.length });
-    toast.warning(message, {
-      duration: WORKSPACE_OPERATION_UNDO_DURATION_MS,
-      action: { label: m.workspace_ops_undo_label(), onClick: () => undo.put(true) },
-    });
+    toast.warning(
+      message,
+      withToastCountdown(
+        {
+          duration: WORKSPACE_OPERATION_UNDO_DURATION_MS,
+          action: { label: m.workspace_ops_undo_label(), onClick: () => undo.put(true) },
+        },
+        { pauseOnHover: false },
+      ),
+    );
   }
   if (failCount > 0) {
     toast.error(
@@ -569,9 +595,16 @@ function* applyCreateProposal(payload: WorkspaceProposalApplyPayload): SagaGener
   if (lifecycle?.status === 'applying' || lifecycle?.status === 'applied') return;
   yield* put(proposalApplyStarted({ proposalId, startedAt: Date.now() }));
   try {
+    // Mirror CompactWorkspaceInitializer: the specialist's display name, or
+    // the generic "Agent" label when the specialist is General or unknown.
+    const specialists = yield* selectSpecialists.effect();
     const result = yield* call(
       [workspaceClient, workspaceClient.create],
-      buildCreateWorkspaceRequestFromProposal(proposal, editedFields),
+      buildCreateWorkspaceRequestFromProposal(proposal, editedFields, {
+        resolveAgentName: (specialistId) =>
+          (specialistId ? specialists.find((s) => s.id === specialistId)?.name : undefined) ??
+          m.workspace_fileChanges_agent_label(),
+      }),
     );
     if (!result.ok) {
       yield* failProposal(proposalId, result.error, result.errorCode);

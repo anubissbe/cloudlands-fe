@@ -3,7 +3,9 @@ import { describe, it, expect } from 'vitest';
 import {
   filterSpecialistsByGitHubAuth,
   filterPickableSpecialists,
+  filterModalPickableSpecialists,
   selectProviderModelOverrides,
+  selectOrchestratorSpecialist,
   selectSpecialists,
   selectUserOverrides,
   selectBundledSpecialists,
@@ -13,9 +15,11 @@ import {
   selectBundledSpecialistsLoaded,
   selectSpecialistsFolderPath,
   selectHasOverrides,
+  selectIsBuiltIn,
   selectEffectiveCodingAgent,
   selectEffectiveModel,
   selectExplicitModel,
+  selectSpecialistName,
   selectSpecialistSourceLabel,
 } from './specialists-selectors';
 import { createCollection } from '@augmentcode/themis/utils/collections/collection-utils';
@@ -30,7 +34,8 @@ function mockState(overrides: Partial<typeof initialState> = {}): StoreState {
   return {
     specialists: { ...initialState, ...overrides },
     featureCodes: { activeFeatures: [], initialized: true },
-    providerSettings: { activeProviderId: 'auggie', enabledProviders: {} },
+    providerSettings: { enabledProviders: {} },
+    model: { defaultProviderId: 'auggie' },
     agentAvailability: {
       providerStatusMap: { auggie: { available: true } },
       providerLoadingMap: {},
@@ -94,11 +99,11 @@ describe('specialists selectors', () => {
   });
 
   describe('visibility gating', () => {
-    it('should include ralph without any feature flag', () => {
+    it('should not include ralph in the shipped catalog', () => {
       const state = mockState();
       const ids = selectSpecialists.select(state).map((specialist) => specialist.id);
 
-      expect(ids).toContain('ralph');
+      expect(ids).not.toContain('ralph');
     });
 
     it('should hide GitHub-dependent specialists when GitHub is not authenticated', () => {
@@ -148,6 +153,328 @@ describe('specialists selectors', () => {
 
       expect(ids).toContain('visible-custom');
       expect(ids).not.toContain('hidden-custom');
+    });
+
+    it('filterPickableSpecialists should keep internal specialists (in-workspace picker)', () => {
+      const ids = filterPickableSpecialists(SPECIALISTS, true).map((specialist) => specialist.id);
+
+      expect(ids).toContain('implementor');
+      expect(ids).toContain('verifier');
+    });
+
+    it('keeps Vulnerability Scanner pickable as a standard specialist', () => {
+      const inWorkspaceIds = filterPickableSpecialists(SPECIALISTS, true).map(({ id }) => id);
+      const modalIds = filterModalPickableSpecialists(SPECIALISTS, true).map(({ id }) => id);
+
+      expect(inWorkspaceIds).toContain('vulnerability-scanner');
+      expect(modalIds).toContain('vulnerability-scanner');
+    });
+
+    it('filterModalPickableSpecialists should drop internal specialists in addition to hidden', () => {
+      const ids = filterModalPickableSpecialists(SPECIALISTS, true).map(
+        (specialist) => specialist.id,
+      );
+
+      expect(ids).not.toContain('implementor');
+      expect(ids).not.toContain('verifier');
+      expect(ids).not.toContain('chief-of-staff');
+      expect(ids).toContain('spec-writer');
+      expect(ids).toContain('developer');
+    });
+  });
+
+  describe('selectOrchestratorSpecialist', () => {
+    it('finds the shipped spec-writer orchestrator in the fallback catalog', () => {
+      const orchestrator = selectOrchestratorSpecialist.select(mockState());
+
+      expect(orchestrator?.id).toBe('spec-writer');
+      expect(orchestrator?.teamAgents).toEqual(['implementor', 'verifier']);
+    });
+
+    it('finds a custom orchestrator with a different id', () => {
+      const state = mockState({
+        fileSpecialists: createCollection('id', [
+          {
+            id: 'my-lead',
+            name: 'My Lead',
+            description: 'custom orchestrator',
+            model: '',
+            behaviorPrompt: 'prompt',
+            filePath: '/Users/test/.intent/specialists/my-lead.md',
+            source: 'user' as const,
+            role: 'orchestrator' as const,
+            teamAgents: ['helper'],
+          },
+        ]),
+      });
+
+      expect(selectOrchestratorSpecialist.select(state)?.id).toBe('my-lead');
+    });
+
+    it('prefers the bundled orchestrator over an earlier-sorting user orchestrator', () => {
+      const specWriter = SPECIALISTS.find(({ id }) => id === 'spec-writer')!;
+      const state = mockState({
+        bundledSpecialists: [{ ...specWriter, source: 'bundled' as const }],
+        fileSpecialists: createCollection('id', [
+          {
+            id: 'role-round-trip',
+            name: 'Role Round Trip',
+            description: 'custom orchestrator',
+            model: '',
+            behaviorPrompt: 'prompt',
+            filePath: '/Users/test/.intent/specialists/role-round-trip.md',
+            source: 'user' as const,
+            role: 'orchestrator' as const,
+          },
+        ]),
+      });
+
+      expect(selectOrchestratorSpecialist.select(state)?.id).toBe('spec-writer');
+    });
+
+    it('keeps a winning user-tier spec-writer override at shipped rank', () => {
+      const state = mockState({
+        fileSpecialists: createCollection('id', [
+          {
+            id: 'spec-writer',
+            name: 'Customized Coordinator',
+            description: 'overridden orchestrator',
+            model: '',
+            behaviorPrompt: 'custom prompt',
+            filePath: '/Users/test/.intent/specialists/spec-writer.md',
+            source: 'user' as const,
+            role: 'orchestrator' as const,
+          },
+          {
+            id: 'role-round-trip',
+            name: 'Role Round Trip',
+            description: 'custom orchestrator',
+            model: '',
+            behaviorPrompt: 'prompt',
+            filePath: '/Users/test/.intent/specialists/role-round-trip.md',
+            source: 'user' as const,
+            role: 'orchestrator' as const,
+          },
+        ]),
+      });
+
+      expect(selectOrchestratorSpecialist.select(state)).toMatchObject({
+        id: 'spec-writer',
+        source: 'user',
+      });
+    });
+
+    it('ranks a user-tier spec-writer from specialist.list above an earlier novel id', () => {
+      const state = mockState({
+        bundledSpecialists: [
+          {
+            id: 'daemon-bundled',
+            name: 'Daemon Bundled',
+            description: 'another bundled specialist',
+            defaultBehaviorPrompt: 'prompt',
+            source: 'bundled' as const,
+          },
+        ],
+        fileSpecialists: createCollection('id', [
+          {
+            id: 'spec-writer',
+            name: 'Customized Coordinator',
+            description: 'winning user tier from specialist.list',
+            model: '',
+            behaviorPrompt: 'custom prompt',
+            filePath: '/Users/test/.intent/specialists/spec-writer.md',
+            source: 'user' as const,
+            role: 'orchestrator' as const,
+          },
+          {
+            id: 'aaa-fixture',
+            name: 'AAA Fixture',
+            description: 'novel user orchestrator',
+            model: '',
+            behaviorPrompt: 'prompt',
+            filePath: '/Users/test/.intent/specialists/aaa-fixture.md',
+            source: 'user' as const,
+            role: 'orchestrator' as const,
+          },
+        ]),
+      });
+
+      expect(selectOrchestratorSpecialist.select(state)).toMatchObject({
+        id: 'spec-writer',
+        source: 'user',
+      });
+    });
+
+    it('returns null when no orchestrator exists (team card hidden)', () => {
+      const state = mockState({
+        bundledSpecialists: [
+          {
+            id: 'plain-one',
+            name: 'Plain One',
+            description: 'no role',
+            defaultBehaviorPrompt: 'prompt',
+            source: 'bundled' as const,
+          },
+        ],
+      });
+
+      expect(selectOrchestratorSpecialist.select(state)).toBeNull();
+    });
+
+    it('breaks ties within the same source rank by id order', () => {
+      const orchestrator = (id: string) => ({
+        id,
+        name: id,
+        description: 'orchestrator',
+        defaultBehaviorPrompt: 'prompt',
+        source: 'bundled' as const,
+        role: 'orchestrator' as const,
+      });
+      const state = mockState({
+        bundledSpecialists: [orchestrator('zeta-lead'), orchestrator('alpha-lead')],
+      });
+
+      expect(selectOrchestratorSpecialist.select(state)?.id).toBe('alpha-lead');
+    });
+  });
+
+  describe('replacement mode (daemon set is authoritative)', () => {
+    const replacementBundled = [
+      {
+        id: 'replacement-one',
+        name: 'Replacement One',
+        description: 'first',
+        defaultBehaviorPrompt: 'prompt one',
+        source: 'bundled' as const,
+      },
+      {
+        id: 'replacement-two',
+        name: 'Replacement Two',
+        description: 'second',
+        defaultBehaviorPrompt: 'prompt two',
+        source: 'bundled' as const,
+      },
+    ];
+
+    it('does not resurrect hardcoded SPECIALISTS once daemon bundled specialists loaded', () => {
+      const state = mockState({ bundledSpecialists: replacementBundled });
+      const ids = selectSpecialists.select(state).map((s) => s.id);
+
+      expect(ids).toEqual(['replacement-one', 'replacement-two']);
+      expect(ids).not.toContain('implementor');
+      expect(ids).not.toContain('verifier');
+    });
+
+    it('does not resurrect hardcoded SPECIALISTS once file specialists loaded', () => {
+      const state = mockState({
+        fileSpecialists: createCollection('id', [
+          {
+            id: 'file-only',
+            name: 'File Only',
+            description: 'from file',
+            model: '',
+            behaviorPrompt: 'prompt',
+            filePath: '/Users/test/.intent/specialists/file-only.md',
+            source: 'user' as const,
+          },
+        ]),
+      });
+      const ids = selectSpecialists.select(state).map((s) => s.id);
+
+      expect(ids).toEqual(['file-only']);
+      expect(ids).not.toContain('implementor');
+    });
+
+    it('keeps the hardcoded fallback before any source has loaded', () => {
+      const ids = selectSpecialists.select(mockState()).map((s) => s.id);
+      expect(ids).toContain('implementor');
+      expect(ids).toContain('verifier');
+    });
+  });
+
+  describe('selectSpecialistName startup window (catalog fallback)', () => {
+    it('resolves built-in ids from the hardcoded catalog before any source has loaded', () => {
+      // Startup window: file + bundled collections are still empty.
+      expect(selectSpecialistName.select(mockState(), 'implementor')).toBe(
+        SPECIALISTS.find((s) => s.id === 'implementor')!.name,
+      );
+    });
+
+    it('returns null for unknown ids before any source has loaded', () => {
+      expect(selectSpecialistName.select(mockState(), 'my-custom-role')).toBeNull();
+    });
+
+    it('does not resurrect catalog names once daemon bundled specialists loaded', () => {
+      const state = mockState({
+        bundledSpecialists: [
+          {
+            id: 'replacement-one',
+            name: 'Replacement One',
+            description: 'first',
+            defaultBehaviorPrompt: 'prompt one',
+            source: 'bundled' as const,
+          },
+        ],
+      });
+      expect(selectSpecialistName.select(state, 'implementor')).toBeNull();
+      expect(selectSpecialistName.select(state, 'replacement-one')).toBe('Replacement One');
+    });
+  });
+
+  describe('collapsed built-in overrides', () => {
+    const implementor = SPECIALISTS.find(({ id }) => id === 'implementor')!;
+
+    function userFile(behaviorPrompt = `${implementor.defaultBehaviorPrompt}\nModified`) {
+      return {
+        id: implementor.id,
+        name: implementor.name,
+        description: implementor.description,
+        model: '',
+        behaviorPrompt,
+        roleReminder: implementor.roleReminder,
+        filePath: '/Users/test/.intent/specialists/implementor.md',
+        source: 'user' as const,
+      };
+    }
+
+    it('recognizes a shipped built-in and its differing user override without a bundled row', () => {
+      const state = mockState({
+        fileSpecialists: createCollection('id', [userFile()]),
+      });
+
+      expect(selectIsBuiltIn.select(state, 'implementor')).toBe(true);
+      expect(selectHasOverrides.select(state, 'implementor')).toBe(true);
+      expect(selectSpecialists.select(state).map(({ id }) => id)).toEqual(['implementor']);
+    });
+
+    it('uses shipped defaults to suppress an identical leftover user file', () => {
+      const state = mockState({
+        fileSpecialists: createCollection('id', [userFile(implementor.defaultBehaviorPrompt)]),
+      });
+
+      expect(selectIsBuiltIn.select(state, 'implementor')).toBe(true);
+      expect(selectHasOverrides.select(state, 'implementor')).toBe(false);
+    });
+
+    it('does not label project-scope or custom specialists as modified built-ins', () => {
+      const projectImplementor = { ...userFile(), source: 'project' as const };
+      const custom = {
+        id: 'custom-specialist',
+        name: 'Custom Specialist',
+        description: 'Custom description',
+        model: '',
+        behaviorPrompt: 'Custom prompt',
+        filePath: '/Users/test/.intent/specialists/custom-specialist.md',
+        source: 'user' as const,
+      };
+      const state = mockState({
+        fileSpecialists: createCollection('id', [projectImplementor, custom]),
+      });
+
+      expect(selectIsBuiltIn.select(state, 'implementor')).toBe(true);
+      expect(selectHasOverrides.select(state, 'implementor')).toBe(false);
+      expect(selectIsBuiltIn.select(state, custom.id)).toBe(false);
+      expect(selectHasOverrides.select(state, custom.id)).toBe(false);
     });
   });
 
@@ -299,12 +626,19 @@ describe('specialists selectors', () => {
       expect(customIds).toEqual(['alpha-custom', 'zebra-custom']);
     });
 
-    it('should keep bundled order stable when a file overrides a bundled specialist', () => {
-      const bundled = SPECIALISTS;
+    it('keeps a collapsed built-in override in catalog order without resurrecting omitted ids', () => {
+      const bundled = [
+        SPECIALISTS.find((specialist) => specialist.id === 'spec-writer')!,
+        SPECIALISTS.find((specialist) => specialist.id === 'verifier')!,
+        {
+          ...SPECIALISTS[0],
+          id: 'daemon-extra',
+          name: 'Daemon Extra',
+        },
+      ];
       const state = mockState({
         bundledSpecialists: bundled,
         fileSpecialists: createCollection('id', [
-          // Override implementor (bundled) + add a custom one
           {
             id: 'implementor',
             name: 'Implementor',
@@ -315,24 +649,36 @@ describe('specialists selectors', () => {
             source: 'user' as const,
           },
           {
-            id: 'my-custom',
-            name: 'My Custom',
+            id: 'zebra-custom',
+            name: 'Zebra Custom',
             description: 'custom',
             model: 'gpt-4',
             behaviorPrompt: 'prompt',
-            filePath: '/Users/test/.intent/specialists/my-custom.md',
+            filePath: '/Users/test/.intent/specialists/zebra-custom.md',
+            source: 'user' as const,
+          },
+          {
+            id: 'alpha-custom',
+            name: 'Alpha Custom',
+            description: 'custom',
+            model: 'gpt-4',
+            behaviorPrompt: 'prompt',
+            filePath: '/Users/test/.intent/specialists/alpha-custom.md',
             source: 'user' as const,
           },
         ]),
       });
 
       const ids = selectSpecialists.select(state).map((s) => s.id);
-      // Bundled order preserved even though implementor was overridden by file
-      expect(ids[0]).toBe('spec-writer');
-      expect(ids[1]).toBe('implementor');
-      expect(ids[2]).toBe('verifier');
-      // Custom at the very end (after all bundled/hardcoded)
-      expect(ids[ids.length - 1]).toBe('my-custom');
+      expect(ids).toEqual([
+        'spec-writer',
+        'implementor',
+        'verifier',
+        'daemon-extra',
+        'alpha-custom',
+        'zebra-custom',
+      ]);
+      expect(ids).not.toContain('ui-designer');
     });
   });
 
@@ -356,8 +702,9 @@ describe('specialists selectors', () => {
     it('selectEffectiveCodingAgent should return a fallback without throwing', () => {
       const state = {
         ...legacyState(),
-        providerSettings: { activeProviderId: 'auggie', enabledProviders: {} },
-      } as StoreState;
+        providerSettings: { enabledProviders: {} },
+        model: { defaultProviderId: 'auggie' },
+      } as unknown as StoreState;
       expect(() =>
         selectEffectiveCodingAgent.select(state, 'nonexistent-specialist'),
       ).not.toThrow();

@@ -91,6 +91,7 @@
   let newFolderOpen = $state(false);
   let newFolderName = $state('');
   let selectedFilePath = $state<string | null>(null);
+  let selectedFolderPath = $state<string | null>(null);
   let lastListingPath: string | null = null;
   let wasOpen = false;
 
@@ -117,6 +118,20 @@
   const displayPath = $derived(
     listing ? collapseDirectoryPickerPath(listing.path, listing.home) : '',
   );
+  const selectedFolderEntry = $derived(
+    mode === 'directory' && selectedFolderPath !== null
+      ? (visibleEntries.find((entry) => entry.isDirectory && entry.path === selectedFolderPath) ??
+          null)
+      : null,
+  );
+  const selectTargetName = $derived(
+    mode === 'directory' ? (selectedFolderEntry?.name ?? breadcrumbs.at(-1)?.label ?? null) : null,
+  );
+  const selectButtonLabel = $derived(
+    selectTargetName !== null
+      ? m.onboarding_dirPicker_selectNamed_label({ name: selectTargetName })
+      : selectLabel,
+  );
 
   function favoriteIcon(favorite: DirectoryPickerFavorite): IconDefinition {
     if (favorite.icon) return favorite.icon;
@@ -130,6 +145,7 @@
   function requestNavigation(path?: string) {
     focusedIndex = 0;
     selectedFilePath = null;
+    selectedFolderPath = null;
     onNavigate(path);
     queueMicrotask(() => listContainerRef?.scrollTo({ top: 0 }));
   }
@@ -185,6 +201,8 @@
       pathDraft = displayPath;
       if (pathError) onClearPathError();
     } else {
+      selectedFilePath = null;
+      selectedFolderPath = null;
       onNavigateToPath(target);
     }
   }
@@ -229,7 +247,7 @@
   }
 
   function handleSelect() {
-    const path = mode === 'file' ? selectedFilePath : listing?.path;
+    const path = mode === 'file' ? selectedFilePath : (selectedFolderEntry?.path ?? listing?.path);
     if (path) onSelect(path);
   }
 
@@ -284,6 +302,7 @@
         pathEditing = false;
         sidebarHighlight = null;
         selectedFilePath = null;
+        selectedFolderPath = null;
         newFolderOpen = false;
         newFolderName = '';
       }
@@ -293,7 +312,10 @@
 
   $effect(() => {
     void visibleEntries;
-    untrack(() => (focusedIndex = 0));
+    untrack(() => {
+      focusedIndex = 0;
+      selectedFolderPath = null;
+    });
   });
 
   $effect(() => {
@@ -386,7 +408,7 @@
               type="text"
               class={cn(
                 'min-w-0 flex-1 rounded border bg-background px-2 py-1 text-xs font-mono text-foreground outline-none',
-                pathError ? 'border-destructive/60' : 'border-border focus-visible:border-ring',
+                pathError ? 'border-danger/60' : 'border-border focus-visible:border-ring',
               )}
               aria-label={m.onboarding_dirPicker_path_ariaLabel()}
               aria-invalid={pathError ? true : undefined}
@@ -444,7 +466,7 @@
 
         {#if pathError}
           <div
-            class="shrink-0 border-b border-border bg-destructive/10 px-3 py-1.5 text-xs text-error-foreground"
+            class="shrink-0 border-b border-border bg-danger-background/10 px-3 py-1.5 text-xs text-danger"
             role="alert"
           >
             {pathError}
@@ -463,7 +485,7 @@
               <span>{m.onboarding_dirPicker_loading_label()}</span>
             </div>
           {:else if error}
-            <div class="px-5 py-10 text-sm text-error-foreground">
+            <div class="px-5 py-10 text-sm text-danger">
               <p class="mb-1 font-medium">{m.onboarding_dirPicker_readError_title()}</p>
               <p class="break-all text-xs text-muted-foreground">{error}</p>
             </div>
@@ -473,18 +495,25 @@
                 ? m.onboarding_dirPicker_noSearchResults_description()
                 : showFiles
                   ? m.onboarding_dirPicker_emptyFolder_description()
-                  : m.onboarding_dirPicker_noSubfolders_description({ label: selectLabel })}
+                  : m.onboarding_dirPicker_noSubfolders_description({ label: selectButtonLabel })}
             </div>
           {:else}
             <ul>
               {#each visibleEntries as entry, index (entry.path)}
                 {@const isFocused = index === focusedIndex}
-                {@const isSelected = mode === 'file' && entry.path === selectedFilePath}
+                {@const isSelected =
+                  mode === 'file'
+                    ? entry.path === selectedFilePath
+                    : entry.path === selectedFolderEntry?.path}
                 <li>
                   <button
                     type="button"
                     role="option"
-                    aria-selected={mode === 'file' ? isSelected : isFocused}
+                    aria-selected={mode === 'file'
+                      ? isSelected
+                      : selectedFolderEntry
+                        ? isSelected
+                        : isFocused}
                     aria-disabled={!entry.isDirectory && mode !== 'file'}
                     data-picker-index={index}
                     class={cn(
@@ -501,6 +530,8 @@
                     onclick={() => {
                       focusedIndex = index;
                       if (!entry.isDirectory && mode === 'file') selectedFilePath = entry.path;
+                      else if (entry.isDirectory && mode === 'directory')
+                        selectedFolderPath = entry.path;
                     }}
                     ondblclick={() => navigateInto(entry)}
                   >
@@ -530,7 +561,7 @@
 
     {#if createError}
       <div
-        class="shrink-0 border-t border-border bg-destructive/10 px-3 py-1.5 text-xs text-error-foreground/90"
+        class="shrink-0 border-t border-border bg-danger-background/10 px-3 py-1.5 text-xs text-danger/90"
         role="alert"
       >
         {createError}
@@ -547,7 +578,7 @@
               type="text"
               class={cn(
                 'min-w-0 flex-1 rounded border bg-background px-2 py-1 text-sm text-foreground outline-none',
-                createError ? 'border-destructive/60' : 'border-border focus-visible:border-ring',
+                createError ? 'border-danger/60' : 'border-border focus-visible:border-ring',
               )}
               placeholder={m.onboarding_dirPicker_newFolderName_placeholder()}
               aria-label={m.onboarding_dirPicker_newFolderName_ariaLabel()}
@@ -583,7 +614,7 @@
       <button
         type="button"
         class={cn(
-          'rounded-md px-3 py-1.5 text-sm transition-colors',
+          'max-w-56 truncate rounded-md px-3 py-1.5 text-sm transition-colors',
           canSelect && !loading
             ? 'cursor-pointer bg-foreground text-background hover:bg-foreground/90'
             : 'cursor-not-allowed bg-muted/30 text-ghost',
@@ -591,7 +622,7 @@
         disabled={!canSelect || loading}
         onclick={handleSelect}
       >
-        {selectLabel}
+        {selectButtonLabel}
       </button>
     </footer>
   </div>

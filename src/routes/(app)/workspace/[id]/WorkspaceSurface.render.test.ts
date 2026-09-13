@@ -1,14 +1,19 @@
-import { cleanup, render, screen } from '@testing-library/svelte';
+import { cleanup, render, screen, waitFor } from '@testing-library/svelte';
 import { readable } from 'svelte/store';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
-  loadError: null as null | { kind: 'not_found' | 'error'; message: string },
+  loadState: { status: 'idle', error: null } as {
+    status: 'idle' | 'loading' | 'cached-ready' | 'optimistic' | 'ready' | 'not-found' | 'error';
+    error: null | { kind: 'not_found' | 'error'; message: string };
+  },
   workspace: null as null | { id: string; title: string },
   dispatch: vi.fn(),
-  markSeen: vi.fn(),
+  usePanelShortcuts: vi.fn(),
 }));
-const action = vi.hoisted(() => (type: string) => (...payload: unknown[]) => ({ type, payload }));
+const action = vi.hoisted(
+  () => (type: string) => Object.assign((...payload: unknown[]) => ({ type, payload }), { type }),
+);
 const mockPart = vi.hoisted(() => (marker: string) => async () => {
   const component = (await import('./__tests__/mocks/MockWorkspaceSurfacePart.svelte')).default;
   const renderPart = component as unknown as (anchor: Node, props: Record<string, unknown>) => void;
@@ -43,26 +48,26 @@ vi.mock('./composables/workspace-page-state.svelte', () => ({
 }));
 vi.mock('./composables', () => ({
   useCloseHandlers: vi.fn(),
-  usePanelShortcuts: vi.fn(),
+  usePanelShortcuts: mocks.usePanelShortcuts,
   useTabManagement: () => ({ isInTransition: false }),
-  useWorkspaceLoader: () => ({
-    get loadError() {
-      return mocks.loadError;
-    },
-    clearLoadingState: vi.fn(),
-  }),
 }));
+
+vi.mock('$store/renderer/slices/workspace-lifecycle/workspace-lifecycle-selectors', () => {
+  const selectWorkspaceLoadResult = Object.assign(() => readable(mocks.workspace), {
+    select: () => mocks.workspace,
+  });
+  return {
+    selectWorkspaceLoadResult,
+    selectWorkspaceLoadState: () => readable(mocks.loadState),
+  };
+});
 vi.mock('./composables/create-file-command', () => ({
   dispatchCreateFileRequest: vi.fn(),
   handleCommandPaletteCreateFile: vi.fn(),
 }));
 vi.mock('$store/renderer/slices/workspace/workspace-selectors', () => {
-  const selectWorkspaceById = Object.assign(() => readable(mocks.workspace), {
-    select: () => mocks.workspace,
-  });
   return {
     selectActiveWorkspaceId: { select: () => null },
-    selectWorkspaceById,
     selectWorkspaceIsEmpty: { select: () => false },
     selectIsNewWorkspaceSession: () => readable(false),
   };
@@ -85,10 +90,8 @@ vi.mock('$store/renderer/slices/app-layout/app-layout-selectors', () => ({
   selectPendingCommandPaletteAction: () => readable(null),
 }));
 vi.mock('$store/renderer/slices/panel-layout/panel-layout-selectors', () => ({
-  selectPanelColumnCountsByWorkspaceId: () => readable({}),
   selectPanelLayoutRoot: () => readable(null),
 }));
-vi.mock('$features/workspace/mark-workspace-seen', () => ({ markWorkspaceSeen: mocks.markSeen }));
 vi.mock('$lib/utils/window-events', () => ({ dispatchWindowEvent: vi.fn() }));
 vi.mock('$features/layout/panel-layout-adapter', () => ({
   getPanelLayoutManager: () => ({ openTab: vi.fn() }),
@@ -98,10 +101,7 @@ vi.mock('$shared/types/branded-ids', () => ({ WorkspaceId: (id: string) => id })
 vi.mock('svelte-sonner', () => ({ toast: { error: vi.fn() } }));
 
 vi.mock('$store/renderer/slices/workspace/workspace-slice', () => ({
-  clearActiveWorkspace: action('workspace/clearActiveWorkspace'),
   loadWorkspacesRequested: action('workspace/loadWorkspacesRequested'),
-  setActiveWorkspaceId: action('workspace/setActiveWorkspaceId'),
-  setWorkspaceEntity: action('workspace/setWorkspaceEntity'),
 }));
 vi.mock('$store/renderer/slices/ui-layout/ui-layout-slice', () => ({
   setPanelVisibility: action('uiLayout/setPanelVisibility'),
@@ -110,7 +110,7 @@ vi.mock('$store/renderer/slices/note-read-tracking/note-read-tracking-slice', ()
   createNoteRequested: action('notes/createNoteRequested'),
 }));
 vi.mock('$store/renderer/slices/workspace-lifecycle/workspace-lifecycle-slice', () => ({
-  workspaceUnmounted: action('workspaceLifecycle/workspaceUnmounted'),
+  workspaceLoadRequested: action('workspace-lifecycle/workspaceLoadRequested'),
 }));
 vi.mock('$store/renderer/slices/sidebar-nav/sidebar-nav-slice', () => ({
   setOnboardingActive: action('sidebarNav/setOnboardingActive'),
@@ -124,8 +124,6 @@ vi.mock('$store/renderer/slices/transient-ui/transient-ui-slice', () => ({
 vi.mock('$store/renderer/slices/workspace-agents/workspace-agents-slice', () => ({
   createAgentRequested: action('workspaceAgents/createAgentRequested'),
   createAgentWithSpecialistRequested: action('workspaceAgents/createAgentWithSpecialistRequested'),
-  setAgents: action('workspaceAgents/setAgents'),
-  setAgentsLoaded: action('workspaceAgents/setAgentsLoaded'),
 }));
 
 vi.mock('$lib/components/workspace/WorkspaceLayout.svelte', async () => ({
@@ -147,54 +145,45 @@ vi.mock('$lib/components/layout/panel-system', async () => {
   };
 });
 
-import WorkspaceSurfaceColumnsHarness from './__tests__/mocks/WorkspaceSurfaceColumnsHarness.svelte';
+import WorkspaceSurface from './WorkspaceSurface.svelte';
+import { workspaceLoadRequested } from '$store/renderer/slices/workspace-lifecycle/workspace-lifecycle-slice';
 
-const hosts = [
-  { name: 'standalone', count: 1, columnMode: false },
-  { name: 'one-column', count: 1, columnMode: true },
-  { name: 'two-column', count: 2, columnMode: true },
-  { name: 'three-column', count: 3, columnMode: true },
-];
-
-function renderHost({ count, columnMode }: (typeof hosts)[number]) {
-  const result = render(WorkspaceSurfaceColumnsHarness, { props: { count, columnMode } });
-  const host = result.container.querySelector<HTMLElement>('[data-visible-workspace-host]')!;
+function renderHost(workspaceId = 'workspace-1') {
+  const result = render(WorkspaceSurface, { props: { workspaceId } });
+  const host = result.container.querySelector<HTMLElement>('[data-workspace-surface]')!;
   Object.defineProperties(host, {
-    clientWidth: { configurable: true, value: columnMode ? count * 360 : 960 },
-    scrollWidth: { configurable: true, value: columnMode ? count * 360 : 960 },
+    clientWidth: { configurable: true, value: 960 },
+    scrollWidth: { configurable: true, value: 960 },
   });
   return { ...result, host };
 }
 
 afterEach(cleanup);
 beforeEach(() => {
-  mocks.loadError = null;
+  mocks.loadState = { status: 'idle', error: null };
   mocks.workspace = null;
   mocks.dispatch.mockClear();
-  mocks.markSeen.mockClear();
+  mocks.usePanelShortcuts.mockClear();
 });
 
 describe('WorkspaceSurface terminal shell boundary', () => {
-  it.each(hosts.flatMap((host) => ['not_found', 'error'].map((kind) => ({ host, kind }))))(
-    'keeps $kind shell-free in $host.name mode',
-    ({ host: scenario, kind }) => {
-      mocks.loadError = {
-        kind: kind as 'not_found' | 'error',
-        message: kind === 'error' ? 'Backend unavailable' : 'Workspace not found',
+  it.each(['not_found', 'error'] as const)(
+    'keeps the standard workspace shell-free for %s terminal state',
+    (kind) => {
+      mocks.loadState = {
+        status: kind === 'not_found' ? 'not-found' : 'error',
+        error: {
+          kind,
+          message: kind === 'error' ? 'Backend unavailable' : 'Workspace not found',
+        },
       };
-      const { container, host } = renderHost(scenario);
-      const columns = [
-        ...container.querySelectorAll<HTMLElement>('[data-visible-workspace-column]'),
-      ];
+      const { container, host } = renderHost();
       const states = [
         ...container.querySelectorAll<HTMLElement>('[data-workspace-terminal-state]'),
       ];
 
-      expect(states).toHaveLength(scenario.count);
-      expect(screen.getAllByRole('button', { name: 'All workspaces' })).toHaveLength(
-        scenario.count,
-      );
-      states.forEach((state, index) => expect(columns[index].contains(state)).toBe(true));
+      expect(states).toHaveLength(1);
+      expect(screen.getAllByRole('button', { name: 'All workspaces' })).toHaveLength(1);
       expect(host.scrollWidth).toBeLessThanOrEqual(host.clientWidth);
       expect(container.querySelector('[data-workspace-layout]')).toBeNull();
       expect(container.querySelector('[data-workspace-sidebar]')).toBeNull();
@@ -210,28 +199,123 @@ describe('WorkspaceSurface terminal shell boundary', () => {
     },
   );
 
-  it.each(hosts.flatMap((host) => ['loading', 'valid'].map((phase) => ({ host, phase }))))(
-    'retains the workspace shell for $phase state in $host.name mode',
-    ({ host: scenario, phase }) => {
-      mocks.workspace =
-        phase === 'valid' ? { id: 'workspace-valid', title: 'Valid workspace' } : null;
-      const { container, host } = renderHost(scenario);
-      expect(container.querySelectorAll('[data-workspace-layout]')).toHaveLength(scenario.count);
-      expect(container.querySelectorAll('[data-workspace-sidebar]')).toHaveLength(scenario.count);
-      expect(container.querySelectorAll('[data-panel-canvas]')).toHaveLength(scenario.count);
-      expect(container.querySelectorAll('[data-terminal-dock]')).toHaveLength(scenario.count);
+  it('renders loading selector state with the standard shell and skeletons', () => {
+    mocks.loadState = { status: 'loading', error: null };
+    const { container, host } = renderHost();
+    expect(container.querySelectorAll('[data-workspace-layout]')).toHaveLength(1);
+    expect(container.querySelectorAll('[data-workspace-sidebar]')).toHaveLength(1);
+    expect(container.querySelectorAll('[data-panel-canvas]')).toHaveLength(1);
+    expect(container.querySelectorAll('[data-terminal-dock]')).toHaveLength(1);
+    expect(container.querySelector('[data-workspace-terminal-state]')).toBeNull();
+    expect(host.scrollWidth).toBeLessThanOrEqual(host.clientWidth);
+    expect(
+      container.querySelectorAll('[data-workspace-surface-part="content-skeleton"]'),
+    ).toHaveLength(1);
+    expect(
+      container.querySelectorAll('[data-workspace-surface-part="sidebar-skeleton"]'),
+    ).toHaveLength(1);
+  });
+
+  it.each(['cached-ready', 'ready'] as const)(
+    'renders the canonical workspace result for %s selector state',
+    (status) => {
+      mocks.loadState = { status, error: null };
+      mocks.workspace = { id: 'workspace-valid', title: 'Valid workspace' };
+      const { container, host } = renderHost();
+      expect(container.querySelectorAll('[data-workspace-layout]')).toHaveLength(1);
+      expect(container.querySelectorAll('[data-workspace-sidebar]')).toHaveLength(1);
+      expect(container.querySelectorAll('[data-panel-canvas]')).toHaveLength(1);
+      expect(container.querySelectorAll('[data-terminal-dock]')).toHaveLength(1);
       expect(container.querySelector('[data-workspace-terminal-state]')).toBeNull();
       expect(host.scrollWidth).toBeLessThanOrEqual(host.clientWidth);
       expect(
-        container.querySelectorAll(
-          `[data-workspace-surface-part="${phase === 'loading' ? 'content-skeleton' : 'valid-panel-layout'}"]`,
-        ),
-      ).toHaveLength(scenario.count);
+        container.querySelectorAll('[data-workspace-surface-part="valid-panel-layout"]'),
+      ).toHaveLength(1);
       expect(
-        container.querySelectorAll(
-          `[data-workspace-surface-part="${phase === 'loading' ? 'sidebar-skeleton' : 'valid-sidebar'}"]`,
-        ),
-      ).toHaveLength(scenario.count);
+        container.querySelectorAll('[data-workspace-surface-part="valid-sidebar"]'),
+      ).toHaveLength(1);
     },
   );
+
+  it('keeps optimistic presentation in the shell without a loaded sidebar', () => {
+    mocks.loadState = { status: 'optimistic', error: null };
+    mocks.workspace = { id: 'optimistic-1', title: 'Creating workspace' };
+    const { container } = renderHost('optimistic-1');
+
+    expect(container.querySelector('[data-workspace-layout]')).toBeTruthy();
+    expect(container.querySelector('[data-workspace-terminal-state]')).toBeNull();
+    expect(
+      container.querySelector('[data-workspace-surface-part="content-skeleton"]'),
+    ).toBeTruthy();
+    expect(container.querySelector('[data-workspace-surface-part="valid-sidebar"]')).toBeNull();
+    expect(container.querySelector('[data-workspace-surface-part="sidebar-skeleton"]')).toBeNull();
+  });
+});
+
+describe('WorkspaceSurface session lifecycle', () => {
+  it('dispatches canonical load intent while preserving A→B→A sessions', async () => {
+    const view = render(WorkspaceSurface, { props: { workspaceId: 'workspace-a' } });
+
+    await waitFor(() =>
+      expect(mocks.dispatch).toHaveBeenCalledWith(workspaceLoadRequested('workspace-a')),
+    );
+    await view.rerender({ workspaceId: 'workspace-b' });
+    await view.rerender({ workspaceId: 'workspace-a' });
+    await waitFor(() => {
+      const loadActions = mocks.dispatch.mock.calls
+        .map(([dispatched]) => dispatched)
+        .filter(
+          (dispatched) => (dispatched as { type?: string }).type === workspaceLoadRequested.type,
+        );
+      expect(loadActions).toEqual([
+        workspaceLoadRequested('workspace-a'),
+        workspaceLoadRequested('workspace-b'),
+        workspaceLoadRequested('workspace-a'),
+      ]);
+    });
+    view.unmount();
+
+    const destructiveActionTypes = new Set([
+      'workspace-lifecycle/workspaceUnmounted',
+      'workspaceAgents/setAgents',
+      'workspaceAgents/setAgentsLoaded',
+    ]);
+    const destructiveActions = mocks.dispatch.mock.calls
+      .map(([dispatched]) => dispatched as { type?: string })
+      .filter((dispatched) => dispatched.type && destructiveActionTypes.has(dispatched.type));
+
+    expect(destructiveActions).toEqual([]);
+  });
+
+  it.each(['', 'undefined', 'new'])(
+    'does not dispatch load intent for non-loadable route %j',
+    async (workspaceId) => {
+      render(WorkspaceSurface, { props: { workspaceId } });
+      await Promise.resolve();
+      expect(mocks.dispatch).not.toHaveBeenCalledWith(workspaceLoadRequested(workspaceId));
+    },
+  );
+
+  it('gates inactive shortcuts and active-only chrome while retaining the panel tree', () => {
+    mocks.loadState = { status: 'ready', error: null };
+    mocks.workspace = { id: 'inactive-workspace', title: 'Inactive' };
+
+    const { container } = render(WorkspaceSurface, {
+      props: { workspaceId: 'inactive-workspace', active: false },
+    });
+
+    const shortcutConfig = mocks.usePanelShortcuts.mock.calls.at(-1)?.[0] as {
+      enabled: boolean;
+    };
+    expect(shortcutConfig.enabled).toBe(false);
+    expect(
+      container
+        .querySelector('[data-workspace-surface-part="valid-panel-layout"]')
+        ?.getAttribute('data-active'),
+    ).toBe('false');
+    expect(container.querySelector('[data-workspace-surface-part="valid-sidebar"]')).toBeNull();
+    expect(container.querySelector('[data-workspace-surface-part="quake-terminal"]')).toBeNull();
+    expect(container.querySelector('[data-workspace-surface-part="modals"]')).toBeNull();
+    expect(mocks.dispatch).not.toHaveBeenCalledWith(workspaceLoadRequested('inactive-workspace'));
+  });
 });

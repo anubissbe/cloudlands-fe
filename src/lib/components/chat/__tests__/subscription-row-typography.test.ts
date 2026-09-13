@@ -14,7 +14,12 @@ const readable = <T>(value: T) => ({
 vi.mock('$store/renderer/store', async () => {
   const { createAppStoreMockModule } =
     await import('$store/renderer/utils/test-helpers/store-mock');
-  return createAppStoreMockModule({ dispatch: dispatchMock });
+  // BrowserTabsRow reads the real panel-layout selectors, which expect the
+  // panelLayout slice to exist on the store state.
+  return createAppStoreMockModule({
+    state: () => ({ panelLayout: { byWorkspaceId: {} } }),
+    dispatch: dispatchMock,
+  });
 });
 vi.mock('$store/renderer/slices/workspace/workspace-selectors', () => ({
   selectWorkspaceById: () =>
@@ -45,6 +50,7 @@ vi.mock('$store/renderer/slices/agent-session/agent-session-selectors', () => ({
     }),
   }),
   selectAgentIsResponding: () => readable(false),
+  selectAgentPreview: Object.assign(() => readable(null), { select: () => null }),
   selectAgentIsWaiting: () => readable(false),
   selectAgentIsBlockedWaiting: () => readable(false),
   selectAgentSessionStreamingContent: () => readable(''),
@@ -52,9 +58,16 @@ vi.mock('$store/renderer/slices/agent-session/agent-session-selectors', () => ({
 }));
 vi.mock('$store/renderer/slices/chat-state/chat-state-selectors', () => ({
   selectChatReceivedFirstChunk: () => readable(false),
+  selectPendingQuestionRecovery: () => readable(undefined),
 }));
 vi.mock('$store/renderer/slices/permission/permission-selectors', () => ({
   selectPendingCount: () => readable(0),
+}));
+vi.mock('$store/renderer/slices/hud/hud-selectors', () => ({
+  selectHudAgentHasPendingQuestion: () => readable(false),
+}));
+vi.mock('$lib/components/chat/questions/wizard-gate', () => ({
+  deriveWizardPendingQuestions: () => null,
 }));
 vi.mock('$store/renderer/slices/changes/changes-selectors', () => ({
   selectAgentLineStats: () => readable(null),
@@ -79,6 +92,7 @@ vi.mock('$store/renderer/slices/agent-subscription-ui/agent-subscription-ui-sele
   selectDelegationGroups: () => readable([]),
   selectWokenUpInfo: () => readable(null),
   selectWaitingState: () => readable('waiting'),
+  selectSubscriptionSnapshotStatus: () => readable('ready'),
 }));
 vi.mock('$store/renderer/slices/background-hooks/background-hooks-selectors', () => ({
   selectBackgroundHooks: () =>
@@ -96,6 +110,7 @@ vi.mock('$store/renderer/slices/background-hooks/background-hooks-selectors', ()
         runCount: 0,
       },
     ]),
+  selectBackgroundHooksSnapshotStatus: () => readable('ready'),
 }));
 vi.mock('$store/renderer/slices/pr-monitor/pr-monitor-selectors', () => ({
   selectAgentPrMonitors: () =>
@@ -114,6 +129,7 @@ vi.mock('$store/renderer/slices/pr-monitor/pr-monitor-selectors', () => ({
         updatedAt: '2026-08-13T10:00:00Z',
       },
     ]),
+  selectPrMonitorsSnapshotStatus: () => readable('ready'),
 }));
 vi.mock('$features/layout/panel-layout-adapter', () => ({
   hasPanelLayoutManager: () => false,
@@ -246,9 +262,8 @@ describe('subscription row typography', () => {
 
     for (const [row, label] of rows) {
       const icon = row.querySelector('svg')!;
-      expect(icon.classList).toContain('text-muted-foreground!');
-      expect(icon.classList).toContain('opacity-100');
       expect(tone(icon)).toEqual(tone(label));
+      expect(tone(icon).opacity).toBe('1');
     }
   });
 });

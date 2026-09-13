@@ -8,14 +8,10 @@ export const DEFAULT_WIDTH = 360;
 export const DEFAULT_EXPANDED_WIDTH = 600;
 export const MIN_WIDTH = 280;
 export const MAX_WIDTH = 800;
-export const COLUMN_SIDEBAR_MAX_WIDTH = 400;
-
 // Bottom dock constants
-export type DockViewMode = 'agents' | 'terminal';
+type DockViewMode = 'agents' | 'terminal';
 
-export const DEFAULT_DOCK_HEIGHT = 400;
-export const MIN_DOCK_HEIGHT = 200;
-export const MAX_DOCK_HEIGHT = 800;
+const DEFAULT_DOCK_HEIGHT = 400;
 
 export interface PanelVisibilityState {
   showNavigationRail: boolean;
@@ -106,9 +102,9 @@ export type UiLayoutState = {
   workspaceSidebarPanelLayout: WorkspaceSidebarPanelLayoutState;
 };
 
-export const SPACES_SIDEBAR_DEFAULT_WIDTH = 200;
+const SPACES_SIDEBAR_DEFAULT_WIDTH = 200;
 
-export const initialState: UiLayoutState = {
+const initialState: UiLayoutState = {
   lineWrapping: true,
   foldUnchanged: true,
   diffSideBySide: true,
@@ -237,10 +233,6 @@ export const hydrateCollapsiblePanelCollapsed = createAction<[key: string, colla
 export const setCollapsiblePanelCollapsed = createAction<[key: string, collapsed: boolean]>(
   'uiLayout/setCollapsiblePanelCollapsed',
 );
-export const setWorkspaceSidebarPanelLayout = createAction<
-  [layout: WorkspaceSidebarPanelLayoutState]
->('uiLayout/setWorkspaceSidebarPanelLayout');
-
 export const uiLayoutReducer = createReducer<UiLayoutState>(initialState);
 lineWrappingPreference.register(uiLayoutReducer);
 foldUnchangedPreference.register(uiLayoutReducer);
@@ -334,10 +326,6 @@ uiLayoutReducer.with(hydrateCollapsiblePanelCollapsed, (state, { payload: [key, 
 uiLayoutReducer.with(setCollapsiblePanelCollapsed, (state, { payload: [key, collapsed] }) => ({
   ...state,
   collapsiblePanelCollapsed: { ...state.collapsiblePanelCollapsed, [key]: collapsed },
-}));
-uiLayoutReducer.with(setWorkspaceSidebarPanelLayout, (state, { payload: [layout] }) => ({
-  ...state,
-  workspaceSidebarPanelLayout: layout,
 }));
 uiLayoutReducer.with(setSpacesSidebarWidth, (state, { payload: [pixels] }) => {
   if (pixels === state.spacesSidebarWidth) return state;

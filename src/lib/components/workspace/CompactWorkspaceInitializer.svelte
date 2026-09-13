@@ -16,7 +16,9 @@
     chooseDefaultSetupScript,
     createRepoConfigProbeScheduler,
     resolveSetupScriptParam,
+    setupScriptDisplayName,
     REPO_CONFIG_SCRIPT_NAME,
+    type SetupScriptNameSource,
   } from '$features/setup-scripts';
   import {
     getLastUsedSetupScript,
@@ -60,7 +62,12 @@
   import {
     selectSpecialists,
     selectEffectiveBehaviorPrompt,
+    selectOrchestratorSpecialist,
+    selectCustomSpecialistsLoaded,
+    selectFileSpecialistsLoaded,
   } from '$store/renderer/slices/specialists/specialists-selectors';
+  import { refetchSpecialistsRequested } from '$store/renderer/slices/specialists/specialists-slice';
+  import { DEFAULT_NEW_WORKSPACE_SPECIALIST_ID } from '$lib/constants/specialists';
   import { createLogger } from '$lib/utils/client-logger';
   import {
     getGitErrorMessage,
@@ -108,6 +115,7 @@
   import Button from '../ui/button/button.svelte';
   import CreateButtonProgress from './initializer/CreateButtonProgress.svelte';
   import InitialAgentPicker from './initializer/InitialAgentPicker.svelte';
+  import { shouldPullSourceRepositoryBeforeCreate } from './initializer/workspace-create-pull-policy';
   import IssueSuggestions, {
     preloadIssues,
     type IssueSelectionData,
@@ -120,11 +128,17 @@
   import { noteUrl } from '$shared/constants/intent-links';
   import { selectActiveProviderId } from '$store/renderer/slices/provider-settings/provider-settings-selectors';
   import { selectEffectiveDefaultProviderId } from '$store/renderer/slices/provider-catalog/provider-catalog-selectors';
-  import { parseCompoundModelId } from '$shared/utils/compound-model-id';
-  import { resolveSubmitProvider } from '$lib/utils/effective-model-resolution';
+  import { splitLegacyCompoundId } from '$shared/utils/legacy-model-id';
+  import { resolveSubmitModelAndProvider } from '$lib/utils/effective-model-resolution';
   import { store as appStore } from '$store/renderer/store';
   import { m } from '$shared/paraglide/messages.js';
   import { hasBlockingAttachments, type ContextItem } from '$lib/components/chat/input/context-api';
+  import { isRemoteBackend } from '$lib/components/chat/input/attachment-placement';
+  import { splitDroppedItems } from '$lib/utils/drop-split';
+  import {
+    imageFilesToContextItems,
+    REFERENCE_IMAGE_MAX_BYTES,
+  } from '$lib/components/chat/input/image-context-items';
   import {
     hasStagedFileItems,
     redeemStagedAttachments,
@@ -138,6 +152,7 @@
     restoreNewWorkspaceDraft,
   } from './initializer/new-workspace-draft';
   import { resolveGitHubPrefillSelection } from './initializer/github-prefill';
+  import { buildContextLinks } from './initializer/context-links';
   import { createRepoCacheWarmer } from './initializer/warm-repo-cache';
   import {
     matchGitHubPrefillRepo,
@@ -152,6 +167,7 @@
 
   // Constants
   const PREFILL_KEY = 'workspace-prefill';
+  const UNKNOWN_SPECIALIST_ERROR_PREFIX = 'unknown specialist:'; // i18n-ignore (daemon error prefix)
 
   function hasWorkspacePrefillData(): boolean {
     try {
@@ -386,8 +402,9 @@
           const matchedSpecialist = specialists.find((s) => s.id === data.specialist);
           if (matchedSpecialist) {
             selectedSpecialist = matchedSpecialist.id;
-            // Switch team mode based on specialist - spec-writer uses team orchestration, everything else is single agent
-            isTeamMode = data.specialist === 'spec-writer';
+            // Switch team mode based on specialist - the orchestrator uses team orchestration, everything else is single agent
+            isTeamMode =
+              data.specialist === selectOrchestratorSpecialist.select(appStore.state)?.id;
             logger.debug('Applied specialist from prefill', { specialistId: matchedSpecialist.id });
           } else {
             logger.warn('Specialist from prefill not found, ignoring', {
@@ -432,6 +449,9 @@
   }
 
   const workspaceInitializerHydrated$ = selectWorkspaceInitializerHydrated();
+  const specialists$ = selectSpecialists();
+  const customSpecialistsLoaded$ = selectCustomSpecialistsLoaded();
+  const fileSpecialistsLoaded$ = selectFileSpecialistsLoaded();
   const compactFormState$ = selectCompactWorkspaceInitializerFormState();
   const lastSelectedRepo$ = selectWorkspaceInitializerLastSelectedRepo();
   const lastSubmittedAgent$ = selectWorkspaceInitializerLastSubmittedAgent();
@@ -462,22 +482,38 @@
   // Use saved state first, then fall back to last submitted values, then defaults
   // NOTE: selectedSpecialist can be null (meaning "General / no specialist").
   // We check !== undefined instead of using ?? because null is a valid value
-  // and ?? treats null as nullish, which would incorrectly fall through to 'spec-writer'.
+  // and ?? treats null as nullish, which would incorrectly fall through to the
+  // first-launch default.
+  // First-launch default: single-agent Developer when the resolved specialist
+  // set carries it, else General (null).
+  const defaultSingleAgentSpecialist: string | null = $specialists$.some(
+    ({ id }) => id === DEFAULT_NEW_WORKSPACE_SPECIALIST_ID,
+  )
+    ? DEFAULT_NEW_WORKSPACE_SPECIALIST_ID
+    : null;
   let selectedSpecialist = $state<string | null>(
     savedState?.selectedSpecialist !== undefined
       ? savedState.selectedSpecialist
       : lastSubmittedAgent?.selectedSpecialist !== undefined
         ? lastSubmittedAgent.selectedSpecialist
-        : 'spec-writer',
+        : defaultSingleAgentSpecialist,
   );
   // Validate saved model against current provider - stale models from a different provider
-  // (e.g., 'claude-code:default' when active provider is now 'opencode') should be discarded
+  // (e.g., a claude-code pick when active provider is now 'opencode') should be discarded
   // since they won't exist in the current model list and cause a flash of the wrong model.
+  // A persisted bare model id is attributed to the provider persisted alongside it;
+  // only a legacy pre-triple compound id carries its own prefix.
   const restoredModel = savedState?.selectedModel ?? lastSubmittedAgent?.selectedModel;
+  const restoredModelProvider =
+    savedState?.selectedModel !== undefined
+      ? savedState?.selectedProvider
+      : lastSubmittedAgent?.selectedProvider;
   const currentProviderAtInit = $activeProviderId$ || $defaultProviderId$;
   const isModelForCurrentProvider =
     !restoredModel ||
-    parseCompoundModelId(restoredModel, $defaultProviderId$).providerId === currentProviderAtInit;
+    (splitLegacyCompoundId(restoredModel).providerId ??
+      restoredModelProvider ??
+      $defaultProviderId$) === currentProviderAtInit;
 
   let selectedModel = $state<string | undefined>(
     isModelForCurrentProvider ? restoredModel : undefined,
@@ -493,10 +529,17 @@
       ? (savedState?.selectedReasoningEffort ?? lastSubmittedAgent?.selectedReasoningEffort)
       : undefined,
   );
-  // Track if team mode is selected (spec-writer orchestrates)
+  // Track if team mode is selected (the orchestrator specialist coordinates).
+  // Defaults to single-agent mode on first launch; a remembered choice wins.
   let isTeamMode = $state<boolean>(
-    savedState?.isTeamMode ?? lastSubmittedAgent?.isTeamMode ?? true,
+    savedState?.isTeamMode ?? lastSubmittedAgent?.isTeamMode ?? false,
   );
+
+  function resetUnavailableSpecialist(): void {
+    selectedSpecialist = isTeamMode
+      ? (selectOrchestratorSpecialist.select(appStore.state)?.id ?? null)
+      : null;
+  }
   // Track which provider the user selected for the initial agent
   // Priority: active provider store takes precedence since it's the user's
   // explicit choice, else the settings-derived effective default. '' when
@@ -515,6 +558,7 @@
   let setupScript = $state('');
   let showSetupScript = $state(false); // Always collapsed on mount
   let setupScriptName = $state('Custom');
+  let setupScriptNameSource = $state<SetupScriptNameSource>('custom');
   let isCustomSetupScript = $state(false);
 
   // Repo-committed setup script from <repo>/.intent/config.json (local repos
@@ -543,6 +587,7 @@
     });
     setupScript = choice.content;
     setupScriptName = choice.name;
+    setupScriptNameSource = choice.source;
     isCustomSetupScript = false;
   }
 
@@ -610,6 +655,9 @@
   // Track the selected PR's source branch and number (for "Use PR branch" suggestion and auto-linking)
   let selectedPRBranch = $state<string>('');
   let selectedPRNumber = $state<number | null>(null);
+  // The PR's target (base) branch — sent as `baseRef` on create so the
+  // workspace diffs/merges against the PR's merge target (PROTOCOL §5.1)
+  let selectedPRTargetBranch = $state<string>('');
 
   let didApplyHydratedCompactState = $state(false);
   let didApplyHydratedLastSelectedRepo = $state(false);
@@ -626,10 +674,13 @@
     if (settings.isTeamMode !== undefined) isTeamMode = settings.isTeamMode;
     if (modelPickedThisSession) return;
     const model = settings.selectedModel;
+    // A persisted bare model id belongs to the provider persisted with it;
+    // only a legacy pre-triple compound id carries its own prefix.
     const savedModelAccepted =
       !!model &&
-      parseCompoundModelId(model, $defaultProviderId$).providerId ===
-        ($activeProviderId$ || $defaultProviderId$);
+      (splitLegacyCompoundId(model).providerId ??
+        settings.selectedProvider ??
+        $defaultProviderId$) === ($activeProviderId$ || $defaultProviderId$);
     if (savedModelAccepted) {
       selectedModel = model;
       modelWasOverridden = settings.modelWasOverridden ?? modelWasOverridden;
@@ -799,6 +850,20 @@
     }
   });
 
+  // A specialist can disappear while this form is closed. Only discard a
+  // persisted selection after both custom/file rosters are authoritative;
+  // the bundled-only startup fallback cannot prove a custom id disappeared.
+  $effect(() => {
+    if (
+      $customSpecialistsLoaded$ &&
+      $fileSpecialistsLoaded$ &&
+      selectedSpecialist &&
+      !$specialists$.some(({ id }) => id === selectedSpecialist)
+    ) {
+      resetUnavailableSpecialist();
+    }
+  });
+
   // Track previous workspace info for inserting @ mention after mount
   let pendingPreviousWorkspace: { id: string; title: string } | null = $state(null);
 
@@ -812,6 +877,7 @@
   // Preload Linear and Sentry issues as soon as this component mounts
   // so they're ready when the user expands the form
   onMount(() => {
+    appStore.dispatch(refetchSpecialistsRequested());
     logger.debug('Preloading issues on mount');
     preloadIssues();
 
@@ -894,8 +960,9 @@
           );
           if (matchedSpecialist) {
             selectedSpecialist = matchedSpecialist.id;
-            // Switch team mode based on specialist - spec-writer uses team orchestration, everything else is single agent
-            isTeamMode = data.specialist === 'spec-writer';
+            // Switch team mode based on specialist - the orchestrator uses team orchestration, everything else is single agent
+            isTeamMode =
+              data.specialist === selectOrchestratorSpecialist.select(appStore.state)?.id;
             logger.debug('Applied specialist from prefill (onMount)', {
               specialistId: matchedSpecialist.id,
             });
@@ -1164,6 +1231,11 @@
             if (!selectedPRBranch) {
               selectedPRBranch = metadata.sourceBranch;
             }
+            if (selectedPRBranch === metadata.sourceBranch) {
+              // Re-sync the target even when the source matched an existing
+              // selection — same head, different merge target must not go stale.
+              selectedPRTargetBranch = metadata.targetBranch ?? '';
+            }
             const prNumMatch = prWithBranch.identifier?.match(/#(\d+)$/);
             selectedPRNumber = prNumMatch ? parseInt(prNumMatch[1], 10) : null;
             logger.debug('Restored selectedPRBranch from context mention', {
@@ -1226,6 +1298,7 @@
           });
           if (response?.success && response.data?.sourceBranch) {
             selectedPRBranch = response.data.sourceBranch;
+            selectedPRTargetBranch = response.data.targetBranch ?? '';
             selectedPRNumber = number;
             logger.debug('Fetched and set selectedPRBranch from restored context mention', {
               branch: response.data.sourceBranch,
@@ -1254,6 +1327,12 @@
 
   // UI state
   let isCreating = $state(false);
+  // Non-zero while dropped/pasted/selected files are being converted to
+  // context items (FileReader is async) — submit is gated on it so a create
+  // can't race the conversion and silently drop the attachment. A counter
+  // (not a boolean) so overlapping conversions don't clear the gate early.
+  let processingImageCount = $state(0);
+  const isProcessingImages = $derived(processingImageCount > 0);
   let creationStage = $state(0); // 0-3 for progress stages
   // progressId of the in-flight create — drives the live progress label/bar
   // on the Create button; null when no create is running.
@@ -1386,6 +1465,7 @@
           } else {
             setupScript = '';
             setupScriptName = 'Custom';
+            setupScriptNameSource = 'custom';
             isCustomSetupScript = false;
           }
         }
@@ -1402,6 +1482,7 @@
       applyScript: (script) => {
         setupScript = script;
         setupScriptName = REPO_CONFIG_SCRIPT_NAME;
+        setupScriptNameSource = 'repo-config';
         isCustomSetupScript = false;
       },
     });
@@ -1552,6 +1633,7 @@
     branchBehind = 0;
     pullError = null;
     selectedPRBranch = '';
+    selectedPRTargetBranch = '';
   }
 
   function handleBranchChange(event: CustomEvent<{ branch: string }>) {
@@ -1632,7 +1714,7 @@
   }
 
   async function handleSubmit() {
-    if (!isValid || isCreating || isEnhancing) return;
+    if (!isValid || isCreating || isEnhancing || isProcessingImages) return;
     // Attachments still placing or failed block the create: a failed pill
     // must be retried or removed first (no silent drop, no base64 fallback).
     if (hasBlockingAttachments(contextItems)) return;
@@ -1680,10 +1762,18 @@
         if (!repoValidation.valid) throw new Error(repoValidation.error);
       }
 
-      // Auto-pull latest changes if branch is behind remote
-      // We always pull automatically to ensure workspace starts with latest code
-      // Skip pull if user explicitly chose to create without pulling (via PullConflictDialog)
-      if (branchBehind > 0 && repoType === 'local' && !isNewRepo && shouldPullBeforeCreate) {
+      // Direct mode uses the selected checkout, so update it before create.
+      // Isolated mode resolves baseRef from the remote-tracking ref and must not
+      // rebase or stash the user's source checkout.
+      if (
+        shouldPullSourceRepositoryBeforeCreate({
+          branchBehind,
+          isLocalRepository: repoType === 'local',
+          isNewRepository: isNewRepo,
+          skipIsolation,
+          pullEnabled: shouldPullBeforeCreate,
+        })
+      ) {
         isPulling = true;
         logger.info('Auto-pulling latest changes before workspace creation', {
           branch,
@@ -1721,12 +1811,13 @@
         isPulling = false;
       }
 
-      // Auto-apply PR branch: if a PR context mention set selectedPRBranch but the user
-      // hasn't manually switched to it, use the PR branch as the base.
-      // This ensures workspace.baseRef matches the PR's source branch for auto-discovery.
-      const effectiveBranch =
-        selectedPRBranch && branch !== selectedPRBranch && !isNewRepo ? selectedPRBranch : branch;
-      const baseBranch = isNewRepo ? 'main' : effectiveBranch;
+      // Auto-apply PR branch: when a PR context mention set selectedPRBranch, the
+      // daemon checks out the PR head as workspace.branch and diffs against the
+      // PR's target branch as baseRef (PROTOCOL §5.1). Send `branch` = PR head and
+      // `baseRef` = PR target when known (omitted → the daemon derives it from the
+      // PR). Non-PR creates keep sending the selected branch as `baseRef` only.
+      const prBranchActive = !!selectedPRBranch && !isNewRepo;
+      const baseBranch = isNewRepo ? 'main' : branch;
 
       // Build environment config if remote setup is selected
       const remoteSetupSnapshot = remoteSetup ? $state.snapshot(remoteSetup) : null;
@@ -1781,12 +1872,6 @@
           type: m.type,
           label: m.label,
         })),
-      });
-
-      // Extract inline images from the editor (legacy fallback)
-      const inlineImages = richTextarea?.getInlineImages() ?? [];
-      logger.info('[CompactWorkspaceInitializer] Extracted inline images (fallback)', {
-        imageCount: inlineImages.length,
       });
 
       // Convert context mentions to context references for the agent
@@ -1934,33 +2019,25 @@
         }
       }
 
+      // Staged folder pills (dropped folders, local daemon only) ride as
+      // path context references on the initial message — never placed via
+      // file.placeAttachment (the daemon rejects directories). Same shape a
+      // folder @-mention produces in chat (type 'file' + absolute path).
+      for (const item of $state.snapshot(contextItems)) {
+        if (item.type === 'folder' && item.path) {
+          contextReferences.push({ type: 'file', path: item.path, title: item.label });
+        }
+      }
+
       // Extract imageBlocks from ALL context items with imageData/imageMimeType
       // (includes attachment items created by processImageFiles)
-      // Also include inline images as fallback for legacy support
       const imageBlocks: Array<{ type: 'image'; data: string; mimeType: string }> = [];
-
-      // First, add images from attachment context items
       for (const item of contextItems) {
         if (item.imageData && item.imageMimeType) {
           imageBlocks.push({
             type: 'image',
             data: item.imageData,
             mimeType: item.imageMimeType,
-          });
-        }
-      }
-
-      // Then, add inline images as fallback (for any that were manually inserted)
-      for (let i = 0; i < inlineImages.length; i++) {
-        const img = inlineImages[i];
-        // Parse data URL to extract mime type and base64 data
-        const match = img.src.match(/^data:([^;]+);base64,(.+)$/);
-        if (match) {
-          const [, mimeType, base64Data] = match;
-          imageBlocks.push({
-            type: 'image',
-            data: base64Data,
-            mimeType: mimeType,
           });
         }
       }
@@ -1987,17 +2064,12 @@
       // With no explicit pick the daemon applies its own resolved default at
       // creation time (the same value the picker previews via
       // `resolvedModel`), so no client-side tier/preference fallback runs.
-      const resolvedModel = modelWasOverridden && selectedModel ? selectedModel : undefined;
-
-      // Derive the submitted provider from the explicit model (if any) so
-      // intent and daemon spawn can never diverge: the daemon's
-      // resolve_provider_id gives a compound model prefix precedence over the
-      // provider field, and a bare model id resolves to the default provider.
-      // With no explicit model, keep the form's selected provider.
-      const submitProvider = resolveSubmitProvider(
-        resolvedModel,
+      // The submitted triple legs are the bare model id paired with the
+      // form's selected provider; a persisted pre-triple compound id is
+      // normalized at this one legacy boundary.
+      const { model: resolvedModel, provider: submitProvider } = resolveSubmitModelAndProvider(
+        modelWasOverridden && selectedModel ? selectedModel : undefined,
         selectedProvider,
-        $defaultProviderId$,
       );
 
       // Staged non-image attachments cannot ride the create request: the
@@ -2006,7 +2078,11 @@
       // whole first message (prompt + images + context) out of initialAgent
       // and send it via `agent.sendMessage` with the attachment-reference
       // fileBlocks after placement succeeds (create → place → send).
-      const hasStagedFiles = hasStagedFileItems(contextItems);
+      // Images follow the same create → place → send path (monorepo#3338):
+      // they too need the workspace to exist for placement, and holding
+      // them keeps inline base64 out of the workspace.create frame — the
+      // held send swaps them to attachment-reference blocks.
+      const hasStagedFiles = hasStagedFileItems(contextItems) || imageBlocks.length > 0;
 
       // No client-minted agentId: the daemon assigns the initial agent's id
       // and returns it on the create result (supersedes the fresh-id-per-
@@ -2062,13 +2138,20 @@
         repoConfigScriptRepo,
       });
 
+      const requestContextLinks = buildContextLinks(contextMentions);
+
       const result = await workspaceClient.create({
         title: prefillTitle || '', // Use deep-link title if provided, otherwise agent will set it
         repositoryPath: isGithubPick
           ? undefined
           : String(remoteSetupSnapshot?.workspacePath || repoPath),
         githubUrl: repoType === 'github' && githubUrl ? githubUrl : undefined, // GitHub URL of the picked repo
-        baseRef: String(baseBranch),
+        // PR-started workspace: branch = PR head (daemon checks it out), baseRef =
+        // PR target when known (omitted → the daemon derives it from the PR).
+        // Otherwise the selected branch rides as baseRef only (PROTOCOL §5.1).
+        branch: prBranchActive ? selectedPRBranch : undefined,
+        baseRef: prBranchActive ? selectedPRTargetBranch || undefined : String(baseBranch),
+        contextLinks: requestContextLinks,
         setupScript: setupScriptParam,
         environmentConfig,
         isNewRepo: Boolean(isNewRepo),
@@ -2151,12 +2234,17 @@
           workspace.id,
           initialAgentId ?? null,
           agentName,
-          specialistId === 'spec-writer',
+          specialistId !== undefined &&
+            specialistId === selectOrchestratorSpecialist.select(appStore.state)?.id,
+          undefined,
+          // Daemon-persisted links are canonical; fall back to the request's
+          // links when an older daemon does not echo them (PROTOCOL §5.1).
+          workspace.contextLinks ?? requestContextLinks,
         ),
       );
       const initialState: WorkspaceNavigationWorkspaceState = {
         version: 2,
-        workspace: { id: workspace.id, status: 'loading' },
+        workspace: { id: workspace.id },
         mainPanel: { type: 'empty' },
         drawer: { open: false, type: null, itemId: null },
         navigation: { history: [], currentIndex: -1 },
@@ -2228,6 +2316,7 @@
           {
             name: setupScriptName || m.workspace_setupScriptEditor_customScript_name(),
             content: setupScript,
+            nameSource: setupScriptName ? setupScriptNameSource : 'named',
           },
           repoType === 'github' ? githubUrl : undefined,
         );
@@ -2244,16 +2333,23 @@
           modelWasOverridden,
           selectedReasoningEffort,
           isTeamMode,
+          selectedProvider,
         }),
       );
 
       clearForm();
       oncreate?.();
     } catch (err) {
-      error =
-        err instanceof Error
-          ? getGitErrorMessage(err.message)
-          : m.workspace_compactInitializer_createFailed_error();
+      if (err instanceof Error && err.message.startsWith(UNKNOWN_SPECIALIST_ERROR_PREFIX)) {
+        appStore.dispatch(refetchSpecialistsRequested());
+        resetUnavailableSpecialist();
+        error = m.workspace_compactInitializer_specialistUnavailable_error();
+      } else {
+        error =
+          err instanceof Error
+            ? getGitErrorMessage(err.message)
+            : m.workspace_compactInitializer_createFailed_error();
+      }
     } finally {
       isCreating = false;
       // The create settled (success, failure, or early return) — drop the
@@ -2294,6 +2390,7 @@
     setupScript = '';
     showSetupScript = false;
     setupScriptName = 'Custom';
+    setupScriptNameSource = 'custom';
     isCustomSetupScript = false;
 
     // Restore the last used setup script for the preserved repo so the next
@@ -2348,11 +2445,13 @@
     // Track the selected PR's source branch and number for auto-linking
     if (metadata.type === 'github' && metadata.metadata?.sourceBranch) {
       selectedPRBranch = metadata.metadata.sourceBranch;
+      selectedPRTargetBranch = metadata.metadata.targetBranch ?? '';
       // Extract PR number from identifier (format: "owner/repo#123")
       const prNumMatch = metadata.identifier?.match(/#(\d+)$/);
       selectedPRNumber = prNumMatch ? parseInt(prNumMatch[1], 10) : null;
     } else {
       selectedPRBranch = '';
+      selectedPRTargetBranch = '';
       selectedPRNumber = null;
     }
 
@@ -2424,10 +2523,59 @@
     e.stopPropagation();
     isDraggingOver = false;
 
-    const files = e.dataTransfer?.files;
-    if (!files || files.length === 0) return;
+    // Folder detection must happen HERE, synchronously in the drop event —
+    // webkitGetAsEntry() returns null once the event loop turns.
+    const { files, folderFiles } = splitDroppedItems(e.dataTransfer);
+    if (files.length === 0 && folderFiles.length === 0) return;
 
-    await processImageFiles(Array.from(files));
+    if (folderFiles.length > 0) {
+      // Folders are path-only references — the agent reads them off the
+      // host filesystem, which a remote daemon cannot do. Any folder in the
+      // drop rejects the WHOLE drop when remote (files included). Mirrors
+      // OnboardingPromptStep's folder-drop behavior.
+      if (isRemoteBackend()) {
+        toast.error(m.chat_richInput_folderDropRemote_error());
+        return;
+      }
+      for (const folder of folderFiles) {
+        stageFolderReference(folder);
+      }
+    }
+    if (files.length > 0) {
+      await processImageFiles(files);
+    }
+  }
+
+  /**
+   * Stage a dropped folder as a path-only context item (local daemon only).
+   * Never placed via `file.placeAttachment` (the daemon rejects directories)
+   * — the submit path carries the absolute host path as a context reference
+   * on the initial message instead.
+   *
+   * When the Electron `getPathForFile` bridge is unavailable or returns ''
+   * the folder is SKIPPED with a toast: a bare folder name would ride
+   * `contextReferences` as if it were an absolute host path the agent
+   * cannot resolve. Mirrors OnboardingPromptStep.stageFolderReference.
+   */
+  function stageFolderReference(folder: File) {
+    const absolutePath = (window as any).electronAPI?.getPathForFile?.(folder) || '';
+    if (!absolutePath) {
+      logger.warn('Dropped folder has no resolvable absolute path; skipping', {
+        name: folder.name,
+      });
+      toast.error(m.workspace_compactInitializer_attachmentNoPath_error({ fileName: folder.name }));
+      return;
+    }
+    // Path-keyed like folder @-mentions, so two dropped folders sharing a
+    // basename stay distinct. Re-dropping the SAME folder is a no-op: the
+    // strip is keyed by item.id, so a duplicate id would break keyed
+    // rendering and make one remove drop both pills while both references
+    // still ride the submit.
+    const id = `staged-folder-${absolutePath}`;
+    if (contextItems.some((item) => item.id === id)) return;
+    // Windows-aware basename fallback ('\' or '/' separators).
+    const label = folder.name || absolutePath.split(/[/\\]/).pop() || absolutePath;
+    contextItems = [...contextItems, { id, type: 'folder', label, path: absolutePath }];
   }
 
   // Handle clipboard paste for images
@@ -2453,10 +2601,17 @@
 
   // Shared file processing logic - images become attachment items, other files as mentions
   async function processImageFiles(files: File[]) {
-    const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
-    const addedImageCount = { value: 0 };
+    processingImageCount += 1;
+    try {
+      await processImageFilesInner(files);
+    } finally {
+      processingImageCount -= 1;
+    }
+  }
+
+  async function processImageFilesInner(files: File[]) {
+    const imageFiles: File[] = [];
     const insertedFileCount = { value: 0 };
-    const oversizedFiles: string[] = [];
 
     // Helper to format file sizes - hoisted outside loop
     function formatFileSize(bytes: number): string {
@@ -2466,44 +2621,12 @@
     }
 
     for (const file of files) {
-      // The inline size cap only applies to images (they cross the wire as
-      // base64) — staged non-image files are placed daemon-side from their
-      // sourcePath, so any size is fine.
-      if (file.type.startsWith('image/') && file.size > MAX_FILE_SIZE) {
-        oversizedFiles.push(file.name);
-        continue;
-      }
-
-      // Images become attachment context items (not inline nodes)
+      // Images become attachment context items (not inline nodes); the
+      // shared helper converts them and enforces the size cap (they cross
+      // the wire as base64) — staged non-image files are placed daemon-side
+      // from their sourcePath, so any size is fine.
       if (file.type.startsWith('image/')) {
-        try {
-          const dataUrl = await fileToDataUrl(file);
-          // Parse data URL to extract mime type and base64 data
-          const match = dataUrl.match(/^data:([^;]+);base64,(.+)$/);
-          if (match) {
-            const [, mimeType, base64Data] = match;
-            const fileName = file.name || `Image ${contextItems.length + 1}`;
-
-            const contextItem: ContextItem = {
-              id: `image-${Date.now()}-${contextItems.length}`,
-              type: 'file',
-              label: fileName,
-              description: `${mimeType} • ${formatFileSize(file.size)}`,
-              path: fileName,
-              file: file,
-              imageData: base64Data,
-              imageMimeType: mimeType,
-            };
-
-            contextItems = [...contextItems, contextItem];
-            addedImageCount.value++;
-          }
-        } catch (err) {
-          logger.error('Failed to process image', { fileName: file.name, error: err });
-          toast.error(
-            m.workspace_compactInitializer_processImageFailed_error({ fileName: file.name }),
-          );
-        }
+        imageFiles.push(file);
       } else {
         // Non-image files are STAGED as path-only context items: no workspace
         // exists yet, so `file.placeAttachment` (PROTOCOL §5.9) runs at
@@ -2534,28 +2657,19 @@
       }
     }
 
-    if (addedImageCount.value > 0) {
-      logger.debug(`Added ${addedImageCount.value} image(s) as attachments`);
+    // Images travel as attachment-reference blocks via the held first
+    // message (image-attachment-placement.ts), so the cap is the daemon's
+    // 30 MiB reference-image limit — not the old 10 MB inline budget.
+    const added = await imageFilesToContextItems(imageFiles, {
+      maxBytes: REFERENCE_IMAGE_MAX_BYTES,
+    });
+    if (added.length > 0) {
+      contextItems = [...contextItems, ...added];
     }
 
     if (insertedFileCount.value > 0) {
       logger.debug(`Staged ${insertedFileCount.value} file(s) for placement at create`);
     }
-
-    if (oversizedFiles.length > 0) {
-      toast.error(
-        m.workspace_compactInitializer_filesTooLarge_error({ files: oversizedFiles.join(', ') }),
-      );
-    }
-  }
-
-  function fileToDataUrl(file: File): Promise<string> {
-    return new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload = () => resolve(reader.result as string);
-      reader.onerror = reject;
-      reader.readAsDataURL(file);
-    });
   }
 
   // Remove a context item (for attachment removal)
@@ -2565,8 +2679,9 @@
 
   // A context item the attachment strip should render: image attachments
   // (thumbnails) plus staged/placed/failed non-image files (chips with
-  // placement state).
+  // placement state) and staged folder references (path-only chips).
   function isPreviewableAttachment(item: ContextItem): boolean {
+    if (item.type === 'folder') return true;
     if (item.type !== 'file') return false;
     if (item.imageData && item.imageMimeType) return true;
     if (item.file && item.file.type?.startsWith('image/')) return true;
@@ -2616,6 +2731,9 @@
       logger.error('First-message send failed after attachment placement', {
         error: sendResult.errorDetail,
       });
+      // Keep the retry blocks (placed references + keyed inline blocks) so
+      // the resumed send replays committed image placements, not duplicates.
+      if (sendResult.imageBlocks) pending.imageBlocks = sendResult.imageBlocks;
       error = sendResult.errorDetail
         ? m.workspace_compactInitializer_firstMessageSendFailedDetail_error({
             detail: sendResult.errorDetail,
@@ -2710,8 +2828,13 @@
       // Found a PR with a source branch - extract and set it
       try {
         const metadata = prWithBranch.metadata ? JSON.parse(prWithBranch.metadata) : null;
-        if (metadata?.sourceBranch && metadata.sourceBranch !== selectedPRBranch) {
-          selectedPRBranch = metadata.sourceBranch;
+        if (metadata?.sourceBranch) {
+          if (metadata.sourceBranch !== selectedPRBranch) {
+            selectedPRBranch = metadata.sourceBranch;
+          }
+          // Re-sync the target branch unconditionally: a remaining PR can share
+          // the removed PR's source branch while targeting a different base.
+          selectedPRTargetBranch = metadata.targetBranch ?? '';
         }
         // Always extract PR number so workspace creation can store it for PR discovery
         const prNumMatch = prWithBranch.identifier?.match(/#(\d+)$/);
@@ -2722,21 +2845,29 @@
       return;
     }
 
-    // Check if we still have any GitHub PRs in the content
-    const hasAnyGitHubPR = contextMentions.some(
+    const githubMentions = contextMentions.filter(
       (mention: any) =>
         (mention.itemType === 'github-issue' || mention.itemType === 'github-pr') &&
         mention.provider === 'github',
     );
 
-    if (!hasAnyGitHubPR) {
-      // No GitHub PRs found, clear the selection
+    // Clear the selection when the mention that provided it is gone: a leftover
+    // issue mention must not keep sending the removed PR's head/target branches.
+    const selectionStillPresent =
+      selectedPRNumber !== null
+        ? githubMentions.some((mention: any) =>
+            mention.identifier?.endsWith(`#${selectedPRNumber}`),
+          )
+        : githubMentions.length > 0;
+
+    if (!selectionStillPresent) {
       if (selectedPRBranch) {
         selectedPRBranch = '';
       }
+      selectedPRTargetBranch = '';
       selectedPRNumber = null;
       lastFetchedPRIdentifier = null;
-      return;
+      if (githubMentions.length === 0) return;
     }
 
     // Look for GitHub PRs without sourceBranch and fetch it
@@ -2782,6 +2913,7 @@
           });
           if (response?.success && response.data?.sourceBranch) {
             selectedPRBranch = response.data.sourceBranch;
+            selectedPRTargetBranch = response.data.targetBranch ?? '';
             selectedPRNumber = number;
           }
         } catch (err) {
@@ -2983,7 +3115,9 @@
           <AttachmentPreview
             id={item.id}
             name={item.label}
-            type={item.file?.type || item.imageMimeType || item.attachmentMimeType || ''}
+            type={item.type === 'folder'
+              ? 'folder'
+              : item.file?.type || item.imageMimeType || item.attachmentMimeType || ''}
             size={item.file?.size ?? item.attachmentSize}
             file={item.file}
             imageData={item.imageData}
@@ -3039,7 +3173,7 @@
               tooltipSide="top"
               aria-label={m.chat_richInput_micStop_label()}
               aria-pressed="true"
-              class="text-error-foreground animate-pulse"
+              class="text-danger animate-pulse"
               data-testid="initializer-mic-button"
             >
               <Fa icon={faMicrophone} size="xs" />
@@ -3076,7 +3210,7 @@
               tooltipSide="top"
             >
               {#if isEnhancing}
-                <Fa icon={faStop} size="xs" class="text-error-foreground" />
+                <Fa icon={faStop} size="xs" class="text-danger" />
               {:else}
                 <Fa icon={faMagicWandSparkles} size="xs" />
               {/if}
@@ -3112,13 +3246,13 @@
       <!-- Git not installed banner -->
       {#if gitAvailable === false}
         <div
-          class="mx-0 mb-3 px-4 py-3 bg-destructive/10 border border-destructive/30 rounded-md text-sm"
+          class="mx-0 mb-3 px-4 py-3 bg-danger-background/10 border border-danger/30 rounded-md text-sm"
           transition:slide={{ axis: 'y', duration: 200 }}
         >
           <div class="flex items-start gap-3">
-            <Fa icon={faExclamationTriangle} class="text-error-foreground mt-0.5 shrink-0" />
+            <Fa icon={faExclamationTriangle} class="text-danger mt-0.5 shrink-0" />
             <div>
-              <p class="font-medium text-error-foreground">
+              <p class="font-medium text-danger">
                 {m.workspace_compactInitializer_gitNotInstalled_label()}
               </p>
               <p class="text-subtle mt-1">
@@ -3196,7 +3330,7 @@
         <div class="shrink-0">
           <Button
             onclick={handleSubmit}
-            disabled={!isValid || isCreating || isEnhancing}
+            disabled={!isValid || isCreating || isEnhancing || isProcessingImages}
             class="bg-primary text-primary-foreground hover:bg-primary/90 hover:text-primary-foreground"
           >
             {#if isCreating}
@@ -3236,7 +3370,7 @@
       <!-- Error message -->
       {#if error}
         <div
-          class="mt-3 mb-3 px-4.5 py-2 text-sm bg-destructive text-destructive-foreground"
+          class="mt-3 mb-3 px-4.5 py-2 text-sm bg-danger-background text-danger"
           transition:slide={{ axis: 'y', duration: 200 }}
         >
           {error}
@@ -3327,7 +3461,7 @@
                   >{m.workspace_compactInitializer_detectingSetupScript_label()}</span
                 >
               {:else}
-                {setupScriptName}
+                {setupScriptDisplayName(setupScriptName, setupScriptNameSource)}
               {/if}
             </button>
             <span class="text-subtle">
@@ -3346,6 +3480,7 @@
             repoConfigScript={repoConfigScriptRepo === repoPath ? repoConfigScript : null}
             bind:value={setupScript}
             bind:scriptName={setupScriptName}
+            bind:scriptNameSource={setupScriptNameSource}
             bind:isCustomScript={isCustomSetupScript}
             onClose={() => (showSetupScript = false)}
           />

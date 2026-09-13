@@ -1,13 +1,17 @@
 import { store } from '../../store';
 import { emptyBrowserWorkspaceState } from './browser-slice';
-import type { BrowserWorkspaceState, BrowserZoomAction, RecentUrl } from './browser-types';
+import type {
+  BrowserElementCapture,
+  BrowserWorkspaceState,
+  BrowserZoomAction,
+  RecentUrl,
+} from './browser-types';
 
-export const selectBrowserWorkspaceState = store.createSelector<
-  [wsId: string],
-  BrowserWorkspaceState
->((state, wsId) => {
-  return state.browser.byWorkspaceId[wsId] ?? emptyBrowserWorkspaceState;
-});
+const selectBrowserWorkspaceState = store.createSelector<[wsId: string], BrowserWorkspaceState>(
+  (state, wsId) => {
+    return state.browser.byWorkspaceId[wsId] ?? emptyBrowserWorkspaceState;
+  },
+);
 
 export const selectExistingBrowserWorkspaceState = store.createSelector<
   [wsId: string],
@@ -33,4 +37,11 @@ export const selectPendingBrowserZoom = store.createSelector<
 >((state, wsId, tabId) => {
   const queue = selectBrowserWorkspaceState.select(state, wsId).pendingZoomByTabId[tabId];
   return queue && queue.length > 0 ? queue : null;
+});
+
+export const selectPendingBrowserElementCaptures = store.createSelector<
+  [wsId: string],
+  BrowserElementCapture[]
+>((state, wsId) => {
+  return Object.values(selectBrowserWorkspaceState.select(state, wsId).pendingElementCaptures);
 });

@@ -2,9 +2,7 @@ import { store } from '../../store';
 import {
   defaultPanelVisibility,
   type PanelVisibilityState,
-  type DockViewMode,
   type ResizablePanelGroupLayoutState,
-  type WorkspaceSidebarPanelLayoutState,
 } from './ui-layout-slice';
 
 export const selectLineWrapping = store.createSelector((state) => {
@@ -35,10 +33,6 @@ export const selectIsCollapsed = store.createSelector((state) => {
   return state.uiLayout.sidebarCollapsed;
 });
 
-export const selectWidthBeforeCollapse = store.createSelector((state) => {
-  return state.uiLayout.sidebarWidthBeforeCollapse;
-});
-
 export const selectPanelVisibilityFlag = store.createSelector<
   [wsId: string, key: keyof PanelVisibilityState],
   boolean
@@ -64,32 +58,11 @@ export const selectSidebarSide = store.createSelector((state) => {
   return state.uiLayout.sidebarSide;
 });
 
-// Bottom dock selectors
-export const selectBottomDockViewMode = store.createSelector<[], DockViewMode>((state) => {
-  return state.uiLayout.bottomDock.viewMode;
-});
-
-export const selectBottomDockActiveTerminalId = store.createSelector<[], string | null>((state) => {
-  return state.uiLayout.bottomDock.activeTerminalId;
-});
-
-export const selectBottomDockHeight = store.createSelector((state) => {
-  return state.uiLayout.bottomDock.height;
-});
-
 export const selectResizablePanelSize = store.createSelector<[key: string], number | undefined>(
   (state, key) => {
     return state.uiLayout.resizablePanelSizes[key];
   },
 );
-
-export const selectResizablePanelSizes = store.createSelector((state) => {
-  return state.uiLayout.resizablePanelSizes;
-});
-
-export const selectHydratedResizablePanelSizes = store.createSelector((state) => {
-  return state.uiLayout.hydratedResizablePanelSizes;
-});
 
 export const selectResizablePanelSizeHydrated = store.createSelector<[key: string], boolean>(
   (state, key) => state.uiLayout.hydratedResizablePanelSizes[key] === true,
@@ -107,11 +80,4 @@ export const selectCollapsiblePanelCollapsed = store.createSelector<
   boolean | undefined
 >((state, key) => {
   return state.uiLayout.collapsiblePanelCollapsed[key];
-});
-
-export const selectWorkspaceSidebarPanelLayout = store.createSelector<
-  [],
-  WorkspaceSidebarPanelLayoutState
->((state) => {
-  return state.uiLayout.workspaceSidebarPanelLayout;
 });

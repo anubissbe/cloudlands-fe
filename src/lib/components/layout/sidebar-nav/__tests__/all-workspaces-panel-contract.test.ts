@@ -1,11 +1,9 @@
+// @verify-changed-triggers: ../SidebarPanel.svelte, ../cards/ChiefCard.svelte
+
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
-const source = readFileSync(
-  resolve(process.cwd(), 'src/lib/components/layout/sidebar-nav/SidebarNavHoverCard.svelte'),
-  'utf8',
-);
 const panelSource = readFileSync(
   resolve(process.cwd(), 'src/lib/components/layout/sidebar-nav/SidebarPanel.svelte'),
   'utf8',
@@ -15,21 +13,13 @@ const chiefSource = readFileSync(
   'utf8',
 );
 
-describe('All Workspaces dropdown presentation', () => {
-  it('renders a recents-only list without header or pin controls', () => {
-    expect(source).toContain('<AllWorkspacesCard recentsOnly />');
-    expect(source).not.toContain('pinAllWorkspacesPanel');
-    expect(source).not.toContain('Find or switch spaces');
-  });
-
+describe('All Workspaces panel presentation', () => {
   it('keeps Spaces and Chief mounted without root-route special casing', () => {
     expect(panelSource).not.toContain("page.url.pathname === '/'");
     expect(panelSource).toContain('data-combined-panel-spaces');
-    expect(panelSource).not.toContain('combined-panel-spaces-collapsed');
-    expect(panelSource).toContain('style="height: {liveSplit * 100}%;"');
+    expect(panelSource).toContain('style:height={$isChiefCollapsed$');
     expect(panelSource).toContain('height var(--motion-slow) var(--ease-emphasized-out)');
-    expect(panelSource.match(/<ChiefCard expanded=\{true\}/g)).toHaveLength(1);
-    expect(panelSource).toContain('<ChiefCard expanded={true} embedded={true} />');
+    expect(panelSource.match(/<ChiefCard\s+expanded=\{true\}/g)).toHaveLength(1);
     expect(panelSource).not.toMatch(
       /function handleExpandHome\(\) \{\s*appStore\.dispatch\(closePanel\(\)\)/,
     );

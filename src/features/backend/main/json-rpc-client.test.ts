@@ -1,6 +1,7 @@
 import { EventEmitter } from 'node:events';
 import type { Duplex } from 'node:stream';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { TUNNEL_RACE_HOST } from './backend-connection';
 import { JsonRpcError, mapErrorCode } from './json-rpc-errors';
 import { JsonRpcClient, ReverseRpcHandlerError } from './json-rpc-client';
 
@@ -419,6 +420,38 @@ describe('JsonRpcClient reconnect + heartbeat', () => {
     client.dispose();
   });
 
+  it('records the race winner per connection and re-derives it on reconnect', async () => {
+    vi.useFakeTimers();
+    const { client, sockets } = makeReconnectingClient();
+    const seen: Array<ReturnType<JsonRpcClient['getConnectedVia']>> = [];
+    client.on('status', (status: string) => {
+      if (status === 'connected') seen.push(client.getConnectedVia());
+    });
+    client.start();
+
+    // Single-host dial: bare `connect` → the winner is unknown.
+    expect(client.getConnectedVia()).toBeNull();
+    sockets[0].emit('connect');
+    expect(client.getConnectedVia()).toBeNull();
+
+    // Reconnect through the tunnel: the race facade names its winner.
+    sockets[0].emit('close');
+    expect(client.getConnectedVia()).toBeNull();
+    await vi.advanceTimersByTimeAsync(100);
+    sockets[1].emit('connect', { host: TUNNEL_RACE_HOST, via: 'tunnel' });
+    expect(client.getConnectedVia()).toBe('tunnel');
+
+    // Reconnect again through a direct host: the marker flips back.
+    sockets[1].emit('close');
+    await vi.advanceTimersByTimeAsync(100);
+    sockets[2].emit('secureConnect', { host: '10.0.0.5', via: 'direct' });
+    expect(client.getConnectedVia()).toBe('direct');
+
+    // The `status → connected` broadcast already observes the fresh value.
+    expect(seen).toEqual([null, 'tunnel', 'direct']);
+    client.dispose();
+  });
+
   // #439: a stopped daemon must be re-probed at least every 5s while
   // disconnected, indefinitely — the daemon-loss modal relies on the main
   // process noticing a returning daemon promptly and never giving up.
@@ -624,6 +657,36 @@ describe('JsonRpcClient reconnect + heartbeat', () => {
     expect(sockets).toHaveLength(3);
     sockets[2].open();
     expect(reconnected).toHaveBeenCalledTimes(2);
+
+    client.dispose();
+  });
+
+  it("re-emits the socket facade's non-fatal pin-mismatch as a cert-warning event (#1746)", () => {
+    const { client, socket } = makeClient();
+    const certWarning = vi.fn();
+    const errors = vi.fn();
+    const statuses: string[] = [];
+    client.on('cert-warning', certWarning);
+    client.on('error', errors);
+    client.on('status', (s: string) => statuses.push(s));
+    client.start();
+
+    // The race can report a losing host's mismatch BEFORE the winning
+    // candidate connects — the client must stay on its normal lifecycle.
+    const info = { host: '192.168.1.9', expected: 'AA:BB', actual: 'CC:DD' };
+    socket.emit('pin-mismatch', info);
+    socket.open();
+
+    expect(certWarning).toHaveBeenCalledTimes(1);
+    expect(certWarning).toHaveBeenCalledWith(info);
+    // Non-fatal: no error, no disconnect — the connection proceeds untouched.
+    expect(errors).not.toHaveBeenCalled();
+    expect(client.getStatus()).toBe('connected');
+    expect(statuses).toEqual(['connecting', 'connected']);
+
+    // Also forwarded while already connected (a late candidate failing).
+    socket.emit('pin-mismatch', { host: '10.0.0.7', expected: 'AA:BB', actual: 'EE:FF' });
+    expect(certWarning).toHaveBeenCalledTimes(2);
 
     client.dispose();
   });

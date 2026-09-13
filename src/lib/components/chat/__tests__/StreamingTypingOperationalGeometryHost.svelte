@@ -6,10 +6,23 @@
     theme?: 'light' | 'dark';
     width?: number;
     zoom?: number;
-    mode?: 'processing' | 'streaming';
+    mode?: 'processing' | 'streaming' | 'idle' | 'permission' | 'error';
+    phaseMessage?: string | null;
   }
 
-  let { theme = 'light', width = 720, zoom = 1, mode = 'processing' }: Props = $props();
+  let {
+    theme = 'light',
+    width = 720,
+    zoom = 1,
+    mode = 'processing',
+    phaseMessage = 'Sent prompt…',
+  }: Props = $props();
+
+  let statusEvents = $derived(
+    phaseMessage === null
+      ? []
+      : [{ phase: 'prompt', message: phaseMessage, level: 'info' as const, timestamp: 1000 }],
+  );
 </script>
 
 {#snippet leading()}
@@ -42,7 +55,10 @@
       <StreamingStatus
         isProcessing={mode === 'processing'}
         isStreaming={mode === 'streaming'}
+        hasPendingPermission={mode === 'permission'}
+        error={mode === 'error' ? 'Provider stopped the response' : null}
         seed="geometry-agent"
+        {statusEvents}
       />
     </div>
     <ChatOperationalRow

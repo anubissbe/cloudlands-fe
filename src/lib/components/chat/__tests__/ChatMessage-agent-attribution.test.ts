@@ -276,11 +276,32 @@ describe('ChatMessage user message text rendering', () => {
     expect(spans.some((el) => el.textContent === 'see ')).toBe(true);
     expect(spans.some((el) => el.textContent === ' now')).toBe(true);
   });
+
+  it('opens an inline file mention at its captured line', async () => {
+    dispatchMock.mockClear();
+    render(ChatMessage, {
+      props: {
+        message: userTextMessage('see @src/a.ts:10 now'),
+        workspace: { id: 'ws-1' } as any,
+      },
+    });
+
+    await fireEvent.click(screen.getByRole('button', { name: 'a.ts:10' }));
+
+    expect(dispatchMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'workspaceNavigation/openWorkspaceFile',
+        payload: ['ws-1', 'src/a.ts', expect.objectContaining({ line: 10 })],
+      }),
+    );
+  });
 });
 
 describe('ChatMessage agent-to-agent sender attribution', () => {
   beforeEach(() => {
     dispatchMock.mockClear();
+    handleLinkMock.mockReset();
+    handleLinkMock.mockResolvedValue(true);
     agentSelectorHarness.reset();
   });
 
@@ -344,7 +365,7 @@ describe('ChatMessage agent-to-agent sender attribution', () => {
     for (const token of SUBSCRIPTION_DISCLOSURE_ROW_CLASS.split(' ')) {
       expect(disclosureHeader.classList.contains(token)).toBe(true);
     }
-    for (const token of ['h-9!', 'px-3!', 'py-2!', 'type-body', 'font-normal']) {
+    for (const token of ['h-auto!', 'min-h-9', 'px-3!', 'py-2!', 'type-body', 'font-normal']) {
       expect(disclosureHeader.classList.contains(token)).toBe(true);
     }
     expect(disclosureHeader.classList.contains('gap-2')).toBe(true);
@@ -404,6 +425,27 @@ describe('ChatMessage agent-to-agent sender attribution', () => {
     }
     expect(mountedAvatar.getAttribute('data-specialist')).toBeNull();
     expect(mountedAvatar.getAttribute('data-provider')).toBe('codex');
+  });
+
+  it('renders the sender as running, not waiting, while a tool is executing mid-turn', async () => {
+    render(ChatMessage, {
+      props: {
+        message: userMessage({
+          type: 'agent_message',
+          fromAgentId: 'agent-sender-tool',
+          fromAgentName: 'Tool Builder',
+        }),
+      },
+    });
+
+    // Only the session drives the avatar state: an unresolved tool_use on the
+    // in-flight turn must resolve to running under the shared precedence.
+    agentSelectorHarness.set({
+      session: { status: 'active', isResponding: true, isWaitingOnTool: true },
+    });
+    await Promise.resolve();
+
+    expect(screen.getByTestId('agent-avatar').getAttribute('data-avatar-state')).toBe('running');
   });
 
   it.each([
@@ -505,6 +547,29 @@ describe('ChatMessage agent-to-agent sender attribution', () => {
     expect(toggle.getAttribute('aria-expanded')).toBe('false');
   });
 
+  it('hides the daemon sender header line from the preview and expanded body', async () => {
+    render(ChatMessage, {
+      props: {
+        message: userMessage(
+          {
+            type: 'agent_message',
+            fromAgentId: 'agent-11111111-2222-3333-4444-555555555555',
+            fromAgentName: 'Builder',
+          },
+          '[MESSAGE FROM AGENT Builder (agent-11111111-2222-3333-4444-555555555555)]\n\nhello from another agent',
+        ),
+      },
+    });
+
+    const preview = screen.getByTestId('agent-message-preview');
+    expect(preview.textContent).toContain('hello from another agent');
+    expect(preview.textContent).not.toContain('[MESSAGE FROM AGENT');
+
+    await fireEvent.click(screen.getByTestId('agent-message-disclosure-toggle'));
+    expect(screen.getByText('hello from another agent')).toBeTruthy();
+    expect(screen.queryByText(/\[MESSAGE FROM AGENT/)).toBeNull();
+  });
+
   it('dispatches openAgentTabRequested with the sender agent id on click', async () => {
     render(ChatMessageRouteContextHarness, {
       props: {
@@ -524,6 +589,85 @@ describe('ChatMessage agent-to-agent sender attribution', () => {
     expect(action.type).toBe('appLayout/openAgentTabRequested');
     expect(action.payload[0]).toBe('ws-1');
     expect(action.payload[1]).toMatchObject({ agentId: 'agent-sender-1' });
+  });
+
+  it('renders Chief attribution as an exact source-message link', async () => {
+    const sourceUrl = 'intent://local/__chief__/agent/agent-chief-1/message/msg-source-1';
+    render(ChatMessageRouteContextHarness, {
+      props: {
+        workspaceId: WorkspaceId('ws-1'),
+        message: userMessage({
+          type: 'chief_message',
+          fromAgentId: 'agent-chief-1',
+          fromAgentName: 'Ignored sender label',
+          fromWorkspaceId: '__chief__',
+          sourceMessageId: 'msg-source-1',
+          sourceUrl,
+        }),
+      },
+    });
+
+    expect(screen.getByText('Chief of Staff')).toBeTruthy();
+    const sourceLink = screen.getByTestId('agent-message-attribution');
+    expect(sourceLink.tagName).toBe('A');
+    expect(sourceLink.getAttribute('href')).toBe(sourceUrl);
+
+    await fireEvent.click(sourceLink);
+
+    expect(handleLinkMock).toHaveBeenCalledWith(sourceUrl, {
+      workspaceId: 'ws-1',
+      event: expect.any(MouseEvent),
+    });
+    expect(dispatchMock).not.toHaveBeenCalled();
+  });
+
+  it('preserves Chief attribution and source navigation for a queued delivery', async () => {
+    const sourceUrl = 'intent://local/__chief__/agent/agent-chief-1/message/msg-source-1';
+    render(ChatMessageRouteContextHarness, {
+      props: {
+        workspaceId: WorkspaceId('ws-1'),
+        message: userMessage({
+          type: 'chief_message',
+          fromAgentId: 'agent-chief-1',
+          fromWorkspaceId: '__chief__',
+          sourceMessageId: 'msg-source-1',
+          sourceUrl,
+          queueInfo: { queuedAt: '2026-01-01T11:59:57Z', waitedMs: 3000 },
+        }),
+      },
+    });
+
+    const sourceLink = screen.getByTestId('agent-message-attribution');
+    await fireEvent.click(sourceLink);
+    await fireEvent.click(screen.getByTestId('agent-message-disclosure-toggle'));
+
+    expect(screen.getByText('Chief of Staff')).toBeTruthy();
+    expect(sourceLink.getAttribute('href')).toBe(sourceUrl);
+    expect(screen.getByTestId('queued-message-notice-text').textContent).toBe(
+      'Waited in queue for 3s',
+    );
+    expect(handleLinkMock).toHaveBeenCalledWith(sourceUrl, {
+      workspaceId: 'ws-1',
+      event: expect.any(MouseEvent),
+    });
+  });
+
+  it('shows Chief attribution without a broken link when source metadata is incomplete', () => {
+    render(ChatMessage, {
+      props: {
+        message: userMessage({
+          type: 'chief_message',
+          fromAgentId: 'agent-chief-1',
+          fromWorkspaceId: '__chief__',
+          sourceMessageId: 'msg-source-1',
+          sourceUrl: 'not-a-canonical-link',
+        }),
+      },
+    });
+
+    expect(screen.getByText('Chief of Staff')).toBeTruthy();
+    expect(screen.getByTestId('agent-message-attribution').tagName).toBe('SPAN');
+    expect(handleLinkMock).not.toHaveBeenCalled();
   });
 
   it('falls back to "Agent" when fromAgentName is absent', () => {
@@ -709,10 +853,43 @@ describe('ChatMessage hook wake attribution', () => {
     expect(surface.getAttribute('data-external-spacing-owner')).toBe('automated-wake-card');
     expect(screen.getByText('ci-watch')).toBeTruthy();
     expect(screen.getByText('woke the agent')).toBeTruthy();
+    const textLane = screen.getByTestId('automated-wake-text-lane');
+    expect(textLane.className).toContain('gap-x-1');
+    expect(textLane.classList.contains('flex-wrap')).toBe(true);
+    const leadingIcon = header.firstElementChild;
+    expect(leadingIcon?.classList.contains('self-start')).toBe(true);
+    expect(leadingIcon?.classList.contains('mt-1')).toBe(true);
+    expect(screen.getByTestId('automated-wake-toggle').classList.contains('self-start')).toBe(true);
+    const primaryLabel = screen.getByTestId('automated-wake-primary-label');
+    expect(primaryLabel.textContent?.trim()).toBe('ci-watch');
+    expect(primaryLabel.classList.contains('break-words')).toBe(true);
+    expect(primaryLabel.classList.contains('truncate')).toBe(false);
+    const status = screen.getByTestId('wake-status');
+    expect(status.classList.contains('min-w-0')).toBe(true);
+    expect(status.classList.contains('break-words')).toBe(true);
+    expect(status.classList.contains('truncate')).toBe(false);
     expect(screen.queryByTestId('automated-wake-details')).toBeNull();
     await expandAutomatedWake();
     expect(screen.getByText('CI is red')).toBeTruthy();
     expect(screen.queryByText(/\[Background hook/)).toBeNull();
+  });
+
+  it('yields the wake card top gap to the batched-delivery seam when suppressed', () => {
+    render(ChatMessage, {
+      props: {
+        message: hookWakeMessage({ rowMetadata: true }),
+        suppressAutomatedWakeTopSpacing: true,
+      },
+    });
+
+    const surface = screen.getByTestId('user-message-surface');
+    for (const token of SUBSCRIPTION_IN_THREAD_CARD_SPACING_CLASS.split(' ')) {
+      expect(surface.classList.contains(token)).toBe(false);
+    }
+    expect(surface.classList.contains('mt-0')).toBe(true);
+    // The preceding gap owns the seam, so the card no longer claims it.
+    expect(surface.hasAttribute('data-external-spacing-owner')).toBe(false);
+    expect(surface.hasAttribute('data-automated-wake-card')).toBe(true);
   });
 
   it('detects hook wake from block-level messageMetadata', async () => {
@@ -746,6 +923,29 @@ describe('ChatMessage hook wake attribution', () => {
 
     expect(screen.getByText('CI is red')).toBeTruthy();
     expect(screen.getByTestId('automated-wake-header')).toBeTruthy();
+  });
+
+  it('toggles the disclosure from anywhere on the header bar', async () => {
+    render(ChatMessage, { props: { message: hookWakeMessage({ rowMetadata: true }) } });
+
+    const header = screen.getByTestId('automated-wake-header');
+    expect(header.className).toContain('cursor-pointer');
+    const toggle = screen.getByTestId('automated-wake-toggle');
+    expect(toggle.getAttribute('aria-expanded')).toBe('false');
+
+    // Empty row space toggles open.
+    await fireEvent.click(header);
+    expect(toggle.getAttribute('aria-expanded')).toBe('true');
+    expect(screen.getByText('CI is red')).toBeTruthy();
+
+    // Hook name label toggles closed again.
+    await fireEvent.click(screen.getByTestId('automated-wake-primary-label'));
+    expect(toggle.getAttribute('aria-expanded')).toBe('false');
+    expect(screen.queryByTestId('automated-wake-details')).toBeNull();
+
+    // Status text toggles open again.
+    await fireEvent.click(screen.getByTestId('wake-status'));
+    expect(toggle.getAttribute('aria-expanded')).toBe('true');
   });
 
   it('hides the trailing state note (old wording) from the rendered body', async () => {
@@ -934,6 +1134,12 @@ describe('ChatMessage PR-monitor wake attribution', () => {
     expect(chip.textContent?.trim()).toBe('intent-hq/monorepo #42');
     // Label sits flush left next to the PR icon (overrides the Button base justify-center)
     expect(chip.className).toContain('justify-start');
+    expect(chip.className).toContain('whitespace-normal');
+    expect(chip.className).toContain('break-words');
+    expect(chip.querySelector('.truncate')).toBeNull();
+    expect(chip.getAttribute('title')).toBe('Open intent-hq/monorepo #42');
+    const lane = screen.getByTestId('automated-wake-text-lane');
+    expect(lane.classList.contains('flex-wrap')).toBe(true);
     expect(screen.getByText('woke the agent')).toBeTruthy();
     await expandAutomatedWake();
     expect(screen.getByText('Checks failed')).toBeTruthy();
@@ -1001,6 +1207,25 @@ describe('ChatMessage PR-monitor wake attribution', () => {
     expect(handleLinkMock).toHaveBeenCalledTimes(1);
     expect(handleLinkMock.mock.calls[0][0]).toBe('https://github.example/pr/42');
     expect(handleLinkMock.mock.calls[0][1]).toMatchObject({ forceExternal: true });
+    // Chip click stays sibling to the disclosure — it never toggles the card.
+    expect(screen.getByTestId('automated-wake-toggle').getAttribute('aria-expanded')).toBe('false');
+    expect(screen.queryByTestId('automated-wake-details')).toBeNull();
+  });
+
+  it('toggles the disclosure from the header bar without opening the PR', async () => {
+    render(ChatMessage, { props: { message: prMonitorWakeMessage({ rowMetadata: true }) } });
+
+    const toggle = screen.getByTestId('automated-wake-toggle');
+    expect(toggle.getAttribute('aria-expanded')).toBe('false');
+
+    await fireEvent.click(screen.getByTestId('automated-wake-header'));
+    expect(toggle.getAttribute('aria-expanded')).toBe('true');
+    expect(screen.getByText('Checks failed')).toBeTruthy();
+
+    await fireEvent.click(screen.getByTestId('wake-status'));
+    expect(toggle.getAttribute('aria-expanded')).toBe('false');
+    expect(screen.queryByTestId('automated-wake-details')).toBeNull();
+    expect(handleLinkMock).not.toHaveBeenCalled();
   });
 
   it('falls back to the GitHub PR URL when metadata has no url', async () => {

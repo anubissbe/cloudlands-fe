@@ -1,3 +1,5 @@
+// @verify-changed-triggers: ../WorkspaceProgressCard.svelte
+
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 
@@ -23,6 +25,19 @@ describe('WorkspaceProgressCard repository tooltip', () => {
     expect(source).toContain('repositoryOpen={repoTooltipOpen}');
     expect(source).not.toContain('data-sidebar-branch-icon');
     expect(source).not.toContain("$workspace.skipWorktree ? 'Direct checkout' : 'Worktree'");
+  });
+
+  it('delays workflow-action tooltips so a mouse pass-over never opens them', () => {
+    // Perf invariant (Trace-20260831T161502): opening a tooltip triggers
+    // floating-ui measurement, so switch-path sidebar action rows must not
+    // use the plain Tooltip default of delayDuration 0.
+    // Only the workflow action row remains; the View PR row moved to the
+    // Changes launcher's PR dropdown.
+    const actionTooltips = source.match(/<Tooltip\s+content=\{action\?\.tooltip\}[\s\S]*?>/g);
+    expect(actionTooltips).toHaveLength(1);
+    for (const tooltip of actionTooltips!) {
+      expect(tooltip).toContain('delayDuration={300}');
+    }
   });
 
   it('renders the hover-card path as a link-styled copy button', () => {

@@ -17,7 +17,7 @@
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mockGetAllWindows = vi.fn();
 const mockGetPath = vi.fn();
@@ -46,6 +46,7 @@ vi.mock('../../features/deeplink/deep-link-handler', () => ({
 
 vi.mock('../utils/resolve-app-title', () => ({
   resolveAppTitle: () => 'Intent',
+  registerWindowTitleListener: vi.fn(),
 }));
 
 import {
@@ -58,6 +59,7 @@ import {
 
 interface FakeWindow {
   isDestroyed: () => boolean;
+  isFullScreen: () => boolean;
   webContents: { getURL: () => string };
   getBounds: () => { x: number; y: number; width: number; height: number };
 }
@@ -73,6 +75,7 @@ function makeWindow(
 ): FakeWindow {
   return {
     isDestroyed: () => false,
+    isFullScreen: () => false,
     webContents: { getURL: () => url },
     getBounds: () => bounds,
   };
@@ -87,6 +90,10 @@ describe('saveWindowSessions — empty getAllWindows() fallback', () => {
     mockGetPath.mockReturnValue(tmpDir);
     mockGetAllWindows.mockReset();
     _resetWindowSessionsCacheForTests();
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 
   it('persists the last-known snapshot when getAllWindows() returns empty', async () => {
@@ -115,8 +122,9 @@ describe('saveWindowSessions — empty getAllWindows() fallback', () => {
 
   it('captureWindowSessionsSnapshot() primes the cache so a later empty-windows save still persists', async () => {
     const bounds = { x: 100, y: 200, width: 1000, height: 700 };
-    mockGetAllWindows.mockReturnValue([makeWindow('app://workspaces/work/snap', bounds)]);
-    captureWindowSessionsSnapshot();
+    const window = makeWindow('app://workspaces/work/snap', bounds);
+    mockGetAllWindows.mockReturnValue([window]);
+    captureWindowSessionsSnapshot.call(window as never);
 
     // All windows are gone by the time saveWindowSessions() runs (non-macOS
     // window-all-closed); the pre-close snapshot must still be written.

@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { render, fireEvent, waitFor } from '@testing-library/svelte';
 import { ChangeStage, type TrackedChange } from '$features/file-tracking/types';
+import { warmImport } from '../../../../../test/warm-import';
 
 const mocks = vi.hoisted(() => {
   const dispatch = vi.fn();
@@ -68,18 +69,6 @@ vi.mock('$store/renderer/slices/changes/changes-selectors', () => ({
 }));
 
 vi.mock('$store/renderer/slices/changes/changes-slice', () => ({
-  stageByPathRequested: vi.fn((wsId: string, paths: string[]) => ({
-    type: 'changes/stageByPathRequested',
-    payload: [wsId, paths],
-  })),
-  unstageByPathRequested: vi.fn((wsId: string, paths: string[]) => ({
-    type: 'changes/unstageByPathRequested',
-    payload: [wsId, paths],
-  })),
-  revertByPathRequested: vi.fn((wsId: string, paths: string[]) => ({
-    type: 'changes/revertByPathRequested',
-    payload: [wsId, paths],
-  })),
   refreshRequested: vi.fn((wsId: string) => ({
     type: 'changes/refreshRequested',
     payload: wsId,
@@ -197,6 +186,8 @@ vi.mock('@fortawesome/free-solid-svg-icons', async (importOriginal) => {
     },
   });
 });
+
+warmImport(() => import('../FileChangesSection.svelte'));
 
 function makeChange(
   path: string,

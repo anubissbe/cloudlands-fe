@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { isProviderAuthenticationReady } from '$shared/types/provider-availability';
   /**
    * ProviderCard
    *
@@ -17,6 +18,8 @@
   import { cn } from '$lib/utils';
   import ProviderIcon from '$features/agent/components/AgentProviderIcon.svelte';
   import { Tooltip } from '$lib/components/ui/tooltip';
+  import CopyButton from '$lib/components/ui/CopyButton.svelte';
+  import ClaudeLoginButton from './ClaudeLoginButton.svelte';
   import { shell } from '$lib/electron-bridge';
   import { m } from '$shared/paraglide/messages.js';
   import { CLAUDE_CODE_NPX_MISSING_WARNING } from '$shared/constants/claude-code';
@@ -36,8 +39,9 @@
     authDetails: string | undefined;
     docsUrl: string;
     installCommand: string;
-    loginCommand: string;
-    description: string;
+    /** Catalog-provided login command (PROTOCOL §5.38 loginCommandHint);
+     *  rendered as copyable guidance when the provider needs login. */
+    loginCommandHint?: string;
     hasNpxFallback: boolean;
     /** Status warning from the availability check (e.g. npx missing for claude-code). */
     warning?: string;
@@ -83,8 +87,18 @@
   const needsLogin = $derived(
     provider.available && !provider.statusLoading && provider.authenticated === false,
   );
-  const ready = $derived(installed && !needsLogin);
-  const needsAction = $derived(!provider.statusLoading && (needsInstall || needsLogin));
+  const authUnknown = $derived(
+    provider.id === 'antigravity' &&
+      installed &&
+      provider.authenticated === undefined &&
+      !provider.statusLoading,
+  );
+  const ready = $derived(
+    installed && isProviderAuthenticationReady(provider.id, provider.authenticated),
+  );
+  const needsAction = $derived(
+    !provider.statusLoading && (needsInstall || needsLogin || authUnknown),
+  );
   const cardClickable = $derived(
     ready || (!ready && !provider.statusLoading && !!provider.docsUrl),
   );
@@ -138,13 +152,15 @@
     onkeydown={handleKeydown}
     aria-label={checking
       ? m.onboarding_providerCard_checking_ariaLabel({ name: provider.name })
-      : provider.available && !needsLogin
+      : ready
         ? selected
           ? m.onboarding_providerCard_selected_ariaLabel({ name: provider.name })
           : m.onboarding_providerCard_use_ariaLabel({ name: provider.name })
-        : needsLogin
-          ? m.onboarding_providerCard_notLoggedIn_ariaLabel({ name: provider.name })
-          : m.onboarding_providerCard_notInstalled_ariaLabel({ name: provider.name })}
+        : authUnknown
+          ? m.providers_antigravity_authUnknown()
+          : needsLogin
+            ? m.onboarding_providerCard_notLoggedIn_ariaLabel({ name: provider.name })
+            : m.onboarding_providerCard_notInstalled_ariaLabel({ name: provider.name })}
   >
     <!-- Gradient overlay — always present, opacity animates on install -->
     <div
@@ -206,28 +222,19 @@
             title={m.onboarding_providerCard_openDocs_tooltip({ name: provider.name })}
             aria-label={m.onboarding_providerCard_openDocs_tooltip({ name: provider.name })}
           >
-            <!-- <span class="text-xs w-0 overflow-hidden group-hover/button:w-8 transition-all"
-              >Docs</span
-            > -->
             <Fa icon={faArrowUpRightFromSquare} size={11} />
           </button>
         {/if}
       </div>
 
-      {#if provider.description}
-        <p class="text-xs opacity-70 leading-snug pb-4">
-          {provider.description}
-        </p>
-      {/if}
-
       <div class="text-xs flex items-center gap-1.5">
         {#if checking}
           <span class="opacity-50">{m.onboarding_providerCard_checking_label()}</span>
-        {:else if provider.available && !needsLogin}
+        {:else if ready}
           <div class="flex items-center whitespace-nowrap min-w-0">
             <div class="flex items-center -ml-3.5" transition:slide={{ axis: 'x', duration: 200 }}>
               <div class="h-px bg-gradient-to-r from-transparent to-current w-3 mt-px"></div>
-              <Fa icon={faPlug} class="mr-1.5 transform rotate-90" size={12} />
+              <Fa icon={faPlug} class="mr-1.5 translate-y-[0.5px] transform rotate-45" size={12} />
             </div>
             <div class="flex items-center whitespace-nowrap truncate font-medium">
               {m.onboarding_providerCard_connected_label()}
@@ -243,11 +250,17 @@
               {/if}
             </div>
           </div>
+        {:else if authUnknown}
+          <span>{m.providers_antigravity_authUnknown()}</span>
         {:else if needsLogin}
-          <span
-            class="border border-border rounded-sm bg-background text-foreground px-2.25 py-0.75 font-medium"
-            >{m.onboarding_providerCard_logIn_label()}</span
-          >
+          {#if provider.id === 'claude-code'}
+            <ClaudeLoginButton />
+          {:else}
+            <span
+              class="border border-border rounded-sm bg-background text-foreground px-2.25 py-0.75 font-medium"
+              >{m.onboarding_providerCard_logIn_label()}</span
+            >
+          {/if}
         {:else}
           <span
             class="border border-border rounded-sm bg-background text-foreground px-2.25 py-0.75 font-medium"
@@ -256,7 +269,7 @@
         {/if}
 
         <div class="flex items-center gap-1.5">
-          {#if needsInstall || needsLogin}
+          {#if needsInstall || needsLogin || authUnknown}
             <button
               type="button"
               class="flex-none opacity-50 hover:opacity-100 transition-colors px-0.5 py-1 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
@@ -281,6 +294,27 @@
           {/if}
         </div>
       </div>
+
+      <!-- Actionable login guidance: the catalog's login command with
+           copy-to-clipboard (docs link above stays the secondary action).
+           Clicks must not bubble to the card (which opens docs). -->
+      {#if needsLogin && provider.id !== 'claude-code' && provider.loginCommandHint}
+        <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
+        <div
+          data-testid="provider-card-login-hint"
+          class="mt-2 text-xs"
+          onclick={(e) => e.stopPropagation()}
+        >
+          <span class="opacity-70">{m.onboarding_providerCard_runToLogIn_label()}</span>
+          <div class="mt-1 flex items-center gap-1">
+            <code
+              class="min-w-0 flex-1 truncate rounded bg-background/60 px-1.5 py-0.5 font-mono text-foreground"
+              >{provider.loginCommandHint}</code
+            >
+            <CopyButton text={provider.loginCommandHint} class="hover:bg-background/60" />
+          </div>
+        </div>
+      {/if}
 
       <!-- npx requirement hint for shim providers when binary not installed + npx missing/old -->
       {#if showNpxMissingHint}

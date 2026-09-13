@@ -9,15 +9,6 @@ import AuroraBackground from '../AuroraBackground.svelte';
 
 vi.mock('$app/environment', () => ({ browser: true }));
 
-vi.mock('$store/renderer/slices/theme/theme-selectors', () => ({
-  selectIsDarkTheme: () => ({
-    subscribe: (fn: (value: boolean) => void) => {
-      fn(false);
-      return () => {};
-    },
-  }),
-}));
-
 function createMockGL() {
   const loseContext = vi.fn();
   const gl = {
@@ -60,26 +51,63 @@ function createMockGL() {
     clear: vi.fn(),
     useProgram: vi.fn(),
     uniform1f: vi.fn(),
+    uniform1fv: vi.fn(),
     uniform2f: vi.fn(),
+    uniform2fv: vi.fn(),
     uniform3f: vi.fn(),
     drawArrays: vi.fn(),
-    getExtension: vi.fn((name: string) =>
-      name === 'WEBGL_lose_context' ? { loseContext } : null,
-    ),
+    getExtension: vi.fn((name: string) => (name === 'WEBGL_lose_context' ? { loseContext } : null)),
   };
   return { gl, loseContext };
+}
+
+class MockResizeObserver {
+  static instances: MockResizeObserver[] = [];
+  constructor(private readonly callback: ResizeObserverCallback) {
+    MockResizeObserver.instances.push(this);
+  }
+  observe() {}
+  disconnect() {}
+  fire(width: number, height: number) {
+    this.callback(
+      [
+        {
+          target: document.querySelector('canvas')!,
+          contentRect: { width, height },
+        } as ResizeObserverEntry,
+      ],
+      this as unknown as ResizeObserver,
+    );
+  }
 }
 
 describe('AuroraBackground cleanup', () => {
   let mockGL: ReturnType<typeof createMockGL>;
   let getContextSpy: ReturnType<typeof vi.spyOn>;
+  let getComputedStyleSpy: ReturnType<typeof vi.spyOn>;
   let rafCallbacks: FrameRequestCallback[];
+  let computedAuroraColor: string;
+  let originalRootClass: string;
+  let originalRootStyle: string;
+  let originalWindowBlurred: boolean;
 
   beforeEach(() => {
+    originalRootClass = document.documentElement.className;
+    originalRootStyle = document.documentElement.style.cssText;
+    originalWindowBlurred = document.documentElement.hasAttribute('data-window-blurred');
+    document.documentElement.removeAttribute('data-window-blurred');
+    computedAuroraColor = 'rgb(202, 213, 91)';
     mockGL = createMockGL();
     getContextSpy = vi
       .spyOn(HTMLCanvasElement.prototype, 'getContext')
       .mockImplementation(() => mockGL.gl as unknown as RenderingContext);
+    const getComputedStyle = window.getComputedStyle.bind(window);
+    getComputedStyleSpy = vi.spyOn(window, 'getComputedStyle').mockImplementation((element) => {
+      if (element instanceof HTMLCanvasElement) {
+        return { color: computedAuroraColor } as CSSStyleDeclaration;
+      }
+      return getComputedStyle(element);
+    });
     rafCallbacks = [];
     vi.stubGlobal(
       'requestAnimationFrame',
@@ -89,11 +117,17 @@ describe('AuroraBackground cleanup', () => {
       }),
     );
     vi.stubGlobal('cancelAnimationFrame', vi.fn());
+    vi.stubGlobal('ResizeObserver', MockResizeObserver);
+    MockResizeObserver.instances = [];
   });
 
   afterEach(() => {
     cleanup();
+    document.documentElement.className = originalRootClass;
+    document.documentElement.style.cssText = originalRootStyle;
+    document.documentElement.toggleAttribute('data-window-blurred', originalWindowBlurred);
     getContextSpy.mockRestore();
+    getComputedStyleSpy.mockRestore();
     vi.unstubAllGlobals();
   });
 
@@ -102,8 +136,14 @@ describe('AuroraBackground cleanup', () => {
     for (const cb of pending) cb(performance.now());
   }
 
+  function uniformColors() {
+    return mockGL.gl.uniform3f.mock.calls
+      .slice(-3)
+      .map(([, red, green, blue]) => [red, green, blue]);
+  }
+
   it('deletes buffer, shaders, program and loses the context on unmount', () => {
-    const { unmount } = render(AuroraBackground, { props: { agentId: 'agent-1' } });
+    const { unmount } = render(AuroraBackground);
 
     expect(getContextSpy).toHaveBeenCalledTimes(1);
     expect(mockGL.gl.createShader).toHaveBeenCalledTimes(2);
@@ -124,7 +164,7 @@ describe('AuroraBackground cleanup', () => {
     mockGL.gl.getShaderParameter.mockReturnValue(false);
     vi.spyOn(console, 'error').mockImplementation(() => {});
 
-    render(AuroraBackground, { props: { agentId: 'agent-1' } });
+    render(AuroraBackground);
 
     expect(getContextSpy).toHaveBeenCalledTimes(1);
     // Partial init must not leave a live context behind
@@ -138,7 +178,7 @@ describe('AuroraBackground cleanup', () => {
   });
 
   it('does not re-initialize WebGL after destroy', () => {
-    const { unmount } = render(AuroraBackground, { props: { agentId: 'agent-1' } });
+    const { unmount } = render(AuroraBackground);
     expect(getContextSpy).toHaveBeenCalledTimes(1);
 
     unmount();
@@ -153,7 +193,7 @@ describe('AuroraBackground cleanup', () => {
   });
 
   it('uses five blobs with radii increased by about twelve percent', () => {
-    render(AuroraBackground, { props: { agentId: 'agent-1' } });
+    render(AuroraBackground);
 
     const fragmentSource = mockGL.gl.shaderSource.mock.calls
       .map(([, source]) => String(source))
@@ -171,11 +211,60 @@ describe('AuroraBackground cleanup', () => {
       expect(radius / previousRadii[index]).toBeGreaterThanOrEqual(1.11);
       expect(radius / previousRadii[index]).toBeLessThanOrEqual(1.13);
     });
+    expect(fragmentSource).toContain('float alpha = intensity * 0.9;');
+  });
+
+  it('sets every shader color to the computed active surface on initial mount', () => {
+    render(AuroraBackground);
+
+    // The mount-time color sync is deferred to the batched layout read phase
+    // (one rAF) instead of forcing a style recalc synchronously.
+    expect(mockGL.gl.uniform3f).not.toHaveBeenCalled();
+    flushRafCallbacks();
+
+    const expected = [202 / 255, 213 / 255, 91 / 255];
+    expect(uniformColors()).toEqual([expected, expected, expected]);
+  });
+
+  it('updates every shader color after live theme and semantic token changes', async () => {
+    render(AuroraBackground);
+    mockGL.gl.uniform3f.mockClear();
+
+    computedAuroraColor = 'rgb(173, 197, 116)';
+    document.documentElement.classList.toggle('dark');
+    await vi.waitFor(() => expect(mockGL.gl.uniform3f).toHaveBeenCalledTimes(3));
+    const dark = [173 / 255, 197 / 255, 116 / 255];
+    expect(uniformColors()).toEqual([dark, dark, dark]);
+
+    mockGL.gl.uniform3f.mockClear();
+    computedAuroraColor = 'rgb(227, 180, 31)';
+    window.dispatchEvent(new CustomEvent('theme-changed'));
+    const liveTheme = [227 / 255, 180 / 255, 31 / 255];
+    expect(uniformColors()).toEqual([liveTheme, liveTheme, liveTheme]);
+
+    mockGL.gl.uniform3f.mockClear();
+    computedAuroraColor = 'rgb(91, 122, 219)';
+    document.documentElement.style.setProperty('--agent-avatar-surface-active', '225 63% 61%');
+    await vi.waitFor(() => expect(mockGL.gl.uniform3f).toHaveBeenCalledTimes(3));
+    const customToken = [91 / 255, 122 / 255, 219 / 255];
+    expect(uniformColors()).toEqual([customToken, customToken, customToken]);
+  });
+
+  it('does not draw an unrelated fallback while the semantic color is unresolved', async () => {
+    computedAuroraColor = 'CanvasText';
+    render(AuroraBackground);
+
+    expect(mockGL.gl.uniform3f).not.toHaveBeenCalled();
+    expect(mockGL.gl.drawArrays).not.toHaveBeenCalled();
+
+    computedAuroraColor = 'rgb(202, 213, 91)';
+    document.documentElement.style.setProperty('--agent-avatar-surface-active', '67 72% 60%');
+    await vi.waitFor(() => expect(mockGL.gl.uniform3f).toHaveBeenCalledTimes(3));
   });
 
   it('keeps drawing throttled to the 30 fps budget', () => {
     const now = vi.spyOn(performance, 'now').mockReturnValue(0);
-    render(AuroraBackground, { props: { agentId: 'agent-1' } });
+    render(AuroraBackground);
     expect(mockGL.gl.drawArrays).not.toHaveBeenCalled();
 
     now.mockReturnValue(10);
@@ -188,6 +277,131 @@ describe('AuroraBackground cleanup', () => {
     flushRafCallbacks();
     expect(mockGL.gl.drawArrays).toHaveBeenCalledTimes(1);
     now.mockRestore();
+  });
+
+  it('uploads stable phases once and moving centers for each drawn frame', () => {
+    const now = vi.spyOn(performance, 'now').mockReturnValue(0);
+    render(AuroraBackground);
+
+    expect(mockGL.gl.uniform1fv).toHaveBeenCalledTimes(1);
+    expect(Array.from(mockGL.gl.uniform1fv.mock.calls[0][1])).toHaveLength(5);
+
+    now.mockReturnValue(34);
+    flushRafCallbacks();
+    expect(mockGL.gl.drawArrays).toHaveBeenCalledTimes(1);
+    expect(mockGL.gl.uniform2fv).toHaveBeenCalledTimes(1);
+    const firstCenters = Array.from(mockGL.gl.uniform2fv.mock.calls[0][1]);
+
+    now.mockReturnValue(68);
+    flushRafCallbacks();
+    expect(mockGL.gl.drawArrays).toHaveBeenCalledTimes(2);
+    expect(mockGL.gl.uniform2fv).toHaveBeenCalledTimes(2);
+    const secondCenters = Array.from(mockGL.gl.uniform2fv.mock.calls[1][1]);
+
+    expect(firstCenters).toHaveLength(10);
+    expect(secondCenters).not.toEqual(firstCenters);
+    expect(mockGL.gl.uniform1fv).toHaveBeenCalledTimes(1);
+    now.mockRestore();
+  });
+
+  it('stops drawing when the shared window-blurred attribute is added', async () => {
+    const now = vi.spyOn(performance, 'now').mockReturnValue(0);
+    render(AuroraBackground);
+
+    now.mockReturnValue(34);
+    flushRafCallbacks();
+    expect(mockGL.gl.drawArrays).toHaveBeenCalledTimes(1);
+
+    document.documentElement.setAttribute('data-window-blurred', '');
+    await vi.waitFor(() => expect(cancelAnimationFrame).toHaveBeenCalledTimes(1));
+    flushRafCallbacks();
+    expect(mockGL.gl.drawArrays).toHaveBeenCalledTimes(1);
+    expect(rafCallbacks).toHaveLength(0);
+
+    now.mockRestore();
+  });
+
+  it('resumes drawing when the shared window-blurred attribute is removed', async () => {
+    document.documentElement.setAttribute('data-window-blurred', '');
+    const now = vi.spyOn(performance, 'now').mockReturnValue(0);
+    render(AuroraBackground);
+
+    flushRafCallbacks();
+    expect(mockGL.gl.drawArrays).not.toHaveBeenCalled();
+    expect(rafCallbacks).toHaveLength(0);
+
+    now.mockReturnValue(34);
+    document.documentElement.removeAttribute('data-window-blurred');
+    await vi.waitFor(() => expect(rafCallbacks).toHaveLength(1));
+    flushRafCallbacks();
+    expect(mockGL.gl.drawArrays).toHaveBeenCalledTimes(1);
+    expect(rafCallbacks).toHaveLength(1);
+
+    now.mockRestore();
+  });
+
+  it('keeps drawing after DOM window blur while the shared signal stays focused', () => {
+    const now = vi.spyOn(performance, 'now').mockReturnValue(0);
+    render(AuroraBackground);
+
+    now.mockReturnValue(34);
+    flushRafCallbacks();
+    expect(mockGL.gl.drawArrays).toHaveBeenCalledTimes(1);
+
+    now.mockReturnValue(68);
+    window.dispatchEvent(new Event('blur'));
+    flushRafCallbacks();
+    expect(mockGL.gl.drawArrays).toHaveBeenCalledTimes(2);
+    expect(rafCallbacks).toHaveLength(1);
+
+    now.mockRestore();
+  });
+
+  it('caps Retina backing work across common sizes without frame layout reads', () => {
+    const devicePixelRatio = vi.spyOn(window, 'devicePixelRatio', 'get').mockReturnValue(2);
+    const clientWidth = vi
+      .spyOn(HTMLCanvasElement.prototype, 'clientWidth', 'get')
+      .mockReturnValue(0);
+    const clientHeight = vi
+      .spyOn(HTMLCanvasElement.prototype, 'clientHeight', 'get')
+      .mockReturnValue(0);
+    render(AuroraBackground);
+
+    expect(clientWidth).toHaveBeenCalledTimes(1);
+    expect(clientHeight).toHaveBeenCalledTimes(1);
+    flushRafCallbacks();
+    expect(clientWidth).toHaveBeenCalledTimes(1);
+    expect(clientHeight).toHaveBeenCalledTimes(1);
+
+    const canvas = document.querySelector('canvas')!;
+    for (const [width, height] of [
+      [320, 180],
+      [640, 360],
+      [1440, 360],
+    ]) {
+      MockResizeObserver.instances[0].fire(width, height);
+      expect(mockGL.gl.viewport).toHaveBeenLastCalledWith(0, 0, width / 2, height / 2);
+      expect([canvas.width, canvas.height]).toEqual([width / 2, height / 2]);
+      expect(canvas.width * canvas.height).toBe((width * height) / 4);
+    }
+    expect(clientWidth).toHaveBeenCalledTimes(1);
+    expect(clientHeight).toHaveBeenCalledTimes(1);
+
+    MockResizeObserver.instances[0].fire(640.25, 360.25);
+    expect(mockGL.gl.viewport).toHaveBeenLastCalledWith(0, 0, 320, 180);
+    expect([canvas.width, canvas.height]).toEqual([320, 180]);
+
+    mockGL.gl.viewport.mockClear();
+    MockResizeObserver.instances[0].fire(640.25, 360.25);
+    expect(mockGL.gl.viewport).not.toHaveBeenCalled();
+
+    MockResizeObserver.instances[0].fire(0, 0);
+    expect(mockGL.gl.viewport).toHaveBeenLastCalledWith(0, 0, 1, 1);
+    expect([canvas.width, canvas.height]).toEqual([1, 1]);
+
+    devicePixelRatio.mockRestore();
+    clientWidth.mockRestore();
+    clientHeight.mockRestore();
   });
 
   it('does not draw frames when reduced motion is requested', () => {
@@ -205,9 +419,10 @@ describe('AuroraBackground cleanup', () => {
         }) as MediaQueryList,
     );
 
-    render(AuroraBackground, { props: { agentId: 'agent-1' } });
+    render(AuroraBackground);
     flushRafCallbacks();
 
     expect(mockGL.gl.drawArrays).not.toHaveBeenCalled();
+    expect(rafCallbacks).toHaveLength(0);
   });
 });

@@ -1,4 +1,4 @@
-import { store } from "../../store";
+import { store } from '../../store';
 import type {
   ProposalApplyResult,
   ProposalLifecycleEntry,
@@ -8,10 +8,6 @@ import type {
 export const selectProposalLifecycleEntry = store.createSelector(
   (state, proposalId: string): ProposalLifecycleEntry | null =>
     state.proposalLifecycle[proposalId] ?? null,
-);
-
-export const selectProposalLifecycleEntries = store.createSelector(
-  (state): Record<string, ProposalLifecycleEntry> => state.proposalLifecycle,
 );
 
 export const selectProposalStatus = store.createSelector(
@@ -31,4 +27,12 @@ export const selectProposalErrorCode = store.createSelector(
 export const selectProposalResult = store.createSelector(
   (state, proposalId: string): ProposalApplyResult | null =>
     state.proposalLifecycle[proposalId]?.result ?? null,
+);
+
+/**
+ * The whole lifecycle map — reactivity source for inline cards and derivations
+ * that scan statuses across many proposals at once, such as the off-screen chip.
+ */
+export const selectProposalLifecycleMap = store.createSelector(
+  (state): Record<string, ProposalLifecycleEntry> => state.proposalLifecycle,
 );

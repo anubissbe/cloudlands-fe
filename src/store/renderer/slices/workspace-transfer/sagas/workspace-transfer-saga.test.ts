@@ -18,11 +18,9 @@ import {
   workspaceTransferReducer,
 } from '../workspace-transfer-slice';
 import { createCollection } from '@augmentcode/themis/utils/collections/collection-utils';
-import { switchConnectionRequested } from '../../connections/connections-slice';
-import type {
-  ConnectionRecord,
-  ConnectionsState,
-} from '../../connections/connections-types';
+import { m } from '$shared/paraglide/messages.js';
+import { openConnectionRequested } from '../../connections/connections-slice';
+import type { ConnectionRecord, ConnectionsState } from '../../connections/connections-types';
 import type { TransferPlan, WorkspaceTransferState } from '../workspace-transfer-types';
 import { workspaceTransferSaga } from './workspace-transfer-saga';
 
@@ -141,7 +139,9 @@ describe('workspaceTransferSaga', () => {
   });
 });
 
-function confirmLoadedState(destination: { kind: 'server'; connectionId: string } | { kind: 'download' }): WorkspaceTransferState {
+function confirmLoadedState(
+  destination: { kind: 'server'; connectionId: string } | { kind: 'download' },
+): WorkspaceTransferState {
   let state = workspaceTransferReducer(
     initialState,
     openTransferModal({ workspaceId: 'ws-1', workspaceTitle: 'My Space' }),
@@ -186,7 +186,11 @@ describe('workspaceTransferSaga — steps 3–4', () => {
   });
 
   it('transfer:start failure lands on the failed result with the reason', async () => {
-    mocks.invoke.mockResolvedValue({ success: false, error: 'versions must match exactly' });
+    mocks.invoke.mockResolvedValue({
+      success: false,
+      error: 'destination unavailable',
+      failurePhase: 'preflight',
+    });
     const h = harness(
       workspaceTransferReducer(
         confirmLoadedState({ kind: 'server', connectionId: 'conn-1' }),
@@ -198,7 +202,29 @@ describe('workspaceTransferSaga — steps 3–4', () => {
     await settle();
 
     expect(h.state().runStatus).toBe('failed');
-    expect(h.state().runError).toBe('versions must match exactly');
+    expect(h.state().runError).toBe('destination unavailable');
+    expect(h.state().failurePhase).toBe('preflight');
+    h.task.cancel();
+  });
+
+  it('maps a not-session-owner rejection to the localized message', async () => {
+    mocks.invoke.mockResolvedValue({
+      success: false,
+      error: 'the transfer session belongs to another window',
+      code: 'not-session-owner',
+    });
+    const h = harness(
+      workspaceTransferReducer(
+        confirmLoadedState({ kind: 'server', connectionId: 'conn-1' }),
+        transferStartRequested(),
+      ),
+    );
+
+    h.channel.put(transferStartRequested());
+    await settle();
+
+    expect(h.state().runStatus).toBe('failed');
+    expect(h.state().runError).toBe(m.workspace_transfer_notSessionOwner_error());
     h.task.cancel();
   });
 
@@ -216,7 +242,7 @@ describe('workspaceTransferSaga — steps 3–4', () => {
     h.task.cancel();
   });
 
-  it('finalize sends archive/restart flags, closes the modal, and switches when asked', async () => {
+  it('finalize sends archive/restart flags, closes the modal, and opens the target when asked', async () => {
     mocks.invoke.mockResolvedValue({ success: true });
     let state = workspaceTransferReducer(
       confirmLoadedState({ kind: 'server', connectionId: 'conn-1' }),
@@ -228,7 +254,7 @@ describe('workspaceTransferSaga — steps 3–4', () => {
     );
     const h = harness(state);
 
-    h.channel.put(transferFinalizeRequested({ switchToTarget: true }));
+    h.channel.put(transferFinalizeRequested({ openTarget: true }));
     await settle();
 
     expect(mocks.invoke).toHaveBeenCalledWith(
@@ -240,10 +266,10 @@ describe('workspaceTransferSaga — steps 3–4', () => {
       }),
     );
     expect(h.dispatch).toHaveBeenCalledWith(closeTransferModal());
-    const switchAction = h.dispatch.mock.calls
+    const openAction = h.dispatch.mock.calls
       .map(([action]) => action)
-      .find((action) => action.type === switchConnectionRequested('conn-1').type);
-    expect(switchAction?.payload).toEqual(['conn-1']);
+      .find((action) => action.type === openConnectionRequested('conn-1').type);
+    expect(openAction?.payload).toEqual(['conn-1']);
     h.task.cancel();
   });
 
@@ -259,7 +285,7 @@ describe('workspaceTransferSaga — steps 3–4', () => {
     );
     const h = harness(state);
 
-    h.channel.put(transferFinalizeRequested({ switchToTarget: false }));
+    h.channel.put(transferFinalizeRequested({ openTarget: false }));
     await settle();
 
     expect(mocks.invoke).toHaveBeenCalledWith('transfer:finalize', {
@@ -282,7 +308,7 @@ describe('workspaceTransferSaga — steps 3–4', () => {
     );
     const h = harness(state);
 
-    h.channel.put(transferFinalizeRequested({ switchToTarget: false }));
+    h.channel.put(transferFinalizeRequested({ openTarget: false }));
     await settle();
     // The toast module is dynamically imported — allow a macrotask to settle.
     await new Promise((resolve) => setTimeout(resolve, 0));
@@ -306,7 +332,7 @@ describe('workspaceTransferSaga — steps 3–4', () => {
     );
     const h = harness(state);
 
-    h.channel.put(transferFinalizeRequested({ switchToTarget: false }));
+    h.channel.put(transferFinalizeRequested({ openTarget: false }));
     await settle();
 
     expect(h.state().open).toBe(true);

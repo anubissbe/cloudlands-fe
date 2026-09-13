@@ -161,15 +161,11 @@ describe('flattenAnswersToMessage (wire contract format)', () => {
     const flattened = flattenAnswersToMessage([
       answer(MULTI, { selectedLabels: ['Desktop app', 'CLI'], freeText: 'and the docs site' }),
     ]);
-    expect(flattened).toBe(
-      `Q: ${MULTI.question}\nA: Desktop app, CLI, (Other) and the docs site`,
-    );
+    expect(flattened).toBe(`Q: ${MULTI.question}\nA: Desktop app, CLI, (Other) and the docs site`);
   });
 
   it('reports an empty non-skipped answer as (skipped)', () => {
-    expect(flattenAnswersToMessage([answer(SINGLE)])).toBe(
-      `Q: ${SINGLE.question}\nA: (skipped)`,
-    );
+    expect(flattenAnswersToMessage([answer(SINGLE)])).toBe(`Q: ${SINGLE.question}\nA: (skipped)`);
   });
 });
 
@@ -245,7 +241,9 @@ describe('wizard completion → agent.sendMessage wire shape', () => {
           workspaceId: WS,
           name: 'Coordinator',
           status: AgentStatus.Pending,
-          messages: [assistantMessage([questionBlock(SINGLE), questionBlock(MULTI), questionBlock(LAST)])],
+          messages: [
+            assistantMessage([questionBlock(SINGLE), questionBlock(MULTI), questionBlock(LAST)]),
+          ],
           createdAt: '2026-07-03T14:35:35.924Z',
           updatedAt: '2026-07-03T14:35:35.924Z',
         } as unknown as AgentSession,
@@ -291,8 +289,8 @@ describe('wizard completion → agent.sendMessage wire shape', () => {
       target: { value: 'and the docs site' },
     });
     await fireEvent.click(screen.getByRole('button', { name: /next/i }));
-    // Q3: explicit Skip completes the wizard.
-    await fireEvent.click(screen.getByRole('button', { name: /skip/i }));
+    // Q3 final single-select: one option click completes and sends immediately.
+    await fireEvent.click(screen.getByText('Force re-login'));
 
     // The send path is a fire-and-forget middleware chain (dynamic imports +
     // pre-send transcript hydration) that can exceed the 1s default timeout
@@ -317,7 +315,7 @@ describe('wizard completion → agent.sendMessage wire shape', () => {
         'A: Desktop app, CLI, (Other) and the docs site\n' +
         '\n' +
         `Q: ${LAST.question}\n` +
-        'A: (skipped)',
+        'A: Force re-login',
     );
     // The structured answer tag naming the question set being resolved —
     // exactly and only these two fields (PROTOCOL §5.5 `messageMetadata`).
@@ -327,29 +325,110 @@ describe('wizard completion → agent.sendMessage wire shape', () => {
     });
     expect(params).not.toHaveProperty('metadata');
     // Exactly ONE send for the whole question set.
-    expect(
-      backendRequestMock.mock.calls.filter((c) => c[0] === 'agent.sendMessage'),
-    ).toHaveLength(1);
+    expect(backendRequestMock.mock.calls.filter((c) => c[0] === 'agent.sendMessage')).toHaveLength(
+      1,
+    );
+  }, 30000);
+
+  it('queues the tagged answer via agent.queueMessage while the agent is responding', async () => {
+    // The asking turn ended and the daemon wrote the marker, but a later
+    // turn is now active: the ordinary send path routes to the queue, and
+    // the answer tag must ride the agent.queueMessage params (§5.5) so the
+    // daemon resolves the set when the entry drains.
+    backendRequestMock.mockImplementation(async (method: string) => {
+      if (method === 'agent.queueMessage') {
+        return {
+          success: true,
+          turnId: 'turn-queued',
+          queuedMessage: {
+            id: 'qm-1',
+            content: `Q: ${SINGLE.question}\nA: OS keychain`,
+            queuedAt: '2026-07-03T14:36:00.000Z',
+            position: 0,
+            messageMetadata: buildAnswerMessageMetadata('msg-a1'),
+          },
+        };
+      }
+      return {};
+    });
+    appStore.dispatch(
+      bulkUpsertSessions([
+        {
+          id: AGENT,
+          backendSessionId: null,
+          workspaceId: WS,
+          name: 'Coordinator',
+          status: AgentStatus.Active,
+          isStreaming: true,
+          isProcessing: true,
+          isResponding: true,
+          messages: [assistantMessage([questionBlock(SINGLE)])],
+          metadata: { pendingQuestionsMessageId: 'msg-a1' },
+          createdAt: '2026-07-03T14:35:35.924Z',
+          updatedAt: '2026-07-03T14:35:35.924Z',
+        } as unknown as AgentSession,
+      ]),
+    );
+    const pending = derivePendingQuestions(
+      [assistantMessage([questionBlock(SINGLE)])],
+      true,
+      false,
+      'msg-a1',
+    );
+    expect(pending).not.toBeNull();
+
+    render(QuestionWizard, {
+      props: {
+        questions: pending!.questions,
+        onComplete: (answers: QuestionAnswer[]) => {
+          appStore.dispatch(
+            sendMessage(AGENT, {
+              wsId: WS,
+              text: flattenAnswersToMessage(answers),
+              messageMetadata: buildAnswerMessageMetadata(pending!.messageId),
+            }),
+          );
+        },
+      },
+    });
+    await fireEvent.click(screen.getByText('OS keychain'));
+
+    await vi.waitFor(
+      () => {
+        expect(backendRequestMock.mock.calls.map((c) => c[0])).toContain('agent.queueMessage');
+      },
+      { timeout: 15000, interval: 50 },
+    );
+
+    const queueCall = backendRequestMock.mock.calls.find((c) => c[0] === 'agent.queueMessage')!;
+    expect(queueCall[1]).toEqual({
+      agentId: AGENT,
+      content: `Q: ${SINGLE.question}\nA: OS keychain`,
+      messageMetadata: { type: 'question_answers', answeredQuestionsMessageId: 'msg-a1' },
+    });
+    expect(backendRequestMock.mock.calls.map((c) => c[0])).not.toContain('agent.sendMessage');
   }, 30000);
 });
 
-describe('transcript-driven wizard transitions', () => {
+describe('marker-compatible wizard transitions', () => {
   const questionMsg = assistantMessage([questionBlock(SINGLE), questionBlock(MULTI)]);
   const answerText = flattenAnswersToMessage([
     answer(SINGLE, { selectedLabels: ['OS keychain'] }),
     answer(MULTI, { skipped: true }),
   ]);
 
-  it('pends before the answer message exists; resolved once the TAGGED one lands', () => {
+  it('uses the marker to persist across chatter and the written clear after an answer', () => {
     expect(derivePendingQuestions([questionMsg], false)).not.toBeNull();
-    // A plain (untagged) user message leaves the Q&A pending — the wizard
-    // stays up and the composer stays usable underneath.
     expect(
-      derivePendingQuestions([questionMsg, userMessage('unrelated', 'msg-u1')], false),
+      derivePendingQuestions(
+        [questionMsg, userMessage('unrelated', 'msg-u1')],
+        false,
+        false,
+        'msg-a1',
+      ),
     ).not.toBeNull();
-    // The wizard's tagged answer message closes it (composer restores).
     expect(
-      derivePendingQuestions([questionMsg, answerMessage(answerText, 'msg-a1')], false),
+      derivePendingQuestions([questionMsg, answerMessage(answerText, 'msg-a1')], false, false, ''),
     ).toBeNull();
   });
 
@@ -361,12 +440,14 @@ describe('transcript-driven wizard transitions', () => {
     expect(pending).not.toBeNull();
     expect(pending!.questions.map((q) => q.header)).toEqual(['Token storage', 'Scope']);
 
-    // Restored transcript WITH the tagged answer message: resolved.
+    // An old daemon omits the marker, so any later user row ends the legacy
+    // transcript-tail fallback. A new daemon also supplies the written clear.
     const answered: AgentMessage[] = [
       userMessage('kick off', 'msg-u0'),
       questionMsg,
       answerMessage(answerText, 'msg-a1', 'msg-u2'),
     ];
     expect(derivePendingQuestions(answered, false)).toBeNull();
+    expect(derivePendingQuestions(answered, false, false, '')).toBeNull();
   });
 });

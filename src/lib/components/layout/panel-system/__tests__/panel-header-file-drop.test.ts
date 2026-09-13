@@ -2,6 +2,7 @@
 import { cleanup, fireEvent, render } from '@testing-library/svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { PanelState, PanelTab } from '$store/renderer/slices/panel-layout/panel-layout-types';
+import type { DropSplit } from '$lib/utils/drop-split';
 
 const mocks = vi.hoisted(() => ({
   dispatch: vi.fn(),
@@ -26,6 +27,7 @@ vi.mock('$store/renderer/slices/tab-state/tab-state-slice', () => ({
 }));
 vi.mock('$store/renderer/slices/panel-layout/panel-layout-selectors', () => ({
   selectRecentlyClosed: () => readable([]),
+  selectPanelColumnCount: () => readable(1),
   selectPanelLayoutWorkspace: { select: () => null },
 }));
 vi.mock('$store/renderer/slices/workspace-notes/workspace-notes-selectors', () => ({
@@ -51,17 +53,21 @@ vi.mock('$store/renderer/slices/workspace-agents/workspace-agents-selectors', ()
   selectAllWorkspaceAgents: () => readable([]),
 }));
 vi.mock('$store/renderer/slices/agent-session/agent-session-selectors', () => ({
-  selectAgentIsResponding: () => readable(false),
+  selectAgentProvider: () => readable(undefined),
+  selectAgentIsResponding: Object.assign(() => readable(false), { select: () => false }),
   selectAgentIsBlockedWaiting: () => readable(false),
   selectAgentAttentionRequest: () => readable(null),
   selectAgentSession: () => readable(null),
 }));
+vi.mock('$store/renderer/slices/agent-queue/agent-queue-selectors', () => ({
+  selectAgentQueueMessages: Object.assign(() => readable([]), { select: () => [] }),
+}));
 vi.mock('$store/renderer/slices/permission/permission-selectors', () => ({
+  selectPendingCount: () => readable(0),
   selectPermissionRequests: () => readable([]),
 }));
-vi.mock('$store/renderer/slices/user-preferences/user-preferences-selectors', () => ({
-  selectPanelOpenMode: () => readable('normal'),
-  selectPanelStackDirection: () => readable('right'),
+vi.mock('$store/renderer/slices/hud/hud-selectors', () => ({
+  selectHudAgentHasPendingQuestion: () => readable(false),
 }));
 vi.mock('$lib/components/ui/toast', () => ({
   toast: { success: vi.fn(), error: vi.fn() },
@@ -144,10 +150,19 @@ function renderHeader(tabType: PanelTab['type']) {
 }
 
 beforeEach(() => {
+  vi.stubGlobal(
+    'ResizeObserver',
+    class {
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    },
+  );
   resetFileDropSpies();
 });
 
 afterEach(() => {
+  vi.unstubAllGlobals();
   cleanup();
 });
 
@@ -169,7 +184,8 @@ describe('panel header file drop', () => {
     await fireEvent(header, drop);
     expect(drop.defaultPrevented).toBe(true);
     expect(droppedFiles).toHaveLength(1);
-    expect(droppedFiles[0].map((file) => file.name)).toEqual(['image.png']);
+    expect(droppedFiles[0].files.map((file) => file.name)).toEqual(['image.png']);
+    expect(droppedFiles[0].folderFiles).toEqual([]);
     expect(dragChanges).toEqual([true, false]);
   });
 
@@ -209,11 +225,11 @@ describe('panel header file drop', () => {
     // before the old tab's cleanup runs: handler goes A→B without passing
     // through null (the ordering the identity-checked unregister tolerates).
     const replacementDragChanges: boolean[] = [];
-    const replacementDrops: File[][] = [];
+    const replacementDrops: DropSplit[] = [];
     flushSync(() => {
       contextRef.current!.register({
         onDragChange: (dragging) => replacementDragChanges.push(dragging),
-        onDrop: (files) => replacementDrops.push(files),
+        onDrop: (drop) => replacementDrops.push(drop),
       });
     });
 
@@ -241,5 +257,70 @@ describe('panel header file drop', () => {
     expect(enter.defaultPrevented).toBe(false);
     expect(dragChanges).toEqual([]);
     expect(droppedFiles).toHaveLength(0);
+  });
+
+  describe('handler registration identity (monorepo#3026)', () => {
+    function makeHandler() {
+      const changes: boolean[] = [];
+      const drops: DropSplit[] = [];
+      return {
+        changes,
+        drops,
+        handler: {
+          onDragChange: (dragging: boolean) => changes.push(dragging),
+          onDrop: (drop: DropSplit) => drops.push(drop),
+        },
+      };
+    }
+
+    it('clears the handler on register → unregister, without a proxy equality warning', async () => {
+      const warn = vi.spyOn(console, 'warn');
+      try {
+        const header = renderHeader('file');
+        const dataTransfer = fileDragData();
+        const first = makeHandler();
+
+        flushSync(() => contextRef.current!.register(first.handler));
+        const activeEnter = dragEvent('dragenter', dataTransfer);
+        await fireEvent(header, activeEnter);
+        expect(activeEnter.defaultPrevented).toBe(true);
+        expect(first.changes).toEqual([true]);
+        await fireEvent(header, dragEvent('dragleave', dataTransfer));
+
+        flushSync(() => contextRef.current!.unregister(first.handler));
+
+        const staleEnter = dragEvent('dragenter', dataTransfer);
+        await fireEvent(header, staleEnter);
+        expect(staleEnter.defaultPrevented).toBe(false);
+        expect(first.changes).toEqual([true, false]);
+        expect(
+          warn.mock.calls.filter((call) =>
+            call.some((arg) => String(arg).includes('state_proxy_equality_mismatch')),
+          ),
+        ).toEqual([]);
+      } finally {
+        warn.mockRestore();
+      }
+    });
+
+    it('keeps the replacement handler when a stale unregister arrives (register → replace → stale-unregister)', async () => {
+      const header = renderHeader('file');
+      const dataTransfer = fileDragData();
+      const first = makeHandler();
+      const replacement = makeHandler();
+
+      flushSync(() => contextRef.current!.register(first.handler));
+      flushSync(() => contextRef.current!.register(replacement.handler));
+      // The deactivated tab's late cleanup must not clobber the newer handler.
+      flushSync(() => contextRef.current!.unregister(first.handler));
+
+      await fireEvent(header, dragEvent('dragenter', dataTransfer));
+      await fireEvent(header, dragEvent('drop', dataTransfer));
+
+      expect(replacement.changes).toEqual([true, false]);
+      expect(replacement.drops).toHaveLength(1);
+      expect(first.changes).toEqual([]);
+      expect(first.drops).toHaveLength(0);
+    });
   });
 });

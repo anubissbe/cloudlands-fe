@@ -6,6 +6,7 @@
  * per-agent id, only close/Switch To dismiss) and the "Switch To" wiring
  * (workspace activation + cross-workspace goto + agent-tab dispatch).
  */
+import { m } from '$shared/paraglide/messages.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const {
@@ -17,6 +18,7 @@ const {
   microStatusMock,
   resolvedKeySlotSelectMock,
   workspaceByIdSelectMock,
+  storeStateMock,
 } = vi.hoisted(() => ({
   toastCustomMock: vi.fn(),
   toastInfoMock: vi.fn(),
@@ -28,6 +30,7 @@ const {
   workspaceByIdSelectMock: vi.fn(
     (_state: unknown, _workspaceId: string): { title?: string } | undefined => undefined,
   ),
+  storeStateMock: { value: {} as Record<string, unknown> },
 }));
 
 vi.mock('svelte-sonner', () => ({
@@ -58,7 +61,7 @@ vi.mock('$lib/utils/navigation.client', () => ({
 vi.mock('$store/renderer/store', async () => {
   const { createAppStoreMockModule } =
     await import('$store/renderer/utils/test-helpers/store-mock');
-  return createAppStoreMockModule({ dispatch: dispatchMock });
+  return createAppStoreMockModule({ dispatch: dispatchMock, state: () => storeStateMock.value });
 });
 
 // Seams of the connected key-slot resolver (badge gating): manager status +
@@ -102,10 +105,12 @@ describe('agent-attention-toast-service', () => {
     microStatusMock.value = 'disconnected';
     resolvedKeySlotSelectMock.mockImplementation(() => null);
     workspaceByIdSelectMock.mockImplementation(() => undefined);
+    storeStateMock.value = {};
   });
 
   afterEach(() => {
     vi.clearAllMocks();
+    vi.restoreAllMocks();
   });
 
   it('shows a STICKY toast (duration: Infinity) with a stable per-agent id', async () => {
@@ -139,7 +144,7 @@ describe('agent-attention-toast-service', () => {
     const call = lastCustomCall();
     expect(call.componentProps.title).toBe('Verifier reports a blocker');
     expect(call.componentProps.kind).toBe('blocker');
-    expect(call.class).toBe('!border-destructive/50');
+    expect(call.class).toBe('!border-danger/50');
   });
 
   describe('micro key-slot badge', () => {
@@ -191,6 +196,123 @@ describe('agent-attention-toast-service', () => {
       const call = lastCustomCall();
       expect(call.componentProps.title).toBe('Implementor requests a discussion');
       expect(call.componentProps.keySlot).toBeNull();
+    });
+  });
+
+  describe('already-viewing suppression', () => {
+    const request = {
+      workspaceId: WS,
+      agentId: AGENT,
+      agentName: 'Implementor',
+      kind: 'discussion' as const,
+      reason: 'Need a decision',
+    };
+
+    /** A panel whose tabs/activeTabId mimic the panelLayout slice shape. */
+    function panel(
+      id: string,
+      tabs: { id: string; type: string; agentId?: string }[],
+      activeTabId: string | null,
+    ) {
+      return { id, tabs, activeTabId };
+    }
+
+    /**
+     * Seed the store so WS is the current workspace tab with the given
+     * panelLayout panels (tab visibility source of truth — tab clicks update
+     * `panel.activeTabId`, never `workspaceAgents.activeAgentId`).
+     */
+    function seedViewingState(
+      panels: ReturnType<typeof panel>[],
+      opts: { currentTabId?: string; expandedPanelId?: string | null } = {},
+    ): void {
+      storeStateMock.value = {
+        tabState: { currentTabId: opts.currentTabId ?? WS },
+        panelLayout: {
+          byWorkspaceId: {
+            [WS]: {
+              panels: Object.fromEntries(panels.map((p) => [p.id, p])),
+              expandedPanelId: opts.expandedPanelId ?? null,
+            },
+          },
+        },
+      };
+    }
+
+    const agentTab = { id: 'tab-agent', type: 'agent', agentId: AGENT };
+    const otherAgentTab = { id: 'tab-other-agent', type: 'agent', agentId: 'agent-other' };
+    const fileTab = { id: 'tab-file', type: 'file' };
+
+    function setWindowFocused(focused: boolean): void {
+      vi.spyOn(document, 'hasFocus').mockReturnValue(focused);
+    }
+
+    it("suppresses the toast when focused + current workspace tab + the agent's tab active in a panel", async () => {
+      setWindowFocused(true);
+      seedViewingState([panel('p1', [agentTab, fileTab], agentTab.id)]);
+
+      await showAgentAttentionToast(request);
+
+      expect(toastCustomMock).not.toHaveBeenCalled();
+      // Suppression only skips the toast — it never dismisses an existing one.
+      expect(toastDismissMock).not.toHaveBeenCalled();
+    });
+
+    it('suppresses when the agent tab is active in a non-focused visible panel (any visible panel counts)', async () => {
+      setWindowFocused(true);
+      seedViewingState([panel('p1', [fileTab], fileTab.id), panel('p2', [agentTab], agentTab.id)]);
+
+      await showAgentAttentionToast(request);
+
+      expect(toastCustomMock).not.toHaveBeenCalled();
+    });
+
+    it('shows the toast when the window is unfocused, even while viewing the agent', async () => {
+      setWindowFocused(false);
+      seedViewingState([panel('p1', [agentTab], agentTab.id)]);
+
+      await showAgentAttentionToast(request);
+
+      expect(toastCustomMock).toHaveBeenCalledTimes(1);
+      expect(lastCustomCall().id).toBe(agentAttentionToastId(AGENT));
+    });
+
+    it('shows the toast when a different workspace tab is current', async () => {
+      setWindowFocused(true);
+      seedViewingState([panel('p1', [agentTab], agentTab.id)], { currentTabId: 'ws-other' });
+
+      await showAgentAttentionToast(request);
+
+      expect(toastCustomMock).toHaveBeenCalledTimes(1);
+    });
+
+    it("shows the toast when another agent's tab is active in the event's workspace", async () => {
+      setWindowFocused(true);
+      seedViewingState([panel('p1', [agentTab, otherAgentTab], otherAgentTab.id)]);
+
+      await showAgentAttentionToast(request);
+
+      expect(toastCustomMock).toHaveBeenCalledTimes(1);
+    });
+
+    it('shows the toast when a non-agent tab (file) is active, even with the agent tab open', async () => {
+      setWindowFocused(true);
+      seedViewingState([panel('p1', [agentTab, fileTab], fileTab.id)]);
+
+      await showAgentAttentionToast(request);
+
+      expect(toastCustomMock).toHaveBeenCalledTimes(1);
+    });
+
+    it('shows the toast when a panel is expanded and the agent tab is only active in a hidden panel', async () => {
+      setWindowFocused(true);
+      seedViewingState([panel('p1', [fileTab], fileTab.id), panel('p2', [agentTab], agentTab.id)], {
+        expandedPanelId: 'p1',
+      });
+
+      await showAgentAttentionToast(request);
+
+      expect(toastCustomMock).toHaveBeenCalledTimes(1);
     });
   });
 
@@ -311,12 +433,14 @@ describe('agent-attention-toast-service', () => {
       expect(options.action.label).toBe('Switch To');
     });
 
-    it('falls back to the generic Space label when the workspace title is unknown', async () => {
+    it('falls back to the generic workspace label when the workspace title is unknown', async () => {
       workspaceByIdSelectMock.mockImplementation(() => undefined);
 
       await showWorkspaceAutoUnarchiveToast(notice);
 
-      expect(lastInfoCall()[0]).toBe('Space was unarchived — Builder became active');
+      expect(lastInfoCall()[0]).toBe(
+        m.workspace_autoUnarchive_toast({ title: m.workspace_page_space_title(), name: 'Builder' }),
+      );
     });
 
     it('still shows the toast (with the fallback title) when title resolution throws', async () => {
@@ -326,7 +450,9 @@ describe('agent-attention-toast-service', () => {
 
       await showWorkspaceAutoUnarchiveToast(notice);
 
-      expect(lastInfoCall()[0]).toBe('Space was unarchived — Builder became active');
+      expect(lastInfoCall()[0]).toBe(
+        m.workspace_autoUnarchive_toast({ title: m.workspace_page_space_title(), name: 'Builder' }),
+      );
     });
 
     it('Switch To routes to the workspace and opens the agent tab', async () => {

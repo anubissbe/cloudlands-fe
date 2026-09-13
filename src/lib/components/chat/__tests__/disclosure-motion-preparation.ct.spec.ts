@@ -1,8 +1,6 @@
 import { expect, test, type Locator, type Page } from '@playwright/experimental-ct-svelte';
 import DisclosureMotionPreparationHost from './DisclosureMotionPreparationHost.svelte';
 
-test.describe.configure({ mode: 'serial' });
-
 interface FrameSample {
   responseHeight: number;
   subscriptionHeight: number;
@@ -10,33 +8,110 @@ interface FrameSample {
   responseAnimations: number;
 }
 
-async function startSampling(component: Locator, frames = 48) {
-  const transcript = component.getByTestId('disclosure-transcript');
-  await transcript.evaluate((scroll, count) => {
-    const state = window as typeof window & {
-      __disclosureSamples?: FrameSample[];
-      __disclosureSamplingDone?: boolean;
-    };
-    state.__disclosureSamples = [];
-    state.__disclosureSamplingDone = false;
-    let remaining = count as number;
-    const sample = () => {
-      const response = document.querySelector<HTMLElement>('[data-operational-expanded-content]');
-      const subscription = document.querySelector<HTMLElement>(
-        '[data-testid="event-subscriptions-card"]',
+interface MotionStartArm {
+  started: Promise<void>;
+  disarm: () => void;
+}
+
+type MotionStartWindow = typeof window & {
+  __disclosureMotionStarts?: Record<string, MotionStartArm>;
+};
+
+function controlledContentSelector(id: string) {
+  return `[id=${JSON.stringify(id)}]`;
+}
+
+async function controlledContent(component: Locator, trigger: Locator) {
+  const id = await trigger.getAttribute('aria-controls');
+  if (!id) throw new Error('Expected disclosure trigger to control content');
+  return component.locator(controlledContentSelector(id));
+}
+
+// Arm BEFORE the click that starts the motion (monorepo#4319): polling
+// `playState === 'running'` after the fact races the motion itself. Svelte
+// reverses an interrupted bidirectional transition over `duration * |t2 - t1|`,
+// so the outro that follows a rapid click lasts only as long as the intro had
+// progressed (tens of ms) and can finish — and unmount its node — before the
+// first poll evaluates under host load. Svelte dispatches `introstart` /
+// `outrostart` on the transitioned node right before it creates the WAAPI
+// animation; recording that (non-bubbling, so capture phase on the host root)
+// is a start signal that cannot be missed.
+async function armMotionStart(component: Locator, selector: string) {
+  await component.evaluate((root, key) => {
+    const state = window as MotionStartWindow;
+    state.__disclosureMotionStarts ??= {};
+    state.__disclosureMotionStarts[key]?.disarm();
+    let disarm = () => {};
+    const started = new Promise<void>((resolve) => {
+      const onStart = (event: Event) => {
+        if (!(event.target instanceof Element) || !event.target.matches(key)) return;
+        disarm();
+        resolve();
+      };
+      disarm = () => {
+        root.removeEventListener('introstart', onStart, true);
+        root.removeEventListener('outrostart', onStart, true);
+      };
+      root.addEventListener('introstart', onStart, true);
+      root.addEventListener('outrostart', onStart, true);
+    });
+    state.__disclosureMotionStarts[key] = { started, disarm };
+  }, selector);
+}
+
+async function expectMotionStarted(component: Locator, selector: string) {
+  await component.evaluate((_root, key) => {
+    const arm = (window as MotionStartWindow).__disclosureMotionStarts?.[key];
+    if (!arm) throw new Error(`Motion start was not armed for ${key}`);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<void>((_, reject) => {
+      timer = setTimeout(
+        () => reject(new Error(`Timed out waiting for motion start on ${key}`)),
+        5000,
       );
-      state.__disclosureSamples!.push({
-        responseHeight: response?.getBoundingClientRect().height ?? 0,
-        subscriptionHeight: subscription?.getBoundingClientRect().height ?? 0,
-        bottomDistance: scroll.scrollHeight - scroll.clientHeight - scroll.scrollTop,
-        responseAnimations: response?.getAnimations().length ?? 0,
-      });
-      remaining -= 1;
-      if (remaining > 0) requestAnimationFrame(sample);
-      else state.__disclosureSamplingDone = true;
-    };
-    requestAnimationFrame(sample);
-  }, frames);
+    });
+    return Promise.race([arm.started, timeout]).finally(() => clearTimeout(timer));
+  }, selector);
+}
+
+async function expectAnimationsCleanedUp(locator: Locator) {
+  await expect
+    .poll(() => locator.evaluate((node) => node.getAnimations({ subtree: true }).length))
+    .toBe(0);
+}
+
+async function startSampling(component: Locator, frames = 48, responseContentId?: string) {
+  const transcript = component.getByTestId('disclosure-transcript');
+  await transcript.evaluate(
+    (scroll, options) => {
+      const state = window as typeof window & {
+        __disclosureSamples?: FrameSample[];
+        __disclosureSamplingDone?: boolean;
+      };
+      state.__disclosureSamples = [];
+      state.__disclosureSamplingDone = false;
+      let remaining = options.frames;
+      const sample = () => {
+        const response = options.responseContentId
+          ? document.getElementById(options.responseContentId)
+          : null;
+        const subscription = document.querySelector<HTMLElement>(
+          '[data-testid="event-subscriptions-card"]',
+        );
+        state.__disclosureSamples!.push({
+          responseHeight: response?.getBoundingClientRect().height ?? 0,
+          subscriptionHeight: subscription?.getBoundingClientRect().height ?? 0,
+          bottomDistance: scroll.scrollHeight - scroll.clientHeight - scroll.scrollTop,
+          responseAnimations: response?.getAnimations().length ?? 0,
+        });
+        remaining -= 1;
+        if (remaining > 0) requestAnimationFrame(sample);
+        else state.__disclosureSamplingDone = true;
+      };
+      requestAnimationFrame(sample);
+    },
+    { frames, responseContentId },
+  );
 }
 
 async function finishSampling(page: Page): Promise<FrameSample[]> {
@@ -70,18 +145,25 @@ for (const config of [
     const component = await mount(DisclosureMotionPreparationHost, { props: config });
     const transcript = component.getByTestId('disclosure-transcript');
     const trigger = component.getByTestId('response-group-disclosure');
+    const responseContentId = await trigger.getAttribute('aria-controls');
+    if (!responseContentId) throw new Error('Expected response disclosure content id');
+    const detailsSelector = controlledContentSelector(responseContentId);
     await transcript.evaluate((node) => node.scrollTo(0, node.scrollHeight));
-    await startSampling(component);
+    await startSampling(component, 48, responseContentId);
 
-    await trigger.evaluate((node) => (node as HTMLElement).click());
-    await page.waitForTimeout(40);
-    await trigger.evaluate((node) => (node as HTMLElement).click());
-    await page.waitForTimeout(40);
-    await trigger.evaluate((node) => (node as HTMLElement).click());
+    await armMotionStart(component, detailsSelector);
+    await trigger.dispatchEvent('click');
+    await expect(trigger).toHaveAttribute('aria-expanded', 'true');
+    await expectMotionStarted(component, detailsSelector);
+    await armMotionStart(component, detailsSelector);
+    await trigger.dispatchEvent('click');
+    await expect(trigger).toHaveAttribute('aria-expanded', 'false');
+    await expectMotionStarted(component, detailsSelector);
+    await trigger.dispatchEvent('click');
 
     const samples = await finishSampling(page);
     await expect(trigger).toHaveAttribute('aria-expanded', 'true');
-    const details = component.locator('[data-operational-expanded-content]');
+    const details = await controlledContent(component, trigger);
     await expect(details).toHaveCount(1);
     expect(samples).toHaveLength(48);
     expect(Math.max(...samples.map((sample) => sample.responseHeight))).toBeGreaterThan(40);
@@ -89,7 +171,22 @@ for (const config of [
     expect(
       Math.max(...samples.map((sample) => Math.abs(sample.bottomDistance))),
     ).toBeLessThanOrEqual(8);
+
+    // Regression (monorepo#3379): repeat a rapid disclosure round and require
+    // the same bottom lock — the css/WAAPI-driven motion drifted 14-22px here.
+    await startSampling(component);
+    for (let click = 0; click < 4; click += 1) {
+      await trigger.evaluate((node) => (node as HTMLElement).click());
+      await page.waitForTimeout(40);
+    }
+    const repeatSamples = await finishSampling(page);
+    await expect(trigger).toHaveAttribute('aria-expanded', 'true');
+    expect(repeatSamples).toHaveLength(48);
+    expect(
+      Math.max(...repeatSamples.map((sample) => Math.abs(sample.bottomDistance))),
+    ).toBeLessThanOrEqual(8);
     await expect(component.getByTestId('disclosure-bottom-state')).toContainText('locked:0');
+    await expectAnimationsCleanedUp(details);
     expect(
       await details.evaluate((node) => ({
         height: (node as HTMLElement).style.height,
@@ -126,34 +223,41 @@ test('measures nested and outer subscription collapse while bottom-following', a
     8,
   );
   expect(samples.at(-1)!.subscriptionHeight).toBeLessThan(samples[0].subscriptionHeight);
-  expect(await component.evaluate((node) => node.getAnimations({ subtree: true }).length)).toBe(0);
+  await expectAnimationsCleanedUp(component);
 });
 
 test('reverses the outer subscription disclosure and keeps native keyboard control', async ({
   mount,
-  page,
 }) => {
   const component = await mount(DisclosureMotionPreparationHost);
   const transcript = component.getByTestId('disclosure-transcript');
   await transcript.evaluate((node) => node.scrollTo(0, node.scrollHeight));
   const outer = component.getByTestId('event-subscriptions-summary');
+  const bodySelector = '[data-testid="event-subscriptions-body"]';
 
-  await outer.click();
-  await page.waitForTimeout(35);
-  await outer.click();
-  await page.waitForTimeout(35);
-  await outer.click();
-  await page.waitForTimeout(35);
+  await outer.focus();
+  await armMotionStart(component, bodySelector);
+  await outer.dispatchEvent('click');
+  await expect(outer).toHaveAttribute('aria-expanded', 'false');
+  await expectMotionStarted(component, bodySelector);
+  await armMotionStart(component, bodySelector);
+  await outer.dispatchEvent('click');
+  await expect(outer).toHaveAttribute('aria-expanded', 'true');
+  await expectMotionStarted(component, bodySelector);
+  await armMotionStart(component, bodySelector);
+  await outer.dispatchEvent('click');
+  await expect(outer).toHaveAttribute('aria-expanded', 'false');
+  await expectMotionStarted(component, bodySelector);
   await outer.press('Enter');
 
   await expect(outer).toHaveAttribute('aria-expanded', 'true');
   const body = component.getByTestId('event-subscriptions-body');
   await expect(body).toBeVisible();
-  await page.waitForTimeout(240);
+  await expectAnimationsCleanedUp(component);
   expect(
     await transcript.evaluate((node) => node.scrollHeight - node.clientHeight - node.scrollTop),
   ).toBeLessThanOrEqual(8);
-  expect(await component.evaluate((node) => node.getAnimations({ subtree: true }).length)).toBe(0);
+  await expectAnimationsCleanedUp(component);
 });
 
 test('accepts live response updates during collapse without stale detached content', async ({
@@ -166,19 +270,55 @@ test('accepts live response updates during collapse without stale detached conte
   await transcript.evaluate((node) => node.scrollTo(0, node.scrollHeight));
   const toggle = component.getByTestId('response-group-disclosure');
 
+  await expect(toggle).toHaveAttribute('aria-expanded', 'false');
+  await expect(component.getByTestId('prepared-response-current')).toHaveText(
+    'Initial live activity.',
+  );
   await toggle.click();
+  await expect(toggle).toHaveAttribute('aria-expanded', 'true');
+  await expect(component.getByTestId('prepared-response-body')).toBeVisible();
+  // Let the expand motion settle before the pointer click that starts the
+  // collapse (monorepo#4267): while the details grow, the followed-bottom
+  // transcript re-pins every frame and shifts the trigger row up. Playwright
+  // verifies the hit target only on pointerdown, so a row that moves before
+  // mouseup lands the synthesized `click` on the common ancestor instead of the
+  // button and the toggle is silently dropped.
+  await expectAnimationsCleanedUp(await controlledContent(component, toggle));
+  await toggle.click();
+  await expect(toggle).toHaveAttribute('aria-expanded', 'false');
   await page.waitForTimeout(35);
   await component.update({
     props: { ...initialProps, responseText: 'Updated live activity while collapsing.' },
   });
   await page.waitForTimeout(240);
   await expect(component.locator('[data-operational-expanded-content]')).toHaveCount(0);
+  const current = component.getByTestId('prepared-response-current');
+  await expect(current).toBeVisible();
+  await expect(current).toHaveText('Updated live activity while collapsing.');
+  expect(
+    await current.evaluate((node) => node.closest('[data-operational-expanded-content]') === null),
+  ).toBe(true);
+  const body = component.getByTestId('prepared-response-body');
+  await expect(body).toHaveCount(1);
+  await expect(body).toBeVisible();
+  expect(
+    await body.evaluate((node) => {
+      const groupContent = node.closest('[data-response-group-content]');
+      return groupContent?.closest('[data-operational-preview-content]') !== null;
+    }),
+  ).toBe(true);
+  expect(
+    await body.evaluate((node) => node.closest('[data-operational-expanded-content]') === null),
+  ).toBe(true);
   expect(
     await transcript.evaluate((node) => node.scrollHeight - node.clientHeight - node.scrollTop),
   ).toBeLessThanOrEqual(8);
 
   await toggle.click();
-  await expect(component.getByText('Updated live activity while collapsing.')).toBeVisible();
+  await expect(toggle).toHaveAttribute('aria-expanded', 'true');
+  await expect(component.getByTestId('prepared-response-body')).toContainText(
+    'Updated live activity while collapsing.',
+  );
   await page.waitForTimeout(240);
   expect(
     await component
@@ -281,7 +421,7 @@ test('completes reduced-motion disclosure cleanup without residual animations or
   await component.getByTestId('event-subscriptions-summary').click();
   await expect(component.getByTestId('one-shot-agent-list')).toHaveCount(0);
   await expect(component.getByTestId('event-subscriptions-body')).toBeHidden();
-  expect(await component.evaluate((node) => node.getAnimations({ subtree: true }).length)).toBe(0);
+  await expectAnimationsCleanedUp(component);
 });
 
 test('honors animation debug disable with immediate clean disclosure states', async ({ mount }) => {
@@ -291,10 +431,12 @@ test('honors animation debug disable with immediate clean disclosure states', as
   const response = component.getByTestId('response-group-disclosure');
   const outer = component.getByTestId('event-subscriptions-summary');
 
-  await response.click();
-  await outer.click();
-  const details = component.locator('[data-operational-expanded-content]');
+  await response.dispatchEvent('click');
+  await expect(response).toHaveAttribute('aria-expanded', 'true');
+  await outer.dispatchEvent('click');
+  await expect(outer).toHaveAttribute('aria-expanded', 'false');
+  const details = await controlledContent(component, response);
   await expect(details).toBeVisible();
   await expect(component.getByTestId('event-subscriptions-body')).toHaveCount(0);
-  expect(await details.evaluate((node) => node.getAnimations().length)).toBe(0);
+  await expectAnimationsCleanedUp(details);
 });

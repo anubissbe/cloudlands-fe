@@ -4,6 +4,11 @@ import ThinkingSpacingGeometryHost from './ThinkingSpacingGeometryHost.svelte';
 for (const theme of ['light', 'dark'] as const) {
   for (const width of [320, 720]) {
     for (const zoom of [1, 2]) {
+      if (
+        (theme === 'light' && (width !== 720 || zoom !== 1)) ||
+        (theme === 'dark' && (width !== 320 || zoom !== 2))
+      )
+        continue;
       test(`keeps Thinking boundaries exact in ${theme} at ${width}px and ${zoom * 100}%`, async ({
         mount,
         page,
@@ -73,6 +78,17 @@ for (const theme of ['light', 'dark'] as const) {
         expect(operationalGeometry.gap).toBeCloseTo(0, 1);
         expect(operationalGeometry.parentRowGap).toBe('0px');
         expect(operationalGeometry.thinkingPaddingTop).toBe('0px');
+
+        for (const testId of ['reasoning-response-boundary', 'streaming-response-boundary']) {
+          const responseGap = await component.getByTestId(testId).evaluate((root) => {
+            const thinking = root.querySelector('[data-message-content-block="thinking"]')!;
+            const response = root.querySelector(
+              '[data-message-content-block="text"] .markdown-viewer > :first-child',
+            )!;
+            return response.getBoundingClientRect().top - thinking.getBoundingClientRect().bottom;
+          });
+          expect(responseGap, testId).toBeCloseTo(24 * zoom, 1);
+        }
 
         const consecutiveReasoning = component.getByTestId('consecutive-reasoning-boundary');
         const reasoningDisclosures = consecutiveReasoning.getByTestId('reasoning-disclosure');

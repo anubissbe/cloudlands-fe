@@ -1,5 +1,6 @@
 import type { AgentMessage } from '$shared/types';
 import { extractAllContent } from '$shared/types';
+import { getAgentMessageAttribution, stripAgentMessageHeader } from './agent-message-attribution';
 import { getQueueInfo } from './queue-info';
 
 const ISO_TIMESTAMP = String.raw`\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})`;
@@ -35,18 +36,46 @@ export function stripInternalDeliveryNotes(text: string, metadata?: unknown): st
   return presented;
 }
 
+const QUEUE_NOTE_STEM = '[SYSTEM NOTE] This message was queued';
+
+/**
+ * Best-effort removal of a trailing delivery note chopped mid-note by
+ * server-side preview truncation (`agent.listUserMessages` previews, §5.5).
+ * Applies only when `metadata.queueInfo` proves the daemon appended a note;
+ * the trailing paragraph is dropped when it is a prefix of — or extends —
+ * the shared queue-note stem. Full texts use `stripInternalDeliveryNotes`.
+ */
+export function stripTruncatedTrailingDeliveryNote(text: string, metadata?: unknown): string {
+  if (!getQueueInfo(metadata)) return text;
+  const match = /(?:\r?\n){2,}(\[[^\n]*)$/u.exec(text);
+  if (!match) return text;
+  const fragment = match[1];
+  if (!fragment.startsWith(QUEUE_NOTE_STEM) && !QUEUE_NOTE_STEM.startsWith(fragment)) return text;
+  return text.slice(0, match.index);
+}
+
 /** Return immutable user-authored text for rendering and other UI surfaces. */
 export function getPresentedUserMessageText(message: AgentMessage): string {
+  // Rows sent by another agent carry the daemon-stamped sender header in
+  // content; the attribution chip conveys the sender, so presentation copies
+  // (render, preview, copy) drop the leading header line.
+  const attribution = getAgentMessageAttribution(message.metadata);
+  const presentLeadingHeader = attribution
+    ? (text: string) => stripAgentMessageHeader(text, attribution)
+    : (text: string) => text;
+
   const textParts = message.contentBlocks
     ?.filter((block) => block.type === 'text')
     .map((block) => block.text ?? '');
   if (!textParts?.length)
-    return stripInternalDeliveryNotes(extractAllContent(message), message.metadata);
+    return presentLeadingHeader(
+      stripInternalDeliveryNotes(extractAllContent(message), message.metadata),
+    );
 
   for (let index = textParts.length - 1; index >= 0; index -= 1) {
     const stripped = stripInternalDeliveryNotes(textParts[index], message.metadata);
     textParts[index] = stripped;
     if (stripped.trim()) break;
   }
-  return stripInternalDeliveryNotes(textParts.join(''), message.metadata);
+  return presentLeadingHeader(stripInternalDeliveryNotes(textParts.join(''), message.metadata));
 }

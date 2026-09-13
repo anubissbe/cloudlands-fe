@@ -7,20 +7,15 @@
    * Supports drag-and-drop for cross-panel tab movement.
    */
 
-  import Fa from 'svelte-fa';
-  import { faXmark } from '@fortawesome/free-solid-svg-icons';
   import { m } from '$shared/paraglide/messages.js';
   import type {
     PanelState,
     PanelTab,
   } from '$store/renderer/slices/panel-layout/panel-layout-types';
   import { cn } from '$lib/utils';
-  import { Button } from '$lib/components/ui/button';
-  import { Tooltip } from '$lib/components/ui/tooltip';
   import PanelTabBar from './PanelTabBar.svelte';
   import PanelContentRenderer from './PanelContentRenderer.svelte';
   import PanelEmptyState from './PanelEmptyState.svelte';
-  import PanelDropZones from './PanelDropZones.svelte';
   import { createPanelHeaderContext } from './panel-header-context.svelte';
   import { createPanelFileDropContext } from './panel-file-drop-context.svelte';
   import type { PanelFileDropHandler } from './panel-file-drop-context.svelte';
@@ -36,23 +31,28 @@
   import { selectIsDragging } from '$store/renderer/slices/tab-state/tab-state-selectors';
   import { untrack, type Snippet } from 'svelte';
   import {
-    PANEL_DRAG_MIME,
-    clearDraggedPanelState,
-    getDraggedPanelId,
-    getPanelDragPlacement,
-    type PanelDragPlacement,
+    PANE_DRAG_MIME,
+    clearDraggedPaneState,
+    getDraggedPane,
+    getPaneColumnDropZone,
+    type PaneDropPlacement,
   } from './panel-drag';
   import { store as appStore } from '$store/renderer/store';
-  import { endDrag } from '$store/renderer/slices/tab-state/tab-state-slice';
   import { markPanelTouched } from '$store/renderer/slices/panel-layout/panel-layout-slice';
+  import { endDrag } from '$store/renderer/slices/tab-state/tab-state-slice';
 
-  export type DropZone = 'top' | 'bottom' | 'left' | 'right' | 'center';
+  export type DropZone = 'left' | 'right' | 'center';
 
   interface Props {
     panel: PanelState;
     isFocused?: boolean;
+    showFocusBorder?: boolean;
     workspaceId: string;
     layoutId: string;
+    active?: boolean;
+    availableCanvasWidth?: number;
+    isRightmostPanel?: boolean;
+    canCreateColumn?: boolean;
     contained?: boolean;
     onFocus?: () => void;
     onTabClick?: (tabId: string) => void;
@@ -70,13 +70,14 @@
     onTabDrop?: (tabId: string, fromPanelId: string, zone: DropZone) => void;
     /** Handler for moving a tab to this panel's tab bar */
     onTabMoveToPanel?: (tabId: string, fromPanelId: string, insertIndex?: number) => void;
-    /** Handler for dropping a whole panel onto this panel (reorder) */
-    onPanelMove?: (draggedPanelId: string, position: PanelDragPlacement) => void;
-    onPanelMovePreview?: (
-      draggedPanelId: string,
-      targetPanelId: string,
-      position: PanelDragPlacement | null,
-    ) => void;
+    /** Reports the one valid destination for the active-pane drag. */
+    onPaneDropPreview?: (placement: PaneDropPlacement | null) => void;
+    /** Idempotently finishes the active-pane drag before layout mutation. */
+    onPaneDragFinish?: () => void;
+    onMovePaneLeft?: () => void;
+    onMovePaneRight?: () => void;
+    onMoveLeft?: () => void;
+    onMoveRight?: () => void;
     /** Handler for renaming a tab (note, agent, or file) */
     onTabRename?: (tab: PanelTab, newName: string) => void;
     /** Callbacks for creating new items */
@@ -88,15 +89,18 @@
     emptyState?: Snippet;
     /** Split panel horizontally (side by side) */
     onSplitHorizontal?: () => void;
-    /** Split panel vertically (top and bottom) */
-    onSplitVertical?: () => void;
   }
 
   let {
     panel,
     isFocused = false,
+    showFocusBorder = false,
     workspaceId,
     layoutId,
+    active = true,
+    availableCanvasWidth,
+    isRightmostPanel = false,
+    canCreateColumn = true,
     contained = false,
     onFocus,
     onTabClick,
@@ -111,8 +115,12 @@
     isZoomed = false,
     onTabDrop,
     onTabMoveToPanel,
-    onPanelMove,
-    onPanelMovePreview,
+    onPaneDropPreview,
+    onPaneDragFinish,
+    onMovePaneLeft,
+    onMovePaneRight,
+    onMoveLeft,
+    onMoveRight,
     onTabRename,
     onCreateAgent,
     onCreateAgentWithSpecialist,
@@ -121,8 +129,12 @@
     onOpenBrowser,
     emptyState,
     onSplitHorizontal,
-    onSplitVertical,
   }: Props = $props();
+
+  // A panel component never changes identity. Keep teardown independent from
+  // the reactive layout entry, which can disappear before child cleanup runs.
+  // svelte-ignore state_referenced_locally
+  const panelId = panel.id;
 
   // Create header context for content components to register their actions
   const { actions: headerActions } = createPanelHeaderContext();
@@ -135,7 +147,7 @@
   const { handler: fileDropHandler } = createPanelFileDropContext();
   const headerFileDrop = createFileDropTarget({
     onDragChange: (dragging) => fileDropHandler.current?.onDragChange(dragging),
-    onDrop: (files) => fileDropHandler.current?.onDrop(files),
+    onDrop: (drop) => fileDropHandler.current?.onDrop(drop),
   });
 
   // Clear stale drag state on any handler identity change: unregister mid-drag
@@ -174,7 +186,7 @@
   // This is more reliable than DOM traversal for navigation events
   // (context must be set at init; a panel's ID is stable for its lifetime)
   // svelte-ignore state_referenced_locally
-  setPanelContext(panel.id);
+  setPanelContext(panelId);
 
   // Get the active tab - use optional chaining to handle workspace transitions
   let activeTab = $derived(panel?.tabs?.find((t) => t.id === panel.activeTabId) ?? null);
@@ -210,23 +222,30 @@
 
   // Update cache when active tab or tab membership changes.
   $effect(() => {
-    applyTabCacheUpdate(panel.tabs, panel.activeTabId);
+    if (active) applyTabCacheUpdate(panel.tabs, panel.activeTabId);
   });
 
-  // Clear focus before a content-triggered tab switch hides its cached wrapper.
+  // Clear focus before a tab switch or panel deactivation flips `inert` on a
+  // cached wrapper. Flipping `inert` while a descendant holds focus makes the
+  // browser blur it synchronously inside the template effect, where widgets
+  // that write $state on blur (e.g. TipTap) throw state_unsafe_mutation.
   // Header controls are outside these wrappers and keep their focus normally.
   $effect.pre(() => {
     const activeTabId = panel.activeTabId;
+    const panelActive = active;
     if (typeof document === 'undefined' || !panelRef) return;
     const focusedElement = document.activeElement;
     if (!(focusedElement instanceof HTMLElement) || !panelRef.contains(focusedElement)) return;
     const focusedWrapper = focusedElement.closest<HTMLElement>('.tab-content-wrapper');
-    if (focusedWrapper && focusedWrapper.dataset.tabId !== activeTabId) focusedElement.blur();
+    if (focusedWrapper && (!panelActive || focusedWrapper.dataset.tabId !== activeTabId)) {
+      focusedElement.blur();
+    }
   });
 
   // Enforce the TTL even when the active tab does not change again. Without
   // this timer, inactive browser/editor/diff tabs can stay mounted forever.
   $effect(() => {
+    if (!active) return;
     const delay = getNextPanelTabCacheExpiryDelay(
       cachedTabIds,
       panel.activeTabId,
@@ -250,14 +269,12 @@
   let animateTabBar = $state(false);
 
   // Custom MIME type for tab drag (must match PanelTabBar)
-  const TAB_DRAG_MIME = 'application/x-panel-tab';
+  const TAB_DRAG_MIME = PANE_DRAG_MIME;
 
   // Drop zone state
-  let isDragOver = $state(false);
+  let isPaneDragOver = $state(false);
+  let isLegacyTabDragOver = $state(false);
   let activeDropZone = $state<DropZone | null>(null);
-  let panelDropPlacement = $state<PanelDragPlacement | null>(null);
-  // Tab bar height in pixels (h-9 = 2.25rem = 36px)
-  const TAB_BAR_HEIGHT = 36;
 
   // Track global drag state to disable pointer events on content
   const isDragging = selectIsDragging();
@@ -265,18 +282,21 @@
   // Reset local drop zone state when global drag ends
   $effect(() => {
     if (!$isDragging) {
-      isDragOver = false;
+      isPaneDragOver = false;
+      isLegacyTabDragOver = false;
       activeDropZone = null;
-      panelDropPlacement = null;
     }
   });
 
+  let pointerFocusHandled = false;
+
   function handlePanelFocus() {
+    if (pointerFocusHandled || isFocused) return;
     onFocus?.();
   }
 
   function markUserTouch() {
-    if (panel.pristine) appStore.dispatch(markPanelTouched(layoutId, panel.id));
+    if (panel.pristine) appStore.dispatch(markPanelTouched(layoutId, panelId));
   }
 
   // Focus the panel when the user clicks anywhere inside it. `onfocusin` only
@@ -291,6 +311,11 @@
 
   function handlePanelPointerDown(event: PointerEvent) {
     if (!isEmptyStateInteraction(event.target)) markUserTouch();
+    // A focusable pointer target emits `focusin` after this capture handler.
+    // Treat both events as one column activation without cancelling either,
+    // so the target keeps its native DOM focus.
+    pointerFocusHandled = true;
+    queueMicrotask(() => (pointerFocusHandled = false));
     if (isFocused) return;
     onFocus?.();
   }
@@ -299,67 +324,39 @@
     if (!isEmptyStateInteraction(event.target)) markUserTouch();
   }
 
-  // Determine which drop zone based on cursor position (relative to content area below tab bar)
-  function getDropZone(e: DragEvent): DropZone | null {
+  function getDropZone(e: DragEvent): DropZone {
     if (!panelRef) return 'center';
-
-    const rect = panelRef.getBoundingClientRect();
-    const x = e.clientX - rect.left;
-    const y = e.clientY - rect.top;
-
-    // If cursor is over the tab bar area, no drop zone
-    if (y < TAB_BAR_HEIGHT) return null;
-
-    const width = rect.width;
-
     // Tabless panels only split along the horizontal stack.
-    if (x < width * 0.2) return 'left';
-    if (x > width * 0.8) return 'right';
-    return 'center';
-  }
-
-  function getPanelPlacement(e: DragEvent): PanelDragPlacement {
-    if (!panelRef) return 'after';
-    return getPanelDragPlacement(
+    return getPaneColumnDropZone(
       e.clientX,
-      e.clientY,
       panelRef.getBoundingClientRect(),
-      panelDropPlacement,
+      canCreateColumn,
+      activeDropZone,
     );
   }
 
-  function handleDragOver(e: DragEvent) {
-    // Whole-panel drag: preview only. The real layout changes once, on drop.
-    if (e.dataTransfer?.types.includes(PANEL_DRAG_MIME)) {
-      const draggedPanelId = getDraggedPanelId();
-      if (!draggedPanelId) return;
-      e.preventDefault();
-      if (draggedPanelId === panel.id) {
-        panelDropPlacement = getPanelPlacement(e);
-        onPanelMovePreview?.(draggedPanelId, panel.id, panelDropPlacement);
-        if (e.dataTransfer) e.dataTransfer.dropEffect = 'move';
-        return;
-      }
-      panelDropPlacement = getPanelPlacement(e);
-      onPanelMovePreview?.(draggedPanelId, panel.id, panelDropPlacement);
-      if (e.dataTransfer) e.dataTransfer.dropEffect = 'move';
-      return;
+  function getPaneDropPlacement(
+    zone: DropZone,
+  ): Extract<PaneDropPlacement, { kind: 'panel' }> | null {
+    const draggedPane = getDraggedPane();
+    if (!draggedPane) return null;
+    if (zone === 'center' && draggedPane.panelId === panelId) return null;
+    if (zone !== 'center' && draggedPane.panelId === panelId && panel.tabs.length === 1) {
+      return null;
     }
+    return { kind: 'panel', targetPanelId: panelId, zone };
+  }
 
-    // Only accept our custom tab drag MIME type
+  function handleDragOver(e: DragEvent) {
     if (!e.dataTransfer?.types.includes(TAB_DRAG_MIME)) return;
 
     e.preventDefault();
-
     const zone = getDropZone(e);
-    // Only show drop zones if cursor is in the content area (not tab bar)
-    if (zone === null) {
-      isDragOver = false;
-      activeDropZone = null;
-    } else {
-      isDragOver = true;
-      activeDropZone = zone;
-    }
+    isPaneDragOver = getDraggedPane() !== null;
+    isLegacyTabDragOver = !isPaneDragOver;
+    activeDropZone = zone;
+    if (isPaneDragOver) onPaneDropPreview?.(getPaneDropPlacement(zone));
+    if (e.dataTransfer) e.dataTransfer.dropEffect = 'move';
   }
 
   function handleDragLeave(e: DragEvent) {
@@ -376,61 +373,60 @@
       if (pointerStillInside) return;
     }
 
-    isDragOver = false;
+    if (isPaneDragOver) onPaneDropPreview?.(null);
+    isPaneDragOver = false;
+    isLegacyTabDragOver = false;
     activeDropZone = null;
-    panelDropPlacement = null;
-    const draggedPanelId = getDraggedPanelId();
-    if (draggedPanelId) onPanelMovePreview?.(draggedPanelId, panel.id, null);
+  }
+
+  function finishPaneDrag() {
+    isPaneDragOver = false;
+    activeDropZone = null;
+    onPaneDropPreview?.(null);
+    const finish = onPaneDragFinish;
+    if (finish) finish();
+    else {
+      clearDraggedPaneState();
+      appStore.dispatch(endDrag());
+    }
   }
 
   function handleDrop(e: DragEvent) {
-    markUserTouch();
     e.preventDefault();
     e.stopPropagation(); // Prevent drop from reaching content (like editors)
-    isDragOver = false;
-
-    // Whole-panel drop: reorder the stack
-    const panelData = e.dataTransfer?.getData(PANEL_DRAG_MIME);
-    const mirroredPanelId = getDraggedPanelId();
-    if (panelData || mirroredPanelId) {
-      const placement = panelDropPlacement ?? getPanelPlacement(e);
-      panelDropPlacement = null;
-      activeDropZone = null;
-      let draggedId = mirroredPanelId;
-      try {
-        if (panelData) draggedId = JSON.parse(panelData).panelId ?? draggedId;
-      } catch {
-        // Fall back to the mirrored id used during dragover.
-      }
-      if (draggedId) {
-        onPanelMovePreview?.(draggedId, panel.id, null);
-        clearDraggedPanelState();
-        appStore.dispatch(endDrag());
-        if (draggedId !== panel.id) onPanelMove?.(draggedId, placement);
-      }
+    const draggedPane = getDraggedPane();
+    if (draggedPane) {
+      const zone = activeDropZone ?? getDropZone(e);
+      const placement = getPaneDropPlacement(zone);
+      finishPaneDrag();
+      if (!placement) return;
+      markUserTouch();
+      if (placement.zone === 'center') onTabMoveToPanel?.(draggedPane.tabId, draggedPane.panelId);
+      else onTabDrop?.(draggedPane.tabId, draggedPane.panelId, placement.zone);
       return;
     }
-    panelDropPlacement = null;
 
+    markUserTouch();
+
+    const zone = activeDropZone ?? getDropZone(e);
+    activeDropZone = null;
+    isLegacyTabDragOver = false;
     try {
       const data = e.dataTransfer?.getData(TAB_DRAG_MIME);
       if (!data) return;
 
       const { tabId, panelId: fromPanelId } = JSON.parse(data);
 
-      const zone = activeDropZone ?? 'center';
-      activeDropZone = null;
-
       if (zone === 'center') {
         // Move tab to this panel's tab bar (only if from a different panel)
-        if (fromPanelId !== panel.id) {
+        if (fromPanelId !== panelId) {
           onTabMoveToPanel?.(tabId, fromPanelId);
         }
       } else {
         // Split and move tab
         // If dropping on the same panel with only one tab, don't do anything
         // (can't split a panel with its only tab - it would just end up the same)
-        if (fromPanelId === panel.id && panel.tabs.length === 1) {
+        if (fromPanelId === panelId && panel.tabs.length === 1) {
           return;
         }
         onTabDrop?.(tabId, fromPanelId, zone);
@@ -445,15 +441,15 @@
   <div
     bind:this={panelRef}
     class={cn(
-      'panel group/panel relative flex flex-col h-full overflow-hidden rounded-lg border border-border',
-      panel.pristine === true && panel.tabs.length === 0
-        ? 'bg-sidebar text-sidebar-foreground'
-        : 'bg-card text-card-foreground',
+      'panel group/panel relative flex flex-col h-full overflow-hidden rounded-(--panel-shell-radius) text-foreground',
     )}
+    class:bg-sidebar={panel.pristine === true && panel.tabs.length === 0}
+    class:bg-background={panel.pristine !== true || panel.tabs.length > 0}
     class:contained
-    data-panel-id={panel.id}
+    data-panel-id={panelId}
     data-layout-id={layoutId}
     data-focused={isFocused}
+    data-focus-border-visible={isFocused && showFocusBorder}
     data-zoomed={isZoomed}
     data-pristine={panel.pristine === true}
     data-empty-panel-surface={panel.pristine === true && panel.tabs.length === 0
@@ -468,26 +464,6 @@
     role="region"
     aria-label={m.layout_panel_ariaLabel()}
   >
-    <!-- Drop zones overlay (positioned below tab bar) -->
-    <PanelDropZones activeZone={activeDropZone} isActive={isDragOver} />
-    {#if !activeTab && onClosePanel}
-      <div class="absolute right-2 top-2 z-20" data-empty-panel-close>
-        <Tooltip content={m.layout_panel_closePanel_ariaLabel()} side="bottom" delayDuration={300}>
-          <Button
-            variant="ghost-light"
-            size="icon-xs"
-            class="cursor-pointer opacity-50 hover:opacity-100 focus-visible:opacity-100"
-            onclick={(event) => {
-              event.stopPropagation();
-              onClosePanel?.();
-            }}
-            aria-label={m.layout_panel_closePanel_ariaLabel()}
-          >
-            <Fa icon={faXmark} size="xs" />
-          </Button>
-        </Tooltip>
-      </div>
-    {/if}
     <!-- Tab Bar (shows group label and actions when focused) -->
     <div
       data-panel-header
@@ -502,16 +478,23 @@
       <PanelTabBar
         tabs={panel.tabs}
         activeTabId={panel.activeTabId}
-        panelId={panel.id}
-        pinned={panel.pinned === true}
+        attentionTabIds={panel.attentionTabIds}
+        {panelId}
         {workspaceId}
         {layoutId}
+        {availableCanvasWidth}
+        {isRightmostPanel}
         {isFocused}
         contentActions={headerActions.current}
         {onTabClick}
         {onTabClose}
         {onTabReorder}
         {onTabMoveToPanel}
+        {onPaneDragFinish}
+        {onMovePaneLeft}
+        {onMovePaneRight}
+        {onMoveLeft}
+        {onMoveRight}
         {onCloseOtherTabs}
         {onCloseTabsToRight}
         {onCloseAllTabs}
@@ -526,7 +509,6 @@
         {onCreateTerminal}
         {onOpenBrowser}
         {onSplitHorizontal}
-        {onSplitVertical}
       />
     </div>
 
@@ -546,7 +528,7 @@
       {#if panel.tabs.length > 0 && activeTab}
         <!-- Render all cached tabs, showing only the active one -->
         {#each tabsToRender as tab (tab.id)}
-          {@const isActive = tab.id === panel.activeTabId}
+          {@const isActive = active && tab.id === panel.activeTabId}
           <div
             class="tab-content-wrapper h-full w-full"
             class:hidden={!isActive}
@@ -569,7 +551,7 @@
       {:else}
         <PanelEmptyState
           {workspaceId}
-          panelId={panel.id}
+          {panelId}
           {onCreateAgent}
           {onCreateAgentWithSpecialist}
           {onCreateNote}
@@ -578,6 +560,15 @@
         />
       {/if}
     </div>
+
+    {#if isLegacyTabDragOver && activeDropZone}
+      <div
+        class={cn('legacy-tab-drop-destination', activeDropZone)}
+        data-panel-drop-destination
+        data-panel-legacy-tab-drop-zone={activeDropZone}
+        aria-hidden="true"
+      ></div>
+    {/if}
 
     <!-- {#if !isFocused}
     <div
@@ -590,9 +581,12 @@
 
 <style>
   .panel {
+    --panel-shell-radius: var(--radius-large);
     position: relative;
     width: 100%;
     min-width: 0;
+    box-sizing: border-box;
+    border: 1px solid transparent;
     box-shadow: var(--elevation-raised);
 
     /* Container query setup for responsive panel headers */
@@ -600,8 +594,51 @@
     container-name: panel;
   }
 
+  .panel[data-focus-border-visible='true'] {
+    border-color: hsl(var(--border));
+  }
+
+  @media (forced-colors: active) {
+    .panel[data-focus-border-visible='true'] {
+      border-color: Highlight;
+    }
+  }
+
   .panel-content {
     position: relative;
+  }
+
+  .legacy-tab-drop-destination {
+    position: absolute;
+    inset-block: 0;
+    z-index: 20;
+    border: 1px solid hsl(var(--border));
+    border-radius: 0.5rem;
+    background: hsl(var(--card) / 0.42);
+    pointer-events: none;
+  }
+
+  .legacy-tab-drop-destination.left {
+    left: 0;
+    width: 50%;
+  }
+
+  .legacy-tab-drop-destination.right {
+    right: 0;
+    width: 50%;
+  }
+
+  .legacy-tab-drop-destination.center {
+    inset-inline: 0;
+  }
+
+  @media (forced-colors: active) {
+    .legacy-tab-drop-destination {
+      border-color: CanvasText;
+      background: Canvas;
+      outline: 2px solid CanvasText;
+      outline-offset: -3px;
+    }
   }
 
   /* Tab content wrapper - keeps content mounted but hidden to preserve scroll */

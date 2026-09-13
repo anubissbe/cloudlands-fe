@@ -151,13 +151,20 @@ for (const scenario of [
     expect(changesResource.width).toBeCloseTo(24, 1);
     expect(changesResource.height).toBeCloseTo(24, 1);
     const changesLabel = changesLauncher.locator('[data-sidebar-launcher-label]');
-    const prAction = changesLauncher.locator('[data-sidebar-pr-link]');
+    const prAction = changesLauncher.locator('[data-sidebar-pr-trigger]');
     await expect(prAction).toHaveCount(1);
     await expect(prAction.locator('svg')).toHaveCount(1);
-    await expect(prAction).toHaveAttribute(
+    await expect(prAction).toHaveAttribute('data-sidebar-pr-count', '1');
+    await expect(changesLauncher.locator('[data-sidebar-pr-link]')).toHaveCount(0);
+    await prAction.click();
+    const prLink = page.locator('[data-sidebar-pr-link]');
+    await expect(prLink).toHaveCount(1);
+    await expect(prLink).toHaveAttribute(
       'data-sidebar-pr-url',
       'https://github.com/intent-hq/repository-with-a-very-long-name/pull/1373',
     );
+    await page.keyboard.press('Escape');
+    await expect(page.locator('[data-sidebar-pr-link]')).toHaveCount(0);
     const labelBounds = await changesLabel.boundingBox();
     const actionBounds = await prAction.boundingBox();
     expect((actionBounds!.x - (labelBounds!.x + labelBounds!.width)) / scenario.zoom).toBeCloseTo(
@@ -200,7 +207,10 @@ test('preserves semantic colors in the collapsed agent stack', async ({ mount, p
   expect(new Set(colors).size).toBe(states.length);
 });
 
-test('preserves hover, focus, click, and note open-marker behavior', async ({ mount, page }) => {
+test('preserves hover, focus, and click behavior without open-panel markers', async ({
+  mount,
+  page,
+}) => {
   await page.setViewportSize({ width: 1200, height: 1000 });
   await page.emulateMedia({ reducedMotion: 'reduce' });
   const component = await mount(LauncherGeometryHost, {
@@ -210,16 +220,15 @@ test('preserves hover, focus, click, and note open-marker behavior', async ({ mo
   const notes = component.locator('[data-sidebar-context]');
   await expect(agents).toHaveCount(6);
   await expect(notes).toHaveCount(6);
-  await expect(notes.first().locator('[data-panel-open-marker]')).toHaveAttribute(
-    'data-panel-open-state',
-    'open',
-  );
+  await expect(component.locator('[data-panel-open-marker]')).toHaveCount(0);
 
   await agents.first().hover({ position: { x: 2, y: 18 } });
-  await expect(page.locator('[data-sidebar-hover-card="agent"]')).toBeVisible({ timeout: 250 });
+  // Launcher hover cards require a deliberate 300ms dwell before opening
+  // (perf: a mouse pass-over during a workspace switch must not open them).
+  await expect(page.locator('[data-sidebar-hover-card="agent"]')).toBeVisible({ timeout: 1000 });
   await notes.first().focus();
   await expect(notes.first()).toBeFocused();
-  await expect(page.locator('[data-sidebar-hover-card="note"]')).toBeVisible({ timeout: 250 });
+  await expect(page.locator('[data-sidebar-hover-card="note"]')).toBeVisible({ timeout: 1000 });
   await agents.first().focus();
   await page.keyboard.press('Tab');
   await expect(agents.nth(1)).toBeFocused();

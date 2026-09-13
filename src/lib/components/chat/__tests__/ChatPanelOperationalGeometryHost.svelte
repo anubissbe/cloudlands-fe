@@ -1,8 +1,9 @@
 <script lang="ts">
-  import { onDestroy } from 'svelte';
+  import { onDestroy, untrack } from 'svelte';
   import { faComment } from '@fortawesome/free-solid-svg-icons';
   import type { AgentMessage, AgentSession, ContentBlock } from '$shared/types';
   import AgentTabType from '$features/layout/tab-types/AgentTabType.svelte';
+  import InitialAgentChatTabType from './InitialAgentChatTabType.svelte';
   import { tabTypeRegistry } from '$features/layout/tab-types/registry';
   import PanelLayout from '$lib/components/layout/panel-system/PanelLayout.svelte';
   import { startRootStoreLifecycle } from '$store/renderer/root-store-lifecycle';
@@ -20,7 +21,24 @@
     zoom = 1,
     width = 560,
     seamOnly = false,
-  }: { theme?: 'light' | 'dark'; zoom?: number; width?: number; seamOnly?: boolean } = $props();
+    detachedStatus = false,
+    reasoningSearchOnly = false,
+    groupedOrphanSearchOnly = false,
+    terminalStatusOnly = false,
+    setupCardOnly = false,
+  }: {
+    theme?: 'light' | 'dark';
+    zoom?: number;
+    width?: number;
+    seamOnly?: boolean;
+    detachedStatus?: boolean;
+    reasoningSearchOnly?: boolean;
+    groupedOrphanSearchOnly?: boolean;
+    terminalStatusOnly?: boolean;
+    setupCardOnly?: boolean;
+  } = $props();
+  const setupCardFixture = untrack(() => setupCardOnly);
+  const reasoningSearchFixture = untrack(() => reasoningSearchOnly);
   const workspaceId = 'chat-panel-operational-geometry';
   const agentId = 'chat-panel-operational-agent';
   const timestamp = '2026-08-17T12:00:00.000Z';
@@ -28,7 +46,11 @@
 
   const operationalContent = (prefix: string, includeStreamingThinking = false) =>
     [
-      { type: 'thinking', id: `${prefix}-thinking-a`, text: 'Inspect the production render path' },
+      {
+        type: 'thinking',
+        id: `${prefix}-thinking-a`,
+        text: 'Inspect the production render path\n\nGeometry detail.',
+      },
       {
         type: 'tool_use',
         id: `${prefix}-view`,
@@ -41,7 +63,11 @@
         tool_use_id: `${prefix}-view`,
         output: 'read complete',
       },
-      { type: 'thinking', id: `${prefix}-thinking-after-view`, text: 'Compare the tool row' },
+      {
+        type: 'thinking',
+        id: `${prefix}-thinking-after-view`,
+        text: 'Compare the tool row\n\nGeometry detail.',
+      },
       {
         type: 'tool_use',
         id: `${prefix}-context`,
@@ -60,7 +86,7 @@
       {
         type: 'thinking',
         id: `${prefix}-thinking-after-context`,
-        text: 'Compare the context row',
+        text: 'Compare the context row\n\nGeometry detail.',
       },
       {
         type: 'text',
@@ -116,7 +142,7 @@
       {
         type: 'thinking',
         id: `${prefix}-thinking-after-group`,
-        text: 'Compare the response group row',
+        text: 'Compare the response group row\n\nGeometry detail.',
       },
       {
         type: 'tool_use',
@@ -130,7 +156,11 @@
         tool_use_id: `${prefix}-command`,
         output: 'command complete',
       },
-      { type: 'thinking', id: `${prefix}-thinking-b`, text: 'Verify every final edge' },
+      {
+        type: 'thinking',
+        id: `${prefix}-thinking-b`,
+        text: 'Verify every final edge\n\nGeometry detail.',
+      },
       {
         type: 'tool_use',
         id: `${prefix}-input-only`,
@@ -204,7 +234,7 @@
   const thinking = (id: string): ContentBlock => ({
     type: 'thinking',
     id,
-    text: `Thinking ${id}`,
+    text: `Thinking ${id}\n\nGeometry detail.`,
   });
   const seamContent = (prefix: string, startsWithThinking = false) =>
     [
@@ -270,7 +300,7 @@
         tool_use_id: `${prefix}-tool`,
         output: `${prefix} complete`,
       },
-    ] as AgentMessage['contentBlocks'];
+    ] as NonNullable<AgentMessage['contentBlocks']>;
   const productionWrapperMessages = [
     {
       ...message('assistant-production-search', 'assistant', [
@@ -311,7 +341,7 @@
         {
           type: 'thinking',
           id: 'production-following-reasoning',
-          text: 'Trace the higher-level list wrapper',
+          text: 'Trace the higher-level list wrapper\n\nGeometry detail.',
         },
       ]),
       timestamp: '2026-08-17T11:00:02.000Z',
@@ -339,6 +369,108 @@
     message('assistant-finished', 'assistant', operationalContent('finished')),
     message('user-streaming', 'user', [{ type: 'text', text: 'Render the streaming rows' }]),
     message('assistant-streaming', 'assistant', operationalContent('streaming', true)),
+  ];
+  const terminalStatusMessages = [
+    message('user-stopped', 'user', [{ type: 'text', text: 'Render the stopped row' }]),
+    {
+      ...message('assistant-stopped', 'assistant', toolOnlyContent('stopped-reference')),
+      metadata: {
+        interrupted: true,
+        stopReason: 'interrupted',
+        interruptReason: 'user_stop',
+      },
+    } as AgentMessage,
+    message('user-abnormal-finish', 'user', [
+      { type: 'text', text: 'Render the abnormal finish row' },
+    ]),
+    {
+      ...message('assistant-abnormal-finish', 'assistant', [
+        ...toolOnlyContent('finish-reference'),
+        { type: 'text', text: '<group:Prepping>' },
+        {
+          type: 'thinking',
+          id: 'finish-reasoning-group',
+          text: 'Thinking\n\nInspect the terminal row geometry.',
+        },
+        { type: 'text', text: '</group:Prepping>' },
+      ]),
+      metadata: { finishReason: 'max_tokens' },
+    } as AgentMessage,
+  ];
+  const reasoningSearchMessages = [
+    message('user-inline-search', 'user', [
+      { type: 'text', text: 'Check inline reasoning search' },
+    ]),
+    message('assistant-inline-search', 'assistant', [
+      {
+        type: 'thinking',
+        id: 'inline-search-predecessor',
+        text: 'Inline headingless search target remains visible without opening anything.',
+      },
+      {
+        type: 'text',
+        id: 'inline-search-open',
+        text: '<group:Prepping>Visible inline description.',
+      },
+      {
+        type: 'thinking',
+        id: 'inline-search-later',
+        text: 'Later inline reasoning stays visible in source order.',
+      },
+      { type: 'text', id: 'inline-search-close', text: '</group:Prepping>Visible final prose.' },
+    ]),
+    message('user-titled-search', 'user', [
+      { type: 'text', text: 'Check titled reasoning search' },
+    ]),
+    message('assistant-titled-search', 'assistant', [
+      {
+        type: 'text',
+        id: 'titled-search-open',
+        text: '<group:Prepping>Visible titled description.',
+      },
+      {
+        type: 'thinking',
+        id: 'titled-search-reasoning',
+        text: 'Model-derived reasoning title\n\nHidden titled reasoning search target.',
+      },
+      {
+        type: 'text',
+        id: 'titled-search-close',
+        text: '</group:Prepping>Visible titled final prose.',
+      },
+    ]),
+  ];
+  const groupedOrphanSearchMessages = [
+    message('user-grouped-orphan-search', 'user', [
+      { type: 'text', text: 'Check grouped orphan search' },
+    ]),
+    message('assistant-grouped-orphan-search', 'assistant', [
+      { type: 'text', text: '<group:Grouped result search>Visible group summary.' },
+      {
+        type: 'tool_use',
+        id: 'grouped-search-tool',
+        toolCallId: 'grouped-search-call',
+        name: 'view',
+        input: { path: 'src/grouped-search.ts' },
+      },
+      {
+        type: 'tool_result',
+        id: 'grouped-search-paired-result',
+        tool_use_id: 'grouped-search-call',
+        output: 'grouped-search-paired-marker',
+      },
+      { type: 'text', text: 'Visible middle content.' },
+      {
+        type: 'tool_result',
+        id: 'grouped-search-orphan-result',
+        tool_use_id: 'missing-grouped-search-call',
+        output: { output: 'grouped-search-orphan-tool-marker' },
+      },
+      { type: 'text', text: 'Visible ending content.</group:Grouped result search>' },
+    ]),
+    message('user-after-grouped-orphan-search', 'user', [
+      { type: 'text', text: 'Continue after grouped orphan search' },
+    ]),
   ];
   const seamMessages = [
     {
@@ -379,16 +511,35 @@
     message('assistant-tool-message-streaming', 'assistant', toolOnlyContent('message-streaming')),
   ];
   // svelte-ignore state_referenced_locally -- each CT mount uses one immutable fixture scenario.
-  const messages = seamOnly ? seamMessages : alignmentMessages;
+  const messages = setupCardFixture
+    ? []
+    : terminalStatusOnly
+      ? terminalStatusMessages
+      : groupedOrphanSearchOnly
+        ? groupedOrphanSearchMessages
+        : reasoningSearchOnly
+          ? reasoningSearchMessages
+          : seamOnly
+            ? seamMessages
+            : alignmentMessages;
+  // svelte-ignore state_referenced_locally -- each CT mount uses one immutable fixture scenario.
+  const fixtureIsStreaming =
+    !setupCardFixture &&
+    !terminalStatusOnly &&
+    !reasoningSearchOnly &&
+    !groupedOrphanSearchOnly &&
+    !detachedStatus;
   const session = {
     id: agentId,
     workspaceId,
     name: 'Operational geometry agent',
     status: 'active',
     isActive: true,
-    isStreaming: true,
-    isProcessing: true,
-    isResponding: true,
+    isStreaming: fixtureIsStreaming,
+    isProcessing: !setupCardFixture && !reasoningSearchFixture,
+    isResponding: !setupCardFixture && !reasoningSearchFixture,
+    isInitialAgent: setupCardFixture,
+    metadata: setupCardFixture ? { isInitialAgent: true } : undefined,
     messages,
     createdAt: timestamp,
     updatedAt: timestamp,
@@ -396,7 +547,7 @@
 
   tabTypeRegistry.register({
     type: 'agent',
-    component: AgentTabType,
+    component: setupCardFixture ? InitialAgentChatTabType : AgentTabType,
     icon: faComment,
     defaultTitle: 'Agent',
     categoryLabel: 'Agents',
@@ -408,6 +559,8 @@
     setWorkspaceEntity({
       id: workspaceId,
       title: 'Operational geometry',
+      repositoryName: setupCardFixture ? 'intent' : undefined,
+      repositoryPath: setupCardFixture ? '/tmp/intent' : undefined,
       branch: 'test',
       status: 'active',
       path: '/tmp/chat-panel-operational-geometry',
@@ -444,7 +597,7 @@
 </script>
 
 <section class:dark={theme === 'dark'} style:zoom data-testid="chat-panel-operational-host">
-  <div class="h-[900px]" style:width="{width}px">
+  <div style:height="900px" style:width="{width}px">
     <PanelLayout {workspaceId} layoutId={workspaceId} contained />
   </div>
 </section>

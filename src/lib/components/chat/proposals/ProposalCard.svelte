@@ -1,7 +1,15 @@
 <script lang="ts">
+  /* eslint-disable max-lines -- sibling mode remains in the single shared proposal renderer */
   import { tick, untrack } from 'svelte';
   import Fa from 'svelte-fa';
-  import { faCircleCheck, faPencil } from '@fortawesome/free-solid-svg-icons';
+  import {
+    faCircleCheck,
+    faCodeBranch,
+    faFolderPlus,
+    faListCheck,
+    faPencil,
+    faRobot,
+  } from '@fortawesome/free-solid-svg-icons';
   import { Button } from '$lib/components/ui/button';
   import { getSpecialistById } from '$lib/constants/specialists';
   import { DiffViewer } from '$features/file-tracking/components/diff';
@@ -22,7 +30,9 @@
   import BulkProposalItems from './BulkProposalItems.svelte';
   import SettingsChangeCard from './SettingsChangeCard.svelte';
   import SpecialistChangeCard from './SpecialistChangeCard.svelte';
+  import ProposalCardHeader from './ProposalCardHeader.svelte';
   import { getProposalId } from './proposal-id';
+  import type { ProposalCardDraft } from './proposal-draft-storage';
   import { goto } from '$app/navigation';
   import {
     selectProposalError,
@@ -30,7 +40,13 @@
     selectProposalResult,
     selectProposalStatus,
   } from '$store/renderer/slices/proposal-lifecycle/proposal-lifecycle-selectors';
-  import { requestPrBranchLookup } from '$store/renderer/slices/pr-branch-lookup/pr-branch-lookup-slice';
+  import { invoke } from '$lib/electron-bridge';
+  import {
+    getPrBranchLookupKey,
+    prBranchLookupFailed as prBranchLookupFailedAction,
+    prBranchLookupStarted,
+    prBranchLookupSucceeded,
+  } from '$store/renderer/slices/pr-branch-lookup/pr-branch-lookup-slice';
   import { selectPrBranchLookupEntries } from '$store/renderer/slices/pr-branch-lookup/pr-branch-lookup-selectors';
   import type { PrBranchLookupRequest } from '$store/renderer/slices/pr-branch-lookup/pr-branch-lookup-types';
   import { store as appStore } from '$store/renderer/store';
@@ -42,10 +58,23 @@
   interface Props {
     proposal: Proposal;
     disabled?: boolean;
-    neutralBorder?: boolean;
     onApply?: (detail: ProposalActionDetail) => void;
     onDiscard?: (detail: ProposalActionDetail) => void;
     onUndo?: (proposalId: string) => void;
+    /**
+     * Tray-hosted restore: transient edits (field values, bulk selections,
+     * workspace-create text edits) captured by a previous mount. Applied
+     * once at init — later changes to the prop are ignored, so the tray
+     * remounts the card (`{#key proposalId}`) to change it.
+     */
+    initialDraft?: ProposalCardDraft | null;
+    /** Reports every transient-edit change so the tray can persist it. */
+    onDraftChange?: (draft: ProposalCardDraft) => void;
+    /**
+     * Tray-hosted Dismiss: skip the local "Discarded" tombstone state so the
+     * host can route discard through its own confirm dialog + resolve flow.
+     */
+    suppressLocalDiscard?: boolean;
   }
 
   type EditorHandle = {
@@ -60,22 +89,34 @@
   let {
     proposal,
     disabled = false,
-    neutralBorder = false,
     onApply,
     onDiscard,
     onUndo,
+    initialDraft = null,
+    onDraftChange,
+    suppressLocalDiscard = false,
   }: Props = $props();
+
+  // Captured once at init (tray remounts per proposal via {#key}), so a
+  // teardown-frame prop change can never re-overlay stale edits.
+  // svelte-ignore state_referenced_locally
+  const restoredDraft = initialDraft;
 
   let rootElement = $state<HTMLElement | undefined>();
   let statusElement = $state<HTMLElement | undefined>();
   let isDismissed = $state(false);
   let fieldValues = $state<Record<string, string>>({});
+  // Settings proposals delegate field editing to SettingsChangeCard; its
+  // string-serialized enum edits stand in for `fieldValues` in the draft.
+  let settingsEditedFields = $state<Record<string, string> | null>(null);
   let selectedBulkItemIds = $state<string[]>([]);
   let editingFieldKey = $state<string | null>(null);
   let draftFieldValue = $state('');
   let activeEditor = $state<EditorHandle | undefined>();
   let syncedWorkspaceProposal: Proposal | undefined;
+  let workspaceTitle = $state('');
   let workspaceInitialPrompt = $state('');
+  let workspaceShortcutEditorFocused = $state(false);
   let workspaceRepoPath = $state('');
   let workspaceRepoType = $state<WorkspaceCreateRepoType>('local');
   let workspaceGithubUrl = $state('');
@@ -92,19 +133,25 @@
   let proposedBranchMissing = $state('');
   let branchListDefault = $state('');
   const BEFORE_AFTER_STACK_THRESHOLD = 40;
+  // Cross-render dedup for direct PR-branch lookups; the store's `loading`
+  // entry (written synchronously by prBranchLookupStarted) dedups across
+  // component instances.
+  const prBranchLookupInFlightKeys = new Set<string>();
 
   const prBranchLookupEntries = selectPrBranchLookupEntries();
 
   const fields = $derived(proposal.preview.fields ?? []);
   const bulkItems = $derived(proposal.preview.bulkItems ?? []);
   const diff = $derived(proposal.preview.diff);
-  const kindLabel = $derived(proposal.kind.replace(/-/g, ' '));
   const proposalId = $derived(getProposalId(proposal));
   const lifecycleStatus = selectProposalStatus(untrack(() => proposalId));
   const lifecycleError = selectProposalError(untrack(() => proposalId));
   const lifecycleErrorCode = selectProposalErrorCode(untrack(() => proposalId));
   const lifecycleResult = selectProposalResult(untrack(() => proposalId));
   const isWorkspaceCreate = $derived(proposal.kind === 'workspace-create');
+  const isSiblingWorkspaceCreate = $derived(
+    isWorkspaceCreate && proposal.preview.workspaceCreate?.mode === 'sibling',
+  );
   const settingsProposal = $derived(isSettingsChangeProposal(proposal) ? proposal : undefined);
   const specialistProposal = $derived(isSpecialistEditProposal(proposal) ? proposal : undefined);
   const shortcutModifier = $derived(
@@ -114,8 +161,12 @@
   const isUndoing = $derived($lifecycleStatus === 'undoing');
   const isFailed = $derived($lifecycleStatus === 'failed');
   const isApplied = $derived($lifecycleStatus === 'applied');
+  const showDismissed = $derived(isDismissed);
   const createdWorkspaceId = $derived($lifecycleResult?.workspaceId);
   const isWorkspaceCreated = $derived(isWorkspaceCreate && isApplied);
+  const workspaceHeading = $derived(
+    isSiblingWorkspaceCreate ? workspaceTitle : proposal.preview.title,
+  );
   const createdRepoLabel = $derived.by(() => {
     if (workspaceRepoType === 'github' && workspaceGithubUrl) {
       const ownerRepo = parseGithubOwnerRepo(workspaceGithubUrl);
@@ -156,25 +207,82 @@
   const actionDisabled = $derived(
     disabled || isApplying || isUndoing || isApplied || isAwaitingPrBranchLookup || prBranchLoading,
   );
+  const showWorkspaceShortcutHint = $derived(
+    isSiblingWorkspaceCreate && workspaceShortcutEditorFocused && !actionDisabled,
+  );
   const metadataIdPrefix = $derived(`proposal-${toDomId(proposalId)}`);
   const cardClass = $derived.by(() => {
     if (isWorkspaceCreate) {
-      return isWorkspaceCreated && !neutralBorder
-        ? 'my-2 min-w-0 w-full max-w-xl rounded-(--radius-medium) border border-success/40 bg-card p-4 shadow-(--elevation-raised) sm:p-5'
-        : 'my-2 min-w-0 w-full max-w-xl rounded-(--radius-medium) border border-border bg-card p-4 shadow-(--elevation-raised) sm:p-5';
+      return isWorkspaceCreated
+        ? 'min-w-0 w-full rounded-(--radius-large) border border-success/40 bg-card p-4 shadow-(--elevation-raised) sm:p-5'
+        : 'min-w-0 w-full overflow-hidden rounded-(--radius-large) border border-border bg-card shadow-(--elevation-raised)';
     }
-    return isApplied && !neutralBorder
-      ? 'my-2 min-w-0 w-full max-w-xl overflow-hidden rounded-(--radius-medium) border border-success/40 bg-card shadow-(--elevation-raised)'
-      : 'my-2 min-w-0 w-full max-w-xl overflow-hidden rounded-(--radius-medium) border border-border bg-card shadow-(--elevation-raised)';
+    return isApplied
+      ? 'min-w-0 w-full overflow-hidden rounded-(--radius-large) border border-success/40 bg-card shadow-(--elevation-raised)'
+      : 'min-w-0 w-full overflow-hidden rounded-(--radius-large) border border-border bg-card shadow-(--elevation-raised)';
   });
 
+  // One-shot restored-draft overlays: consumed on the first run of the
+  // matching sync effect so a later proposal identity change (remount-less
+  // hosts) resets cleanly from the proposal itself.
+  let pendingFieldDraft = restoredDraft;
+  let pendingWorkspaceDraft = restoredDraft?.workspace ?? null;
+
   $effect(() => {
-    fieldValues = Object.fromEntries(
+    const defaults = Object.fromEntries(
       fields.map((field) => [field.key, formatValue(getFieldValue(field))]),
     );
-    selectedBulkItemIds = bulkItems
+    const defaultBulkIds = bulkItems
       .filter((item) => item.selected !== false && !item.disabled)
       .map((item) => item.id);
+    if (pendingFieldDraft) {
+      const draft = pendingFieldDraft;
+      pendingFieldDraft = null;
+      const knownKeys = new Set(Object.keys(defaults));
+      const knownBulkIds = new Set(bulkItems.map((item) => item.id));
+      fieldValues = {
+        ...defaults,
+        ...Object.fromEntries(
+          Object.entries(draft.fieldValues).filter(([key]) => knownKeys.has(key)),
+        ),
+      };
+      selectedBulkItemIds =
+        bulkItems.length > 0
+          ? draft.selectedBulkItemIds.filter((id) => knownBulkIds.has(id))
+          : defaultBulkIds;
+      return;
+    }
+    fieldValues = defaults;
+    selectedBulkItemIds = defaultBulkIds;
+  });
+
+  // Report transient edits to a tray host so they survive unmount/reload.
+  // The first run only captures the initial (possibly restored) snapshot.
+  // Settings proposals report the child card's enum edits in place of the
+  // outer card's (unused) fieldValues.
+  let draftReportPrimed = false;
+  $effect(() => {
+    const snapshot: ProposalCardDraft = {
+      fieldValues: settingsProposal
+        ? { ...(settingsEditedFields ?? restoredDraft?.fieldValues ?? {}) }
+        : { ...fieldValues },
+      selectedBulkItemIds: [...selectedBulkItemIds],
+      ...(isWorkspaceCreate
+        ? {
+            workspace: {
+              title: workspaceTitle,
+              initialPrompt: workspaceInitialPrompt,
+              branch: workspaceBranch,
+              specialist: workspaceSpecialist,
+            },
+          }
+        : {}),
+    };
+    if (!draftReportPrimed) {
+      draftReportPrimed = true;
+      return;
+    }
+    onDraftChange?.(snapshot);
   });
 
   $effect(() => {
@@ -193,7 +301,9 @@
     if (!isWorkspaceCreate || syncedWorkspaceProposal === proposal) return;
     syncedWorkspaceProposal = proposal;
     const workspaceCreate = getWorkspaceCreateFields();
+    workspaceTitle = workspaceCreate.title ?? '';
     workspaceInitialPrompt = workspaceCreate.initialPrompt ?? '';
+    workspaceShortcutEditorFocused = false;
     workspaceRepoPath = workspaceCreate.repoPath ?? '';
     workspaceRepoType = workspaceCreate.repoType ?? 'local';
     workspaceGithubUrl = workspaceCreate.githubUrl ?? '';
@@ -208,6 +318,18 @@
     prBranchLookupRequest = undefined;
     proposedBranchMissing = '';
     branchListDefault = '';
+    if (pendingWorkspaceDraft) {
+      const draft = pendingWorkspaceDraft;
+      pendingWorkspaceDraft = null;
+      workspaceTitle = draft.title;
+      workspaceInitialPrompt = draft.initialPrompt;
+      workspaceSpecialist = draft.specialist;
+      if (draft.branch && draft.branch !== workspaceBranch) {
+        // Restored user-chosen branch: suppress the PR-head lookup override.
+        workspaceBranch = draft.branch;
+        prBranchUserEdited = true;
+      }
+    }
   });
 
   $effect(() => {
@@ -234,7 +356,7 @@
     if (!prBranchLookupRequest || !prBranchLookupKey || prBranchLookup) return;
     if (!canUseElectronPrLookup()) return;
 
-    appStore.dispatch(requestPrBranchLookup(prBranchLookupRequest));
+    void performPrBranchLookup(prBranchLookupRequest);
   });
 
   $effect(() => {
@@ -348,6 +470,47 @@
     return window.electronAPI.versions?.electron !== '0.0.0-browser';
   }
 
+  async function performPrBranchLookup(request: PrBranchLookupRequest): Promise<void> {
+    const payload = { ...request, key: getPrBranchLookupKey(request) };
+    if (prBranchLookupInFlightKeys.has(payload.key)) return;
+
+    prBranchLookupInFlightKeys.add(payload.key);
+    appStore.dispatch(prBranchLookupStarted(payload));
+
+    try {
+      const response = await invoke<{
+        success: boolean;
+        data?: { sourceBranch?: string };
+        error?: string;
+      }>('git-tracking:get-pull-request', {
+        owner: payload.owner,
+        repo: payload.repo,
+        number: payload.prNumber,
+      });
+      const branch = response?.success ? response.data?.sourceBranch?.trim() : undefined;
+
+      if (branch) {
+        appStore.dispatch(prBranchLookupSucceeded(payload, branch));
+        return;
+      }
+
+      appStore.dispatch(
+        // i18n-ignore — internal store error string, never rendered directly
+        prBranchLookupFailedAction(payload, response?.error ?? 'Could not detect PR branch'),
+      );
+    } catch (error) {
+      appStore.dispatch(
+        prBranchLookupFailedAction(
+          payload,
+          // i18n-ignore — internal store error string, never rendered directly
+          error instanceof Error ? error.message : 'PR branch lookup failed',
+        ),
+      );
+    } finally {
+      prBranchLookupInFlightKeys.delete(payload.key);
+    }
+  }
+
   function toDomId(value: string): string {
     return value.replace(/[^a-zA-Z0-9_-]+/g, '-');
   }
@@ -381,6 +544,8 @@
       getFieldString('repositoryPath') ??
       (repoInput ? repositoryFallbackPath(repoInput, githubUrl) : undefined);
     return {
+      mode: preview.mode,
+      title: preview.title ?? stringParam('title'),
       initialPrompt:
         preview.initialPrompt ??
         (typeof getInitialAgentValue('prompt') === 'string'
@@ -564,15 +729,18 @@
 
   function buildWorkspaceEditedFields(): Record<string, unknown> {
     const editedFields: Record<string, unknown> = {};
+    if (isSiblingWorkspaceCreate) editedFields.title = workspaceTitle.trim();
     addPopulatedField(editedFields, 'initialPrompt', workspaceInitialPrompt);
-    addPopulatedField(editedFields, 'repoPath', workspaceRepoPath);
-    addPopulatedField(editedFields, 'repoType', workspaceRepoType);
-    addPopulatedField(editedFields, 'githubUrl', workspaceGithubUrl);
-    addPopulatedField(editedFields, 'clonePath', workspaceClonePath);
+    if (!isSiblingWorkspaceCreate) {
+      addPopulatedField(editedFields, 'repoPath', workspaceRepoPath);
+      addPopulatedField(editedFields, 'repoType', workspaceRepoType);
+      addPopulatedField(editedFields, 'githubUrl', workspaceGithubUrl);
+      addPopulatedField(editedFields, 'clonePath', workspaceClonePath);
+      addPopulatedField(editedFields, 'isNewRepo', workspaceIsNewRepo);
+      addPopulatedField(editedFields, 'isValidPath', workspaceIsValidPath);
+      addPopulatedField(editedFields, 'scope', workspaceScope);
+    }
     addPopulatedField(editedFields, 'branch', workspaceBranch);
-    addPopulatedField(editedFields, 'isNewRepo', workspaceIsNewRepo);
-    addPopulatedField(editedFields, 'isValidPath', workspaceIsValidPath);
-    addPopulatedField(editedFields, 'scope', workspaceScope);
     addPopulatedField(editedFields, 'specialist', workspaceSpecialist);
     return editedFields;
   }
@@ -582,6 +750,21 @@
     if (event.key !== 'Enter' || (!event.metaKey && !event.ctrlKey)) return;
     event.preventDefault();
     handleApply();
+  }
+
+  function handleWorkspaceEditorFocus() {
+    if (isSiblingWorkspaceCreate && !actionDisabled) workspaceShortcutEditorFocused = true;
+  }
+
+  function handleWorkspaceEditorBlur(event: FocusEvent) {
+    const nextElement = event.relatedTarget;
+    if (
+      nextElement instanceof HTMLElement &&
+      nextElement.hasAttribute('data-workspace-shortcut-editor')
+    ) {
+      return;
+    }
+    workspaceShortcutEditorFocused = false;
   }
 
   function cardKeyboardShortcut(node: HTMLElement) {
@@ -624,7 +807,7 @@
     if (isUndoing) return m.chat_shared_undoing_label();
     if (isFailed)
       return `${m.chat_shared_actionFailed_label()}${$lifecycleError ? `: ${$lifecycleError}` : ''}`;
-    if ($lifecycleStatus === 'applied') return m.chat_shared_appliedStatus_label();
+    if (isApplied) return m.chat_shared_appliedStatus_label();
     return '';
   }
 
@@ -638,7 +821,7 @@
   function handleDiscard() {
     if (actionDisabled) return;
     const detail = buildDetail();
-    isDismissed = true;
+    if (!suppressLocalDiscard) isDismissed = true;
     onDiscard?.(detail);
     emitAction('proposaldiscard', detail);
   }
@@ -650,17 +833,31 @@
   }
 </script>
 
-{#if isDismissed}
-  <div
-    class="type-body my-2 rounded-(--radius-medium) border border-border bg-muted/30 px-3 py-2 text-muted-foreground"
-  >
+{#if showDismissed}
+  <div class="type-body px-3 py-2 text-muted-foreground">
     {m.chat_shared_discarded_label()}
     {proposal.preview.title}
   </div>
 {:else if settingsProposal}
-  <SettingsChangeCard proposal={settingsProposal} {disabled} {onApply} {onDiscard} {onUndo} />
+  <SettingsChangeCard
+    proposal={settingsProposal}
+    {disabled}
+    {onApply}
+    {onDiscard}
+    {onUndo}
+    {suppressLocalDiscard}
+    initialEditedFields={restoredDraft?.fieldValues ?? null}
+    onEditedFieldsChange={(fields) => (settingsEditedFields = fields)}
+  />
 {:else if specialistProposal}
-  <SpecialistChangeCard proposal={specialistProposal} {disabled} {onApply} {onDiscard} {onUndo} />
+  <SpecialistChangeCard
+    proposal={specialistProposal}
+    {disabled}
+    {onApply}
+    {onDiscard}
+    {onUndo}
+    {suppressLocalDiscard}
+  />
 {:else}
   <section
     bind:this={rootElement}
@@ -681,7 +878,7 @@
               <Fa icon={faCircleCheck} class="h-4 w-4 text-success" />
             </span>
             <h3 class="type-body min-w-0 font-medium leading-snug text-foreground">
-              {proposal.preview.title}
+              {workspaceHeading}
             </h3>
           </div>
 
@@ -732,92 +929,133 @@
           </div>
         </div>
       {:else}
-        <div class="space-y-4">
-          <h3 class="type-body font-medium leading-snug text-foreground">
-            {proposal.preview.title}
-          </h3>
-
-          <Textarea
-            bind:value={workspaceInitialPrompt}
-            placeholder={m.chat_proposalCard_initialPrompt_placeholder()}
-            minHeight={112}
-            maxHeight={240}
-            doesExpandToFit
-            noFocusStyle
-            class="resize-y"
+        <div class="space-y-5 p-5">
+          <ProposalCardHeader
+            icon={faFolderPlus}
+            title={m.chat_proposalCard_createNewWorkspace_title()}
           />
 
-          <div class="space-y-1.5">
-            <div
-              class="grid grid-cols-[6rem_minmax(0,1fr)] items-center gap-x-2"
-              data-row="metadata"
-              role="group"
-              aria-labelledby={`${metadataIdPrefix}-repo-label`}
-            >
-              <span
-                id={`${metadataIdPrefix}-repo-label`}
-                class="type-caption font-medium text-muted-foreground"
-                data-metadata-label
-              >
-                {m.chat_proposalCard_repo_label()}
+          {#if isSiblingWorkspaceCreate}
+            <label class="block space-y-2">
+              <span class="type-caption font-medium text-muted-foreground">
+                {m.chat_proposalCard_workspaceName_label()}
               </span>
-              <div class="min-w-0" data-testid="proposal-repo-picker">
-                <RepoAndBranchPicker
-                  repoPath={workspaceRepoPath}
-                  repoType={workspaceRepoType}
-                  githubUrl={workspaceGithubUrl}
-                  isNewRepo={workspaceIsNewRepo}
-                  presentation="metadata"
-                  field="repo"
-                  onRepoChange={handleRepoChange}
-                />
-              </div>
-            </div>
+              <Input
+                bind:value={workspaceTitle}
+                aria-label={m.workspace_page_space_title()}
+                placeholder={m.ui_editableName_placeholder()}
+                maxlength={100}
+                disabled={actionDisabled}
+                data-testid="proposal-workspace-title"
+                data-workspace-shortcut-editor
+                class="font-medium"
+                onfocus={handleWorkspaceEditorFocus}
+                onblur={handleWorkspaceEditorBlur}
+              />
+            </label>
+          {:else}
+            <p class="type-body font-medium leading-snug text-foreground">
+              {proposal.preview.title}
+            </p>
+          {/if}
 
+          <label class="block space-y-2">
+            <span class="type-caption font-medium text-muted-foreground">
+              {m.chat_proposalCard_task_label()}
+            </span>
+            <Textarea
+              bind:value={workspaceInitialPrompt}
+              placeholder={m.chat_proposalCard_initialPrompt_placeholder()}
+              minHeight={112}
+              maxHeight={240}
+              doesExpandToFit
+              noFocusStyle
+              disabled={actionDisabled}
+              data-workspace-shortcut-editor={isSiblingWorkspaceCreate ? '' : undefined}
+              class="resize-y px-3.5 py-3"
+              onfocus={handleWorkspaceEditorFocus}
+              onblur={handleWorkspaceEditorBlur}
+            />
+          </label>
+
+          <div
+            class="overflow-hidden rounded-(--radius-large) border border-border bg-muted/30 divide-y divide-border"
+            data-testid="proposal-metadata-group"
+          >
             <div
-              class="grid grid-cols-[6rem_minmax(0,1fr)] items-start gap-x-2"
+              class="flex min-w-0 items-center gap-3 px-3 py-2.5"
               data-row="metadata"
               role="group"
-              aria-labelledby={`${metadataIdPrefix}-branch-label`}
+              aria-labelledby={`${metadataIdPrefix}-project-label`}
             >
               <span
-                id={`${metadataIdPrefix}-branch-label`}
-                class="type-caption pt-1 font-medium text-muted-foreground"
-                data-metadata-label
+                class="flex size-8 shrink-0 items-center justify-center rounded-md bg-background text-muted-foreground shadow-xs"
+                aria-hidden="true"
               >
-                {m.chat_proposalCard_baseBranch_label()}
+                <Fa icon={faCodeBranch} class="size-3.5" />
               </span>
-              <div class="min-w-0 space-y-1">
-                <div
-                  bind:this={branchRowElement}
-                  class={branchNeedsAttention
-                    ? 'min-w-0 rounded-md ring-1 ring-amber-500/70 focus:outline-none'
-                    : 'min-w-0 focus:outline-none'}
-                  data-testid="proposal-branch-picker"
-                  data-branch-warning={branchNeedsAttention ? 'true' : undefined}
-                  tabindex="-1"
-                  role="group"
-                  aria-label={m.chat_proposalCard_baseBranch_label()}
-                  aria-describedby={proposedBranchMissing
-                    ? `${metadataIdPrefix}-branch-mismatch`
-                    : undefined}
+              <div class="min-w-0 flex-1">
+                <span
+                  id={`${metadataIdPrefix}-project-label`}
+                  class="type-caption block font-medium text-muted-foreground"
+                  data-metadata-label
                 >
-                  <RepoAndBranchPicker
-                    repoPath={workspaceRepoPath}
-                    branch={workspaceBranch}
-                    repoType={workspaceRepoType}
-                    githubUrl={workspaceGithubUrl}
-                    presentation="metadata"
-                    field="branch"
-                    isLoading={prBranchLoading}
-                    onBranchChange={handleBranchChange}
-                    onBranchesLoaded={handleBranchesLoaded}
-                  />
+                  {m.chat_proposalCard_project_label()}
+                </span>
+                <div class="flex min-w-0 items-center gap-1">
+                  {#if isSiblingWorkspaceCreate}
+                    <span
+                      class="type-body min-w-0 truncate font-normal text-foreground"
+                      data-testid="proposal-repo-locked"
+                      title={createdRepoLabel}
+                    >
+                      {createdRepoLabel}
+                    </span>
+                  {:else}
+                    <div class="min-w-0 flex-1" data-testid="proposal-repo-picker">
+                      <RepoAndBranchPicker
+                        repoPath={workspaceRepoPath}
+                        repoType={workspaceRepoType}
+                        githubUrl={workspaceGithubUrl}
+                        isNewRepo={workspaceIsNewRepo}
+                        presentation="metadata"
+                        field="repo"
+                        onRepoChange={handleRepoChange}
+                      />
+                    </div>
+                  {/if}
+                  <span class="type-body shrink-0 text-muted-foreground" aria-hidden="true">/</span>
+                  <div
+                    bind:this={branchRowElement}
+                    class={branchNeedsAttention
+                      ? 'min-w-0 max-w-[50%] rounded-md ring-1 ring-amber-500/70 focus:outline-none'
+                      : 'min-w-0 max-w-[50%] focus:outline-none'}
+                    data-testid="proposal-branch-picker"
+                    data-branch-warning={branchNeedsAttention ? 'true' : undefined}
+                    tabindex="-1"
+                    role="group"
+                    aria-label={m.chat_proposalCard_baseBranch_label()}
+                    aria-describedby={proposedBranchMissing
+                      ? `${metadataIdPrefix}-branch-mismatch`
+                      : undefined}
+                  >
+                    <RepoAndBranchPicker
+                      repoPath={workspaceRepoPath}
+                      branch={workspaceBranch}
+                      repoType={workspaceRepoType}
+                      githubUrl={workspaceGithubUrl}
+                      presentation="metadata"
+                      field="branch"
+                      isLoading={prBranchLoading}
+                      onBranchChange={handleBranchChange}
+                      onBranchesLoaded={handleBranchesLoaded}
+                    />
+                  </div>
                 </div>
                 {#if proposedBranchMissing}
                   <p
                     id={`${metadataIdPrefix}-branch-mismatch`}
-                    class="px-2 text-xs text-amber-600 dark:text-amber-400"
+                    class="type-caption mt-1 text-amber-600 dark:text-amber-400"
                     data-testid="proposal-branch-mismatch-warning"
                   >
                     {m.chat_proposalCard_branchNotFound_label({
@@ -829,7 +1067,7 @@
                 {/if}
                 {#if prBranchLookupFailed}
                   <p
-                    class="type-caption px-2 text-muted-foreground"
+                    class="type-caption mt-1 text-muted-foreground"
                     data-testid="proposal-branch-lookup-failure"
                   >
                     {m.chat_proposalCard_branchLookupFailed_label()}
@@ -839,18 +1077,24 @@
             </div>
 
             <div
-              class="grid grid-cols-[6rem_minmax(0,1fr)] items-center gap-x-2"
+              class="flex min-w-0 items-center gap-3 px-3 py-2.5"
               data-row="metadata"
               data-testid="proposal-specialist-dropdown"
               role="group"
               aria-labelledby={`${metadataIdPrefix}-specialist-label`}
             >
               <span
+                class="flex size-8 shrink-0 items-center justify-center rounded-md bg-background text-muted-foreground shadow-xs"
+                aria-hidden="true"
+              >
+                <Fa icon={faRobot} class="size-3.5" />
+              </span>
+              <span
                 id={`${metadataIdPrefix}-specialist-label`}
-                class="type-caption font-medium text-muted-foreground"
+                class="type-caption sr-only font-medium text-muted-foreground"
                 data-metadata-label
               >
-                {m.chat_proposalCard_specialist_label()}
+                {m.chat_proposalCard_initialAgent_label()}
               </span>
               <SpecialistDropdown
                 value={workspaceSpecialist}
@@ -875,7 +1119,7 @@
             <div
               bind:this={statusElement}
               class={isFailed
-                ? 'type-caption text-error-foreground focus:outline-none'
+                ? 'type-caption text-danger focus:outline-none'
                 : 'type-caption text-muted-foreground focus:outline-none'}
               role="status"
               aria-live={isFailed ? 'assertive' : 'polite'}
@@ -884,51 +1128,46 @@
               {statusMessage}
             </div>
           {/if}
-
-          <div class="flex items-center justify-end gap-2 pt-1">
-            <Button variant="outline" size="sm" disabled={actionDisabled} onclick={handleDiscard}
-              >{m.chat_shared_discard_label()}</Button
-            >
-            <Button
-              size="sm"
-              disabled={actionDisabled}
-              onclick={handleApply}
-              aria-keyshortcuts="Enter"
-            >
-              <span>
-                {isAwaitingPrBranchLookup
-                  ? m.chat_proposalCard_detectingBranch_label()
-                  : isApplying
-                    ? m.chat_shared_applying_label()
-                    : isFailed
-                      ? m.chat_shared_retry_label()
-                      : m.chat_proposalCard_createWorkspace_label()}
-              </span>
-              {#if !isApplying && !isFailed}
-                <span class="opacity-50">{shortcutModifier}+↵</span>
-              {/if}
-            </Button>
-          </div>
+        </div>
+        <div
+          class="flex items-center justify-end gap-2 border-t border-border bg-muted/30 px-5 py-4"
+        >
+          <Button variant="outline" size="sm" disabled={actionDisabled} onclick={handleDiscard}
+            >{m.chat_shared_discard_label()}</Button
+          >
+          <Button
+            size="sm"
+            class="border-primary bg-primary text-primary-foreground hover:border-primary hover:bg-primary/90 hover:text-primary-foreground active:bg-primary/80"
+            disabled={actionDisabled}
+            onclick={handleApply}
+            aria-keyshortcuts="Enter"
+          >
+            <span>
+              {isAwaitingPrBranchLookup
+                ? m.chat_proposalCard_detectingBranch_label()
+                : isApplying
+                  ? m.chat_shared_applying_label()
+                  : isFailed
+                    ? m.chat_shared_retry_label()
+                    : m.chat_proposalCard_createWorkspace_label()}
+            </span>
+            {#if isSiblingWorkspaceCreate ? showWorkspaceShortcutHint : !isApplying && !isFailed}
+              <span class="opacity-50">{shortcutModifier}+↵</span>
+            {/if}
+          </Button>
         </div>
       {/if}
     {:else}
-      <div class="px-3 pt-3">
-        <div class="min-w-0 space-y-0.5">
-          <div class="type-caption font-medium uppercase tracking-wide text-muted-foreground">
-            {kindLabel}
-          </div>
-          <h3 class="type-body font-medium leading-snug text-foreground">
-            {proposal.preview.title}
-          </h3>
-          {#if proposal.preview.summary}
-            <p class="type-body leading-relaxed text-muted-foreground">
-              {proposal.preview.summary}
-            </p>
-          {/if}
-        </div>
+      <div class="px-5 pt-5">
+        <ProposalCardHeader
+          icon={faListCheck}
+          title={m.chat_proposalCard_bulkQuestion_title()}
+          summary={proposal.preview.summary}
+        />
       </div>
 
-      <div class="space-y-3 px-3 py-2.5">
+      <div class="space-y-3 px-5 py-4">
+        <p class="type-body font-medium text-foreground">{proposal.preview.title}</p>
         {#if fields.length > 0}
           <div class="space-y-1.5">
             {#each fields as field (field.key)}
@@ -1145,7 +1384,7 @@
           class={isApplied
             ? 'type-caption border-t border-success/30 bg-success/10 px-3 py-2 text-success focus:outline-none'
             : isFailed
-              ? 'type-caption border-t border-border px-3 py-2 text-error-foreground focus:outline-none'
+              ? 'type-caption border-t border-border px-3 py-2 text-danger focus:outline-none'
               : 'type-caption border-t border-border px-3 py-2 text-muted-foreground focus:outline-none'}
           role="status"
           aria-live={isFailed ? 'assertive' : 'polite'}
@@ -1166,13 +1405,14 @@
 
       {#if !isApplied}
         <div
-          class="flex items-center justify-end gap-2 border-t border-border bg-muted/10 px-3 py-3"
+          class="flex items-center justify-end gap-2 border-t border-border bg-muted/30 px-5 py-4"
         >
           <Button variant="outline" size="sm" disabled={actionDisabled} onclick={handleDiscard}
             >{m.chat_shared_discard_label()}</Button
           >
           <Button
             size="sm"
+            class="border-primary bg-primary text-primary-foreground hover:border-primary hover:bg-primary/90 hover:text-primary-foreground active:bg-primary/80"
             disabled={actionDisabled}
             onclick={handleApply}
             aria-keyshortcuts="Enter"

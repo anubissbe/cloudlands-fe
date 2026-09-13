@@ -9,7 +9,11 @@ const makeReadable = <T>(value: T) => ({
 });
 
 /** Mutable BE-owned activity flags the avatar-state derivation reads. */
-const agentFlags = vi.hoisted(() => ({ isResponding: false, isBlockedWaiting: false }));
+const agentFlags = vi.hoisted(() => ({
+  isResponding: false,
+  isBlockedWaiting: false,
+  isWaitingOnTool: false,
+}));
 
 vi.mock('$store/renderer/slices/agent-session/agent-session-selectors', () => ({
   selectAgentSession: () =>
@@ -23,12 +27,17 @@ vi.mock('$store/renderer/slices/agent-session/agent-session-selectors', () => ({
             status: agentFlags.isBlockedWaiting ? 'waiting' : 'active',
             messages: [],
             isResponding: agentFlags.isResponding,
+            isWaitingOnTool: agentFlags.isWaitingOnTool,
             isWaitingForOtherAgents: agentFlags.isBlockedWaiting,
           }
         : null,
     ),
   selectAgentIsResponding: () => makeReadable(agentFlags.isResponding),
-  selectAgentIsWaiting: () => makeReadable(agentFlags.isBlockedWaiting),
+  selectAgentPreview: Object.assign(() => makeReadable(null), { select: () => null }),
+  // Mirrors the stored-session predicate: the raw waiting reason includes an
+  // unresolved tool_use on the in-flight turn.
+  selectAgentIsWaiting: () =>
+    makeReadable(agentFlags.isBlockedWaiting || agentFlags.isWaitingOnTool),
   selectAgentIsBlockedWaiting: () => makeReadable(agentFlags.isBlockedWaiting),
   selectAgentSessionStreamingContent: () => makeReadable(''),
   selectAgentSessionHasStreamOwnedMessage: () => makeReadable(false),
@@ -38,10 +47,27 @@ vi.mock('$store/renderer/slices/agent-session/agent-session-selectors', () => ({
 vi.mock('$store/renderer/slices/chat-state/chat-state-selectors', () => ({
   selectChatReceivedFirstChunk: () => makeReadable(false),
   selectChatLastChunkReceivedAt: () => makeReadable(0),
+  selectPendingQuestionRecovery: () => makeReadable(undefined),
 }));
 
 vi.mock('$store/renderer/slices/permission/permission-selectors', () => ({
   selectPendingCount: () => makeReadable(0),
+}));
+
+// AgentCard reads `appStore.state` for the transcript-derived question
+// fallback; the real store is never initialized in this suite.
+vi.mock('$store/renderer/store', async () => {
+  const { createAppStoreMockModule } =
+    await import('$store/renderer/utils/test-helpers/store-mock');
+  return createAppStoreMockModule({ state: () => ({}) });
+});
+
+vi.mock('$store/renderer/slices/hud/hud-selectors', () => ({
+  selectHudAgentHasPendingQuestion: () => makeReadable(false),
+}));
+
+vi.mock('$lib/components/chat/questions/wizard-gate', () => ({
+  deriveWizardPendingQuestions: () => null,
 }));
 
 vi.mock('$store/renderer/slices/changes/changes-selectors', () => ({
@@ -69,6 +95,7 @@ describe('isCompleted avatar state wiring', () => {
   beforeEach(() => {
     agentFlags.isResponding = false;
     agentFlags.isBlockedWaiting = false;
+    agentFlags.isWaitingOnTool = false;
   });
   afterEach(() => cleanup());
 
@@ -153,7 +180,7 @@ describe('isCompleted avatar state wiring', () => {
     expect(row.querySelector('[data-agent-row-name]')?.className).toContain('truncate');
     expect(row.querySelector('[data-agent-row-trailing]')).toBeTruthy();
     expect(row.querySelector('[data-agent-background-badge]')).toBeTruthy();
-    expect(row.querySelector('[data-panel-open-count="2"]')).toBeTruthy();
+    expect(row.querySelector('[data-panel-open-count]')).toBeNull();
     expect(screen.queryByTestId('agent-card-preview')).toBeNull();
     expect(row.textContent).not.toContain('must not be exposed');
   });
@@ -178,6 +205,23 @@ describe('isCompleted avatar state wiring', () => {
     agentFlags.isBlockedWaiting = true;
 
     render(AgentCard, { props: { agentId: 'agent-1' } });
+
+    expect(screen.getByTestId('mock-avatar-with-state').dataset.state).toBe('waiting');
+  });
+
+  it('InlineAgentAvatar renders running, not waiting, while a tool is executing mid-turn', () => {
+    agentFlags.isResponding = true;
+    agentFlags.isWaitingOnTool = true;
+
+    render(InlineAgentAvatar, { props: { agentId: 'agent-1' } });
+
+    expect(screen.getByTestId('mock-avatar-with-state').dataset.state).toBe('running');
+  });
+
+  it('InlineAgentAvatar renders waiting for a genuinely blocked agent', () => {
+    agentFlags.isBlockedWaiting = true;
+
+    render(InlineAgentAvatar, { props: { agentId: 'agent-1' } });
 
     expect(screen.getByTestId('mock-avatar-with-state').dataset.state).toBe('waiting');
   });

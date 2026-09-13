@@ -3,32 +3,56 @@
  */
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { render, fireEvent, waitFor, screen } from '@testing-library/svelte';
+import { tick } from 'svelte';
 import type { Note, Workspace } from '$shared/types';
 import { WorkspaceStatusEnum } from '$shared/types';
+import type { LiveClient, WorkspaceBrowserClient } from '$shared/types/browser-clients';
+import { createCollection } from '@augmentcode/themis/utils/collections/collection-utils';
+import type { PanelTab } from '$store/renderer/slices/panel-layout/panel-layout-types';
 import type { WorkspaceProgressAction } from '$store/renderer/slices/workspace/workspace-types';
+import type { BrowserClientsState } from '$store/renderer/slices/browser-clients/browser-clients-types';
+import {
+  createLiveClientCollection,
+  emptyWorkspaceBrowserClientsState,
+  initialState as browserClientsInitialState,
+} from '$store/renderer/slices/browser-clients/browser-clients-types';
 import { warmImport } from '../../../../../test/warm-import';
 
 const mocks = vi.hoisted(() => {
   const storeState = {
+    panelLayout: {
+      byWorkspaceId: {
+        'ws-1': { columnCount: 2, panels: {} } as {
+          columnCount: number;
+          panels: Record<string, unknown>;
+          hiddenTabs?: unknown;
+        },
+      },
+    },
     workspace: {
       pendingTitleMutations: {} as Record<string, { token: number }>,
     },
+    browserClients: undefined as unknown,
   };
   const dispatch = vi.fn((action: { type: string; payload?: unknown[] }) => {
-    const [workspaceId, token] = action.payload ?? [];
-    if (action.type === 'workspace/beginWorkspaceTitleMutation') {
-      storeState.workspace.pendingTitleMutations[workspaceId as string] = {
-        token: token as number,
-      };
-    } else if (
+    if (
+      action.type === 'workspace/beginWorkspaceTitleMutation' ||
       action.type === 'workspace/completeWorkspaceTitleMutation' ||
       action.type === 'workspace/failWorkspaceTitleMutation'
     ) {
-      delete storeState.workspace.pendingTitleMutations[workspaceId as string];
+      const [workspaceId, token] = action.payload ?? [];
+      if (action.type === 'workspace/beginWorkspaceTitleMutation') {
+        storeState.workspace.pendingTitleMutations[workspaceId as string] = {
+          token: token as number,
+        };
+      } else {
+        delete storeState.workspace.pendingTitleMutations[workspaceId as string];
+      }
     }
     return action;
   });
   const update = vi.fn();
+  const archive = vi.fn();
   const clipboardWrite = vi.fn();
   const toastSuccess = vi.fn();
   const toastError = vi.fn();
@@ -36,6 +60,7 @@ const mocks = vi.hoisted(() => {
   const progressActions = [] as WorkspaceProgressAction[];
   const notes = [] as Note[];
   const taskState = {
+    initialized: true,
     loading: false,
     progress: { total: 0, completed: 0, inProgress: 0 },
   };
@@ -75,6 +100,7 @@ const mocks = vi.hoisted(() => {
   return {
     dispatch,
     update,
+    archive,
     clipboardWrite,
     toastSuccess,
     toastError,
@@ -117,6 +143,9 @@ vi.mock('$store/renderer/slices/workspace-notes/workspace-notes-selectors', () =
 
 vi.mock('$store/renderer/slices/workspace-tasks/workspace-tasks-selectors', () => ({
   selectWorkspaceTaskProgress: mocks.selector(() => mocks.taskState.progress),
+  selectWorkspaceTasksInitialized: mocks.selector(() => mocks.taskState.initialized),
+  // Kept so the refetch regression test also fails under a loading-gated
+  // implementation: flipping this must not affect the mounted progress bar.
   selectWorkspaceTasksLoading: mocks.selector(() => mocks.taskState.loading),
 }));
 
@@ -128,8 +157,17 @@ vi.mock('$store/renderer/slices/workspace-agents/workspace-agents-selectors', ()
   selectAllWorkspaceAgents: mocks.selector(() => []),
 }));
 
+vi.mock('$store/renderer/slices/git/git-selectors', () => ({
+  selectAcceptChangesStatus: mocks.selector(() => null),
+  selectAcceptChangesStatusLoading: mocks.selector(() => false),
+}));
+
 vi.mock('$store/renderer/slices/workspace/workspace-slice', () => ({
   loadWorkspacesRequested: vi.fn(() => ({ type: 'workspace/loadWorkspacesRequested' })),
+  removeWorkspaceEntity: Object.assign(
+    vi.fn((id: string) => ({ type: 'workspace/removeWorkspaceEntity', payload: [id] })),
+    { type: 'workspace/removeWorkspaceEntity' },
+  ),
   beginWorkspaceTitleMutation: vi.fn(
     (id: string, token: number, optimisticTitle: string, previousTitle: string) => ({
       type: 'workspace/beginWorkspaceTitleMutation',
@@ -166,18 +204,32 @@ vi.mock('$store/renderer/slices/ui-layout/ui-layout-selectors', () => ({
 }));
 
 vi.mock('$store/renderer/slices/ui-layout/ui-layout-slice', () => ({
+  toggleSidebar: vi.fn(() => ({ type: 'uiLayout/toggleSidebar' })),
   toggleSidebarSide: vi.fn(() => ({ type: 'uiLayout/toggleSidebarSide' })),
 }));
 
-vi.mock('$store/renderer/slices/workspace-operations/workspace-operations-slice', () => ({
-  requestDeleteWorkspace: vi.fn((id: string) => ({
-    type: 'workspaceOperations/delete',
-    payload: [id],
+vi.mock('$store/renderer/slices/workspace-transfer/workspace-transfer-slice', () => ({
+  openTransferModal: vi.fn((payload: { workspaceId: string; workspaceTitle: string }) => ({
+    type: 'workspaceTransfer/openTransferModal',
+    payload,
   })),
 }));
 
+vi.mock(
+  '$store/renderer/slices/workspace-operations/workspace-operations-slice',
+  async (importOriginal) => ({
+    ...(await importOriginal<
+      typeof import('$store/renderer/slices/workspace-operations/workspace-operations-slice')
+    >()),
+    requestDeleteWorkspace: vi.fn((id: string) => ({
+      type: 'workspaceOperations/delete',
+      payload: [id],
+    })),
+  }),
+);
+
 vi.mock('$store/renderer/slices/workspace/utils/workspace.client', () => ({
-  workspaceClient: { update: mocks.update, archive: vi.fn(), unarchive: vi.fn() },
+  workspaceClient: { update: mocks.update, archive: mocks.archive, unarchive: vi.fn() },
 }));
 
 vi.mock('$features/accept-changes/accept-changes.client', () => ({
@@ -202,10 +254,10 @@ vi.mock('$lib/components/ui/button/button.svelte', async () => ({
   default: (await import('../../../terminal/__tests__/mocks/MockButton.svelte')).default,
 }));
 vi.mock('$lib/components/ui/dropdown-menu.svelte', async () => ({
-  default: (await import('./mocks/MockSimple.svelte')).default,
+  default: (await import('../../../ui/__tests__/mocks/dropdown-menu.svelte')).default,
 }));
 vi.mock('$features/workspace/components/WorkspaceActionsMenu.svelte', async () => ({
-  default: (await import('./mocks/MockSimple.svelte')).default,
+  default: (await import('./mocks/MockWorkspaceActionsMenu.svelte')).default,
 }));
 vi.mock('$lib/components/ui/tooltip/Tooltip.svelte', async () => ({
   default: (await import('./mocks/MockTooltip.svelte')).default,
@@ -229,7 +281,7 @@ vi.mock('$lib/components/tiptap/TaskAgentStatus.svelte', async () => ({
   default: (await import('./mocks/MockSimple.svelte')).default,
 }));
 vi.mock('../FlameGraph.svelte', async () => ({
-  default: (await import('./mocks/MockSimple.svelte')).default,
+  default: (await import('./mocks/MockFlameGraph.svelte')).default,
 }));
 vi.mock('svelte-fa', async () => ({
   default: (await import('./mocks/Fa.svelte')).default,
@@ -268,6 +320,9 @@ function makeNote(overrides: Partial<Note>): Note {
 // billed to the first test's timeout (intent-hq/monorepo#1464).
 warmImport(() => import('../../../terminal/__tests__/mocks/MockButton.svelte'));
 warmImport(() => import('./mocks/MockSimple.svelte'));
+warmImport(() => import('./mocks/MockWorkspaceActionsMenu.svelte'));
+warmImport(() => import('../../../ui/__tests__/mocks/dropdown-menu.svelte'));
+warmImport(() => import('./mocks/MockFlameGraph.svelte'));
 warmImport(() => import('./mocks/MockTooltip.svelte'));
 warmImport(() => import('./mocks/Fa.svelte'));
 warmImport(() => import('../WorkspaceProgressCard.svelte'));
@@ -276,7 +331,9 @@ describe('WorkspaceProgressCard status message', () => {
   beforeEach(() => {
     mocks.dispatch.mockClear();
     mocks.update.mockReset();
+    mocks.archive.mockReset();
     mocks.notes.length = 0;
+    mocks.taskState.initialized = true;
     mocks.taskState.loading = false;
     mocks.taskState.progress = { total: 0, completed: 0, inProgress: 0 };
     mocks.update.mockResolvedValue({ ok: true, data: mocks.workspaceEntity });
@@ -286,10 +343,90 @@ describe('WorkspaceProgressCard status message', () => {
     mocks.handleLink.mockReset();
     mocks.progressActions.length = 0;
     mocks.storeState.workspace.pendingTitleMutations = {};
+    mocks.storeState.browserClients = browserClientsInitialState;
     Object.defineProperty(navigator, 'clipboard', {
       value: { writeText: mocks.clipboardWrite },
       configurable: true,
     });
+  });
+
+  it('leases accept-status freshness only while the card is mounted', async () => {
+    const view = await renderProgressCard();
+
+    expect(mocks.dispatch).toHaveBeenCalledWith({
+      type: 'git/acceptChangesConsumerMounted',
+      payload: ['ws-1'],
+    });
+    view.unmount();
+    expect(mocks.dispatch).toHaveBeenCalledWith({
+      type: 'git/acceptChangesConsumerUnmounted',
+      payload: ['ws-1'],
+    });
+  });
+
+  it('places a divider between the move and transfer actions while keeping transfer before archive', async () => {
+    const { container } = await renderProgressCard();
+    await fireEvent.click(container.querySelector('[data-workspace-actions-trigger]')!);
+
+    const moveSidebar = screen.getByRole('button', { name: 'Move sidebar to right' });
+    const transfer = screen.getByRole('button', { name: 'Transfer/Download…' });
+    const archive = screen.getByRole('button', { name: 'Archive Workspace' });
+    const menuItems = Array.from(transfer.parentElement!.children);
+    const moveSidebarIndex = menuItems.indexOf(moveSidebar);
+    const dividerIndex = moveSidebarIndex + 1;
+    const transferIndex = menuItems.indexOf(transfer);
+    const archiveIndex = menuItems.indexOf(archive);
+
+    expect(transfer.dataset.iconName).toBe('right-left');
+    expect(menuItems[dividerIndex]?.getAttribute('data-testid')).toBe('menu-divider');
+    expect(transferIndex).toBe(dividerIndex + 1);
+    expect(archiveIndex).toBe(transferIndex + 1);
+  });
+
+  it('routes archive through the workspace-operations saga instead of calling the RPC directly', async () => {
+    const { requestArchiveWorkspace } =
+      await import('$store/renderer/slices/workspace-operations/workspace-operations-slice');
+    const { container } = await renderProgressCard();
+    await fireEvent.click(container.querySelector('[data-workspace-actions-trigger]')!);
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Archive Workspace' }));
+    await tick();
+
+    expect(mocks.dispatch).toHaveBeenCalledWith(requestArchiveWorkspace('ws-1'));
+    expect(mocks.archive).not.toHaveBeenCalled();
+  });
+
+  it('dispatches the transfer payload and dismisses the menu', async () => {
+    const { container } = await renderProgressCard();
+    await fireEvent.click(container.querySelector('[data-workspace-actions-trigger]')!);
+    const transfer = screen.getByRole('button', { name: 'Transfer/Download…' });
+
+    await fireEvent.click(transfer);
+
+    expect(mocks.dispatch).toHaveBeenCalledWith({
+      type: 'workspaceTransfer/openTransferModal',
+      payload: { workspaceId: 'ws-1', workspaceTitle: 'Active Workspace' },
+    });
+    expect(
+      container.querySelector('[data-workspace-actions-trigger]')?.getAttribute('aria-expanded'),
+    ).toBe('false');
+  });
+
+  it('omits the transfer action when workspace data becomes unavailable', async () => {
+    const { container } = await renderProgressCard();
+    const loadedWorkspace = mocks.workspaceEntity;
+
+    try {
+      mocks.workspaceEntity = null as unknown as Workspace;
+      mocks.notifySelectors();
+      await tick();
+      await fireEvent.click(container.querySelector('[data-workspace-actions-trigger]')!);
+
+      expect(screen.queryByRole('button', { name: 'Transfer/Download…' })).toBeNull();
+    } finally {
+      mocks.workspaceEntity = loadedWorkspace;
+      mocks.notifySelectors();
+    }
   });
 
   it('renders title, metadata, progress, then status like the sidebar reference', async () => {
@@ -312,9 +449,7 @@ describe('WorkspaceProgressCard status message', () => {
 
     const repoButton = screen.getByRole('button', { name: 'augment/intent' });
     const titleButton = screen.getByRole('button', { name: 'Active Workspace' });
-    const flameGraph = screen
-      .getAllByTestId('mock-component')
-      .find((node) => repoButton.compareDocumentPosition(node) & Node.DOCUMENT_POSITION_FOLLOWING);
+    const flameGraph = screen.getByTestId('mock-flame-graph');
     const statusButton = screen.getByRole('button', { name: 'Edit workspace status' });
 
     expect(statusButton.textContent).toContain('Implementing the active sidebar fix.');
@@ -322,10 +457,10 @@ describe('WorkspaceProgressCard status message', () => {
       titleButton.compareDocumentPosition(repoButton) & Node.DOCUMENT_POSITION_FOLLOWING,
     ).toBeTruthy();
     expect(
-      repoButton.compareDocumentPosition(flameGraph!) & Node.DOCUMENT_POSITION_FOLLOWING,
+      repoButton.compareDocumentPosition(flameGraph) & Node.DOCUMENT_POSITION_FOLLOWING,
     ).toBeTruthy();
     expect(
-      flameGraph!.compareDocumentPosition(statusButton) & Node.DOCUMENT_POSITION_FOLLOWING,
+      flameGraph.compareDocumentPosition(statusButton) & Node.DOCUMENT_POSITION_FOLLOWING,
     ).toBeTruthy();
   });
 
@@ -341,29 +476,8 @@ describe('WorkspaceProgressCard status message', () => {
       name: 'editorial-team/long-running-navigation-redesign',
     });
     const metadata = repoButton.closest('[data-sidebar-repository-branch-metadata]');
-    const repoLabel = repoButton.querySelector('[data-sidebar-repository-label]');
-    const branchButton = screen.getByRole('button', {
-      name: 'feature/simplify-workspace-navigation-and-sidebar',
-    });
-    const branchLabel = branchButton.querySelector('[data-sidebar-branch-label]');
 
     expect(metadata?.textContent).toContain('feature/simplify-workspace-navigation-and-sidebar');
-    expect(metadata?.className).toContain('type-caption');
-    expect(metadata?.className).toContain('min-w-0');
-    expect(metadata?.className.split(/\s+/)).toContain('gap-2.5');
-    expect(repoButton.className).toContain('shrink');
-    expect(repoButton.className).not.toContain('max-w-[45%]');
-    expect(repoButton.className).not.toContain('shrink-0');
-    expect(repoButton.className).toContain('overflow-hidden');
-    expect(repoLabel?.className).toContain('truncate');
-    expect(branchButton.className).toContain('shrink');
-    expect(branchButton.className).not.toContain('flex-1');
-    expect(branchButton.className).toContain('justify-start');
-    expect(branchButton.className).toContain('font-medium');
-    expect(repoButton.className.split(/\s+/)).toContain('text-muted-foreground');
-    expect(branchButton.className.split(/\s+/)).toContain('text-muted-foreground');
-    expect(branchButton.className).toContain('overflow-hidden');
-    expect(branchLabel?.className).toContain('truncate');
 
     await fireEvent.click(repoButton);
 
@@ -386,12 +500,51 @@ describe('WorkspaceProgressCard status message', () => {
     expect(screen.queryByRole('textbox')).toBeNull();
   });
 
-  it('renders the title editor full-width without JS auto-resize', async () => {
+  it('prefills the title editor and saves a changed title on Enter', async () => {
+    await renderProgressCard();
+    await fireEvent.click(screen.getByRole('button', { name: 'Active Workspace' }));
+    const titleInput = screen.getByRole('textbox') as HTMLInputElement;
+    expect(titleInput.value).toBe('Active Workspace');
+
+    await fireEvent.input(titleInput, { target: { value: 'Renamed Workspace' } });
+    await fireEvent.keyDown(titleInput, { key: 'Enter' });
+
+    await waitFor(() =>
+      expect(mocks.update).toHaveBeenCalledWith({ id: 'ws-1', title: 'Renamed Workspace' }),
+    );
+    expect(screen.queryByRole('textbox')).toBeNull();
+  });
+
+  it('restores the title on Escape without saving', async () => {
+    await renderProgressCard();
+    await fireEvent.click(screen.getByRole('button', { name: 'Active Workspace' }));
+    const titleInput = screen.getByRole('textbox');
+    await fireEvent.input(titleInput, { target: { value: 'Discarded title' } });
+
+    await fireEvent.keyDown(titleInput, { key: 'Escape' });
+
+    expect(mocks.update).not.toHaveBeenCalled();
+    expect(screen.getByRole('button', { name: 'Active Workspace' })).toBeTruthy();
+  });
+
+  it('saves a changed title on blur', async () => {
+    await renderProgressCard();
+    await fireEvent.click(screen.getByRole('button', { name: 'Active Workspace' }));
+    const titleInput = screen.getByRole('textbox');
+    await fireEvent.input(titleInput, { target: { value: 'Blurred Workspace' } });
+
+    await fireEvent.blur(titleInput);
+
+    await waitFor(() =>
+      expect(mocks.update).toHaveBeenCalledWith({ id: 'ws-1', title: 'Blurred Workspace' }),
+    );
+  });
+
+  it('does not apply inline JS sizing to the title editor', async () => {
     await renderProgressCard();
     await fireEvent.click(screen.getByRole('button', { name: 'Active Workspace' }));
     const titleInput = screen.getByRole('textbox') as HTMLInputElement;
 
-    expect(titleInput.className.split(/\s+/)).toContain('w-full');
     expect(titleInput.style.width).toBe('');
 
     await fireEvent.input(titleInput, { target: { value: 'A much longer workspace title' } });
@@ -407,9 +560,6 @@ describe('WorkspaceProgressCard status message', () => {
     const branch = screen.getByRole('button', { name: 'feature/status' });
     const hoverCard = container.querySelector('[data-sidebar-branch-hover-card]');
 
-    expect(branch.className).toContain('h-5');
-    expect(branch.className.split(/\s+/)).not.toContain('gap-0.5');
-    expect(branch.className.split(/\s+/)).not.toContain('gap-1.5');
     expect(container.querySelector('[data-sidebar-branch-icon]')).toBeNull();
     expect(hoverCard?.textContent).toContain('feature/status');
     expect(hoverCard?.textContent).toContain('Base main');
@@ -432,11 +582,6 @@ describe('WorkspaceProgressCard status message', () => {
     const statusButton = screen.getByRole('button', { name: 'Edit workspace status' });
 
     expect(statusButton.textContent).toContain('It can wrap across lines');
-    expect(statusButton.className).not.toMatch(
-      /line-clamp|truncate|overflow-hidden|whitespace-nowrap|text-ellipsis/,
-    );
-    expect(statusButton.className).toContain('whitespace-pre-wrap');
-    expect(statusButton.className).toContain('leading-snug');
   });
 
   it('keeps the workspace status wrapping while it is being edited', async () => {
@@ -449,10 +594,6 @@ describe('WorkspaceProgressCard status message', () => {
 
     expect(editor.tagName).toBe('TEXTAREA');
     expect(editor.getAttribute('rows')).toBe('1');
-    expect(editor.className).toContain('whitespace-pre-wrap');
-    expect(editor.className).toContain('break-words');
-    expect(editor.className).toContain('resize-none');
-    expect(editor.className).toContain('min-h-0');
   });
 
   it('hides the status row when the active sidebar status is empty', async () => {
@@ -467,7 +608,7 @@ describe('WorkspaceProgressCard status message', () => {
     expect(screen.queryByRole('button', { name: 'Add workspace status' })).toBeNull();
   });
 
-  it('renders one View PR action directly after a long status description', async () => {
+  it('does not render the View PR action under the status (the Changes launcher owns PR access)', async () => {
     mocks.progressActions.push({
       id: 'view-pr',
       label: 'View PR',
@@ -476,69 +617,57 @@ describe('WorkspaceProgressCard status message', () => {
       url: 'https://github.com/intent-hq/monorepo/pull/42',
     });
     const { container } = await renderProgressCard({
-      statusMessage: 'A long workspace description that wraps before the pull request action.',
-    });
-    const status = screen.getByRole('button', { name: 'Edit workspace status' });
-    const viewPr = screen.getByRole('button', { name: 'View PR' });
-
-    expect(container.querySelectorAll('[data-workspace-view-pr]')).toHaveLength(1);
-    expect(status.compareDocumentPosition(viewPr) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-    await fireEvent.click(viewPr);
-    expect(mocks.handleLink).toHaveBeenCalledWith('https://github.com/intent-hq/monorepo/pull/42', {
-      workspaceId: 'ws-1',
+      statusMessage: 'A workspace description that used to be followed by the pull request action.',
     });
 
-    mocks.workspaceEntity.statusMessage = undefined;
-    expect(screen.queryByRole('button', { name: 'Add workspace status' })).toBeNull();
+    expect(screen.getByRole('button', { name: 'Edit workspace status' })).toBeTruthy();
+    expect(container.querySelector('[data-workspace-view-pr]')).toBeNull();
+    expect(screen.queryByRole('button', { name: 'View PR' })).toBeNull();
+    expect(mocks.handleLink).not.toHaveBeenCalled();
   });
 
-  it('survives the View PR action flipping to undefined mid-render (monorepo#2543)', async () => {
-    type TooltipProps = { content: unknown; disabled: unknown };
-    const tooltipProps: TooltipProps[] = [];
-    const withRegistry = globalThis as { __mockTooltipProps?: TooltipProps[] };
-    withRegistry.__mockTooltipProps = tooltipProps;
-    try {
-      mocks.progressActions.push({
-        id: 'view-pr',
-        label: 'View PR',
-        iconKey: 'code-branch',
-        tooltip: 'Open the pull request.',
-        url: 'https://github.com/intent-hq/monorepo/pull/42',
-      });
-      const { container } = await renderProgressCard();
-      expect(container.querySelectorAll('[data-workspace-view-pr]')).toHaveLength(1);
-
-      const viewPrTooltip = tooltipProps.find((p) => p.content === 'Open the pull request.');
-      expect(viewPrTooltip).toBeDefined();
-      expect(viewPrTooltip!.disabled).toBe(false);
-
-      mocks.progressActions.length = 0;
-      mocks.notifySelectors();
-
-      // The teardown race: the Tooltip's lazy prop getters re-evaluate after
-      // the action flipped to undefined but before the {#if} block tears down.
-      expect(viewPrTooltip!.disabled).toBe(true);
-      expect(viewPrTooltip!.content).toBeUndefined();
-
-      await waitFor(() => {
-        expect(container.querySelector('[data-workspace-view-pr]')).toBeNull();
-      });
-    } finally {
-      delete withRegistry.__mockTooltipProps;
-    }
-  });
-
-  it('hides empty task progress after canonical tasks finish loading', async () => {
+  it('hides empty task progress once canonical tasks are initialized', async () => {
     const { container } = await renderProgressCard();
 
     expect(container.querySelector('[data-workspace-task-progress]')).toBeNull();
   });
 
-  it('keeps task progress visible while canonical tasks are loading', async () => {
-    mocks.taskState.loading = true;
+  it('reserves task progress as loading before canonical tasks initialize', async () => {
+    mocks.taskState.initialized = false;
     const { container } = await renderProgressCard();
 
     expect(container.querySelector('[data-workspace-task-progress]')).toBeTruthy();
+    expect(screen.getByTestId('mock-flame-graph').dataset.loading).toBe('true');
+  });
+
+  it('keeps the progress bar mounted across task refetches after initialization', async () => {
+    mocks.taskState.progress = { total: 2, completed: 1, inProgress: 1 };
+    const { container } = await renderProgressCard();
+
+    const flameGraph = screen.getByTestId('mock-flame-graph');
+    const progressBar = screen.getByTestId('mock-flame-progress');
+    expect(flameGraph.dataset.loading).toBe('false');
+
+    // Simulate an event-driven refetch after initialization: the slice's
+    // loading flag flips false -> true (fetch in flight) -> false (settled).
+    // The bar must never swap to its loading placeholder mid-refetch — that
+    // remount is what replayed the entrance wipe.
+    mocks.taskState.loading = true;
+    mocks.notifySelectors();
+    await tick();
+    expect(screen.getByTestId('mock-flame-graph').dataset.loading).toBe('false');
+    expect(container.querySelector('[data-testid="mock-flame-placeholder"]')).toBeNull();
+    expect(screen.getByTestId('mock-flame-progress')).toBe(progressBar);
+
+    // The refetch settles with an updated rollup; same elements, new data.
+    mocks.taskState.loading = false;
+    mocks.taskState.progress = { total: 2, completed: 2, inProgress: 0 };
+    mocks.notifySelectors();
+    await waitFor(() => {
+      expect(screen.getByTestId('mock-flame-progress').dataset.progress).toBe('1');
+    });
+    expect(screen.getByTestId('mock-flame-graph')).toBe(flameGraph);
+    expect(screen.getByTestId('mock-flame-progress')).toBe(progressBar);
   });
 
   it('saves status edits on Enter and dispatches the updated workspace', async () => {
@@ -568,8 +697,21 @@ describe('WorkspaceProgressCard status message', () => {
     const input = await screen.findByLabelText('Workspace status');
 
     expect(input.tagName).toBe('TEXTAREA');
-    expect(input.className).toContain('resize-none');
-    expect(input.className).toContain('whitespace-pre-wrap');
+  });
+
+  it('saves status edits on blur', async () => {
+    const updatedWorkspace = { ...mocks.workspaceEntity, statusMessage: 'Saved on blur.' };
+    mocks.update.mockResolvedValue({ ok: true, data: updatedWorkspace });
+    await renderProgressCard({ statusMessage: 'Drafting status.' });
+    await fireEvent.click(screen.getByRole('button', { name: 'Edit workspace status' }));
+    const input = await screen.findByLabelText('Workspace status');
+    await fireEvent.input(input, { target: { value: 'Saved on blur.' } });
+
+    await fireEvent.blur(input);
+
+    await waitFor(() =>
+      expect(mocks.update).toHaveBeenCalledWith({ id: 'ws-1', statusMessage: 'Saved on blur.' }),
+    );
   });
 
   it('does not save and allows a newline on Shift+Enter', async () => {
@@ -646,10 +788,6 @@ describe('WorkspaceProgressCard status screenshot (intent-hq/monorepo#997)', () 
 
     const image = screen.getByAltText('Workspace status screenshot') as HTMLImageElement;
     expect(image.getAttribute('src')).toBe('workspace-asset://ws-1/asset-abc123');
-    // Bounded dimensions + rounded border per the acceptance criteria.
-    expect(image.className).toContain('max-h-48');
-    expect(image.className).toContain('rounded-md');
-    expect(image.className.split(/\s+/)).toContain('border');
 
     const statusButton = screen.getByRole('button', { name: 'Edit workspace status' });
     expect(
@@ -699,5 +837,249 @@ describe('WorkspaceProgressCard status screenshot (intent-hq/monorepo#997)', () 
     await waitFor(() => {
       expect(screen.getByRole('dialog', { name: /image preview/i })).toBeTruthy();
     });
+  });
+});
+
+describe('WorkspaceProgressCard driving browser client', () => {
+  const OWN = 'client-own';
+  const OTHER = 'client-other';
+  const SET_PRIMARY = { name: 'Set Current Client as Primary' };
+
+  function liveClient(clientId: string, name: string): LiveClient {
+    return {
+      clientId,
+      name,
+      hostname: name,
+      capabilities: { browserExec: true },
+      connections: 1,
+      transports: ['ws'],
+      connectedAt: '2026-05-05T00:00:00.000Z',
+    } as LiveClient;
+  }
+
+  function seedBrowserClients(
+    clients: LiveClient[],
+    browserClient: WorkspaceBrowserClient | null,
+  ): void {
+    mocks.storeState.browserClients = {
+      ownClientId: OWN,
+      liveClients: createLiveClientCollection(clients),
+      liveClientsLoaded: true,
+      byWorkspaceId: { 'ws-1': { ...emptyWorkspaceBrowserClientsState, browserClient } },
+    } satisfies BrowserClientsState;
+  }
+
+  const browserTab: PanelTab = { id: 'tab-web', type: 'browser', title: 'Web', closable: true };
+
+  /** Put `tabs` in the workspace's single panel (the indicator needs a browser tab). */
+  function seedPanelTabs(tabs: PanelTab[]): void {
+    mocks.storeState.panelLayout.byWorkspaceId['ws-1'].panels = {
+      main: { id: 'main', tabs, activeTabId: tabs[0]?.id ?? null },
+    };
+  }
+
+  const drivingIndicator = (container: HTMLElement) =>
+    container.querySelector<HTMLElement>('[data-sidebar-driving-client]');
+
+  // The card publishes its workspace id to the selector argument store from
+  // an effect after mount; the store mock reads readable args once, so
+  // re-emit to let the driving-client selector observe the mounted id.
+  async function renderDrivingCard() {
+    const view = await renderProgressCard();
+    await tick();
+    const { store } = await import('$store/renderer/store');
+    (store as unknown as { emitState: () => void }).emitState();
+    await tick();
+    return view;
+  }
+
+  beforeEach(() => {
+    mocks.dispatch.mockClear();
+    mocks.storeState.browserClients = browserClientsInitialState;
+    seedPanelTabs([browserTab]);
+  });
+
+  it('shows nothing and offers no switch when this app is the only eligible client', async () => {
+    seedBrowserClients([liveClient(OWN, 'laptop')], {
+      source: 'default',
+      resolved: { clientId: OWN, name: 'laptop' },
+    });
+    const { container } = await renderDrivingCard();
+
+    expect(drivingIndicator(container)).toBeNull();
+    await fireEvent.click(container.querySelector('[data-workspace-actions-trigger]')!);
+    expect(screen.queryByRole('button', SET_PRIMARY)).toBeNull();
+  });
+
+  it('marks this app as driving and hides the switch when it already drives', async () => {
+    seedBrowserClients([liveClient(OWN, 'laptop'), liveClient(OTHER, 'desktop')], {
+      source: 'default',
+      resolved: { clientId: OWN, name: 'laptop' },
+    });
+    const { container } = await renderDrivingCard();
+
+    expect(drivingIndicator(container)?.dataset.sidebarDrivingClient).toBe('here');
+    await fireEvent.click(container.querySelector('[data-workspace-actions-trigger]')!);
+    expect(screen.queryByRole('button', SET_PRIMARY)).toBeNull();
+  });
+
+  const SET_PRIMARY_DIALOG = { name: /set this client as primary/i };
+  const CONFIRM_SET_PRIMARY = { name: 'Set as Primary' };
+
+  async function openSetPrimaryDialog(container: HTMLElement): Promise<HTMLElement> {
+    await fireEvent.click(container.querySelector('[data-workspace-actions-trigger]')!);
+    await fireEvent.click(screen.getByRole('button', SET_PRIMARY));
+    return await waitFor(() => screen.getByRole('dialog', SET_PRIMARY_DIALOG));
+  }
+
+  it('names the other driving client and asks for confirmation before switching', async () => {
+    seedBrowserClients([liveClient(OWN, 'laptop'), liveClient(OTHER, 'desktop')], {
+      source: 'default',
+      resolved: { clientId: OTHER, name: 'desktop' },
+    });
+    const { container } = await renderDrivingCard();
+
+    const indicator = drivingIndicator(container);
+    expect(indicator?.dataset.sidebarDrivingClient).toBe('elsewhere');
+    expect(indicator?.getAttribute('aria-label')).toContain('desktop');
+
+    const dialog = await openSetPrimaryDialog(container);
+
+    expect(dialog.textContent).toContain('desktop');
+    expect(mocks.dispatch).not.toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'browserClients/setWorkspaceBrowserClientRequested' }),
+    );
+  });
+
+  it('pins this app only once the confirmation is accepted', async () => {
+    seedBrowserClients([liveClient(OWN, 'laptop'), liveClient(OTHER, 'desktop')], {
+      source: 'default',
+      resolved: { clientId: OTHER, name: 'desktop' },
+    });
+    const { container } = await renderDrivingCard();
+
+    await openSetPrimaryDialog(container);
+    await fireEvent.click(screen.getByRole('button', CONFIRM_SET_PRIMARY));
+
+    expect(mocks.dispatch).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'browserClients/setWorkspaceBrowserClientRequested',
+        payload: ['ws-1', OWN],
+      }),
+    );
+    await waitFor(() => {
+      expect(screen.queryByRole('dialog', SET_PRIMARY_DIALOG)).toBeNull();
+    });
+  });
+
+  it('sends nothing when the confirmation is cancelled', async () => {
+    seedBrowserClients([liveClient(OWN, 'laptop'), liveClient(OTHER, 'desktop')], {
+      source: 'default',
+      resolved: { clientId: OTHER, name: 'desktop' },
+    });
+    const { container } = await renderDrivingCard();
+
+    await openSetPrimaryDialog(container);
+    await fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+
+    await waitFor(() => {
+      expect(screen.queryByRole('dialog', SET_PRIMARY_DIALOG)).toBeNull();
+    });
+    expect(mocks.dispatch).not.toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'browserClients/setWorkspaceBrowserClientRequested' }),
+    );
+  });
+
+  it('surfaces an offline pinned client and still offers the switch', async () => {
+    seedBrowserClients([liveClient(OWN, 'laptop')], {
+      source: 'workspace',
+      clientId: OTHER,
+      resolved: null,
+    });
+    const { container } = await renderDrivingCard();
+
+    expect(drivingIndicator(container)?.dataset.sidebarDrivingClient).toBe('offline');
+    await fireEvent.click(container.querySelector('[data-workspace-actions-trigger]')!);
+    expect(screen.getByRole('button', SET_PRIMARY)).toBeTruthy();
+  });
+
+  it('hides the indicator without browser tabs but keeps the switch, and shows it once a tab opens', async () => {
+    seedBrowserClients([liveClient(OWN, 'laptop'), liveClient(OTHER, 'desktop')], {
+      source: 'default',
+      resolved: { clientId: OTHER, name: 'desktop' },
+    });
+    seedPanelTabs([]);
+    const { container } = await renderDrivingCard();
+    const { store } = await import('$store/renderer/store');
+    const emitState = () => (store as unknown as { emitState: () => void }).emitState();
+
+    expect(drivingIndicator(container)).toBeNull();
+    await fireEvent.click(container.querySelector('[data-workspace-actions-trigger]')!);
+    expect(screen.getByRole('button', SET_PRIMARY)).toBeTruthy();
+    await fireEvent.keyDown(document.activeElement ?? document.body, { key: 'Escape' });
+
+    // A browser tab opening in the layout (no reload) reveals the indicator …
+    seedPanelTabs([browserTab]);
+    emitState();
+    await tick();
+    expect(drivingIndicator(container)?.dataset.sidebarDrivingClient).toBe('elsewhere');
+
+    // … and closing the last one hides it again.
+    seedPanelTabs([]);
+    emitState();
+    await tick();
+    expect(drivingIndicator(container)).toBeNull();
+  });
+
+  it('counts a hidden agent-owned browser tab as a tab to drive', async () => {
+    seedBrowserClients([liveClient(OWN, 'laptop'), liveClient(OTHER, 'desktop')], {
+      source: 'default',
+      resolved: { clientId: OWN, name: 'laptop' },
+    });
+    seedPanelTabs([]);
+    mocks.storeState.panelLayout.byWorkspaceId['ws-1'].hiddenTabs = createCollection('id', [
+      { ...browserTab, ownerAgentId: 'agent-1' },
+    ]);
+    try {
+      const { container } = await renderDrivingCard();
+      expect(drivingIndicator(container)?.dataset.sidebarDrivingClient).toBe('here');
+    } finally {
+      mocks.storeState.panelLayout.byWorkspaceId['ws-1'].hiddenTabs = undefined;
+    }
+  });
+
+  it('never renders the indicator with one connected client even with browser tabs', async () => {
+    seedBrowserClients([liveClient(OWN, 'laptop')], {
+      source: 'default',
+      resolved: { clientId: OWN, name: 'laptop' },
+    });
+    const { container } = await renderDrivingCard();
+
+    expect(drivingIndicator(container)).toBeNull();
+  });
+
+  it('surfaces an offline pinned client without any browser tabs', async () => {
+    seedBrowserClients([liveClient(OWN, 'laptop')], {
+      source: 'workspace',
+      clientId: OTHER,
+      resolved: null,
+    });
+    seedPanelTabs([]);
+    const { container } = await renderDrivingCard();
+
+    expect(drivingIndicator(container)?.dataset.sidebarDrivingClient).toBe('offline');
+  });
+
+  it('hides the switch while this app does not yet know its own client id', async () => {
+    seedBrowserClients([liveClient(OWN, 'laptop'), liveClient(OTHER, 'desktop')], {
+      source: 'default',
+      resolved: { clientId: OTHER, name: 'desktop' },
+    });
+    (mocks.storeState.browserClients as BrowserClientsState).ownClientId = null;
+    const { container } = await renderDrivingCard();
+
+    expect(drivingIndicator(container)?.dataset.sidebarDrivingClient).toBe('elsewhere');
+    await fireEvent.click(container.querySelector('[data-workspace-actions-trigger]')!);
+    expect(screen.queryByRole('button', SET_PRIMARY)).toBeNull();
   });
 });

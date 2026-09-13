@@ -29,11 +29,21 @@
     selectSpecialistName,
     selectSpecialists,
   } from '$store/renderer/slices/specialists/specialists-selectors';
-  import { faCheck, faCircleInfo, faCopy, faTrash } from '@fortawesome/free-solid-svg-icons';
+  import {
+    faCheck,
+    faCircleInfo,
+    faCopy,
+    faRightLeft,
+    faTrash,
+    faUserTie,
+  } from '@fortawesome/free-solid-svg-icons';
   import { faNote } from '$lib/icons/faNote';
   import HarnessFeaturesModal from '$lib/components/chat/HarnessFeaturesModal.svelte';
+  import ReplaceAgentModal from '$lib/components/modals/ReplaceAgentModal.svelte';
   import { formatAgentMessagesForClipboard } from '$lib/utils/clipboard-formatters';
+  import { isReplaceAgentEligible } from '$shared/utils/replace-agent-eligibility';
   import { m } from '$shared/paraglide/messages.js';
+  import { sendMessage } from '$store/renderer/slices/chat-state/chat-state-slice';
   import { deleteAgentWithUndoRequested } from '$store/renderer/slices/workspace-agents/workspace-agents-slice';
   import { store as appStore } from '$store/renderer/store';
 
@@ -72,7 +82,7 @@
   // Subscribe to agent session updates
   let agentSession = $state<AgentSession | undefined>(undefined);
   $effect(() => {
-    if (!tab.agentId) {
+    if (!isActive || !tab.agentId) {
       agentSession = undefined;
       return;
     }
@@ -86,14 +96,15 @@
 
   const agentMessages = $derived(agentSession?.messages || []);
 
-  // Get specialist display name
+  // Get specialist display name, falling back to the raw id when the
+  // lookup misses (parity with AgentCard).
   const agentSpecialistName = $derived.by(() => {
     void $specialists$;
     if (!tab.agentId) return null;
     const specialistId =
       agentSession?.metadata?.specialist || (agentSession as any)?.agentMetadata?.specialist;
     if (!specialistId) return null;
-    return selectSpecialistName.select(appStore.state, specialistId);
+    return selectSpecialistName.select(appStore.state, specialistId) ?? specialistId;
   });
 
   // Resolve "Delegated by" reactively once the parent session is loaded into Redux.
@@ -115,6 +126,34 @@
   const harnessFeatures = $derived($agent$?.harnessFeatures ?? null);
   let harnessModalOpen = $state(false);
 
+  // "Replace Agent" (peer-agent hand-off) — hidden unless every session-derived
+  // eligibility gate passes: harnessFeatures.peerAgents snapshot true,
+  // top-level, non-background, not retired. Mirrors the AgentCard context menu.
+  const canReplaceAgent = $derived(isReplaceAgentEligible($agent$));
+  let replaceAgentModalOpen = $state(false);
+
+  // Raw specialist id (not the display name) — interpolated into the built
+  // hand-off instruction's `ws.agent.create` call shape.
+  const agentSpecialistId = $derived(
+    ((agentSession?.metadata?.specialist ||
+      (agentSession as any)?.agentMetadata?.specialist) as string) || null,
+  );
+
+  // Send the (possibly edited) hand-off instruction through the normal chat
+  // send path so it lands in the transcript as a regular user message.
+  function handleReplaceAgentSend(text: string) {
+    if (!tab.agentId) return;
+    appStore.dispatch(
+      sendMessage(tab.agentId, {
+        wsId: workspaceId,
+        text,
+        agentName: agentSession?.name || tab.title || '',
+        agentModel,
+        isInitialWorkspaceAgent,
+      }),
+    );
+  }
+
   // Copy/delete state
   let agentCopyFeedback = $state<string | null>(null);
   let agentCopyTimeoutId: ReturnType<typeof setTimeout> | null = null;
@@ -122,10 +161,12 @@
   let chatPanelRef = $state<{
     scrollToBottom: () => void;
     navigateToUserMessage: (messageId: string) => Promise<boolean>;
+    refreshUserMessageIndex: () => void;
   } | null>(null);
   let chatNavigationState = $state<ChatNavigationState>({
     isAtBottom: true,
     userMessages: [],
+    isLoadingUserMessageIndex: false,
   });
 
   onDestroy(() => {
@@ -199,8 +240,10 @@
   <ChatMessageNavigator
     messages={chatNavigationState.userMessages}
     isAtBottom={chatNavigationState.isAtBottom}
+    isLoadingIndex={chatNavigationState.isLoadingUserMessageIndex}
     onSelectMessage={(messageId) => chatPanelRef?.navigateToUserMessage(messageId) ?? false}
     onScrollToBottom={() => chatPanelRef?.scrollToBottom()}
+    onOpen={() => chatPanelRef?.refreshUserMessageIndex()}
   />
 {/snippet}
 
@@ -222,6 +265,13 @@
     onclick={handleCopyAgentConversation}
     disabled={agentMessages.length === 0}
   />
+  {#if canReplaceAgent}
+    <Menu.CommandItem
+      icon={faRightLeft}
+      label={m.layout_agentTab_replaceAgent_tooltip()}
+      onclick={() => (replaceAgentModalOpen = true)}
+    />
+  {/if}
   <Menu.CommandItem
     icon={faTrash}
     label={m.layout_agentTab_deleteAgent_tooltip()}
@@ -229,13 +279,22 @@
     disabled={isAgentDeleting}
     destructive
   />
-  {#if harnessVersion}
+  {#if agentSpecialistName || harnessVersion}
     <Menu.Separator />
-    <Menu.CommandItem
-      icon={faCircleInfo}
-      label={m.chat_agentCard_menu_harnessVersion_label({ version: harnessVersion })}
-      onclick={() => (harnessModalOpen = true)}
-    />
+    {#if agentSpecialistName}
+      <Menu.CommandItem
+        icon={faUserTie}
+        label={m.chat_agentCard_menu_specialist_label({ name: agentSpecialistName })}
+        disabled
+      />
+    {/if}
+    {#if harnessVersion}
+      <Menu.CommandItem
+        icon={faCircleInfo}
+        label={m.chat_agentCard_menu_harnessVersion_label({ version: harnessVersion })}
+        onclick={() => (harnessModalOpen = true)}
+      />
+    {/if}
   {/if}
 {/snippet}
 
@@ -244,6 +303,15 @@
     bind:open={harnessModalOpen}
     version={harnessVersion}
     features={harnessFeatures}
+  />
+{/if}
+
+{#if replaceAgentModalOpen}
+  <ReplaceAgentModal
+    bind:open={replaceAgentModalOpen}
+    agentName={agentSession?.name || tab.title || ''}
+    specialist={agentSpecialistId}
+    onSend={handleReplaceAgentSend}
   />
 {/if}
 

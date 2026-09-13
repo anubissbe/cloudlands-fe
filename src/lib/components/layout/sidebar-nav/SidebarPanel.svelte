@@ -4,15 +4,10 @@
   import AllWorkspacesCard from './cards/AllWorkspacesCard.svelte';
   import ChiefCard from './cards/ChiefCard.svelte';
   import SettingsCard from './cards/SettingsCard.svelte';
-  import { slide } from 'svelte/transition';
   import { onDestroy } from 'svelte';
   import Fa from 'svelte-fa';
-  import {
-    faXmark,
-    faEllipsisVertical,
-    faMagnifyingGlass,
-    faPlus,
-  } from '@fortawesome/free-solid-svg-icons';
+  import { faXmark, faMagnifyingGlass, faPlus } from '@fortawesome/free-solid-svg-icons';
+  import KebabIcon from '$lib/components/icons/KebabIcon.svelte';
   import { Tooltip } from '$lib/components/ui/tooltip';
   import * as Menu from '$lib/components/ui/menu';
 
@@ -20,6 +15,7 @@
     selectPanelItem,
     selectPanelWidth,
     selectCombinedPanelSplit,
+    selectIsChiefCollapsed,
     selectOnboardingActive,
     selectAllSpacesViewMode,
     selectShowArchivedWorkspaces,
@@ -28,6 +24,7 @@
     closePanel,
     setPanelWidth as setPanelWidthAction,
     setCombinedPanelSplit as setCombinedPanelSplitAction,
+    toggleChiefCollapsed,
     setAllSpacesViewMode,
     setShowArchivedWorkspaces,
     setShowCreateModal,
@@ -35,12 +32,14 @@
   import {
     isCombinedWorkspacePanelItem,
     type AllSpacesViewMode,
+    type SidebarNavItem,
   } from '$store/renderer/slices/sidebar-nav/sidebar-nav-types';
   import { store as appStore } from '$store/renderer/store';
 
   const panelItem$ = selectPanelItem();
   const panelWidth$ = selectPanelWidth();
   const combinedPanelSplit$ = selectCombinedPanelSplit();
+  const isChiefCollapsed$ = selectIsChiefCollapsed();
   const onboardingActive$ = selectOnboardingActive();
   const allSpacesViewMode$ = selectAllSpacesViewMode();
   const showArchivedWorkspaces$ = selectShowArchivedWorkspaces();
@@ -55,14 +54,49 @@
   const MIN_SPLIT = 0.15;
   const MAX_SPLIT = 0.85;
 
+  // ── Keep the panel mounted across open/close ──
+  // Nothing renders until the panel is first opened; after that it stays
+  // mounted (hidden, width 0) when closed so its heavy children are not torn
+  // down and rebuilt on every toggle. The width animates instead of the panel
+  // mounting/unmounting.
+  const isOpen = $derived(Boolean($panelItem$) && !$onboardingActive$);
+
+  // Last opened item, preserved while the panel is hidden so its content stays
+  // mounted. Content reads `displayedPanelItem`, which falls back to it while
+  // the live panel item is null (closed).
+  let lastPanelItem = $state<SidebarNavItem | null>(null);
+  $effect(() => {
+    if (isOpen && $panelItem$) lastPanelItem = $panelItem$;
+  });
+  const displayedPanelItem = $derived($panelItem$ ?? lastPanelItem);
+
+  // Render once the panel has ever been opened, then keep it in the tree.
+  const shouldRender = $derived(isOpen || lastPanelItem !== null);
+
+  // Drive the open/close width animation without unmounting. Deferring the
+  // expand by a frame lets the collapsed state paint first so the very first
+  // open still animates.
+  let expanded = $state(false);
+  $effect(() => {
+    if (!isOpen) {
+      expanded = false;
+      return;
+    }
+    if (expanded) return;
+    const raf = requestAnimationFrame(() => {
+      expanded = true;
+    });
+    return () => cancelAnimationFrame(raf);
+  });
+
   // Chief and All Workspaces open the same combined panel:
   // workspace list on top, Chief chat below, separated by a resizable divider.
   const isCombinedWorkspace = $derived(
-    $panelItem$ !== null && isCombinedWorkspacePanelItem($panelItem$),
+    displayedPanelItem !== null && isCombinedWorkspacePanelItem(displayedPanelItem),
   );
 
   const panelMeta = $derived.by(() => {
-    switch ($panelItem$) {
+    switch (displayedPanelItem) {
       case 'active':
         return { title: m.layout_sidebarNav_activeWorkspaces_title(), description: '' };
       case 'settings':
@@ -229,13 +263,18 @@
   });
 </script>
 
-{#if $panelItem$ && !$onboardingActive$}
-  <!-- Outer wrapper animates width; inner content stays at full static width -->
+{#if shouldRender}
+  <!-- Outer wrapper animates width; the panel stays mounted while hidden so its
+       children are not torn down and rebuilt on every open/close. -->
   <div
-    class="shrink-0 h-full overflow-hidden"
+    class="shrink-0 h-full overflow-clip"
     data-sidebar-panel
     data-panel-item={$panelItem$}
-    transition:slide={{ axis: 'x', duration: 200 }}
+    data-panel-shell
+    data-resizing={isResizing}
+    style="width: {expanded ? liveWidth : 0}px;"
+    style:overflow-clip-margin={expanded ? '0.5rem' : '0px'}
+    inert={!isOpen}
   >
     <div
       class="sidebar-panel h-full flex flex-col relative text-sidebar-foreground"
@@ -249,15 +288,17 @@
           data-combined-panel-split
         >
           <div
-            class="combined-panel-spaces min-h-0 shrink-0 overflow-hidden flex flex-col"
-            style="height: {liveSplit * 100}%;"
+            class="combined-panel-spaces min-h-0 overflow-hidden flex flex-col {$isChiefCollapsed$
+              ? 'flex-1'
+              : 'shrink-0'}"
+            style:height={$isChiefCollapsed$ ? undefined : `${liveSplit * 100}%`}
             data-combined-panel-spaces
           >
             <!-- Combined workspace panel: workspace list stacked above the Chief chat
                with a draggable horizontal divider between them. -->
             <div class="panel-header shrink-0">
               <div class="min-w-0 flex-1">
-                <h2 class="panel-title text-ui font-semibold text-foreground truncate">
+                <h2 class="panel-title text-ui font-medium text-foreground truncate">
                   {m.layout_sidebarNav_allWorkspaces_title()}
                 </h2>
               </div>
@@ -294,7 +335,7 @@
                           aria-expanded={spacesOptionsOpen}
                           data-spaces-options-trigger
                         >
-                          <Fa icon={faEllipsisVertical} size="xs" />
+                          <KebabIcon class="size-3.5" />
                         </button>
                       </Tooltip>
                     {/snippet}
@@ -360,25 +401,40 @@
             </div>
           </div>
 
-          <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
-          <div
-            class="app-resize-handle combined-panel-divider relative shrink-0"
-            data-resize-axis="y"
-            data-resizing={isSplitResizing}
-            data-testid="split-resize-handle"
-            onmousedown={handleSplitResizeStart}
-            role="separator"
-            aria-orientation="horizontal"
-            aria-label={m.layout_sidebarPanel_resizeListAndChat_ariaLabel()}
-          >
+          {#if !$isChiefCollapsed$}
+            <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
             <div
-              class="pointer-events-none h-px w-full bg-border"
-              data-combined-panel-divider-border
-            ></div>
-          </div>
+              class="app-resize-handle combined-panel-divider relative shrink-0"
+              data-resize-axis="y"
+              data-resizing={isSplitResizing}
+              data-testid="split-resize-handle"
+              onmousedown={handleSplitResizeStart}
+              role="separator"
+              aria-orientation="horizontal"
+              aria-label={m.layout_sidebarPanel_resizeListAndChat_ariaLabel()}
+            >
+              <div
+                class="pointer-events-none h-px w-full bg-border"
+                data-combined-panel-divider-border
+              ></div>
+            </div>
+          {/if}
 
-          <div class="min-h-0 flex-1 overflow-hidden flex flex-col" data-combined-panel-chief>
-            <ChiefCard expanded={true} embedded={true} />
+          <!-- overflow-clip with an 8px clip margin (instead of overflow-hidden)
+               lets the Chief composer's streaming aurora bleed across the app
+               frame's pl-2/pb-2 window inset to the window edges. -->
+          <div
+            class="min-h-0 overflow-clip [overflow-clip-margin:0.5rem] flex flex-col {$isChiefCollapsed$
+              ? 'shrink-0'
+              : 'flex-1'}"
+            data-combined-panel-chief
+          >
+            <ChiefCard
+              expanded={true}
+              embedded={true}
+              collapsed={$isChiefCollapsed$}
+              ontoggle={() => appStore.dispatch(toggleChiefCollapsed())}
+            />
           </div>
         </div>
       {:else}
@@ -411,9 +467,9 @@
           bind:this={contentEl}
           onscroll={updateScrollFades}
         >
-          {#if $panelItem$ === 'active'}
+          {#if displayedPanelItem === 'active'}
             <ActiveWorkspacesCard expanded={true} />
-          {:else if $panelItem$ === 'settings'}
+          {:else if displayedPanelItem === 'settings'}
             <SettingsCard />
           {/if}
         </div>
@@ -447,6 +503,22 @@
 <style>
   .sidebar-panel {
     container-type: inline-size;
+  }
+
+  /* The panel shell animates its width open/closed while staying mounted.
+     Disabled during a manual width drag so the handle tracks the pointer. */
+  [data-panel-shell] {
+    transition: width var(--motion-standard) var(--ease-standard);
+  }
+
+  [data-panel-shell][data-resizing='true'] {
+    transition: none;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    [data-panel-shell] {
+      transition: none;
+    }
   }
 
   .sidebar-panel-content {

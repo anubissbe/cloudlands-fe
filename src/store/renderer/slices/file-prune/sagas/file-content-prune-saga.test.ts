@@ -3,10 +3,12 @@ import { runSaga, stdChannel } from 'redux-saga';
 
 import type { StoreState } from '../../../types';
 import { TAB_REMOVAL_ACTIONS } from '../../panel-layout/panel-layout-action-utils';
+import { removeScript } from '../../scripts/scripts-slice';
 import {
   applyPreset,
   clearPanelLayout,
   closeActiveTab,
+  closeFocusedPanelTab,
   closeAllOthersEverywhere,
   closeAllTabs,
   closeOtherTabs,
@@ -142,6 +144,7 @@ const tabRemovalActionCases = [
   createGridLayout(WS_2, 1, NOW),
   closeTab(WS_2, 'tab', 'panel', NOW),
   closeActiveTab(WS_2, 'panel', NOW),
+  closeFocusedPanelTab(WS_2, NOW),
   closeTabsByType(WS_2, 'file', undefined, undefined, NOW),
   closeTabsByAgentId(WS_2, 'agent', NOW),
   moveTabToPanel(WS_2, 'tab', 'from', 'to', 0, NOW),
@@ -156,6 +159,7 @@ const tabRemovalActionCases = [
   goBack(WS_2, NOW),
   goForward(WS_2),
   reconcileStaleAgentTabs(WS_2, [], 'replacement', 'Replacement'),
+  removeScript(WS_2, 'script'),
   clearPanelLayout(WS_2),
 ];
 

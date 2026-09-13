@@ -38,30 +38,42 @@
  * history's newest side and an append its oldest side, so the other walk's
  * position may no longer border the segment — its next request re-seeks.
  * Continuation state resets when the history segment is cleared out from
- * under the walk (session removal, explicit segment clear, and the §7.1
- * `resumed: false` rehydration — whose retained rows are unanchored, so the
- * segment itself is discarded here too). Errors are logged and swallowed
- * (the transcript already rendered); the finally settle always clears the
- * fetching flag.
+ * under the walk (session removal — single, per-workspace bulk, or global
+ * clear — explicit segment clear, and the §7.1 `resumed: false` rehydration
+ * — whose retained rows are unanchored, so the segment itself is discarded
+ * here too). Errors are logged and swallowed (the transcript already
+ * rendered); the finally settle always clears the fetching flag.
  */
-import { all, call, put, takeEvery, type SagaGenerator } from 'typed-redux-saga';
+import { all, call, delay, put, race, take, takeEvery, type SagaGenerator } from 'typed-redux-saga';
 
 import { appClient } from '$lib/client';
 import { createLogger } from '$lib/utils/client-logger';
 import { estimateSeekLandingStartOrdinal } from '$lib/utils/seek-landing-estimate';
 import type { AgentMessage } from '$shared/types';
+import { dedupeResourceBlocks } from '$shared/types/resource-block-identity';
+import { getQuestionFromResourceBlock, type Question } from '$shared/types/question-resource';
+import {
+  classifyPendingProposalRefs,
+  proposalsOf,
+} from '$lib/components/chat/proposals/pending-proposals';
+import type { Proposal } from '$shared/types/proposal';
 import { isAgentDeletionPending } from '$features/agent/utils/pending-agent-deletions';
 import {
   appendHistoryMessages,
+  clearAllSessions,
   clearHistorySegment,
   prependHistoryMessages,
   removeSession,
+  removeWorkspaceSessions,
   seedHistoryAround,
   setHistoryOldestReached,
 } from '../../agent-session/agent-session-slice';
 import {
   selectAgentHistoryMessages,
+  selectAgentMessageById,
   selectAgentMessages,
+  selectAgentSession,
+  selectHasHistorySegment,
   selectHistorySegmentMeta,
 } from '../../agent-session/agent-session-selectors';
 import {
@@ -69,18 +81,91 @@ import {
   historyGapFillRequested,
   historySeekRequested,
   olderHistoryPageRequested,
+  pendingProposalRecoveryPruned,
+  pendingProposalRecoveryRequested,
+  pendingProposalRecoverySettled,
+  pendingQuestionRecoveryCleared,
+  pendingQuestionRecoveryRequested,
+  pendingQuestionRecoverySettled,
   scrollbackContinuationReset,
   scrollbackFetchStarted,
   scrollbackGapPageSettled,
   scrollbackOlderPageSettled,
   scrollbackSeekSettled,
 } from '../chat-state-slice';
-import { selectChatAgentState } from '../chat-state-selectors';
+import { selectChatAgentIds, selectChatAgentState } from '../chat-state-selectors';
 
 const logger = createLogger('ChatScrollbackSaga');
 const PAGE_LIMIT = 200;
+const MARKED_QUESTION_LIMIT = 1;
+const MARKED_QUESTION_RETRY_DELAYS_MS = [250, 1_000] as const;
 
 type ConversationPage = Awaited<ReturnType<typeof appClient.agents.getConversation>>;
+type ObservedAction = { type: string; payload?: unknown };
+
+function markedQuestions(message: AgentMessage): Question[] {
+  if (message.role !== 'assistant' || message.isStreaming) return [];
+  return dedupeResourceBlocks(message.contentBlocks ?? [])
+    .map(getQuestionFromResourceBlock)
+    .filter((question): question is Question => question !== null);
+}
+
+function stopsPendingQuestionRecovery(
+  action: ObservedAction,
+  agentId: string,
+  messageId: string,
+): boolean {
+  if (!Array.isArray(action.payload) || action.payload[0] !== agentId) return false;
+  if (action.type === removeSession.type || action.type === pendingQuestionRecoveryCleared.type) {
+    return true;
+  }
+  return action.type === pendingQuestionRecoveryRequested.type && action.payload[1] !== messageId;
+}
+
+function* pendingQuestionRecoveryIsCurrent(
+  agentId: string,
+  messageId: string,
+): SagaGenerator<boolean> {
+  const session = yield* selectAgentSession.effect(agentId);
+  const chat = yield* selectChatAgentState.effect(agentId);
+  return (
+    session?.metadata?.pendingQuestionsMessageId === messageId &&
+    chat.pendingQuestionRecovery?.messageId === messageId &&
+    chat.pendingQuestionRecovery.status === 'loading'
+  );
+}
+
+/** Tray projection of a recovered carrying message (never transcript state). */
+function recoveredProposals(message: AgentMessage): { proposalId: string; proposal: Proposal }[] {
+  return [...proposalsOf(message)].map(([proposalId, proposal]) => ({ proposalId, proposal }));
+}
+
+function stopsPendingProposalRecovery(
+  action: ObservedAction,
+  agentId: string,
+  messageId: string,
+): boolean {
+  if (!Array.isArray(action.payload) || action.payload[0] !== agentId) return false;
+  if (action.type === removeSession.type) return true;
+  return (
+    action.type === pendingProposalRecoveryPruned.type &&
+    Array.isArray(action.payload[1]) &&
+    !action.payload[1].includes(messageId)
+  );
+}
+
+function* pendingProposalRecoveryIsCurrent(
+  agentId: string,
+  messageId: string,
+): SagaGenerator<boolean> {
+  const session = yield* selectAgentSession.effect(agentId);
+  const chat = yield* selectChatAgentState.effect(agentId);
+  const refs = classifyPendingProposalRefs(session?.metadata?.pendingProposals);
+  return (
+    refs.some((ref) => ref.messageId === messageId) &&
+    chat.pendingProposalRecovery?.[messageId]?.status === 'loading'
+  );
+}
 
 function oldestRowId(messages: AgentMessage[]): string | undefined {
   for (const message of messages) {
@@ -101,7 +186,7 @@ function newestRowId(messages: AgentMessage[]): string | undefined {
 function* fetchPage(
   agentId: string,
   token: string | null,
-  anchor: string,
+  anchor: string | undefined,
 ): SagaGenerator<ConversationPage> {
   if (token) {
     return yield* call(
@@ -134,18 +219,30 @@ function* fetchOlderPageWorker(
   const meta = yield* selectHistorySegmentMeta.effect(agentId);
   if (meta.oldestReached) return;
   const history: AgentMessage[] = yield* selectAgentHistoryMessages.effect(agentId);
-  // The persisted cursor is only honored while the segment it was minted
-  // against still has rows; with no anchorable row anywhere there is no
-  // history to page (empty conversation).
-  const token = history.length > 0 ? chat.scrollbackOlderToken : null;
+  // A held cursor is honored unconditionally — even when the segment holds
+  // no rows. It is never stale: every segment-clearing path (removeSession,
+  // the removeWorkspaceSessions / clearAllSessions bulk removals,
+  // clearHistorySegment, the §7.1 `resumed: false` snapshot discard) nulls
+  // it via scrollbackContinuationReset / the snapshot reducer's atomic
+  // reset. And it can be the walk's only way to make progress: a page whose
+  // rows are all already tail-resident merges to an EMPTY segment, so
+  // re-anchoring at the tail's oldest row would refetch the identical page
+  // forever. The anchored seek is only the no-cursor fallback.
+  const token = chat.scrollbackOlderToken;
   const tail: AgentMessage[] = yield* selectAgentMessages.effect(agentId);
   const anchor = oldestRowId(history) ?? oldestRowId(tail);
-  if (!anchor) return;
+  // No cursor and no anchorable row anywhere: empty conversation.
+  if (!token && !anchor) return;
+  const epoch = chat.scrollbackDiscardEpoch;
   yield* put(scrollbackFetchStarted(agentId, 'older'));
   let continuation: string | null = null;
   try {
     const page = yield* fetchPage(agentId, token, anchor);
     if (yield* call(isAgentDeletionPending, agentId)) return;
+    // A §7.1 discard landed while the wire call was in flight: the page was
+    // fetched against the discarded transcript — drop it entirely (the
+    // reducer already reset the flags/cursors atomically with the snapshot).
+    if (yield* discardedSince(agentId, epoch)) return;
     if (page.messages.length > 0) {
       yield* put(prependHistoryMessages(agentId, page.messages));
     }
@@ -156,8 +253,10 @@ function* fetchOlderPageWorker(
   } catch (error) {
     logger.error('Failed to fetch older scrollback page', error);
   } finally {
-    yield* put(scrollbackOlderPageSettled(agentId, continuation));
-    yield* dropContinuationIfSegmentGone(agentId);
+    if (!(yield* discardedSince(agentId, epoch))) {
+      yield* put(scrollbackOlderPageSettled(agentId, continuation));
+      yield* dropContinuationIfSegmentGone(agentId);
+    }
   }
 }
 
@@ -176,11 +275,14 @@ function* fetchGapFillWorker(
   const anchor = newestRowId(history);
   if (!anchor) return;
   const token = chat.scrollbackGapToken;
+  const epoch = chat.scrollbackDiscardEpoch;
   yield* put(scrollbackFetchStarted(agentId, 'gap'));
   let continuation: string | null = null;
   try {
     const page = yield* fetchPage(agentId, token, anchor);
     if (yield* call(isAgentDeletionPending, agentId)) return;
+    // Mid-flight §7.1 discard: drop the stale page (see fetchOlderPageWorker).
+    if (yield* discardedSince(agentId, epoch)) return;
     if (page.messages.length > 0) {
       yield* put(appendHistoryMessages(agentId, page.messages));
     }
@@ -188,8 +290,10 @@ function* fetchGapFillWorker(
   } catch (error) {
     logger.error('Failed to fetch scrollback gap-refill page', error);
   } finally {
-    yield* put(scrollbackGapPageSettled(agentId, continuation));
-    yield* dropContinuationIfSegmentGone(agentId);
+    if (!(yield* discardedSince(agentId, epoch))) {
+      yield* put(scrollbackGapPageSettled(agentId, continuation));
+      yield* dropContinuationIfSegmentGone(agentId);
+    }
   }
 }
 
@@ -207,9 +311,7 @@ function isInvalidParamsError(error: unknown): boolean {
   return candidate.rpcCode === -32602 || candidate.code === 'INVALID_PARAMS';
 }
 
-function* historySeekWorker(
-  action: ReturnType<typeof historySeekRequested>,
-): SagaGenerator<void> {
+function* historySeekWorker(action: ReturnType<typeof historySeekRequested>): SagaGenerator<void> {
   const [, agentId, targetOrdinal] = action.payload;
   if (yield* call(isAgentDeletionPending, agentId)) return;
   const chat = yield* selectChatAgentState.effect(agentId);
@@ -219,6 +321,7 @@ function* historySeekWorker(
   // segment. The panel re-classifies once the in-flight fetch settles.
   if (chat.fetchingOlderHistory || chat.fetchingGapFill) return;
   const target = Math.max(0, Math.round(targetOrdinal));
+  const epoch = chat.scrollbackDiscardEpoch;
   yield* put(scrollbackFetchStarted(agentId, 'seek'));
   let tokens: { nextToken: string | null; prevToken: string | null } = {
     nextToken: null,
@@ -235,6 +338,9 @@ function* historySeekWorker(
       target,
     );
     if (yield* call(isAgentDeletionPending, agentId)) return;
+    // Mid-flight §7.1 discard: the landing was fetched against the discarded
+    // transcript — drop it (see fetchOlderPageWorker).
+    if (yield* discardedSince(agentId, epoch)) return;
     if (page.prevToken === null) {
       // No forward cursor: either the daemon predates `aroundIndex` (its
       // router ignores unknown params and returned the legacy NEWEST page),
@@ -273,20 +379,264 @@ function* historySeekWorker(
       logger.error('Failed to fetch scrollback seek page', error);
     }
   } finally {
-    yield* put(scrollbackSeekSettled(agentId, tokens, unsupported));
-    yield* dropContinuationIfSegmentGone(agentId);
+    // After a mid-flight discard the settle only runs to latch
+    // `historySeekUnsupported` (a daemon capability, not walk state — it
+    // survives the discard); a stale token settle must not overwrite the
+    // post-discard walk.
+    if (!(yield* discardedSince(agentId, epoch))) {
+      yield* put(scrollbackSeekSettled(agentId, tokens, unsupported));
+      yield* dropContinuationIfSegmentGone(agentId);
+    } else if (unsupported) {
+      yield* put(scrollbackSeekSettled(agentId, { nextToken: null, prevToken: null }, true));
+    }
+  }
+}
+
+function* recoverPendingQuestionWorker(
+  inFlight: Set<string>,
+  action: ReturnType<typeof pendingQuestionRecoveryRequested>,
+): SagaGenerator<void> {
+  const [agentId, messageId] = action.payload;
+  const key = `${agentId}\u0000${messageId}`;
+  const chat = yield* selectChatAgentState.effect(agentId);
+  if (
+    chat.pendingQuestionRecovery?.messageId !== messageId ||
+    chat.pendingQuestionRecovery.status !== 'loading' ||
+    inFlight.has(key)
+  ) {
+    return;
+  }
+  const resident = yield* selectAgentMessageById.effect(agentId, messageId);
+  if (resident) {
+    const questions = markedQuestions(resident);
+    yield* put(
+      pendingQuestionRecoverySettled(
+        agentId,
+        messageId,
+        questions.length > 0 ? 'found' : 'not-found',
+        questions,
+      ),
+    );
+    return;
+  }
+
+  inFlight.add(key);
+  try {
+    for (let attempt = 0; attempt <= MARKED_QUESTION_RETRY_DELAYS_MS.length; attempt++) {
+      try {
+        const outcome: { page?: ConversationPage; stopped?: ObservedAction } = yield* race({
+          page: call(
+            [appClient.agents, appClient.agents.getConversation],
+            agentId,
+            MARKED_QUESTION_LIMIT,
+            undefined,
+            messageId,
+          ),
+          stopped: take((action: ObservedAction) =>
+            stopsPendingQuestionRecovery(action, agentId, messageId),
+          ),
+        });
+        if (outcome.stopped || !outcome.page) {
+          yield* put(pendingQuestionRecoverySettled(agentId, messageId, 'cancelled'));
+          return;
+        }
+        if (!(yield* pendingQuestionRecoveryIsCurrent(agentId, messageId))) {
+          yield* put(pendingQuestionRecoverySettled(agentId, messageId, 'cancelled'));
+          return;
+        }
+        const marked = outcome.page.messages.find((message) => message.id === messageId);
+        if (!marked) {
+          yield* put(pendingQuestionRecoverySettled(agentId, messageId, 'not-found'));
+          return;
+        }
+        const questions = markedQuestions(marked);
+        yield* put(
+          pendingQuestionRecoverySettled(
+            agentId,
+            messageId,
+            questions.length > 0 ? 'found' : 'not-found',
+            questions,
+          ),
+        );
+        return;
+      } catch (error) {
+        if (isInvalidParamsError(error)) {
+          yield* put(pendingQuestionRecoverySettled(agentId, messageId, 'not-found'));
+          return;
+        }
+        if (!(yield* pendingQuestionRecoveryIsCurrent(agentId, messageId))) {
+          yield* put(pendingQuestionRecoverySettled(agentId, messageId, 'cancelled'));
+          return;
+        }
+        const retryDelay = MARKED_QUESTION_RETRY_DELAYS_MS[attempt];
+        if (retryDelay === undefined) {
+          logger.error('Failed to recover marked pending question after bounded retries', {
+            agentId,
+            messageId,
+            error,
+          });
+          yield* put(pendingQuestionRecoverySettled(agentId, messageId, 'error'));
+          return;
+        }
+        logger.warn('Retrying marked pending question recovery', {
+          agentId,
+          messageId,
+          attempt: attempt + 1,
+          error,
+        });
+        const { stopped }: { stopped?: ObservedAction } = yield* race({
+          elapsed: delay(retryDelay),
+          stopped: take((action: ObservedAction) =>
+            stopsPendingQuestionRecovery(action, agentId, messageId),
+          ),
+        });
+        if (stopped || !(yield* pendingQuestionRecoveryIsCurrent(agentId, messageId))) {
+          yield* put(pendingQuestionRecoverySettled(agentId, messageId, 'cancelled'));
+          return;
+        }
+      }
+    }
+  } finally {
+    inFlight.delete(key);
   }
 }
 
 /**
- * Post-settle hygiene: when the history segment was cleared out from under
- * an in-flight fetch (session removal / `resumed: false` rehydration), the
- * just-persisted cursor was minted against the discarded segment — drop it
- * so a future walk re-seeks instead of continuing from a stale position.
+ * Mirror of `recoverPendingQuestionWorker` for pending-proposal carrying
+ * messages outside the loaded window: one bounded `aroundMessageId` seek per
+ * requested messageId (multiple recoveries may run for one agent — proposals
+ * can span carrying messages). Same retry ladder and cancellation triggers
+ * (session removal, or a prune dropping the messageId from the tracked set).
+ */
+function* recoverPendingProposalWorker(
+  inFlight: Set<string>,
+  action: ReturnType<typeof pendingProposalRecoveryRequested>,
+): SagaGenerator<void> {
+  const [agentId, messageId] = action.payload;
+  const key = `${agentId}\u0000${messageId}`;
+  const chat = yield* selectChatAgentState.effect(agentId);
+  if (chat.pendingProposalRecovery?.[messageId]?.status !== 'loading' || inFlight.has(key)) {
+    return;
+  }
+  const resident = yield* selectAgentMessageById.effect(agentId, messageId);
+  if (resident) {
+    const proposals = recoveredProposals(resident);
+    yield* put(
+      pendingProposalRecoverySettled(
+        agentId,
+        messageId,
+        proposals.length > 0 ? 'found' : 'not-found',
+        proposals,
+      ),
+    );
+    return;
+  }
+
+  inFlight.add(key);
+  try {
+    for (let attempt = 0; attempt <= MARKED_QUESTION_RETRY_DELAYS_MS.length; attempt++) {
+      try {
+        const outcome: { page?: ConversationPage; stopped?: ObservedAction } = yield* race({
+          page: call(
+            [appClient.agents, appClient.agents.getConversation],
+            agentId,
+            MARKED_QUESTION_LIMIT,
+            undefined,
+            messageId,
+          ),
+          stopped: take((action: ObservedAction) =>
+            stopsPendingProposalRecovery(action, agentId, messageId),
+          ),
+        });
+        if (outcome.stopped || !outcome.page) {
+          yield* put(pendingProposalRecoverySettled(agentId, messageId, 'cancelled'));
+          return;
+        }
+        if (!(yield* pendingProposalRecoveryIsCurrent(agentId, messageId))) {
+          yield* put(pendingProposalRecoverySettled(agentId, messageId, 'cancelled'));
+          return;
+        }
+        const carrying = outcome.page.messages.find((message) => message.id === messageId);
+        if (!carrying) {
+          yield* put(pendingProposalRecoverySettled(agentId, messageId, 'not-found'));
+          return;
+        }
+        const proposals = recoveredProposals(carrying);
+        yield* put(
+          pendingProposalRecoverySettled(
+            agentId,
+            messageId,
+            proposals.length > 0 ? 'found' : 'not-found',
+            proposals,
+          ),
+        );
+        return;
+      } catch (error) {
+        if (isInvalidParamsError(error)) {
+          yield* put(pendingProposalRecoverySettled(agentId, messageId, 'not-found'));
+          return;
+        }
+        if (!(yield* pendingProposalRecoveryIsCurrent(agentId, messageId))) {
+          yield* put(pendingProposalRecoverySettled(agentId, messageId, 'cancelled'));
+          return;
+        }
+        const retryDelay = MARKED_QUESTION_RETRY_DELAYS_MS[attempt];
+        if (retryDelay === undefined) {
+          logger.error('Failed to recover pending proposal message after bounded retries', {
+            agentId,
+            messageId,
+            error,
+          });
+          yield* put(pendingProposalRecoverySettled(agentId, messageId, 'error'));
+          return;
+        }
+        logger.warn('Retrying pending proposal message recovery', {
+          agentId,
+          messageId,
+          attempt: attempt + 1,
+          error,
+        });
+        const { stopped }: { stopped?: ObservedAction } = yield* race({
+          elapsed: delay(retryDelay),
+          stopped: take((action: ObservedAction) =>
+            stopsPendingProposalRecovery(action, agentId, messageId),
+          ),
+        });
+        if (stopped || !(yield* pendingProposalRecoveryIsCurrent(agentId, messageId))) {
+          yield* put(pendingProposalRecoverySettled(agentId, messageId, 'cancelled'));
+          return;
+        }
+      }
+    }
+  } finally {
+    inFlight.delete(key);
+  }
+}
+
+/**
+ * True when a §7.1 `resumed: false` discard landed after the caller captured
+ * `epoch` (before its wire call). The discard reducer already reset the
+ * fetching flags + cursors atomically with the snapshot, so a worker
+ * observing a bumped epoch must drop its result wholesale — no page
+ * mutation, no settle — or it would recreate a history segment / persist a
+ * cursor minted against the discarded transcript.
+ */
+function* discardedSince(agentId: string, epoch: number): SagaGenerator<boolean> {
+  const chat = yield* selectChatAgentState.effect(agentId);
+  return chat.scrollbackDiscardEpoch !== epoch;
+}
+
+/**
+ * Post-settle hygiene: when the history segment RECORD was cleared out from
+ * under an in-flight fetch (session removal / `resumed: false` rehydration),
+ * the just-persisted cursor was minted against the discarded segment — drop
+ * it so a future walk re-seeks instead of continuing from a stale position.
+ * A record that exists with ZERO rows is different: the page's rows were all
+ * already tail-resident (prependHistoryMessages keeps the record), and the
+ * persisted cursor is the walk's only way to make progress — keep it.
  */
 function* dropContinuationIfSegmentGone(agentId: string): SagaGenerator<void> {
-  const history: AgentMessage[] = yield* selectAgentHistoryMessages.effect(agentId);
-  if (history.length === 0) {
+  if (!(yield* selectHasHistorySegment.effect(agentId))) {
     yield* put(scrollbackContinuationReset(agentId));
   }
 }
@@ -297,6 +647,24 @@ function* continuationResetWorker(
 ): SagaGenerator<void> {
   const [agentId] = action.payload;
   yield* put(scrollbackContinuationReset(agentId));
+}
+
+/**
+ * Bulk session removal (`removeWorkspaceSessions` / `clearAllSessions`)
+ * dropped every affected agent's session AND history segment in one reducer
+ * pass, without touching chat-state — so persisted cursors would go stale
+ * and get honored unconditionally if the same agent were hydrated again.
+ * The removal reducer runs before this watcher, so the affected set is
+ * exactly the chat-state entries whose agent session no longer exists;
+ * unaffected agents (other workspaces) keep their session and are skipped,
+ * and the reset reducer no-ops on entries with nothing to clear.
+ */
+function* bulkContinuationResetWorker(): SagaGenerator<void> {
+  const agentIds = yield* selectChatAgentIds.effect();
+  for (const agentId of agentIds) {
+    const session = yield* selectAgentSession.effect(agentId);
+    if (!session) yield* put(scrollbackContinuationReset(agentId));
+  }
 }
 
 /**
@@ -314,12 +682,31 @@ function* snapshotResetWorker(
 }
 
 export function* chatScrollbackSaga(): SagaGenerator<void> {
-  yield* all([
-    takeEvery(olderHistoryPageRequested, fetchOlderPageWorker),
-    takeEvery(historyGapFillRequested, fetchGapFillWorker),
-    takeEvery(historySeekRequested, historySeekWorker),
-    takeEvery(removeSession, continuationResetWorker),
-    takeEvery(clearHistorySegment, continuationResetWorker),
-    takeEvery(chatTranscriptSnapshotApplied, snapshotResetWorker),
-  ]);
+  const pendingQuestionRecoveries = new Set<string>();
+  const pendingProposalRecoveries = new Set<string>();
+  try {
+    yield* all([
+      takeEvery(olderHistoryPageRequested, fetchOlderPageWorker),
+      takeEvery(historyGapFillRequested, fetchGapFillWorker),
+      takeEvery(historySeekRequested, historySeekWorker),
+      takeEvery(
+        pendingQuestionRecoveryRequested,
+        recoverPendingQuestionWorker,
+        pendingQuestionRecoveries,
+      ),
+      takeEvery(
+        pendingProposalRecoveryRequested,
+        recoverPendingProposalWorker,
+        pendingProposalRecoveries,
+      ),
+      takeEvery(removeSession, continuationResetWorker),
+      takeEvery(clearHistorySegment, continuationResetWorker),
+      takeEvery(removeWorkspaceSessions, bulkContinuationResetWorker),
+      takeEvery(clearAllSessions, bulkContinuationResetWorker),
+      takeEvery(chatTranscriptSnapshotApplied, snapshotResetWorker),
+    ]);
+  } finally {
+    pendingQuestionRecoveries.clear();
+    pendingProposalRecoveries.clear();
+  }
 }

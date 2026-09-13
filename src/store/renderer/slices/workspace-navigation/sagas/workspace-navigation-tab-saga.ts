@@ -9,13 +9,14 @@ import {
 import { createLogger } from '$lib/utils/client-logger';
 import { isBinaryExtension } from '$shared/binary-file-extensions';
 import { m } from '$shared/paraglide/messages.js';
-import { selectPanel } from '../../panel-layout/panel-layout-selectors';
-import { openTabInNewRootColumn } from '../../panel-layout/panel-layout-slice';
-import type { PanelTab } from '../../panel-layout/panel-layout-types';
+import { parseFilePathLineSuffix } from '$shared/utils/link-helpers';
 import {
-  selectPanelOpenMode,
-  selectPanelStackDirection,
-} from '../../user-preferences/user-preferences-selectors';
+  openTab,
+  openTabInAdjacentOrSplit,
+  openTabInRightmostColumnRequested,
+} from '../../panel-layout/panel-layout-slice';
+import { selectFocusedPanelId } from '../../panel-layout/panel-layout-selectors';
+import type { PanelTab } from '../../panel-layout/panel-layout-types';
 import { selectNoteById } from '../../workspace-notes/workspace-notes-selectors';
 import {
   chatChangesDedupId,
@@ -38,16 +39,23 @@ function* openWorkspaceTab(
   tab: Omit<PanelTab, 'id'>,
   adjacent: boolean,
   sourcePanelId?: string,
+  allowDuplicate?: boolean,
 ): SagaGenerator<void> {
-  void adjacent;
-  void sourcePanelId;
+  if (adjacent) {
+    yield* put(
+      openTabInAdjacentOrSplit(workspaceId, tab, sourcePanelId, {
+        force: true,
+        ...(allowDuplicate ? { allowDuplicate } : {}),
+      }),
+    );
+    return;
+  }
+  const targetPanelId =
+    sourcePanelId ?? (yield* selectFocusedPanelId.effect(workspaceId)) ?? undefined;
   yield* put(
-    openTabInNewRootColumn(workspaceId, tab, {
-      force: true,
-      sourcePanelId,
-      panelOpenMode: yield* selectPanelOpenMode.effect(),
-      panelStackDirection: yield* selectPanelStackDirection.effect(),
-    }),
+    targetPanelId
+      ? openTab(workspaceId, tab, targetPanelId, undefined, true)
+      : openTabInRightmostColumnRequested(workspaceId, tab, { force: true }),
   );
 }
 
@@ -83,15 +91,17 @@ function* openCommit(action: ReturnType<typeof openWorkspaceCommitChangeset>): S
 function* openFile(action: ReturnType<typeof openWorkspaceFile>): SagaGenerator<void> {
   const [workspaceId, filePath, options] = action.payload;
   if (!workspaceId || !filePath) return;
+  const parsed = parseFilePathLineSuffix(filePath);
+  const line = options?.line !== undefined ? options.line : parsed.line;
   yield* openWorkspaceTab(
     workspaceId,
     {
       type: 'file',
-      title: filePath.split('/').pop() || m.layout_tabTypes_file_title(),
-      filePath,
+      title: parsed.path.split('/').pop() || m.layout_tabTypes_file_title(),
+      filePath: parsed.path,
       workspaceId,
       closable: true,
-      ...(options?.line ? { data: { line: options.line, jumpTimestamp: Date.now() } } : {}),
+      ...(line !== undefined ? { data: { line, jumpTimestamp: Date.now() } } : {}),
     },
     options?.openInAdjacentPanel ?? false,
     options?.sourcePanelId,
@@ -101,12 +111,6 @@ function* openFile(action: ReturnType<typeof openWorkspaceFile>): SagaGenerator<
 function* openNote(action: ReturnType<typeof openWorkspaceNote>): SagaGenerator<void> {
   const [workspaceId, noteId, options] = action.payload;
   if (!workspaceId || !noteId) return;
-  let adjacent = options?.openInAdjacentPanel ?? false;
-  if (!adjacent && options?.sourcePanelId) {
-    const panel = yield* selectPanel.effect(workspaceId, options.sourcePanelId);
-    const activeTab = panel?.tabs.find((tab) => tab.id === panel.activeTabId);
-    adjacent = activeTab?.type === 'agent';
-  }
   const note = yield* selectNoteById.effect(workspaceId, noteId);
   yield* openWorkspaceTab(
     workspaceId,
@@ -117,8 +121,9 @@ function* openNote(action: ReturnType<typeof openWorkspaceNote>): SagaGenerator<
       workspaceId,
       closable: true,
     },
-    adjacent,
+    options?.openInAdjacentPanel ?? false,
     options?.sourcePanelId,
+    options?.openInNewAdjacentPanel ?? false,
   );
 }
 
@@ -141,6 +146,8 @@ function* openDiff(action: ReturnType<typeof openWorkspaceDiff>): SagaGenerator<
         ...(options?.branchBaseCommitSha
           ? { branchBaseCommitSha: options.branchBaseCommitSha }
           : {}),
+        ...(options?.gitRootId ? { gitRootId: options.gitRootId } : {}),
+        ...(options?.gitRootPath ? { gitRootPath: options.gitRootPath } : {}),
       },
     },
     options?.openInAdjacentPanel ?? false,
@@ -167,7 +174,7 @@ function* openBrowser(action: ReturnType<typeof openWorkspaceBrowser>): SagaGene
 function* openLocalChanges(
   action: ReturnType<typeof openWorkspaceLocalChanges>,
 ): SagaGenerator<void> {
-  const [workspaceId] = action.payload;
+  const [workspaceId, options] = action.payload;
   if (!workspaceId) return;
   yield* openWorkspaceTab(
     workspaceId,
@@ -176,6 +183,7 @@ function* openLocalChanges(
       title: m.layout_presetExecutor_allChanges_title(),
       workspaceId,
       closable: true,
+      data: { gitRootId: options?.gitRootId },
     },
     false,
   );
@@ -204,7 +212,7 @@ function* openChatChanges(
         ...(options?.turnNumber !== undefined ? { turnNumber: options.turnNumber } : {}),
       },
     },
-    Boolean(options?.sourcePanelId),
+    false,
     options?.sourcePanelId,
   );
 }

@@ -13,12 +13,27 @@ vi.mock('$lib/client', () => ({
 
 import type { AgentMessage, AgentSession } from '$shared/types';
 import { AgentStatus } from '$shared/types';
+import { QUESTION_RESOURCE_MIME_TYPE } from '$shared/types/question-resource';
+import type { Proposal } from '$shared/types/proposal';
+import { createProposalResource } from '$shared/types/proposal-resource';
+import type { StoreState } from '$store/renderer/types';
+import { composeTranscript } from '$lib/components/chat/chat-scrollback-composition';
+import {
+  deriveMarkedQuestionRecoveryState,
+  deriveWizardPendingQuestions,
+} from '$lib/components/chat/questions/wizard-gate';
+import { derivePendingProposalRecoveryState } from '$lib/components/chat/proposals/pending-proposal-recovery';
 import {
   HISTORY_SEGMENT_MAX,
   agentSessionReducer,
+  appendHistoryMessages,
   bulkUpsertSessions,
+  clearAllSessions,
   initialState as agentSessionInitialState,
   prependHistoryMessages,
+  removeSession,
+  removeWorkspaceSessions,
+  updateSession,
 } from '../../agent-session/agent-session-slice';
 import {
   chatStateReducer,
@@ -27,6 +42,9 @@ import {
   historySeekRequested,
   initialState as chatStateInitialState,
   olderHistoryPageRequested,
+  pendingProposalRecoveryPruned,
+  pendingProposalRecoveryRequested,
+  pendingQuestionRecoveryRequested,
 } from '../chat-state-slice';
 import { chatScrollbackSaga } from './chat-scrollback-saga';
 
@@ -67,6 +85,51 @@ function message(id: string, index: number): AgentMessage {
   };
 }
 
+function questionMessage(id: string, index: number): AgentMessage {
+  return {
+    ...message(id, index),
+    contentBlocks: [
+      {
+        type: 'resource',
+        resource: {
+          uri: 'intent-question://tar-abc123def456',
+          name: 'Marked question',
+          mimeType: QUESTION_RESOURCE_MIME_TYPE,
+          text: JSON.stringify({
+            attachmentId: 'tar-abc123def456',
+            header: 'Marked question',
+            question: 'Which option?',
+            options: [
+              { label: 'First', description: 'Use the first option' },
+              { label: 'Second', description: 'Use the second option' },
+            ],
+            multiSelect: false,
+          }),
+        },
+      },
+    ],
+  } as AgentMessage;
+}
+
+function proposal(applyToolCallId: string): Proposal {
+  return {
+    kind: 'workspace-create',
+    applyToolCallId,
+    payload: { params: { title: `Proposal ${applyToolCallId}` } },
+    preview: { title: `Proposal ${applyToolCallId}` },
+  } as Proposal;
+}
+
+function proposalMessage(id: string, index: number, proposals: Proposal[]): AgentMessage {
+  return {
+    ...message(id, index),
+    contentBlocks: proposals.map((proposal) => ({
+      type: 'resource',
+      resource: createProposalResource(proposal),
+    })),
+  } as AgentMessage;
+}
+
 function page(
   messages: AgentMessage[],
   overrides: Partial<{
@@ -105,11 +168,15 @@ function harness() {
     task,
     history: () => agentSessions.historySegmentsByAgentId?.[AGENT],
     chat: () => chatState.byAgentId[AGENT],
+    state: () => ({ agentSessions, chatState }) as StoreState,
   };
 }
 
 describe('chatScrollbackSaga (on-demand history paging)', () => {
-  afterEach(() => vi.clearAllMocks());
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.clearAllMocks();
+  });
 
   it('seeks at the tail oldest on the first older request, then continues from the persisted token', async () => {
     const run = harness();
@@ -168,6 +235,142 @@ describe('chatScrollbackSaga (on-demand history paging)', () => {
     await run.task.toPromise();
   });
 
+  it('honors the persisted token when the previous page merged to an empty segment (all rows tail-resident)', async () => {
+    const run = harness();
+    run.dispatch(
+      bulkUpsertSessions([session({ messages: [message('m-10', 10), message('m-11', 11)] })]),
+    );
+
+    // Anchored seek at the tail's oldest returns a page whose rows are ALL
+    // already tail-resident (e.g. the row above the tail exceeds the slim
+    // page budget): the prepend merges to an EMPTY segment, but the daemon
+    // minted a backward cursor — the walk's only way to make progress.
+    mocks.getConversation.mockResolvedValueOnce(
+      page([message('m-10', 10), message('m-11', 11)], { nextToken: 'older-1' }),
+    );
+    run.channel.put(olderHistoryPageRequested(WS, AGENT));
+    await settle();
+
+    // The segment record exists with zero rows; the cursor survives the
+    // settle (post-settle hygiene only drops it when the RECORD is gone).
+    expect(run.history()?.messages).toEqual([]);
+    expect(run.chat()?.scrollbackOlderToken).toBe('older-1');
+    expect(run.history()?.oldestReached).toBe(false);
+
+    // The NEXT older request continues from the token — no re-seek at the
+    // same anchor (which would refetch the identical page forever).
+    mocks.getConversation.mockResolvedValueOnce(
+      page([message('m-08', 8)], { nextToken: 'older-2' }),
+    );
+    run.channel.put(olderHistoryPageRequested(WS, AGENT));
+    await settle();
+    expect(run.history()?.messages.map((m) => m.id)).toEqual(['m-08']);
+    expect(run.chat()?.scrollbackOlderToken).toBe('older-2');
+
+    // The token chain exhausts: oldestReached, no repeated identical requests.
+    mocks.getConversation.mockResolvedValueOnce(page([message('m-07', 7)], { nextToken: null }));
+    run.channel.put(olderHistoryPageRequested(WS, AGENT));
+    await settle();
+
+    expect(mocks.getConversation.mock.calls).toEqual([
+      [AGENT, 200, undefined, 'm-10'],
+      [AGENT, 200, 'older-1'],
+      [AGENT, 200, 'older-2'],
+    ]);
+    expect(run.history()?.messages.map((m) => m.id)).toEqual(['m-07', 'm-08']);
+    expect(run.history()?.oldestReached).toBe(true);
+    expect(run.chat()?.scrollbackOlderToken).toBeNull();
+    run.task.cancel();
+    await run.task.toPromise();
+  });
+
+  it('still drops the cursor when the session (and segment record) is removed mid-flight', async () => {
+    const run = harness();
+    run.dispatch(bulkUpsertSessions([session({ messages: [message('m-10', 10)] })]));
+    let resolvePage!: (value: ReturnType<typeof page>) => void;
+    mocks.getConversation.mockReturnValueOnce(
+      new Promise((done) => {
+        resolvePage = done;
+      }),
+    );
+    run.channel.put(olderHistoryPageRequested(WS, AGENT));
+    await settle();
+    expect(run.chat()?.fetchingOlderHistory).toBe(true);
+
+    // Session removal clears the segment RECORD; the settle re-persists the
+    // stale cursor, and post-settle hygiene must still drop it.
+    run.dispatch(removeSession(AGENT));
+    resolvePage(page([message('m-05', 5)], { nextToken: 'stale-older-1' }));
+    await settle();
+
+    expect(run.history()).toBeUndefined();
+    expect(run.chat()?.scrollbackOlderToken).toBeNull();
+    expect(run.chat()?.fetchingOlderHistory).toBe(false);
+    run.task.cancel();
+    await run.task.toPromise();
+  });
+
+  it('drops the cursor on removeWorkspaceSessions for the removed workspace only', async () => {
+    const OTHER_WS = 'ws-other';
+    const OTHER_AGENT = 'agent-other';
+    const run = harness();
+    run.dispatch(
+      bulkUpsertSessions([
+        session({ messages: [message('m-10', 10)] }),
+        session({ id: OTHER_AGENT, workspaceId: OTHER_WS, messages: [message('n-10', 10)] }),
+      ]),
+    );
+
+    // Persist a backward cursor for each agent.
+    mocks.getConversation.mockResolvedValueOnce(
+      page([message('m-09', 9), message('m-10', 10)], { nextToken: 'older-1' }),
+    );
+    run.channel.put(olderHistoryPageRequested(WS, AGENT));
+    await settle();
+    mocks.getConversation.mockResolvedValueOnce(
+      page([message('n-09', 9), message('n-10', 10)], { nextToken: 'other-older-1' }),
+    );
+    run.channel.put(olderHistoryPageRequested(OTHER_WS, OTHER_AGENT));
+    await settle();
+    expect(run.chat()?.scrollbackOlderToken).toBe('older-1');
+    expect(run.state().chatState.byAgentId[OTHER_AGENT]?.scrollbackOlderToken).toBe(
+      'other-older-1',
+    );
+
+    // The bulk removal drops the segment RECORD; the cursor must go with it —
+    // a re-hydrated agent would otherwise continue from a stale continuation.
+    run.dispatch(removeWorkspaceSessions(WS));
+    await settle();
+
+    expect(run.history()).toBeUndefined();
+    expect(run.chat()?.scrollbackOlderToken).toBeNull();
+    // The other workspace's agent keeps its session, segment, and cursor.
+    expect(run.state().chatState.byAgentId[OTHER_AGENT]?.scrollbackOlderToken).toBe(
+      'other-older-1',
+    );
+    run.task.cancel();
+    await run.task.toPromise();
+  });
+
+  it('drops every cursor on clearAllSessions', async () => {
+    const run = harness();
+    run.dispatch(bulkUpsertSessions([session({ messages: [message('m-10', 10)] })]));
+    mocks.getConversation.mockResolvedValueOnce(
+      page([message('m-09', 9), message('m-10', 10)], { nextToken: 'older-1' }),
+    );
+    run.channel.put(olderHistoryPageRequested(WS, AGENT));
+    await settle();
+    expect(run.chat()?.scrollbackOlderToken).toBe('older-1');
+
+    run.dispatch(clearAllSessions());
+    await settle();
+
+    expect(run.history()).toBeUndefined();
+    expect(run.chat()?.scrollbackOlderToken).toBeNull();
+    run.task.cancel();
+    await run.task.toPromise();
+  });
+
   it('dedupes concurrent older requests per agent (takeLeading semantics)', async () => {
     const run = harness();
     run.dispatch(bulkUpsertSessions([session({ messages: [message('m-10', 10)] })]));
@@ -190,6 +393,353 @@ describe('chatScrollbackSaga (on-demand history paging)', () => {
     await settle();
     expect(run.chat()?.fetchingOlderHistory).toBe(false);
     expect(run.history()?.messages.map((m) => m.id)).toEqual(['m-09']);
+    run.task.cancel();
+    await run.task.toPromise();
+  });
+
+  it('retains one recovered marker across existing history and both cap-pruning directions', async () => {
+    const run = harness();
+    run.dispatch(
+      bulkUpsertSessions([
+        session({
+          status: AgentStatus.Idle,
+          messages: [message('m-tail', 2000)],
+          metadata: { pendingQuestionsMessageId: 'm-question' },
+        }),
+      ]),
+    );
+    run.dispatch(
+      prependHistoryMessages(AGENT, [message('m-existing-1', 1100), message('m-existing-2', 1101)]),
+    );
+    const historyBeforeRecovery = run.history()?.messages;
+    mocks.getConversation.mockResolvedValueOnce(
+      page([questionMessage('m-question', 1000)], {
+        totalMessages: 2001,
+        nextToken: 'unused',
+      }),
+    );
+
+    run.dispatch(pendingQuestionRecoveryRequested(AGENT, 'm-question'));
+    await settle();
+
+    expect(mocks.getConversation).toHaveBeenCalledTimes(1);
+    expect(mocks.getConversation).toHaveBeenCalledWith(AGENT, 1, undefined, 'm-question');
+    expect(run.history()?.messages).toBe(historyBeforeRecovery);
+    expect(run.chat()?.pendingQuestionRecovery).toMatchObject({
+      messageId: 'm-question',
+      status: 'found',
+    });
+    expect(
+      deriveWizardPendingQuestions(run.state(), AGENT, [message('m-tail', 2000)]),
+    ).toMatchObject({ messageId: 'm-question' });
+
+    run.dispatch(prependHistoryMessages(AGENT, [questionMessage('m-question', 1000)]));
+    const composed = composeTranscript(
+      run.history()?.messages ?? [],
+      [message('m-tail', 2000)],
+      run.history()?.gapToTail === true,
+    );
+    expect(
+      composed.groups.flatMap((group) => group.messages).filter((item) => item.id === 'm-question'),
+    ).toHaveLength(1);
+
+    run.dispatch(
+      prependHistoryMessages(
+        AGENT,
+        Array.from({ length: HISTORY_SEGMENT_MAX }, (_, index) =>
+          message(`m-older-${index}`, index),
+        ),
+      ),
+    );
+    expect(run.history()?.messages.some((item) => item.id === 'm-question')).toBe(false);
+    run.dispatch(pendingQuestionRecoveryRequested(AGENT, 'm-question'));
+    expect(deriveWizardPendingQuestions(run.state(), AGENT, [])).toMatchObject({
+      messageId: 'm-question',
+    });
+
+    run.dispatch(
+      appendHistoryMessages(
+        AGENT,
+        Array.from({ length: HISTORY_SEGMENT_MAX }, (_, index) =>
+          message(`m-newer-${index}`, 1200 + index),
+        ),
+      ),
+    );
+    run.dispatch(pendingQuestionRecoveryRequested(AGENT, 'm-question'));
+    await settle();
+    expect(deriveWizardPendingQuestions(run.state(), AGENT, [])).toMatchObject({
+      messageId: 'm-question',
+    });
+    expect(mocks.getConversation).toHaveBeenCalledTimes(1);
+    run.task.cancel();
+    await run.task.toPromise();
+  });
+
+  it('does not land a recovered row when the marker clears during the request', async () => {
+    const run = harness();
+    run.dispatch(
+      bulkUpsertSessions([
+        session({
+          messages: [message('m-tail', 100)],
+          metadata: { pendingQuestionsMessageId: 'm-question' },
+        }),
+      ]),
+    );
+    let resolvePage!: (value: ReturnType<typeof page>) => void;
+    mocks.getConversation.mockReturnValueOnce(
+      new Promise((done) => {
+        resolvePage = done;
+      }),
+    );
+    run.dispatch(pendingQuestionRecoveryRequested(AGENT, 'm-question'));
+    await settle();
+    run.dispatch(updateSession(AGENT, { metadata: { pendingQuestionsMessageId: '' } }));
+    resolvePage(page([message('m-question', 10)]));
+    await settle();
+
+    expect(run.history()).toBeUndefined();
+    expect(run.chat()?.pendingQuestionRecovery).toBeUndefined();
+    expect(mocks.getConversation).toHaveBeenCalledTimes(1);
+    run.task.cancel();
+    await run.task.toPromise();
+  });
+
+  it('retries one transient recovery failure without allowing duplicate panel requests', async () => {
+    vi.useFakeTimers();
+    const run = harness();
+    run.dispatch(
+      bulkUpsertSessions([
+        session({
+          status: AgentStatus.Idle,
+          metadata: { pendingQuestionsMessageId: 'm-question' },
+        }),
+      ]),
+    );
+    mocks.getConversation
+      .mockRejectedValueOnce(new Error('temporary transport failure'))
+      .mockResolvedValueOnce(page([questionMessage('m-question', 10)]));
+
+    run.dispatch(pendingQuestionRecoveryRequested(AGENT, 'm-question'));
+    run.dispatch(pendingQuestionRecoveryRequested(AGENT, 'm-question'));
+    await settle();
+
+    expect(mocks.getConversation).toHaveBeenCalledTimes(1);
+    expect(run.chat()?.pendingQuestionRecovery?.status).toBe('loading');
+    await vi.advanceTimersByTimeAsync(250);
+    await settle();
+
+    expect(mocks.getConversation).toHaveBeenCalledTimes(2);
+    expect(run.chat()?.pendingQuestionRecovery?.status).toBe('found');
+    expect(deriveWizardPendingQuestions(run.state(), AGENT, [])).toMatchObject({
+      messageId: 'm-question',
+    });
+    run.task.cancel();
+    await run.task.toPromise();
+  });
+
+  it('exhausts bounded transport retries and does not restart for the same marker', async () => {
+    vi.useFakeTimers();
+    const run = harness();
+    run.dispatch(
+      bulkUpsertSessions([session({ metadata: { pendingQuestionsMessageId: 'm-question' } })]),
+    );
+    mocks.getConversation.mockRejectedValue(new Error('transport unavailable'));
+
+    run.dispatch(pendingQuestionRecoveryRequested(AGENT, 'm-question'));
+    await settle();
+    await vi.advanceTimersByTimeAsync(250);
+    await settle();
+    await vi.advanceTimersByTimeAsync(1_000);
+    await settle();
+
+    expect(mocks.getConversation).toHaveBeenCalledTimes(3);
+    expect(run.chat()?.pendingQuestionRecovery).toEqual({
+      messageId: 'm-question',
+      status: 'error',
+    });
+    expect(deriveMarkedQuestionRecoveryState(run.state(), AGENT)).toEqual({
+      messageId: 'm-question',
+      shouldRequest: false,
+      loading: true,
+    });
+    run.dispatch(pendingQuestionRecoveryRequested(AGENT, 'm-question'));
+    await vi.advanceTimersByTimeAsync(10_000);
+    await settle();
+    expect(mocks.getConversation).toHaveBeenCalledTimes(3);
+    run.task.cancel();
+    await run.task.toPromise();
+  });
+
+  it('cancels a stale in-flight completion when the marker changes', async () => {
+    const run = harness();
+    run.dispatch(
+      bulkUpsertSessions([session({ metadata: { pendingQuestionsMessageId: 'm-old' } })]),
+    );
+    let resolveOld!: (value: ReturnType<typeof page>) => void;
+    mocks.getConversation
+      .mockReturnValueOnce(new Promise((resolve) => (resolveOld = resolve)))
+      .mockResolvedValueOnce(page([questionMessage('m-new', 11)]));
+
+    run.dispatch(pendingQuestionRecoveryRequested(AGENT, 'm-old'));
+    await settle();
+    run.dispatch(updateSession(AGENT, { metadata: { pendingQuestionsMessageId: 'm-new' } }));
+    run.dispatch(pendingQuestionRecoveryRequested(AGENT, 'm-new'));
+    await settle();
+    resolveOld(page([questionMessage('m-old', 10)]));
+    await settle();
+
+    expect(mocks.getConversation).toHaveBeenCalledTimes(2);
+    expect(run.chat()?.pendingQuestionRecovery).toMatchObject({
+      messageId: 'm-new',
+      status: 'found',
+    });
+    run.task.cancel();
+    await run.task.toPromise();
+  });
+
+  it('stops a scheduled retry when the session is removed', async () => {
+    vi.useFakeTimers();
+    const run = harness();
+    run.dispatch(
+      bulkUpsertSessions([session({ metadata: { pendingQuestionsMessageId: 'm-question' } })]),
+    );
+    mocks.getConversation.mockRejectedValue(new Error('temporary transport failure'));
+
+    run.dispatch(pendingQuestionRecoveryRequested(AGENT, 'm-question'));
+    await settle();
+    run.dispatch(removeSession(AGENT));
+    await settle();
+    await vi.advanceTimersByTimeAsync(10_000);
+    await settle();
+
+    expect(mocks.getConversation).toHaveBeenCalledTimes(1);
+    expect(run.chat()?.pendingQuestionRecovery).toBeUndefined();
+    run.task.cancel();
+    await run.task.toPromise();
+  });
+
+  it('recovers a pending-proposal carrying message with a bounded targeted seek', async () => {
+    const run = harness();
+    const pendingProposal = proposal('toolu-1');
+    run.dispatch(
+      bulkUpsertSessions([
+        session({
+          status: AgentStatus.Idle,
+          messages: [message('m-tail', 2000)],
+          metadata: {
+            pendingProposals: [{ proposalId: 'toolu-1', messageId: 'm-proposal' }],
+          },
+        }),
+      ]),
+    );
+    // The carrying message is outside the loaded window: recovery names one
+    // needed lookup.
+    expect(derivePendingProposalRecoveryState(run.state(), AGENT)).toEqual([
+      { messageId: 'm-proposal', shouldRequest: true, loading: true },
+    ]);
+    mocks.getConversation.mockResolvedValueOnce(
+      page([proposalMessage('m-proposal', 1000, [pendingProposal])], { totalMessages: 2001 }),
+    );
+    run.dispatch(pendingProposalRecoveryRequested(AGENT, 'm-proposal'));
+    await settle();
+
+    expect(mocks.getConversation).toHaveBeenCalledTimes(1);
+    expect(mocks.getConversation).toHaveBeenCalledWith(AGENT, 1, undefined, 'm-proposal');
+    expect(run.chat()?.pendingProposalRecovery?.['m-proposal']).toMatchObject({
+      status: 'found',
+    });
+    // Recovered rows never land in transcript state.
+    expect(run.history()).toBeUndefined();
+    run.task.cancel();
+    await run.task.toPromise();
+  });
+
+  it('runs independent recoveries per carrying message and settles resident rows without a fetch', async () => {
+    const run = harness();
+    const p1 = proposal('toolu-1');
+    const p2 = proposal('toolu-2');
+    run.dispatch(
+      bulkUpsertSessions([
+        session({
+          messages: [proposalMessage('m-resident', 90, [p2])],
+          metadata: {
+            pendingProposals: [
+              { proposalId: 'toolu-1', messageId: 'm-far' },
+              { proposalId: 'toolu-2', messageId: 'm-resident' },
+            ],
+          },
+        }),
+      ]),
+    );
+    // Only the non-resident message needs a lookup.
+    expect(derivePendingProposalRecoveryState(run.state(), AGENT)).toEqual([
+      { messageId: 'm-far', shouldRequest: true, loading: true },
+    ]);
+    mocks.getConversation.mockResolvedValueOnce(page([proposalMessage('m-far', 10, [p1])]));
+    run.dispatch(pendingProposalRecoveryRequested(AGENT, 'm-far'));
+    run.dispatch(pendingProposalRecoveryRequested(AGENT, 'm-resident'));
+    await settle();
+
+    expect(mocks.getConversation).toHaveBeenCalledTimes(1);
+    expect(run.chat()?.pendingProposalRecovery?.['m-far']?.status).toBe('found');
+    // Resident carrying message settles synchronously from the loaded row.
+    expect(run.chat()?.pendingProposalRecovery?.['m-resident']?.status).toBe('found');
+    run.task.cancel();
+    await run.task.toPromise();
+  });
+
+  it('cancels an in-flight proposal recovery when a prune drops its messageId', async () => {
+    const run = harness();
+    run.dispatch(
+      bulkUpsertSessions([
+        session({
+          metadata: { pendingProposals: [{ proposalId: 'toolu-1', messageId: 'm-proposal' }] },
+        }),
+      ]),
+    );
+    let resolvePage!: (value: ReturnType<typeof page>) => void;
+    mocks.getConversation.mockReturnValueOnce(
+      new Promise((done) => {
+        resolvePage = done;
+      }),
+    );
+    run.dispatch(pendingProposalRecoveryRequested(AGENT, 'm-proposal'));
+    await settle();
+    run.dispatch(updateSession(AGENT, { metadata: { pendingProposals: [] } }));
+    run.dispatch(pendingProposalRecoveryPruned(AGENT, []));
+    resolvePage(page([proposalMessage('m-proposal', 10, [proposal('toolu-1')])]));
+    await settle();
+
+    expect(run.chat()?.pendingProposalRecovery).toBeUndefined();
+    expect(mocks.getConversation).toHaveBeenCalledTimes(1);
+    run.task.cancel();
+    await run.task.toPromise();
+  });
+
+  it('latches a stale marker after one failed seek and ignores repeated derivations', async () => {
+    const run = harness();
+    run.dispatch(
+      bulkUpsertSessions([
+        session({
+          messages: [message('m-tail', 100)],
+          metadata: { pendingQuestionsMessageId: 'm-stale' },
+        }),
+      ]),
+    );
+    mocks.getConversation.mockRejectedValueOnce({ code: 'INVALID_PARAMS' });
+
+    run.dispatch(pendingQuestionRecoveryRequested(AGENT, 'm-stale'));
+    await settle();
+    run.dispatch(pendingQuestionRecoveryRequested(AGENT, 'm-stale'));
+    run.dispatch(pendingQuestionRecoveryRequested(AGENT, 'm-stale'));
+    await settle();
+
+    expect(mocks.getConversation).toHaveBeenCalledTimes(1);
+    expect(run.chat()?.pendingQuestionRecovery).toEqual({
+      messageId: 'm-stale',
+      status: 'not-found',
+    });
+    expect(run.history()).toBeUndefined();
     run.task.cancel();
     await run.task.toPromise();
   });
@@ -347,6 +897,157 @@ describe('chatScrollbackSaga (on-demand history paging)', () => {
     expect(run.chat()?.scrollbackGapToken).toBeNull();
     expect(run.chat()?.fetchingOlderHistory).toBe(false);
     expect(run.chat()?.fetchingGapFill).toBe(false);
+    run.task.cancel();
+    await run.task.toPromise();
+  });
+
+  it('a resumed:false snapshot clears a stranded fetching flag even while the wire call hangs', async () => {
+    const run = harness();
+    run.dispatch(bulkUpsertSessions([session({ messages: [message('m-10', 10)] })]));
+    // Transport died mid-fetch: the promise never settles, so the saga's
+    // finally-settle can never clear the flag — the reducer's atomic reset
+    // on the discard snapshot must.
+    mocks.getConversation.mockReturnValueOnce(new Promise(() => {}));
+    run.channel.put(olderHistoryPageRequested(WS, AGENT));
+    await settle();
+    expect(run.chat()?.fetchingOlderHistory).toBe(true);
+
+    // Dispatch (not a bare channel put): the reducers must see the snapshot
+    // — the atomic reset under test lives there, not in the saga chain.
+    run.dispatch(
+      chatTranscriptSnapshotApplied(AGENT, {
+        truncated: false,
+        totalMessages: 3,
+        resumed: false,
+      }),
+    );
+    await settle();
+
+    expect(run.chat()?.fetchingOlderHistory).toBe(false);
+    expect(run.chat()?.fetchingGapFill).toBe(false);
+    expect(run.chat()?.fetchingHistorySeek).toBe(false);
+    expect(run.chat()?.scrollbackOlderToken).toBeNull();
+    expect(run.chat()?.scrollbackGapToken).toBeNull();
+    expect(run.history()).toBeUndefined();
+    run.task.cancel();
+    await run.task.toPromise();
+  });
+
+  it('drops an in-flight older page that resolves AFTER a resumed:false discard', async () => {
+    const run = harness();
+    run.dispatch(bulkUpsertSessions([session({ messages: [message('m-10', 10)] })]));
+    let resolvePage!: (value: ReturnType<typeof page>) => void;
+    mocks.getConversation.mockReturnValueOnce(
+      new Promise((done) => {
+        resolvePage = done;
+      }),
+    );
+    run.channel.put(olderHistoryPageRequested(WS, AGENT));
+    await settle();
+    expect(run.chat()?.fetchingOlderHistory).toBe(true);
+
+    // §7.1 discard lands while the wire call is in flight: the reducer
+    // resets the walk atomically (flags + cursors + epoch bump).
+    run.dispatch(
+      chatTranscriptSnapshotApplied(AGENT, {
+        truncated: false,
+        totalMessages: 3,
+        resumed: false,
+      }),
+    );
+    await settle();
+    expect(run.chat()?.fetchingOlderHistory).toBe(false);
+
+    // The stale page resolves afterwards: the worker resumes past its
+    // `yield call` — it must drop the result wholesale, not recreate a
+    // segment of discarded rows or persist a continuation cursor minted
+    // against the discarded transcript.
+    resolvePage(page([message('m-05', 5)], { nextToken: 'stale-older-1' }));
+    await settle();
+
+    expect(run.history()).toBeUndefined();
+    expect(run.chat()?.scrollbackOlderToken).toBeNull();
+    expect(run.chat()?.fetchingOlderHistory).toBe(false);
+    run.task.cancel();
+    await run.task.toPromise();
+  });
+
+  it('drops an in-flight gap-fill page that resolves AFTER a resumed:false discard', async () => {
+    const run = harness();
+    run.dispatch(bulkUpsertSessions([session({ messages: [message('m-tail', 2000)] })]));
+    const bulk: AgentMessage[] = [];
+    for (let index = 0; index <= HISTORY_SEGMENT_MAX; index++) {
+      bulk.push(message(`m-${String(index + 1000)}`, index + 1000));
+    }
+    run.dispatch(prependHistoryMessages(AGENT, bulk));
+    expect(run.history()?.gapToTail).toBe(true);
+
+    let resolveGap!: (value: ReturnType<typeof page>) => void;
+    mocks.getConversation.mockReturnValueOnce(
+      new Promise((done) => {
+        resolveGap = done;
+      }),
+    );
+    run.channel.put(historyGapFillRequested(WS, AGENT));
+    await settle();
+    expect(run.chat()?.fetchingGapFill).toBe(true);
+
+    run.dispatch(
+      chatTranscriptSnapshotApplied(AGENT, {
+        truncated: false,
+        totalMessages: 3,
+        resumed: false,
+      }),
+    );
+    await settle();
+    expect(run.history()).toBeUndefined();
+
+    resolveGap(page([message('m-1900', 1900)], { prevToken: 'stale-fwd-1' }));
+    await settle();
+
+    expect(run.history()).toBeUndefined();
+    expect(run.chat()?.scrollbackGapToken).toBeNull();
+    expect(run.chat()?.fetchingGapFill).toBe(false);
+    run.task.cancel();
+    await run.task.toPromise();
+  });
+
+  it('drops an in-flight seek landing that resolves AFTER a resumed:false discard', async () => {
+    const run = harness();
+    run.dispatch(bulkUpsertSessions([session({ messages: [message('m-tail', 2000)] })]));
+    let resolveSeek!: (value: ReturnType<typeof page>) => void;
+    mocks.getConversation.mockReturnValueOnce(
+      new Promise((done) => {
+        resolveSeek = done;
+      }),
+    );
+    run.channel.put(historySeekRequested(WS, AGENT, 500));
+    await settle();
+    expect(run.chat()?.fetchingHistorySeek).toBe(true);
+
+    run.dispatch(
+      chatTranscriptSnapshotApplied(AGENT, {
+        truncated: false,
+        totalMessages: 3,
+        resumed: false,
+      }),
+    );
+    await settle();
+    expect(run.chat()?.fetchingHistorySeek).toBe(false);
+
+    resolveSeek(
+      page([message('m-500', 500)], {
+        totalMessages: 2000,
+        nextToken: 'stale-older',
+        prevToken: 'stale-newer',
+      }),
+    );
+    await settle();
+
+    expect(run.history()).toBeUndefined();
+    expect(run.chat()?.scrollbackOlderToken).toBeNull();
+    expect(run.chat()?.scrollbackGapToken).toBeNull();
+    expect(run.chat()?.fetchingHistorySeek).toBe(false);
     run.task.cancel();
     await run.task.toPromise();
   });
@@ -562,9 +1263,7 @@ describe('chatScrollbackSaga (on-demand history paging)', () => {
     await settle();
     expect(mocks.getConversation).toHaveBeenCalledTimes(1);
 
-    resolveSeek(
-      page([message('m-500', 500)], { totalMessages: 2000, nextToken: 'older-1' }),
-    );
+    resolveSeek(page([message('m-500', 500)], { totalMessages: 2000, nextToken: 'older-1' }));
     await settle();
     expect(run.chat()?.fetchingHistorySeek).toBe(false);
     run.task.cancel();

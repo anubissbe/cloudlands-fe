@@ -7,7 +7,7 @@
    */
 
   import type { TabTypeComponentProps } from './registry';
-  import { openTabWithPanelModeRequested } from '$store/renderer/slices/panel-layout/panel-layout-slice';
+  import { openTabInRightmostColumnRequested } from '$store/renderer/slices/panel-layout/panel-layout-slice';
 
   import { getPanelHeaderContext } from '$lib/components/layout/panel-system/panel-header-context.svelte';
   import {
@@ -65,13 +65,16 @@
   // svelte-ignore state_referenced_locally
   const workspace = selectWorkspaceById(workspaceId);
   const repoPath = $derived($workspace?.worktreePath || $workspace?.repositoryPath || undefined);
+  const gitRootId = $derived(tab.data?.gitRootId as string | undefined);
+  const gitRootPath = $derived(tab.data?.gitRootPath as string | undefined);
+  const effectiveRepoPath = $derived(gitRootPath || repoPath);
 
   // Compute absolute path for diff files
   const diffAbsolutePath = $derived(
-    tab.diffPath && repoPath
+    tab.diffPath && effectiveRepoPath
       ? isAbsolutePath(tab.diffPath)
         ? tab.diffPath
-        : `${repoPath}/${tab.diffPath}`
+        : `${effectiveRepoPath}/${tab.diffPath}`
       : null,
   );
 
@@ -85,9 +88,12 @@
     return false;
   }
 
+  // The file-tracking store only covers the primary root; its suffix matching
+  // would pick a primary change with the same trailing path for a
+  // secondary-root diff, so root-scoped tabs skip the store lookups entirely.
   // Find only active (staged/unstaged) changes
   function findActiveChangeByPath(path: string | null): TrackedChange | null {
-    if (!path) return null;
+    if (!path || gitRootId) return null;
     return (
       $ftChanges$.find(
         (c) => matchesPath(c, path) && (c.stage === 'staged' || c.stage === 'unstaged'),
@@ -97,7 +103,7 @@
 
   // Find the most-recent committed-stage entry in the store that carries a commitHash
   function findCommittedChangeByPath(path: string | null): TrackedChange | null {
-    if (!path) return null;
+    if (!path || gitRootId) return null;
     let latest: TrackedChange | null = null;
     let latestTs = -Infinity;
     for (const c of $ftChanges$) {
@@ -125,7 +131,7 @@
   // whose files[] includes this path. Lets TrackedChangeDiffViewer's committed-by-hash branch
   // render HASH^..HASH for files with only committed changes on the current branch.
   function synthesiseCommittedChangeFromCommits(path: string | null): TrackedChange | null {
-    if (!path) return null;
+    if (!path || gitRootId) return null;
     for (const commit of $ftCommits$) {
       if (!commit?.hash) continue;
       if (!commit.files?.some((f) => f?.path && commitFileMatchesPath(f.path, path))) continue;
@@ -207,11 +213,11 @@
       type: 'file' as const,
       title: fileName,
       closable: true,
-      filePath: tab.diffPath,
+      filePath: diffAbsolutePath || tab.diffPath,
       workspaceId,
     };
     const store = appStore;
-    store.dispatch(openTabWithPanelModeRequested(workspaceId, tabData));
+    store.dispatch(openTabInRightmostColumnRequested(workspaceId, tabData));
   }
 
   // Register header actions
@@ -289,7 +295,7 @@
       {workspaceId}
       isDirectory={false}
       embedded
-      workspaceFolderPath={repoPath}
+      workspaceFolderPath={effectiveRepoPath}
     />
   {/if}
 {/snippet}
@@ -297,6 +303,7 @@
 {#if tab.diffPath}
   {#key tab.diffPath}
     <TrackedChangeDiffViewer
+      active={isActive}
       {change}
       {workspaceId}
       viewMode={$diffSideBySide ? 'split' : 'unified'}
@@ -305,8 +312,14 @@
       {refreshKey}
       {branchBaseRef}
       {branchBaseCommitSha}
-      onStageHunk={change.stage === ChangeStage.Unstaged ? handleStageHunk : undefined}
-      onUnstageHunk={change.stage === ChangeStage.Staged ? handleUnstageHunk : undefined}
+      {gitRootId}
+      {gitRootPath}
+      onStageHunk={!gitRootId && change.stage === ChangeStage.Unstaged
+        ? handleStageHunk
+        : undefined}
+      onUnstageHunk={!gitRootId && change.stage === ChangeStage.Staged
+        ? handleUnstageHunk
+        : undefined}
     />
   {/key}
 {/if}

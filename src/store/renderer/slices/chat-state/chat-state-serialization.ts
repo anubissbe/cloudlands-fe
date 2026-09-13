@@ -71,18 +71,15 @@ export function sanitizeStatusEvent(
     ? 'error'
     : DEFAULT_STATUS_EVENT.level;
 
-  return {
+  const sanitized: StatusEvent = {
     phase: toSafeString(readField(statusEvent, 'phase'), DEFAULT_STATUS_EVENT.phase),
     message: toSafeString(readField(statusEvent, 'message'), DEFAULT_STATUS_EVENT.message),
     level: toSafeStatusLevel(readField(statusEvent, 'level'), fallbackLevel),
     timestamp: toSafeTimestamp(readField(statusEvent, 'timestamp'), fallbackTimestamp),
   };
-}
-
-export function sanitizeStatusEvents(statusEvents: unknown): StatusEvent[] {
-  if (!Array.isArray(statusEvents)) {
-    return [];
+  const silentMs = readField(statusEvent, 'silentMs');
+  if (typeof silentMs === 'number' && Number.isFinite(silentMs) && silentMs >= 0) {
+    sanitized.silentMs = silentMs;
   }
-
-  return statusEvents.map((statusEvent) => sanitizeStatusEvent(statusEvent));
+  return sanitized;
 }

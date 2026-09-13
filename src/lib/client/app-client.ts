@@ -31,51 +31,63 @@ import type {
   WorkspaceDiskUsage,
   WorkspaceTask,
   WorkspaceTaskStats,
-} from "$shared/types";
-import type { CommitInfo, TrackedChange } from "$features/file-tracking/types";
-import type { WorkspaceEvent } from "$features/events/types";
-import type { TokenUsage } from "$features/token-usage/token-usage-types";
-import type { ContextItem } from "$features/context/types";
+} from '$shared/types';
+import type { CommitInfo, TrackedChange } from '$features/file-tracking/types';
+import type { WorkspaceEvent } from '$features/events/types';
+import type { TokenUsage } from '$features/token-usage/token-usage-types';
+import type { ContextItem } from '$features/context/types';
 import type {
   TaskAgentAssociation,
   TaskAgentAssociationsByTaskKey,
-} from "$store/renderer/slices/task-agent-associations/task-agent-associations-types";
-import type { TerminalTab } from "$store/renderer/slices/terminals/terminals-slice";
+} from '$store/renderer/slices/task-agent-associations/task-agent-associations-types';
+import type { TerminalTab } from '$store/renderer/slices/terminals/terminals-slice';
 import type {
   ScriptRuntimeState,
   ScriptWithState,
   WorkspaceScript,
-} from "$store/renderer/slices/scripts/scripts-types";
-import type { ScriptCategory, ScriptMode } from "$features/scripts/types";
-import type { SkillInfo } from "$store/renderer/slices/skills/skills-types";
-import type { AuggieModel } from "$features/auggie/auggie-models.client";
-import type { ProviderCatalogResult } from "$shared/provider-catalog";
-import type { RecentUrl } from "$store/renderer/slices/browser/browser-types";
-import type { McpServerConfig, McpServerRuntimeStatus } from "$store/renderer/slices/mcp-settings/mcp-settings-types";
-import type { UserPreferencesState } from "$store/renderer/slices/user-preferences/user-preferences-slice";
-import type { ProviderSettingsState } from "$store/renderer/slices/provider-settings/provider-settings-slice";
+} from '$store/renderer/slices/scripts/scripts-types';
+import type { ScriptCategory, ScriptMode } from '$features/scripts/types';
+import type { SkillInfo } from '$store/renderer/slices/skills/skills-types';
+import type { AuggieModel } from '$features/auggie/auggie-models.client';
+import type { ProviderCatalogResult } from '$shared/provider-catalog';
+import type { RecentUrl } from '$store/renderer/slices/browser/browser-types';
+import type {
+  BrowserActionEnvelope,
+  BrowserTab,
+  BrowserTabInput,
+  BrowserTabListing,
+  LiveClient,
+  WorkspaceBrowserClient,
+} from '$shared/types/browser-clients';
+import type {
+  McpServerConfig,
+  McpServerRuntimeStatus,
+} from '$store/renderer/slices/mcp-settings/mcp-settings-types';
+import type { UserPreferencesState } from '$store/renderer/slices/user-preferences/user-preferences-slice';
+import type { ProviderSettingsState } from '$store/renderer/slices/provider-settings/provider-settings-slice';
 
 /**
- * The daemon-persisted subset of provider settings (`providers.active` /
- * `providers.enabled`, PROTOCOL §5.12). The remaining ProviderSettingsState
- * fields are registry snapshots hydrated from `providers.catalog`, never
- * persisted through this seam.
+ * The daemon-persisted subset of provider settings (`model.defaultProvider` /
+ * `providers.enabled`, PROTOCOL §5.12). `activeProviderId` carries the default
+ * provider — the provider leg of the default model triple (the deprecated
+ * `providers.active` key is no longer read or written). The remaining
+ * ProviderSettingsState fields are registry snapshots hydrated from
+ * `providers.catalog`, never persisted through this seam.
  */
-export type PersistedProviderSettings = Pick<
-  ProviderSettingsState,
-  "activeProviderId" | "enabledProviders"
->;
-import type { SingleWorkspaceSettings } from "$store/renderer/slices/workspace-settings/workspace-settings-slice";
-import type { BackgroundAgentSettingsState } from "$store/renderer/slices/background-agent-settings/background-agent-settings-slice";
-import type { GitHubUser } from "$features/github-auth/types";
-import type { LinearIssueResult } from "$features/linear-auth/renderer/linear-auth.client";
-import type { SentryIssueResult } from "$features/sentry-auth/types";
-import type { ReleaseNotes } from "$store/renderer/slices/release-notes/release-notes-types";
-import type { SystemStatusState } from "$store/renderer/slices/system-status/system-status-slice";
-import type { AutoUpdateState } from "$store/renderer/slices/auto-update/auto-update-types";
-import type { CommentV2 } from "$store/renderer/slices/comments/comments-types";
-import type { AuthorType, CommentType } from "$features/comments/comment-types-v2";
-import type { FileContentEntry } from "$store/renderer/slices/files/files-types";
+export type PersistedProviderSettings = Pick<ProviderSettingsState, 'enabledProviders'> & {
+  activeProviderId: string;
+};
+import type { SingleWorkspaceSettings } from '$store/renderer/slices/workspace-settings/workspace-settings-slice';
+import type { BackgroundAgentSettingsState } from '$store/renderer/slices/background-agent-settings/background-agent-settings-slice';
+import type { GitHubUser } from '$features/github-auth/types';
+import type { LinearIssueResult } from '$features/linear-auth/renderer/linear-auth.client';
+import type { SentryIssueResult } from '$features/sentry-auth/types';
+import type { ReleaseNotes } from '$store/renderer/slices/release-notes/release-notes-types';
+import type { SystemStatusState } from '$store/renderer/slices/system-status/system-status-slice';
+import type { AutoUpdateState } from '$store/renderer/slices/auto-update/auto-update-types';
+import type { CommentV2 } from '$store/renderer/slices/comments/comments-types';
+import type { AuthorType, CommentType } from '$features/comments/comment-types-v2';
+import type { FileContentEntry } from '$store/renderer/slices/files/files-types';
 
 /** Disposer returned by every `subscribe()` call. */
 export type Unsubscribe = () => void;
@@ -102,6 +114,13 @@ export interface MutationResult {
    * inference, so merge order across FE/BE does not matter.
    */
   noteRev?: number;
+  /**
+   * Authoritative post-write note content echoed by `note.setContent`
+   * (`newContent`). The daemon merges a full-content write against concurrent
+   * edits, so the persisted text can differ from what the caller sent; when
+   * present, callers MUST apply it as the local content. Additive and optional.
+   */
+  newContent?: string;
   /**
    * Optimistic-concurrency conflict outcome (§11.4-D): present ONLY when the
    * daemon rejected the mutation with the conflict error (numeric `-32005` AND
@@ -183,8 +202,7 @@ export interface AgentCreateRequest {
  * the agent without choosing any option.
  */
 export type PermissionOutcome =
-  | { outcome: "selected"; optionId: string }
-  | { outcome: "cancelled" };
+  { outcome: 'selected'; optionId: string } | { outcome: 'cancelled' };
 
 /**
  * `agent.respondPermission` outcome (PROTOCOL §8). The daemon returns
@@ -220,6 +238,31 @@ export interface ResolveInterruptedResult {
   failed: Array<{ agentId: string; error: string }>;
 }
 
+/**
+ * One lightweight user-message index item (`agent.listUserMessages`, §5.5,
+ * v7.3). `preview` is the daemon-extracted plain text of the message,
+ * server-truncated (default 300 chars); `metadata` is the persisted
+ * `messageMetadata` passed through verbatim when present (omitted when
+ * absent, never null) so callers can keep filtering automated rows.
+ */
+export interface UserMessageIndexItem {
+  id: string;
+  preview: string;
+  createdAt: string;
+  metadata?: Record<string, unknown>;
+}
+
+/**
+ * Result of `agents.listUserMessages`. Failures are typed instead of thrown
+ * so the navigator can silently degrade to its tail-derived items:
+ * `unsupported: true` marks a daemon that predates the method (-32601
+ * Method not found); any other transport/daemon failure keeps
+ * `unsupported: false`.
+ */
+export type UserMessageIndexResult =
+  | { ok: true; items: UserMessageIndexItem[]; total: number }
+  | { ok: false; unsupported: boolean; error: string };
+
 /** Pull-request summary surfaced by the git domain. */
 export interface PrStatusSummary {
   prNumber?: number;
@@ -234,7 +277,7 @@ export interface PrStatusSummary {
  * the daemon-owned per-branch PR list.
  */
 export interface PrRefreshResult {
-  outcome: "skipped" | "unchanged" | "linked" | "updated" | "unlinked";
+  outcome: 'skipped' | 'unchanged' | 'linked' | 'updated' | 'unlinked';
   prNumber?: number;
   prUrl?: string;
   prStatus?: PullRequestStatus;
@@ -414,18 +457,39 @@ export interface WorkspacesClient {
    * that the bridge folds into the context slice.
    */
   updateContext(workspaceId: string, items: ContextItem[]): Promise<ContextItem[]>;
+  /**
+   * `workspace.getBrowserClient` (REV-2, PROTOCOL §5.1): the workspace's
+   * effective browser client — the persisted pin (`clientId` + `source:
+   * "workspace"`, else `source: "default"`) plus `resolved`, the client an
+   * agent `browser.exec` would reach right now (`null` when none).
+   */
+  getBrowserClient(workspaceId: string): Promise<WorkspaceBrowserClient>;
+  /**
+   * `workspace.setBrowserClient` (REV-2, PROTOCOL §5.1): persist (`clientId`)
+   * or clear (`null`) the per-workspace browser-client pin. The daemon emits
+   * `workspace:updated { changes: { browserClientId } }` and echoes the
+   * `getBrowserClient` shape.
+   */
+  setBrowserClient(workspaceId: string, clientId: string | null): Promise<WorkspaceBrowserClient>;
   subscribe(handler: SubscriptionHandler<Workspace[]>): Unsubscribe;
 }
 
 /**
- * Image content block attached to a message (PROTOCOL §5.5:
- * `{ type: "image", data, mimeType }`). Shared shape for the optional
- * `imageBlocks` param on `agents.queue`.
+ * Image content block attached to a message (PROTOCOL §5.5). Two arms,
+ * exactly one of `data` / `attachmentId` per block (monorepo#3338):
+ * inline `{ type: "image", data, mimeType }` carries base64 bytes; the
+ * attachment-registry reference `{ type: "image", attachmentId, mimeType? }`
+ * carries the UUID of a placed attachment (`file.placeAttachment` /
+ * `file.attachmentUpload.*`) and the daemon resolves the bytes server-side.
+ * Shared shape for the optional `imageBlocks` param on `agents.queue`.
  */
 export interface ImageBlock {
-  type: "image";
-  data: string;
-  mimeType: string;
+  type: 'image';
+  /** Base64 image bytes (inline arm). */
+  data?: string;
+  mimeType?: string;
+  /** Attachment-registry UUID (reference arm — no bytes on the wire). */
+  attachmentId?: string;
 }
 
 /**
@@ -435,7 +499,7 @@ export interface ImageBlock {
  * paths. Shared shape for the optional `fileBlocks` param on `agents.queue`.
  */
 export interface FileBlock {
-  type: "file";
+  type: 'file';
   attachmentId: string;
   fileName: string;
   mimeType?: string;
@@ -466,7 +530,23 @@ export interface AgentCancelDeleteResult extends MutationResult {
 }
 
 export interface AgentsClient {
-  list(workspaceId: string): Promise<AgentSession[]>;
+  /**
+   * Agents of one workspace (`agent.list`, §5.5). Soft-retired sessions
+   * (`retiredAt` set, v7.5) are excluded from the default read daemon-side;
+   * `options.retiredOnly: true` (v8.2) serves ONLY retired rows, each
+   * carrying the presence-detected `retiredAt` ISO timestamp. The flag only
+   * rides the wire when supplied so the default read carries no flags.
+   */
+  list(workspaceId: string, options?: { retiredOnly?: boolean }): Promise<AgentSession[]>;
+  /**
+   * Same read as `list` plus response metadata: `retiredCount` (v8.2) is the
+   * number of soft-retired sessions in the workspace, served on every
+   * `agent.list` variant (defaults to 0 if the field is absent).
+   */
+  listWithMeta(
+    workspaceId: string,
+    options?: { retiredOnly?: boolean },
+  ): Promise<{ agents: AgentSession[]; retiredCount: number }>;
   get(agentId: string): Promise<AgentSession | null>;
   /**
    * One page of an agent's retained transcript (`agent.getConversation`, §5.5).
@@ -518,6 +598,18 @@ export interface AgentsClient {
    */
   getMessageBlock(agentId: string, messageId: string, blockId: string): Promise<ContentBlock>;
   /**
+   * The full user-message index of one agent (`agent.listUserMessages`,
+   * §5.5, v7.3): every **user-role** message as a lightweight
+   * `{ id, preview, createdAt, metadata? }` item, oldest→newest, deliberately
+   * unpaged (the navigator filter needs the whole set client-side).
+   * `previewChars` bounds the preview length (daemon default 300,
+   * server-clamped into [1, 2000]). Never rejects: an old daemon lacking the
+   * method surfaces as `{ ok: false, unsupported: true }` and any other
+   * transport/daemon failure as `{ ok: false, unsupported: false, error }`,
+   * so callers can ignore the failure and fall back to tail-derived items.
+   */
+  listUserMessages(agentId: string, previewChars?: number): Promise<UserMessageIndexResult>;
+  /**
    * Create an agent session (`agent.create`, §5.5). The daemon returns the
    * full `AgentLite` projection of the newly persisted session (widened in
    * P2-12a from the earlier `{id, name}` snippet), which this method
@@ -549,8 +641,9 @@ export interface AgentsClient {
   }): Promise<MutationResult>;
   /**
    * Queue a message behind the agent's in-flight turn (`agent.queueMessage`,
-   * §5.5). Optional `imageBlocks` / `fileBlocks` are only forwarded when
-   * supplied so queued attachments survive queue-on-send. The daemon returns
+   * §5.5). Optional `imageBlocks` / `fileBlocks` / `messageMetadata` are only
+   * forwarded when supplied so queued attachments and the Q&A wizard's answer
+   * tag survive queue-on-send. The daemon returns
    * `{ success, queuedMessage, turnId }`, surfaced as `queuedMessage` /
    * `turnId` on the MutationResult (the entry's turn-correlation id,
    * monorepo#1057 — falls back to `queuedMessage.turnId` when the top-level
@@ -563,6 +656,7 @@ export interface AgentsClient {
     options?: {
       imageBlocks?: ImageBlock[];
       fileBlocks?: FileBlock[];
+      messageMetadata?: Record<string, unknown>;
     },
   ): Promise<MutationResult>;
   /**
@@ -647,8 +741,8 @@ export interface AgentsClient {
    * Dismiss the pending Agent Q&A question set (`agent.dismissQuestions`,
    * §5.5). The daemon persists `dismissedQuestionsMessageId` (the id of the
    * question-bearing assistant message) in session metadata — so the
-   * dismissal survives reload — emits `agent:updated`, and kicks the queue
-   * drain so messages held by the question hold resume. Idempotent:
+   * dismissal survives reload — and emits `agent:updated`, which clears the
+   * pending question set so the sticky wizard hides everywhere. Idempotent:
    * re-dismissing the same message succeeds. A nonexistent agent or a
    * workspace mismatch rejects (folded into `{ success: false, error }`).
    */
@@ -656,6 +750,23 @@ export interface AgentsClient {
     agentId: string;
     workspaceId: string;
     messageId: string;
+  }): Promise<MutationResult>;
+  /**
+   * Resolve one pending proposal (`agent.resolveProposal`, §5.5). The daemon
+   * removes `proposalId` from the session-metadata `pendingProposals` set,
+   * persists the resolution outcome, emits `agent:updated`, and delivers a
+   * system-origin notice to the model for BOTH outcomes (applied/dismissed;
+   * `detail` rides the applied notice, e.g. the created workspace id).
+   * Idempotent on re-resolution. The Apply itself stays FE-driven — this
+   * records the outcome and notifies. A nonexistent agent or a workspace
+   * mismatch rejects (folded into `{ success: false, error }`).
+   */
+  resolveProposal(params: {
+    agentId: string;
+    workspaceId: string;
+    proposalId: string;
+    outcome: 'applied' | 'dismissed';
+    detail?: string;
   }): Promise<MutationResult>;
   /**
    * Advance the per-conversation seen marker (`agent.markSeen`, §5.5). The
@@ -736,6 +847,12 @@ export interface AgentsClient {
    * never scheduled) — a non-error, race-safe outcome.
    */
   cancelDelete(agentId: string, workspaceId?: string): Promise<AgentCancelDeleteResult>;
+  /**
+   * Un-retire a soft-retired session (`agent.restore`, §5.5 soft retire,
+   * v7.5). Clears `retiredAt` and emits `agent:restored`, which reconciles
+   * the list. Idempotent — restoring an already-active agent succeeds.
+   */
+  restore(agentId: string, workspaceId?: string): Promise<MutationResult>;
   /**
    * Retry a failed agent spawn (`agent.retry`). Only valid when the agent
    * status is `error` (after spawn exhaustion); returns `{ ok: false, error }`
@@ -838,11 +955,7 @@ export interface ChatTranscript {
  * timed out, retry pending).
  */
 export type ChatLiveStreamPhase =
-  | "connecting"
-  | "awaiting-snapshot"
-  | "live"
-  | "resyncing"
-  | "delayed";
+  'connecting' | 'awaiting-snapshot' | 'live' | 'resyncing' | 'delayed';
 
 export interface ChatClient {
   /**
@@ -972,13 +1085,19 @@ export interface SettingDefinitionWithValue {
   label: string;
   description: string;
   category: string;
-  type: "boolean" | "number" | "string" | "enum" | "object";
+  type: 'boolean' | 'number' | 'string' | 'enum' | 'object';
   enumValues?: string[];
   min?: number;
   max?: number;
   defaultValue?: unknown;
   sensitive?: boolean;
+  /** Approximate prompt-token cost of the gated feature (e.g. "~620 tokens/session"); absent when unannotated. */
+  tokenImpact?: string;
   value: unknown;
+  /** Effective source for TOML-backed settings; absent for other stores. */
+  origin?: 'default' | 'file' | 'flag';
+  /** Daemon ordering watermark, present on settings.get results. */
+  revision?: number;
 }
 
 /** Wire-level change entry for `settings.update` (PROTOCOL §5.12 `AppSettingChange`). */
@@ -992,6 +1111,18 @@ export interface AppSettingChange {
 export interface AppliedSettingChange {
   path: string;
   value: unknown;
+  /** Effective source after the commit for TOML-backed settings. */
+  origin?: 'default' | 'file' | 'flag';
+}
+
+export interface SettingsSnapshot {
+  settings: SettingDefinitionWithValue[];
+  revision: number;
+}
+
+export interface SettingsUpdateResult {
+  applied: AppliedSettingChange[];
+  revision: number;
 }
 
 /** One user-override rule as read via `rules.get` (§5.21). */
@@ -1004,10 +1135,12 @@ export interface UserRuleState {
 export interface SettingsClient {
   /** `settings.list` (§5.12). Returns every BE-owned setting with its current value (sensitive values redacted). */
   list(): Promise<SettingDefinitionWithValue[]>;
+  listSnapshot?(): Promise<SettingsSnapshot>;
   /** `settings.get` (§5.12). Returns the single setting + its definition; `null` when the daemon rejects the path. */
   get(path: string): Promise<SettingDefinitionWithValue | null>;
   /** `settings.update` (§5.12). Atomic batch update; emits `settings:changed` on success. */
   update(changes: AppSettingChange[]): Promise<AppliedSettingChange[]>;
+  updateSnapshot?(changes: AppSettingChange[]): Promise<SettingsUpdateResult>;
   /** `settings.reset` (§5.12). Restores one setting to its `defaultValue`. */
   reset(path: string): Promise<AppliedSettingChange | null>;
   /** `rules.get` (§5.21). Reads one global user-override rule type; `null` when the probe fails. */
@@ -1026,6 +1159,25 @@ export interface SettingsClient {
    * fails are omitted (live updates arrive via `mcp.servers:status-changed`).
    */
   getMcpServerStatuses(serverIds: string[]): Promise<McpServerRuntimeStatus[]>;
+  /** `mcp.servers.restart` (§5.22). Restarts/re-probes one daemon-owned server. */
+  restartMcpServer(serverId: string): Promise<McpServerRuntimeStatus>;
+  /**
+   * Workspace-scoped `mcp.servers.list` (§5.22 per-workspace disable). Returns
+   * the names of servers whose entry carries `workspaceDisabled: true`; `null`
+   * when the read fails (callers keep their current state).
+   */
+  getWorkspaceDisabledMcpServerNames(workspaceId: string): Promise<string[] | null>;
+  /**
+   * Workspace-scoped `mcp.servers.toggle` (§5.22 per-workspace disable): sets
+   * (`enabled: false`) or clears (`enabled: true`) the per-workspace disabled
+   * marker only — the global config is untouched. Success carries the daemon's
+   * resulting `workspaceDisabled`.
+   */
+  toggleWorkspaceMcpServer(
+    workspaceId: string,
+    serverId: string,
+    enabled: boolean,
+  ): Promise<MutationResult & { workspaceDisabled?: boolean }>;
   getWorkspaceSettings(workspaceId: string): Promise<SingleWorkspaceSettings | null>;
   setWorkspaceSettings(
     workspaceId: string,
@@ -1116,7 +1268,8 @@ export interface GitDiffsOptions {
 }
 
 export interface GitClient {
-  status(workspaceId: string): Promise<GitStatus | null>;
+  /** `forceRefresh` bypasses client and daemon status caches for post-mutation reconciliation. */
+  status(workspaceId: string, options?: { forceRefresh?: boolean }): Promise<GitStatus | null>;
   changes(workspaceId: string): Promise<GitStatus | null>;
   /**
    * `git.diffs` — per-file hunks. Defaults to the index→workdir (unstaged)
@@ -1138,7 +1291,7 @@ export interface GitClient {
    */
   commitsWithBoundary(
     workspaceId: string,
-    includeOlder?: boolean
+    includeOlder?: boolean,
   ): Promise<{ commits: CommitInfo[]; boundarySha: string | null; nextToken: string | null }>;
   /**
    * `git.commitDetails` — metadata + per-file `(additions, deletions)` for one
@@ -1149,7 +1302,7 @@ export interface GitClient {
   commitDetails(
     workspaceId: string,
     commitHash: string,
-    opts?: { gitRootId?: string }
+    opts?: { gitRootId?: string },
   ): Promise<CommitDetailsResult | null>;
   prStatus(workspaceId: string): Promise<PrStatusSummary | null>;
   /**
@@ -1236,7 +1389,7 @@ export interface NoteRestoreResult extends MutationResult {
 export interface LineAttributionAuthor {
   id: string;
   name: string;
-  type: "user" | "agent" | "system";
+  type: 'user' | 'agent' | 'system';
   turnNumber?: number;
 }
 
@@ -1282,7 +1435,16 @@ export interface LineAttributionClient {
 }
 
 export interface NotesClient {
-  list(workspaceId: string): Promise<Note[]>;
+  /**
+   * Notes of one workspace (`note.list`, §5.2). `options.projection: "slim"`
+   * requests the content-free projection — rows carry `content: ""` plus
+   * `contentPreview`/`contentLength` — for list surfaces that do not render
+   * full bodies. Omitted (or `"full"`) keeps today's full rows; the param only
+   * rides the wire when `"slim"` is requested so older daemons see an
+   * unchanged request, and the live client falls back to a full list when a
+   * daemon rejects the unknown param.
+   */
+  list(workspaceId: string, options?: { projection?: 'full' | 'slim' }): Promise<Note[]>;
   /**
    * Fetch one note. Optional `workspaceId` pins the read to the note's owning
    * workspace — note ids are not globally unique (every workspace has a `spec`
@@ -1370,7 +1532,7 @@ export interface NotesClient {
 }
 
 /** Inline checkbox status vocabulary (`task.updateStatus` / `task.update`). */
-export type TaskCheckboxStatus = "todo" | "in-progress" | "done";
+export type TaskCheckboxStatus = 'todo' | 'in-progress' | 'done';
 
 /** Fields a `task.update` mutation may change on a single checkbox line. */
 export interface TaskUpdatePatch {
@@ -1463,9 +1625,7 @@ export interface TasksClient {
    * `hydrateTaskAgentAssociations`. `task:agent-linked` /
    * `task:agent-unlinked` events (§6.5) drive incremental updates.
    */
-  listAgentLinks(
-    workspaceId: string,
-  ): Promise<Record<string, TaskAgentAssociationsByTaskKey>>;
+  listAgentLinks(workspaceId: string): Promise<Record<string, TaskAgentAssociationsByTaskKey>>;
   /**
    * `task.linkAgent` (PROTOCOL §5.4): persist a task↔agent linkage row. The
    * daemon uses `taskKey ?? taskText` as the association key and echoes the
@@ -1613,7 +1773,7 @@ export interface WorkspaceSetupScript {
   script: string;
   projectType?: string | null;
   updatedAt: number;
-  generatedBy?: "user" | "agent";
+  generatedBy?: 'user' | 'agent';
 }
 
 export interface SetupScriptsClient {
@@ -1655,16 +1815,32 @@ export interface SpecialistDef {
    * `list`/`get` when the resolved list is non-empty, omitted otherwise
    * (never `null`/`[]` on the wire); accepted in `create`/`edit` spec bodies.
    */
-  modelOptions?: { model: string; hint: string; reasoningEffort?: string }[];
+  modelOptions?: { provider?: string; model: string; hint: string; reasoningEffort?: string }[];
   /**
    * Reasoning-effort level for the specialist's model (additive, PROTOCOL
    * §5.11): one of the model's catalog `effortLevels`. Omitted when the
    * specialist inherits the model default (never `null`/`""` on the wire).
    */
   reasoningEffort?: string;
+  /**
+   * Orchestration role (additive, PROTOCOL §5.11): 'orchestrator' powers the
+   * New Workspace modal's team card; 'internal' is excluded from the modal's
+   * single-agent dropdown only. Omitted for standard specialists.
+   */
+  role?: 'orchestrator' | 'internal';
+  /**
+   * Specialist ids the orchestrator delegates to (additive, PROTOCOL §5.11).
+   * Advisory/render-only; omitted when not declared.
+   */
+  teamAgents?: string[];
+  /**
+   * Built-in avatar design id (additive, PROTOCOL §5.11). Free string on the
+   * wire; unknown/absent values degrade to the client's fallback design.
+   */
+  icon?: string;
   prompt?: string;
   behaviorPrompt?: string;
-  source: "project" | "user" | "bundled";
+  source: 'project' | 'user' | 'bundled';
   isCustomized?: boolean;
   path?: string;
   /**
@@ -1691,22 +1867,32 @@ export interface SpecialistsClient {
    * Create a new specialist definition (`specialist.create`, PROTOCOL §5.11).
    * Errors if a specialist with the same id already exists in the target scope.
    */
-  create(id: string, spec: SpecialistDef, scope?: "project" | "user", workspacePath?: string): Promise<SpecialistDef>;
+  create(
+    id: string,
+    spec: SpecialistDef,
+    scope?: 'project' | 'user',
+    workspacePath?: string,
+  ): Promise<SpecialistDef>;
   /**
    * Edit an existing specialist definition (`specialist.edit`, PROTOCOL §5.11).
    * Errors if the specialist does not exist in the target scope.
    */
-  edit(id: string, spec: SpecialistDef, scope: "project" | "user", workspacePath?: string): Promise<SpecialistDef>;
+  edit(
+    id: string,
+    spec: SpecialistDef,
+    scope: 'project' | 'user',
+    workspacePath?: string,
+  ): Promise<SpecialistDef>;
   /**
    * Delete a specialist definition (`specialist.delete`, PROTOCOL §5.11).
    * Errors if the specialist does not exist in the target scope.
    * Bundled definitions are read-only and cannot be deleted.
    */
-  delete(id: string, scope: "project" | "user", workspacePath?: string): Promise<{ success: true }>;
+  delete(id: string, scope: 'project' | 'user', workspacePath?: string): Promise<{ success: true }>;
 }
 
 export interface ModelsClient {
-  list(): Promise<AuggieModel[]>;
+  list(providerId?: string): Promise<AuggieModel[]>;
   subscribe(handler: SubscriptionHandler<AuggieModel[]>): Unsubscribe;
 }
 
@@ -1722,17 +1908,21 @@ export interface ProvidersClient {
 }
 
 /** Wire `period` mode for `stats.getUsage`. */
-export type UsageStatsPeriod = "24h" | "month" | "year";
+export type UsageStatsPeriod = '24h' | 'month' | 'year';
 
-/** The separate token counters for one `stats.getUsage` aggregation cell. */
+/**
+ * The separate token counters for one `stats.getUsage` aggregation cell —
+ * five disjoint buckets since intentd 0.8.20 (§5.23 / §5.36).
+ */
 export interface UsageTokenTotals {
   inputTokens: number;
   outputTokens: number;
   cacheReadTokens: number;
   cacheCreationTokens: number;
   /**
-   * Reasoning ("thought") tokens — **omitted when zero or unreported** (§5.23),
-   * so an absent field means no provider broke reasoning out of `outputTokens`.
+   * Reasoning ("thought") tokens — a counter disjoint from `outputTokens`,
+   * **omitted when zero or unreported** (§5.23), so an absent field means no
+   * provider reported reasoning tokens.
    */
   thoughtTokens?: number;
 }
@@ -1802,7 +1992,7 @@ export interface VoiceTranscribeContext {
 export interface VoiceTranscribeResult {
   text: string;
   /** The provider that actually served the request. */
-  provider: "elevenlabs" | "openai";
+  provider: 'elevenlabs' | 'openai';
   /** Transcribed audio duration in ms; always present, `null` when unknown. */
   durationMs: number | null;
 }
@@ -1841,6 +2031,47 @@ export interface VoiceClient {
 export interface BrowserClient {
   recentUrls(workspaceId: string): Promise<RecentUrl[]>;
   subscribe(handler: SubscriptionHandler<RecentUrl[]>): Unsubscribe;
+  /*
+   * Daemon tab registry (REV-2, `browser.*` tab methods). Tabs are
+   * workspace-bound rows keyed by `tabId`; the reporting host is the
+   * connection's hello'd `clientId`, never a wire parameter.
+   */
+  /** `browser.listTabs { workspaceId }` → the workspace's rows with host presence. */
+  listTabs(workspaceId: string): Promise<BrowserTabListing[]>;
+  /** `browser.upsertTab { workspaceId, tab }` (host only) → the stored row. */
+  upsertTab(workspaceId: string, tab: Omit<BrowserTabInput, 'workspaceId'>): Promise<BrowserTab>;
+  /** `browser.removeTab { tabId }` (host only): host-reported close. */
+  removeTab(tabId: string): Promise<{ ok: true }>;
+  /**
+   * `browser.syncTabs { tabs }` (host only): full snapshot of this host's
+   * tabs → `drop`, the tabIds the daemon rejected (stale / foreign rows) that
+   * the host must close locally.
+   */
+  syncTabs(tabs: BrowserTabInput[]): Promise<{ drop: string[] }>;
+  /**
+   * `browser.navigateTab { tabId, url }` (any client): routed to the tab's
+   * host → the `navigate` action's `{ action, success, result?, error? }` envelope.
+   */
+  navigateTab(tabId: string, url: string): Promise<BrowserActionEnvelope>;
+  /**
+   * `browser.closeTab { tabId, force? }` (any client). Without `force` the
+   * host must be connected (typed error otherwise, no mutation); `force`
+   * tombstones the row regardless of connectivity.
+   */
+  closeTab(tabId: string, options?: { force?: boolean }): Promise<{ ok: true }>;
+}
+
+/**
+ * Connected-clients domain (REV-2, PROTOCOL §5.17). `list` is the daemon's
+ * live logical-client registry; `ownClientId` is the identity THIS renderer's
+ * connection presents on `client.hello`, so later consumers can compute
+ * `isHost = hostClientId === ownClientId`.
+ */
+export interface ClientsClient {
+  /** `client.list` → every connected logical client. */
+  list(): Promise<LiveClient[]>;
+  /** The stable `clientId` the daemon confirmed for this connection. */
+  ownClientId(): Promise<string>;
 }
 
 /**
@@ -1880,8 +2111,57 @@ export interface GitHubRepoConfigResult {
   exists: boolean;
 }
 
+/** Normalized single-value PR state (the wire carries `state` + `merged` + `draft`). */
+export type GitHubPullRequestState = 'open' | 'closed' | 'merged' | 'draft';
+
+/**
+ * One pull request (`github.pulls.get`, §5.27) normalized for link previews:
+ * the wire's `state` + `merged` + `draft` collapse into a single `state`
+ * (merged → `'merged'`, draft → `'draft'`, else the wire state).
+ */
+export interface GitHubPullRequestDetails {
+  owner: string;
+  repo: string;
+  number: number;
+  title: string;
+  state: GitHubPullRequestState;
+  /** `user.login` of the PR author. */
+  author: string;
+  createdAt: string;
+  updatedAt: string;
+  url: string;
+  headRef: string;
+  baseRef: string;
+}
+
+/** One issue (`github.issues.get`, §5.27) normalized for link previews. */
+export interface GitHubIssueDetails {
+  owner: string;
+  repo: string;
+  number: number;
+  title: string;
+  state: 'open' | 'closed';
+  /** `user.login` of the issue author. */
+  author: string;
+  createdAt: string;
+  updatedAt: string;
+  url: string;
+}
+
 export interface IntegrationsClient {
   githubUser(): Promise<GitHubUser | null>;
+  /**
+   * One pull request by number (`github.pulls.get`, §5.27). THROWS on
+   * transport/daemon errors (e.g. "GitHub is not configured.") and when the
+   * daemon reports no such PR, so the link hover card renders an explicit
+   * URL-only fallback — never a fabricated card.
+   */
+  githubPullRequest(owner: string, repo: string, number: number): Promise<GitHubPullRequestDetails>;
+  /**
+   * One issue by number (`github.issues.get`, §5.27). Same THROWS contract as
+   * `githubPullRequest`.
+   */
+  githubIssue(owner: string, repo: string, number: number): Promise<GitHubIssueDetails>;
   /**
    * Remote branch names for a GitHub repo (`github.branches.list`, §5.27),
    * with the default branch from `github.repos.get` (best-effort). Unlike the
@@ -1936,6 +2216,17 @@ export interface ServerPairingInfo {
   path: string;
   localIps: string[];
   hostname: string;
+  /**
+   * Additive tailcat tunnel address (§5.2): present only when the tunnel is
+   * enabled and up; absent on older daemons or while the tunnel is down.
+   */
+  tcAddress?: string;
+  /**
+   * Additive bind-candidate enumeration: the machine's non-loopback IPv4
+   * addresses regardless of the current bind set (unlike `localIps`, which is
+   * bind-filtered). Absent on older daemons.
+   */
+  availableIps?: string[];
 }
 
 export interface ServerClient {
@@ -1955,6 +2246,17 @@ export interface EventQueryOptions {
   limit?: number;
 }
 
+/** Cursor options for the opt-in paginated `event.query` envelope. */
+export interface EventQueryPageOptions extends EventQueryOptions {
+  nextToken?: string;
+}
+
+/** One newest→oldest page returned by paginated `event.query`. */
+export interface EventQueryPage {
+  items: WorkspaceEvent[];
+  nextToken: string | null;
+}
+
 export interface EventsClient {
   /** Boot snapshot of the workspace event stream, oldest→newest. */
   list(workspaceId: string): Promise<WorkspaceEvent[]>;
@@ -1963,6 +2265,8 @@ export interface EventsClient {
    * wire order (newest→oldest); the daemon defaults `limit` to 50.
    */
   query(workspaceId: string, options?: EventQueryOptions): Promise<WorkspaceEvent[]>;
+  /** Paginated historical read; `nextToken` continues toward older events. */
+  queryPage(workspaceId: string, options?: EventQueryPageOptions): Promise<EventQueryPage>;
   subscribe(workspaceId: string, handler: SubscriptionHandler<WorkspaceEvent[]>): Unsubscribe;
 }
 
@@ -1978,6 +2282,8 @@ export interface DraftAttachment {
   type: string;
   label: string;
   description?: string;
+  /** Opaque text carried by content-backed context items such as selections. */
+  content?: string;
   path?: string;
   imageData?: string;
   imageMimeType?: string;
@@ -2044,4 +2350,5 @@ export interface AppClient {
   server: ServerClient;
   events: EventsClient;
   drafts: DraftsClient;
+  clients: ClientsClient;
 }

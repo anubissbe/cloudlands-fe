@@ -18,6 +18,7 @@ import {
   selectIsInitialSpecWriteInProgress,
   selectIsLoadingAgents,
   selectRecentlyCreatedAgents,
+  resolveCanonicalInitialAgent,
   resolveEmptyLayoutAgent,
   selectEmptyLayoutAgent,
   selectWorkspaceAgentIsSoftDeleted,
@@ -25,9 +26,11 @@ import {
   selectWorkspaceAgentSession,
   selectWorkspaceForegroundAgentIds,
   selectWorkspaceHasAgent,
+  selectWorkspaceHasUnreadForegroundAgents,
 } from './workspace-agents-selectors';
 import {
   addAgent,
+  adjustRetiredCount,
   agentsLoaded,
   createAgentRequested,
   createAgentWithSpecialistRequested,
@@ -44,6 +47,9 @@ import {
   setInitialAgentId,
   setInitialSpecWriteInProgress,
   setIsLoadingAgents,
+  setIsLoadingRetiredAgents,
+  setRetiredAgentsLoaded,
+  setRetiredCount,
   setWaitingForFirstMessage,
   workspaceAgentsReducer,
 } from './workspace-agents-slice';
@@ -112,6 +118,7 @@ describe('workspaceAgentsReducer', () => {
           ...emptyWorkspaceAgentState,
           agentIds: ['agent-1', 'agent-2'],
           foregroundAgentIds: ['agent-1', 'agent-2'],
+          diskMessageCounts: { 'agent-1': 0, 'agent-2': 0 },
         },
       },
     });
@@ -172,6 +179,7 @@ describe('workspaceAgentsReducer', () => {
           ...emptyWorkspaceAgentState,
           agentIds: ['agent-2'],
           foregroundAgentIds: [],
+          diskMessageCounts: { 'agent-2': 0 },
         },
       },
     });
@@ -196,6 +204,30 @@ describe('workspaceAgentsReducer', () => {
       agentsLoaded: true,
       initialAgentId: 'agent-1',
     });
+  });
+
+  it('tracks the lazy retired-bin state per workspace (§5.5 v8.2)', () => {
+    let state = workspaceAgentsReducer(initialState, setRetiredCount(WS_1, 3));
+    state = workspaceAgentsReducer(state, setIsLoadingRetiredAgents(WS_1, true));
+    state = workspaceAgentsReducer(state, setRetiredAgentsLoaded(WS_1, true));
+
+    expect(state.byWorkspaceId[WS_1]).toEqual({
+      ...emptyWorkspaceAgentState,
+      retiredCount: 3,
+      isLoadingRetiredAgents: true,
+      retiredAgentsLoaded: true,
+    });
+
+    // Event nudges move the count but never below zero.
+    state = workspaceAgentsReducer(state, adjustRetiredCount(WS_1, -1));
+    expect(state.byWorkspaceId[WS_1].retiredCount).toBe(2);
+    state = workspaceAgentsReducer(state, adjustRetiredCount(WS_1, -5));
+    expect(state.byWorkspaceId[WS_1].retiredCount).toBe(0);
+    state = workspaceAgentsReducer(state, adjustRetiredCount(WS_1, 1));
+    expect(state.byWorkspaceId[WS_1].retiredCount).toBe(1);
+    // A daemon-served count can never be negative in state either.
+    state = workspaceAgentsReducer(state, setRetiredCount(WS_1, -2));
+    expect(state.byWorkspaceId[WS_1].retiredCount).toBe(0);
   });
 
   it('stores waiting-for-first-message per agent and clears it when false', () => {
@@ -314,6 +346,34 @@ describe('workspace-agents selectors', () => {
     expect(selectInitialAgentId.select(state, WS_1)).toBeNull();
     expect(selectRecentlyCreatedAgents.select(state, WS_1)).toEqual([]);
     expect(selectEmptyLayoutAgent.select(state, WS_1)).toBeNull();
+    expect(selectWorkspaceHasUnreadForegroundAgents.select(state, WS_1)).toBe(false);
+  });
+
+  it('reports unread foreground agents while ignoring background-only unread', () => {
+    const stateFor = (sessions: AgentSession[]) =>
+      mockState(workspaceAgentsReducer(initialState, setAgents(WS_1, sessions)), sessions);
+    const unreadForeground = { ...mockAgent('agent-foreground'), hasUnread: true };
+    const readForeground = { ...mockAgent('agent-foreground'), hasUnread: false };
+    const unreadBackground = { ...mockBackgroundAgent('agent-background'), hasUnread: true };
+
+    expect(
+      selectWorkspaceHasUnreadForegroundAgents.select(
+        stateFor([unreadForeground, unreadBackground]),
+        WS_1,
+      ),
+    ).toBe(true);
+    expect(
+      selectWorkspaceHasUnreadForegroundAgents.select(
+        stateFor([readForeground, unreadBackground]),
+        WS_1,
+      ),
+    ).toBe(false);
+    expect(
+      selectWorkspaceHasUnreadForegroundAgents.select(stateFor([unreadBackground]), WS_1),
+    ).toBe(false);
+    expect(selectWorkspaceHasUnreadForegroundAgents.select(stateFor([readForeground]), WS_1)).toBe(
+      false,
+    );
   });
 
   it('resolves the primary agent with the newest valid user-message timestamp', () => {
@@ -417,6 +477,18 @@ describe('workspace-agents selectors', () => {
     } as AgentSession;
 
     expect(resolveEmptyLayoutAgent([excluded], WS_1)).toBeNull();
+  });
+
+  it('resolveCanonicalInitialAgent skips retired sessions (§5.5 soft retire)', () => {
+    const retiredInitial = {
+      ...mockAgent('agent-retired'),
+      isInitialAgent: true,
+      retiredAt: '2026-03-19T01:00:00.000Z',
+    } as AgentSession;
+    const active = mockAgent('agent-active');
+
+    expect(resolveCanonicalInitialAgent([retiredInitial, active])).toBe(active);
+    expect(resolveCanonicalInitialAgent([retiredInitial])).toBeNull();
   });
 
   it('returns per-workspace agent values (sessions from agent-session slice)', () => {
@@ -607,6 +679,30 @@ describe('workspace-agents selectors', () => {
       const state = workspaceAgentsReducer(initialState, setActiveAgentId(WS_1, 'agent-1'));
       const next = workspaceAgentsReducer(state, setActiveAgentId(WS_1, 'agent-1'));
       expect(next).toBe(state);
+    });
+  });
+
+  describe('hydration membership snapshots', () => {
+    it('records disk message counts in the setAgents membership commit', () => {
+      const withMessage = mockAgent('agent-1', WS_1, 'Agent');
+      withMessage.messages = [
+        { id: 'msg-1', role: 'user', timestamp: '2026-03-19T00:00:00.000Z' } as any,
+      ];
+
+      const state = workspaceAgentsReducer(initialState, setAgents(WS_1, [withMessage]));
+
+      expect(state.byWorkspaceId[WS_1].diskMessageCounts).toEqual({ 'agent-1': 1 });
+    });
+
+    it('records disk message counts when a retired hydration appends with addAgent', () => {
+      const withMessage = mockAgent('agent-1', WS_1, 'Agent');
+      withMessage.messages = [
+        { id: 'msg-1', role: 'user', timestamp: '2026-03-19T00:00:00.000Z' } as any,
+      ];
+
+      const state = workspaceAgentsReducer(initialState, addAgent(WS_1, withMessage));
+
+      expect(state.byWorkspaceId[WS_1].diskMessageCounts).toEqual({ 'agent-1': 1 });
     });
   });
 

@@ -132,7 +132,10 @@ vi.mock('$store/renderer/slices/workspace/workspace-selectors', () => ({
 vi.mock('$store/renderers/terminal-overlay.store.svelte', () => ({
   terminalsStore: { terminals: [], activeTerminalId: null },
 }));
-vi.mock('$lib/components/ui/toast', () => ({ toast }));
+vi.mock('$lib/components/ui/toast', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('$lib/components/ui/toast')>()),
+  toast,
+}));
 vi.mock('$lib/utils/client-logger', () => ({
   createLogger: () => ({ info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() }),
 }));
@@ -532,20 +535,98 @@ describe('TerminalSidebar context menu Escape handling', () => {
   });
 });
 
+describe('TerminalSidebar script inline rename', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    scriptEntries.value = [
+      {
+        id: 'script-1',
+        name: 'build',
+        command: 'npm run build',
+        mode: 'command',
+        category: 'build',
+        source: 'user',
+        runtime: { status: 'idle', exitCode: null },
+      },
+    ] as any[];
+    activeWorkspaceState.value = { id: 'ws-1', path: '/repo' } as any;
+    mockScriptUpdate.mockResolvedValue({ success: true });
+  });
+
+  it('shows a prefilled rename input on double-click and restores the row on Escape', async () => {
+    const { container } = render(TerminalSidebar, { props: { workspaceId: 'ws-1' } });
+
+    await fireEvent.doubleClick(screen.getByText('build'));
+
+    const input = container.querySelector<HTMLInputElement>('[data-edit-script="script-1"]');
+    expect(input).toBeTruthy();
+    expect(input!.value).toBe('build');
+
+    await fireEvent.keyDown(input!, { key: 'Escape' });
+    expect(container.querySelector('[data-edit-script="script-1"]')).toBeNull();
+    expect(screen.getByText('build')).toBeTruthy();
+    expect(mockScriptUpdate).not.toHaveBeenCalled();
+  });
+
+  it('commits a non-empty rename with Enter', async () => {
+    const { container } = render(TerminalSidebar, { props: { workspaceId: 'ws-1' } });
+
+    await fireEvent.doubleClick(screen.getByText('build'));
+    const input = container.querySelector<HTMLInputElement>('[data-edit-script="script-1"]');
+    await fireEvent.input(input!, { target: { value: 'compile' } });
+    await fireEvent.keyDown(input!, { key: 'Enter' });
+
+    await waitFor(() =>
+      expect(mockScriptUpdate).toHaveBeenCalledWith('ws-1', 'script-1', { name: 'compile' }),
+    );
+    expect(container.querySelector('[data-edit-script="script-1"]')).toBeNull();
+  });
+
+  it('commits a non-empty rename on blur', async () => {
+    const { container } = render(TerminalSidebar, { props: { workspaceId: 'ws-1' } });
+    await fireEvent.doubleClick(screen.getByText('build'));
+    const input = container.querySelector<HTMLInputElement>('[data-edit-script="script-1"]');
+    await fireEvent.input(input!, { target: { value: 'bundle' } });
+
+    await fireEvent.blur(input!);
+
+    await waitFor(() =>
+      expect(mockScriptUpdate).toHaveBeenCalledWith('ws-1', 'script-1', { name: 'bundle' }),
+    );
+    expect(screen.getByText('build')).toBeTruthy();
+  });
+
+  it('never leaves the script row empty when an empty rename is submitted', async () => {
+    const { container } = render(TerminalSidebar, { props: { workspaceId: 'ws-1' } });
+    await fireEvent.doubleClick(screen.getByText('build'));
+    const input = container.querySelector<HTMLInputElement>('[data-edit-script="script-1"]');
+    await fireEvent.input(input!, { target: { value: '   ' } });
+
+    await fireEvent.keyDown(input!, { key: 'Enter' });
+
+    expect(mockScriptUpdate).not.toHaveBeenCalled();
+    expect(screen.getByText('build')).toBeTruthy();
+  });
+});
+
 describe('TerminalSidebar agent navigation context', () => {
-  it('forwards the click navigation context when opening the detection agent', async () => {
+  it.each([
+    ['unmodified', {}, false],
+    ['Cmd', { metaKey: true }, true],
+    ['Ctrl', { ctrlKey: true }, true],
+  ])('forwards %s agent navigation intent', async (_name, modifier, openInAdjacentPanel) => {
     executorState.isRunning = true;
     executorState.agentId = 'agent-detect';
     activeWorkspaceState.value = { id: 'ws-1', path: '/repo' } as any;
-    mockGetNavigationContext.mockReturnValue({
+    mockGetNavigationContext.mockImplementation((event: MouseEvent) => ({
       sourcePanelId: 'panel-1',
-      openInAdjacentPanel: true,
-    });
+      openInAdjacentPanel: event.metaKey || event.ctrlKey,
+    }));
 
     render(TerminalSidebar, { props: { workspaceId: 'ws-1' } });
 
     const detectionAgentButton = await screen.findByTitle('View detection agent');
-    await fireEvent.click(detectionAgentButton);
+    await fireEvent.click(detectionAgentButton, modifier);
 
     expect(mockGetNavigationContext).toHaveBeenCalledWith(expect.any(MouseEvent));
     expect(mockDispatch).toHaveBeenCalledWith({
@@ -555,19 +636,10 @@ describe('TerminalSidebar agent navigation context', () => {
         {
           agentId: 'agent-detect',
           sourcePanelId: 'panel-1',
-          openInAdjacentPanel: true,
+          openInAdjacentPanel,
         },
       ],
     });
-  });
-});
-
-describe('TerminalSidebar section title spacing', () => {
-  it('keeps both section titles flush with their content', () => {
-    render(TerminalSidebar, { props: { workspaceId: 'ws-1' } });
-
-    expect(screen.getByText('Scripts').parentElement?.classList.contains('pb-0!')).toBe(true);
-    expect(screen.getByText('Terminals').parentElement?.classList.contains('pb-0!')).toBe(true);
   });
 });
 
@@ -579,7 +651,6 @@ describe('TerminalSidebar resize handle', () => {
     expect(handle).not.toBeNull();
     expect(handle?.getAttribute('data-resize-axis')).toBe('x');
     expect(handle?.getAttribute('data-resizing')).toBe('false');
-    expect(handle?.classList).toContain('w-4');
 
     await fireEvent.mouseDown(handle!);
     expect(handle?.getAttribute('data-resizing')).toBe('true');

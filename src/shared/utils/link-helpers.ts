@@ -14,8 +14,8 @@ export function isGithubLinkDefaultAction(value: unknown): value is GithubLinkDe
   return GITHUB_LINK_DEFAULT_ACTIONS.includes(value as GithubLinkDefaultAction);
 }
 
-/** Modifier key flags extracted from a MouseEvent */
-export interface ModifierFlags {
+/** Modifier key flags extracted from a mouse or keyboard event. */
+interface ModifierFlags {
   metaKey?: boolean;
   ctrlKey?: boolean;
 }
@@ -23,13 +23,13 @@ export interface ModifierFlags {
 export interface LinkHandlerOptions {
   /** Workspace ID for panel layout manager lookup. When undefined, HTTP/HTTPS links fall back to the external browser. */
   workspaceId?: WorkspaceId;
-  /** Panel where the navigation originated. Used to resolve stacked workspace-column layouts. */
+  /** Panel where the navigation originated. Used to resolve stacked panel layouts. */
   sourcePanelId?: string;
   /** The raw (unresolved) `href` attribute of the clicked anchor, e.g. `src/main.rs`.
    *  Used to detect schemeless path-like targets that the DOM resolves against the app's own origin. */
   rawHref?: string;
-  /** The original MouseEvent (used to detect Cmd+Click) */
-  event?: MouseEvent;
+  /** The original activation event (used to detect Mod-click and Mod+Enter). */
+  event?: MouseEvent | KeyboardEvent;
   /** Explicitly open internal note/task links beside the source panel. */
   openInAdjacentPanel?: boolean;
   /** Create a new adjacent panel instead of reusing an existing neighbor. */
@@ -42,6 +42,39 @@ export interface LinkHandlerOptions {
   githubLinkDefaultAction?: GithubLinkDefaultAction;
   /** Custom handler for specific link types */
   customHandler?: (url: string) => Promise<boolean> | boolean;
+}
+
+export interface ParsedFilePathLineSuffix {
+  path: string;
+  line?: number;
+  column?: number;
+}
+
+/** Strip a supported trailing line reference from a file path. */
+export function parseFilePathLineSuffix(path: string): ParsedFilePathLineSuffix {
+  const hashMatch = path.match(/^(.+?)#L(\d+)(?:-\d+|C(\d+))?$/);
+  if (hashMatch) {
+    return {
+      path: hashMatch[1],
+      line: Number.parseInt(hashMatch[2], 10),
+      ...(hashMatch[3] ? { column: Number.parseInt(hashMatch[3], 10) } : {}),
+    };
+  }
+
+  const colonMatch = path.match(/^(.+?):(\d+)(?::(\d+))?$/);
+  if (
+    colonMatch &&
+    !/:\d+$/.test(colonMatch[1]) &&
+    (colonMatch[1].includes('.') || colonMatch[1].includes('/'))
+  ) {
+    return {
+      path: colonMatch[1],
+      line: Number.parseInt(colonMatch[2], 10),
+      ...(colonMatch[3] ? { column: Number.parseInt(colonMatch[3], 10) } : {}),
+    };
+  }
+
+  return { path };
 }
 
 /** Path segments that indicate an OAuth / authentication flow */
@@ -69,7 +102,7 @@ export function isGitHubUrl(url: string): boolean {
 }
 
 /** Kind of a parsed GitHub issue/PR reference. */
-export type GitHubIssueOrPrKind = 'issue' | 'pr';
+type GitHubIssueOrPrKind = 'issue' | 'pr';
 
 /** A GitHub issue or pull-request reference parsed from a github.com URL. */
 export interface GitHubIssueOrPrRef {

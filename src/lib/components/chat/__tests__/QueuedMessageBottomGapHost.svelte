@@ -4,6 +4,7 @@
   import type { QueuedMessage } from '$shared/types';
   import {
     CHAT_SCROLL_END_MARKER_CLASS,
+    CHAT_TRANSCRIPT_OVERFLOW_CLASS,
     chatTranscriptBottomInsetClass,
   } from '../chat-queue-edge-layout';
 
@@ -13,7 +14,6 @@
     zoom?: number;
     queueCount?: number;
     reverse?: boolean;
-    heldForQuestions?: boolean;
     saveDelayMs?: number;
   }
 
@@ -23,7 +23,6 @@
     zoom = 1,
     queueCount = 0,
     reverse = false,
-    heldForQuestions = false,
     saveDelayMs = 0,
   }: Props = $props();
   let removedIds = $state<string[]>([]);
@@ -75,7 +74,7 @@
       onFollowChange: (next) => (following = next),
       onScrollStateChange: reportBottom,
     }}
-    class="min-h-0 flex-1 overflow-y-auto"
+    class="min-h-0 flex-1 {CHAT_TRANSCRIPT_OVERFLOW_CLASS}"
     style="overflow-anchor: none;"
     data-testid="queued-gap-transcript"
     role="region"
@@ -89,13 +88,9 @@
       <div class="h-[520px] shrink-0" data-testid="queued-gap-history"></div>
       <div class="mt-auto" data-testid="transcript-utility-stack">
         {#if messages.length > 0}
-          <div
-            class="queued-message-utility-wide mt-6 -mx-4 sm:-mx-6"
-            data-testid="queued-message-utility-area"
-          >
+          <div class="relative z-20 mt-6 w-full" data-testid="queued-message-utility-area">
             <QueuedMessageList
               {messages}
-              {heldForQuestions}
               onedit={editMessage}
               onremove={(id) => (removedIds = [...removedIds, id])}
             />

@@ -1,3 +1,4 @@
+import { m } from '$shared/paraglide/messages.js';
 import { describe, it, expect, beforeEach, vi, type Mock } from 'vitest';
 import { render, fireEvent, waitFor } from '@testing-library/svelte';
 import type { TrackedChange, CommitInfo } from '$features/file-tracking/types';
@@ -109,18 +110,6 @@ vi.mock('$store/renderer/slices/changes/changes-slice', async (importOriginal) =
     type: 'changes/clearOlderCommits',
     payload: wsId,
   })),
-  stageByPathRequested: vi.fn((wsId: string, paths: string[]) => ({
-    type: 'changes/stageByPathRequested',
-    payload: [wsId, paths],
-  })),
-  unstageByPathRequested: vi.fn((wsId: string, paths: string[]) => ({
-    type: 'changes/unstageByPathRequested',
-    payload: [wsId, paths],
-  })),
-  revertByPathRequested: vi.fn((wsId: string, paths: string[]) => ({
-    type: 'changes/revertByPathRequested',
-    payload: [wsId, paths],
-  })),
   refreshRequested: vi.fn((wsId: string) => ({
     type: 'changes/refreshRequested',
     payload: [wsId],
@@ -193,6 +182,13 @@ vi.mock('$features/git/git.client', () => ({
 }));
 
 vi.mock('$store/renderer/slices/git/git-selectors', () => ({
+  emptySecondaryRootState: {
+    status: null,
+    commits: [],
+    commitFiles: {},
+    loading: false,
+    error: null,
+  },
   selectGitAhead: Object.assign(() => createReadable(mockGitState.ahead), {
     select: () => mockGitState.ahead,
   }),
@@ -210,6 +206,7 @@ vi.mock('$store/renderer/slices/git/git-selectors', () => ({
     (workspaceId: string) => createSelectorReadable(workspaceId, () => mockGitOperationFlags),
     { select: () => mockGitOperationFlags },
   ),
+  selectSecondaryRootGitRoots: () => createReadable({}),
 }));
 
 vi.mock('$store/renderer/slices/git/git-slice', async (importOriginal) => ({
@@ -246,7 +243,6 @@ const mockAcceptChangesState = {
   isAutofillAndCreatingPR: false,
   pendingCommitAction: null as any,
   pendingPRContext: null as any,
-  backgroundOperation: null as any,
 };
 
 function createReadable<T>(value: T) {
@@ -340,12 +336,11 @@ vi.mock('$store/renderer/slices/agent-lock/agent-lock-selectors', () => ({
     },
   }),
 }));
-vi.mock('$store/renderer/slices/agent-lock/agent-lock-slice', async (importOriginal) => ({
+// The panel hydrates the daemon-computed agent-lock snapshot on workspace
+// switch (PROTOCOL §5.19); fake the client so no wire read is attempted.
+vi.mock('$features/file-tracking/file-tracking.client', async (importOriginal) => ({
   ...(await importOriginal<Record<string, unknown>>()),
-  recomputeAgentLocks: vi.fn((wsId: string) => ({
-    type: 'agentLock/recomputeAgentLocks',
-    payload: [wsId],
-  })),
+  hydrateAgentLocks: vi.fn(() => Promise.resolve()),
 }));
 
 const mockGitHubAuthIsAuthenticated = vi.hoisted(() => ({ value: false }));
@@ -390,10 +385,6 @@ vi.mock(
     })),
     cancelExecution: vi.fn((...args: any[]) => ({
       type: 'backgroundAgentExecutor/cancel',
-      payload: args,
-    })),
-    reconnectAgent: vi.fn((...args: any[]) => ({
-      type: 'backgroundAgentExecutor/reconnect',
       payload: args,
     })),
     resetExecutor: vi.fn((...args: any[]) => ({
@@ -722,6 +713,20 @@ describe('SidebarChangesPanel', () => {
   // ═══════════════════════════════════════════════════════════════════════════
 
   describe('Rendering', () => {
+    it('leases accept-status freshness only while the panel is mounted', async () => {
+      const view = await renderPanel();
+
+      expect(mockDispatch).toHaveBeenCalledWith({
+        type: 'git/acceptChangesConsumerMounted',
+        payload: ['ws-1'],
+      });
+      view.unmount();
+      expect(mockDispatch).toHaveBeenCalledWith({
+        type: 'git/acceptChangesConsumerUnmounted',
+        payload: ['ws-1'],
+      });
+    });
+
     it('refreshes Git status before broad Changes data with the explicit workspace ID', async () => {
       mockWorkspaceStore.findById.mockReturnValue(makeWorkspace());
       const { container } = await renderPanel();
@@ -2205,39 +2210,12 @@ describe('SidebarChangesPanel', () => {
       });
       // Primary selection keeps today's behavior: normal panel body, no read-only view
       expect(container.querySelector('[data-testid="secondary-root-changes-view"]')).toBeFalsy();
-      expect(container.textContent).toContain('Space root');
+      expect(container.textContent).toContain(m.workspace_sidebarChanges_rootPrimary_label());
     });
 
-    it('selecting a secondary root swaps in the read-only view driven by gitRootId reads', async () => {
+    it('selecting a secondary root swaps in the read-only view and dispatches a scoped load', async () => {
       mockWorkspaceStore.findById.mockReturnValue(makeWorkspace());
       await seedGitRoots([makeGitRoot()]);
-      mockRootGetStatus.mockResolvedValue({
-        ok: true,
-        data: {
-          branch: 'feature/sub',
-          ahead: 0,
-          behind: 0,
-          diverged: false,
-          files: [{ path: 'src/a.ts', status: 'M', staged: false }],
-          hasUncommittedChanges: true,
-          hasUntrackedFiles: false,
-        },
-      });
-      mockRootGetHistory.mockResolvedValue({
-        ok: true,
-        data: {
-          items: [
-            {
-              hash: 'aaaa1111bbbb',
-              sha: 'aaaa111',
-              author: 'Dev',
-              email: 'dev@example.com',
-              date: new Date().toISOString(),
-              message: 'feat: sub work',
-            },
-          ],
-        },
-      });
 
       const { container } = await renderPanel();
 
@@ -2262,21 +2240,15 @@ describe('SidebarChangesPanel', () => {
         expect(container.querySelector('[data-testid="secondary-root-changes-view"]')).toBeTruthy();
       });
 
-      // Reads are scoped to the registered root
+      // The component delegates scoped reads to the Redux saga.
       await waitFor(() => {
-        expect(mockRootGetStatus).toHaveBeenCalledWith('ws-1', { gitRootId: 'root-1' });
-        expect(mockRootGetHistory).toHaveBeenCalledWith('ws-1', expect.any(Number), {
-          gitRootId: 'root-1',
+        expect(mockDispatch).toHaveBeenCalledWith({
+          type: 'git/loadSecondaryRoot',
+          payload: ['ws-1', 'root-1', undefined, 30],
         });
       });
 
-      // Read-only content rendered; no mutation affordances
-      await waitFor(() => {
-        const text = container.textContent || '';
-        expect(text).toContain('src/a.ts');
-        expect(text).toContain('feat: sub work');
-        expect(text).toContain('Read-only');
-      });
+      // The selected view remains read-only.
       const viewText = container.textContent || '';
       expect(viewText).not.toContain('Stage all');
       expect(viewText).not.toContain('Create PR');

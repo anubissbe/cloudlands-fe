@@ -8,6 +8,8 @@
   import SimpleRichInput from '$lib/components/chat/input/SimpleRichInput.svelte';
   import { isFocusInTerminal } from '$lib/utils/keyboardShortcuts';
   import { m } from '$shared/paraglide/messages.js';
+  import { getEffectiveShortcut } from '$lib/utils/effective-shortcuts';
+  import { matchesShortcut } from '$lib/utils/shortcut-bindings';
 
   interface Props {
     session?: AgentSession | null;
@@ -114,17 +116,12 @@
 
   function handleKeyDown(event: KeyboardEvent) {
     if (!enableShortcuts) return;
+    const isMac = /Mac|iPhone|iPad|iPod/.test(navigator.userAgent);
 
     // Cmd/Ctrl + Enter to send
-    if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
+    if (matchesShortcut(event, getEffectiveShortcut('chat.force-send'), isMac)) {
       event.preventDefault();
       handleSend();
-    }
-
-    // Escape to stop streaming
-    if (event.key === 'Escape' && isStreaming) {
-      event.preventDefault();
-      handleStop();
     }
   }
 
@@ -175,7 +172,7 @@
         >
           <span>{ref.name || ref.type || m.chat_shared_context_fallback()}</span>
           <button
-            class="flex items-center justify-center size-4 p-0 bg-transparent border-none text-muted-foreground cursor-pointer transition-colors hover:text-error-foreground"
+            class="flex items-center justify-center size-4 p-0 bg-transparent border-none text-muted-foreground cursor-pointer transition-colors hover:text-danger"
             onclick={() => {
               const newRefs = contextReferences.filter((r) => r !== ref);
               onContextUpdate?.({ references: newRefs });
@@ -202,7 +199,6 @@
       {#if showStopButton && (isProcessing || isStreaming)}
         <TooltipShortcut
           label={m.chat_agentInputArea_stopGeneration_label()}
-          shortcut="esc"
           side="top"
           delayDuration={200}
         >

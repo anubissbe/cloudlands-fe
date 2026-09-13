@@ -78,7 +78,7 @@
     /** Focused file from keyboard navigation in parent */
     focusedFile?: { path: string; staged: boolean } | null;
     isWorkspaceSwitching?: boolean;
-    onOpenChange?: (change: TrackedChange) => void;
+    onOpenChange?: (change: TrackedChange, event?: MouseEvent | KeyboardEvent) => void;
     onOpenNote?: (noteId: string) => void;
     /** Callback when a file is clicked (for parent keyboard nav tracking) */
     onFileClicked?: (path: string, staged: boolean) => void;
@@ -319,9 +319,14 @@
     lastClickedFile = { path, staged };
   }
 
-  function handleFileClick(path: string, _commitHash?: string, staged?: boolean) {
+  function handleFileClick(
+    path: string,
+    _commitHash?: string,
+    staged?: boolean,
+    event?: MouseEvent | KeyboardEvent,
+  ) {
     const change = findChange(path, staged ?? false);
-    if (change) onOpenChange?.(change);
+    if (change) onOpenChange?.(change, event);
   }
 
   function handleOpenFile(relativePath: string) {
@@ -798,11 +803,10 @@
                         active={isFileActive(file.path, false)}
                         selected={isFileSelected(file.path, false)}
                         focused={isFileFocused(file.path, false)}
-                        openPanelCount={panelState.count}
                         activeInPanel={panelState.isActive}
-                        onFileClick={(path, commitHash) => {
+                        onFileClick={(path, commitHash, _staged, event) => {
                           trackLastClicked(path, false);
-                          handleFileClick(path, commitHash, false);
+                          handleFileClick(path, commitHash, false, event);
                         }}
                         onSelectClick={(path, e) => handleSelectClick(path, false, e)}
                         onStage={handleStageFile}
@@ -834,11 +838,10 @@
                 active={isFileActive(change.relativePath, false)}
                 selected={isFileSelected(change.relativePath, false)}
                 focused={isFileFocused(change.relativePath, false)}
-                openPanelCount={panelState.count}
                 activeInPanel={panelState.isActive}
-                onFileClick={(path, commitHash) => {
+                onFileClick={(path, commitHash, _staged, event) => {
                   trackLastClicked(path, false);
-                  handleFileClick(path, commitHash, false);
+                  handleFileClick(path, commitHash, false, event);
                 }}
                 onSelectClick={(path, e) => handleSelectClick(path, false, e)}
                 onStage={handleStageFile}
@@ -1012,11 +1015,10 @@
                         active={isFileActive(file.path, true)}
                         selected={isFileSelected(file.path, true)}
                         focused={isFileFocused(file.path, true)}
-                        openPanelCount={panelState.count}
                         activeInPanel={panelState.isActive}
-                        onFileClick={(path, commitHash) => {
+                        onFileClick={(path, commitHash, _staged, event) => {
                           trackLastClicked(path, true);
-                          handleFileClick(path, commitHash, true);
+                          handleFileClick(path, commitHash, true, event);
                         }}
                         onSelectClick={(path, e) => handleSelectClick(path, true, e)}
                         onUnstage={handleUnstageFile}
@@ -1045,11 +1047,10 @@
                 active={isFileActive(change.relativePath, true)}
                 selected={isFileSelected(change.relativePath, true)}
                 focused={isFileFocused(change.relativePath, true)}
-                openPanelCount={panelState.count}
                 activeInPanel={panelState.isActive}
-                onFileClick={(path, commitHash) => {
+                onFileClick={(path, commitHash, _staged, event) => {
                   trackLastClicked(path, true);
-                  handleFileClick(path, commitHash, true);
+                  handleFileClick(path, commitHash, true, event);
                 }}
                 onSelectClick={(path, e) => handleSelectClick(path, true, e)}
                 onUnstage={handleUnstageFile}

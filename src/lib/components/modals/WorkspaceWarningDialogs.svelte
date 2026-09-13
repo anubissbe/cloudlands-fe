@@ -10,6 +10,10 @@
   import {
     selectActiveHookNamesForArchive,
     selectActiveHookNamesForDelete,
+    selectLocalChangesForArchive,
+    selectLocalChangesForDelete,
+    selectOpenPrsForArchive,
+    selectOpenPrsForDelete,
     selectRunningAgentNamesForArchive,
     selectRunningAgentNamesForDelete,
     selectShowArchiveWarning,
@@ -19,9 +23,13 @@
   const showDeleteWarning$ = selectShowDeleteWarning();
   const runningAgentNamesForDelete$ = selectRunningAgentNamesForDelete();
   const activeHookNamesForDelete$ = selectActiveHookNamesForDelete();
+  const openPrsForDelete$ = selectOpenPrsForDelete();
+  const localChangesForDelete$ = selectLocalChangesForDelete();
   const showArchiveWarning$ = selectShowArchiveWarning();
   const runningAgentNamesForArchive$ = selectRunningAgentNamesForArchive();
   const activeHookNamesForArchive$ = selectActiveHookNamesForArchive();
+  const openPrsForArchive$ = selectOpenPrsForArchive();
+  const localChangesForArchive$ = selectLocalChangesForArchive();
 </script>
 
 <!-- Redux-owned delete warning host (global for all workspace delete entrypoints) -->
@@ -29,6 +37,8 @@
   open={$showDeleteWarning$}
   agentNames={$runningAgentNamesForDelete$}
   hookNames={$activeHookNamesForDelete$}
+  openPrs={$openPrsForDelete$}
+  localChanges={$localChangesForDelete$}
   onDeleteAnyway={() => appStore.dispatch(confirmDeleteWorkspace())}
   onCancel={() => appStore.dispatch(closeDeleteWarning())}
 />
@@ -39,6 +49,8 @@
   mode="archive"
   agentNames={$runningAgentNamesForArchive$}
   hookNames={$activeHookNamesForArchive$}
+  openPrs={$openPrsForArchive$}
+  localChanges={$localChangesForArchive$}
   onDeleteAnyway={() => appStore.dispatch(confirmArchiveWorkspace())}
   onCancel={() => appStore.dispatch(closeArchiveWarning())}
 />

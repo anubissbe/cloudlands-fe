@@ -2,13 +2,18 @@
   StreamingTypingIndicator.svelte
 
   A polished, animated typing indicator for streaming messages.
-  Features animated squares using the seeded agent color scheme.
+  Uses the shared Intent mark loader in the operational leading slot.
 -->
 <script lang="ts">
+  import { onDestroy } from 'svelte';
   import { fade } from 'svelte/transition';
   import { cubicOut } from 'svelte/easing';
-  import { getAgentColorsWithSeed } from '$lib/utils/agent-colors';
   import { m } from '$shared/paraglide/messages.js';
+  import {
+    IntentMarkLoader,
+    intentMarkMotionTiming,
+    type IntentMarkVariant,
+  } from '$lib/components/ui/indicators';
   import {
     CHAT_OPERATIONAL_LEADING_CLASS,
     CHAT_OPERATIONAL_ROW_CLASS,
@@ -18,6 +23,15 @@
   interface Props {
     visible?: boolean;
     message?: string;
+    lifecycleMessage?: string | null;
+    elapsed?: string | null;
+    /**
+     * Called with `true` while the pointer is over the row and `false` when it
+     * leaves or the row hides, so the owner can refresh the hover-only elapsed
+     * text only while it can be seen.
+     */
+    onHoverChange?: (hovered: boolean) => void;
+    variant?: IntentMarkVariant;
     class?: string;
     /** Compact mode - shows only spinner without message */
     compact?: boolean;
@@ -27,34 +41,70 @@
 
   let {
     visible = false,
-    message = 'Thinking',
+    message = m.chat_streamingStatus_thinking_label(),
+    lifecycleMessage = null,
+    elapsed = null,
+    onHoverChange,
+    variant = 'bloom',
     class: className = '',
     compact = false,
-    seed = 'default',
+    seed: _seed = 'default',
   }: Props = $props();
 
-  let [color1, color2] = $derived(getAgentColorsWithSeed(seed));
+  const hideMs = 150;
+  const settlementHoldMs = intentMarkMotionTiming.settleMs + 20;
+  let rendered = $state(false);
+  let hideTimer: number | undefined;
+  let hovered = false;
+
+  function setHovered(next: boolean) {
+    if (hovered === next) return;
+    hovered = next;
+    onHoverChange?.(next);
+  }
+
+  $effect.pre(() => {
+    if (visible) {
+      if (hideTimer !== undefined) window.clearTimeout(hideTimer);
+      hideTimer = undefined;
+      rendered = true;
+    } else if (rendered && hideTimer === undefined) {
+      hideTimer = window.setTimeout(() => {
+        hideTimer = undefined;
+        if (!visible) rendered = false;
+      });
+    }
+  });
+
+  $effect(() => {
+    if (!rendered) setHovered(false);
+  });
+
+  onDestroy(() => {
+    if (hideTimer !== undefined) window.clearTimeout(hideTimer);
+    setHovered(false);
+  });
+
+  function settleAndFade(node: Element) {
+    return fade(node, {
+      duration: settlementHoldMs,
+      easing: (progress) => cubicOut(Math.min(1, (progress * settlementHoldMs) / hideMs)),
+    });
+  }
 </script>
 
-{#if visible}
+{#if rendered}
   <div
-    class="{CHAT_OPERATIONAL_ROW_CLASS} font-family-child font-normal text-muted-foreground {className}"
+    class="{CHAT_OPERATIONAL_ROW_CLASS} group font-family-child font-normal text-muted-foreground {className}"
     data-streaming-typing-row
+    aria-hidden={!visible}
+    onpointerenter={() => setHovered(true)}
+    onpointerleave={() => setHovered(false)}
     in:fade={{ duration: 200, easing: cubicOut }}
-    out:fade={{ duration: 150, easing: cubicOut }}
+    out:settleAndFade
   >
-    <div
-      class="legacy-streaming-spinner {CHAT_OPERATIONAL_LEADING_CLASS}"
-      style="--size: 3.5px; --gap: 1px; --color1: {color1}; --color2: {color2};"
-      role="status"
-      aria-label={m.ui_spinner_loading_ariaLabel()}
-      data-operational-leading
-    >
-      <span class="legacy-spinner-track" aria-hidden="true">
-        <span class="legacy-spinner-square legacy-spinner-square-0"></span>
-        <span class="legacy-spinner-square legacy-spinner-square-1"></span>
-        <span class="legacy-spinner-square legacy-spinner-square-2"></span>
-      </span>
+    <div class={CHAT_OPERATIONAL_LEADING_CLASS} data-operational-leading>
+      <IntentMarkLoader {variant} size={16} playing={visible} />
     </div>
 
     <!-- Message text -->
@@ -62,61 +112,28 @@
       <span
         class={CHAT_OPERATIONAL_SUMMARY_CLASS}
         data-operational-summary
-        data-testid="streaming-status-thinking">{message}</span
+        data-testid="streaming-status-thinking"
+      >
+        <span
+          class="inline-flex min-w-0 max-w-full items-baseline gap-[0.5ch]"
+          data-testid="streaming-status-copy"
+          ><span
+            class="shrink-0 font-normal text-foreground"
+            data-testid="streaming-status-thinking-label">{message}</span
+          >{#if lifecycleMessage}<span
+              class="min-w-0 truncate font-normal text-muted-foreground"
+              data-testid="streaming-status-phase">{lifecycleMessage}</span
+            >{/if}</span
+        >
+      </span>
+    {/if}
+
+    {#if elapsed}
+      <span
+        class="type-caption pointer-events-none opacity-0 transition-opacity duration-[var(--motion-fast)] group-hover:opacity-100 motion-reduce:transition-none"
+        aria-live="off"
+        data-testid="streaming-status-elapsed">{elapsed}</span
       >
     {/if}
   </div>
 {/if}
-
-<style>
-  .legacy-streaming-spinner {
-    --duration: 800ms;
-    --delay: 200ms;
-  }
-
-  .legacy-spinner-track {
-    display: flex;
-    gap: var(--gap);
-  }
-
-  .legacy-spinner-square {
-    width: var(--size);
-    height: var(--size);
-    animation: legacy-spinner-wave var(--duration) step-start infinite;
-  }
-
-  .legacy-spinner-square-0 {
-    background-color: var(--color1);
-  }
-
-  .legacy-spinner-square-1 {
-    background-color: color-mix(in srgb, var(--color2) 90%, var(--color-muted-foreground) 10%);
-    animation-delay: var(--delay);
-  }
-
-  .legacy-spinner-square-2 {
-    background-color: currentColor;
-    opacity: 0.5;
-    animation-delay: calc(var(--delay) * 2);
-  }
-
-  @keyframes legacy-spinner-wave {
-    0%,
-    50%,
-    100% {
-      transform: translateY(0);
-    }
-    25% {
-      transform: translateY(-90%);
-    }
-    75% {
-      transform: translateY(90%);
-    }
-  }
-
-  @media (prefers-reduced-motion: reduce) {
-    .legacy-spinner-square {
-      animation: none;
-    }
-  }
-</style>

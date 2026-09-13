@@ -1,6 +1,6 @@
 import { faWrench } from '@fortawesome/free-solid-svg-icons';
 import { describe, expect, it } from 'vitest';
-import type { ToolCategory, ToolDisplay } from '../tool-classifier';
+import type { ToolCategory, ToolDisplay } from '$lib/utils/tool-classifier';
 import {
   buildToolDisplayModel,
   isOkOnlyResult,
@@ -147,7 +147,9 @@ describe('compact tool display model', () => {
 
   it('preserves newlines when sanitizing multiline tool text', () => {
     const command = 'cd repo && \\\n  API_KEY=abc123 pnpm test\n';
-    expect(sanitizeMultilineToolText(command)).toBe('cd repo && \\\n  API_KEY=[redacted] pnpm test');
+    expect(sanitizeMultilineToolText(command)).toBe(
+      'cd repo && \\\n  API_KEY=[redacted] pnpm test',
+    );
   });
 
   it('redacts secrets while preserving non-secret provenance', () => {

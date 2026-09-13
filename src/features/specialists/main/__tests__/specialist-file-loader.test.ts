@@ -12,19 +12,13 @@
 
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
-import {
-  describe,
-  it,
-  expect,
-  vi,
-  beforeEach,
-  beforeAll,
-  afterAll,
-  afterEach,
-} from 'vitest';
+import { describe, it, expect, vi, beforeEach, beforeAll, afterAll, afterEach } from 'vitest';
 import {
   parseSpecialistFile,
   parseModelOptionsScalar,
+  parseRoleScalar,
+  parseTeamAgentsScalar,
+  splitCompoundModelScalar,
   writeSpecialistFile,
   loadSpecialistFile,
   loadProjectSpecialistFiles,
@@ -36,7 +30,6 @@ import {
 } from '../../../../shared/specialist-file-types';
 
 const TEST_HOME = '/tmp/augment-specialist-file-loader-test';
-let originalHome: string | undefined;
 
 // Mock electron app
 vi.mock('electron', () => ({
@@ -46,9 +39,22 @@ vi.mock('electron', () => ({
   },
 }));
 
+// Redirect the loader's user-level specialists directory (resolved via
+// getSafeHomeDir() -> os.homedir()) into TEST_HOME. Overriding process.env.HOME
+// is not sufficient: os.homedir() ignores env mutations made inside a worker
+// thread, so under `vitest --pool=threads` the write-path tests below leaked
+// their fixtures into the developer's real ~/.intent/specialists/
+// (intent-hq/intent#4332). Mocking homedir() holds regardless of the pool.
+vi.mock('os', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('os')>();
+  return {
+    ...actual,
+    default: { ...actual, homedir: () => TEST_HOME },
+    homedir: () => TEST_HOME,
+  };
+});
+
 beforeAll(async () => {
-  originalHome = process.env.HOME;
-  process.env.HOME = TEST_HOME;
   await fs.rm(TEST_HOME, { recursive: true, force: true });
 });
 
@@ -58,11 +64,6 @@ beforeEach(async () => {
 
 afterAll(async () => {
   await fs.rm(TEST_HOME, { recursive: true, force: true });
-  if (originalHome === undefined) {
-    delete process.env.HOME;
-  } else {
-    process.env.HOME = originalHome;
-  }
 });
 
 describe('parseSpecialistFile', () => {
@@ -310,7 +311,7 @@ Body`;
 
   describe('Windows line endings', () => {
     it('should handle CRLF line endings', () => {
-      const content = "---\r\nname: \"Test\"\r\ndescription: \"A test\"\r\n---\r\n\r\nBody content";
+      const content = '---\r\nname: "Test"\r\ndescription: "A test"\r\n---\r\n\r\nBody content';
 
       const result = parseSpecialistFile('/path/to/crlf.md', content);
       expect('error' in result).toBe(false);
@@ -442,7 +443,7 @@ Body`;
       const content = `---
 name: "With Options"
 description: "Has model options"
-modelOptions: [{"model":"opencode:kimi-k3","hint":"cheap"},{"model":"opus4.5","hint":""}]
+modelOptions: [{"provider":"opencode","model":"kimi-k3","hint":"cheap"},{"model":"opus4.5","hint":""}]
 ---
 
 Prompt.`;
@@ -451,10 +452,42 @@ Prompt.`;
       expect('error' in result).toBe(false);
       if (!('error' in result)) {
         expect(result.frontmatter.modelOptions).toEqual([
-          { model: 'opencode:kimi-k3', hint: 'cheap' },
+          { provider: 'opencode', model: 'kimi-k3', hint: 'cheap' },
           { model: 'opus4.5', hint: '' },
         ]);
       }
+    });
+
+    it('should split legacy compound model ids into provider + bare model', () => {
+      expect(parseModelOptionsScalar('[{"model":"opencode:kimi-k3","hint":"cheap"}]')).toEqual([
+        { provider: 'opencode', model: 'kimi-k3', hint: 'cheap' },
+      ]);
+      // The compound prefix wins over an entry-level provider field.
+      expect(
+        parseModelOptionsScalar('[{"provider":"auggie","model":"opencode:kimi-k3","hint":""}]'),
+      ).toEqual([{ provider: 'opencode', model: 'kimi-k3', hint: '' }]);
+      // Both halves are trimmed.
+      expect(parseModelOptionsScalar('[{"model":" opencode : kimi-k3 ","hint":""}]')).toEqual([
+        { provider: 'opencode', model: 'kimi-k3', hint: '' },
+      ]);
+    });
+
+    it('should treat a compound id with an empty prefix or rest as unusable', () => {
+      expect(parseModelOptionsScalar('[{"model":":kimi-k3","hint":""}]')).toBeUndefined();
+      expect(parseModelOptionsScalar('[{"model":"opencode:","hint":""}]')).toBeUndefined();
+      expect(parseModelOptionsScalar('[{"model":" : ","hint":""}]')).toBeUndefined();
+    });
+
+    it('should carry provider only when it is a non-empty string', () => {
+      expect(parseModelOptionsScalar('[{"provider":"","model":"opus4.5","hint":""}]')).toEqual([
+        { model: 'opus4.5', hint: '' },
+      ]);
+      expect(parseModelOptionsScalar('[{"provider":"  ","model":"opus4.5","hint":""}]')).toEqual([
+        { model: 'opus4.5', hint: '' },
+      ]);
+      expect(parseModelOptionsScalar('[{"provider":42,"model":"opus4.5","hint":""}]')).toEqual([
+        { model: 'opus4.5', hint: '' },
+      ]);
     });
 
     it('should treat an unparseable scalar as an omitted key', () => {
@@ -479,8 +512,132 @@ Prompt.`;
       ]);
     });
 
+    it('should read a whitespace-only model or reasoningEffort as unusable/omitted', () => {
+      expect(parseModelOptionsScalar('[{"model":"  ","hint":""}]')).toBeUndefined();
+      expect(
+        parseModelOptionsScalar('[{"model":"opus4.5","hint":"","reasoningEffort":"  "}]'),
+      ).toEqual([{ model: 'opus4.5', hint: '' }]);
+    });
+
     it('should treat a non-empty array of all-unusable entries as omitted (inherits)', () => {
       expect(parseModelOptionsScalar('[{"hint":"no model"},"junk"]')).toBeUndefined();
+    });
+  });
+
+  describe('legacy compound model frontmatter scalar (PROTOCOL §5.11 lenient reads)', () => {
+    it('should split a compound model into bare model + codingAgent, the prefix winning', () => {
+      expect(splitCompoundModelScalar('opencode:kimi-k3', undefined)).toEqual({
+        model: 'kimi-k3',
+        codingAgent: 'opencode',
+      });
+      expect(splitCompoundModelScalar('opencode:kimi-k3', 'auggie')).toEqual({
+        model: 'kimi-k3',
+        codingAgent: 'opencode',
+      });
+      expect(splitCompoundModelScalar(' opencode : kimi-k3 ', undefined)).toEqual({
+        model: 'kimi-k3',
+        codingAgent: 'opencode',
+      });
+    });
+
+    it('should pass bare models through untouched', () => {
+      expect(splitCompoundModelScalar('opus4.5', 'auggie')).toEqual({
+        model: 'opus4.5',
+        codingAgent: 'auggie',
+      });
+      expect(splitCompoundModelScalar(undefined, 'auggie')).toEqual({
+        model: undefined,
+        codingAgent: 'auggie',
+      });
+    });
+
+    it('should read a compound with an empty prefix or rest as an omitted model', () => {
+      expect(splitCompoundModelScalar(':kimi-k3', 'auggie')).toEqual({
+        model: undefined,
+        codingAgent: 'auggie',
+      });
+      expect(splitCompoundModelScalar('opencode:', 'auggie')).toEqual({
+        model: undefined,
+        codingAgent: 'auggie',
+      });
+    });
+
+    it('should apply the split when parsing a specialist file', () => {
+      const content = `---
+name: "Legacy"
+description: "Compound model id"
+codingAgent: "auggie"
+model: "opencode:kimi-k3"
+---
+
+Prompt.`;
+
+      const result = parseSpecialistFile('/path/to/legacy.md', content);
+      expect('error' in result).toBe(false);
+      if (!('error' in result)) {
+        expect(result.frontmatter.model).toBe('kimi-k3');
+        expect(result.frontmatter.codingAgent).toBe('opencode');
+      }
+    });
+  });
+
+  describe('role/teamAgents/icon frontmatter (PROTOCOL §5.11 lenient reads)', () => {
+    it('should parse known role values and the icon scalar', () => {
+      const content = `---
+name: "Orchestrator"
+description: "Coordinates"
+role: "orchestrator"
+teamAgents: ["implementor","verifier"]
+icon: "coordinator"
+---
+
+Prompt.`;
+
+      const result = parseSpecialistFile('/path/to/orchestrator.md', content);
+      expect('error' in result).toBe(false);
+      if (!('error' in result)) {
+        expect(result.frontmatter.role).toBe('orchestrator');
+        expect(result.frontmatter.teamAgents).toEqual(['implementor', 'verifier']);
+        expect(result.frontmatter.icon).toBe('coordinator');
+      }
+    });
+
+    it('should read unknown role values as an omitted key (never rejects)', () => {
+      expect(parseRoleScalar('orchestrator')).toBe('orchestrator');
+      expect(parseRoleScalar('internal')).toBe('internal');
+      expect(parseRoleScalar('sidekick')).toBeUndefined();
+      expect(parseRoleScalar('')).toBeUndefined();
+      expect(parseRoleScalar(undefined)).toBeUndefined();
+    });
+
+    it('should apply modelOptions-style lenient reads to teamAgents', () => {
+      expect(parseTeamAgentsScalar('["a","b"]')).toEqual(['a', 'b']);
+      expect(parseTeamAgentsScalar('[]')).toEqual([]);
+      expect(parseTeamAgentsScalar('not json')).toBeUndefined();
+      expect(parseTeamAgentsScalar('{"a":1}')).toBeUndefined();
+      expect(parseTeamAgentsScalar('["good","",42]')).toEqual(['good']);
+      expect(parseTeamAgentsScalar('["",42]')).toBeUndefined();
+      expect(parseTeamAgentsScalar('["good"," "]')).toEqual(['good']);
+      expect(parseTeamAgentsScalar('[" "]')).toBeUndefined();
+      expect(parseTeamAgentsScalar(undefined)).toBeUndefined();
+      expect(parseTeamAgentsScalar('')).toBeUndefined();
+    });
+
+    it('should leave role/teamAgents/icon undefined when absent', () => {
+      const content = `---
+name: "Plain"
+description: "No metadata"
+---
+
+Prompt.`;
+
+      const result = parseSpecialistFile('/path/to/plain.md', content);
+      expect('error' in result).toBe(false);
+      if (!('error' in result)) {
+        expect(result.frontmatter.role).toBeUndefined();
+        expect(result.frontmatter.teamAgents).toBeUndefined();
+        expect(result.frontmatter.icon).toBeUndefined();
+      }
     });
   });
 
@@ -496,6 +653,11 @@ Prompt.`;
       });
 
       const loaded = await loadSpecialistFile('round-trip');
+
+      // The write must land under the isolated test home, never the real one.
+      await expect(
+        fs.access(path.join(TEST_HOME, '.intent', 'specialists', 'round-trip.md')),
+      ).resolves.toBeUndefined();
 
       expect(loaded).not.toBeNull();
       expect(loaded?.frontmatter.codingAgent).toBe('codex');
@@ -535,7 +697,7 @@ Prompt.`;
 
     it('should round-trip modelOptions when writing and loading a specialist file', async () => {
       const modelOptions = [
-        { model: 'opencode:kimi-k3', hint: 'cheap' },
+        { provider: 'opencode', model: 'kimi-k3', hint: 'cheap' },
         { model: 'opus4.5', hint: '' },
       ];
       await writeSpecialistFile({
@@ -551,6 +713,51 @@ Prompt.`;
       expect(loaded).not.toBeNull();
       expect(loaded?.rawContent).toContain(`modelOptions: ${JSON.stringify(modelOptions)}`);
       expect(loaded?.frontmatter.modelOptions).toEqual(modelOptions);
+    });
+
+    it('should normalize legacy compound entries to the triple shape on write', async () => {
+      await writeSpecialistFile({
+        id: 'options-compound-write',
+        name: 'Options Compound Write',
+        description: 'Legacy compound entry normalization',
+        model: 'opencode:kimi-k3',
+        codingAgent: 'auggie',
+        modelOptions: [{ provider: 'auggie', model: 'opencode:kimi-k3', hint: 'cheap' }],
+        behaviorPrompt: 'Prompt',
+      });
+
+      const loaded = await loadSpecialistFile('options-compound-write');
+      expect(loaded?.rawContent).toContain(
+        `modelOptions: ${JSON.stringify([{ provider: 'opencode', model: 'kimi-k3', hint: 'cheap' }])}`,
+      );
+      expect(loaded?.rawContent).toContain('model: "kimi-k3"');
+      expect(loaded?.rawContent).toContain('codingAgent: "opencode"');
+      expect(loaded?.frontmatter.modelOptions).toEqual([
+        { provider: 'opencode', model: 'kimi-k3', hint: 'cheap' },
+      ]);
+      expect(loaded?.frontmatter.model).toBe('kimi-k3');
+      expect(loaded?.frontmatter.codingAgent).toBe('opencode');
+    });
+
+    it('should drop unusable compound entries (empty prefix, empty rest, multi-colon) on write', async () => {
+      await writeSpecialistFile({
+        id: 'options-malformed-write',
+        name: 'Options Malformed Write',
+        description: 'Malformed compound entries never persist',
+        modelOptions: [
+          { model: 'opencode:', hint: 'no rest' },
+          { model: ':kimi-k3', hint: 'no prefix' },
+          { model: 'a:b:c', hint: 'multi-colon' },
+          { model: 'sonnet-4.5', hint: 'kept' },
+        ],
+        behaviorPrompt: 'Prompt',
+      });
+
+      const loaded = await loadSpecialistFile('options-malformed-write');
+      expect(loaded?.rawContent).toContain(
+        `modelOptions: ${JSON.stringify([{ model: 'sonnet-4.5', hint: 'kept' }])}`,
+      );
+      expect(loaded?.frontmatter.modelOptions).toEqual([{ model: 'sonnet-4.5', hint: 'kept' }]);
     });
 
     it('should omit the modelOptions key when undefined and write [] verbatim', async () => {
@@ -581,9 +788,12 @@ Prompt.`;
         id: 'effort-round-trip',
         name: 'Effort Round Trip',
         description: 'Reasoning effort round-trip test specialist',
-        model: 'codex:gpt-5.3-codex',
+        codingAgent: 'codex',
+        model: 'gpt-5.3-codex',
         reasoningEffort: 'high',
-        modelOptions: [{ model: 'codex:gpt-5.3-codex', hint: 'deep', reasoningEffort: 'xhigh' }],
+        modelOptions: [
+          { provider: 'codex', model: 'gpt-5.3-codex', hint: 'deep', reasoningEffort: 'xhigh' },
+        ],
         behaviorPrompt: 'Effort prompt',
       });
 
@@ -591,7 +801,7 @@ Prompt.`;
       expect(loaded?.rawContent).toContain('reasoningEffort: "high"');
       expect(loaded?.frontmatter.reasoningEffort).toBe('high');
       expect(loaded?.frontmatter.modelOptions).toEqual([
-        { model: 'codex:gpt-5.3-codex', hint: 'deep', reasoningEffort: 'xhigh' },
+        { provider: 'codex', model: 'gpt-5.3-codex', hint: 'deep', reasoningEffort: 'xhigh' },
       ]);
 
       await writeSpecialistFile({
@@ -603,6 +813,40 @@ Prompt.`;
       const noEffort = await loadSpecialistFile('no-effort');
       expect(noEffort?.rawContent).not.toContain('reasoningEffort:');
       expect(noEffort?.frontmatter.reasoningEffort).toBeUndefined();
+    });
+
+    it('should round-trip role/teamAgents/icon and omit the keys when unset', async () => {
+      await writeSpecialistFile({
+        id: 'role-round-trip',
+        name: 'Role Round Trip',
+        description: 'Role round-trip test specialist',
+        role: 'orchestrator',
+        teamAgents: ['implementor', 'verifier'],
+        icon: 'coordinator',
+        behaviorPrompt: 'Role prompt',
+      });
+
+      const loaded = await loadSpecialistFile('role-round-trip');
+      expect(loaded?.rawContent).toContain('role: "orchestrator"');
+      expect(loaded?.rawContent).toContain('teamAgents: ["implementor","verifier"]');
+      expect(loaded?.rawContent).toContain('icon: "coordinator"');
+      expect(loaded?.frontmatter.role).toBe('orchestrator');
+      expect(loaded?.frontmatter.teamAgents).toEqual(['implementor', 'verifier']);
+      expect(loaded?.frontmatter.icon).toBe('coordinator');
+
+      await writeSpecialistFile({
+        id: 'no-role',
+        name: 'No Role',
+        description: 'No role metadata',
+        behaviorPrompt: 'Prompt',
+      });
+      const noRole = await loadSpecialistFile('no-role');
+      expect(noRole?.rawContent).not.toContain('role:');
+      expect(noRole?.rawContent).not.toContain('teamAgents:');
+      expect(noRole?.rawContent).not.toContain('icon:');
+      expect(noRole?.frontmatter.role).toBeUndefined();
+      expect(noRole?.frontmatter.teamAgents).toBeUndefined();
+      expect(noRole?.frontmatter.icon).toBeUndefined();
     });
 
     it('should write and load project-level specialists from the workspace path', async () => {
@@ -622,8 +866,12 @@ Prompt.`;
 
       expect(loaded?.source).toBe('project');
       expect(loaded?.behaviorPrompt).toBe('Project prompt');
-      expect(projectList.specialists.map((specialist) => specialist.id)).toContain('repo-specialist');
-      expect(projectList.specialists[0]?.filePath).toContain(getProjectSpecialistsDirectory(workspacePath));
+      expect(projectList.specialists.map((specialist) => specialist.id)).toContain(
+        'repo-specialist',
+      );
+      expect(projectList.specialists[0]?.filePath).toContain(
+        getProjectSpecialistsDirectory(workspacePath),
+      );
     });
   });
 
@@ -638,10 +886,7 @@ Prompt.`;
         'tech-spec-writer-2',
       );
       expect(
-        generateUniqueSpecialistId('Tech Spec Writer', [
-          'tech-spec-writer',
-          'tech-spec-writer-2',
-        ]),
+        generateUniqueSpecialistId('Tech Spec Writer', ['tech-spec-writer', 'tech-spec-writer-2']),
       ).toBe('tech-spec-writer-3');
     });
   });
@@ -688,9 +933,9 @@ describe('Stale specialist fallback on transient refresh failure', () => {
       migrateOverridesFromStore: vi.fn(async () => ({ migrated: 0, errors: [] })),
     }));
 
-    const service = await vi.importActual<
-      typeof import('../../../agent/main/specialists.service')
-    >('../../../agent/main/specialists.service');
+    const service = await vi.importActual<typeof import('../../../agent/main/specialists.service')>(
+      '../../../agent/main/specialists.service',
+    );
 
     vi.useFakeTimers();
 

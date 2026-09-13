@@ -27,6 +27,8 @@ export type ConnectionMode = 'sidecar' | 'external' | 'unknown';
  */
 export interface DaemonVersionInfo {
   daemonVersion: string | null;
+  /** Source commit reported by the adopted daemon, when its build embeds one. */
+  daemonBuildCommit?: string | null;
   pinnedVersion: string | null;
   versionMismatch: boolean;
 }
@@ -49,6 +51,7 @@ export interface OrphanedSidecarState {
 let connectionMode: ConnectionMode = 'unknown';
 let daemonVersionInfo: DaemonVersionInfo | null = null;
 let orphanedSidecarInfo: OrphanedSidecarState | null = null;
+let localUpdateSupported: boolean | null = null;
 
 /** Current connection mode (resolved during `startIntentdSidecar`). */
 export function getConnectionMode(): ConnectionMode {
@@ -81,6 +84,22 @@ export function setOrphanedSidecarInfo(info: OrphanedSidecarState | null): void 
 }
 
 /**
+ * Whether the adopted external local daemon reports self-update support
+ * (`updateSupported` from its `system.status`), captured after each local
+ * hello. `null` = unknown (capture pending, a daemon too old to report the
+ * field, or sidecar/unresolved mode). Never persisted — the local connection
+ * entry stays synthesized-only.
+ */
+export function getLocalUpdateSupported(): boolean | null {
+  return localUpdateSupported;
+}
+
+/** Record (or clear) the local external daemon's updateSupported capture. */
+export function setLocalUpdateSupported(supported: boolean | null): void {
+  localUpdateSupported = supported;
+}
+
+/**
  * Test seam: reset module state for testing.
  * @internal
  */
@@ -88,4 +107,5 @@ export function __resetConnectionModeForTesting(): void {
   connectionMode = 'unknown';
   daemonVersionInfo = null;
   orphanedSidecarInfo = null;
+  localUpdateSupported = null;
 }

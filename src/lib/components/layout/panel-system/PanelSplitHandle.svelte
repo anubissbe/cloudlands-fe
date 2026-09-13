@@ -5,27 +5,12 @@
    * Allows users to resize panels by dragging the handle.
    * Also serves as a drop zone for creating splits at the container level.
    *
-   * Drop zone behavior:
-   * For horizontal split handle (vertical bar between left/right panels):
-   *   - Top ~50px: "Add row above" (new row spanning full width at top)
-   *   - Bottom ~50px: "Add row below" (new row spanning full width at bottom)
-   *   - Middle area: "Add column left/right" based on X position
-   *
-   * For vertical split handle (horizontal bar between top/bottom panels):
-   *   - Left ~50px: "Add column left"
-   *   - Right ~50px: "Add column right"
-   *   - Middle area: "Add row above/below" based on Y position
+   * In fixed-column workspaces, horizontal handles accept only left/right column drops.
    */
 
   import { m } from '$shared/paraglide/messages.js';
   import { cn } from '$lib/utils';
-  import { selectIsDragging } from '$store/renderer/slices/tab-state/tab-state-selectors';
-  import {
-    setActiveHandleDrop,
-    type HandleDropZoneType,
-    type SerializableRect,
-  } from '$store/renderer/slices/tab-state/tab-state-slice';
-  import { store as appStore } from '$store/renderer/store';
+  import { getDraggedPane } from './panel-drag';
 
   /** Position relative to the split for container-level insertion */
   export type HandleDropZone = 'before' | 'after';
@@ -63,19 +48,7 @@
   let isDragging = $state(false);
   let startPos = $state(0);
 
-  // Tab drag drop zone state
-  let isTabDragOver = $state(false);
   let handleRef: HTMLButtonElement;
-
-  // Track global tab drag state
-  const isTabDragging = selectIsDragging();
-
-  // Reset drop zone state when global drag ends
-  $effect(() => {
-    if (!$isTabDragging) {
-      isTabDragOver = false;
-    }
-  });
 
   // Custom MIME type for tab drag (must match PanelTabBar)
   const TAB_DRAG_MIME = 'application/x-panel-tab';
@@ -135,166 +108,55 @@
     window.removeEventListener('mouseup', handleMouseUp);
   }
 
-  // Edge threshold in pixels for row/column edge zones
-  const EDGE_THRESHOLD = 50;
-
-  // Detailed drop zone info including direction and position
   interface DropZoneInfo {
-    zoneType: HandleDropZoneType;
     position: HandleDropZone;
     insertDirection: 'horizontal' | 'vertical';
-    label: string;
   }
 
-  // Determine drop zone based on cursor position
-  // For horizontal split handle (vertical bar between left/right panels):
-  //   - Top ~50px: row-above
-  //   - Bottom ~50px: row-below
-  //   - Middle: column-left or column-right based on X
-  // For vertical split handle (horizontal bar between top/bottom panels):
-  //   - Left ~50px: column-left
-  //   - Right ~50px: column-right
-  //   - Middle: row-above or row-below based on Y
   function getDropZoneInfo(e: DragEvent): DropZoneInfo | null {
-    if (!handleRef) return null;
+    if (!handleRef || direction !== 'horizontal') return null;
 
     const rect = handleRef.getBoundingClientRect();
     const x = e.clientX - rect.left;
-    const y = e.clientY - rect.top;
-
-    if (direction === 'horizontal') {
-      // Vertical bar between left/right panels
-      // Check if near top or bottom edges first
-      if (y < EDGE_THRESHOLD) {
-        return {
-          zoneType: 'row-above',
-          position: 'before',
-          insertDirection: 'vertical',
-          label: m.layout_panelSplitHandle_addRowAbove_label(),
-        };
-      }
-      if (y > rect.height - EDGE_THRESHOLD) {
-        return {
-          zoneType: 'row-below',
-          position: 'after',
-          insertDirection: 'vertical',
-          label: m.layout_panelSplitHandle_addRowBelow_label(),
-        };
-      }
-      // Middle area - add column left or right
-      const midX = rect.width / 2;
-      if (x < midX) {
-        return {
-          zoneType: 'column-left',
-          position: 'before',
-          insertDirection: 'horizontal',
-          label: m.layout_panelSplitHandle_addColumnLeft_label(),
-        };
-      } else {
-        return {
-          zoneType: 'column-right',
-          position: 'after',
-          insertDirection: 'horizontal',
-          label: m.layout_panelSplitHandle_addColumnRight_label(),
-        };
-      }
-    } else {
-      // Horizontal bar between top/bottom panels
-      // Check if near left or right edges first
-      if (x < EDGE_THRESHOLD) {
-        return {
-          zoneType: 'column-left',
-          position: 'before',
-          insertDirection: 'horizontal',
-          label: m.layout_panelSplitHandle_addColumnLeft_label(),
-        };
-      }
-      if (x > rect.width - EDGE_THRESHOLD) {
-        return {
-          zoneType: 'column-right',
-          position: 'after',
-          insertDirection: 'horizontal',
-          label: m.layout_panelSplitHandle_addColumnRight_label(),
-        };
-      }
-      // Middle area - add row above or below
-      const midY = rect.height / 2;
-      if (y < midY) {
-        return {
-          zoneType: 'row-above',
-          position: 'before',
-          insertDirection: 'vertical',
-          label: m.layout_panelSplitHandle_addRowAbove_label(),
-        };
-      } else {
-        return {
-          zoneType: 'row-below',
-          position: 'after',
-          insertDirection: 'vertical',
-          label: m.layout_panelSplitHandle_addRowBelow_label(),
-        };
-      }
+    if (x < rect.width / 2) {
+      return {
+        position: 'before',
+        insertDirection: 'horizontal',
+      };
     }
+    return {
+      position: 'after',
+      insertDirection: 'horizontal',
+    };
   }
 
   // Current drop zone info
   let currentZoneInfo = $state<DropZoneInfo | null>(null);
 
   function handleTabDragOver(e: DragEvent) {
+    if (getDraggedPane()) return;
     if (!e.dataTransfer?.types.includes(TAB_DRAG_MIME)) return;
 
     e.preventDefault();
     e.stopPropagation();
 
-    isTabDragOver = true;
-    const zoneInfo = getDropZoneInfo(e);
-    currentZoneInfo = zoneInfo;
-
-    // Update global store with drop info for the overlay
-    if (zoneInfo && handleRef) {
-      const handleRect = handleRef.getBoundingClientRect();
-      // Find the parent split container to get full bounds for the overlay
-      const container = handleRef.closest('.panel-split-container');
-      const containerRect = container?.getBoundingClientRect() ?? handleRect;
-
-      const toRect = (r: DOMRect): SerializableRect => ({
-        x: r.x,
-        y: r.y,
-        width: r.width,
-        height: r.height,
-        top: r.top,
-        right: r.right,
-        bottom: r.bottom,
-        left: r.left,
-      });
-      appStore.dispatch(
-        setActiveHandleDrop({
-          handleRect: toRect(handleRect),
-          containerRect: toRect(containerRect),
-          zoneType: zoneInfo.zoneType,
-          label: zoneInfo.label,
-        }),
-      );
-    }
+    currentZoneInfo = getDropZoneInfo(e);
   }
 
   function handleTabDragLeave(e: DragEvent) {
     const relatedTarget = e.relatedTarget as HTMLElement;
     if (relatedTarget && handleRef?.contains(relatedTarget)) return;
 
-    isTabDragOver = false;
     currentZoneInfo = null;
-    appStore.dispatch(setActiveHandleDrop(null));
   }
 
   function handleTabDrop(e: DragEvent) {
+    if (getDraggedPane()) return;
     e.preventDefault();
     e.stopPropagation();
 
     const zoneInfo = currentZoneInfo;
-    isTabDragOver = false;
     currentZoneInfo = null;
-    appStore.dispatch(setActiveHandleDrop(null));
 
     if (!zoneInfo) return;
 
@@ -325,7 +187,6 @@
     'app-resize-handle panel-split-handle',
     direction === 'horizontal' ? 'horizontal' : 'vertical',
     isDragging && 'dragging',
-    isTabDragOver && 'tab-drag-over',
   )}
   data-resize-axis={direction === 'horizontal' ? 'x' : 'y'}
   data-resizing={isDragging}
@@ -343,80 +204,27 @@
     z-index: 35;
   }
 
-  /* 8px gap, handle is 16px wide, so margin = -(16 - 8) / 2 = -4px each side */
+  /* 8px gap, handle is 16px wide, so margin = -(16 - 8) / 2 = -4px each side.
+     The leading 4px is clipped out of hit-testing: it overlays the previous
+     panel's trailing edge, where native scrollbars live (a left panel's
+     vertical scrollbar, an upper panel's horizontal scrollbar), and clicks
+     there must reach the scrollbar. The trailing 4px keeps intruding into the
+     next panel's leading edge. That edge hosts no along-axis scrollbar, though
+     the intrusion still covers a 4px corner sliver of the next panel's
+     cross-axis scrollbar (e.g. the last 4px of a right panel's horizontal
+     scrollbar) — an accepted trade-off to preserve the forgiving target.
+     Note inset() sides are physical, not logical: under RTL the leading edge
+     would flip to the right, but all shipped locales are LTR. */
   .panel-split-handle.horizontal {
     width: 16px;
     margin: 0 -4px;
+    clip-path: inset(0 0 0 4px);
   }
 
   .panel-split-handle.vertical {
     height: 16px;
     width: 100%;
     margin: -4px 0;
-  }
-
-  /* Tab drag drop zone styles */
-  .panel-split-handle.tab-drag-over {
-    z-index: 30;
-  }
-
-  .handle-drop-indicator {
-    position: absolute;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    background: hsl(var(--primary) / 0.15);
-    pointer-events: none;
-    z-index: 100;
-  }
-
-  /* Horizontal split handle (vertical bar) - indicators go above/below */
-  .handle-drop-indicator.horizontal {
-    left: 50%;
-    transform: translateX(-50%);
-    width: max(200px, 30vw);
-    height: 60px;
-  }
-
-  .handle-drop-indicator.horizontal.before {
-    bottom: 100%;
-    margin-bottom: 10px;
-    /* border-radius: 8px 8px 0 0; */
-  }
-
-  .handle-drop-indicator.horizontal.after {
-    top: 100%;
-    margin-top: 10px;
-    /* border-radius: 0 0 8px 8px; */
-  }
-
-  /* Vertical split handle (horizontal bar) - indicators go left/right */
-  .handle-drop-indicator.vertical {
-    top: 50%;
-    transform: translateY(-50%);
-    width: 60px;
-    height: max(100px, 20vh);
-  }
-
-  .handle-drop-indicator.vertical.before {
-    right: 100%;
-    margin-right: 10px;
-    /* border-radius: 8px 0 0 8px; */
-  }
-
-  .handle-drop-indicator.vertical.after {
-    left: 100%;
-    margin-left: 10px;
-    /* border-radius: 0 8px 8px 0; */
-  }
-
-  .drop-label {
-    font-size: 0.75rem;
-    font-weight: 500;
-    color: hsl(var(--primary));
-    background: hsl(var(--background) / 0.9);
-    padding: 0.25rem 0.5rem;
-    /* border-radius: 10px; */
-    white-space: nowrap;
+    clip-path: inset(4px 0 0 0);
   }
 </style>

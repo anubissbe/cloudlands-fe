@@ -59,7 +59,6 @@ export const LOGGING_CONFIG: LoggingConfig = {
     EventsClient: LogLevel.INFO,
     EventSystem: LogLevel.INFO,
 
-
     // Terminal operations
     TerminalHistoryTracker: LogLevel.WARN,
     TerminalManager: LogLevel.INFO,
@@ -124,6 +123,12 @@ export const LOGGING_CONFIG: LoggingConfig = {
     // production defaultLevel of WARN — they exist to populate debug bundles,
     // so filtering them out in packaged builds would defeat the purpose.
     RendererConsole: LogLevel.INFO,
+
+    // Build identity lines (#3649): the startup app-version banner and the
+    // connected-daemon build log. Pinned to INFO so they survive the
+    // production defaultLevel of WARN — their whole purpose is identifying
+    // which builds produced a packaged-app log file.
+    BuildInfo: LogLevel.INFO,
 
     // UI components - reduce noise during normal operation
     TipTapEditor: LogLevel.WARN,
@@ -201,58 +206,4 @@ export function getLogLevel(category: string): LogLevel {
 
   // Fall back to default level
   return LOGGING_CONFIG.defaultLevel;
-}
-
-/**
- * Set runtime log level override for a category
- */
-export function setLogLevelOverride(category: string, level: LogLevel | null): void {
-  if (
-    !LOGGING_CONFIG.enableRuntimeConfig ||
-    typeof window === 'undefined' ||
-    !window.localStorage
-  ) {
-    return;
-  }
-
-  try {
-    const overrides = localStorage.getItem('log-level-overrides');
-    const parsed = overrides ? JSON.parse(overrides) : {};
-
-    if (level === null) {
-      delete parsed[category];
-    } else {
-      parsed[category] = level;
-    }
-
-    localStorage.setItem('log-level-overrides', JSON.stringify(parsed));
-  } catch (e) {
-    console.error('Failed to set log level override:', e);
-  }
-}
-
-/**
- * Clear all runtime log level overrides
- */
-export function clearLogLevelOverrides(): void {
-  if (typeof window !== 'undefined' && window.localStorage) {
-    localStorage.removeItem('log-level-overrides');
-  }
-}
-
-/**
- * Get all current log level settings (including overrides)
- */
-export function getCurrentLogLevels(): Record<string, LogLevel> {
-  const levels: Record<string, LogLevel> = {};
-
-  // Add all configured categories
-  for (const category in LOGGING_CONFIG.categories) {
-    levels[category] = getLogLevel(category);
-  }
-
-  // Add default for uncategorized
-  levels['_default'] = LOGGING_CONFIG.defaultLevel;
-
-  return levels;
 }

@@ -49,7 +49,13 @@ vi.mock('$store/renderer/store', async () => {
     await import('$store/renderer/utils/test-helpers/store-mock');
 
   return createAppStoreMockModule({
-    state: () => ({}),
+    state: () => ({
+      panelLayout: {
+        byWorkspaceId: {
+          'ws-1': { columnCount: 1 },
+        },
+      },
+    }),
     dispatch: mocks.dispatch,
   });
 });
@@ -66,7 +72,7 @@ vi.mock('$store/renderer/slices/workspace-notes/workspace-notes-selectors', () =
 }));
 
 vi.mock('$store/renderer/slices/workspace-tasks/workspace-tasks-selectors', () => ({
-  selectWorkspaceTasksLoading: mocks.selector(() => false),
+  selectWorkspaceTasksInitialized: mocks.selector(() => true),
   selectWorkspaceTaskProgress: mocks.selector(() => ({
     total: 0,
     completed: 0,
@@ -82,8 +88,17 @@ vi.mock('$store/renderer/slices/workspace-agents/workspace-agents-selectors', ()
   selectAllWorkspaceAgents: mocks.selector(() => []),
 }));
 
+vi.mock('$store/renderer/slices/git/git-selectors', () => ({
+  selectAcceptChangesStatus: mocks.selector(() => null),
+  selectAcceptChangesStatusLoading: mocks.selector(() => false),
+}));
+
 vi.mock('$store/renderer/slices/workspace/workspace-slice', () => ({
   loadWorkspacesRequested: vi.fn(() => ({ type: 'workspace/loadWorkspacesRequested' })),
+  removeWorkspaceEntity: Object.assign(
+    vi.fn((id: string) => ({ type: 'workspace/removeWorkspaceEntity', payload: [id] })),
+    { type: 'workspace/removeWorkspaceEntity' },
+  ),
   setWorkspaceEntity: vi.fn((workspace: Workspace) => ({
     type: 'workspace/setWorkspaceEntity',
     payload: [workspace],
@@ -110,6 +125,10 @@ vi.mock('$store/renderer/slices/ui-layout/ui-layout-slice', () => ({
 }));
 
 vi.mock('$store/renderer/slices/workspace-operations/workspace-operations-slice', () => ({
+  requestArchiveWorkspace: vi.fn((id: string) => ({
+    type: 'workspaceOperations/requestArchiveWorkspace',
+    payload: [id],
+  })),
   requestDeleteWorkspace: vi.fn((id: string) => ({
     type: 'workspaceOperations/delete',
     payload: [id],

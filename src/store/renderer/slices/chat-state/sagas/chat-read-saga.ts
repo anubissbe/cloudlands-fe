@@ -41,10 +41,23 @@ import { INITIAL_RETRY_DELAY_MS, SNAPSHOT_TIMEOUT_MS } from '$lib/client/live/li
 import { createLogger } from '$lib/utils/client-logger';
 import type { AgentMessage, AgentSession } from '$shared/types';
 import { isAgentDeletionPending } from '$features/agent/utils/pending-agent-deletions';
+import { isAgentNotFoundError } from '$features/agent/utils/agent-not-found-error';
+import { readAgentSession } from '$features/agent/agent-read-service';
+import {
+  hasChatSubscriptionAcquisitionInFlight,
+  hasReplayableChatSnapshot,
+  hasStandingChatSubscription,
+} from '$features/agent/utils/chat-subscription-registry';
+import {
+  acquireChatInterestLease,
+  releaseChatInterestLease,
+} from '$features/agent/utils/chat-interest-leases';
 import { bulkUpsertSessions, upsertSession } from '../../agent-session/agent-session-slice';
 import { selectAgentMessages } from '../../agent-session/agent-session-selectors';
 import { workspaceUnmounted } from '../../workspace-lifecycle/workspace-lifecycle-slice';
+import { cleanupDeletedAgentTabs } from '../../workspace-agents/sagas/deleted-agent-cleanup';
 import {
+  chatReset,
   chatTranscriptSnapshotApplied,
   chatTranscriptSnapshotRerequested,
   initializeChatRequested,
@@ -94,6 +107,9 @@ const SNAPSHOT_WAIT_MS = SNAPSHOT_TIMEOUT_MS + INITIAL_RETRY_DELAY_MS + SNAPSHOT
  */
 const SNAPSHOT_WAIT_ATTEMPTS = 3;
 
+/** Unique interest-lease holder id per hydration attempt (monorepo#3295). */
+let hydrationLeaseSeq = 0;
+
 type ChatRequest = { wsId: string; agentId: string };
 type HydrationTails = Map<string, Promise<void>>;
 type HydrateResult = {
@@ -116,13 +132,17 @@ function* hydrateChatTranscriptSaga(request: ChatRequest): SagaGenerator<Hydrate
   }
   let started = false;
   let succeeded = false;
+  // Interest lease (intent-hq/monorepo#3295): held for the duration of this
+  // hydration attempt — acquired before the bounded snapshot wait so a sweep
+  // cannot close the standing registration the wait depends on, released in
+  // the finally (which also runs on saga cancellation).
+  hydrationLeaseSeq += 1;
+  const leaseHolder = `chat-read:${hydrationLeaseSeq}`;
+  yield* call(acquireChatInterestLease, agentId, leaseHolder);
   try {
     yield* put(transcriptHydrationStarted(agentId));
     started = true;
-    const session: AgentSession | null = yield* call(
-      [appClient.agents, appClient.agents.get],
-      agentId,
-    );
+    const session: AgentSession | null = yield* call(readAgentSession, agentId);
     if (!session || String(session.workspaceId) !== wsId) {
       return { started, succeeded: true };
     }
@@ -163,6 +183,31 @@ function* hydrateChatTranscriptSaga(request: ChatRequest): SagaGenerator<Hydrate
       // a fresh application.
       if (!(meta && (meta.totalMessages === 0 || visible.length > 0))) {
         meta = undefined;
+        // Fast path (intent-hq/monorepo#2864 defense-in-depth): the standing
+        // subscription already holds a replayable snapshot (deferred
+        // pre-session snapshot, or its last reconciled transcript IS a
+        // snapshot) yet no valid meta backs this hydration — its seq-0 emit
+        // was consumed before this hydration attached (e.g. a teardown reset
+        // dropped the meta) and no new emit is coming. Escalate NOW instead
+        // of stranding the first bounded wait window: the re-request replays
+        // the held snapshot without touching the wire.
+        //
+        // Dead-wait fast path (intent-hq/monorepo#3295): this window opened
+        // with NEITHER a standing registration NOR an acquisition in flight
+        // for the agent — a dedup-consumed open or an already-swept slot, so
+        // no seq-0 emit is coming at all. Escalate NOW too: the re-request
+        // force-cycles a fresh registration instead of stranding ~8s.
+        //
+        // A cold open (no replayable snapshot, but an acquisition IS in
+        // flight) keeps the plain wait — its seq-0 emit is still coming and
+        // force-cycling it would only churn a healthy opening subscription.
+        const replayable = yield* call(hasReplayableChatSnapshot, agentId);
+        const deadWait =
+          !(yield* call(hasStandingChatSubscription, agentId)) &&
+          !(yield* call(hasChatSubscriptionAcquisitionInFlight, agentId));
+        if (replayable || deadWait) {
+          yield* put(chatTranscriptSnapshotRerequested(wsId, agentId));
+        }
         for (let attempt = 1; attempt <= SNAPSHOT_WAIT_ATTEMPTS && !meta; attempt += 1) {
           const { applied } = yield* race({
             applied: take(snapshotChannel),
@@ -177,7 +222,7 @@ function* hydrateChatTranscriptSaga(request: ChatRequest): SagaGenerator<Hydrate
           // a re-request in flight.
           if (!meta && attempt < SNAPSHOT_WAIT_ATTEMPTS) {
             logger.warn(
-              `No transcript snapshot recorded within wait window (attempt ${attempt}/${SNAPSHOT_WAIT_ATTEMPTS}); re-requesting`,
+              `No transcript snapshot recorded within wait window (attempt ${attempt}/${SNAPSHOT_WAIT_ATTEMPTS}) for agent ${agentId} in workspace ${wsId}; re-requesting`,
             );
             yield* put(chatTranscriptSnapshotRerequested(wsId, agentId));
           }
@@ -190,7 +235,28 @@ function* hydrateChatTranscriptSaga(request: ChatRequest): SagaGenerator<Hydrate
       snapshotChannel.close();
     }
   } catch (error) {
-    logger.error('Failed to hydrate chat transcript', error);
+    if (isAgentNotFoundError(error)) {
+      // The daemon no longer knows this agent — a restored layout carrying a
+      // tab for a deleted agent (monorepo#1753). Expected condition, not a
+      // hydration failure: WARN + close the referencing tabs (shared cleanup)
+      // and short-circuit with `started: false` so the worker dispatches
+      // neither settled nor failed — no error/retry surface for a tab that is
+      // being closed. Unlike the deletion-pending early return above,
+      // `transcriptHydrationStarted` HAS already been dispatched here, so
+      // reset the chat-state entry — otherwise the deleted agent's marker
+      // would sit at 'loading' forever (a leak today, a retry-less permanent
+      // skeleton if a chat surface ever mounts outside an agent panel tab).
+      // The interest lease still releases via the finally.
+      yield* call(cleanupDeletedAgentTabs, wsId, agentId);
+      yield* put(chatReset(agentId));
+      return { started: false, succeeded: false };
+    }
+    logger.error(
+      `Failed to hydrate chat transcript for agent ${agentId} in workspace ${wsId}`,
+      error,
+    );
+  } finally {
+    yield* call(releaseChatInterestLease, agentId, leaseHolder);
   }
   return { started, succeeded };
 }

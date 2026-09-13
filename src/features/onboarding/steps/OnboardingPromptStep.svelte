@@ -24,6 +24,7 @@
   import { hasBlockingAttachments, type ContextItem } from '$lib/components/chat/input/context-api';
   import BranchSelector from '$lib/components/workspace/initializer/BranchSelector.svelte';
   import SetupScriptModal from '$lib/components/modals/SetupScriptModal.svelte';
+  import { setupScriptDisplayName, type SetupScriptNameSource } from '$features/setup-scripts';
   import IssueSuggestions from '$lib/components/workspace/initializer/IssueSuggestions.svelte';
   import ModelPicker from '$lib/components/chat/input/ModelPicker.svelte';
   import WorkspaceCreationError from '$features/onboarding/steps/WorkspaceCreationError.svelte';
@@ -35,8 +36,16 @@
   import { appClient } from '$lib/client';
   import { createLogger } from '$lib/utils/client-logger';
   import { formatFileSize } from '$lib/utils/file-utils';
+  import {
+    imageFilesToContextItems,
+    REFERENCE_IMAGE_MAX_BYTES,
+  } from '$lib/components/chat/input/image-context-items';
+  import { splitDroppedItems } from '$lib/utils/drop-split';
+  import { isRemoteBackend } from '$lib/components/chat/input/attachment-placement';
+  import { shouldTreatAsNewRepo } from '$features/onboarding/utils/treat-as-new-repo';
+  import { DEFAULT_NEW_WORKSPACE_SPECIALIST_ID } from '$lib/constants/specialists';
 
-  const COORDINATOR_SPECIALIST_ID = 'spec-writer';
+  const INITIAL_AGENT_SPECIALIST_ID = DEFAULT_NEW_WORKSPACE_SPECIALIST_ID;
 
   const logger = createLogger('OnboardingPromptStep');
   const defaultProviderId$ = selectEffectiveDefaultProviderId();
@@ -64,6 +73,7 @@
     setupScript: string;
     showSetupScript: boolean;
     setupScriptName: string;
+    setupScriptNameSource: SetupScriptNameSource;
     isCustomSetupScript: boolean;
     /** Repo-committed `.intent/config.json` script, forwarded to SetupScriptModal. */
     repoConfigScript: string | null;
@@ -74,13 +84,14 @@
      */
     hideSetupScriptControl?: boolean;
 
-    // Model picker (initial Coordinator agent)
-    /** User-picked model — undefined means use the Coordinator's auto-resolved default. */
+    // Model picker (initial Developer agent)
+    /** User-picked model — undefined means use the Developer's auto-resolved default. */
     selectedModel?: string | undefined;
     /** Whether the user explicitly overrode the model (vs the resolved default). */
     modelWasOverridden?: boolean;
-    /** Callback when the user picks a model. */
-    onModelChange?: (model: string) => void;
+    /** Callback when the user picks a model — `pick` carries the resolved
+     * bare model id + provider legs (see ModelPicker's onModelChange). */
+    onModelChange?: (model: string, pick?: { providerId: string; modelId: string }) => void;
 
     // Suggestions
     visibleSuggestions: string[];
@@ -93,6 +104,14 @@
      * from the first message.
      */
     stagedContextItems?: ContextItem[];
+
+    /**
+     * Image attachments as context items (`imageData`/`imageMimeType`),
+     * rendered as thumbnail squares below the editor — never inline in the
+     * editor. Owned by the parent so the submit path can send them as
+     * attachment-reference blocks on the first message.
+     */
+    imageContextItems?: ContextItem[];
 
     // Handlers
     onSubmit: () => void;
@@ -127,6 +146,7 @@
     setupScript = $bindable(),
     showSetupScript = $bindable(),
     setupScriptName = $bindable(),
+    setupScriptNameSource = $bindable(),
     isCustomSetupScript = $bindable(),
     repoConfigScript,
     hideSetupScriptControl = false,
@@ -136,6 +156,7 @@
     visibleSuggestions,
     focusedSuggestionIndex = $bindable(),
     stagedContextItems = $bindable([]),
+    imageContextItems = $bindable([]),
     onSubmit,
     onEnhancePrompt,
     enhancePromptAvailable = true,
@@ -158,11 +179,34 @@
   let onboardingFileInput: HTMLInputElement | null = $state(null);
   let richTextareaWrapper: HTMLDivElement | null = $state(null);
 
+  const treatAsNewRepo = $derived(
+    projectSelection ? shouldTreatAsNewRepo(projectSelection) : false,
+  );
+  const hasResolvedBranch = $derived(
+    treatAsNewRepo || Boolean(projectSelection?.branch.trim()) || Boolean(selectedPRBranch.trim()),
+  );
+
   // Drag and drop state
   let isDragging = $state(false);
   let dragCounter = $state(0);
 
-  // Daemon-resolved default-model preview for the Coordinator (PROTOCOL
+  // Non-zero while dropped/pasted/selected files are being converted to
+  // context items (FileReader is async) — submit is gated on it so a create
+  // can't race the conversion and silently drop the attachment. A counter
+  // (not a boolean) so overlapping conversions don't clear the gate early.
+  let processingImageCount = $state(0);
+  const isProcessingImages = $derived(processingImageCount > 0);
+  const createDisabledReason = $derived.by(() => {
+    if (!onboardingInputValue.trim()) return m.onboarding_promptStep_enterPrompt_description();
+    if (!hasResolvedBranch) return m.onboarding_promptStep_selectBranch_description();
+    if (isProcessingImages) return m.onboarding_promptStep_imagesProcessing_description();
+    if (hasBlockingAttachments(stagedContextItems)) {
+      return m.onboarding_promptStep_blockingAttachments_description();
+    }
+    return null;
+  });
+
+  // Daemon-resolved default-model preview for the Developer (PROTOCOL
   // §5.11): `specialist.list` with the onboarding provider context returns
   // additive `resolvedModel` fields computed by the same resolver a no-model
   // create uses, so the picker displays exactly what the daemon would pin.
@@ -201,10 +245,10 @@
     })();
   });
 
-  const coordinatorDefaultModel = $derived.by(() => {
+  const initialAgentDefaultModel = $derived.by(() => {
     const providerView = resolvedModelsByProvider[onboardingProvider];
-    if (providerView) return providerView[COORDINATOR_SPECIALIST_ID];
-    return $specialists$.find((s) => s.id === COORDINATOR_SPECIALIST_ID)?.resolvedModel;
+    if (providerView) return providerView[INITIAL_AGENT_SPECIALIST_ID];
+    return $specialists$.find((s) => s.id === INITIAL_AGENT_SPECIALIST_ID)?.resolvedModel;
   });
 
   // Expose the RichTextarea ref so the parent can call methods on it
@@ -212,12 +256,34 @@
     return onboardingRichTextarea;
   }
 
+  /**
+   * Snapshot of the picker's effective default selection for the submit-time
+   * default commit (monorepo#3044): the daemon resolvedModel preview when the
+   * user never overrode it (undefined ⇒ "Provider default"), plus the provider
+   * context it was resolved under so the caller can detect a mismatch with the
+   * create's resolved provider. Unlike the displayed `initialAgentDefaultModel`,
+   * this never uses the `$specialists$` fallback — that view was resolved in
+   * the daemon-default-provider context, so certifying it for
+   * `onboardingProvider` could persist another provider's model when the user
+   * submits before the provider-specific fetch lands.
+   */
+  export function getEffectiveDefaultModel(): {
+    model: string | undefined;
+    provider: string;
+  } {
+    return {
+      model: resolvedModelsByProvider[onboardingProvider]?.[INITIAL_AGENT_SPECIALIST_ID],
+      provider: onboardingProvider,
+    };
+  }
+
   /** Open the file input dialog. */
   function handleFileSelect() {
     onboardingFileInput?.click();
   }
 
-  /** Handle selected files — insert images into RichTextarea. */
+  /** Handle selected files — images become thumbnail context items, other
+   * files are staged path-only. */
   async function handleFileChange(e: Event) {
     const target = e.target as HTMLInputElement;
     const files = target.files;
@@ -226,23 +292,33 @@
     target.value = '';
   }
 
-  /** Process files from file input or drag-and-drop: images inline, other
-   * files staged as path-only context items placed at workspace.create
+  /** Process files from file input, drag-and-drop, or paste: images become
+   * context items rendered as thumbnails (30 MiB cap — they travel as
+   * attachment-reference blocks, monorepo#3338), other files staged as
+   * path-only context items placed at workspace.create
    * (`file.placeAttachment`, PROTOCOL §5.9) — never inlined, never dropped. */
   async function processImageFiles(files: File[]) {
-    const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB (images only — they cross the wire as base64)
+    processingImageCount += 1;
+    try {
+      await processImageFilesInner(files);
+    } finally {
+      processingImageCount -= 1;
+    }
+  }
+
+  /** Submit guard: every submit surface (editor Cmd+Enter, Create button,
+   * error-banner Retry) routes through here so a submit can't race an
+   * in-flight image conversion and drop the attachment. */
+  function handleSubmit() {
+    if (isProcessingImages) return;
+    onSubmit();
+  }
+
+  async function processImageFilesInner(files: File[]) {
+    const imageFiles: File[] = [];
     for (const file of files) {
       if (file.type.startsWith('image/')) {
-        if (file.size > MAX_FILE_SIZE) {
-          toast.error(m.onboarding_promptStep_fileTooLarge_error({ name: file.name }));
-          continue;
-        }
-        const reader = new FileReader();
-        reader.onload = () => {
-          const dataUrl = reader.result as string;
-          onboardingRichTextarea?.insertImage(dataUrl, file.name);
-        };
-        reader.readAsDataURL(file);
+        imageFiles.push(file);
       } else {
         // Stage path-only; no resolvable path (e.g. clipboard bytes) is an
         // immediate failed pill that blocks create until removed.
@@ -270,10 +346,43 @@
         }
       }
     }
+
+    const newItems = await imageFilesToContextItems(imageFiles, {
+      maxBytes: REFERENCE_IMAGE_MAX_BYTES,
+    });
+    if (newItems.length > 0) {
+      imageContextItems = [...imageContextItems, ...newItems];
+    }
   }
 
   function removeStagedItem(id: string) {
     stagedContextItems = stagedContextItems.filter((item) => item.id !== id);
+  }
+
+  function removeImageItem(id: string) {
+    imageContextItems = imageContextItems.filter((item) => item.id !== id);
+  }
+
+  /** Intercept clipboard file pastes (mirrors SimpleRichInput) so pasted
+   * images become thumbnail context items instead of TipTap inline nodes. */
+  async function handlePaste(e: ClipboardEvent) {
+    const items = e.clipboardData?.items;
+    if (!items) return;
+
+    const pastedFiles: File[] = [];
+    for (const item of items) {
+      if (item.kind === 'file') {
+        const file = item.getAsFile();
+        if (file) {
+          pastedFiles.push(file);
+        }
+      }
+    }
+
+    if (pastedFiles.length > 0) {
+      e.preventDefault(); // Prevent default paste behavior for files
+      await processImageFiles(pastedFiles);
+    }
   }
 
   /** Handle drag enter - track drag state with counter for nested elements */
@@ -309,10 +418,62 @@
     isDragging = false;
     dragCounter = 0;
 
-    const files = e.dataTransfer?.files;
-    if (!files || files.length === 0) return;
+    // Folder detection must happen HERE, synchronously in the drop event —
+    // webkitGetAsEntry() returns null once the event loop turns.
+    const { files, folderFiles } = splitDroppedItems(e.dataTransfer);
+    if (files.length === 0 && folderFiles.length === 0) return;
 
-    await processImageFiles(Array.from(files));
+    if (folderFiles.length > 0) {
+      // Folders are path-only references — the agent reads them off the
+      // host filesystem, which a remote daemon cannot do. Any folder in the
+      // drop rejects the WHOLE drop when remote (files included). Mirrors
+      // SimpleRichInput's folder-drop behavior.
+      if (isRemoteBackend()) {
+        toast.error(m.chat_richInput_folderDropRemote_error());
+        return;
+      }
+      for (const folder of folderFiles) {
+        stageFolderReference(folder);
+      }
+    }
+    if (files.length > 0) {
+      await processImageFiles(files);
+    }
+  }
+
+  /**
+   * Stage a dropped folder as a path-only context item (local daemon only).
+   * Never placed via `file.placeAttachment` (the daemon rejects directories)
+   * — the submit path carries the absolute host path as a context reference
+   * on the initial message instead.
+   *
+   * When the Electron `getPathForFile` bridge is unavailable or returns ''
+   * the folder is SKIPPED with a toast: a bare folder name would ride
+   * `contextReferences` as if it were an absolute host path the agent
+   * cannot resolve. Mirrors SimpleRichInput.addFolderReference.
+   */
+  function stageFolderReference(folder: File) {
+    const absolutePath =
+      (
+        window as unknown as { electronAPI?: { getPathForFile?: (f: File) => string } }
+      ).electronAPI?.getPathForFile?.(folder) ?? '';
+    if (!absolutePath) {
+      logger.warn('Dropped folder has no resolvable absolute path; skipping', {
+        name: folder.name,
+      });
+      toast.error(m.onboarding_promptStep_attachmentNoPath_error({ name: folder.name }));
+      return;
+    }
+    // Path-keyed like folder @-mentions, so two dropped folders sharing a
+    // basename stay distinct. Re-dropping the SAME folder is a no-op: the
+    // strip is keyed by item.id, so a duplicate id would break keyed
+    // rendering and make one remove drop both pills while both references
+    // still ride the submit.
+    const id = `staged-folder-${absolutePath}`;
+    if (stagedContextItems.some((item) => item.id === id)) return;
+    // Windows-aware basename fallback ('\' or '/' separators).
+    const label = folder.name || absolutePath.split(/[/\\]/).pop() || absolutePath;
+    stagedContextItems = [...stagedContextItems, { id, type: 'folder', label, path: absolutePath }];
   }
 
   /**
@@ -402,6 +563,7 @@
         ondragleave={handleDragLeave}
         ondragover={handleDragOver}
         ondrop={handleDrop}
+        onpaste={handlePaste}
       >
         <!-- Drop zone overlay -->
         {#if isDragging}
@@ -420,7 +582,7 @@
             bind:this={onboardingRichTextarea}
             bind:value={onboardingInputValue}
             repoPath={projectSelection?.repoPath || undefined}
-            onsubmit={onSubmit}
+            onsubmit={handleSubmit}
             onchange={onContentChange}
             onfocus={onFocus}
             onkeydown={onKeydown}
@@ -489,10 +651,24 @@
           {/if}
         </div>
 
-        <!-- Staged non-image attachments: chips with placement state (failed
-             pills block create until removed) -->
-        {#if stagedContextItems.length > 0}
+        <!-- Attachments: image thumbnails (lightbox + hover-remove) plus
+             staged non-image chips with placement state (failed pills block
+             create until removed) -->
+        {#if imageContextItems.length > 0 || stagedContextItems.length > 0}
           <div class="px-2.5 pt-1 pb-1 flex flex-wrap gap-2 items-center">
+            {#each imageContextItems as item (item.id)}
+              <AttachmentPreview
+                id={item.id}
+                name={item.label}
+                type={item.file?.type || item.imageMimeType || ''}
+                size={item.file?.size}
+                file={item.file}
+                imageData={item.imageData}
+                imageMimeType={item.imageMimeType}
+                onRemove={removeImageItem}
+                variant="thumbnail"
+              />
+            {/each}
             {#each stagedContextItems as item (item.id)}
               <AttachmentPreview
                 id={item.id}
@@ -556,7 +732,14 @@
 
     <div class="onboarding-metadata-stack flex w-full min-w-0 flex-col gap-2">
       <!-- Branch picker -->
-      {#if projectSelection?.type === 'local' && projectSelection?.repoPath}
+      {#if projectSelection?.type === 'local' && projectSelection?.repoPath && treatAsNewRepo}
+        <div
+          class="onboarding-metadata-row flex min-h-8 min-w-0 flex-wrap items-center gap-x-1.5 gap-y-1 text-sm text-muted-foreground"
+          in:fly={{ y: 10, duration: 200, easing: cubicOut }}
+        >
+          {m.onboarding_promptStep_initGit_description()}
+        </div>
+      {:else if projectSelection?.type === 'local' && projectSelection?.repoPath}
         <!-- svelte-ignore a11y_click_events_have_key_events -->
         <!-- svelte-ignore a11y_no_static_element_interactions -->
         <div
@@ -575,7 +758,7 @@
           <BranchSelector
             variant="ghost"
             triggerClass="max-w-full pl-1 pr-1.5 font-medium bg-card/50 py-1.25 rounded-md border border-border"
-            value={projectSelection?.branch || 'main'}
+            value={projectSelection.branch}
             repoPath={projectSelection.repoPath}
             repoType="local"
             hasTriggerIcon={false}
@@ -614,7 +797,7 @@
           <BranchSelector
             variant="ghost"
             triggerClass="max-w-full pl-1 pr-1.5 font-medium bg-card/50 py-1.25 rounded-md border border-border"
-            value={projectSelection?.branch || 'main'}
+            value={projectSelection.branch}
             repoPath={projectSelection.repoPath || ''}
             repoType="github"
             githubUrl={projectSelection.githubUrl}
@@ -651,7 +834,7 @@
               <span>{m.onboarding_promptStep_setupEnvWith_before()}</span>
               <span
                 class="max-w-full break-words rounded-md border border-border bg-card/50 px-1.5 py-1.25 font-medium text-foreground"
-                >{setupScriptName}</span
+                >{setupScriptDisplayName(setupScriptName, setupScriptNameSource)}</span
               >
               <span class="text-muted-foreground"
                 >{m.onboarding_promptStep_setupEnvWith_after()}</span
@@ -666,12 +849,13 @@
           {repoConfigScript}
           bind:value={setupScript}
           bind:scriptName={setupScriptName}
+          bind:scriptNameSource={setupScriptNameSource}
           bind:isCustomScript={isCustomSetupScript}
           onClose={() => onShowSetupScriptChange(false)}
         />
       {/if}
 
-      <!-- Model picker (initial Coordinator agent) -->
+      <!-- Model picker (initial Developer agent) -->
       <div
         class="onboarding-metadata-row flex min-h-8 min-w-0 flex-wrap items-center gap-x-1.5 gap-y-1 text-sm"
         in:fly={{ y: 10, duration: 200, easing: cubicOut }}
@@ -679,14 +863,14 @@
         <span class="shrink-0 text-muted-foreground"
           >{m.onboarding_promptStep_usingModel_before()}</span
         >
-        {#key coordinatorDefaultModel}
+        {#key initialAgentDefaultModel}
           <ModelPicker
             selectedModel={modelWasOverridden ? selectedModel : undefined}
             {onModelChange}
             variant="ghost"
             size="xs"
             triggerClass="max-w-full pl-1 pr-1.5 font-medium bg-card/50 py-1.25 rounded-md border border-border text-sm"
-            defaultModelId={coordinatorDefaultModel}
+            defaultModelId={initialAgentDefaultModel}
             defaultModelLabel={m.chat_modelPicker_providerDefault_label()}
             fallbackToCatalogDefault
             fallbackProviderId={onboardingProvider}
@@ -697,7 +881,7 @@
     </div>
 
     <!-- Use PR branch suggestion -->
-    {#if selectedPRBranch && projectSelection?.branch !== selectedPRBranch && projectSelection?.type !== 'new'}
+    {#if selectedPRBranch && projectSelection?.branch !== selectedPRBranch && !treatAsNewRepo}
       <div class="mt-1">
         <button
           class="flex items-center gap-2 mt-1 mb-1 px-1 text-sm text-primary hover:text-primary/80 cursor-pointer"
@@ -725,18 +909,19 @@
       <WorkspaceCreationError
         message={onboardingCreationError}
         errorCode={onboardingCreationErrorCode}
-        onRetry={onSubmit}
+        onRetry={handleSubmit}
       />
     {/if}
 
-    <!-- Create button (blocked while any staged pill is placing/failed) -->
-    <div class="onboarding-create-action flex items-center gap-3 pt-2">
+    <!-- Create button (blocked while the branch is unresolved, an image is
+      still converting, or a staged pill is placing/failed) -->
+    <div class="onboarding-create-action flex flex-col items-start gap-2 pt-2">
       <Button
         class="group/button"
         size="xl"
         variant={!onboardingInputValue.trim() ? 'outline' : 'default'}
-        disabled={!onboardingInputValue.trim() || hasBlockingAttachments(stagedContextItems)}
-        onclick={onSubmit}
+        disabled={createDisabledReason !== null}
+        onclick={handleSubmit}
       >
         {m.onboarding_promptStep_createWorkspace_label()}
         {#if onboardingInputValue.trim()}
@@ -748,6 +933,9 @@
           class="transform -translate-x-0.75 transition-all group-hover/button:translate-x-0 ml-1 opacity-50"
         />
       </Button>
+      {#if createDisabledReason}
+        <p class="text-xs text-muted-foreground">{createDisabledReason}</p>
+      {/if}
     </div>
   {/if}
 </div>

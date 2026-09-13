@@ -6,26 +6,34 @@ import { compareToPinnedVersion, type PinComparison } from '$shared/intentd-vers
 import { store } from '../../store';
 import type { BackendTransportInfo } from './daemon-health-types';
 
-export const selectDaemonHealth = store.createSelector(
-  (state) => state.daemonHealth.health,
-);
+export const selectDaemonHealth = store.createSelector((state) => state.daemonHealth.health);
 
-export const selectDaemonHealthStats = store.createSelector(
-  (state) => state.daemonHealth.stats,
-);
+export const selectDaemonHealthStats = store.createSelector((state) => state.daemonHealth.stats);
 
 export const selectDaemonHealthLastUpdated = store.createSelector(
   (state) => state.daemonHealth.lastUpdated,
 );
 
-export const selectDaemonHealthPolling = store.createSelector(
-  (state) => state.daemonHealth.polling,
+/**
+ * Context for the failed system.status poll behind a degraded health, or
+ * null while checks succeed (#4439). Pair with `selectDaemonHealthLastUpdated`
+ * for last-success freshness.
+ */
+export const selectDaemonStatusCheckFailure = store.createSelector(
+  (state) => state.daemonHealth.statusCheckFailure,
+);
+
+/**
+ * Connection lifecycle counter a system.status poll captures before its
+ * request so the reducer can discard the result if the connection changed
+ * meanwhile (see DaemonHealthState.connectionGeneration).
+ */
+export const selectDaemonConnectionGeneration = store.createSelector(
+  (state) => state.daemonHealth.connectionGeneration,
 );
 
 /** Last-known transport info; survives disconnects (see DaemonHealthState.transport). */
-export const selectDaemonTransport = store.createSelector(
-  (state) => state.daemonHealth.transport,
-);
+export const selectDaemonTransport = store.createSelector((state) => state.daemonHealth.transport);
 
 /** Reconnect attempts since the last successful connect (#1750). */
 export const selectReconnectAttempts = store.createSelector(
@@ -127,6 +135,14 @@ export const selectSidecarSpawnError = store.createSelector(
   (state) => state.daemonHealth.sidecarSpawnError,
 );
 
+/**
+ * Epoch ms of the first disconnect caused by a user-requested daemon update,
+ * or null when the current outage (if any) is not update-caused.
+ */
+export const selectDaemonUpdateDisconnectedAt = store.createSelector(
+  (state) => state.daemonHealth.daemonUpdateDisconnectedAt,
+);
+
 /** Last-run sidecar log fetched on demand for the daemon-loss dialog, if any. */
 export const selectSidecarRunLog = store.createSelector(
   (state) => state.daemonHealth.sidecarRunLog,
@@ -150,9 +166,4 @@ export const selectUnslothStatus = store.createSelector(
 /** True while an unsloth.stop request is in flight. */
 export const selectUnslothStopping = store.createSelector(
   (state) => state.daemonHealth.unslothStopping,
-);
-
-/** Error string from the last failed unsloth.stop request, if any. */
-export const selectUnslothStopError = store.createSelector(
-  (state) => state.daemonHealth.unslothStopError,
 );

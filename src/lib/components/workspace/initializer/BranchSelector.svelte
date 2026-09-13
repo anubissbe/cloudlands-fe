@@ -7,10 +7,12 @@
   import Input from '$lib/components/ui/input/input.svelte';
   import { Select } from '$lib/components/ui/select';
   import { Tooltip } from '$lib/components/ui/tooltip';
+  import { toast } from '$lib/components/ui/toast';
   import { debugConfig } from '$lib/config/debug';
   import { createLogger } from '$lib/utils/client-logger';
   import { appClient } from '$lib/client';
   import { performanceMonitor } from '$lib/utils/performance';
+  import { parseGitHubUrl } from '$lib/utils/workspace-validation';
 
   import { setWorkspaceInitializerBranchForRepo } from '$store/renderer/slices/workspace-initializer/workspace-initializer-slice';
   import { selectWorkspaceInitializerBranchByRepo } from '$store/renderer/slices/workspace-initializer/workspace-initializer-selectors';
@@ -610,11 +612,11 @@
         }
       } else if (effectiveRepoType === 'github' && effectiveGithubUrl) {
         // Parse GitHub URL to get owner and repo
-        const match = effectiveGithubUrl.match(/github\.com\/([^\/]+)\/([^\/\.]+)/);
-        if (!match) {
+        const parsed = parseGitHubUrl(effectiveGithubUrl);
+        if (!parsed) {
           throw new Error('Invalid GitHub URL format');
         }
-        const [, owner, repo] = match;
+        const { owner, repo } = parsed;
 
         // Cached-first paint (`github.branches.listCached`, PROTOCOL §5.27):
         // refs from the daemon's local repo cache — or its one-round-trip
@@ -769,6 +771,7 @@
         } else if (err.message === 'GITHUB_NO_ACCESS') {
           // User is authenticated but doesn't have access to this repo
           error = m.workspace_branchSelector_noAccess_error();
+          toast.error(error);
           // githubAuthNeeded is already set to 'no-access'
           return;
         }
@@ -808,6 +811,9 @@
       } else {
         error = m.workspace_branchSelector_fetchBranchesFailedManual_error();
       }
+
+      // Surface the failure without requiring the user to open the dropdown.
+      toast.error(error);
 
       // Never fabricate branch names on failure — the error state renders and
       // the user can still type a branch name manually.
@@ -1223,8 +1229,7 @@
       (repoPath && /^[a-zA-Z0-9_-]+\/[a-zA-Z0-9._-]+$/.test(repoPath)
         ? `https://github.com/${repoPath}`
         : undefined);
-    const match = url?.match(/github\.com\/([^\/]+)\/([^\/\.]+)/);
-    return match ? { owner: match[1], repo: match[2] } : null;
+    return url ? parseGitHubUrl(url) : null;
   }
 
   // Server-side prefix search: when the user types in a GitHub repo's search
@@ -1449,7 +1454,7 @@
             {/if}
           </span>
           <!-- Branch status indicators -->
-          {#if showUncommittedIndicator && selectedBranch && repoType === 'local' && !branchStatusIsLoading && branchStatusHasUncommittedChanges && isCurrentBranch}
+          {#if showUncommittedIndicator && !skipIsolation && selectedBranch && repoType === 'local' && !branchStatusIsLoading && branchStatusHasUncommittedChanges && isCurrentBranch}
             <div class="flex-0 flex flex-col" transition:slide={{ axis: 'x', duration: 150 }}>
               <Tooltip
                 content={m.workspace_branchSelector_uncommittedChanges_tooltip()}
@@ -1495,7 +1500,7 @@
           </button>
         {/if}
 
-        <div class="px-2 pb-1 pt-1 sticky -top-1 bg-background z-10">
+        <div class="px-2 pb-1 pt-1 sticky -top-1 bg-popover z-10">
           <div class="flex gap-2">
             <Input
               bind:this={searchInputElement}
@@ -1509,7 +1514,7 @@
                   selectBranch(searchValue);
                 }
               }}
-              class="flex-1 border-0 bg-sidebar"
+              class="flex-1 border-0 bg-background"
               noFocusStyle
             />
             <Button
@@ -1525,7 +1530,7 @@
         </div>
 
         <!-- Branch status info -->
-        {#if selectedBranch && repoType === 'local' && (branchStatusBehind > 0 || (showUncommittedIndicator && branchStatusHasUncommittedChanges && isCurrentBranch))}
+        {#if selectedBranch && repoType === 'local' && (branchStatusBehind > 0 || (showUncommittedIndicator && !skipIsolation && branchStatusHasUncommittedChanges && isCurrentBranch))}
           <div
             class="mx-2 mb-1 px-3 py-2 text-sm text-subtle"
             transition:slide={{ axis: 'y', duration: 150 }}
@@ -1533,7 +1538,7 @@
             {#if branchStatusBehind > 0}
               <p>{m.workspace_branchSelector_pullLatest_description()}</p>
             {/if}
-            {#if showUncommittedIndicator && branchStatusHasUncommittedChanges && isCurrentBranch}
+            {#if showUncommittedIndicator && !skipIsolation && branchStatusHasUncommittedChanges && isCurrentBranch}
               <p class={branchStatusBehind > 0 ? 'mt-1.5' : ''}>
                 <span class="inline-block w-1.5 h-1.5 rounded-full bg-amber-500 mr-1 align-middle"
                 ></span>
@@ -1580,8 +1585,8 @@
             </div>
           {:else if githubAuthNeeded === 'no-access'}
             <!-- User is authenticated but doesn't have access -->
-            <div class="px-2 py-2 border-l-2 border-destructive bg-destructive/10">
-              <div class="text-sm text-error-foreground">
+            <div class="px-2 py-2 border-l-2 border-danger bg-danger-background/10">
+              <div class="text-sm text-danger">
                 {m.workspace_branchSelector_noAccess_error()}
               </div>
               <div class="text-sm text-subtle mt-1">
@@ -1589,8 +1594,8 @@
               </div>
             </div>
           {:else if error}
-            <div class="px-2 py-2 border-l-2 border-destructive bg-destructive/10">
-              <div class="text-sm text-error-foreground">{error}</div>
+            <div class="px-2 py-2 border-l-2 border-danger bg-danger-background/10">
+              <div class="text-sm text-danger">{error}</div>
               {#if repoType === 'github'}
                 <div class="text-sm text-subtle mt-1">
                   {m.workspace_branchSelector_typeManually_description()}
@@ -1816,7 +1821,7 @@
 
         <!-- Use current branch option (no isolated checkout) -->
         {#if typeof onSkipIsolationChange === 'function' && currentBranch}
-          <div class="px-2 pt-2 pb-3 border-t border-border sticky -bottom-1 bg-background">
+          <div class="px-2 pt-2 pb-3 border-t border-border sticky -bottom-1 bg-popover">
             <button
               onclick={() => {
                 const enabling = !skipIsolation;

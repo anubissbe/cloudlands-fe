@@ -3,6 +3,7 @@ import {
   actionChannel,
   all,
   call,
+  cancelled,
   delay,
   flush,
   fork,
@@ -18,8 +19,23 @@ import { createLogger } from '$lib/utils/client-logger';
 import { m } from '$shared/paraglide/messages.js';
 import type { SpecialistFileScope } from '$shared/specialist-file-types';
 import { settingsChanged } from '../../settings-events/settings-events-slice';
-import { selectBundledSpecialists, selectGetFileSpecialist } from '../specialists-selectors';
-import { deleteFileSpecialist, saveFileSpecialist, setBundledSpecialists, setBundledSpecialistsLoaded, setCustomSpecialistsLoaded, setFileSpecialists, setFileSpecialistsLoaded, setOverridesLoaded, type FileSpecialist } from '../specialists-slice';
+import {
+  selectBundledSpecialists,
+  selectBundledSpecialistsLoaded,
+  selectGetFileSpecialist,
+} from '../specialists-selectors';
+import {
+  deleteFileSpecialist,
+  refetchSpecialistsRequested,
+  saveFileSpecialist,
+  setBundledSpecialists,
+  setBundledSpecialistsLoaded,
+  setCustomSpecialistsLoaded,
+  setFileSpecialists,
+  setFileSpecialistsLoaded,
+  setOverridesLoaded,
+  type FileSpecialist,
+} from '../specialists-slice';
 
 const logger = createLogger('SpecialistsSaga');
 
@@ -35,18 +51,18 @@ interface ListContext {
  * when a `settings:changed` delta touches one of these paths
  * (intent-hq/monorepo#1925).
  */
-export const MODEL_RESOLUTION_SETTINGS_PATHS: readonly string[] = [
+const MODEL_RESOLUTION_SETTINGS_PATHS: readonly string[] = [
   'model.providerDefaults',
   'model.default',
-  'providers.active',
+  'model.defaultProvider',
 ];
 
 /**
- * Trailing debounce for settings-driven refetches so one `specialist.list`
- * call serves a multi-path delta burst — mirrors the live client's
+ * Trailing debounce for explicit and settings-driven refetches so one
+ * `specialist.list` call serves a trigger burst — mirrors the live client's
  * `specialists:changed` debounce.
  */
-const SETTINGS_REFETCH_DEBOUNCE_MS = 100;
+const REFETCH_DEBOUNCE_MS = 100;
 
 /**
  * Predicate pattern (not the action creator) so unrelated settings deltas
@@ -62,6 +78,10 @@ function touchesModelResolutionSettings(action: { type: string; payload?: unknow
       MODEL_RESOLUTION_SETTINGS_PATHS.includes(change.path),
     )
   );
+}
+
+function triggersSpecialistRefetch(action: { type: string; payload?: unknown }): boolean {
+  return action.type === refetchSpecialistsRequested.type || touchesModelResolutionSettings(action);
 }
 
 function toBundledSpecialist(def: SpecialistDef): Specialist {
@@ -80,6 +100,9 @@ function toBundledSpecialist(def: SpecialistDef): Specialist {
     reasoningEffort: def.reasoningEffort,
     resolvedModel: def.resolvedModel,
     resolvedProvider: def.resolvedProvider,
+    role: def.role,
+    teamAgents: def.teamAgents,
+    icon: def.icon,
   };
 }
 
@@ -99,6 +122,9 @@ function bundledFallback(builtin: Specialist): Specialist {
   if (builtin.modelOptions !== undefined) mapped.modelOptions = builtin.modelOptions;
   if (builtin.resolvedModel !== undefined) mapped.resolvedModel = builtin.resolvedModel;
   if (builtin.resolvedProvider !== undefined) mapped.resolvedProvider = builtin.resolvedProvider;
+  if (builtin.role !== undefined) mapped.role = builtin.role;
+  if (builtin.teamAgents !== undefined) mapped.teamAgents = builtin.teamAgents;
+  if (builtin.icon !== undefined) mapped.icon = builtin.icon;
   return mapped;
 }
 
@@ -115,23 +141,36 @@ function toFileSpecialist(def: SpecialistDef): FileSpecialist {
     source: def.source as SpecialistFileScope,
     hidden: def.hidden,
     modelOptions: def.modelOptions,
+    // Must be mapped from the daemon def: the post-mutation refetch replaces the
+    // stored specialist, so dropping it here reset the Model row picker to Auto
+    // and let the next save erase the level on the daemon (hidden-dolphin ws).
+    reasoningEffort: def.reasoningEffort,
     resolvedModel: def.resolvedModel,
     resolvedProvider: def.resolvedProvider,
+    role: def.role,
+    teamAgents: def.teamAgents,
+    icon: def.icon,
   };
 }
 
 function* applySpecialistList(defs: SpecialistDef[]) {
+  // The daemon always ships bundled specialists. The live client folds a
+  // transport failure into [], so an empty result after initial load is a
+  // failed read and must not replace the last-known-good roster or loaded flags.
+  if (defs.length === 0 && (yield* selectBundledSpecialistsLoaded.effect())) {
+    logger.warn('Ignoring empty specialist list after initial load');
+    return;
+  }
+
   const bundledDefs = defs.filter((def) => def.source === 'bundled');
   const fileDefs = defs.filter((def) => def.source === 'user' || def.source === 'project');
-  const bundledById = new Map(bundledDefs.map((def) => [def.id, def]));
-  const knownIds = new Set(SPECIALISTS.map((specialist) => specialist.id));
-  const bundled = SPECIALISTS.map((builtin) => {
-    const def = bundledById.get(builtin.id);
-    return def ? toBundledSpecialist(def) : bundledFallback(builtin);
-  });
-  for (const def of bundledDefs) {
-    if (!knownIds.has(def.id)) bundled.push(toBundledSpecialist(def));
-  }
+  // The daemon list is authoritative: shipped specialists absent from it must
+  // not resurrect (daemon replacement mode). A successful response with only
+  // user/project defs means the base set is intentionally empty, so the
+  // hardcoded SPECIALISTS fallback only applies to an empty initial load.
+  const bundled = defs.length
+    ? bundledDefs.map(toBundledSpecialist)
+    : SPECIALISTS.map(bundledFallback);
 
   yield* put(setBundledSpecialists(bundled));
   yield* put(setBundledSpecialistsLoaded(true));
@@ -158,13 +197,31 @@ function errorMessage(error: unknown, fallback: string): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+function mutationError(error: unknown, fallback: string): Error {
+  return error instanceof Error ? error : new Error(errorMessage(error, fallback));
+}
+
 function* showMutationError(error: unknown, fallback: string) {
   const { toast } = yield* call(() => import('svelte-sonner'));
   yield* call([toast, toast.error], errorMessage(error, fallback));
 }
 
+/**
+ * Reject the per-dispatch promise with `error`. The promise is marked handled
+ * first so fire-and-forget dispatchers (e.g. the settings editor) don't
+ * surface unhandled-rejection noise; awaiting callers still get the rejection.
+ */
+function* rejectAction(
+  action: ReturnType<typeof saveFileSpecialist> | ReturnType<typeof deleteFileSpecialist>,
+  error: Error,
+) {
+  action.promise.catch(() => {});
+  yield* put(action.failure(error));
+}
+
 function* handleSave(context: ListContext, action: ReturnType<typeof saveFileSpecialist>) {
   const [payload] = action.payload;
+  let settled = false;
   try {
     const existing = yield* selectGetFileSpecialist.effect(payload.id);
     const bundledSpecialists = yield* selectBundledSpecialists.effect();
@@ -184,6 +241,9 @@ function* handleSave(context: ListContext, action: ReturnType<typeof saveFileSpe
       behaviorPrompt: payload.behaviorPrompt,
       source: scope,
       hidden: existing?.hidden ?? bundled?.hidden,
+      role: existing?.role ?? bundled?.role,
+      teamAgents: existing?.teamAgents ?? bundled?.teamAgents,
+      icon: existing?.icon ?? bundled?.icon,
     };
     if (existing) {
       yield* call(
@@ -202,15 +262,30 @@ function* handleSave(context: ListContext, action: ReturnType<typeof saveFileSpe
         payload.workspacePath,
       );
     }
+    // The daemon write succeeded: settle the promise before the list refetch
+    // (which handles its own failures) so awaiting callers aren't blocked on it.
+    yield* put(action.success(undefined as never));
+    settled = true;
     yield* call(refetchSpecialists, context);
   } catch (error) {
     logger.error('Failed to save file specialist', error);
     yield* call(showMutationError, error, m.specialists_mutation_saveFailed_error());
+    yield* call(
+      rejectAction,
+      action,
+      mutationError(error, m.specialists_mutation_saveFailed_error()),
+    );
+    settled = true;
+  } finally {
+    if (!settled && (yield* cancelled())) {
+      yield* call(rejectAction, action, new Error(m.specialists_mutation_saveFailed_error()));
+    }
   }
 }
 
 function* handleDelete(context: ListContext, action: ReturnType<typeof deleteFileSpecialist>) {
   const [ref] = action.payload;
+  let settled = false;
   try {
     yield* call(
       [appClient.specialists, appClient.specialists.delete],
@@ -218,33 +293,45 @@ function* handleDelete(context: ListContext, action: ReturnType<typeof deleteFil
       ref.scope ?? 'user',
       ref.workspacePath,
     );
+    yield* put(action.success(undefined as never));
+    settled = true;
     yield* call(refetchSpecialists, context);
   } catch (error) {
     logger.error('Failed to delete file specialist', error);
     yield* call(showMutationError, error, m.specialists_mutation_deleteFailed_error());
+    yield* call(
+      rejectAction,
+      action,
+      mutationError(error, m.specialists_mutation_deleteFailed_error()),
+    );
+    settled = true;
+  } finally {
+    if (!settled && (yield* cancelled())) {
+      yield* call(rejectAction, action, new Error(m.specialists_mutation_deleteFailed_error()));
+    }
   }
 }
 
 /**
- * Single-flight, trailing-coalesced settings-driven refetch loop (per the
+ * Single-flight, trailing-coalesced refetch loop (per the
  * event-driven refetch rule in AGENTS.md). A sliding(1) action channel
- * buffers relevant deltas: the debounce window folds a burst into one
+ * buffers explicit requests and relevant settings deltas: the debounce window folds a burst into one
  * `specialist.list` call, the blocking `call` guarantees no concurrent
- * refetches, and deltas arriving mid-flight collapse into at most one
+ * refetches, and triggers arriving mid-flight collapse into at most one
  * trailing refetch after the current one settles.
  */
-function* watchModelResolutionSettings(context: ListContext) {
-  const channel = yield* actionChannel(touchesModelResolutionSettings, buffers.sliding(1));
+function* watchSpecialistRefetches(context: ListContext) {
+  const channel = yield* actionChannel(triggersSpecialistRefetch, buffers.sliding(1));
   while (true) {
     yield* take(channel);
-    yield* delay(SETTINGS_REFETCH_DEBOUNCE_MS);
-    // Deltas that arrived during the window are served by this refetch.
+    yield* delay(REFETCH_DEBOUNCE_MS);
+    // Triggers that arrived during the window are served by this refetch.
     yield* flush(channel);
     yield* call(refetchSpecialists, context);
   }
 }
 
-export function createSpecialistsChannel(): EventChannel<SpecialistDef[]> {
+function createSpecialistsChannel(): EventChannel<SpecialistDef[]> {
   return eventChannel<SpecialistDef[]>(
     (emit) => appClient.specialists.subscribe(emit),
     buffers.expanding<SpecialistDef[]>(),
@@ -271,6 +358,6 @@ export function* specialistsSaga() {
   yield* all([
     takeEvery(saveFileSpecialist, handleSave, context),
     takeEvery(deleteFileSpecialist, handleDelete, context),
-    fork(watchModelResolutionSettings, context),
+    fork(watchSpecialistRefetches, context),
   ]);
 }

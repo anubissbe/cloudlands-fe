@@ -211,7 +211,7 @@
             status === 'success'
               ? 'text-emerald-500/80 dark:text-emerald-400/70'
               : status === 'error'
-                ? 'text-error-foreground'
+                ? 'text-danger'
                 : 'text-ghost'}
           {@const prevEvent = index > 0 ? dedupedEvents[index - 1] : null}
           {@const thisTime = new Date(event.timestamp).getTime()}
@@ -309,11 +309,11 @@
             {#if isAgent && event.actor?.id}
               <button
                 type="button"
-                class="shrink-0 -my-1 p-0.5 rounded-full hover:bg-muted/50 hover:ring-2 hover:ring-primary/20 transition-all cursor-pointer"
+                class="shrink-0 -my-1 p-0.5 rounded-full hover:bg-muted/50 hover:ring-2 hover:ring-primary/20 transition-[background-color,box-shadow] cursor-pointer"
                 onclick={(e) => onShowAgent?.(event.actor.id!, e)}
                 title={m.log_timeline_openAgent_tooltip()}
               >
-                <AgentAvatar size={24} agentId={event.actor.id} />
+                <AgentAvatar variant="emphasized" agentId={event.actor.id} />
               </button>
             {/if}
           </div>

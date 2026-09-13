@@ -45,6 +45,16 @@ vi.mock('svelte-sonner', () => ({
   },
 }));
 
+const toggleComposerMicRecordingMock = vi.hoisted(() => vi.fn(() => 'started'));
+const isComposerMicRecordingMock = vi.hoisted(() => vi.fn(() => false));
+
+vi.mock('$features/hardware-console/voice/composer-mic-controller', () => ({
+  toggleComposerMicRecording: toggleComposerMicRecordingMock,
+  isComposerMicRecording: isComposerMicRecordingMock,
+  cancelComposerMicRecording: vi.fn(() => false),
+  resetComposerMic: vi.fn(),
+}));
+
 vi.mock('../../ui/button/button.svelte', async () => {
   const Button = (await import('../../ui/__tests__/mocks/button.svelte')).default;
   return { default: Button };
@@ -178,7 +188,18 @@ const mockReduxState = vi.hoisted(
   (): {
     workspaceAgents: { byWorkspaceId: Record<string, any> };
     providerSettings: { activeProviderId: string };
+    readonly model: { defaultProviderId: string };
     hardwareConsole: { pttRecording: boolean; voiceTranscribing: boolean };
+    skills: {
+      byWorkspaceId: Record<
+        string,
+        {
+          skills: Array<{ name: string; description: string; location: string }>;
+          loading: boolean;
+          error: string | null;
+        }
+      >;
+    };
     voiceSettings: {
       isLoading: boolean;
       engine: string;
@@ -190,10 +211,16 @@ const mockReduxState = vi.hoisted(
     daemonHealth: { hostLocality: 'local' | 'remote' | null; transport: unknown };
   } => ({
     workspaceAgents: { byWorkspaceId: {} },
-    // Unset active provider — the §5.31 gate treats this as auggie (default)
+    // Unset default provider — the §5.31 gate resolves CLOSED for ''.
+    // Tests mutate providerSettings.activeProviderId; the model slice
+    // (where selectActiveProviderId reads from) mirrors it via this getter.
     providerSettings: { activeProviderId: '' },
+    get model() {
+      return { defaultProviderId: this.providerSettings.activeProviderId };
+    },
     // The composer mic button subscribes to these hardware-console flags
     hardwareConsole: { pttRecording: false, voiceTranscribing: false },
+    skills: { byWorkspaceId: {} },
     // The oversized-attachment placement flow reads daemon locality to pick
     // the sourcePath fast path vs. the wire data variant
     daemonHealth: { hostLocality: null, transport: null },
@@ -295,6 +322,51 @@ warmImport(() => import('../__tests__/mocks/TipTapEditor.svelte'));
 warmImport(() => import('../__tests__/mocks/ModelPicker.svelte'));
 warmImport(() => import('../__tests__/mocks/SlotOnly.svelte'));
 
+describe('SimpleRichInput workspace skills', () => {
+  afterEach(() => {
+    cleanup();
+    mockReduxState.skills.byWorkspaceId = {};
+  });
+
+  it('follows workspace changes and live Redux skill updates', async () => {
+    mockReduxState.skills.byWorkspaceId = {
+      'ws-1': {
+        skills: [{ name: 'review', description: 'Review', location: '/skills/review' }],
+        loading: false,
+        error: null,
+      },
+      'ws-2': {
+        skills: [{ name: 'research', description: 'Research', location: '/skills/research' }],
+        loading: true,
+        error: null,
+      },
+    };
+    const workspace = (id: string) => ({ id, path: `/tmp/${id}` }) as any;
+    const view = render(SimpleRichInput, {
+      props: { value: '', contextItems: [], workspace: workspace('ws-1') },
+    });
+    const editor = screen.getByTestId('tiptap-editor');
+    expect(editor.getAttribute('data-skills')).toBe('review');
+
+    await view.rerender({ value: '', contextItems: [], workspace: workspace('ws-2') });
+    const { store } = await import('$store/renderer/store');
+    (store as typeof store & { emitState: () => void }).emitState();
+    await waitFor(() => expect(editor.getAttribute('data-skills')).toBe('research'));
+    expect(editor.getAttribute('data-skills-loading')).toBe('true');
+
+    mockReduxState.skills.byWorkspaceId['ws-2'] = {
+      skills: [{ name: 'audit', description: 'Audit', location: '/skills/audit' }],
+      loading: false,
+      error: 'refresh failed',
+    };
+    (store as typeof store & { emitState: () => void }).emitState();
+
+    await waitFor(() => expect(editor.getAttribute('data-skills')).toBe('audit'));
+    expect(editor.getAttribute('data-skills-loading')).toBe('false');
+    expect(editor.getAttribute('data-skills-error')).toBe('refresh failed');
+  });
+});
+
 describe('SimpleRichInput draft change notification', () => {
   afterEach(() => {
     cleanup();
@@ -318,12 +390,18 @@ describe('SimpleRichInput draft change notification', () => {
     expect(onvaluechange).toHaveBeenLastCalledWith('draft that must survive remounts');
   });
 
-  it('uses the concise chat placeholder by default', () => {
+  it('keeps the localized placeholder mounted while focus toggles its fade state', async () => {
     render(SimpleRichInput, { props: { value: '', contextItems: [] } });
+    const editor = screen.getByTestId('tiptap-editor');
+    const editorWrapper = editor.closest('.editor-wrapper');
 
-    expect(screen.getByTestId('tiptap-editor').getAttribute('placeholder')).toBe(
-      'Ask anything or type @ for context',
-    );
+    expect(editor.getAttribute('placeholder')).toBe('Ask anything');
+    expect(editorWrapper?.classList.contains('placeholder-hidden')).toBe(true);
+    await fireEvent.focusIn(editor);
+    expect(editorWrapper?.classList.contains('placeholder-hidden')).toBe(false);
+    await fireEvent.focusOut(editor);
+    expect(editorWrapper?.classList.contains('placeholder-hidden')).toBe(true);
+    expect(editor.getAttribute('placeholder')).toBe('Ask anything');
   });
 });
 
@@ -468,13 +546,34 @@ describe('SimpleRichInput action bar layout', () => {
     expect(screen.getByTestId('message-input').className).not.toContain('focus-within:ring-2');
   });
 
-  it('keeps the prompt surface transparent when edge-docked', () => {
+  it('uses the nested sidebar surface only when edge-docked', () => {
     render(SimpleRichInput, {
       props: { value: '', contextItems: [], edgeDocked: true },
     });
 
-    expect(screen.getByTestId('message-input').className).toContain('bg-transparent');
-    expect(screen.getByTestId('message-input').className).not.toContain('bg-card');
+    const edgeDockedInput = screen.getByTestId('message-input');
+    expect(edgeDockedInput.className).toContain('rounded-lg');
+    expect(edgeDockedInput.className).toContain('border-0');
+    expect(edgeDockedInput.className).toContain('bg-sidebar');
+    expect(edgeDockedInput.className).not.toContain('bg-transparent');
+    expect(document.querySelector('[data-chat-input-action-bar]')?.className).toContain(
+      'flex-wrap',
+    );
+    expect(document.querySelector('[data-chat-input-submit-actions]')?.className).toContain(
+      'justify-end',
+    );
+
+    cleanup();
+    render(SimpleRichInput, { props: { value: '', contextItems: [] } });
+    const standaloneInput = screen.getByTestId('message-input');
+    expect(standaloneInput.className).toContain('border-border');
+    expect(standaloneInput.className).not.toContain('bg-sidebar');
+    expect(document.querySelector('[data-chat-input-action-bar]')?.className).not.toContain(
+      'flex-wrap',
+    );
+    expect(document.querySelector('[data-chat-input-submit-actions]')?.className).toContain(
+      'shrink-0',
+    );
   });
 });
 
@@ -1101,9 +1200,12 @@ describe('SimpleRichInput Stop-button visibility', () => {
     });
   });
 
-  it('invokes onstop when the Stop button is clicked while responding', async () => {
+  it('ignores Escape while responding and invokes onstop from the Stop button', async () => {
     const onstop = vi.fn();
     render(SimpleRichInput, { props: { ...baseProps(), isResponding: true, onstop } });
+
+    await fireEvent.keyDown(screen.getByTestId('tiptap-editor'), { key: 'Escape' });
+    expect(onstop).not.toHaveBeenCalled();
 
     const btn = stopButton();
     expect(btn).not.toBeNull();
@@ -1113,7 +1215,7 @@ describe('SimpleRichInput Stop-button visibility', () => {
   });
 });
 
-describe('SimpleRichInput compact panel height', () => {
+describe('SimpleRichInput automatic composer geometry', () => {
   const props = {
     value: '',
     contextItems: [],
@@ -1127,24 +1229,48 @@ describe('SimpleRichInput compact panel height', () => {
     selectedModel: 'gpt5.4',
   };
 
-  function renderInPanel(height: number) {
+  function renderInPanel(height: number, overrides: Record<string, unknown> = {}) {
     const panel = document.createElement('div');
     panel.className = 'group/panel';
     Object.defineProperty(panel, 'clientHeight', { configurable: true, value: height });
     document.body.append(panel);
-    return render(SimpleRichInput, { target: panel, props });
+    return render(SimpleRichInput, { target: panel, props: { ...props, ...overrides } });
+  }
+
+  // Mirrors the real ResizeObserver: an initial callback is delivered
+  // asynchronously after observe() with the current size — the component
+  // relies on it instead of a synchronous clientHeight read (forced reflow).
+  class MockResizeObserver {
+    static instances: MockResizeObserver[] = [];
+    callback: ResizeObserverCallback;
+    observed: Element[] = [];
+    disconnected = false;
+    constructor(callback: ResizeObserverCallback) {
+      this.callback = callback;
+      MockResizeObserver.instances.push(this);
+    }
+    observe(target: Element) {
+      this.observed.push(target);
+      queueMicrotask(() => {
+        if (!this.disconnected) this.fire(target, (target as HTMLElement).clientHeight);
+      });
+    }
+    fire(target: Element, height: number) {
+      this.callback(
+        [{ target, contentRect: { height } } as unknown as ResizeObserverEntry],
+        this as unknown as ResizeObserver,
+      );
+    }
+    unobserve() {}
+    disconnect() {
+      this.disconnected = true;
+    }
   }
 
   beforeEach(() => {
     vi.clearAllMocks();
-    vi.stubGlobal(
-      'ResizeObserver',
-      class {
-        observe() {}
-        unobserve() {}
-        disconnect() {}
-      },
-    );
+    MockResizeObserver.instances = [];
+    vi.stubGlobal('ResizeObserver', MockResizeObserver);
     addMockSession('ws-1', createSession());
   });
 
@@ -1155,24 +1281,191 @@ describe('SimpleRichInput compact panel height', () => {
     document.body.innerHTML = '';
   });
 
-  it('uses the 65px composer in a short stacked panel', async () => {
+  it('keeps 56px on focus, expands to 65px for content, and collapses when cleared', async () => {
     renderInPanel(560);
+    const editor = screen.getByTestId('tiptap-editor');
+    const composer = screen.getByTestId('message-input');
+    const editorWrapper = editor.closest('.editor-wrapper');
 
     await waitFor(() => {
-      expect(screen.getByTestId('message-input').getAttribute('style')).toContain(
-        'min-height: 65px',
-      );
+      expect(composer.getAttribute('style')).toContain('min-height: 56px');
     });
+    expect(editor.getAttribute('placeholder')).toBe('Ask anything');
+    expect(editorWrapper?.classList.contains('placeholder-hidden')).toBe(true);
+    expect(composer.className).toContain(
+      'transition-[border-color,background-color,box-shadow,min-height]',
+    );
+    expect(composer.className).toContain('duration-(--motion-fast)');
+    expect(composer.className).toContain('ease-(--ease-standard)');
+    expect(composer.className).toContain('motion-reduce:transition-none');
+
+    await fireEvent.focusIn(editor);
+    expect(composer.getAttribute('style')).toContain('min-height: 56px');
+    expect(editorWrapper?.classList.contains('placeholder-hidden')).toBe(false);
+
+    await fireEvent.input(editor, { target: { value: 'draft' } });
+    await waitFor(() => expect(composer.getAttribute('style')).toContain('min-height: 65px'));
+    await fireEvent.input(editor, { target: { value: '' } });
+    await waitFor(() => expect(composer.getAttribute('style')).toContain('min-height: 56px'));
   });
 
-  it('keeps the roomier composer in a tall panel', async () => {
+  it('keeps 80px on focus, expands to 100px for content, and collapses when cleared', async () => {
     renderInPanel(720);
+    const editor = screen.getByTestId('tiptap-editor');
+    const composer = screen.getByTestId('message-input');
+    const editorWrapper = editor.closest('.editor-wrapper');
 
     await waitFor(() => {
-      expect(screen.getByTestId('message-input').getAttribute('style')).toContain(
-        'min-height: 100px',
-      );
+      expect(composer.getAttribute('style')).toContain('min-height: 80px');
     });
+    await fireEvent.focusIn(editor);
+    expect(composer.getAttribute('style')).toContain('min-height: 80px');
+    expect(editorWrapper?.classList.contains('placeholder-hidden')).toBe(false);
+
+    await fireEvent.input(editor, { target: { value: 'draft' } });
+    await waitFor(() => expect(composer.getAttribute('style')).toContain('min-height: 100px'));
+    await fireEvent.input(editor, { target: { value: '' } });
+    await waitFor(() => expect(composer.getAttribute('style')).toContain('min-height: 80px'));
+
+    await fireEvent.focusOut(editor);
+    expect(editorWrapper?.classList.contains('placeholder-hidden')).toBe(true);
+  });
+
+  it('settles rapid focus changes at the idle automatic height', async () => {
+    renderInPanel(720);
+    const editor = screen.getByTestId('tiptap-editor');
+    const composer = screen.getByTestId('message-input');
+
+    await waitFor(() => expect(composer.getAttribute('style')).toContain('min-height: 80px'));
+    await fireEvent.focusIn(editor);
+    await fireEvent.focusOut(editor);
+    await fireEvent.focusIn(editor);
+
+    await waitFor(() => expect(composer.getAttribute('style')).toContain('min-height: 80px'));
+    expect(editor.closest('.editor-wrapper')?.classList.contains('placeholder-hidden')).toBe(false);
+  });
+
+  it.each([
+    { mode: 'draft', overrides: { value: 'preserved draft' } },
+    {
+      mode: 'context',
+      overrides: { contextItems: [{ id: 'note-1', type: 'note', label: 'Spec' }] },
+    },
+    {
+      mode: 'attachment',
+      overrides: {
+        contextItems: [
+          {
+            id: 'attachment-1',
+            type: 'file',
+            label: 'trace.json',
+            attachmentId: 'att-1',
+            placementStatus: 'placed',
+          },
+        ],
+      },
+    },
+  ])(
+    'keeps active geometry without an empty-state placeholder for $mode content',
+    async ({ overrides }) => {
+      renderInPanel(720, overrides);
+
+      await waitFor(() => {
+        expect(screen.getByTestId('message-input').getAttribute('style')).toContain(
+          'min-height: 100px',
+        );
+      });
+      expect(screen.getByTestId('tiptap-editor').getAttribute('placeholder')).toBe('Ask anything');
+    },
+  );
+
+  it('keeps a manual resize when focus changes', async () => {
+    renderInPanel(720);
+    const composer = screen.getByTestId('message-input');
+    const editor = screen.getByTestId('tiptap-editor');
+    const editorWrapper = composer.querySelector('.editor-wrapper');
+    Object.defineProperty(composer, 'offsetHeight', { configurable: true, value: 80 });
+
+    const resizeHandle = screen.getByRole('button', { name: /Resize input area/ });
+    await fireEvent.mouseDown(resizeHandle, {
+      clientY: 100,
+    });
+    await waitFor(() => expect(resizeHandle.getAttribute('data-resizing')).toBe('true'));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    document.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientY: 50 }));
+    await waitFor(() => expect(composer.getAttribute('style')).toContain('height: 130px'));
+    await fireEvent.mouseUp(document);
+
+    await fireEvent.focusIn(editor);
+    expect(composer.getAttribute('style')).toContain('height: 130px');
+    expect(composer.getAttribute('style')).not.toContain('min-height');
+    expect(composer.className).toContain('transition-[border-color,background-color,box-shadow]');
+    expect(composer.className).not.toContain('box-shadow,min-height');
+    expect(editorWrapper?.className).toContain('pt-1');
+  });
+
+  it('affirms idle and focused geometry in every required visual state', async () => {
+    const observed = await exerciseVisualStates(async (configuration) => {
+      const height = configuration.width < 500 ? 560 : 720;
+      const view = renderInPanel(height);
+      const composer = view.getByTestId('message-input');
+      const editor = view.getByTestId('tiptap-editor');
+      const editorWrapper = composer.querySelector('.editor-wrapper');
+      const idleHeight = height > 640 ? 80 : 56;
+      const activeHeight = height > 640 ? 100 : 65;
+
+      await waitFor(() => {
+        expect(composer.getAttribute('style')).toContain(`min-height: ${idleHeight}px`);
+      });
+      expect(editor.getAttribute('placeholder')).toBe('Ask anything');
+      expect(editorWrapper?.classList.contains('placeholder-hidden')).toBe(true);
+      expect(editorWrapper?.className).toContain('pt-1');
+
+      return {
+        ...view,
+        target: editor,
+        assertCapability: async () => {
+          expect(composer.getAttribute('style')).toContain(`min-height: ${idleHeight}px`);
+          expect(editorWrapper?.classList.contains('placeholder-hidden')).toBe(false);
+          await fireEvent.input(editor, { target: { value: 'draft' } });
+          await waitFor(() => {
+            expect(composer.getAttribute('style')).toContain(`min-height: ${activeHeight}px`);
+          });
+          expect(editorWrapper?.className).toContain('pt-1');
+          expect(composer.className).toContain('motion-reduce:transition-none');
+        },
+      };
+    });
+
+    expect(observed).toEqual(configuredVisualStates);
+  });
+
+  it('sets up one panel observer and resizes update geometry without recreating it', async () => {
+    renderInPanel(560);
+    const composer = screen.getByTestId('message-input');
+
+    // The observer's initial callback (no synchronous clientHeight read)
+    // seeds the panel height.
+    await waitFor(() => {
+      expect(composer.getAttribute('style')).toContain('min-height: 56px');
+    });
+    expect(MockResizeObserver.instances).toHaveLength(1);
+    const observer = MockResizeObserver.instances[0];
+    expect(observer.observed).toHaveLength(1);
+
+    // A panel resize flows through the same observer — no teardown/recreate,
+    // no re-observe — while parentPanelHeight-derived geometry updates.
+    observer.fire(observer.observed[0], 720);
+    await waitFor(() => {
+      expect(composer.getAttribute('style')).toContain('min-height: 80px');
+    });
+    observer.fire(observer.observed[0], 560);
+    await waitFor(() => {
+      expect(composer.getAttribute('style')).toContain('min-height: 56px');
+    });
+    expect(MockResizeObserver.instances).toHaveLength(1);
+    expect(observer.observed).toHaveLength(1);
+    expect(observer.disconnected).toBe(false);
   });
 });
 
@@ -1394,6 +1687,50 @@ describe('SimpleRichInput prompt enhancement menu (§5.31)', () => {
     expect((screen.getByTestId('tiptap-editor') as HTMLTextAreaElement).value).toBe(
       'make this prompt better',
     );
+  });
+
+  it("ignores a stale toast's Undo after a newer enhancement replaced it", async () => {
+    mockReduxState.providerSettings.activeProviderId = 'auggie';
+    enhancePromptMock
+      .mockResolvedValueOnce({ enhanced: 'first enhanced prompt' })
+      .mockResolvedValueOnce({ enhanced: 'second enhanced prompt' });
+    render(SimpleRichInput, { props: baseProps() });
+
+    startEnhancement();
+    await waitFor(() => {
+      expect((screen.getByTestId('tiptap-editor') as HTMLTextAreaElement).value).toBe(
+        'first enhanced prompt',
+      );
+    });
+
+    const { toast } = await import('svelte-sonner');
+    const successMock = toast.success as ReturnType<typeof vi.fn>;
+    expect(successMock).toHaveBeenCalledTimes(1);
+    const firstToastUndo = successMock.mock.calls[0]![1].action.onClick as () => void;
+
+    startEnhancement();
+    await waitFor(() => {
+      expect((screen.getByTestId('tiptap-editor') as HTMLTextAreaElement).value).toBe(
+        'second enhanced prompt',
+      );
+    });
+    expect(successMock).toHaveBeenCalledTimes(2);
+
+    // The first toast may still linger on screen: its Undo must no-op, not
+    // revert the newer enhancement to the first toast's original prompt.
+    firstToastUndo();
+    expect((screen.getByTestId('tiptap-editor') as HTMLTextAreaElement).value).toBe(
+      'second enhanced prompt',
+    );
+
+    // The current toast's Undo still restores that enhancement's original.
+    const secondToastUndo = successMock.mock.calls[1]![1].action.onClick as () => void;
+    secondToastUndo();
+    await waitFor(() => {
+      expect((screen.getByTestId('tiptap-editor') as HTMLTextAreaElement).value).toBe(
+        'first enhanced prompt',
+      );
+    });
   });
 });
 
@@ -1672,6 +2009,93 @@ describe('SimpleRichInput mic-button cancel-while-transcribing', () => {
   });
 });
 
+describe('SimpleRichInput mic-button focus retention', () => {
+  const baseProps = () => ({
+    value: '',
+    contextItems: [],
+    workspace: {
+      id: 'ws-1',
+      name: 'Workspace',
+      path: '/tmp/workspace',
+      createdAt: new Date().toISOString(),
+    } as any,
+    agentId: 'agent-1',
+    selectedModel: 'gpt5.4',
+  });
+
+  function buttonByIcon(icon: string): HTMLButtonElement | null {
+    const el = document.body.querySelector(`[data-icon="${icon}"]`);
+    return (el?.closest('button') as HTMLButtonElement | null) ?? null;
+  }
+
+  // jsdom does not implement the browser's focus-on-mousedown default
+  // action — emulate it: focus the button unless the handler prevented the
+  // default, then deliver the click.
+  async function clickLikeABrowser(button: HTMLButtonElement) {
+    const notPrevented = await fireEvent.mouseDown(button);
+    if (notPrevented) button.focus();
+    await fireEvent.click(button);
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
+      callback(0);
+      return 1;
+    });
+    addMockSession('ws-1', createSession());
+  });
+
+  afterEach(() => {
+    cleanup();
+    removeMockSession('ws-1', 'agent-1');
+    mockReduxState.hardwareConsole.pttRecording = false;
+    mockReduxState.hardwareConsole.voiceTranscribing = false;
+    isComposerMicRecordingMock.mockReturnValue(false);
+    toggleComposerMicRecordingMock.mockReturnValue('started');
+    vi.unstubAllGlobals();
+    document.body.innerHTML = '';
+  });
+
+  it('keeps editor focus when clicking the mic to start dictation', async () => {
+    render(SimpleRichInput, { props: baseProps() });
+    const editor = screen.getByTestId('tiptap-editor');
+    editor.focus();
+
+    await clickLikeABrowser(buttonByIcon('microphone')!);
+
+    expect(document.activeElement).toBe(editor);
+    expect(toggleComposerMicRecordingMock).toHaveBeenCalledTimes(1);
+    expect(toggleComposerMicRecordingMock).toHaveBeenCalledWith(expect.any(Object), 'agent-1');
+  });
+
+  it('keeps editor focus when clicking the mic to stop a recording', async () => {
+    mockReduxState.hardwareConsole.pttRecording = true;
+    isComposerMicRecordingMock.mockReturnValue(true);
+    toggleComposerMicRecordingMock.mockReturnValue('stopped');
+    render(SimpleRichInput, { props: baseProps() });
+    const editor = screen.getByTestId('tiptap-editor');
+    editor.focus();
+
+    await clickLikeABrowser(buttonByIcon('microphone')!);
+
+    expect(document.activeElement).toBe(editor);
+    expect(toggleComposerMicRecordingMock).toHaveBeenCalledTimes(1);
+    expect(toggleComposerMicRecordingMock).toHaveBeenCalledWith(expect.any(Object), 'agent-1');
+  });
+
+  it('keeps editor focus when clicking cancel while transcribing', async () => {
+    mockReduxState.hardwareConsole.voiceTranscribing = true;
+    render(SimpleRichInput, { props: baseProps() });
+    const editor = screen.getByTestId('tiptap-editor');
+    editor.focus();
+
+    await clickLikeABrowser(buttonByIcon('spinner')!);
+
+    expect(document.activeElement).toBe(editor);
+  });
+});
+
 describe('SimpleRichInput non-image attachment placement (unified flow)', () => {
   const baseProps = () => ({
     value: '',
@@ -1780,9 +2204,9 @@ describe('SimpleRichInput non-image attachment placement (unified flow)', () => 
     expect(screen.getByTestId('attachment-retry')).toBeTruthy();
   });
 
-  it('still rejects oversized images with the too-large toast (inline limit kept)', async () => {
+  it('still rejects images over the 30 MiB reference cap with the too-large toast (monorepo#3338)', async () => {
     render(SimpleRichInput, { props: baseProps() });
-    await dropFiles([makeFile('huge.png', 'image/png', 12 * 1024 * 1024)]);
+    await dropFiles([makeFile('huge.png', 'image/png', 31 * 1024 * 1024)]);
 
     const { toast } = await import('svelte-sonner');
     await waitFor(() => {
@@ -2094,5 +2518,212 @@ describe('SimpleRichInput non-image attachment placement (unified flow)', () => 
       'button[aria-label="Send message"]',
     ) as HTMLButtonElement | null;
     expect(sendButton!.disabled).toBe(true);
+  });
+});
+
+describe('SimpleRichInput folder drop (path references, local daemon only)', () => {
+  const baseProps = () => ({
+    value: '',
+    contextItems: [],
+    workspace: {
+      id: 'ws-1',
+      name: 'Workspace',
+      path: '/tmp/workspace',
+      createdAt: new Date().toISOString(),
+    } as any,
+    agentId: 'agent-1',
+    selectedModel: 'gpt5.4',
+  });
+
+  function makeFile(name: string, type: string, size = 16): File {
+    const file = new File(['x'], name, { type });
+    Object.defineProperty(file, 'size', { value: size });
+    return file;
+  }
+
+  /** Drop with a DataTransferItem list carrying folder-detection entries. */
+  function makeItemsDropEvent(entries: Array<{ file: File; isDirectory: boolean }>) {
+    return {
+      dataTransfer: {
+        types: ['Files'],
+        files: entries.map((e) => e.file),
+        items: entries.map((e) => ({
+          kind: 'file',
+          getAsFile: () => e.file,
+          webkitGetAsEntry: () => ({ isDirectory: e.isDirectory }),
+        })),
+      },
+    };
+  }
+
+  function insertMentionCalls(): Array<Record<string, unknown>> {
+    return ((window as any).__tiptapInsertMentionCalls ?? []) as Array<Record<string, unknown>>;
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    (window as any).__tiptapInsertMentionCalls = [];
+    mockReduxState.daemonHealth = { hostLocality: 'local', transport: null };
+    addMockSession('ws-1', createSession());
+  });
+
+  afterEach(() => {
+    cleanup();
+    removeMockSession('ws-1', 'agent-1');
+    delete (window as any).__tiptapInsertMentionCalls;
+    document.body.innerHTML = '';
+  });
+
+  it('local folder drop inserts a folder mention chip with the absolute host path — no placement', async () => {
+    (window as any).electronAPI.getPathForFile = vi.fn(() => '/home/user/projects/my-folder');
+
+    render(SimpleRichInput, { props: baseProps() });
+    const folder = makeFile('my-folder', '');
+    await fireEvent.drop(
+      screen.getByTestId('message-input'),
+      makeItemsDropEvent([{ file: folder, isDirectory: true }]),
+    );
+
+    await waitFor(() => {
+      expect(insertMentionCalls()).toHaveLength(1);
+    });
+    const mention = insertMentionCalls()[0];
+    expect(mention.type).toBe('folder');
+    expect(mention.label).toBe('my-folder');
+    expect((mention.meta as any).fullPath).toBe('/home/user/projects/my-folder');
+    // Folders are never placed as attachments.
+    expect(placeAttachmentMock).not.toHaveBeenCalled();
+    const { toast } = await import('svelte-sonner');
+    expect(toast.error).not.toHaveBeenCalled();
+  });
+
+  it('remote drop containing a folder rejects the WHOLE drop with one error toast', async () => {
+    mockReduxState.daemonHealth = { hostLocality: 'remote', transport: null };
+    (window as any).electronAPI.getPathForFile = vi.fn(() => '/home/user/projects/my-folder');
+
+    render(SimpleRichInput, { props: baseProps() });
+    const folder = makeFile('my-folder', '');
+    const image = makeFile('photo.png', 'image/png');
+    await fireEvent.drop(
+      screen.getByTestId('message-input'),
+      makeItemsDropEvent([
+        { file: image, isDirectory: false },
+        { file: folder, isDirectory: true },
+      ]),
+    );
+
+    const { toast } = await import('svelte-sonner');
+    await waitFor(() => {
+      expect(toast.error).toHaveBeenCalledTimes(1);
+    });
+    // Nothing attaches — not even the file in the same drop.
+    expect(insertMentionCalls()).toHaveLength(0);
+    expect(placeAttachmentMock).not.toHaveBeenCalled();
+    expect(screen.queryByRole('img', { name: 'photo.png' })).toBeNull();
+  });
+
+  it('mixed local drop: folder becomes a path reference, image attaches as today', async () => {
+    (window as any).electronAPI.getPathForFile = vi.fn(() => '/home/user/projects/my-folder');
+
+    render(SimpleRichInput, { props: baseProps() });
+    const folder = makeFile('my-folder', '');
+    const image = makeFile('photo.png', 'image/png');
+    await fireEvent.drop(
+      screen.getByTestId('message-input'),
+      makeItemsDropEvent([
+        { file: image, isDirectory: false },
+        { file: folder, isDirectory: true },
+      ]),
+    );
+
+    await waitFor(() => {
+      expect(insertMentionCalls()).toHaveLength(1);
+    });
+    expect(insertMentionCalls()[0].type).toBe('folder');
+    expect(await screen.findByRole('img', { name: 'photo.png' })).toBeTruthy();
+    expect(placeAttachmentMock).not.toHaveBeenCalled();
+  });
+
+  it('file-only drops behave exactly as before when remote (no folder involved)', async () => {
+    mockReduxState.daemonHealth = { hostLocality: 'remote', transport: null };
+
+    render(SimpleRichInput, { props: baseProps() });
+    const image = makeFile('photo.png', 'image/png');
+    await fireEvent.drop(
+      screen.getByTestId('message-input'),
+      makeItemsDropEvent([{ file: image, isDirectory: false }]),
+    );
+
+    expect(await screen.findByRole('img', { name: 'photo.png' })).toBeTruthy();
+    const { toast } = await import('svelte-sonner');
+    expect(toast.error).not.toHaveBeenCalled();
+    expect(insertMentionCalls()).toHaveLength(0);
+  });
+
+  it('handleDroppedFiles still accepts a plain File[] (legacy external callers)', async () => {
+    const { component } = render(SimpleRichInput, { props: baseProps() });
+    const image = new File(['image-bytes'], 'ext.png', { type: 'image/png' });
+
+    await component.handleDroppedFiles([image]);
+
+    expect(await screen.findByRole('img', { name: 'ext.png' })).toBeTruthy();
+  });
+
+  it('handleDroppedFiles accepts the DropSplit shape from external drop targets', async () => {
+    (window as any).electronAPI.getPathForFile = vi.fn(() => '/home/user/ext-folder');
+    const { component } = render(SimpleRichInput, { props: baseProps() });
+    const folder = makeFile('ext-folder', '');
+
+    await component.handleDroppedFiles({ files: [], folderFiles: [folder] });
+
+    await waitFor(() => {
+      expect(insertMentionCalls()).toHaveLength(1);
+    });
+    expect(insertMentionCalls()[0].label).toBe('ext-folder');
+    expect((insertMentionCalls()[0].meta as any).path).toBe('/home/user/ext-folder');
+  });
+
+  it('skips the folder with an error toast when no absolute path is resolvable', async () => {
+    // dev:web / missing bridge: a bare folder name must never ride as a
+    // mention that looks like a workspace-relative path.
+    (window as any).electronAPI.getPathForFile = vi.fn(() => '');
+
+    render(SimpleRichInput, { props: baseProps() });
+    const folder = makeFile('my-folder', '');
+    await fireEvent.drop(
+      screen.getByTestId('message-input'),
+      makeItemsDropEvent([{ file: folder, isDirectory: true }]),
+    );
+
+    const { toast } = await import('svelte-sonner');
+    await waitFor(() => {
+      expect(toast.error).toHaveBeenCalledTimes(1);
+    });
+    expect(insertMentionCalls()).toHaveLength(0);
+  });
+
+  it('keys folder mention ids by resolved path so same-basename folders stay distinct', async () => {
+    const folderA = makeFile('src', '');
+    const folderB = makeFile('src', '');
+    // Two distinct File objects share the basename; resolve by identity.
+    (window as any).electronAPI.getPathForFile = vi.fn((f: File) =>
+      f === folderA ? '/home/user/a/src' : '/home/user/b/src',
+    );
+
+    render(SimpleRichInput, { props: baseProps() });
+    await fireEvent.drop(
+      screen.getByTestId('message-input'),
+      makeItemsDropEvent([
+        { file: folderA, isDirectory: true },
+        { file: folderB, isDirectory: true },
+      ]),
+    );
+
+    await waitFor(() => {
+      expect(insertMentionCalls()).toHaveLength(2);
+    });
+    const ids = insertMentionCalls().map((c) => c.id);
+    expect(ids).toEqual(['folder-/home/user/a/src', 'folder-/home/user/b/src']);
+    expect(new Set(ids).size).toBe(2);
   });
 });

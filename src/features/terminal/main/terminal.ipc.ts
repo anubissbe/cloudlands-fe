@@ -2,9 +2,15 @@
  * Terminal IPC Handler
  *
  * Routes every terminal spawn through the daemon's `terminal.*` RPC surface
- * (PROTOCOL §5.13) via `getBackendClient()`. Local `node-pty` /
- * `child_process` spawning has been retired — the daemon owns the PTY host,
- * including for remote workspaces (the daemon runs on the remote host).
+ * (PROTOCOL §5.13). Local `node-pty` / `child_process` spawning has been
+ * retired — the daemon owns the PTY host, including for remote workspaces
+ * (the daemon runs on the remote host).
+ *
+ * Backend policy: per-backend. Every terminal is stamped with the backend id
+ * of the sender that created it, and all subsequent RPCs (`terminal.write`,
+ * `terminal.resize`, `terminal.kill`, resubscribe) resolve that id via
+ * `getBackendClientForId` — fail-closed when that backend has no live
+ * pooled client, never retargeting the primary.
  *
  * The renderer IPC contract on `TERMINAL_CHANNELS.*` is preserved: request /
  * response shapes, buffered-output replay, and the terminal:* Redux domain
@@ -36,19 +42,14 @@ import {
   getWorkspacePathInfo,
   isWorkspacePathDeterministicallyNull,
 } from '$features/workspace/main/workspace-path.service';
-import { mainDispatch } from '../../../store/main/redux-store-bridge';
 import {
-  terminalProfessionalData,
-  terminalProfessionalExit,
-  terminalDisposed,
-  terminalCreated,
-} from '../../../store/main/slices/terminal-events/terminal-events-slice';
-import {
-  getBackendClient,
+  getBackendClientForId,
+  getBackendIdForIpcSender,
   onBackendNotification,
   onBackendReconnected,
 } from '../../backend/main/backend.ipc';
 import type { JsonRpcNotification } from '../../backend/main/json-rpc-client';
+import { LOCAL_CONNECTION_ID } from '../../../shared/types/connections';
 
 const logger = new Logger('Terminal-IPC');
 
@@ -82,14 +83,39 @@ function delay(ms: number): Promise<void> {
  */
 async function getWorkspaceInfo(
   workspaceId: string,
+  backendId: string,
 ): Promise<{ workspacePath?: string; scope?: string }> {
+  if (backendId !== LOCAL_CONNECTION_ID) {
+    try {
+      const response = (await getClientForBackend(backendId).request('workspace.get', {
+        workspaceId,
+      })) as { workspace?: Record<string, unknown> } | Record<string, unknown>;
+      const workspace = (
+        response && 'workspace' in response ? response.workspace : response
+      ) as Record<string, unknown>;
+      const workspacePath = [workspace.worktreePath, workspace.repositoryPath, workspace.path].find(
+        (value): value is string => typeof value === 'string' && value.length > 0,
+      );
+      return {
+        workspacePath,
+        scope: typeof workspace.scope === 'string' ? workspace.scope : undefined,
+      };
+    } catch (error) {
+      logger.warn('[Terminal] remote workspace.get failed', {
+        backendId,
+        workspaceId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return {};
+    }
+  }
   for (let attempt = 0; attempt <= WORKSPACE_INFO_MAX_RETRIES; attempt++) {
     try {
-      const info = await getWorkspacePathInfo(workspaceId);
+      const info = await getWorkspacePathInfo(workspaceId, backendId);
       if (!info) {
         // Deterministic null (virtual workspace / remote backend): retrying
         // cannot change the answer — surface the refusal immediately.
-        if (isWorkspacePathDeterministicallyNull(workspaceId)) return {};
+        if (isWorkspacePathDeterministicallyNull(workspaceId, backendId)) return {};
         if (attempt < WORKSPACE_INFO_MAX_RETRIES) {
           await delay(WORKSPACE_INFO_RETRY_DELAY_MS);
           continue;
@@ -107,6 +133,10 @@ async function getWorkspaceInfo(
     }
   }
   return {};
+}
+
+function getClientForBackend(backendId: string): ReturnType<typeof getBackendClientForId> {
+  return getBackendClientForId(backendId);
 }
 
 function ensureDirectoryExists(dirPath: string): string | null {
@@ -202,6 +232,8 @@ class DaemonTerminal {
 }
 
 class DaemonTerminalRegistry {
+  constructor(private readonly backendId: string) {}
+
   private terminals = new Map<string, DaemonTerminal>();
   private byDaemonId = new Map<string, string>();
   private subscriptionId: string | undefined;
@@ -244,7 +276,7 @@ class DaemonTerminalRegistry {
     if (!terminal) return false;
     if (terminal.isAlive) {
       try {
-        await getBackendClient().request('terminal.kill', {
+        await getClientForBackend(this.backendId).request('terminal.kill', {
           terminalId: terminal.daemonTerminalId,
         });
       } catch (error) {
@@ -268,7 +300,7 @@ class DaemonTerminalRegistry {
   disposeAllSync(): void {
     for (const terminal of this.terminals.values()) {
       if (terminal.isAlive) {
-        getBackendClient()
+        getClientForBackend(this.backendId)
           .request('terminal.kill', { terminalId: terminal.daemonTerminalId })
           .catch(() => {});
       }
@@ -278,7 +310,7 @@ class DaemonTerminalRegistry {
   }
   private async ensureSubscription(): Promise<void> {
     if (this.subscriptionId || this.notificationDisposer) return;
-    const client = getBackendClient();
+    const client = getClientForBackend(this.backendId);
     const listener = (n: JsonRpcNotification): void => {
       if (n.method !== 'events.event') return;
       const params = n.params as { subscriptionId?: unknown; event?: unknown } | undefined;
@@ -309,16 +341,14 @@ class DaemonTerminalRegistry {
         const chunk = decodeBase64(event.data?.chunk);
         if (chunk) {
           terminal.appendOutput(chunk);
-          mainDispatch(terminalProfessionalData({ terminalId: localId, data: chunk }));
         }
       } else if (type === 'terminal:exit') {
         const exitCode = typeof event.data?.exitCode === 'number' ? event.data.exitCode : null;
         const signal = typeof event.data?.signal === 'string' ? event.data.signal : null;
         terminal.markExit(exitCode, signal);
-        mainDispatch(terminalProfessionalExit({ terminalId: localId, exitCode, signal }));
       }
     };
-    this.notificationDisposer = onBackendNotification(listener);
+    this.notificationDisposer = onBackendNotification(listener, this.backendId);
     if (!this.reconnectDisposer) {
       this.reconnectDisposer = onBackendReconnected(() => {
         // The notification listener persists across reconnects AND client swaps
@@ -329,13 +359,13 @@ class DaemonTerminalRegistry {
         // either skip it or double-register the listener depending on state.
         this.subscriptionId = undefined;
         if (this.terminals.size === 0) return;
-        void this.doSubscribe(getBackendClient());
-      });
+        void this.doSubscribe(getClientForBackend(this.backendId));
+      }, this.backendId);
     }
     await this.doSubscribe(client);
   }
 
-  private async doSubscribe(client: ReturnType<typeof getBackendClient>): Promise<void> {
+  private async doSubscribe(client: ReturnType<typeof getBackendClientForId>): Promise<void> {
     try {
       const result = await client.request<{ subscriptionId?: string }>('events.subscribe', {
         eventTypes: ['terminal:data', 'terminal:exit'],
@@ -349,43 +379,16 @@ class DaemonTerminalRegistry {
   }
 }
 
-const registry = new DaemonTerminalRegistry();
+const registries = new Map<string, DaemonTerminalRegistry>();
 
-/**
- * Backwards-compatible export shim used by MCP `ws.terminal.*` in
- * `ws-misc-api.ts`. Preserves the small surface those callers rely on
- * (`getTerminal`, `getWorkspaceTerminals`, `getInfo()`, `getBufferedOutput()`)
- * without exposing the daemon-backed internals.
- */
-export const terminalManager = {
-  getTerminal(id: string) {
-    const t = registry.getTerminal(id);
-    if (!t) return null;
-    return {
-      disposed: t.isDisposed,
-      isAlive: t.isAlive,
-      getInfo: () => t.getInfo(),
-      getBufferedOutput: () => t.getBufferedOutput(),
-    };
-  },
-  getWorkspaceTerminals(workspaceId: string) {
-    return registry.getWorkspaceTerminals(workspaceId).map((t) => ({
-      disposed: t.isDisposed,
-      isAlive: t.isAlive,
-      getInfo: () => t.getInfo(),
-      getBufferedOutput: () => t.getBufferedOutput(),
-    }));
-  },
-  disposeTerminal(id: string) {
-    return registry.dispose(id);
-  },
-  disposeAll() {
-    return registry.disposeAll();
-  },
-  disposeAllSync() {
-    registry.disposeAllSync();
-  },
-};
+function getRegistry(backendId: string): DaemonTerminalRegistry {
+  let registry = registries.get(backendId);
+  if (!registry) {
+    registry = new DaemonTerminalRegistry(backendId);
+    registries.set(backendId, registry);
+  }
+  return registry;
+}
 
 // ---------------------------------------------------------------------------
 // Core spawn helper — delegates to `terminal.create` (PROTOCOL §5.13)
@@ -400,8 +403,10 @@ async function spawnDaemonTerminal(params: {
   command?: string;
   env?: Record<string, string>;
   title?: string;
+  backendId: string;
 }): Promise<{ ok: true; terminal: DaemonTerminal } | { ok: false; error: string }> {
   try {
+    const registry = getRegistry(params.backendId);
     const request: Record<string, unknown> = {
       workspaceId: params.workspaceId,
       cols: params.cols,
@@ -410,7 +415,7 @@ async function spawnDaemonTerminal(params: {
     };
     if (params.command) request.command = params.command;
     if (params.env && Object.keys(params.env).length > 0) request.env = params.env;
-    const result = await getBackendClient().request<{ terminalId?: unknown }>(
+    const result = await getClientForBackend(params.backendId).request<{ terminalId?: unknown }>(
       'terminal.create',
       request,
     );
@@ -451,7 +456,9 @@ export function registerTerminalHandlers() {
     TERMINAL_CHANNELS.PROFESSIONAL_CREATE,
     createSafeValidatedHandler(
       TerminalProfessionalCreateSchema,
-      async (_, validated) => {
+      async (event, validated) => {
+        const backendId = getBackendIdForIpcSender(event.sender);
+        const registry = getRegistry(backendId);
         const { terminalId: providedId, workspaceId, cwd, cols = 80, rows = 24 } = validated;
 
         if (providedId) {
@@ -464,7 +471,7 @@ export function registerTerminalHandlers() {
               );
             } else {
               try {
-                await getBackendClient().request('terminal.resize', {
+                await getClientForBackend(backendId).request('terminal.resize', {
                   terminalId: existing.daemonTerminalId,
                   cols,
                   rows,
@@ -490,7 +497,7 @@ export function registerTerminalHandlers() {
           if (workspaceId === '__root__') {
             workingDir = os.homedir();
           } else {
-            const info = await getWorkspaceInfo(workspaceId);
+            const info = await getWorkspaceInfo(workspaceId, backendId);
             if (info.workspacePath) {
               workingDir = info.scope
                 ? path.join(info.workspacePath, info.scope)
@@ -507,7 +514,8 @@ export function registerTerminalHandlers() {
             error: m.terminal_ipc_workspacePathUnknown_error(),
           };
         }
-        const validatedCwd = ensureDirectoryExists(workingDir);
+        const validatedCwd =
+          backendId === LOCAL_CONNECTION_ID ? ensureDirectoryExists(workingDir) : workingDir;
         if (!validatedCwd) {
           return {
             success: false,
@@ -522,6 +530,7 @@ export function registerTerminalHandlers() {
           cwd: validatedCwd,
           cols,
           rows,
+          backendId,
         });
         if (!spawn.ok) return { success: false, error: spawn.error };
         return { success: true, terminalId: localId, cwd: validatedCwd };
@@ -534,8 +543,9 @@ export function registerTerminalHandlers() {
     TERMINAL_CHANNELS.PROFESSIONAL_LIST,
     createSafeValidatedHandler(
       TerminalProfessionalListSchema,
-      async (_, validated) => {
+      async (event, validated) => {
         try {
+          const registry = getRegistry(getBackendIdForIpcSender(event.sender));
           const { workspaceId } = validated;
           const terminals = registry.getWorkspaceTerminals(workspaceId).map((t) => ({
             id: t.id,
@@ -561,14 +571,16 @@ export function registerTerminalHandlers() {
     TERMINAL_CHANNELS.PROFESSIONAL_WRITE,
     createSafeValidatedHandler(
       TerminalProfessionalWriteSchema,
-      async (_, validated) => {
+      async (event, validated) => {
+        const backendId = getBackendIdForIpcSender(event.sender);
+        const registry = getRegistry(backendId);
         const { terminalId, data } = validated;
         const terminal = registry.getTerminal(terminalId);
         if (!terminal)
           return { success: false, error: m.terminal_ipc_notFoundWithId_error({ terminalId }) };
         if (!terminal.isAlive) return { success: false, error: m.terminal_ipc_disposed_error() };
         try {
-          await getBackendClient().request('terminal.write', {
+          await getClientForBackend(backendId).request('terminal.write', {
             terminalId: terminal.daemonTerminalId,
             data: encodeBase64(data),
           });
@@ -589,14 +601,16 @@ export function registerTerminalHandlers() {
     TERMINAL_CHANNELS.PROFESSIONAL_RESIZE,
     createSafeValidatedHandler(
       TerminalProfessionalResizeSchema,
-      async (_, validated) => {
+      async (event, validated) => {
+        const backendId = getBackendIdForIpcSender(event.sender);
+        const registry = getRegistry(backendId);
         const { terminalId, cols, rows } = validated;
         const terminal = registry.getTerminal(terminalId);
         if (!terminal)
           return { success: false, error: m.terminal_ipc_notFoundWithId_error({ terminalId }) };
         if (!terminal.isAlive) return { success: false, error: m.terminal_ipc_disposed_error() };
         try {
-          await getBackendClient().request('terminal.resize', {
+          await getClientForBackend(backendId).request('terminal.resize', {
             terminalId: terminal.daemonTerminalId,
             cols,
             rows,
@@ -618,7 +632,8 @@ export function registerTerminalHandlers() {
     TERMINAL_CHANNELS.PROFESSIONAL_INFO,
     createSafeValidatedHandler(
       TerminalProfessionalInfoSchema,
-      async (_, validated) => {
+      async (event, validated) => {
+        const registry = getRegistry(getBackendIdForIpcSender(event.sender));
         const { terminalId } = validated;
         const terminal = registry.getTerminal(terminalId);
         if (!terminal)
@@ -633,7 +648,8 @@ export function registerTerminalHandlers() {
     TERMINAL_CHANNELS.PROFESSIONAL_GET_BUFFER,
     createSafeValidatedHandler(
       TerminalProfessionalGetBufferSchema,
-      async (_, validated) => {
+      async (event, validated) => {
+        const registry = getRegistry(getBackendIdForIpcSender(event.sender));
         const { terminalId } = validated;
         const terminal = registry.getTerminal(terminalId);
         if (!terminal) return { success: false, error: m.terminal_ipc_notFound_error() };
@@ -647,13 +663,15 @@ export function registerTerminalHandlers() {
     TERMINAL_CHANNELS.PROFESSIONAL_REFRESH,
     createSafeValidatedHandler(
       TerminalProfessionalRefreshSchema,
-      async (_, validated) => {
+      async (event, validated) => {
+        const backendId = getBackendIdForIpcSender(event.sender);
+        const registry = getRegistry(backendId);
         const { terminalId } = validated;
         const terminal = registry.getTerminal(terminalId);
         if (!terminal) return { success: false, error: m.terminal_ipc_notFound_error() };
         if (!terminal.isAlive) return { success: false, error: m.terminal_ipc_disposed_error() };
         try {
-          await getBackendClient().request('terminal.write', {
+          await getClientForBackend(backendId).request('terminal.write', {
             terminalId: terminal.daemonTerminalId,
             data: encodeBase64('\r'),
           });
@@ -674,8 +692,9 @@ export function registerTerminalHandlers() {
     TERMINAL_CHANNELS.PROFESSIONAL_DISPOSE,
     createSafeValidatedHandler(
       TerminalProfessionalDisposeSchema,
-      async (_, validated) => {
+      async (event, validated) => {
         try {
+          const registry = getRegistry(getBackendIdForIpcSender(event.sender));
           await registry.dispose(validated.terminalId);
           return { success: true };
         } catch (error) {
@@ -694,7 +713,8 @@ export function registerTerminalHandlers() {
     TERMINAL_CHANNELS.CREATE_WITH_COMMAND,
     createSafeValidatedHandler(
       TerminalCreateWithCommandSchema,
-      async (_, validated) => {
+      async (event, validated) => {
+        const backendId = getBackendIdForIpcSender(event.sender);
         const { workspaceId, command, cwd, title, env, pasteOnly } = validated;
         try {
           let workingDir = cwd;
@@ -702,7 +722,7 @@ export function registerTerminalHandlers() {
             if (workspaceId === '__root__') {
               workingDir = os.homedir();
             } else {
-              const info = await getWorkspaceInfo(workspaceId);
+              const info = await getWorkspaceInfo(workspaceId, backendId);
               if (info.workspacePath) {
                 workingDir = info.scope
                   ? path.join(info.workspacePath, info.scope)
@@ -719,7 +739,8 @@ export function registerTerminalHandlers() {
               error: m.terminal_ipc_workspacePathUnknown_error(),
             };
           }
-          const validatedCwd = ensureDirectoryExists(workingDir);
+          const validatedCwd =
+            backendId === LOCAL_CONNECTION_ID ? ensureDirectoryExists(workingDir) : workingDir;
           if (!validatedCwd) {
             return {
               ok: false,
@@ -734,6 +755,7 @@ export function registerTerminalHandlers() {
             initialCommand: command,
             pasteOnly,
             env,
+            backendId,
           });
           return { ok: result.success, terminalId: result.terminalId, error: result.error };
         } catch (error) {
@@ -753,13 +775,14 @@ export function registerTerminalHandlers() {
 // ---------------------------------------------------------------------------
 
 /**
- * Create a terminal via the daemon and dispatch `terminalCreated` so the
- * renderer's terminal tabs pick it up. Used by workspace setup and by the
+ * Create a terminal via the daemon; the renderer's terminal tabs pick it up
+ * from the daemon's terminal events. Used by workspace setup and by the
  * `terminal:createWithCommand` handler above.
  */
-export async function createTerminalFromBackend(options: {
+async function createTerminalFromBackend(options: {
   workspaceId: WorkspaceId;
   cwd: string;
+  backendId?: string;
   title?: string;
   initialCommand?: string;
   /**
@@ -771,15 +794,17 @@ export async function createTerminalFromBackend(options: {
   env?: Record<string, string>;
 }): Promise<{ terminalId: string; success: boolean; error?: string }> {
   const { workspaceId, cwd, title, initialCommand, pasteOnly, env } = options;
+  const backendId = options.backendId ?? LOCAL_CONNECTION_ID;
   const workspaceInfo =
     workspaceId === '__root__'
       ? { workspacePath: undefined as string | undefined, scope: undefined as string | undefined }
-      : await getWorkspaceInfo(workspaceId);
+      : await getWorkspaceInfo(workspaceId, backendId);
   let terminalCwd = cwd;
   if (workspaceInfo.scope && workspaceInfo.workspacePath) {
     terminalCwd = path.join(workspaceInfo.workspacePath, workspaceInfo.scope);
   }
-  const validatedCwd = ensureDirectoryExists(terminalCwd);
+  const validatedCwd =
+    backendId === LOCAL_CONNECTION_ID ? ensureDirectoryExists(terminalCwd) : terminalCwd;
   if (!validatedCwd) {
     return {
       terminalId: '',
@@ -796,20 +821,11 @@ export async function createTerminalFromBackend(options: {
     rows: 24,
     env,
     title: title || m.terminal_quakeOverlay_terminal_fallback(),
+    backendId,
   });
   if (!spawn.ok) {
     return { terminalId: '', success: false, error: spawn.error };
   }
-  mainDispatch(
-    terminalCreated({
-      terminalId: localId,
-      workspaceId,
-      title: title || m.terminal_quakeOverlay_terminal_fallback(),
-      cwd: validatedCwd,
-      createdAt: new Date().toISOString(),
-      background: !!initialCommand,
-    }),
-  );
   logger.info('[Terminal] Backend terminal created via daemon', {
     terminalId: localId,
     daemonTerminalId: spawn.terminal.daemonTerminalId,
@@ -817,7 +833,7 @@ export async function createTerminalFromBackend(options: {
     cwd: validatedCwd,
   });
   if (initialCommand) {
-    const client = getBackendClient();
+    const client = getClientForBackend(backendId);
     // Give the shell a beat to render its prompt before feeding input,
     // matching the previous local-pty behaviour.
     setTimeout(() => {
@@ -841,28 +857,22 @@ export async function createTerminalFromBackend(options: {
 
 export async function cleanupTerminals(): Promise<void> {
   logger.info('[Terminal] Cleaning up all terminals');
-  await registry.disposeAll();
-}
-
-export function cleanupTerminalsSync(): void {
-  logger.info('[Terminal] Cleaning up all terminals (sync)');
-  registry.disposeAllSync();
+  await Promise.all([...registries.values()].map((registry) => registry.disposeAll()));
+  registries.clear();
 }
 
 export async function cleanupWorkspaceTerminals(workspaceId: WorkspaceId): Promise<void> {
-  const terminals = registry.getWorkspaceTerminals(workspaceId);
+  const registryEntries = [...registries.values()];
+  const terminals = registryEntries.flatMap((registry) =>
+    registry.getWorkspaceTerminals(workspaceId).map((terminal) => ({ registry, terminal })),
+  );
   if (terminals.length === 0) return;
   logger.info('[Terminal] Cleaning up workspace terminals', {
     workspaceId,
     count: terminals.length,
   });
   await Promise.all(
-    terminals.map(async (t) => {
-      const ok = await registry.dispose(t.id).catch(() => false);
-      if (ok) {
-        mainDispatch(terminalDisposed({ terminalId: t.id, workspaceId }));
-      }
-    }),
+    terminals.map(({ registry, terminal }) => registry.dispose(terminal.id).catch(() => false)),
   );
 }
 

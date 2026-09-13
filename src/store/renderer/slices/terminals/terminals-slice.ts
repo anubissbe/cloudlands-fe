@@ -1,5 +1,5 @@
-import { createAction } from "@augmentcode/themis/utils/store/create-action";
-import { createReducer } from "@augmentcode/themis/utils/store/create-reducer";
+import { createAction } from '@augmentcode/themis/utils/store/create-action';
+import { createReducer } from '@augmentcode/themis/utils/store/create-reducer';
 import {
   createCollection,
   addItem,
@@ -8,17 +8,19 @@ import {
   getItem,
   getItemIndex,
   type Collection,
-} from "@augmentcode/themis/utils/collections/collection-utils";
-import { setScriptsData } from "../scripts/scripts-slice";
+} from '@augmentcode/themis/utils/collections/collection-utils';
+import {
+  DEFAULT_TERMINAL_OVERLAY_HEIGHT,
+  clampTerminalOverlayHeight,
+  isValidTerminalOverlayHeight,
+} from '$shared/utils/terminal-overlay-height';
+import { setScriptsData } from '../scripts/scripts-slice';
 
 // ============================================================================
 // Constants
 // ============================================================================
 
-export const DEFAULT_HEIGHT = 50;
-export const MIN_HEIGHT = 20;
-export const MAX_HEIGHT = 90;
-
+/** Legacy global height key; still read as the fallback for never-resized workspaces. */
 export const STORAGE_KEY = 'terminal-overlay-height';
 export const CUSTOM_NAMES_STORAGE_KEY = 'terminal-custom-names';
 export const WORKSPACE_STATE_STORAGE_KEY = 'terminal-overlay-workspace-state';
@@ -45,13 +47,15 @@ export interface TerminalMetadata {
   title?: string;
 }
 
-/** @deprecated Use TerminalTab instead — kept for backward compatibility during migration. */
-export type WorkspaceTerminal = TerminalTab;
+/** Surface a terminal or script output was last shown on. */
+export type TerminalPlacement = 'overlay' | 'panel';
+
+export const DEFAULT_TERMINAL_PLACEMENT: TerminalPlacement = 'overlay';
 
 export interface WorkspaceTerminalState {
   isOpen: boolean;
   activeTerminalId: string | null;
-  terminals: Collection<TerminalTab, "id">;
+  terminals: Collection<TerminalTab, 'id'>;
   terminalsLoaded: boolean;
   isLoadingTerminals: boolean;
   recentlyCreatedTerminals: string[];
@@ -68,6 +72,12 @@ export interface WorkspaceTerminalState {
    * PTYs respawn via auto-reconnect). `null` until a boot id is seen.
    */
   daemonBootId: string | null;
+  /**
+   * Last surface each terminal (keyed by terminal id) or script output (keyed
+   * by script id) was shown on, so the Shell sidebar reopens it there. Missing
+   * entries read as `'overlay'`.
+   */
+  placements: Record<string, TerminalPlacement>;
 }
 
 /** Persisted subset of workspace state (terminals are loaded from terminalManager) */
@@ -76,10 +86,27 @@ export interface PersistedWorkspaceState {
   activeTerminalId: string | null;
   /** Optional for backward compat with entries persisted before it existed. */
   selectedScriptId?: string | null;
+  /** Optional for backward compat with entries persisted before it existed. */
+  height?: number;
+  /** Optional for backward compat with entries persisted before it existed. */
+  placements?: Record<string, TerminalPlacement>;
 }
 
 export type TerminalOverlayState = {
+  /** Fallback height for workspaces without their own (legacy global value or default). */
   height: number;
+  /**
+   * Per-workspace overlay heights in vh. Kept outside `workspaces` so boot
+   * hydration never materializes a workspace entry — persistence relies on the
+   * `emptyWorkspaceState` identity to skip not-yet-loaded workspaces.
+   */
+  workspaceHeights: Record<string, number>;
+  /**
+   * Stored placements per workspace, hydrated at boot and consumed by the
+   * workspace's first `loadWorkspaceTerminals`. Kept outside `workspaces` for
+   * the same reason as `workspaceHeights`.
+   */
+  workspacePlacements: Record<string, Record<string, TerminalPlacement>>;
   workspaces: Record<string, WorkspaceTerminalState>;
 };
 
@@ -90,16 +117,19 @@ export type TerminalOverlayState = {
 export const emptyWorkspaceState: WorkspaceTerminalState = {
   isOpen: false,
   activeTerminalId: null,
-  terminals: createCollection<TerminalTab, "id">("id"),
+  terminals: createCollection<TerminalTab, 'id'>('id'),
   terminalsLoaded: false,
   isLoadingTerminals: false,
   recentlyCreatedTerminals: [],
   selectedScriptId: null,
   daemonBootId: null,
+  placements: {},
 };
 
 const initialState: TerminalOverlayState = {
-  height: DEFAULT_HEIGHT,
+  height: DEFAULT_TERMINAL_OVERLAY_HEIGHT,
+  workspaceHeights: {},
+  workspacePlacements: {},
   workspaces: {},
 };
 
@@ -118,50 +148,43 @@ export function getTerminalName(termId: string): string {
 // Actions
 // ============================================================================
 
-export const openTerminalOverlay = createAction<[wsId: string, termId?: string]>(
-  "terminals/open"
-);
+export const openTerminalOverlay = createAction<[wsId: string, termId?: string]>('terminals/open');
 
-export const closeTerminalOverlay = createAction<[wsId: string]>("terminals/close");
+export const closeTerminalOverlay = createAction<[wsId: string]>('terminals/close');
 
-export const toggleTerminalOverlay = createAction<[wsId: string, termId?: string]>(
-  "terminals/toggle"
-);
+export const toggleTerminalOverlay =
+  createAction<[wsId: string, termId?: string]>('terminals/toggle');
 
 export const selectTerminal = createAction<[wsId: string, termId: string]>(
-  "terminals/selectTerminal"
+  'terminals/selectTerminal',
 );
 
-export const selectScript = createAction<[wsId: string, scriptId: string]>(
-  "terminals/selectScript"
-);
+export const selectScript =
+  createAction<[wsId: string, scriptId: string]>('terminals/selectScript');
 
-export const clearScriptSelection = createAction<[wsId: string]>(
-  "terminals/clearScriptSelection"
-);
+export const clearScriptSelection = createAction<[wsId: string]>('terminals/clearScriptSelection');
 
-export const addTerminal = createAction<[wsId: string, termId: string, name?: string]>(
-  "terminals/addTerminal"
-);
+/** Record the surface a terminal (`id` = terminal id) or script (`id` = script id) was shown on. */
+export const setTerminalPlacement =
+  createAction<[wsId: string, id: string, placement: TerminalPlacement]>('terminals/setPlacement');
+
+export const addTerminal =
+  createAction<[wsId: string, termId: string, name?: string]>('terminals/addTerminal');
 
 export const removeTerminal = createAction<[wsId: string, termId: string]>(
-  "terminals/removeTerminal"
+  'terminals/removeTerminal',
 );
 
-export const setTerminalOverlayHeight = createAction<[height: number]>(
-  "terminals/setHeight"
-);
+export const setTerminalOverlayHeight =
+  createAction<[wsId: string, height: number]>('terminals/setHeight');
 
 export const renameTerminal = createAction<[wsId: string, termId: string, newName: string]>(
-  "terminals/renameTerminal"
+  'terminals/renameTerminal',
 );
 
-export const saveTerminalMetadata = createAction<[
-  wsId: string,
-  termId: string,
-  title: string | undefined,
-  createdAt: string,
-]>("terminals/saveTerminalMetadata");
+export const saveTerminalMetadata = createAction<
+  [wsId: string, termId: string, title: string | undefined, createdAt: string]
+>('terminals/saveTerminalMetadata');
 
 /**
  * Load workspace terminals data (dispatched by the hydration paths after a
@@ -169,20 +192,35 @@ export const saveTerminalMetadata = createAction<[
  * §5.13); omitted for legacy bare-array responses, which the reducer treats
  * as carrying no boot metadata (empty lists then preserve existing tabs).
  */
-export const loadWorkspaceTerminals = createAction<[
-  wsId: string,
-  terminals: TerminalTab[],
-  savedState?: PersistedWorkspaceState | null,
-  daemonBootId?: string,
-]>("terminals/loadWorkspaceTerminals");
+export const loadWorkspaceTerminals = createAction<
+  [
+    wsId: string,
+    terminals: TerminalTab[],
+    savedState?: PersistedWorkspaceState | null,
+    daemonBootId?: string,
+  ]
+>('terminals/loadWorkspaceTerminals');
 
-/** Hydrate height from localStorage (dispatched by init saga) */
-export const hydrateHeight = createAction<[height: number]>(
-  "terminals/hydrateHeight"
-);
+/**
+ * Hydrate heights from localStorage (dispatched by init saga): the legacy
+ * global value becomes the fallback, `workspaceHeights` seeds per-workspace
+ * heights. Out-of-range entries are ignored individually.
+ */
+export const hydrateHeight =
+  createAction<[height: number, workspaceHeights?: Record<string, number>]>(
+    'terminals/hydrateHeight',
+  );
+
+/**
+ * Hydrate stored placements per workspace from localStorage (dispatched by
+ * init saga). Each workspace consumes its entry on its first terminal load.
+ */
+export const hydratePlacements = createAction<
+  [workspacePlacements: Record<string, Record<string, TerminalPlacement>>]
+>('terminals/hydratePlacements');
 
 export const createTerminalRequested = createAction<[wsId: string]>(
-  "terminals/createTerminalRequested"
+  'terminals/createTerminalRequested',
 );
 
 /**
@@ -193,24 +231,12 @@ export const createTerminalRequested = createAction<[wsId: string]>(
  * (see AGENTS.md §8); the handler lives in `lifecycle-read-service`.
  */
 export const hydrateTerminalsRequested = createAction<[wsId: string]>(
-  "terminals/hydrateTerminalsRequested"
+  'terminals/hydrateTerminalsRequested',
 );
 
 export const closeActiveTerminalRequested = createAction<[wsId: string]>(
-  "terminals/closeActiveTerminalRequested"
+  'terminals/closeActiveTerminalRequested',
 );
-
-/**
- * Signals a successful daemon `terminal.create` (PROTOCOL §5.13) from an
- * interactive create flow. Trigger-only action with no reducer entry; the
- * lifecycle read saga invalidates any in-flight `terminal.list` fetch and
- * starts a coalesced refetch so the store converges on the daemon list.
- */
-export const terminalCreated = createAction<[wsId: string]>(
-  "terminals/terminalCreated"
-);
-
-
 
 // ============================================================================
 // Reducer helpers
@@ -220,11 +246,28 @@ function getWs(state: TerminalOverlayState, wsId: string): WorkspaceTerminalStat
   return state.workspaces[wsId] || emptyWorkspaceState;
 }
 
-function setWs(state: TerminalOverlayState, wsId: string, ws: WorkspaceTerminalState): TerminalOverlayState {
+function setWs(
+  state: TerminalOverlayState,
+  wsId: string,
+  ws: WorkspaceTerminalState,
+): TerminalOverlayState {
   return { ...state, workspaces: { ...state.workspaces, [wsId]: ws } };
 }
 
-function ensureDefaultTerminal(terminals: Collection<TerminalTab, "id">, wsId: string, customNames?: Record<string, string>): { terminals: Collection<TerminalTab, "id">; defaultId: string } {
+function setWsHeight(
+  state: TerminalOverlayState,
+  wsId: string,
+  height: number,
+): TerminalOverlayState {
+  if (state.workspaceHeights[wsId] === height) return state;
+  return { ...state, workspaceHeights: { ...state.workspaceHeights, [wsId]: height } };
+}
+
+function ensureDefaultTerminal(
+  terminals: Collection<TerminalTab, 'id'>,
+  wsId: string,
+  customNames?: Record<string, string>,
+): { terminals: Collection<TerminalTab, 'id'>; defaultId: string } {
   const defaultId = `terminal-${wsId}-default`;
   if (getItem(terminals, defaultId)) {
     return { terminals, defaultId };
@@ -236,9 +279,46 @@ function ensureDefaultTerminal(terminals: Collection<TerminalTab, "id">, wsId: s
   };
 }
 
-function addTerminalIfMissing(terminals: Collection<TerminalTab, "id">, termId: string, name?: string, customName?: string, metadata?: Partial<TerminalTab>): Collection<TerminalTab, "id"> {
+function addTerminalIfMissing(
+  terminals: Collection<TerminalTab, 'id'>,
+  termId: string,
+  name?: string,
+  customName?: string,
+  metadata?: Partial<TerminalTab>,
+): Collection<TerminalTab, 'id'> {
   if (getItem(terminals, termId)) return terminals;
-  return addItem(terminals, { id: termId, name: name || getTerminalName(termId), customName, ...metadata });
+  return addItem(terminals, {
+    id: termId,
+    name: name || getTerminalName(termId),
+    customName,
+    ...metadata,
+  });
+}
+
+function withPlacement(
+  placements: Record<string, TerminalPlacement>,
+  id: string | null,
+  placement: TerminalPlacement,
+): Record<string, TerminalPlacement> {
+  if (!id || placements[id] === placement) return placements;
+  return { ...placements, [id]: placement };
+}
+
+function withoutPlacement(
+  placements: Record<string, TerminalPlacement>,
+  id: string,
+): Record<string, TerminalPlacement> {
+  if (!(id in placements)) return placements;
+  const { [id]: _removed, ...rest } = placements;
+  return rest;
+}
+
+function consumeHydratedPlacements(
+  state: TerminalOverlayState,
+  wsId: string,
+): TerminalOverlayState {
+  const { [wsId]: _consumed, ...workspacePlacements } = state.workspacePlacements;
+  return { ...state, workspacePlacements };
 }
 
 // ============================================================================
@@ -247,111 +327,158 @@ function addTerminalIfMissing(terminals: Collection<TerminalTab, "id">, termId: 
 
 export const terminalsReducer = createReducer<TerminalOverlayState>(initialState);
 terminalsReducer.with(openTerminalOverlay, (state, { payload: [wsId, termId] }) => {
-    const ws = getWs(state, wsId);
-    const newWs = { ...ws };
+  const ws = getWs(state, wsId);
+  const newWs = { ...ws };
 
-    if (termId) {
-      newWs.terminals = addTerminalIfMissing(ws.terminals, termId);
-      newWs.activeTerminalId = termId;
-      newWs.selectedScriptId = null;
-    } else if (!ws.activeTerminalId || !getItem(ws.terminals, ws.activeTerminalId)) {
-      const result = ensureDefaultTerminal(ws.terminals, wsId);
-      newWs.terminals = result.terminals;
-      newWs.activeTerminalId = result.defaultId;
-    }
+  if (termId) {
+    newWs.terminals = addTerminalIfMissing(ws.terminals, termId);
+    newWs.activeTerminalId = termId;
+    newWs.selectedScriptId = null;
+  } else if (!ws.activeTerminalId || !getItem(ws.terminals, ws.activeTerminalId)) {
+    const result = ensureDefaultTerminal(ws.terminals, wsId);
+    newWs.terminals = result.terminals;
+    newWs.activeTerminalId = result.defaultId;
+  }
 
-    newWs.isOpen = true;
-    return setWs(state, wsId, newWs);
-  });
+  // The overlay shows the selected script when one is set, else the active terminal.
+  newWs.placements = withPlacement(
+    ws.placements,
+    newWs.selectedScriptId ?? newWs.activeTerminalId,
+    'overlay',
+  );
+  newWs.isOpen = true;
+  return setWs(state, wsId, newWs);
+});
+terminalsReducer.with(setTerminalPlacement, (state, { payload: [wsId, id, placement] }) => {
+  const ws = getWs(state, wsId);
+  const placements = withPlacement(ws.placements, id, placement);
+  if (placements === ws.placements) return state;
+  return setWs(state, wsId, { ...ws, placements });
+});
 terminalsReducer.with(closeTerminalOverlay, (state, { payload: [wsId] }) => {
-    const ws = getWs(state, wsId);
-    if (!ws.isOpen) return state;
-    return setWs(state, wsId, { ...ws, isOpen: false });
-  });
+  const ws = getWs(state, wsId);
+  if (!ws.isOpen) return state;
+  return setWs(state, wsId, { ...ws, isOpen: false });
+});
 terminalsReducer.with(toggleTerminalOverlay, (state, { payload: [wsId, termId] }) => {
-    const ws = getWs(state, wsId);
-    if (ws.isOpen && !termId) {
-      return setWs(state, wsId, { ...ws, isOpen: false });
-    }
-    // Delegate to open logic
-    const newWs = { ...ws };
-    if (termId) {
-      newWs.terminals = addTerminalIfMissing(ws.terminals, termId);
-      newWs.activeTerminalId = termId;
-      newWs.selectedScriptId = null;
-    } else if (!ws.activeTerminalId || !getItem(ws.terminals, ws.activeTerminalId)) {
-      const result = ensureDefaultTerminal(ws.terminals, wsId);
-      newWs.terminals = result.terminals;
-      newWs.activeTerminalId = result.defaultId;
-    }
-    newWs.isOpen = true;
-    return setWs(state, wsId, newWs);
-  });
+  const ws = getWs(state, wsId);
+  if (ws.isOpen && !termId) {
+    return setWs(state, wsId, { ...ws, isOpen: false });
+  }
+  // Delegate to open logic
+  const newWs = { ...ws };
+  if (termId) {
+    newWs.terminals = addTerminalIfMissing(ws.terminals, termId);
+    newWs.activeTerminalId = termId;
+    newWs.selectedScriptId = null;
+  } else if (!ws.activeTerminalId || !getItem(ws.terminals, ws.activeTerminalId)) {
+    const result = ensureDefaultTerminal(ws.terminals, wsId);
+    newWs.terminals = result.terminals;
+    newWs.activeTerminalId = result.defaultId;
+  }
+  newWs.placements = withPlacement(
+    ws.placements,
+    newWs.selectedScriptId ?? newWs.activeTerminalId,
+    'overlay',
+  );
+  newWs.isOpen = true;
+  return setWs(state, wsId, newWs);
+});
+// Selecting inside an open overlay shows the target there, so it counts as an overlay placement.
 terminalsReducer.with(selectTerminal, (state, { payload: [wsId, termId] }) => {
-    const ws = getWs(state, wsId);
-    if (!getItem(ws.terminals, termId)) return state;
-    if (ws.activeTerminalId === termId && ws.selectedScriptId === null) return state;
-    return setWs(state, wsId, { ...ws, activeTerminalId: termId, selectedScriptId: null });
+  const ws = getWs(state, wsId);
+  if (!getItem(ws.terminals, termId)) return state;
+  const placements = ws.isOpen ? withPlacement(ws.placements, termId, 'overlay') : ws.placements;
+  if (
+    ws.activeTerminalId === termId &&
+    ws.selectedScriptId === null &&
+    placements === ws.placements
+  ) {
+    return state;
+  }
+  return setWs(state, wsId, {
+    ...ws,
+    activeTerminalId: termId,
+    selectedScriptId: null,
+    placements,
   });
+});
 terminalsReducer.with(selectScript, (state, { payload: [wsId, scriptId] }) => {
-    const ws = getWs(state, wsId);
-    if (ws.selectedScriptId === scriptId) return state;
-    return setWs(state, wsId, { ...ws, selectedScriptId: scriptId });
-  });
+  const ws = getWs(state, wsId);
+  const placements = ws.isOpen ? withPlacement(ws.placements, scriptId, 'overlay') : ws.placements;
+  if (ws.selectedScriptId === scriptId && placements === ws.placements) return state;
+  return setWs(state, wsId, { ...ws, selectedScriptId: scriptId, placements });
+});
 terminalsReducer.with(clearScriptSelection, (state, { payload: [wsId] }) => {
-    const ws = getWs(state, wsId);
-    if (ws.selectedScriptId === null) return state;
-    return setWs(state, wsId, { ...ws, selectedScriptId: null });
-  });
+  const ws = getWs(state, wsId);
+  if (ws.selectedScriptId === null) return state;
+  return setWs(state, wsId, { ...ws, selectedScriptId: null });
+});
 terminalsReducer.with(addTerminal, (state, { payload: [wsId, termId, name] }) => {
-    const ws = getWs(state, wsId);
-    const newTerminals = addTerminalIfMissing(ws.terminals, termId, name);
-    return setWs(state, wsId, {
-      ...ws,
-      terminals: newTerminals,
-      activeTerminalId: termId,
-      selectedScriptId: null,
-    });
+  const ws = getWs(state, wsId);
+  const newTerminals = addTerminalIfMissing(ws.terminals, termId, name);
+  return setWs(state, wsId, {
+    ...ws,
+    terminals: newTerminals,
+    activeTerminalId: termId,
+    selectedScriptId: null,
   });
+});
 terminalsReducer.with(removeTerminal, (state, { payload: [wsId, termId] }) => {
-    const ws = getWs(state, wsId);
-    const index = getItemIndex(ws.terminals, termId);
-    if (index === -1) return state;
+  const ws = getWs(state, wsId);
+  const index = getItemIndex(ws.terminals, termId);
+  if (index === -1) return state;
 
-    const newTerminals = removeItem(ws.terminals, termId);
-    let newActiveId = ws.activeTerminalId;
+  const newTerminals = removeItem(ws.terminals, termId);
+  let newActiveId = ws.activeTerminalId;
 
-    if (ws.activeTerminalId === termId) {
-      if (newTerminals.ids.length > 0) {
-        const newIndex = Math.min(index, newTerminals.ids.length - 1);
-        newActiveId = newTerminals.ids[newIndex];
-      } else {
-        newActiveId = null;
-      }
+  if (ws.activeTerminalId === termId) {
+    if (newTerminals.ids.length > 0) {
+      const newIndex = Math.min(index, newTerminals.ids.length - 1);
+      newActiveId = newTerminals.ids[newIndex];
+    } else {
+      newActiveId = null;
     }
+  }
 
-    // Close the panel when the last terminal is removed — the panel
-    // requires activeTerminalId to render, so isOpen:true with no
-    // terminals creates a stuck state.
-    const isOpen = newTerminals.ids.length > 0 ? ws.isOpen : false;
+  // Close the panel when the last terminal is removed — the panel
+  // requires activeTerminalId to render, so isOpen:true with no
+  // terminals creates a stuck state.
+  const isOpen = newTerminals.ids.length > 0 ? ws.isOpen : false;
 
-    return setWs(state, wsId, { ...ws, terminals: newTerminals, activeTerminalId: newActiveId, isOpen });
+  const next = setWs(state, wsId, {
+    ...ws,
+    terminals: newTerminals,
+    activeTerminalId: newActiveId,
+    isOpen,
+    placements: withoutPlacement(ws.placements, termId),
   });
-terminalsReducer.with(setTerminalOverlayHeight, (state, { payload: [height] }) => {
-    const clamped = Math.max(MIN_HEIGHT, Math.min(MAX_HEIGHT, height));
-    if (clamped === state.height) return state;
-    return { ...state, height: clamped };
-  });
+  const hydrated = state.workspacePlacements[wsId];
+  if (!hydrated || !(termId in hydrated)) return next;
+  return {
+    ...next,
+    workspacePlacements: {
+      ...next.workspacePlacements,
+      [wsId]: withoutPlacement(hydrated, termId),
+    },
+  };
+});
+terminalsReducer.with(setTerminalOverlayHeight, (state, { payload: [wsId, height] }) => {
+  if (!Number.isFinite(height)) return state;
+  return setWsHeight(state, wsId, clampTerminalOverlayHeight(height));
+});
 terminalsReducer.with(renameTerminal, (state, { payload: [wsId, termId, newName] }) => {
-    const ws = getWs(state, wsId);
-    const trimmedName = newName.trim() || undefined;
-    if (!getItem(ws.terminals, termId)) return state;
-    return setWs(state, wsId, {
-      ...ws,
-      terminals: updateItem(ws.terminals, { id: termId, customName: trimmedName }),
-    });
+  const ws = getWs(state, wsId);
+  const trimmedName = newName.trim() || undefined;
+  if (!getItem(ws.terminals, termId)) return state;
+  return setWs(state, wsId, {
+    ...ws,
+    terminals: updateItem(ws.terminals, { id: termId, customName: trimmedName }),
   });
-terminalsReducer.with(saveTerminalMetadata, (state, { payload: [wsId, termId, title, createdAt] }) => {
+});
+terminalsReducer.with(
+  saveTerminalMetadata,
+  (state, { payload: [wsId, termId, title, createdAt] }) => {
     const ws = getWs(state, wsId);
     const existing = getItem(ws.terminals, termId);
     // No explicit title must never clobber a daemon-provided name (e.g.
@@ -361,7 +488,7 @@ terminalsReducer.with(saveTerminalMetadata, (state, { payload: [wsId, termId, ti
       ...(existing ?? { id: termId }),
       id: termId,
       name,
-      type: existing?.type ?? "terminal",
+      type: existing?.type ?? 'terminal',
       workspaceId: wsId,
       createdAt: existing?.createdAt ?? createdAt,
     };
@@ -371,9 +498,20 @@ terminalsReducer.with(saveTerminalMetadata, (state, { payload: [wsId, termId, ti
       : addItem(ws.terminals, terminal);
 
     return setWs(state, wsId, { ...ws, terminals });
-  });
-terminalsReducer.with(loadWorkspaceTerminals, (state, { payload: [wsId, terminals, savedState, daemonBootId] }) => {
-    const collection = createCollection<TerminalTab, "id">("id", terminals);
+  },
+);
+terminalsReducer.with(
+  loadWorkspaceTerminals,
+  (rawState, { payload: [wsId, terminals, savedState, daemonBootId] }) => {
+    const withHeight =
+      savedState?.height !== undefined && isValidTerminalOverlayHeight(savedState.height)
+        ? setWsHeight(rawState, wsId, savedState.height)
+        : rawState;
+    // The hydrated entry seeds the first load (in-memory changes win), then
+    // the loaded workspace state is authoritative.
+    const hydrated = withHeight.workspacePlacements[wsId];
+    const state = hydrated ? consumeHydratedPlacements(withHeight, wsId) : withHeight;
+    const collection = createCollection<TerminalTab, 'id'>('id', terminals);
     const prior = getWs(state, wsId);
     const nextBootId = daemonBootId ?? prior.daemonBootId;
     let wsState: WorkspaceTerminalState;
@@ -381,6 +519,9 @@ terminalsReducer.with(loadWorkspaceTerminals, (state, { payload: [wsId, terminal
       (savedState?.selectedScriptId !== undefined
         ? savedState.selectedScriptId
         : prior.selectedScriptId) ?? null;
+    const placements =
+      savedState?.placements ??
+      (hydrated ? { ...hydrated, ...prior.placements } : prior.placements);
 
     if (terminals.length > 0) {
       let activeId: string | null;
@@ -388,17 +529,29 @@ terminalsReducer.with(loadWorkspaceTerminals, (state, { payload: [wsId, terminal
 
       if (savedState) {
         isOpen = savedState.isOpen;
-        activeId = (savedState.activeTerminalId && getItem(collection, savedState.activeTerminalId))
-          ? savedState.activeTerminalId
-          : collection.ids[0];
+        activeId =
+          savedState.activeTerminalId && getItem(collection, savedState.activeTerminalId)
+            ? savedState.activeTerminalId
+            : collection.ids[0];
       } else {
         isOpen = prior.isOpen;
-        activeId = (prior.activeTerminalId && getItem(collection, prior.activeTerminalId))
-          ? prior.activeTerminalId
-          : collection.ids[0];
+        activeId =
+          prior.activeTerminalId && getItem(collection, prior.activeTerminalId)
+            ? prior.activeTerminalId
+            : collection.ids[0];
       }
 
-      wsState = { terminals: collection, isOpen, activeTerminalId: activeId, terminalsLoaded: false, isLoadingTerminals: false, recentlyCreatedTerminals: [], selectedScriptId, daemonBootId: nextBootId };
+      wsState = {
+        terminals: collection,
+        isOpen,
+        activeTerminalId: activeId,
+        terminalsLoaded: false,
+        isLoadingTerminals: false,
+        recentlyCreatedTerminals: [],
+        selectedScriptId,
+        daemonBootId: nextBootId,
+        placements,
+      };
     } else if (prior.terminals.ids.length > 0) {
       const sameBootAuthoritativeEmpty =
         daemonBootId !== undefined &&
@@ -406,28 +559,30 @@ terminalsReducer.with(loadWorkspaceTerminals, (state, { payload: [wsId, terminal
         daemonBootId === prior.daemonBootId;
 
       if (!sameBootAuthoritativeEmpty) {
-        if (nextBootId === prior.daemonBootId) return state;
-        return setWs(state, wsId, { ...prior, daemonBootId: nextBootId });
+        if (nextBootId === prior.daemonBootId && placements === prior.placements) return state;
+        return setWs(state, wsId, { ...prior, daemonBootId: nextBootId, placements });
       }
 
       const kept = prior.terminals.ids
         .filter((id) => prior.recentlyCreatedTerminals.includes(id))
         .map((id) => getItem(prior.terminals, id))
         .filter((tab): tab is TerminalTab => tab !== undefined);
-      const keptCollection = createCollection<TerminalTab, "id">("id", kept);
+      const keptCollection = createCollection<TerminalTab, 'id'>('id', kept);
       const activeId =
         prior.activeTerminalId && getItem(keptCollection, prior.activeTerminalId)
           ? prior.activeTerminalId
-          : keptCollection.ids[0] ?? null;
+          : (keptCollection.ids[0] ?? null);
       wsState = {
         ...prior,
         terminals: keptCollection,
         activeTerminalId: activeId,
-        isOpen: keptCollection.ids.length > 0
-          ? prior.isOpen
-          : selectedScriptId !== null && (savedState ? savedState.isOpen : prior.isOpen),
+        isOpen:
+          keptCollection.ids.length > 0
+            ? prior.isOpen
+            : selectedScriptId !== null && (savedState ? savedState.isOpen : prior.isOpen),
         selectedScriptId,
         daemonBootId: nextBootId,
+        placements,
       };
     } else {
       // Don't restore isOpen when there are no terminals — the panel
@@ -436,7 +591,7 @@ terminalsReducer.with(loadWorkspaceTerminals, (state, { payload: [wsId, terminal
       // (first click closes an invisible panel, second click finally
       // creates a default terminal and opens it).
       wsState = {
-        terminals: createCollection<TerminalTab, "id">("id"),
+        terminals: createCollection<TerminalTab, 'id'>('id'),
         activeTerminalId: null,
         isOpen: selectedScriptId !== null && (savedState ? savedState.isOpen : prior.isOpen),
         terminalsLoaded: false,
@@ -444,23 +599,39 @@ terminalsReducer.with(loadWorkspaceTerminals, (state, { payload: [wsId, terminal
         recentlyCreatedTerminals: [],
         selectedScriptId,
         daemonBootId: nextBootId,
+        placements,
       };
     }
 
     return setWs(state, wsId, wsState);
-  });
-terminalsReducer.with(hydrateHeight, (state, { payload: [height] }) => {
-    if (height < MIN_HEIGHT || height > MAX_HEIGHT) return state;
-    return { ...state, height };
-  });
+  },
+);
+terminalsReducer.with(hydrateHeight, (state, { payload: [height, workspaceHeights] }) => {
+  let next = state;
+  if (isValidTerminalOverlayHeight(height) && height !== state.height) {
+    next = { ...next, height };
+  }
+  for (const [wsId, wsHeight] of Object.entries(workspaceHeights ?? {})) {
+    if (!isValidTerminalOverlayHeight(wsHeight)) continue;
+    next = setWsHeight(next, wsId, wsHeight);
+  }
+  return next;
+});
+terminalsReducer.with(hydratePlacements, (state, { payload: [workspacePlacements] }) => {
+  if (Object.keys(workspacePlacements).length === 0) return state;
+  return {
+    ...state,
+    workspacePlacements: { ...state.workspacePlacements, ...workspacePlacements },
+  };
+});
 
 terminalsReducer.with(setScriptsData, (state, { payload: { wsId, scripts } }) => {
-    const ws = state.workspaces[wsId];
-    if (!ws?.selectedScriptId) return state;
-    if (scripts.some((script) => script.id === ws.selectedScriptId)) return state;
-    return setWs(state, wsId, {
-      ...ws,
-      selectedScriptId: null,
-      isOpen: ws.activeTerminalId !== null ? ws.isOpen : false,
-    });
+  const ws = state.workspaces[wsId];
+  if (!ws?.selectedScriptId) return state;
+  if (scripts.some((script) => script.id === ws.selectedScriptId)) return state;
+  return setWs(state, wsId, {
+    ...ws,
+    selectedScriptId: null,
+    isOpen: ws.activeTerminalId !== null ? ws.isOpen : false,
   });
+});

@@ -13,7 +13,6 @@
 
 import { describe, it, expect, vi, beforeAll } from 'vitest';
 import { SPECIALISTS, getSpecialistById } from '../../src/lib/constants/specialists';
-import { common, taskBreakdown, workspace } from '../../src/features/agent/main/instructions';
 import {
   formatSpecialistsForPrompt,
   initSpecialistsService,
@@ -55,9 +54,9 @@ describe('Specialist Prompts Verification', () => {
         'verifier',
         'pr-reviewer',
         'ui-designer',
+        'vulnerability-scanner',
         'developer',
         'chief-of-staff',
-        'ralph',
       ]);
     });
 
@@ -113,35 +112,36 @@ describe('Specialist Prompts Verification', () => {
       expect(chief!.defaultBehaviorPrompt).toContain('confirmation cards');
       expect(chief!.defaultBehaviorPrompt).toContain('NavLink');
     });
-  });
 
-  describe('Delegation Instructions in Prompts', () => {
-    it('common instructions should contain delegation guidance', () => {
-      expect(common).toContain('Before delegating');
-      expect(common).toContain('list the tasks');
-      expect(common).toContain('ws.agent.delegate');
-      expect(common).toContain('Never use `ws.agent.create` for tasks that already have IDs');
-    });
+    it('chief-of-staff should document positional completion-only messaging', () => {
+      const prompt = getSpecialistById('chief-of-staff')!.defaultBehaviorPrompt;
 
-    it('common instructions should contain waitMode examples', () => {
-      expect(common).toContain('waitMode: "after_all"');
-    });
-
-    // Note: implement instruction tests removed - implement.ts was deleted as unused
-  });
-
-  describe('Task Block and Delegation Patterns', () => {
-    it('task breakdown should use task blocks, not checkbox lists', () => {
-      expect(taskBreakdown).toContain('Do not use markdown checkbox lists');
-      expect(taskBreakdown).toContain('task block');
-    });
-
-    it('workspace instructions should contain core workspace concepts', () => {
-      // Tests updated to match current workspace.ts content
-      expect(workspace).toContain('Space');
-      expect(workspace).toContain('notes');
-      expect(workspace).toContain('ws.agent.delegate');
-      expect(workspace).toContain('ws.note.read');
+      expect(prompt).toContain('ws.app.agents.send(agentId, message, priority?)');
+      expect(prompt).toContain('ws.app.agents.ask(agentId, message, priority?)');
+      expect(prompt).toContain('one wake only when the target completes');
+      expect(prompt).toContain('readConversation(asked.send.workspaceId, asked.send.agentId');
+      expect(prompt).toContain(
+        'const finalAssistant = [...conversation.messages].reverse().find((message) => message.role === "assistant" && typeof message.id === "string" && message.id.length > 0)',
+      );
+      expect(prompt).toContain(
+        '[${conversation.workspaceTitle}](intent://local/${conversation.workspaceId}/agent/${conversation.agentId}/message/${finalAssistant.id})',
+      );
+      expect(prompt).toContain('Build this URL only from the `readConversation` result');
+      expect(prompt).toContain('Use `conversation.workspaceTitle` as the visible link label');
+      expect(prompt).toContain(
+        'Never use `asked.send.workspaceId`, `asked.send.agentId`, `asked.send.messageId`',
+      );
+      expect(prompt).toContain('a `chief_message` source ID');
+      expect(prompt).toContain('a user-role message ID');
+      expect(prompt).toContain(
+        'Never expose a raw workspace ID or agent ID in relay prose or link text',
+      );
+      expect(prompt).not.toContain(
+        'Resolve the live workspace title with `ws.app.workspaces.list({ filter: {}, sort: {} })`',
+      );
+      expect(prompt).not.toContain('"/agent/" + asked.send.agentId');
+      expect(prompt).not.toContain('ws.app.agents.send({ agentId, message, priority? })');
+      expect(prompt).not.toContain('ws.app.agents.ask({ agentId, message, priority? })');
     });
   });
 
@@ -157,6 +157,9 @@ describe('Specialist Prompts Verification', () => {
       // All specialists should be included so agents know about them
       expect(formatted).toContain('Coordinator');
       expect(formatted).toContain('spec-writer');
+      expect(formatted).toContain(
+        '| **Vulnerability Scanner** | `vulnerability-scanner` | Finds real, exploitable security vulnerabilities in code |',
+      );
     });
 
     it('should include usage examples', async () => {
@@ -179,8 +182,6 @@ describe('Specialist Prompts Verification', () => {
 
     it('each specialist prompt should be substantial', () => {
       for (const specialist of SPECIALISTS) {
-        // Ralph gets its prompt via ralph-loop agentType instruction, not defaultBehaviorPrompt
-        if (specialist.id === 'ralph') continue;
         expect(specialist.defaultBehaviorPrompt.length).toBeGreaterThan(100);
         expect(specialist.description.length).toBeGreaterThan(10);
         expect(specialist.name.length).toBeGreaterThan(3);

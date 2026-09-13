@@ -13,7 +13,9 @@ import type {
   ConnectionRecord,
   ConnectionAuthRejectedEvent,
   ConnectionCertMismatchEvent,
+  ConnectionHostCertWarning,
   ConnectionProtocolMismatchEvent,
+  KeychainSyncStateResult,
 } from '$shared/types/connections';
 import type { Collection } from '@augmentcode/themis/utils/collections/collection-utils';
 
@@ -24,18 +26,31 @@ export type {
   CaptureFingerprintResult,
   ConnectionRecord,
   ConnectionsListResult,
+  OpenConnectionResult,
+  RotateConnectionSecretParams,
+  RotateConnectionSecretResult,
+  TestConnectionParams,
+  TestConnectionResult,
+  UpdateConnectionParams,
+  UpdateConnectionResult,
+  ConnectionOpenStatus,
+  UpdateBackendResult,
   ConnectionAuthRejectedEvent,
   ConnectionCertMismatchEvent,
+  ConnectionCertWarningsEvent,
+  ConnectionHostCertWarning,
   ConnectionProtocolMismatchEvent,
+  KeychainSyncStateResult,
+  KeychainSyncUiStatus,
 } from '$shared/types/connections';
 
 /**
- * Status of the current connect/switch operation (add or switch).
+ * Status of the current connect operation (add or open).
  *   - `idle`       → no operation in flight.
- *   - `connecting` → an add/switch invoke is pending.
+ *   - `connecting` → an add/open invoke is pending.
  *   - `error`      → the last operation failed (see `error`).
  */
-export type ConnectionOpStatus = 'idle' | 'connecting' | 'error';
+type ConnectionOpStatus = 'idle' | 'connecting' | 'error';
 
 /**
  * Connections slice state.
@@ -45,10 +60,42 @@ export interface ConnectionsState {
   connections: Collection<ConnectionRecord, 'id'>;
   /** id of the active connection (`LOCAL_CONNECTION_ID` for the local sidecar). */
   activeId: string;
-  /** Status of the in-flight add/switch operation. */
+  /** Backend bound to this renderer window. */
+  windowBackendId: string;
+  /**
+   * True once at least one `connectionsListReceived` has landed. Until then
+   * `activeId` is still the boot-time `LOCAL_CONNECTION_ID` default and must
+   * not be trusted as the true active backend — destructive backend-scoped
+   * work (e.g. workspace-tab reconciliation) gates on this flag.
+   */
+  hasReceivedList: boolean;
+  /**
+   * The app's pinned intentd version (from the `connections:list` result), or
+   * null before the list has loaded or when the pin file is missing/malformed.
+   * Compared against each remote's captured `daemonVersion`.
+   */
+  pinnedVersion: string | null;
+  /**
+   * ids of the connections with a live, currently-connected client in main's
+   * pool (from the `connections:list` result / `connections:changed` push).
+   * Gates connected-only actions (the remote Update button). Empty until the
+   * first list payload carrying the field lands.
+   */
+  connectedIds: string[];
+  /** Status of the in-flight add/open operation. */
   status: ConnectionOpStatus;
-  /** Error message from the last failed add/switch operation, or null. */
+  /** Error message from the last failed add/open operation, or null. */
   error: string | null;
+  /**
+   * One entry per open operation currently in flight, keyed by backend id (a
+   * multiset — a repeat open of the same id adds a second entry). Opens run
+   * concurrently (main serializes the underlying work), so each is tracked
+   * for per-row UI feedback. `status` alone is not the busy signal: a failed
+   * open sets it to `error` while other opens may still be tracked here. Gate
+   * busy UI on `selectIsConnecting` (`status === 'connecting'` OR this list is
+   * non-empty), never on `status` by itself.
+   */
+  openingIds: string[];
   /**
    * Last cert-mismatch push (`connections:cert-mismatch`), or null. A pinned
    * cert changed on (re)connect — the UI surfaces a blocking failure modal
@@ -56,13 +103,22 @@ export interface ConnectionsState {
    */
   certMismatch: ConnectionCertMismatchEvent | null;
   /**
+   * NON-FATAL per-host cert warnings by connection id, from the
+   * `connections:cert-warnings` push (latest fingerprint per host, accumulated
+   * across reconnect attempts by main). Informative only — never blocks a
+   * connection or a retry. An empty pushed `warnings` array clears the entry
+   * (main built a fresh client for the id). The wire's array payload is
+   * converted to a host-keyed `Collection` at the slice boundary.
+   */
+  certWarnings: Record<string, Collection<ConnectionHostCertWarning, 'host'>>;
+  /**
    * Last auth-rejected push (`connections:auth-rejected`), or null. The remote
    * backend rejected the WebSocket upgrade with HTTP 401/403 (bad/rotated
    * token, or the WS API is disabled) — retrying with the same token cannot
-   * succeed, so the UI surfaces a "re-pair or switch" state instead of the
+   * succeed, so the UI surfaces a "re-pair or open local" state instead of the
    * generic cannot-connect overlay. Latched per connection id: selectors gate
-   * visibility on the active connection, and a new add/switch operation clears
-   * it (a re-pair refreshes the token; a switch changes the target).
+   * visibility on this window's connection, and a new add/open operation clears
+   * it (a re-pair refreshes the token; a fresh open rebuilds the client).
    */
   authRejected: ConnectionAuthRejectedEvent | null;
   /**
@@ -70,15 +126,21 @@ export interface ConnectionsState {
    * remote's `protocolVersion` differs in major version from the local
    * intentd's — warn-but-allow (the connection still proceeds). Kept while the
    * mismatched backend stays active so the daemon-status menu can show a
-   * persistent warning; selectors gate visibility on the active connection id.
+   * persistent warning; selectors gate visibility on this window's connection id.
    */
   protocolMismatch: ConnectionProtocolMismatchEvent | null;
   /**
    * Whether the user has dismissed the advisory protocol-mismatch modal for the
    * current {@link protocolMismatch}. Reset to `false` on each new push so a
-   * later switch to a mismatched backend shows the modal again — except for
+   * later connect to a mismatched backend shows the modal again — except for
    * boot-origin pushes (`origin: 'boot'`), which set it to `true` up front so
    * only the persistent menu warning shows; the menu warning ignores this flag.
    */
   protocolMismatchModalDismissed: boolean;
+  /**
+   * iCloud-keychain backend sync state (`connections:sync-get-state` result),
+   * or null before the settings UI first loads it. `status` inside is
+   * refreshed live by the `connections:sync-status-changed` push.
+   */
+  keychainSync: KeychainSyncStateResult | null;
 }

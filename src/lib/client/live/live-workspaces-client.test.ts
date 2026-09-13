@@ -69,6 +69,46 @@ describe('LiveWorkspacesClient mutations (fake transport)', () => {
     expect(parsed.progressId).toBe(progressId);
   });
 
+  it('create forwards contextLinks on the wire (PROTOCOL §5.1)', async () => {
+    mockedRequest.mockResolvedValueOnce({ id: 'ws-1' });
+    const client = new LiveWorkspacesClient();
+    const contextLinks = [
+      {
+        kind: 'pr' as const,
+        url: 'https://github.com/acme/widgets/pull/42',
+        owner: 'acme',
+        repo: 'widgets',
+        number: 42,
+      },
+      {
+        kind: 'issue' as const,
+        url: 'https://github.com/acme/widgets/issues/7',
+        owner: 'acme',
+        repo: 'widgets',
+        number: 7,
+      },
+    ];
+
+    await client.create({
+      title: 'With context links',
+      branch: 'feature/pr-head',
+      baseRef: 'main',
+      contextLinks,
+    } as CreateWorkspaceRequest);
+
+    expect(mockedRequest).toHaveBeenCalledWith(
+      'workspace.create',
+      expect.objectContaining({ contextLinks, branch: 'feature/pr-head', baseRef: 'main' }),
+      { timeoutMs: 120_000 },
+    );
+    // The wire params (minus the per-call idempotencyKey) must satisfy the
+    // shared request schema, which now admits contextLinks.
+    const [, params] = mockedRequest.mock.calls[0];
+    const { idempotencyKey: _ignored, ...request } = params as Record<string, unknown>;
+    const parsed = CreateWorkspaceRequestSchema.parse(request);
+    expect(parsed.contextLinks).toEqual(contextLinks);
+  });
+
   it("create surfaces the daemon's { workspace } normalized on the result", async () => {
     // PROTOCOL §5.1: workspace.create → { workspace: Workspace }. The legacy
     // `workspace:create` bridge hands this to the creation flow as
@@ -91,6 +131,23 @@ describe('LiveWorkspacesClient mutations (fake transport)', () => {
       title: 'Fresh',
       branch: 'intent/fresh',
     });
+  });
+
+  it('open sends the exact workspace.get request and unwraps the protocol response', async () => {
+    const workspace = {
+      id: '77777777-7777-4777-8777-777777777777',
+      title: 'Warm refresh workspace',
+      branch: 'intent/warm-refresh',
+      status: 'Active',
+    };
+    mockedRequest.mockResolvedValueOnce({ workspace });
+    const client = new LiveWorkspacesClient();
+
+    const result = await client.open(workspace.id);
+
+    expect(mockedRequest).toHaveBeenCalledOnce();
+    expect(mockedRequest).toHaveBeenCalledWith('workspace.get', { workspaceId: workspace.id });
+    expect(result).toMatchObject({ id: workspace.id, title: workspace.title });
   });
 
   it('create surfaces the daemon-assigned initialAgent on the result', async () => {
@@ -244,6 +301,39 @@ describe('LiveWorkspacesClient mutations (fake transport)', () => {
     const firstKey = (mockedRequest.mock.calls[0][1] as { idempotencyKey: string }).idempotencyKey;
     const secondKey = (mockedRequest.mock.calls[1][1] as { idempotencyKey: string }).idempotencyKey;
     expect(firstKey).not.toEqual(secondKey);
+  });
+
+  it('create preserves a proposal idempotencyKey on the exact workspace.create wire request', async () => {
+    mockedRequest.mockResolvedValueOnce({
+      workspace: {
+        id: '77777777-7777-4777-8777-777777777777',
+        title: 'Sibling follow-up',
+        branch: 'intent/sibling-follow-up',
+        status: 'Active',
+      },
+    });
+    const client = new LiveWorkspacesClient();
+    const request: CreateWorkspaceRequest = {
+      idempotencyKey: 'sibling-proposal-stable-key',
+      title: 'Sibling follow-up',
+      repositoryPath: '/repo/current',
+      baseRef: 'feature/dependency',
+      initialAgent: {
+        name: 'Coordinator',
+        prompt: 'Continue the separate follow-up.',
+        specialist: 'implementor',
+      },
+    };
+
+    const result = await client.create(request);
+
+    expect(mockedRequest).toHaveBeenCalledExactlyOnceWith('workspace.create', request, {
+      timeoutMs: 120_000,
+    });
+    expect(result).toMatchObject({
+      success: true,
+      workspace: { id: '77777777-7777-4777-8777-777777777777', title: 'Sibling follow-up' },
+    });
   });
 
   it('delete forwards workspace.delete with the workspaceId and 120s timeout override', async () => {
@@ -819,4 +909,94 @@ describe('LiveWorkspacesClient context (PROTOCOL §5.1, fake transport)', () => 
 
     expect(await client.updateContext('ws-abc', [good] as never)).toEqual([good]);
   });
+});
+
+describe('LiveWorkspacesClient browser client pin (REV-2 PROTOCOL §5.17, fake transport)', () => {
+  afterEach(() => vi.clearAllMocks());
+
+  it('getBrowserClient sends { workspaceId } and unwraps the browserClient envelope', async () => {
+    const browserClient = {
+      clientId: 'cli-desk',
+      source: 'workspace',
+      resolved: { clientId: 'cli-desk', name: 'Intent Desktop' },
+    };
+    mockedRequest.mockResolvedValueOnce({ browserClient });
+    const client = new LiveWorkspacesClient();
+
+    expect(await client.getBrowserClient('ws-abc')).toEqual(browserClient);
+    expect(mockedRequest).toHaveBeenCalledWith('workspace.getBrowserClient', {
+      workspaceId: 'ws-abc',
+    });
+  });
+
+  it('getBrowserClient surfaces the unpinned default shape (no clientId, resolved may be null)', async () => {
+    mockedRequest.mockResolvedValueOnce({ browserClient: { source: 'default', resolved: null } });
+    const client = new LiveWorkspacesClient();
+
+    expect(await client.getBrowserClient('ws-abc')).toEqual({ source: 'default', resolved: null });
+  });
+
+  it('setBrowserClient sends the pinned clientId and returns the new pin state', async () => {
+    const browserClient = {
+      clientId: 'cli-laptop',
+      source: 'workspace',
+      resolved: { clientId: 'cli-laptop', name: 'Intent Desktop' },
+    };
+    mockedRequest.mockResolvedValueOnce({ browserClient });
+    const client = new LiveWorkspacesClient();
+
+    expect(await client.setBrowserClient('ws-abc', 'cli-laptop')).toEqual(browserClient);
+    expect(mockedRequest).toHaveBeenCalledWith('workspace.setBrowserClient', {
+      workspaceId: 'ws-abc',
+      clientId: 'cli-laptop',
+    });
+  });
+
+  it('setBrowserClient sends an explicit JSON null to clear the pin', async () => {
+    mockedRequest.mockResolvedValueOnce({
+      browserClient: { source: 'default', resolved: { clientId: 'cli-desk' } },
+    });
+    const client = new LiveWorkspacesClient();
+
+    await client.setBrowserClient('ws-abc', null);
+    expect(mockedRequest).toHaveBeenCalledWith('workspace.setBrowserClient', {
+      workspaceId: 'ws-abc',
+      clientId: null,
+    });
+  });
+
+  it('setBrowserClient propagates the daemon -32602 for an unknown clientId', async () => {
+    mockedRequest.mockRejectedValueOnce(
+      new BackendError({ code: 'INVALID_PARAMS', message: 'unknown clientId', rpcCode: -32602 }),
+    );
+    const client = new LiveWorkspacesClient();
+
+    await expect(client.setBrowserClient('ws-abc', 'cli-nope')).rejects.toMatchObject({
+      rpcCode: -32602,
+    });
+  });
+
+  it.each([
+    ['an unknown source', { source: 'bogus', resolved: null }],
+    // `clientId` is the pin: present exactly when `source: "workspace"`.
+    ['source "workspace" without the pinned clientId', { source: 'workspace', resolved: null }],
+    [
+      'source "default" carrying a clientId',
+      { source: 'default', clientId: 'cli-desk', resolved: null },
+    ],
+    [
+      'a resolved entry without clientId',
+      { source: 'workspace', clientId: 'cli-desk', resolved: { name: 'Intent Desktop' } },
+    ],
+  ])(
+    'rejects a malformed browserClient envelope (%s) instead of healing it',
+    async (_case, bad) => {
+      mockedRequest.mockResolvedValueOnce({ browserClient: bad });
+      const client = new LiveWorkspacesClient();
+
+      await expect(client.getBrowserClient('ws-abc')).rejects.toThrow(
+        'Invalid workspace.getBrowserClient response shape',
+      );
+    },
+  );
 });

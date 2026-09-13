@@ -14,8 +14,11 @@ type KnownWindowEventName =
   | 'editor:selection-change'
   | 'file:changed'
   | 'file:restore-scroll-position'
+  // Browser-emitted built-in event; fired when the window regains OS focus.
+  // Consumed by a saga via takeEveryFromWindowEvent (`lifecycle-read-saga.ts`)
+  // to reconcile workspace deltas missed while unfocused.
+  | 'focus'
   | 'navigate-message'
-  | 'note-content-update'
   | 'note:restore-scroll-position'
   | 'panel:focus-content'
   // Browser-emitted built-in event; consumed by a saga via takeEveryFromWindowEvent
@@ -27,6 +30,7 @@ type KnownWindowEventName =
   | 'theme-changed'
   | 'workspace:go-to-line'
   | 'workspace:new-terminal'
+  | 'workspace:tab-moved'
   | 'workspace:toggle-left-sidebar'
   // Orphan listener saga (`watchWaitingForFirstMessageSaga` in
   // workspace-agents-saga.ts) — no dispatcher exists today. Tracked as a
@@ -67,11 +71,21 @@ export type WorkspaceNewTerminalDetail = {
   workspaceId: string;
 };
 
+export type WorkspaceTabMovedDetail = {
+  workspaceId: string;
+  position: number;
+};
+
 export function dispatchWindowEvent(eventName: WindowEventName): void;
 export function dispatchWindowEvent(
   eventName: 'workspace:new-terminal',
   detail: WorkspaceNewTerminalDetail,
   options?: WindowEventOptions<WorkspaceNewTerminalDetail>,
+): void;
+export function dispatchWindowEvent(
+  eventName: 'workspace:tab-moved',
+  detail: WorkspaceTabMovedDetail,
+  options?: WindowEventOptions<WorkspaceTabMovedDetail>,
 ): void;
 export function dispatchWindowEvent<T>(
   eventName: WindowEventName,

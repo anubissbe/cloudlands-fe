@@ -22,6 +22,7 @@
     selectTransferArchiveSource,
     selectTransferDestinationValue,
     selectTransferDownloadFilePath,
+    selectTransferFailurePhase,
     selectTransferFinalizeError,
     selectTransferFinalizeStatus,
     selectTransferInterruptedAgents,
@@ -49,6 +50,7 @@
   const runStatus$ = selectTransferRunStatus();
   const progress$ = selectTransferProgress();
   const runError$ = selectTransferRunError();
+  const failurePhase$ = selectTransferFailurePhase();
   const restartAgents$ = selectTransferRestartAgents();
   const downloadFilePath$ = selectTransferDownloadFilePath();
   const interruptedAgents$ = selectTransferInterruptedAgents();
@@ -69,6 +71,7 @@
   runStatus={$runStatus$}
   progress={$progress$}
   runError={$runError$}
+  failurePhase={$failurePhase$}
   restartAgents={$restartAgents$}
   downloadFilePath={$downloadFilePath$}
   interruptedAgents={$interruptedAgents$}
@@ -83,5 +86,5 @@
   onRetry={() => appStore.dispatch(transferStartRequested())}
   onSetRestartAgents={(value) => appStore.dispatch(setTransferRestartAgents(value))}
   onSetArchiveSource={(value) => appStore.dispatch(setTransferArchiveSource(value))}
-  onFinalize={(switchToTarget) => appStore.dispatch(transferFinalizeRequested({ switchToTarget }))}
+  onFinalize={(openTarget) => appStore.dispatch(transferFinalizeRequested({ openTarget }))}
 />

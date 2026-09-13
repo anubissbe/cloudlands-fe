@@ -7,7 +7,7 @@
   import { backgroundGitActionsService } from '$features/accept-changes/background-git-actions.service';
   import { invoke } from '$shared/generated/ipc-client';
 
-  import { recomputeAgentLocks } from '$store/renderer/slices/agent-lock/agent-lock-slice';
+  import { hydrateAgentLocks } from '$features/file-tracking/file-tracking.client';
   import {
     selectStagedWorkingChanges as selectFtStagedChanges,
     selectUnstagedWorkingChanges as selectFtUnstagedChanges,
@@ -28,6 +28,8 @@
   import { gitCache } from '$features/git/git-cache';
   import {
     loadGitStatus,
+    acceptChangesConsumerMounted,
+    acceptChangesConsumerUnmounted,
     setPostMergeState,
     setGitOperationFlag,
   } from '$store/renderer/slices/git/git-slice';
@@ -85,8 +87,6 @@
   import PRSection from './PRSection.svelte';
   import { store as appStore } from '$store/renderer/store';
   import type { PanelTab } from '$store/renderer/slices/panel-layout/panel-layout-types';
-  import { getPanelTabOpenState } from '$store/renderer/slices/panel-layout/panel-layout-selectors';
-  import OpenPanelIndicator from './OpenPanelIndicator.svelte';
 
   interface Props {
     workspaceId: string;
@@ -95,7 +95,7 @@
     /** Whether the active file is from the staged list (true) or unstaged list (false) */
     activeFileStaged?: boolean | null;
     isAllChangesViewActive?: boolean;
-    onOpenChange?: (change: TrackedChange) => void;
+    onOpenChange?: (change: TrackedChange, event?: MouseEvent | KeyboardEvent) => void;
     onOpenFullPanel?: () => void;
     onOpenNote?: (noteId: string) => void;
     /** Callback to open the code review panel */
@@ -193,6 +193,7 @@
         $activePullRequest$,
         constructPrUrl,
         getPRDisplayTitle,
+        workspaceRepo,
       ),
       $prMonitors$,
       workspaceRepo,
@@ -284,6 +285,12 @@
 
   const githubAuthIsAuthenticated$ = selectGitHubAuthIsAuthenticated();
 
+  $effect(() => {
+    const visibleWorkspaceId = workspaceId;
+    appStore.dispatch(acceptChangesConsumerMounted(visibleWorkspaceId));
+    return () => appStore.dispatch(acceptChangesConsumerUnmounted(visibleWorkspaceId));
+  });
+
   // Git operation loading flag — used by the refresh button spinner
   const isRefreshingGitStatus = $derived($gitOps$.isRefreshingGitStatus);
 
@@ -363,7 +370,9 @@
       lastWorkspaceId = workspaceId;
       // Sync workspace settings for the new workspace
       appStore.dispatch(syncWorkspaceSettings(workspaceId as string));
-      appStore.dispatch(recomputeAgentLocks(workspaceId as string));
+      // Hydrate the daemon-computed agent-lock snapshot (PROTOCOL §5.19);
+      // live updates arrive via the `changes:agent-locks` event (§6.5).
+      void hydrateAgentLocks(workspaceId as string);
       // Reset form state that is workspace-specific to prevent leaking between workspaces
       targetBranch = '';
       // Post-merge state is now read from Redux via selectPostMergeState — no manual restoration needed
@@ -458,8 +467,7 @@
     }
   }
 
-  // Accept-changes status (aheadOfTrunk, hasRemote, etc.) is now fetched by
-  // acceptChangesStatusSaga on workspaceMounted and refreshAcceptChangesStatus actions.
+  // Accept-changes status is owned by the visibility/event-driven Redux saga.
 
   // Track the last pushed commit count we triggered discovery for.
   // When pushed commits increase (e.g., agent pushes), we re-trigger discovery.
@@ -635,13 +643,6 @@
     appStore.dispatch(openWorkspaceLocalChanges(workspaceId));
   }
 
-  const localChangesPanelState = $derived(
-    getPanelTabOpenState(openPanelTabs, activePanelTab, workspaceId, {
-      type: 'local-changes',
-      workspaceId,
-    }),
-  );
-
   // Multi-select state for bulk staging/unstaging
   // Keys are "{staged}:{path}" to distinguish between same file in staged vs unstaged
   let selectedFiles = $state(new Set<string>());
@@ -773,7 +774,7 @@
             ? stagedChanges.find((c) => c.relativePath === focusedFile!.path)
             : unstagedChanges.find((c) => c.relativePath === focusedFile!.path);
           if (change) {
-            handleFileClick(focusedFile.path, undefined, focusedFile.staged);
+            handleFileClick(focusedFile.path, undefined, focusedFile.staged, e);
           }
         }
         break;
@@ -984,9 +985,14 @@
     }
   }
 
-  function handleFileClick(path: string, _commitHash?: string, staged?: boolean) {
+  function handleFileClick(
+    path: string,
+    _commitHash?: string,
+    staged?: boolean,
+    event?: MouseEvent | KeyboardEvent,
+  ) {
     const change = findChange(path, staged ?? false);
-    if (change) onOpenChange?.(change);
+    if (change) onOpenChange?.(change, event);
   }
 
   // Determine if trunk can be changed (only before first push)
@@ -1106,7 +1112,7 @@
               <button
                 onclick={handleOpenAllChanges}
                 class="flex flex-1 items-center border gap-2 pr-2 py-1.5 text-subtle rounded-sm transition-colors group cursor-pointer min-w-0 {isActive
-                  ? 'bg-background text-foreground border-border shadow-xs pl-2'
+                  ? 'bg-background text-foreground border-transparent pl-2'
                   : 'border-transparent'}
                 "
               >
@@ -1119,10 +1125,6 @@
                           count: formatInteger(totalFilesChanged),
                         })}
                   </span>
-                  <OpenPanelIndicator
-                    count={localChangesPanelState.count}
-                    active={localChangesPanelState.isActive}
-                  />
                   <!-- <LineChangesBadge additions={totalAdditions} deletions={totalDeletions} size="xs" /> -->
                 </div>
               </button>

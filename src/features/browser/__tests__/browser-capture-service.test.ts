@@ -12,8 +12,17 @@ vi.mock('electron', () => ({
   webContents: { fromId: vi.fn(() => undefined) },
 }));
 
+// The action executor imports the workspace-visibility probe from system.ipc
+// (workspace-inactive warning, monorepo#3045), which pulls in Electron app
+// lifecycle hooks this suite's minimal electron mock does not provide.
+vi.mock('../../system/main/system.ipc', () => ({
+  getWindowIdForWorkspace: vi.fn(() => 1),
+}));
+
 vi.mock('../main/embedded-browser-cdp-service', () => ({
   DEFAULT_AGENT_VIEWPORT: { width: 1280, height: 800 },
+  AGENT_VIEWPORT_MIN_PX: 320,
+  AGENT_VIEWPORT_MAX_PX: 3840,
   embeddedBrowserCdp: {
     ensureAttached: vi.fn(),
     evaluate: vi.fn(),
@@ -40,7 +49,11 @@ vi.mock('../main/embedded-browser-cdp-service', () => ({
         cdpMessageHandler = undefined;
       };
     }),
-    screenshot: vi.fn().mockResolvedValue({ base64: '', width: 1, height: 1 }),
+    screenshot: vi.fn().mockResolvedValue({
+      base64: Buffer.from('jpeg-bytes').toString('base64'),
+      width: 1280,
+      height: 800,
+    }),
     sendCdpCommand: vi.fn(async (_: number, method: string) => {
       if (method === 'Tracing.end') {
         queueMicrotask(() => {
@@ -54,6 +67,7 @@ vi.mock('../main/embedded-browser-cdp-service', () => ({
 
 import { browserCapture } from '../main/browser-capture-service';
 import { executeActions } from '../main/browser-action-executor';
+import { embeddedBrowserCdp } from '../main/embedded-browser-cdp-service';
 import type { CaptureSession } from '../main/browser-capture-types';
 
 describe('BrowserCaptureService path boundaries', () => {
@@ -76,6 +90,50 @@ describe('BrowserCaptureService path boundaries', () => {
     else process.env.WORKSPACES_BASE_DIR = previousWorkspaceRoot;
     await fs.rm(tempRoot, { recursive: true, force: true });
     vi.clearAllMocks();
+  });
+
+  it('rejects an empty snapshot screenshot before creating screenshot.jpg', async () => {
+    vi.mocked(embeddedBrowserCdp.screenshot).mockResolvedValueOnce({
+      base64: '',
+      width: 1,
+      height: 1,
+    });
+    const outputDir = path.join(
+      tempRoot,
+      'workspace-state',
+      'local',
+      'workspace-a',
+      'browser-snapshots',
+      'example.test',
+      'empty-snapshot',
+    );
+
+    await expect(
+      browserCapture.snapshot({ workspaceId: 'workspace-a', name: 'empty-snapshot' }),
+    ).rejects.toThrow(outputDir);
+    await expect(fs.stat(path.join(outputDir, 'screenshot.jpg'))).rejects.toMatchObject({
+      code: 'ENOENT',
+    });
+  });
+
+  it('rejects an empty capture step before creating screenshot.jpg', async () => {
+    const session = await browserCapture.startSession({
+      workspaceId: 'workspace-a',
+      name: 'empty-step-session',
+    });
+    vi.mocked(embeddedBrowserCdp.screenshot).mockResolvedValueOnce({
+      base64: '',
+      width: 1,
+      height: 1,
+    });
+    const stepDir = path.join(session.outputDir, 'step-1-empty-step');
+
+    await expect(
+      browserCapture.captureStep(session.id, 'workspace-a', 'empty-step'),
+    ).rejects.toThrow(stepDir);
+    await expect(fs.stat(path.join(stepDir, 'screenshot.jpg'))).rejects.toMatchObject({
+      code: 'ENOENT',
+    });
   });
 
   it('sanitizes traversal trace names and writes only inside the session directory', async () => {

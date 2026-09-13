@@ -1,7 +1,7 @@
 /**
  * Keyboard shortcuts management for chat interfaces
  */
-import { m } from '$shared/paraglide/messages.js';
+import { matchesShortcut } from './shortcut-bindings';
 
 /**
  * Check if the currently focused element is within an xterm terminal.
@@ -120,7 +120,7 @@ export function isFocusInEditableElement(target?: Element | null): boolean {
  * Some (hide/quit) are handled by Electron menu roles and are safe there,
  * but must never be registered in the renderer-side KeyboardShortcutManager.
  */
-export const RESERVED_NATIVE_SHORTCUTS: ReadonlyArray<{
+const RESERVED_NATIVE_SHORTCUTS: ReadonlyArray<{
   key: string;
   meta?: boolean;
   ctrl?: boolean;
@@ -143,6 +143,8 @@ export interface KeyboardShortcut {
   alt?: boolean;
   description: string;
   action: () => void;
+  /** Resolve a user-configurable binding at event time. */
+  binding?: () => string;
   /**
    * If true, this shortcut will be skipped when focus is in an editable element
    * (input, textarea, contenteditable, etc.). This is useful for shortcuts that
@@ -163,6 +165,7 @@ export interface KeyboardShortcut {
 
 export class KeyboardShortcutManager {
   private shortcuts: Map<string, KeyboardShortcut> = new Map();
+  private dynamicShortcuts: KeyboardShortcut[] = [];
   private enabled = false;
   private boundHandler: ((e: KeyboardEvent) => void) | null = null;
 
@@ -175,6 +178,10 @@ export class KeyboardShortcutManager {
    * Warns in development mode if the shortcut conflicts with a reserved native OS shortcut.
    */
   register(shortcut: KeyboardShortcut): void {
+    if (shortcut.binding) {
+      this.dynamicShortcuts.push(shortcut);
+      return;
+    }
     // Dev-mode guard: warn if registering a reserved native shortcut
     if (typeof process !== 'undefined' && process.env?.NODE_ENV === 'development') {
       for (const reserved of RESERVED_NATIVE_SHORTCUTS) {
@@ -251,6 +258,8 @@ export class KeyboardShortcutManager {
   private handleKeyDown(e: KeyboardEvent): void {
     const target = e.target as HTMLElement;
 
+    if (target.closest?.('[data-shortcut-input], [data-shortcut-entry]')) return;
+
     // Don't intercept shortcuts when focus is in a terminal (xterm)
     // Terminals need to receive shortcuts like Cmd+K (clear screen) directly
     if (isFocusInTerminal(target)) {
@@ -281,7 +290,13 @@ export class KeyboardShortcutManager {
     parts.push(keyValue);
 
     const key = parts.join('+');
-    const shortcut = this.shortcuts.get(key);
+    const isMac =
+      typeof navigator !== 'undefined' && navigator.platform.toUpperCase().includes('MAC');
+    const shortcut =
+      [...this.dynamicShortcuts]
+        .reverse()
+        .find(({ binding }) => binding && matchesKeyboardEvent(e, binding(), isMac)) ??
+      this.shortcuts.get(key);
 
     if (shortcut) {
       if (shortcut.ignoreRepeat && e.repeat) return;
@@ -296,11 +311,9 @@ export class KeyboardShortcutManager {
       // Check if we should handle this shortcut in an input
       // On macOS, Ctrl+key are Emacs shortcuts (Ctrl+A/E/K/P/N/etc.) and should NOT
       // be intercepted when in an editable element. Only Meta (Cmd) shortcuts are global on Mac.
-      const isMac =
-        typeof navigator !== 'undefined' && navigator.platform.toUpperCase().includes('MAC');
       const isGlobalShortcut = isMac
-        ? shortcut.meta || shortcut.alt // On Mac, only Cmd/Alt shortcuts are global
-        : shortcut.ctrl || shortcut.meta || shortcut.alt; // On Win/Linux, Ctrl is also global
+        ? e.metaKey || e.altKey // On Mac, only Cmd/Alt shortcuts are global
+        : e.ctrlKey || e.metaKey || e.altKey; // On Win/Linux, Ctrl is also global
 
       if (!isInput || isGlobalShortcut || shortcut.global) {
         e.preventDefault();
@@ -335,6 +348,7 @@ export class KeyboardShortcutManager {
    */
   clear(): void {
     this.shortcuts.clear();
+    this.dynamicShortcuts = [];
   }
 
   /**
@@ -346,199 +360,22 @@ export class KeyboardShortcutManager {
   }
 }
 
-/**
- * Common chat keyboard shortcuts
- */
-export const CHAT_SHORTCUTS = {
-  // Navigation
-  SCROLL_TO_BOTTOM: {
-    key: 'End',
-    get description() {
-      return m.chat_shortcuts_scrollToBottom_description();
+function matchesKeyboardEvent(event: KeyboardEvent, binding: string, isMac: boolean): boolean {
+  const key =
+    event.altKey && event.code.startsWith('Key')
+      ? event.code.slice(3)
+      : event.altKey && event.code.startsWith('Digit')
+        ? event.code.slice(5)
+        : event.key;
+  return matchesShortcut(
+    {
+      key,
+      metaKey: event.metaKey,
+      ctrlKey: event.ctrlKey,
+      altKey: event.altKey,
+      shiftKey: event.shiftKey,
     },
-  },
-  SCROLL_TO_TOP: {
-    key: 'Home',
-    get description() {
-      return m.chat_shortcuts_scrollToTop_description();
-    },
-  },
-  PREVIOUS_MESSAGE: {
-    key: 'ArrowUp',
-    alt: true,
-    get description() {
-      return m.chat_shortcuts_prevMessage_description();
-    },
-  },
-  NEXT_MESSAGE: {
-    key: 'ArrowDown',
-    alt: true,
-    get description() {
-      return m.chat_shortcuts_nextMessage_description();
-    },
-  },
-
-  // Actions
-  FOCUS_INPUT: {
-    key: '/',
-    get description() {
-      return m.chat_shortcuts_focusInput_description();
-    },
-  },
-  SEND_MESSAGE: {
-    key: 'Enter',
-    ctrl: true,
-    get description() {
-      return m.chat_shortcuts_sendMessage_description();
-    },
-  },
-  NEW_LINE: {
-    key: 'Enter',
-    shift: true,
-    get description() {
-      return m.chat_shortcuts_newLine_description();
-    },
-  },
-  COPY_LAST_MESSAGE: {
-    key: 'c',
-    ctrl: true,
-    shift: true,
-    get description() {
-      return m.chat_shortcuts_copyLastMessage_description();
-    },
-  },
-  EDIT_LAST_MESSAGE: {
-    key: 'e',
-    ctrl: true,
-    shift: true,
-    get description() {
-      return m.chat_shortcuts_editLastMessage_description();
-    },
-  },
-  DELETE_LAST_MESSAGE: {
-    key: 'd',
-    ctrl: true,
-    shift: true,
-    get description() {
-      return m.chat_shortcuts_deleteLastMessage_description();
-    },
-  },
-  SEARCH: {
-    key: 'f',
-    ctrl: true,
-    get description() {
-      return m.chat_shortcuts_searchMessages_description();
-    },
-  },
-  TOGGLE_SIDEBAR: {
-    key: 'b',
-    ctrl: true,
-    get description() {
-      return m.chat_shortcuts_toggleSidebar_description();
-    },
-  },
-
-  // Platform-specific
-  ...getPlatformShortcuts(),
-};
-
-/**
- * Get platform-specific shortcuts
- */
-function getPlatformShortcuts() {
-  const isMac =
-    typeof navigator !== 'undefined' && navigator.platform.toUpperCase().indexOf('MAC') >= 0;
-
-  if (isMac) {
-    return {
-      SEND_MESSAGE_MAC: {
-        key: 'Enter',
-        meta: true,
-        get description() {
-          return m.chat_shortcuts_sendMessageMac_description();
-        },
-      },
-      COPY_LAST_MESSAGE_MAC: {
-        key: 'c',
-        meta: true,
-        shift: true,
-        get description() {
-          return m.chat_shortcuts_copyLastMessageMac_description();
-        },
-      },
-      SEARCH_MAC: {
-        key: 'f',
-        meta: true,
-        get description() {
-          return m.chat_shortcuts_searchMessagesMac_description();
-        },
-      },
-    };
-  }
-
-  return {};
-}
-
-/**
- * Create a keyboard shortcut manager with default chat shortcuts
- */
-export function createChatShortcuts(handlers: {
-  onScrollToBottom?: () => void;
-  onScrollToTop?: () => void;
-  onPreviousMessage?: () => void;
-  onNextMessage?: () => void;
-  onFocusInput?: () => void;
-  onSendMessage?: () => void;
-  onCopyLastMessage?: () => void;
-  onEditLastMessage?: () => void;
-  onDeleteLastMessage?: () => void;
-  onSearch?: () => void;
-  onToggleSidebar?: () => void;
-}): KeyboardShortcutManager {
-  const manager = new KeyboardShortcutManager();
-
-  // Register shortcuts with handlers
-  if (handlers.onScrollToBottom) {
-    manager.register({
-      ...CHAT_SHORTCUTS.SCROLL_TO_BOTTOM,
-      action: handlers.onScrollToBottom,
-    });
-  }
-
-  if (handlers.onScrollToTop) {
-    manager.register({
-      ...CHAT_SHORTCUTS.SCROLL_TO_TOP,
-      action: handlers.onScrollToTop,
-    });
-  }
-
-  if (handlers.onPreviousMessage) {
-    manager.register({
-      ...CHAT_SHORTCUTS.PREVIOUS_MESSAGE,
-      action: handlers.onPreviousMessage,
-    });
-  }
-
-  if (handlers.onNextMessage) {
-    manager.register({
-      ...CHAT_SHORTCUTS.NEXT_MESSAGE,
-      action: handlers.onNextMessage,
-    });
-  }
-
-  if (handlers.onFocusInput) {
-    manager.register({
-      ...CHAT_SHORTCUTS.FOCUS_INPUT,
-      action: handlers.onFocusInput,
-    });
-  }
-
-  if (handlers.onSearch) {
-    manager.register({
-      ...CHAT_SHORTCUTS.SEARCH,
-      action: handlers.onSearch,
-    });
-  }
-
-  return manager;
+    binding,
+    isMac,
+  );
 }

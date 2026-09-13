@@ -14,6 +14,7 @@ import {
 } from '../workspace-import-slice';
 import type { WorkspaceImportState } from '../workspace-import-types';
 import { workspaceImportSaga } from './workspace-import-saga';
+import { m } from '$shared/paraglide/messages.js';
 
 const settle = async () => {
   for (let i = 0; i < 6; i++) await Promise.resolve();
@@ -74,13 +75,14 @@ describe('workspaceImportSaga', () => {
     stubBridge();
     mocks.invoke.mockResolvedValue({ success: true });
     // Settled success screen: the reducer drops importStartRequested here.
-    let seed = workspaceImportReducer(
-      initialState,
-      importStartRequested({ reuseLastFile: false }),
-    );
+    let seed = workspaceImportReducer(initialState, importStartRequested({ reuseLastFile: false }));
     seed = workspaceImportReducer(
       seed,
-      importRunSucceeded({ workspaceId: 'ws-1', workspaceTitle: 'My Space', interruptedAgents: [] }),
+      importRunSucceeded({
+        workspaceId: 'ws-1',
+        workspaceTitle: 'My Space',
+        interruptedAgents: [],
+      }),
     );
     const h = harness(seed);
 
@@ -106,6 +108,25 @@ describe('workspaceImportSaga', () => {
 
     expect(h.state().runStatus).toBe('failed');
     expect(h.state().runError).toBe(daemonError);
+    h.task.cancel();
+  });
+
+  it('maps a not-session-owner rejection to the localized message', async () => {
+    stubBridge();
+    mocks.invoke.mockResolvedValue({
+      success: false,
+      error: 'the import session belongs to another window',
+      code: 'not-session-owner',
+    });
+    const h = harness(
+      workspaceImportReducer(initialState, importStartRequested({ reuseLastFile: false })),
+    );
+
+    h.channel.put(importStartRequested({ reuseLastFile: false }));
+    await settle();
+
+    expect(h.state().runStatus).toBe('failed');
+    expect(h.state().runError).toBe(m.workspace_import_notSessionOwner_error());
     h.task.cancel();
   });
 
@@ -138,13 +159,14 @@ describe('workspaceImportSaga', () => {
   it('open-workspace navigates to the imported workspace and closes', async () => {
     stubBridge();
     mocks.navigate.mockResolvedValue(undefined);
-    let seed = workspaceImportReducer(
-      initialState,
-      importStartRequested({ reuseLastFile: false }),
-    );
+    let seed = workspaceImportReducer(initialState, importStartRequested({ reuseLastFile: false }));
     seed = workspaceImportReducer(
       seed,
-      importRunSucceeded({ workspaceId: 'ws-1', workspaceTitle: 'My Space', interruptedAgents: [] }),
+      importRunSucceeded({
+        workspaceId: 'ws-1',
+        workspaceTitle: 'My Space',
+        interruptedAgents: [],
+      }),
     );
     const h = harness(seed);
 

@@ -1717,7 +1717,10 @@
 
       <!-- Results list -->
       <!-- svelte-ignore a11y_no_static_element_interactions -->
-      <div class="max-h-64 overflow-y-auto flex flex-col" onscroll={handleResultsScroll}>
+      <div
+        class="max-h-[min(16rem,35dvh)] overflow-y-auto flex flex-col"
+        onscroll={handleResultsScroll}
+      >
         <!-- Provider issues -->
         {#if isLoading}
           <div class="space-y-1 p-2">
@@ -1780,6 +1783,7 @@
               >
               {#each visibleLinearAssigned as issue (issue.id)}
                 <TooltipRich
+                  class="flex w-full min-w-0"
                   side="top"
                   align="start"
                   delayDuration={400}
@@ -1852,6 +1856,7 @@
               >
               {#each visibleLinearCreated as issue (issue.id)}
                 <TooltipRich
+                  class="flex w-full min-w-0"
                   side="top"
                   align="start"
                   delayDuration={400}
@@ -1920,6 +1925,7 @@
             <!-- Server-side search results (flat list) -->
             {#each visibleLinearSearch as issue (issue.id)}
               <TooltipRich
+                class="flex w-full min-w-0"
                 side="top"
                 align="start"
                 delayDuration={400}
@@ -2008,6 +2014,7 @@
           <!-- GitHub issues -->
           {#each visibleGitHubIssues as issue (issue.id)}
             <TooltipRich
+              class="flex w-full min-w-0"
               side="top"
               align="start"
               delayDuration={400}
@@ -2072,6 +2079,7 @@
           <!-- GitHub PRs -->
           {#each visibleGitHubPRs as pr (pr.id)}
             <TooltipRich
+              class="flex w-full min-w-0"
               side="top"
               align="start"
               delayDuration={400}
@@ -2285,7 +2293,7 @@
                   </button>
                 </div>
                 {#if $sentryError$}
-                  <p class="text-xs text-destructive">{$sentryError$}</p>
+                  <p class="text-xs text-danger">{$sentryError$}</p>
                 {/if}
                 <p class="text-xs text-subtle opacity-50">
                   {m.workspace_issueSuggestions_createTokenAt_label()}

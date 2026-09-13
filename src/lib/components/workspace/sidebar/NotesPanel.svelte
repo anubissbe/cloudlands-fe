@@ -27,13 +27,10 @@
   import AgentAvatarWithState from '$features/agent/components/agent-avatar/AgentAvatarWithState.svelte';
   import {
     type AvatarState,
-    getAvatarState,
+    getAvatarStateForSession,
+    isSessionRunning,
   } from '$features/agent/components/agent-avatar/avatar-state';
-  import {
-    selectAgentIsResponding,
-    selectAgentIsWaiting,
-    selectAgentSessionsByIds,
-  } from '$store/renderer/slices/agent-session/agent-session-selectors';
+  import { selectAgentSessionsByIds } from '$store/renderer/slices/agent-session/agent-session-selectors';
 
   import { writable } from 'svelte/store';
   import {
@@ -54,26 +51,25 @@
 
   import { deleteNote, createNote, updateNoteTitle } from '$features/notes/notes-write-service';
   import { toast } from 'svelte-sonner';
+  import { withToastCountdown } from '$lib/components/ui/toast';
   import { store as appStore } from '$store/renderer/store';
-  import type { PanelTab } from '$store/renderer/slices/panel-layout/panel-layout-types';
-  import { getPanelTabOpenState } from '$store/renderer/slices/panel-layout/panel-layout-selectors';
-  import OpenPanelIndicator from './OpenPanelIndicator.svelte';
   import ResourceIconTile from '$lib/components/shared/ResourceIconTile.svelte';
+  import { isCmdClickModifier } from '$shared/utils/link-helpers';
+
+  type PaneOpenEvent = MouseEvent | KeyboardEvent;
 
   interface Props {
     notes: Note[];
     workspaceId: string;
     selectedNoteId?: string | null;
-    onOpenNote?: (noteId: string) => void;
-    onOpenAgent?: (agentId: string) => void;
+    onOpenNote?: (noteId: string, event?: PaneOpenEvent) => void;
+    onOpenAgent?: (agentId: string, event?: PaneOpenEvent) => void;
     onReorderNotes?: (noteIds: string[]) => void;
     onCreateNote?: () => void;
     loading?: boolean;
     class?: string;
     indentSize?: number; // Size of each indent level in px (default: 22)
     flush?: boolean;
-    openPanelTabs?: PanelTab[];
-    activePanelTab?: PanelTab | null;
   }
 
   let {
@@ -88,8 +84,6 @@
     class: className,
     indentSize = 22,
     flush = false,
-    openPanelTabs = [],
-    activePanelTab,
   }: Props = $props();
 
   const workspaceIdStore = writable('');
@@ -209,23 +203,29 @@
           void deleteNote(workspaceId, note.id);
           closeContextMenu();
 
-          toast.warning(`Deleted "${noteTitle}"`, {
-            duration: 15000,
-            action: {
-              label: 'Undo',
-              onClick: () => {
-                // eslint-disable-next-line intent/no-component-async-data-fetch -- sanctioned post-saga notes-write-service seam (dispatches optimistic store updates + AppClient mutation); not a component data fetch.
-                void createNote(workspaceId, {
-                  title: savedNote.title,
-                  content: savedNote.content,
-                  contentType: savedNote.contentType,
-                  tags: savedNote.tags,
-                  parentId: savedNote.parentId,
-                  visibility: savedNote.visibility,
-                });
+          toast.warning(
+            m.layout_noteTab_deletedNote_toast({ title: noteTitle }),
+            withToastCountdown(
+              {
+                duration: 15000,
+                action: {
+                  label: m.ui_workspaceActions_undo_label(),
+                  onClick: () => {
+                    // eslint-disable-next-line intent/no-component-async-data-fetch -- sanctioned post-saga notes-write-service seam (dispatches optimistic store updates + AppClient mutation); not a component data fetch.
+                    void createNote(workspaceId, {
+                      title: savedNote.title,
+                      content: savedNote.content,
+                      contentType: savedNote.contentType,
+                      tags: savedNote.tags,
+                      parentId: savedNote.parentId,
+                      visibility: savedNote.visibility,
+                    });
+                  },
+                },
               },
-            },
-          });
+              { pauseOnHover: false },
+            ),
+          );
         },
       });
     }
@@ -356,7 +356,7 @@
   function getActiveAgentsForNote(note: Note): Array<{
     agentId: string;
     state: AvatarState;
-    onClick: () => void;
+    onClick: (event: PaneOpenEvent) => void;
     specialist?: 'spec-writer' | 'implementor' | 'verifier' | null;
   }> {
     const assignedAgentIds = note.metadata?.task?.assignedAgentIds || [];
@@ -365,30 +365,20 @@
     const activeAgents: Array<{
       agentId: string;
       state: AvatarState;
-      onClick: () => void;
+      onClick: (event: PaneOpenEvent) => void;
       specialist?: 'spec-writer' | 'implementor' | 'verifier' | null;
     }> = [];
-
-    const reduxState = appStore.state;
 
     for (const agentId of assignedAgentIds) {
       const agent = agentSessionsById.get(agentId);
       if (!agent) continue;
 
-      const isWaiting = selectAgentIsWaiting.select(reduxState, agentId);
-      const isResponding = selectAgentIsResponding.select(reduxState, agentId);
-      const activelyWorking = isResponding && !isWaiting;
-
-      if (!activelyWorking) continue;
-
-      // Use centralized getAvatarState for consistent state calculation
-      const state = getAvatarState(
-        {
-          isStreaming: activelyWorking,
-          status: isWaiting ? 'waiting' : agent.status,
-        },
-        {},
-      );
+      // Shared running test: a live turn with an unresolved tool is still running,
+      // so tool-executing agents stay visible here instead of dropping out. The
+      // avatar state itself may outrank `running` (e.g. `question`), so it is
+      // not used as the visibility gate.
+      if (!isSessionRunning(agent)) continue;
+      const state = getAvatarStateForSession(agent);
 
       // Get specialist from agent metadata
       const specialistId = agent.metadata?.specialist || agent.agentMetadata?.specialist;
@@ -402,7 +392,7 @@
       activeAgents.push({
         agentId,
         state,
-        onClick: () => openAgent(agentId),
+        onClick: (event) => openAgent(agentId, event),
         specialist,
       });
     }
@@ -411,18 +401,17 @@
   }
 
   // Open agent in drawer
-  function openAgent(agentId: string) {
+  function openAgent(agentId: string, event?: PaneOpenEvent) {
     if (onOpenAgent) {
-      onOpenAgent(agentId);
+      onOpenAgent(agentId, event);
     }
   }
 
-  function getNotePanelState(noteId: string) {
-    return getPanelTabOpenState(openPanelTabs, activePanelTab, workspaceId, {
-      type: 'note',
-      noteId,
-      workspaceId,
-    });
+  function handleModifiedEnter(event: KeyboardEvent, open: (event: KeyboardEvent) => void): void {
+    if (event.key !== 'Enter' || !isCmdClickModifier({ event })) return;
+    event.preventDefault();
+    event.stopPropagation();
+    open(event);
   }
 </script>
 
@@ -475,7 +464,6 @@
               ? 'not_started'
               : undefined}
         {@const isUnread = $unreadNoteIds.includes(note.id as string)}
-        {@const panelState = getNotePanelState(note.id as string)}
         {#if !isHidden}
           <!-- svelte-ignore a11y_no_static_element_interactions -->
           <div
@@ -490,7 +478,7 @@
             ondblclick={(e) => handleDoubleClick(note, e)}
             oncontextmenu={(e) => handleContextMenu(e, note)}
             class={cn(
-              'w-full transition-all duration-150 flex items-center group/note min-w-0',
+              'note-row relative w-full transition-[opacity,border-color,border-top-width] duration-150 flex items-center group/note min-w-0',
               isDragging && 'opacity-50',
               isDragOver && 'border-t-2 border-accent',
             )}
@@ -499,7 +487,7 @@
               <!-- Inline edit mode - matches ListItem sm size styling with active state -->
               {@const leftIndent = depth * Math.round((indentSize * 16) / 22)}
               <div
-                class="flex items-center gap-2 py-0.5 px-2 rounded-md border border-border shadow-xs bg-background text-foreground"
+                class="relative z-10 flex items-center gap-2 rounded-md px-2 py-0.5 text-foreground"
                 style="margin-left: {leftIndent}px; width: calc(100% - {leftIndent}px);"
               >
                 {#if note?.metadata?.task?.status}
@@ -548,7 +536,7 @@
                   bind:value={editingValue}
                   onblur={saveEdit}
                   onkeydown={handleEditKeydown}
-                  class="flex-1 text-sm bg-transparent border-none outline-none ring-0 focus:ring-0 focus:outline-none focus-visible:ring-0 focus-visible:outline-none min-w-0"
+                  class="inline-edit-input relative z-10 min-w-0 flex-1 border-none bg-transparent text-sm outline-none ring-0 focus:outline-none focus:ring-0 focus-visible:outline-none focus-visible:ring-0"
                   onclick={(e) => e.stopPropagation()}
                 />
               </div>
@@ -559,12 +547,15 @@
                 <ListItem
                   iconClass="text-ghost"
                   title={getNoteTitle(note)}
+                  titleClass="cursor-text"
                   active={selectedNoteId === note.id}
                   indent={depth}
                   {indentSize}
                   badge={isCollapsed && hasChildren ? childNotes.length : undefined}
                   badgeClass="text-ui px-1 py-0"
-                  onclick={() => onOpenNote?.(note.id)}
+                  onclick={(event) => onOpenNote?.(note.id, event)}
+                  onkeydown={(event) =>
+                    handleModifiedEnter(event, (keyEvent) => onOpenNote?.(note.id, keyEvent))}
                   class="cursor-pointer flex-1"
                 >
                   {#snippet iconSnippet()}
@@ -579,7 +570,6 @@
                       title={m.workspace_notesPanel_unreadChanges_tooltip()}
                     ></span>
                   {/if}
-                  <OpenPanelIndicator count={panelState.count} active={panelState.isActive} />
                 </ListItem>
 
                 <!-- Show active agents working on this note -->
@@ -590,14 +580,15 @@
                         type="button"
                         class="cursor-pointer hover:opacity-80 transition-opacity"
                         onclick={onClick}
+                        onkeydown={(event) => handleModifiedEnter(event, onClick)}
                         title={m.workspace_notesPanel_openAgent_tooltip()}
                       >
-                        <AgentAvatarWithState {agentId} size={16} {state} {specialist} />
+                        <AgentAvatarWithState {agentId} variant="compact" {state} {specialist} />
                       </button>
                     {/each}
                     {#if activeAgents.length > 3}
                       <span
-                        class="ml-1! inline-flex w-max flex-none items-center bg-transparent text-xs leading-none text-subtle"
+                        class="relative z-10 -ml-1.5! inline-flex h-4 min-w-4 w-max flex-none items-center justify-center rounded-sm bg-muted px-1 text-xs font-medium leading-none text-muted-foreground"
                         data-agent-avatar-overflow
                       >
                         +{activeAgents.length - 3}
@@ -620,12 +611,15 @@
                 <ListItem
                   iconClass="text-ghost"
                   title={getNoteTitle(note)}
+                  titleClass="cursor-text"
                   active={selectedNoteId === note.id}
                   indent={depth}
                   {indentSize}
                   badge={isCollapsed && hasChildren ? childNotes.length : undefined}
                   badgeClass="text-ui px-1 py-0"
-                  onclick={() => onOpenNote?.(note.id)}
+                  onclick={(event) => onOpenNote?.(note.id, event)}
+                  onkeydown={(event) =>
+                    handleModifiedEnter(event, (keyEvent) => onOpenNote?.(note.id, keyEvent))}
                   class="cursor-pointer"
                 >
                   {#snippet iconSnippet()}
@@ -693,7 +687,6 @@
                       title={m.workspace_notesPanel_unreadChanges_tooltip()}
                     ></span>
                   {/if}
-                  <OpenPanelIndicator count={panelState.count} active={panelState.isActive} />
                 </ListItem>
               </div>
             {:else}
@@ -701,12 +694,15 @@
               <div class="relative flex-1 w-full flex items-center gap-1">
                 <ListItem
                   title={getNoteTitle(note)}
+                  titleClass="cursor-text"
                   active={selectedNoteId === note.id}
                   indent={depth}
                   {indentSize}
                   badge={isCollapsed && hasChildren ? childNotes.length : undefined}
                   badgeClass="text-ui px-1 py-0"
-                  onclick={() => onOpenNote?.(note.id)}
+                  onclick={(event) => onOpenNote?.(note.id, event)}
+                  onkeydown={(event) =>
+                    handleModifiedEnter(event, (keyEvent) => onOpenNote?.(note.id, keyEvent))}
                   class="cursor-pointer flex-1"
                 >
                   {#snippet iconSnippet()}
@@ -718,7 +714,6 @@
                       title={m.workspace_notesPanel_unreadChanges_tooltip()}
                     ></span>
                   {/if}
-                  <OpenPanelIndicator count={panelState.count} active={panelState.isActive} />
                 </ListItem>
 
                 <!-- Show active agents working on this note -->
@@ -729,14 +724,15 @@
                         type="button"
                         class="cursor-pointer hover:opacity-80 transition-opacity"
                         onclick={onClick}
+                        onkeydown={(event) => handleModifiedEnter(event, onClick)}
                         title={m.workspace_notesPanel_openAgent_tooltip()}
                       >
-                        <AgentAvatarWithState {agentId} size={16} {state} {specialist} />
+                        <AgentAvatarWithState {agentId} variant="compact" {state} {specialist} />
                       </button>
                     {/each}
                     {#if activeAgents.length > 3}
                       <span
-                        class="ml-1! inline-flex w-max flex-none items-center bg-transparent text-xs leading-none text-subtle"
+                        class="relative z-10 -ml-1.5! inline-flex h-4 min-w-4 w-max flex-none items-center justify-center rounded-sm bg-muted px-1 text-xs font-medium leading-none text-muted-foreground"
                         data-agent-avatar-overflow
                       >
                         +{activeAgents.length - 3}
@@ -746,6 +742,13 @@
                 {/if}
               </div>
             {/if}
+            <span
+              aria-hidden="true"
+              class="pointer-events-none absolute z-0 rounded-(--radius-small) border transition-[inset,border-color,background-color] duration-(--motion-standard) ease-(--ease-standard) motion-reduce:transition-none {editingNoteId ===
+              note.id
+                ? '-inset-x-2 -inset-y-1.5 border-ring/60 bg-background'
+                : '-inset-x-1 -inset-y-0.5 border-transparent bg-transparent'}"
+            ></span>
             {#if hasChildren}
               <button
                 type="button"
@@ -778,3 +781,19 @@
     onClickOutside={closeContextMenu}
   />
 {/if}
+
+<style>
+  input.inline-edit-input::selection {
+    background: hsl(var(--ring) / 0.3);
+  }
+
+  /* Off-screen rows skip style/layout/paint; the intrinsic size matches the 36px
+     ListItem row so scrollHeight stays stable before a row is first rendered. The
+     clip margin keeps the focus ring, unread dot and inline-edit outline
+     (-inset-x-2) visible outside the row box under paint containment. */
+  .note-row {
+    content-visibility: auto;
+    contain-intrinsic-block-size: auto 36px;
+    overflow-clip-margin: 8px;
+  }
+</style>

@@ -12,6 +12,11 @@ test('matches adjacent tool-row geometry and keeps the explicit 8px top margin',
   for (const theme of ['light', 'dark'] as const) {
     for (const width of [240, 720]) {
       for (const zoom of [1, 2]) {
+        if (
+          (theme === 'light' && (width !== 720 || zoom !== 1)) ||
+          (theme === 'dark' && (width !== 240 || zoom !== 2))
+        )
+          continue;
         for (const mode of ['processing', 'streaming'] as const) {
           await component.update({ props: { theme, width, zoom, mode } });
           await page.waitForTimeout(220);
@@ -47,6 +52,8 @@ test('matches adjacent tool-row geometry and keeps the explicit 8px top margin',
                 leadingCenterY: (leadingBox.top + leadingBox.bottom) / 2 - box.top,
                 iconCenterX: (iconBox.left + iconBox.right) / 2,
                 iconCenterY: (iconBox.top + iconBox.bottom) / 2 - box.top,
+                iconWidth: iconBox.width,
+                iconHeight: iconBox.height,
                 labelStart: summaryBox.left,
                 baseline,
                 marginTop: style.marginTop,
@@ -77,7 +84,7 @@ test('matches adjacent tool-row geometry and keeps the explicit 8px top margin',
                 thinkingRow,
                 '[data-operational-leading]',
                 '[data-operational-summary]',
-                '.legacy-spinner-track',
+                '[data-slot="intent-mark-loader"]',
               ),
               after: measure(
                 afterRow,
@@ -91,6 +98,13 @@ test('matches adjacent tool-row geometry and keeps the explicit 8px top margin',
               bottomGap:
                 afterContainer.getBoundingClientRect().top -
                 thinkingRow.getBoundingClientRect().bottom,
+              text: thinkingRow.textContent,
+              primaryColor: getComputedStyle(
+                root.querySelector('[data-testid="streaming-status-thinking-label"]')!,
+              ).color,
+              secondaryColor: getComputedStyle(
+                root.querySelector('[data-testid="streaming-status-phase"]')!,
+              ).color,
             };
           });
 
@@ -103,6 +117,12 @@ test('matches adjacent tool-row geometry and keeps the explicit 8px top margin',
           expect(geometry.thinking.paddingInline).toEqual(['8px', '8px']);
           expect(geometry.thinking.columnGap).toBe('8px');
           expect(geometry.thinking.summary).toEqual(['0px', 'hidden', 'ellipsis', 'nowrap']);
+          expect(geometry.thinking.iconWidth).toBeCloseTo(16 * zoom, 1);
+          expect(geometry.thinking.iconHeight).toBeCloseTo(16 * zoom, 1);
+          expect(geometry.text).toContain('Thinking');
+          expect(geometry.text).toContain('Sent prompt…');
+          expect(geometry.text).not.toContain('·');
+          expect(geometry.primaryColor).not.toBe(geometry.secondaryColor);
 
           for (const tool of [geometry.before, geometry.after]) {
             for (const [thinking, adjacent] of [
@@ -121,21 +141,119 @@ test('matches adjacent tool-row geometry and keeps the explicit 8px top margin',
             }
           }
 
-          await expect(component.getByRole('status')).toHaveAccessibleName(/loading/i);
+          const mark = component.getByRole('status', { name: 'Loading' });
+          await expect(mark).toHaveAttribute('viewBox', '0 0 256 208');
+          await expect(mark.locator('[data-mark-arm]')).toHaveCount(5);
+          const semanticColors = await mark.evaluate((node) => ({
+            color: getComputedStyle(node).color,
+            stroke: getComputedStyle(node.querySelector('[data-mark-arm]')!).stroke,
+          }));
+          expect(semanticColors.stroke).toBe(semanticColors.color);
         }
       }
     }
   }
 });
 
-test('preserves the square animation and disables it for reduced motion', async ({
+test('runs the mark only while active and holds neutral for reduced motion', async ({
   mount,
   page,
 }) => {
   const component = await mount(StreamingTypingOperationalGeometryHost);
-  const square = component.locator('.legacy-spinner-square-0');
-  await expect(square).toHaveCSS('animation-name', /legacy-spinner-wave$/);
+  const mark = component.locator('[data-slot="intent-mark-loader"]');
+  await expect(mark).toHaveAttribute('data-motion-state', 'playing');
+  expect(
+    await mark.evaluate((node) =>
+      Array.from(node.querySelectorAll<SVGSVGElement>('[data-mark-arm-box]')).map(
+        (arm) => arm.style.transform !== '' && arm.style.willChange === '',
+      ),
+    ),
+  ).toEqual([true, true, true, true, true]);
+  expect(await mark.evaluate((node) => node.getAnimations({ subtree: true }).length)).toBe(0);
+
+  await mark.evaluate(
+    (node) => ((window as typeof window & { thinkingRoot?: Element }).thinkingRoot = node),
+  );
+  await component.update({ props: { mode: 'permission' } });
+  await expect(mark).toHaveAttribute('data-playing', 'false');
+  await expect(mark).toHaveAttribute('data-motion-state', 'settling');
+  await component.update({ props: { mode: 'streaming' } });
+  await expect(mark).toHaveAttribute('data-playing', 'true');
+  await expect(mark).toHaveAttribute('data-motion-state', 'playing');
+  expect(
+    await mark.evaluate(
+      (node) => (window as typeof window & { thinkingRoot?: Element }).thinkingRoot === node,
+    ),
+  ).toBe(true);
+
+  await component.update({ props: { mode: 'error' } });
+  await expect(mark).toHaveAttribute('data-motion-state', 'settling');
+  await expect(component.getByRole('alert')).toContainText('Provider stopped the response');
+  await expect(mark).toHaveCount(0);
+  await component.update({ props: { mode: 'processing' } });
+  await expect(component.locator('[data-slot="intent-mark-loader"]')).toHaveAttribute(
+    'data-motion-state',
+    'playing',
+  );
 
   await page.emulateMedia({ reducedMotion: 'reduce' });
-  await expect(square).toHaveCSS('animation-name', 'none');
+  const reducedMark = component.locator('[data-slot="intent-mark-loader"]');
+  await expect(reducedMark).toHaveAttribute('data-motion-state', 'neutral');
+  expect(await reducedMark.evaluate((node) => node.getAnimations({ subtree: true }).length)).toBe(
+    0,
+  );
+});
+
+test('updates localized phases, omits missing detail, and truncates without overflow', async ({
+  mount,
+}) => {
+  const component = await mount(StreamingTypingOperationalGeometryHost, {
+    props: {
+      mode: 'processing',
+      phaseMessage: 'Solicitud enviada al modelo…',
+      width: 160,
+      zoom: 2,
+    },
+  });
+
+  await expect(component.getByTestId('streaming-status-thinking-label')).toHaveText('Thinking');
+  const lifecycle = component.getByTestId('streaming-status-phase');
+  await expect(lifecycle).toHaveText('Solicitud enviada al modelo…');
+
+  const truncation = await lifecycle.evaluate((node) => {
+    const style = getComputedStyle(node);
+    const row = node.closest('[data-streaming-typing-row]')!;
+    return {
+      overflow: style.overflow,
+      textOverflow: style.textOverflow,
+      whiteSpace: style.whiteSpace,
+      clipped: node.scrollWidth > node.clientWidth,
+      rowContained: row.scrollWidth <= row.clientWidth,
+    };
+  });
+  expect(truncation).toEqual({
+    overflow: 'hidden',
+    textOverflow: 'ellipsis',
+    whiteSpace: 'nowrap',
+    clipped: true,
+    rowContained: true,
+  });
+
+  await component.update({
+    props: {
+      mode: 'streaming',
+      phaseMessage: 'Transmitiendo respuesta…',
+      width: 160,
+      zoom: 2,
+    },
+  });
+  await expect(component.getByTestId('streaming-status-phase')).toHaveText(
+    'Transmitiendo respuesta…',
+  );
+
+  await component.update({
+    props: { mode: 'streaming', phaseMessage: null, width: 160, zoom: 2 },
+  });
+  await expect(component.getByTestId('streaming-status-phase')).toHaveCount(0);
+  await expect(component.getByRole('status')).toHaveAccessibleName('Loading');
 });

@@ -2,11 +2,12 @@ import { THEME_PRESET_IDS, THEME_PRESET_MANIFEST } from './theme-presets-manifes
 import { locales } from './paraglide/runtime.js';
 import { SYSTEM_LANGUAGE_PREFERENCE } from './i18n/locale-matcher';
 import { GITHUB_LINK_DEFAULT_ACTIONS } from './utils/link-helpers';
+import { UPDATE_CHANNELS } from '../features/auto-update/types';
 
-export type AppSettingValueType =
+type AppSettingValueType =
   'string' | 'boolean' | 'number' | 'object' | 'array' | 'enum' | 'status' | 'readonly';
 
-export type AppSettingSource =
+type AppSettingSource =
   /**
    * Deprecated tombstone. No APP_SETTING_DEFINITIONS entry uses this any more;
    * the union member is retained only so the audit-only facade in
@@ -91,15 +92,16 @@ export function formatSettingValue(definition: AppSettingDefinition, value: unkn
   return compactJsonSnippet(value);
 }
 
-export const APP_SETTING_DEFINITIONS: readonly AppSettingDefinition[] = [
+const APP_SETTING_DEFINITIONS: readonly AppSettingDefinition[] = [
   {
     path: 'preferences.updateChannel',
     label: 'Update channel',
-    description: 'Release channel for app updates: stable, beta, or alpha.',
+    description:
+      'Release channel for app updates: stable, beta, or alpha — or disabled to turn updates off.',
     category: 'preferences',
     type: 'enum',
-    enumValues: ['stable', 'beta', 'alpha'],
-    enumLabels: { stable: 'Stable', beta: 'Beta', alpha: 'Alpha' },
+    enumValues: UPDATE_CHANNELS,
+    enumLabels: { stable: 'Stable', beta: 'Beta', alpha: 'Alpha', disabled: 'Disabled' },
     source: 'redux',
     defaultValue: 'stable',
     apply: { kind: 'redux-action', action: 'userPreferences/setUpdateChannel' },
@@ -179,6 +181,28 @@ export const APP_SETTING_DEFINITIONS: readonly AppSettingDefinition[] = [
     apply: { kind: 'redux-action', action: 'theme/requestThemePreferenceChange' },
   },
   {
+    path: 'appearance.chatAurora',
+    label: 'Chat aurora',
+    description: 'Whether the aurora effect is shown while chat responses are streaming.',
+    category: 'theme',
+    type: 'boolean',
+    source: 'local-storage',
+    storageKey: 'chat:auroraEnabled',
+    defaultValue: true,
+    apply: { kind: 'redux-action', action: 'userPreferences/setChatAuroraEnabled' },
+  },
+  {
+    path: 'appearance.shellTransparency',
+    label: 'Shell transparency',
+    description: 'Whether the app shell uses translucent backgrounds.',
+    category: 'theme',
+    type: 'boolean',
+    source: 'local-storage',
+    storageKey: 'appearance:shellTransparencyEnabled',
+    defaultValue: true,
+    apply: { kind: 'redux-action', action: 'userPreferences/setShellTransparencyEnabled' },
+  },
+  {
     path: 'theme.activePresetId',
     label: 'Theme preset',
     description: `Active built-in color theme preset ID. Available presets: ${THEME_PRESET_OPTIONS_DESCRIPTION}.`,
@@ -241,6 +265,18 @@ export const APP_SETTING_DEFINITIONS: readonly AppSettingDefinition[] = [
   {
     path: 'specialists.default',
     label: 'Default specialist',
+    description:
+      'Daemon setting: specialist applied when none is chosen (e.g. running a task note). Empty means unset (falls back to implementor).',
+    category: 'agents',
+    type: 'string',
+    source: 'daemon-settings',
+    storageKey: 'specialists.default',
+    defaultValue: '',
+    apply: { kind: 'daemon-settings-update', path: 'specialists.default' },
+  },
+  {
+    path: 'workspaceInitializer.lastSpecialist',
+    label: 'Last workspace initializer specialist',
     description: 'Last submitted workspace initializer specialist selection.',
     category: 'agents',
     type: 'object',
@@ -250,13 +286,15 @@ export const APP_SETTING_DEFINITIONS: readonly AppSettingDefinition[] = [
     apply: { kind: 'read-only' },
   },
   {
-    path: 'providers.active',
-    label: 'Active coding agent',
+    // Provider leg of the default model triple. Replaces the deprecated
+    // `providers.active` key (unread by the daemon).
+    path: 'model.defaultProvider',
+    label: 'Default provider',
     description: 'Default provider/coding agent for new work.',
-    category: 'accounts',
+    category: 'agents',
     type: 'string',
-    source: 'local-storage',
-    storageKey: 'workspaces-active-provider',
+    source: 'daemon-settings',
+    storageKey: 'model.defaultProvider',
     defaultValue: 'auggie',
     apply: { kind: 'redux-action', action: 'providerSettings/setActiveProvider' },
   },
@@ -613,6 +651,17 @@ export const APP_SETTING_DEFINITIONS: readonly AppSettingDefinition[] = [
     storageKey: 'open-combo-button-last-action',
     defaultValue: 'vscode',
     apply: { kind: 'redux-action', action: 'externalEditors/setOpenAction' },
+  },
+  {
+    path: 'openIn.editorOrder',
+    label: 'Open In editor order',
+    description: 'Preferred order for editors shown in Open In controls.',
+    category: 'per-feature',
+    type: 'array',
+    source: 'local-storage',
+    storageKey: 'settings:openInEditorsOrder',
+    defaultValue: [],
+    apply: { kind: 'local-storage-set', key: 'settings:openInEditorsOrder' },
   },
   {
     path: 'githubLinks.defaultAction',

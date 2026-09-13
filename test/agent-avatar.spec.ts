@@ -3,6 +3,7 @@ import { resolve } from 'node:path';
 import { svelte } from '@sveltejs/vite-plugin-svelte';
 import type { ViteDevServer } from 'vite';
 import { createServer } from 'vite';
+import { viteHarnessCacheDir } from './vite-harness-cache.mjs';
 import {
   agentAvatarGeometry,
   agentAvatarVariants,
@@ -18,7 +19,9 @@ test.beforeAll(async () => {
   server = await createServer({
     configFile: false,
     root: process.cwd(),
-    cacheDir: process.env.AGENT_AVATAR_VITE_CACHE_DIR,
+    cacheDir: viteHarnessCacheDir('agent-avatar', {
+      override: process.env.AGENT_AVATAR_VITE_CACHE_DIR,
+    }),
     plugins: [svelte({ configFile: resolve(process.cwd(), 'svelte.config.js') })],
     resolve: {
       alias: [
@@ -120,10 +123,25 @@ async function catalogStackPng(locator: Locator, scale: number): Promise<Buffer>
       const x = (itemRect.left - nodeRect.left) * selectedScale;
       const y = (itemRect.top - nodeRect.top) * selectedScale;
       if (item.hasAttribute('data-agent-avatar-overflow')) {
+        context.fillStyle = style.backgroundColor;
+        context.beginPath();
+        context.roundRect(
+          x,
+          y,
+          itemRect.width * selectedScale,
+          itemRect.height * selectedScale,
+          (Number.parseFloat(style.borderRadius) || 0) * selectedScale,
+        );
+        context.fill();
         context.fillStyle = style.color;
         context.font = `500 ${12 * selectedScale}px system-ui`;
+        context.textAlign = 'center';
         context.textBaseline = 'middle';
-        context.fillText(item.textContent?.trim() ?? '', x, canvas.height / 2);
+        context.fillText(
+          item.textContent?.trim() ?? '',
+          x + (itemRect.width * selectedScale) / 2,
+          canvas.height / 2,
+        );
         continue;
       }
       const size = itemRect.width * selectedScale;
@@ -415,9 +433,9 @@ test('fits the emphasized panel stack and aligned overflow count in a narrow tab
     };
   });
   expect(overflowStyle).toEqual({
-    background: 'rgba(0, 0, 0, 0)',
+    background: expect.not.stringMatching(/rgba\(0, 0, 0, 0\)|transparent/),
     borderWidth: '0px',
-    borderRadius: '0px',
+    borderRadius: '7px',
     boxShadow: 'none',
     fontSize: '12px',
   });
@@ -431,16 +449,16 @@ test('fits the emphasized panel stack and aligned overflow count in a narrow tab
       avatars.evaluateAll((nodes) => nodes.map((node) => node.getBoundingClientRect().toJSON())),
       overflow.boundingBox(),
     ]);
-    expect(stackBox?.width).toBeGreaterThan(42 * zoom);
-    expect(stackBox?.width).toBeLessThan(60 * zoom);
+    const avatarTrackWidth = 24 * zoom + (avatarBoxes.length - 1) * 18 * zoom;
+    expect(stackBox?.width).toBeCloseTo(avatarTrackWidth + overflowBox!.width - 6 * zoom, 1);
     expect(stackBox?.height).toBeCloseTo(24 * zoom, 1);
-    expect(overflowBox?.width).toBeGreaterThan(0);
-    expect(overflowBox?.width).toBeLessThan(24 * zoom);
-    expect(overflowBox?.height).toBeCloseTo(12 * zoom, 1);
+    expect(overflowBox?.width).toBeGreaterThanOrEqual(24 * zoom);
+    expect(overflowBox?.height).toBeCloseTo(24 * zoom, 1);
     for (const box of avatarBoxes) {
       expect(box.width).toBeCloseTo(24 * zoom, 1);
       expect(box.height).toBeCloseTo(24 * zoom, 1);
     }
+    expect(overflowBox!.x - avatarBoxes.at(-1)!.x).toBeCloseTo(18 * zoom, 1);
     const avatarCenter = avatarBoxes.at(-1)!.y + avatarBoxes.at(-1)!.height / 2;
     const overflowCenter = overflowBox!.y + overflowBox!.height / 2;
     expect(
@@ -541,6 +559,71 @@ test('keeps every SVG path and circle color identical across states and color mo
   }
 });
 
+test('computes butt caps and miter joins across avatar modes, widths, and zoom levels', async ({
+  page,
+}) => {
+  await mountAvatarHost(page);
+  for (const mode of ['light', 'dark', 'system-light', 'system-dark', 'forced-colors'] as const) {
+    await page.emulateMedia({
+      colorScheme: mode === 'dark' || mode === 'system-dark' ? 'dark' : 'light',
+      forcedColors: mode === 'forced-colors' ? 'active' : 'none',
+      reducedMotion: mode === 'system-dark' ? 'reduce' : 'no-preference',
+    });
+    await page.evaluate((selectedMode) => {
+      document.documentElement.classList.toggle('light', selectedMode === 'light');
+      document.documentElement.classList.toggle('dark', selectedMode === 'dark');
+    }, mode);
+    for (const width of [320, 1280]) {
+      for (const zoom of [1, 2]) {
+        await page.locator('[data-agent-avatar-host]').evaluate(
+          (node, geometry) => {
+            const host = node as HTMLElement;
+            host.style.width = `${geometry.width}px`;
+            host.style.zoom = String(geometry.zoom);
+          },
+          { width, zoom },
+        );
+        const geometry = await page.locator('[data-agent-avatar]').evaluateAll((avatars) =>
+          avatars.flatMap((avatar) =>
+            Array.from(avatar.querySelectorAll('path, rect, circle')).map((shape) => {
+              const style = getComputedStyle(shape);
+              return { linecap: style.strokeLinecap, linejoin: style.strokeLinejoin };
+            }),
+          ),
+        );
+        expect(geometry.length).toBeGreaterThan(0);
+        expect(new Set(geometry.map(({ linecap }) => linecap))).toEqual(new Set(['butt']));
+        expect(new Set(geometry.map(({ linejoin }) => linejoin))).toEqual(new Set(['miter']));
+      }
+    }
+  }
+});
+
+test('keeps Settings Specialists at named standard geometry at 100% and 200%', async ({ page }) => {
+  await mountAvatarHost(page);
+  const settings = page.locator('[data-settings-specialists]');
+  const rows = settings.getByRole('button').filter({ has: page.locator('[data-agent-avatar]') });
+  expect(await rows.count()).toBeGreaterThan(0);
+  for (const zoom of [1, 2]) {
+    await settings.evaluate((node, selectedZoom) => {
+      (node as HTMLElement).style.zoom = String(selectedZoom);
+    }, zoom);
+    for (const avatar of await settings.locator('[data-agent-avatar]').all()) {
+      await expect(avatar).toHaveAttribute('data-avatar-variant', 'standard');
+      const [box, style] = await Promise.all([
+        avatar.boundingBox(),
+        avatar.evaluate((node) => {
+          const computed = getComputedStyle(node);
+          return { padding: computed.paddingLeft, boxSizing: computed.boxSizing };
+        }),
+      ]);
+      expect(box?.width).toBeCloseTo(20 * zoom, 1);
+      expect(box?.height).toBeCloseTo(20 * zoom, 1);
+      expect(style).toEqual({ padding: '2px', boxSizing: 'border-box' });
+    }
+  }
+});
+
 test('matches each theme palette in the catalog at 20px and 200%', async ({ page }) => {
   await page.emulateMedia({ reducedMotion: 'reduce' });
   await mountAvatarHost(page);
@@ -564,12 +647,15 @@ test('matches each theme palette in the catalog at 20px and 200%', async ({ page
 test('matches the emphasized catalog stack in each theme at 100% and 200%', async ({ page }) => {
   await page.emulateMedia({ reducedMotion: 'reduce' });
   await mountAvatarHost(page);
-  const stack = page.locator('[data-agent-avatar-catalog-stack]');
+  const stack = page.locator('[data-agent-avatar-catalog-stack] [data-agent-avatar-stack]');
   for (const theme of ['light', 'dark'] as const) {
-    await page.evaluate((selectedTheme) => {
+    await page.evaluate(async (selectedTheme) => {
       document.documentElement.classList.toggle('dark', selectedTheme === 'dark');
       document.documentElement.classList.toggle('light', selectedTheme === 'light');
+      await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+      await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
     }, theme);
+    await page.waitForTimeout(250);
     for (const scale of [1, 2] as const) {
       expect(await catalogStackPng(stack, scale)).toMatchSnapshot(
         `agent-avatar-stack-${theme}-${scale === 1 ? '100' : '200'}-percent.png`,

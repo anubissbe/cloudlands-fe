@@ -13,15 +13,24 @@
  */
 
 export interface FollowBottomOptions {
+  /** Detach all listeners and observers while the owning surface is inactive. */
+  enabled?: boolean;
   /** Whether to follow (auto-scroll) - reactive */
   follow: boolean;
   /** Threshold in pixels from bottom to consider "at bottom" (default: 100) */
   threshold?: number;
   /** Callback when follow state changes due to user interaction */
   onFollowChange?: (follow: boolean) => void;
-  /** Reports live geometry for controls outside the scroll container. */
+  /**
+   * Reports live geometry for controls outside the scroll container.
+   *
+   * While following, this can fire synchronously inside ResizeObserver
+   * delivery (see handleResizeDelivery), so it must stay layout-cheap:
+   * reads of already-clean geometry and state writes are fine, but dirtying
+   * style and then reading geometry here would force layout mid-broadcast.
+   */
   onScrollStateChange?: (state: FollowBottomState) => void;
-  /** Keep the native anchor active without reserving a layout pixel. */
+  /** Keep the native anchor active without contributing layout height. */
   layoutNeutralBottomAnchor?: boolean;
 }
 
@@ -35,12 +44,37 @@ interface BottomFollower {
   followAndScroll: () => void;
   isFollowing: () => boolean;
   isNativeScrollAnchoringActive: () => boolean;
-  beforeMutation: (element: HTMLElement) => FollowBottomMutation;
+  hasActiveMutation: () => boolean;
+  beforeMutation: (
+    element: HTMLElement,
+    options: FollowBottomMutationOptions,
+  ) => FollowBottomMutation;
+}
+
+interface MutationLease {
+  element: HTMLElement;
+  expiresAt: number;
+}
+
+interface ScrollGeometry {
+  maximum: number;
+  scrollTop: number;
 }
 
 export interface FollowBottomMutation {
   request: () => void;
   settle: () => void;
+}
+
+export interface FollowBottomMutationOptions {
+  /**
+   * Upper bound on the lease lifetime, in milliseconds from acquisition. A
+   * lease whose terminal `settle()` never arrives (an aborted transition, a
+   * throttled tick loop) releases itself once this elapses, so a missed
+   * release can only ever delay the follower's settle and the hydration hold
+   * by a bounded time.
+   */
+  maxHoldMs?: number;
 }
 
 const inertFollowBottomMutation: FollowBottomMutation = {
@@ -50,6 +84,7 @@ const inertFollowBottomMutation: FollowBottomMutation = {
 
 const bottomFollowers = new WeakMap<HTMLElement, BottomFollower>();
 const FOLLOW_BOTTOM_STABLE_FRAMES = 2;
+const FOLLOW_BOTTOM_MUTATION_MAX_HOLD_MS = 2000;
 
 /**
  * Svelte action that follows the bottom of a scrollable container.
@@ -59,6 +94,7 @@ const FOLLOW_BOTTOM_STABLE_FRAMES = 2;
  * maximum until the observed layout is stable. Enabling follow also snaps immediately.
  */
 export function followBottom(container: HTMLElement, options: FollowBottomOptions) {
+  let enabled = options.enabled ?? true;
   let isFollowing = options.follow;
   let onFollowChange = options.onFollowChange;
   let onScrollStateChange = options.onScrollStateChange;
@@ -67,22 +103,43 @@ export function followBottom(container: HTMLElement, options: FollowBottomOption
   let pointerMaximum = 0;
   let pointerDistanceFromBottom = 0;
   let pointerMovedTowardBottom = false;
+  let userStateFrame: number | null = null;
+  let lastReportedState: FollowBottomState | null = null;
 
   let mutationObserver: MutationObserver | null = null;
   let resizeObserver: ResizeObserver | null = null;
   let settleFrame: number | null = null;
+  let reactivationFrame: number | null = null;
+  let layoutReportFrame: number | null = null;
+  let layoutFrame: number | null = null;
   let stableFrames = 0;
   let previousMaximum: number | null = null;
-  let activeMutationLocks = 0;
   let destroyed = false;
+  // Whether native scroll anchoring on the container (via the follower's
+  // bottom anchor) carries a followed viewport through a leased motion's
+  // per-frame growth until the post-layout resize delivery snaps exactly.
+  // Read from the container's computed `overflow-anchor` once per attach
+  // (primed by the reactivation frame, so lease ticks normally never read).
+  let nativeAnchorCarriesPin: boolean | null = null;
+  const activeLeases = new Set<MutationLease>();
   const mutationElements = new Map<HTMLElement, number>();
   const persistentResizeElements = new WeakSet<HTMLElement>();
   const originalOverflowAnchors = new Map<HTMLElement, string>();
   const nativeBottomAnchor = document.createElement('div');
   nativeBottomAnchor.dataset.followBottomAnchor = '';
   nativeBottomAnchor.setAttribute('aria-hidden', 'true');
+  // Zero-sized elements are rejected as scroll-anchor candidates by both
+  // Chromium and Gecko (w3c/csswg-drafts#3483), so the layout-neutral form
+  // keeps a 1px box and cancels it with a negative margin instead of
+  // collapsing to 0px — net scrollHeight contribution stays zero while the
+  // anchor remains eligible to hold a followed viewport pinned. Neutrality
+  // holds in flex parents (margins don't collapse) and in block containers
+  // via adjacent-margin collapsing — ChatPanel appends the anchor to its
+  // block scroll viewport, where the -1px margin collapses with the
+  // preceding sibling's bottom margin and the 1px height restores the
+  // difference.
   nativeBottomAnchor.style.cssText =
-    `height:${options.layoutNeutralBottomAnchor ? 0 : 1}px;` +
+    `height:1px;${options.layoutNeutralBottomAnchor ? 'margin-top:-1px;' : ''}` +
     'overflow-anchor:auto;pointer-events:none;flex:0 0 auto;';
 
   function excludeNativeAnchor(element: HTMLElement) {
@@ -132,7 +189,9 @@ export function followBottom(container: HTMLElement, options: FollowBottomOption
 
   function cancelSettle() {
     if (settleFrame !== null) cancelAnimationFrame(settleFrame);
+    if (layoutFrame !== null) cancelAnimationFrame(layoutFrame);
     settleFrame = null;
+    layoutFrame = null;
     stableFrames = 0;
     previousMaximum = null;
   }
@@ -141,73 +200,196 @@ export function followBottom(container: HTMLElement, options: FollowBottomOption
     return Math.max(0, container.scrollHeight - container.clientHeight);
   }
 
-  function setExactBottom(): number {
-    const maximum = maximumScrollTop();
-    if (container.scrollTop !== maximum) container.scrollTop = maximum;
-    return maximum;
+  function canNativeAnchorCarryPin(): boolean {
+    nativeAnchorCarriesPin ??= getComputedStyle(container).overflowAnchor !== 'none';
+    return nativeAnchorCarriesPin;
   }
 
-  function checkIfAtBottom(): boolean {
-    return maximumScrollTop() - container.scrollTop <= threshold;
+  function readScrollGeometry(): ScrollGeometry {
+    return { maximum: maximumScrollTop(), scrollTop: container.scrollTop };
   }
 
-  function reportState() {
-    const distance = Math.max(0, maximumScrollTop() - container.scrollTop);
+  function setExactBottom(geometry = readScrollGeometry()): ScrollGeometry {
+    if (geometry.scrollTop !== geometry.maximum) container.scrollTop = geometry.maximum;
+    return { maximum: geometry.maximum, scrollTop: geometry.maximum };
+  }
+
+  function checkIfAtBottom(geometry = readScrollGeometry()): boolean {
+    return geometry.maximum - geometry.scrollTop <= threshold;
+  }
+
+  function reportState(geometry = readScrollGeometry()) {
+    const distance = Math.max(0, geometry.maximum - geometry.scrollTop);
+    const isAtBottom = distance <= threshold;
+    if (
+      lastReportedState?.distanceFromBottom === distance &&
+      lastReportedState.isAtBottom === isAtBottom &&
+      lastReportedState.isFollowing === isFollowing
+    ) {
+      return;
+    }
+    lastReportedState = { distanceFromBottom: distance, isAtBottom, isFollowing };
     onScrollStateChange?.({
       distanceFromBottom: distance,
-      isAtBottom: distance <= threshold,
+      isAtBottom,
       isFollowing,
     });
   }
 
+  function scheduleUserStateCheck() {
+    if (userStateFrame !== null) return;
+    userStateFrame = requestAnimationFrame(() => {
+      userStateFrame = null;
+      if (destroyed || !enabled) return;
+      if (checkIfAtBottom()) follower.followAndScroll();
+      else reportState();
+    });
+  }
+
   function setFollowing(value: boolean, notify = true) {
+    if (!enabled) {
+      isFollowing = value;
+      return;
+    }
     const changed = isFollowing !== value;
     if (changed) {
       isFollowing = value;
+      setNativeBottomAnchorActive(value);
     }
-    setNativeBottomAnchorActive(value);
     if (changed && notify) onFollowChange?.(value);
     if (!value) cancelSettle();
     reportState();
   }
 
+  function releaseLease(lease: MutationLease, scheduleSettle = true): void {
+    if (!activeLeases.delete(lease)) return;
+    const remainingElementLocks = (mutationElements.get(lease.element) ?? 1) - 1;
+    if (remainingElementLocks > 0) mutationElements.set(lease.element, remainingElementLocks);
+    else {
+      mutationElements.delete(lease.element);
+      if (!persistentResizeElements.has(lease.element)) {
+        resizeObserver?.unobserve?.(lease.element);
+      }
+    }
+    stableFrames = 0;
+    if (scheduleSettle) scheduleBottomSettle();
+  }
+
+  /**
+   * Leases release from their motion's terminal tick, but Svelte's
+   * `transition.stop()` aborts an animation without one and the destroyed
+   * effect removes the node — so a lease whose element left the container,
+   * or whose bounded lifetime elapsed, is released here instead. Neither
+   * check reads geometry (`contains` is a tree walk), so the settle frame and
+   * the hold query stay read-free during the motion.
+   */
+  function releaseStaleLeases(scheduleSettle = true): void {
+    if (activeLeases.size === 0) return;
+    const now = performance.now();
+    for (const lease of activeLeases) {
+      if (!container.contains(lease.element) || now >= lease.expiresAt) {
+        releaseLease(lease, scheduleSettle);
+      }
+    }
+  }
+
   function runSettleFrame() {
     settleFrame = null;
-    if (destroyed || !isFollowing) return;
-    const maximum = setExactBottom();
-    reportState();
+    if (destroyed || !enabled || !isFollowing) return;
+    // Already inside the settle loop: a stale release must not arm a second one.
+    releaseStaleLeases(false);
+    if (activeLeases.size > 0) {
+      // A leased element is resize-observed, so its per-frame growth arrives
+      // post-layout through handleResizeDelivery — the frame's single clean
+      // geometry read — while the native bottom anchor carries the pin
+      // between layouts. Reading here too would add a pre-layout read every
+      // frame (a forced layout whenever the frame's tick already dirtied
+      // style); just keep the loop armed until the last lease settles.
+      settleFrame = requestAnimationFrame(runSettleFrame);
+      return;
+    }
+    const geometry = setExactBottom();
+    const { maximum } = geometry;
+    reportState(geometry);
     if (maximum === previousMaximum) stableFrames += 1;
     else {
       stableFrames = 0;
       previousMaximum = maximum;
     }
-    if (activeMutationLocks > 0 || stableFrames < FOLLOW_BOTTOM_STABLE_FRAMES) {
+    if (stableFrames < FOLLOW_BOTTOM_STABLE_FRAMES) {
       settleFrame = requestAnimationFrame(runSettleFrame);
     }
   }
 
   function scheduleBottomSettle() {
-    if (destroyed || !isFollowing || settleFrame !== null) return;
+    if (destroyed || !enabled || !isFollowing || settleFrame !== null) return;
     settleFrame = requestAnimationFrame(runSettleFrame);
   }
 
-  function requestBottomSettle() {
-    if (destroyed || !isFollowing) return;
-    const maximum = setExactBottom();
-    reportState();
+  function requestBottomSettle(scheduleTail = true) {
+    if (destroyed || !enabled || !isFollowing) return;
+    const geometry = setExactBottom();
+    const { maximum } = geometry;
+    reportState(geometry);
     stableFrames = 0;
     previousMaximum = maximum;
-    scheduleBottomSettle();
+    if (scheduleTail) scheduleBottomSettle();
+  }
+
+  function scheduleLayoutReport() {
+    if (layoutReportFrame !== null) return;
+    layoutReportFrame = requestAnimationFrame(() => {
+      layoutReportFrame = null;
+      if (destroyed || !enabled) return;
+      reportState();
+    });
+  }
+
+  function reconcileLayoutChange() {
+    layoutFrame = null;
+    if (destroyed || !enabled) return;
+    let geometry = readScrollGeometry();
+    const correctedBottom = geometry.scrollTop !== geometry.maximum;
+    geometry = setExactBottom(geometry);
+    if (correctedBottom || geometry.maximum !== previousMaximum || activeLeases.size > 0) {
+      stableFrames = 0;
+      previousMaximum = geometry.maximum;
+      scheduleBottomSettle();
+    }
+    reportState(geometry);
   }
 
   function handleLayoutChange() {
+    // Mutation callbacks fire as microtasks on a dirty tree — e.g. when a
+    // retained surface is revealed — where a synchronous
+    // scrollHeight/clientHeight read forces layout. Defer all layout reads
+    // to a single coalesced animation frame (still pre-paint); the native
+    // bottom anchor keeps a followed viewport pinned until the settle frame
+    // snaps exactly.
+    if (destroyed || !enabled) return;
     if (isFollowing) {
-      const maximum = setExactBottom();
-      stableFrames = 0;
-      previousMaximum = maximum;
-      scheduleBottomSettle();
+      if (settleFrame !== null || layoutFrame !== null) return;
+      layoutFrame = requestAnimationFrame(reconcileLayoutChange);
+      return;
     }
-    reportState();
+    scheduleLayoutReport();
+  }
+
+  function handleResizeDelivery() {
+    // ResizeObserver delivers after layout, pre-paint, on a clean tree, so
+    // geometry reads here are cheap. Snap synchronously while following:
+    // deferring to a rAF (which runs in the NEXT frame from an RO callback)
+    // would paint one stale-scrollTop frame per resize burst — the footer
+    // utility bar flicker under rapid streaming. ("Clean" is per broadcast
+    // depth: an earlier ResizeObserver in the same broadcast that dirties
+    // style forces one bounded re-layout here; the settle tail corrects any
+    // residue.)
+    if (destroyed || !enabled) return;
+    if (isFollowing) {
+      requestBottomSettle(layoutFrame === null);
+      return;
+    }
+    scheduleLayoutReport();
   }
 
   const follower: BottomFollower = {
@@ -218,46 +400,59 @@ export function followBottom(container: HTMLElement, options: FollowBottomOption
     isFollowing: () => isFollowing,
     isNativeScrollAnchoringActive: () =>
       !isFollowing && getComputedStyle(container).overflowAnchor !== 'none',
-    beforeMutation(element) {
-      if (destroyed || !isFollowing) return inertFollowBottomMutation;
-      activeMutationLocks += 1;
+    hasActiveMutation: () => {
+      // A lease acquired while following stays owned through wheel-up,
+      // PageUp/Home or a consumer `follow: false` (so a later re-follow keeps
+      // its pin), but an unfollowed viewport is not being swept by a bottom
+      // pin, so it must not hold hydration.
+      if (!isFollowing) return false;
+      releaseStaleLeases();
+      return activeLeases.size > 0;
+    },
+    beforeMutation(element, mutationOptions) {
+      // The lease avoids reading geometry itself: acquisition, request() and
+      // settle() are called from Svelte flushes and transition ticks that
+      // have just dirtied style, where a scrollHeight/clientHeight read
+      // forces layout. They only arm the settle loop; the pin comes from the
+      // element's resize delivery (post-layout) and the tail frames, while
+      // native anchoring holds the viewport in between. A container that
+      // opts out of native anchoring (`overflow-anchor: none`) has no such
+      // carrier — any rAF callback ordered after the transition tick would
+      // read the grown content against the previous frame's scrollTop until
+      // resize delivery — so there request() pins synchronously instead.
+      if (destroyed || !enabled || !isFollowing) return inertFollowBottomMutation;
+      const lease: MutationLease = {
+        element,
+        expiresAt:
+          performance.now() + (mutationOptions.maxHoldMs ?? FOLLOW_BOTTOM_MUTATION_MAX_HOLD_MS),
+      };
+      activeLeases.add(lease);
       const elementLocks = mutationElements.get(element) ?? 0;
       mutationElements.set(element, elementLocks + 1);
       if (elementLocks === 0 && !persistentResizeElements.has(element)) {
         resizeObserver?.observe(element);
       }
-      requestBottomSettle();
-      let active = true;
+      stableFrames = 0;
+      scheduleBottomSettle();
       return {
         request() {
-          if (active && !destroyed) requestBottomSettle();
+          if (!activeLeases.has(lease) || destroyed) return;
+          if (canNativeAnchorCarryPin()) scheduleBottomSettle();
+          else requestBottomSettle();
         },
         settle() {
-          if (!active || destroyed) return;
-          active = false;
-          activeMutationLocks = Math.max(0, activeMutationLocks - 1);
-          const remainingElementLocks = (mutationElements.get(element) ?? 1) - 1;
-          if (remainingElementLocks > 0) mutationElements.set(element, remainingElementLocks);
-          else {
-            mutationElements.delete(element);
-            if (!persistentResizeElements.has(element)) resizeObserver?.unobserve?.(element);
-          }
-          requestBottomSettle();
+          if (destroyed) return;
+          releaseLease(lease);
         },
       };
     },
   };
-  bottomFollowers.set(container, follower);
-
   // Handle wheel events - user is scrolling with mouse/trackpad
   function handleWheel(e: WheelEvent) {
     if (e.deltaY < 0) {
       setFollowing(false);
     } else if (e.deltaY > 0) {
-      requestAnimationFrame(() => {
-        if (checkIfAtBottom()) follower.followAndScroll();
-        else reportState();
-      });
+      scheduleUserStateCheck();
     }
   }
 
@@ -279,10 +474,7 @@ export function followBottom(container: HTMLElement, options: FollowBottomOption
 
   function handleTouchEnd() {
     // Check if at bottom after touch scroll ends
-    requestAnimationFrame(() => {
-      if (checkIfAtBottom()) follower.followAndScroll();
-      else reportState();
-    });
+    scheduleUserStateCheck();
   }
 
   // Handle keyboard events for scroll keys
@@ -291,10 +483,7 @@ export function followBottom(container: HTMLElement, options: FollowBottomOption
       setFollowing(false);
     } else if (['ArrowDown', 'PageDown', 'End'].includes(e.key)) {
       // Check if at bottom after keyboard scroll
-      requestAnimationFrame(() => {
-        if (checkIfAtBottom()) follower.followAndScroll();
-        else reportState();
-      });
+      scheduleUserStateCheck();
     }
   }
 
@@ -312,8 +501,13 @@ export function followBottom(container: HTMLElement, options: FollowBottomOption
 
   function handleScroll() {
     if (!pointerScrolling) {
-      if (isFollowing) setExactBottom();
-      reportState();
+      // While the settle loop is armed it (or resize delivery) already owns
+      // this frame's single geometry read and pin; a scroll event here is
+      // the echo of that pin, and re-reading would double the layout work.
+      if (isFollowing && settleFrame !== null) return;
+      let geometry = readScrollGeometry();
+      if (isFollowing) geometry = setExactBottom(geometry);
+      reportState(geometry);
       return;
     }
 
@@ -359,9 +553,11 @@ export function followBottom(container: HTMLElement, options: FollowBottomOption
     // Watch for DOM changes
     mutationObserver = new MutationObserver((mutations) => {
       // When new children are added, observe them for size changes too
+      let removedNodes = false;
       for (const mutation of mutations) {
         if (mutation.type === 'childList') {
           for (const node of mutation.removedNodes) {
+            removedNodes = true;
             if (node instanceof HTMLElement) restoreNativeAnchor(node);
           }
           for (const node of mutation.addedNodes) {
@@ -372,6 +568,7 @@ export function followBottom(container: HTMLElement, options: FollowBottomOption
           }
         }
       }
+      if (removedNodes) releaseStaleLeases();
       setNativeBottomAnchorActive(isFollowing);
       handleLayoutChange();
     });
@@ -383,7 +580,7 @@ export function followBottom(container: HTMLElement, options: FollowBottomOption
     });
 
     // Watch for size changes
-    resizeObserver = new ResizeObserver(handleLayoutChange);
+    resizeObserver = new ResizeObserver(handleResizeDelivery);
     observePersistentResize(container);
 
     // Also observe children for size changes
@@ -401,34 +598,100 @@ export function followBottom(container: HTMLElement, options: FollowBottomOption
     resizeObserver = null;
   }
 
-  // Attach event listeners
-  container.addEventListener('scroll', handleScroll, { passive: true });
-  container.addEventListener('wheel', handleWheel, { passive: true });
-  container.addEventListener('touchstart', handleTouchStart, { passive: true });
-  container.addEventListener('touchmove', handleTouchMove, { passive: true });
-  container.addEventListener('touchend', handleTouchEnd, { passive: true });
-  container.addEventListener('keydown', handleKeyDown);
-  container.addEventListener('pointerdown', handlePointerDown, { passive: true });
-  window.addEventListener('pointerup', handlePointerUp, { passive: true });
-  window.addEventListener('pointercancel', handlePointerUp, { passive: true });
-
-  // Initial setup
-  setupNativeBottomAnchor();
-  setupObservers();
-  if (isFollowing) {
-    setExactBottom();
+  function attachLifecycle(deferSnap = false) {
+    if (!enabled || destroyed) return;
+    bottomFollowers.set(container, follower);
+    container.addEventListener('scroll', handleScroll, { passive: true });
+    container.addEventListener('wheel', handleWheel, { passive: true });
+    container.addEventListener('touchstart', handleTouchStart, { passive: true });
+    container.addEventListener('touchmove', handleTouchMove, { passive: true });
+    container.addEventListener('touchend', handleTouchEnd, { passive: true });
+    container.addEventListener('keydown', handleKeyDown);
+    container.addEventListener('pointerdown', handlePointerDown, { passive: true });
+    window.addEventListener('pointerup', handlePointerUp, { passive: true });
+    window.addEventListener('pointercancel', handlePointerUp, { passive: true });
+    setupNativeBottomAnchor();
+    setupObservers();
+    if (deferSnap) {
+      // Re-enable of a retained surface: its DOM and scroll position were
+      // preserved while detached, and the surface was just revealed, so a
+      // synchronous scrollHeight/clientHeight read here forces layout on a
+      // dirty tree. Defer the snap/report to the frame (still pre-paint).
+      reactivationFrame = requestAnimationFrame(() => {
+        reactivationFrame = null;
+        if (destroyed || !enabled) return;
+        canNativeAnchorCarryPin();
+        if (isFollowing) requestBottomSettle();
+        else reportState();
+      });
+      return;
+    }
+    canNativeAnchorCarryPin();
+    let initialGeometry = readScrollGeometry();
+    if (isFollowing) {
+      initialGeometry = setExactBottom(initialGeometry);
+      previousMaximum = initialGeometry.maximum;
+    }
+    reportState(initialGeometry);
   }
-  reportState();
+
+  function detachLifecycle() {
+    activeLeases.clear();
+    mutationElements.clear();
+    pointerScrolling = false;
+    cancelSettle();
+    if (userStateFrame !== null) cancelAnimationFrame(userStateFrame);
+    userStateFrame = null;
+    if (reactivationFrame !== null) cancelAnimationFrame(reactivationFrame);
+    reactivationFrame = null;
+    if (layoutReportFrame !== null) cancelAnimationFrame(layoutReportFrame);
+    layoutReportFrame = null;
+    lastReportedState = null;
+    nativeAnchorCarriesPin = null;
+    if (bottomFollowers.get(container) === follower) bottomFollowers.delete(container);
+    teardownObservers();
+    teardownNativeBottomAnchor();
+    container.removeEventListener('scroll', handleScroll);
+    container.removeEventListener('wheel', handleWheel);
+    container.removeEventListener('touchstart', handleTouchStart);
+    container.removeEventListener('touchmove', handleTouchMove);
+    container.removeEventListener('touchend', handleTouchEnd);
+    container.removeEventListener('keydown', handleKeyDown);
+    container.removeEventListener('pointerdown', handlePointerDown);
+    window.removeEventListener('pointerup', handlePointerUp);
+    window.removeEventListener('pointercancel', handlePointerUp);
+  }
+
+  // Initial mount runs inside the component mount flush on a dirty tree, so
+  // the same deferred snap/report as a retained-surface re-enable applies: a
+  // synchronous scrollHeight/clientHeight read here forces layout mid-flush.
+  attachLifecycle(true);
 
   return {
     update(newOptions: FollowBottomOptions) {
       onFollowChange = newOptions.onFollowChange;
       onScrollStateChange = newOptions.onScrollStateChange;
       threshold = newOptions.threshold ?? 100;
+      const nextEnabled = newOptions.enabled ?? true;
+
+      if (enabled !== nextEnabled) {
+        if (!nextEnabled) detachLifecycle();
+        enabled = nextEnabled;
+        if (enabled) {
+          // Sync the consumer's follow policy first (no onFollowChange echo),
+          // then attach with the bottom snap/report deferred — the reveal of
+          // a retained surface must not force layout synchronously.
+          isFollowing = newOptions.follow;
+          attachLifecycle(true);
+          return;
+        }
+      }
 
       // Consumer-driven changes do not echo through onFollowChange. That
       // callback is reserved for wheel, touch, keyboard, and scrollbar input.
-      if (newOptions.follow && !isFollowing) {
+      if (!enabled) {
+        isFollowing = newOptions.follow;
+      } else if (newOptions.follow && !isFollowing) {
         setFollowing(true, false);
         requestBottomSettle();
       } else if (!newOptions.follow && isFollowing) setFollowing(false, false);
@@ -437,21 +700,7 @@ export function followBottom(container: HTMLElement, options: FollowBottomOption
 
     destroy() {
       destroyed = true;
-      activeMutationLocks = 0;
-      mutationElements.clear();
-      cancelSettle();
-      if (bottomFollowers.get(container) === follower) bottomFollowers.delete(container);
-      teardownObservers();
-      teardownNativeBottomAnchor();
-      container.removeEventListener('scroll', handleScroll);
-      container.removeEventListener('wheel', handleWheel);
-      container.removeEventListener('touchstart', handleTouchStart);
-      container.removeEventListener('touchmove', handleTouchMove);
-      container.removeEventListener('touchend', handleTouchEnd);
-      container.removeEventListener('keydown', handleKeyDown);
-      container.removeEventListener('pointerdown', handlePointerDown);
-      window.removeEventListener('pointerup', handlePointerUp);
-      window.removeEventListener('pointercancel', handlePointerUp);
+      detachLifecycle();
     },
   };
 }
@@ -465,14 +714,28 @@ export function isNativeScrollAnchoringActive(element: HTMLElement): boolean {
 }
 
 /**
+ * True while a descendant mutation lease (see beforeFollowBottomMutation) is
+ * held on this followed container — i.e. a disclosure motion or similar
+ * layout change is still moving content under a bottom-pinned viewport.
+ */
+export function hasActiveFollowBottomMutation(element: HTMLElement): boolean {
+  return bottomFollowers.get(element)?.hasActiveMutation() ?? false;
+}
+
+/**
  * Capture the nearest followed scroll container before descendant layout changes.
  * The returned lease asks that single authority to keep its settle active.
+ * `settle()` is idempotent; the follower also releases the lease itself once
+ * the element leaves the container or `maxHoldMs` elapses.
  */
-export function beforeFollowBottomMutation(element: HTMLElement): FollowBottomMutation {
+export function beforeFollowBottomMutation(
+  element: HTMLElement,
+  options: FollowBottomMutationOptions = {},
+): FollowBottomMutation {
   let current: HTMLElement | null = element;
   while (current) {
     const follower = bottomFollowers.get(current);
-    if (follower) return follower.beforeMutation(element);
+    if (follower) return follower.beforeMutation(element, options);
     current = current.parentElement;
   }
   return inertFollowBottomMutation;
@@ -481,7 +744,7 @@ export function beforeFollowBottomMutation(element: HTMLElement): FollowBottomMu
 /**
  * Distance from scroll bottom in pixels
  */
-export function distanceFromBottom(element: HTMLElement): number {
+function distanceFromBottom(element: HTMLElement): number {
   const { scrollTop, scrollHeight, clientHeight } = element;
   return scrollHeight - scrollTop - clientHeight;
 }
@@ -489,7 +752,7 @@ export function distanceFromBottom(element: HTMLElement): number {
 /**
  * Check if scroll position is near the bottom
  */
-export function isScrollNearBottom(element: HTMLElement, threshold = 100): boolean {
+function isScrollNearBottom(element: HTMLElement, threshold = 100): boolean {
   return distanceFromBottom(element) <= threshold;
 }
 

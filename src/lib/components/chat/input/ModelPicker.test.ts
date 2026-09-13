@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/svelte';
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/svelte';
+import { tick } from 'svelte';
 import { derived, get, readable, writable } from 'svelte/store';
 
 const mockModelState = vi.hoisted(() => ({
@@ -18,7 +19,7 @@ const mockProviderModelsState = vi.hoisted(() => ({
   byProviderId: {} as Record<
     string,
     {
-      models: { value: string; label: string; description?: string }[];
+      models: { value: string; label: string; description?: string; isLegacyModel?: boolean }[];
       fetchedAt: string;
       warning?: string;
       stale?: boolean;
@@ -78,7 +79,8 @@ vi.mock('$store/renderer/store', async () => {
       providerCatalog,
       // The effective default provider is settings-derived (never the first
       // catalog row) — mirror the mocked selectActiveProviderId default.
-      providerSettings: { activeProviderId: 'auggie', enabledProviders: {} },
+      providerSettings: { enabledProviders: {} },
+      model: { defaultProviderId: 'auggie' },
       providerModels: {
         byProviderId: mockProviderModelsState.byProviderId,
         clearEpoch: mockProviderModelsState.clearEpoch,
@@ -197,7 +199,12 @@ const mockAgentSession$ = writable<
 >(undefined);
 vi.mock('$store/renderer/slices/provider-settings/provider-settings-selectors', () => ({
   selectActiveProviderId: () => activeProviderId$,
-  selectEnabledProviderIds: () => enabledProviderIds$,
+  selectModelFetchProviderIds: () =>
+    derived(
+      [hasCheckedOnce$, enabledProviderIds$, availableEnabledProviderIds$],
+      ([checked, enabled, available]) => (checked ? available : enabled),
+    ),
+  selectIsProviderModelAccessAllowed: () => readable(true),
   selectAvailableEnabledProviderIds: () => availableEnabledProviderIds$,
 }));
 
@@ -334,6 +341,183 @@ describe('ModelPicker locked state', () => {
   });
 });
 
+describe('ModelPicker legacy Auggie models', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockModelState.selectedModel = 'current';
+    mockModelState.availableModels = [{ value: 'current', label: 'Current model' }];
+    mockModelState.availableModelsProviderId = 'auggie';
+    mockModelState.loadError = null;
+    enabledProviderIds$.set(['auggie']);
+    activeProviderId$.set('auggie');
+    vi.mocked(getModelsForProviderForLoadingState).mockResolvedValue({
+      models: [
+        { value: 'current', label: 'Current model' },
+        { value: 'legacy-opus', label: 'Opus 4.1', isLegacyModel: true },
+      ],
+    });
+  });
+
+  afterEach(() => {
+    cleanup();
+    document.body.innerHTML = '';
+  });
+
+  it('keeps current models visible and toggles the collapsed legacy subgroup', async () => {
+    const onModelChange = vi.fn();
+    render(ModelPicker, {
+      props: { selectedModel: 'current', onModelChange, portal: false },
+    });
+
+    await fireEvent.click(screen.getByRole('button'));
+    expect(await screen.findByRole('option', { name: /Current model/ })).toBeTruthy();
+    const legacyToggle = await screen.findByRole('button', { name: 'Toggle legacy models' });
+    expect(legacyToggle.getAttribute('aria-expanded')).toBe('false');
+    expect(screen.queryByRole('option', { name: /Opus 4.1/ })).toBeNull();
+    expect(screen.queryByRole('button', { name: /Refresh Legacy models/ })).toBeNull();
+
+    await fireEvent.click(legacyToggle);
+    expect(legacyToggle.getAttribute('aria-expanded')).toBe('true');
+    const legacyOption = await screen.findByRole('option', { name: /Opus 4.1/ });
+    await fireEvent.click(legacyOption);
+    expect(onModelChange).toHaveBeenCalledWith('legacy-opus', {
+      providerId: 'auggie',
+      modelId: 'legacy-opus',
+    });
+  });
+
+  it('supports keyboard expand and collapse on the legacy subgroup header', async () => {
+    render(ModelPicker, { props: { selectedModel: 'current', portal: false } });
+
+    await fireEvent.click(screen.getByRole('button'));
+    const legacyToggle = await screen.findByRole('button', { name: 'Toggle legacy models' });
+    await fireEvent.keyDown(legacyToggle, { key: 'Enter' });
+    await waitFor(() => expect(legacyToggle.getAttribute('aria-expanded')).toBe('true'));
+    expect(await screen.findByRole('option', { name: /Opus 4.1/ })).toBeTruthy();
+
+    await fireEvent.keyDown(legacyToggle, { key: ' ' });
+    await waitFor(() => expect(legacyToggle.getAttribute('aria-expanded')).toBe('false'));
+    expect(screen.queryByRole('option', { name: /Opus 4.1/ })).toBeNull();
+  });
+
+  it('reveals matching legacy models during search and restores collapse when cleared', async () => {
+    render(ModelPicker, { props: { selectedModel: 'current', portal: false } });
+
+    await fireEvent.click(screen.getByRole('button'));
+    const legacyToggle = await screen.findByRole('button', { name: 'Toggle legacy models' });
+    const search = screen.getByRole('searchbox', { name: 'Search options' });
+    expect(screen.queryByRole('option', { name: /Opus 4.1/ })).toBeNull();
+
+    await fireEvent.input(search, { target: { value: 'Legacy' } });
+    expect(await screen.findByRole('option', { name: /Opus 4.1/ })).toBeTruthy();
+    expect(legacyToggle.getAttribute('aria-expanded')).toBe('true');
+    expect(legacyToggle.getAttribute('aria-disabled')).toBe('true');
+    expect(legacyToggle.hasAttribute('disabled')).toBe(false);
+    await fireEvent.click(legacyToggle);
+
+    await fireEvent.input(search, { target: { value: '' } });
+    await waitFor(() => expect(screen.queryByRole('option', { name: /Opus 4.1/ })).toBeNull());
+    expect(legacyToggle.getAttribute('aria-expanded')).toBe('false');
+    expect(screen.getByRole('option', { name: /Current model/ })).toBeTruthy();
+  });
+
+  it('shows the legacy subgroup when every Auggie model is legacy', async () => {
+    mockModelState.selectedModel = 'legacy-opus';
+    mockModelState.availableModels = [];
+    vi.mocked(getModelsForProviderForLoadingState).mockResolvedValue({
+      models: [{ value: 'legacy-opus', label: 'Opus 4.1', isLegacyModel: true }],
+    });
+    render(ModelPicker, { props: { selectedModel: 'legacy-opus', portal: false } });
+
+    await fireEvent.click(screen.getByRole('button'));
+    expect(await screen.findByRole('option', { name: /Opus 4.1/ })).toBeTruthy();
+    const legacyToggle = screen.getByRole('button', { name: 'Toggle legacy models' });
+    expect(legacyToggle.getAttribute('aria-expanded')).toBe('true');
+    expect(legacyToggle.getAttribute('aria-disabled')).toBe('true');
+    expect(legacyToggle.hasAttribute('disabled')).toBe(false);
+  });
+
+  it('restores an expanded subgroup after search clears', async () => {
+    render(ModelPicker, { props: { selectedModel: 'current', portal: false } });
+
+    await fireEvent.click(screen.getByRole('button'));
+    const legacyToggle = await screen.findByRole('button', { name: 'Toggle legacy models' });
+    const search = screen.getByRole('searchbox', { name: 'Search options' });
+    await fireEvent.click(legacyToggle);
+    expect(legacyToggle.getAttribute('aria-expanded')).toBe('true');
+
+    await fireEvent.input(search, { target: { value: 'Opus' } });
+    expect(legacyToggle.getAttribute('aria-disabled')).toBe('true');
+    expect(legacyToggle.hasAttribute('disabled')).toBe(false);
+    await fireEvent.input(search, { target: { value: '' } });
+
+    expect(legacyToggle.getAttribute('aria-expanded')).toBe('true');
+    expect(await screen.findByRole('option', { name: /Opus 4.1/ })).toBeTruthy();
+  });
+});
+
+describe('ModelPicker default pseudo-row filtering', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockModelState.selectedModel = 'auggie:sonnet';
+    mockModelState.availableModels = [];
+    mockModelState.availableModelsProviderId = 'auggie';
+    mockModelState.loadError = null;
+    enabledProviderIds$.set(['auggie']);
+    activeProviderId$.set('auggie');
+  });
+
+  afterEach(() => {
+    cleanup();
+    document.body.innerHTML = '';
+  });
+
+  it('never lists a default pseudo-row still served by an older daemon', async () => {
+    vi.mocked(getModelsForProviderForLoadingState).mockResolvedValue({
+      models: [
+        { value: 'auggie:default', label: 'Default (recommended)' },
+        { value: 'auggie:sonnet', label: 'Sonnet 4.6' },
+        { value: 'auggie:opus', label: 'Opus 4.5' },
+      ],
+    });
+    render(ModelPicker, { props: { selectedModel: 'auggie:sonnet', portal: false } });
+
+    await fireEvent.click(screen.getByRole('button'));
+    expect(await screen.findByRole('option', { name: /Sonnet 4.6/ })).toBeTruthy();
+    expect(screen.getByRole('option', { name: /Opus 4.5/ })).toBeTruthy();
+    expect(screen.queryByRole('option', { name: /Default \(recommended\)/ })).toBeNull();
+  });
+
+  it('cannot surface the default pseudo-row through search', async () => {
+    vi.mocked(getModelsForProviderForLoadingState).mockResolvedValue({
+      models: [
+        { value: 'auggie:default', label: 'Default (recommended)' },
+        { value: 'auggie:sonnet', label: 'Sonnet 4.6' },
+      ],
+    });
+    render(ModelPicker, { props: { selectedModel: 'auggie:sonnet', portal: false } });
+
+    await fireEvent.click(screen.getByRole('button'));
+    await screen.findByRole('option', { name: /Sonnet 4.6/ });
+    const search = screen.getByRole('searchbox', { name: 'Search options' });
+    await fireEvent.input(search, { target: { value: 'Default' } });
+
+    await waitFor(() =>
+      expect(screen.queryByRole('option', { name: /Default \(recommended\)/ })).toBeNull(),
+    );
+  });
+
+  it('keeps the default pseudo-row when it is the only row for the provider (D1)', async () => {
+    vi.mocked(getModelsForProviderForLoadingState).mockResolvedValue({
+      models: [{ value: 'auggie:default', label: 'Default (recommended)' }],
+    });
+    render(ModelPicker, { props: { selectedModel: 'auggie:default', portal: false } });
+
+    await fireEvent.click(screen.getByRole('button'));
+    expect(await screen.findByRole('option', { name: /Default \(recommended\)/ })).toBeTruthy();
+  });
+});
+
 describe('ModelPicker combined reasoning mode', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -370,7 +554,104 @@ describe('ModelPicker combined reasoning mode', () => {
     activeProviderId$.set('auggie');
   });
 
-  it('shows a compact collapsed reasoning row by default', async () => {
+  const effortTrigger = () => screen.getByTestId('effort-picker-trigger');
+
+  async function openEffortSelect() {
+    await fireEvent.click(effortTrigger());
+    const listboxes = await screen.findAllByRole('listbox');
+    return listboxes[listboxes.length - 1];
+  }
+
+  async function selectEffort(listbox: HTMLElement, name: string) {
+    await fireEvent.pointerUp(within(listbox).getByRole('option', { name }), {
+      pointerType: 'mouse',
+    });
+  }
+
+  const triggerBranches: Array<{
+    name: string;
+    props: { size?: 'xs'; isLocked?: boolean };
+  }> = [
+    { name: 'regular', props: {} },
+    { name: 'xs', props: { size: 'xs' } },
+    { name: 'locked', props: { isLocked: true } },
+  ];
+
+  it.each(triggerBranches)(
+    'renders Auto, Off, and explicit effort gauges in the $name trigger',
+    async ({ props }) => {
+      const levels = ['none', 'low', 'medium', 'high'];
+      const cases: Array<{
+        effort: string | null;
+        label: string;
+        gaugeValue: number | null;
+      }> = [
+        { effort: null, label: 'Auto', gaugeValue: null },
+        { effort: 'none', label: 'Off', gaugeValue: null },
+        { effort: 'low', label: 'Low', gaugeValue: 1 },
+        { effort: 'medium', label: 'Medium', gaugeValue: 2 },
+        { effort: 'high', label: 'High', gaugeValue: 3 },
+      ];
+
+      for (const { effort, label, gaugeValue } of cases) {
+        reasoningEffort$.set(effort);
+        agentModelEffortLevels$.set(levels);
+        render(ModelPicker, {
+          props: {
+            selectedModel: 'codex:gpt-5.6-sol',
+            agentId: 'agent-1',
+            workspaceId: 'ws-1',
+            showReasoning: true,
+            portal: false,
+            ...props,
+          },
+        });
+
+        const accessibleLabel = `GPT-5.6-Sol · ${label}`;
+        const trigger = await waitFor(() => screen.getByRole('button', { name: accessibleLabel }));
+        const titleElement = props.isLocked ? trigger : trigger.querySelector('[title]');
+        expect(titleElement?.getAttribute('title')).toContain(accessibleLabel);
+
+        const gauge = screen.queryByTestId('model-reasoning-effort-gauge');
+        if (gaugeValue === null) {
+          expect(gauge).toBeNull();
+        } else {
+          expect(gauge?.dataset.gaugeValue).toBe(String(gaugeValue));
+          expect(gauge?.dataset.gaugeSize).toBe('compact');
+        }
+
+        if (effort === null) {
+          expect(screen.getByTestId('model-reasoning-strength').textContent).toContain('Auto');
+        } else {
+          expect(screen.queryByTestId('model-reasoning-strength')).toBeNull();
+          expect(trigger.textContent).not.toContain(label);
+        }
+
+        cleanup();
+        document.body.innerHTML = '';
+      }
+    },
+  );
+
+  it('hides the reasoning footer when the selected model has no effort levels', async () => {
+    const models = [{ value: 'no-effort', label: 'No effort model' }];
+    mockModelState.availableModels = models;
+    vi.mocked(getModelsForProviderForLoadingState).mockResolvedValue({ models });
+
+    render(ModelPicker, {
+      props: {
+        selectedModel: 'no-effort',
+        portal: false,
+        showReasoning: true,
+      },
+    });
+
+    await fireEvent.click(screen.getByRole('button'));
+
+    expect(screen.queryByTestId('model-reasoning-section')).toBeNull();
+  });
+
+  it('shows a compact reasoning select and replaces the current strength with a gauge', async () => {
     render(ModelPicker, {
       props: {
         selectedModel: 'codex:gpt-5.6-sol',
@@ -382,46 +663,36 @@ describe('ModelPicker combined reasoning mode', () => {
     });
 
     const trigger = screen.getByRole('button');
-    const triggerGauge = await waitFor(() => screen.getByTestId('effort-gauge'));
     expect(trigger.textContent).toContain('GPT-5.6-Sol');
+    await waitFor(() => expect(screen.getByLabelText('GPT-5.6-Sol · Medium')).toBeTruthy());
     expect(trigger.textContent).not.toContain('Medium');
-    expect(screen.getByLabelText('GPT-5.6-Sol · Medium')).toBeTruthy();
-    expect(triggerGauge.dataset.gaugeValue).toBe('1');
-    expect(triggerGauge.dataset.gaugeCentered).toBe('false');
-    expect(triggerGauge.dataset.gaugeSize).toBe('compact');
+    expect(screen.getByTestId('model-reasoning-effort-gauge').dataset.gaugeValue).toBe('1');
+    expect(screen.queryByTestId('effort-gauge')).toBeNull();
 
     await fireEvent.click(trigger);
 
+    const popover = screen.getByRole('listbox');
+    expect(popover.className).toContain('bg-background!');
+    expect(popover.className).toContain('[&_[role=searchbox]]:border-b!');
+    expect(popover.className).toContain('[&_[role=searchbox]]:border-solid!');
     const modelOption = await screen.findByRole('option', { name: /GPT-5\.6-Sol/ });
     expect(modelOption.textContent).toContain('Codex model');
     expect(modelOption.textContent).not.toContain('Effort:');
     expect(modelOption.textContent).not.toContain('low · medium · high · max');
     expect(screen.getByTestId('model-reasoning-section')).toBeTruthy();
-    const toggle = screen.getByTestId('model-reasoning-toggle');
-    expect(toggle.hasAttribute('disabled')).toBe(false);
-    expect(toggle.textContent?.trim()).toBe('Reasoning effort · Medium');
-    expect(toggle.className).toContain('text-xs');
-    expect(toggle.querySelector('[data-testid="effort-gauge"]')).toBeNull();
-    expect(toggle.querySelector('svg')).toBeNull();
-    expect(toggle.getAttribute('aria-expanded')).toBe('false');
-    expect(toggle.classList.contains('bg-transparent')).toBe(true);
-    expect(toggle.className).not.toContain('focus:bg-muted');
+    const selectTrigger = effortTrigger() as HTMLButtonElement;
+    expect(selectTrigger.disabled).toBe(false);
+    expect(selectTrigger.textContent?.trim()).toBe('Medium');
+    expect(selectTrigger.className).toContain('text-xs');
+    expect(selectTrigger.getAttribute('aria-expanded')).toBe('false');
+    expect(screen.getByTestId('effort-gauge')).toBeTruthy();
     expect(screen.queryByRole('slider')).toBeNull();
 
-    await fireEvent.click(toggle);
-
-    expect(toggle.textContent?.trim()).toBe('Reasoning effort · Medium');
-    const slider = screen.getByRole('slider');
-    expect(slider.getAttribute('max')).toBe('4');
-    expect(slider.getAttribute('aria-valuetext')).toBe('Medium');
-    expect(screen.getAllByTestId('effort-slider-tick')).toHaveLength(5);
-    expect(screen.queryByTestId('effort-current-value')).toBeNull();
-    expect(screen.getByTestId('effort-picker-content').textContent).not.toContain(
-      'Reasoning effort',
-    );
-    const nextSendCaption = screen.getByText('Applies on the next message you send.');
-    expect(nextSendCaption).toBeTruthy();
-    expect(screen.queryByTestId('effort-picker-trigger')).toBeNull();
+    const effortListbox = await openEffortSelect();
+    expect(within(effortListbox).getAllByRole('option')).toHaveLength(5);
+    expect(within(effortListbox).getByRole('option', { name: 'Auto' })).toBeTruthy();
+    expect(screen.queryByTestId('effort-slider-tick')).toBeNull();
+    expect(applyReasoningEffortMock).not.toHaveBeenCalled();
   });
 
   it('renders expanded Codex effort rows as one base model option', async () => {
@@ -464,7 +735,7 @@ describe('ModelPicker combined reasoning mode', () => {
     await fireEvent.click(screen.getByRole('button'));
 
     expect(await screen.findAllByRole('option', { name: /GPT-5\.6-Sol/ })).toHaveLength(1);
-    expect(screen.getByTestId('model-reasoning-toggle').hasAttribute('disabled')).toBe(false);
+    expect((effortTrigger() as HTMLButtonElement).disabled).toBe(false);
   });
 
   it('uses applyReasoningEffort when a reasoning level is selected', async () => {
@@ -479,10 +750,9 @@ describe('ModelPicker combined reasoning mode', () => {
     });
 
     await fireEvent.click(screen.getByRole('button'));
-    const toggle = screen.getByTestId('model-reasoning-toggle');
-    await waitFor(() => expect(toggle.hasAttribute('disabled')).toBe(false));
-    await fireEvent.click(toggle);
-    await fireEvent.change(screen.getByRole('slider'), { target: { value: '3' } });
+    await waitFor(() => expect((effortTrigger() as HTMLButtonElement).disabled).toBe(false));
+    const effortListbox = await openEffortSelect();
+    await selectEffort(effortListbox, 'High');
 
     await waitFor(() => {
       expect(applyReasoningEffortMock).toHaveBeenCalledWith('agent-1', 'ws-1', 'high', 'medium');
@@ -503,44 +773,86 @@ describe('ModelPicker combined reasoning mode', () => {
     });
 
     const trigger = screen.getByRole('button');
-    const triggerGauge = await waitFor(() => screen.getByTestId('effort-gauge'));
-    expect(screen.getByLabelText('GPT-5.6-Sol · High')).toBeTruthy();
-    expect(triggerGauge.dataset.gaugeValue).toBe('2');
+    await waitFor(() => expect(screen.getByLabelText('GPT-5.6-Sol · High')).toBeTruthy());
+    expect(trigger.textContent).not.toContain('High');
+    expect(screen.getByTestId('model-reasoning-effort-gauge').dataset.gaugeValue).toBe('2');
+    expect(screen.queryByTestId('effort-gauge')).toBeNull();
 
     await fireEvent.click(trigger);
-    const toggle = screen.getByTestId('model-reasoning-toggle');
-    expect(toggle.hasAttribute('disabled')).toBe(false);
-    await fireEvent.click(toggle);
-    await fireEvent.change(screen.getByRole('slider'), { target: { value: '4' } });
+    expect((effortTrigger() as HTMLButtonElement).disabled).toBe(false);
+    const effortListbox = await openEffortSelect();
+    await selectEffort(effortListbox, 'Max');
 
     await waitFor(() => expect(onReasoningChange).toHaveBeenCalledWith('max'));
     expect(applyReasoningEffortMock).not.toHaveBeenCalled();
   });
 
-  it('treats an unsupported controlled effort as unset', async () => {
+  it('ignores a second effort commit while the first is in flight without disabling the trigger', async () => {
+    let resolveChange!: (applied: boolean) => void;
+    const onReasoningChange = vi.fn(
+      () =>
+        new Promise<boolean>((resolve) => {
+          resolveChange = resolve;
+        }),
+    );
+
+    render(ModelPicker, {
+      props: {
+        selectedModel: 'codex:gpt-5.6-sol',
+        showReasoning: true,
+        reasoningEffort: 'medium',
+        onReasoningChange,
+        portal: false,
+      },
+    });
+
+    await fireEvent.click(screen.getByRole('button'));
+    const selectTrigger = (await screen.findByTestId('effort-picker-trigger')) as HTMLButtonElement;
+    await waitFor(() => expect(selectTrigger.disabled).toBe(false));
+    await selectEffort(await openEffortSelect(), 'High');
+    await waitFor(() => expect(onReasoningChange).toHaveBeenCalledWith('high'));
+
+    // The in-flight window is announced, not enforced through the HTML
+    // `disabled` attribute, so the focused trigger keeps focus (intent#4159).
+    await waitFor(() => expect(selectTrigger.getAttribute('aria-busy')).toBe('true'));
+    expect(selectTrigger.disabled).toBe(false);
+
+    await selectEffort(await openEffortSelect(), 'Max');
+    await waitFor(() => expect(selectTrigger.textContent?.trim()).toBe('Medium'));
+    expect(onReasoningChange).toHaveBeenCalledTimes(1);
+
+    resolveChange(true);
+    await waitFor(() => expect(selectTrigger.hasAttribute('aria-busy')).toBe(false));
+    expect(onReasoningChange).toHaveBeenCalledTimes(1);
+  });
+
+  it('displays an unsupported controlled effort as Auto without mutating it', async () => {
+    const onReasoningChange = vi.fn();
     render(ModelPicker, {
       props: {
         selectedModel: 'codex:gpt-5.6-sol',
         showReasoning: true,
         reasoningEffort: 'xhigh',
-        onReasoningChange: vi.fn(),
+        onReasoningChange,
         portal: false,
       },
     });
 
     const trigger = screen.getByRole('button');
-    expect(screen.getByLabelText('GPT-5.6-Sol')).toBeTruthy();
+    await waitFor(() => expect(trigger.textContent).toContain('Auto'));
 
     await fireEvent.click(trigger);
-    const toggle = screen.getByTestId('model-reasoning-toggle');
-    await waitFor(() => expect(toggle.hasAttribute('disabled')).toBe(false));
+    await waitFor(() => expect((effortTrigger() as HTMLButtonElement).disabled).toBe(false));
     expect(screen.queryByTestId('effort-gauge')).toBeNull();
-    expect(toggle.textContent?.trim()).toBe('Reasoning effort · Default');
-    await fireEvent.click(toggle);
-    expect(screen.getByRole('slider').getAttribute('aria-valuetext')).toBe('Default');
+    expect(trigger.textContent).toContain('Auto');
+    expect(trigger.textContent).not.toContain('Default');
+    expect(effortTrigger().textContent?.trim()).toBe('Auto');
+    const effortListbox = await openEffortSelect();
+    expect(within(effortListbox).getByRole('option', { name: 'Auto' })).toBeTruthy();
+    expect(onReasoningChange).not.toHaveBeenCalled();
   });
 
-  it('expands by keyboard, lets Escape collapse first, and resets after reopening', async () => {
+  it('lets the canonical select own keyboard navigation, focus, and Escape', async () => {
     render(ModelPicker, {
       props: {
         selectedModel: 'codex:gpt-5.6-sol',
@@ -552,45 +864,22 @@ describe('ModelPicker combined reasoning mode', () => {
     });
 
     await fireEvent.click(screen.getByRole('button'));
-    const toggle = screen.getByTestId('model-reasoning-toggle');
-    await waitFor(() => expect(toggle.hasAttribute('disabled')).toBe(false));
-    await fireEvent.keyDown(toggle, { key: 'Enter' });
-    expect(screen.getByRole('slider')).toBeTruthy();
+    const selectTrigger = (await screen.findByTestId('effort-picker-trigger')) as HTMLButtonElement;
+    await waitFor(() => expect(selectTrigger.disabled).toBe(false));
+    selectTrigger.focus();
+    await fireEvent.keyDown(selectTrigger, { key: 'Enter' });
+    const listboxes = screen.getAllByRole('listbox');
+    expect(listboxes).toHaveLength(2);
 
-    await fireEvent.keyDown(screen.getByRole('slider'), { key: 'Escape' });
-    await waitFor(() => expect(screen.queryByRole('slider')).toBeNull());
-    expect(screen.getByRole('listbox')).toBeTruthy();
+    await fireEvent.keyDown(selectTrigger, { key: 'Escape' });
+    await waitFor(() => {
+      expect(screen.getAllByRole('listbox')).toHaveLength(1);
+      expect(selectTrigger.getAttribute('aria-expanded')).toBe('false');
+    });
+    expect(document.activeElement).toBe(selectTrigger);
 
-    await fireEvent.click(await screen.findByRole('option', { name: /GPT-5\.6-Sol/ }));
+    await fireEvent.keyDown(selectTrigger, { key: 'Escape' });
     await waitFor(() => expect(screen.queryByRole('listbox')).toBeNull());
-    await fireEvent.click(screen.getByRole('button'));
-    expect(screen.getByTestId('model-reasoning-toggle').getAttribute('aria-expanded')).toBe(
-      'false',
-    );
-  });
-
-  it('keeps the chat popover height stable while allowing the model list to scroll', async () => {
-    render(ModelPicker, {
-      props: {
-        selectedModel: 'codex:gpt-5.6-sol',
-        agentId: 'agent-1',
-        workspaceId: 'ws-1',
-        showReasoning: true,
-        portal: false,
-      },
-    });
-
-    await fireEvent.click(screen.getByRole('button'));
-
-    const popover = screen.getByRole('listbox');
-    expect(popover.className).toContain('w-85');
-    expect(popover.className).toContain('min-h-90');
-    expect(popover.className).toContain('max-h-90');
-    expect(popover.className).not.toContain(' h-[min(');
-    expect(popover.querySelector('[data-scroll-container]')?.className).toContain('flex-1');
-    expect(popover.querySelector('[data-scroll-container]')?.className).toContain(
-      'overflow-y-auto',
-    );
   });
 
   it('closes the open menu when the trigger is clicked again', async () => {
@@ -639,6 +928,9 @@ describe('ModelPicker combined reasoning mode', () => {
     await fireEvent.click(screen.getByRole('button'));
 
     const codexTab = screen.getByRole('tab', { name: /Codex/ });
+    const providerTabs = screen.getByTestId('model-provider-tabs');
+    expect(providerTabs.parentElement?.className).toContain('bg-popover!');
+    expect(providerTabs.parentElement?.className).toContain('border-b!');
     expect(codexTab.getAttribute('aria-selected')).toBe('true');
     expect(await screen.findByRole('option', { name: /GPT-5\.6-Sol/ })).toBeTruthy();
     expect(screen.queryByRole('option', { name: /GPT 5\.4/ })).toBeNull();
@@ -679,6 +971,156 @@ describe('ModelPicker combined reasoning mode', () => {
     await waitFor(() => expect(screen.queryByRole('listbox')).toBeNull());
   });
 
+  it('force-refreshes and replaces the active provider list from the tab row', async () => {
+    let resolveRefresh!: (result: {
+      models: { value: string; label: string; description: string }[];
+    }) => void;
+    vi.mocked(getModelsForProviderForLoadingState).mockImplementation(
+      async (providerId, options) => {
+        if (providerId === 'codex' && options?.forceRefresh) {
+          return new Promise((resolve) => {
+            resolveRefresh = resolve;
+          });
+        }
+        return {
+          models:
+            providerId === 'codex'
+              ? [{ value: 'codex:gpt-5.6-sol', label: 'GPT-5.6-Sol', description: 'Codex model' }]
+              : [{ value: 'gpt5.4', label: 'GPT 5.4', description: 'Auggie model' }],
+        };
+      },
+    );
+    enabledProviderIds$.set(['auggie', 'codex']);
+
+    render(ModelPicker, {
+      props: {
+        selectedModel: 'codex:gpt-5.6-sol',
+        agentId: 'agent-1',
+        workspaceId: 'ws-1',
+        showReasoning: true,
+        portal: false,
+      },
+    });
+
+    await waitFor(() => {
+      expect(vi.mocked(getModelsForProviderForLoadingState)).toHaveBeenCalledWith('codex');
+    });
+    await fireEvent.click(screen.getByRole('button'));
+    expect(await screen.findByRole('option', { name: /GPT-5\.6-Sol/ })).toBeTruthy();
+
+    const refreshButton = screen.getByTestId('model-provider-refresh-button');
+    expect(refreshButton.getAttribute('title')).toBe('Refresh OpenAI Codex models');
+    vi.mocked(getModelsForProviderForLoadingState).mockClear();
+    await fireEvent.click(refreshButton);
+
+    await waitFor(() => {
+      expect(vi.mocked(getModelsForProviderForLoadingState)).toHaveBeenCalledWith('codex', {
+        forceRefresh: true,
+      });
+    });
+    expect(refreshButton.hasAttribute('disabled')).toBe(true);
+    expect(refreshButton.querySelector('.animate-spin')).toBeTruthy();
+
+    resolveRefresh({
+      models: [{ value: 'codex:gpt-6-codex', label: 'GPT-6 Codex', description: 'Smarter' }],
+    });
+
+    expect(await screen.findByRole('option', { name: /GPT-6 Codex/ })).toBeTruthy();
+    expect(screen.queryByRole('option', { name: /GPT-5\.6-Sol/ })).toBeNull();
+    await waitFor(() => expect(refreshButton.hasAttribute('disabled')).toBe(false));
+  });
+
+  it('keeps a force-refreshed provider ahead of overlapping catalog fetches', async () => {
+    mockProviderModelsState.byProviderId = {
+      codex: {
+        models: [{ value: 'codex:gpt-5.6-sol', label: 'GPT-5.6-Sol', description: 'Cached model' }],
+        fetchedAt: new Date().toISOString(),
+      },
+    };
+    let resolveCatalog!: (result: {
+      models: { value: string; label: string; description: string }[];
+    }) => void;
+    let resolveRefresh!: (result: {
+      models: { value: string; label: string; description: string }[];
+    }) => void;
+    const catalogResult = new Promise<{
+      models: { value: string; label: string; description: string }[];
+    }>((resolve) => {
+      resolveCatalog = resolve;
+    });
+    vi.mocked(getModelsForProviderForLoadingState).mockImplementation(
+      async (providerId, options) => {
+        if (providerId === 'codex') {
+          if (options?.forceRefresh) {
+            return new Promise((resolve) => {
+              resolveRefresh = resolve;
+            });
+          }
+          return catalogResult;
+        }
+        return { models: [] };
+      },
+    );
+    enabledProviderIds$.set(['auggie', 'codex']);
+
+    render(ModelPicker, {
+      props: {
+        selectedModel: 'codex:gpt-5.6-sol',
+        agentId: 'agent-1',
+        workspaceId: 'ws-1',
+        showReasoning: true,
+        portal: false,
+      },
+    });
+
+    await waitFor(() => {
+      expect(vi.mocked(getModelsForProviderForLoadingState)).toHaveBeenCalledWith('codex');
+    });
+    await fireEvent.click(screen.getByRole('button'));
+    expect(await screen.findByRole('option', { name: /GPT-5\.6-Sol/ })).toBeTruthy();
+
+    await fireEvent.click(screen.getByTestId('model-provider-refresh-button'));
+    await waitFor(() => {
+      expect(vi.mocked(getModelsForProviderForLoadingState)).toHaveBeenCalledWith('codex', {
+        forceRefresh: true,
+      });
+    });
+
+    enabledProviderIds$.set(['auggie', 'codex', 'claude-code']);
+    await waitFor(() => {
+      expect(vi.mocked(getModelsForProviderForLoadingState)).toHaveBeenCalledWith('claude-code');
+    });
+    expect(
+      vi
+        .mocked(getModelsForProviderForLoadingState)
+        .mock.calls.filter(
+          ([providerId, options]) => providerId === 'codex' && !options?.forceRefresh,
+        ),
+    ).toHaveLength(1);
+
+    resolveRefresh({
+      models: [{ value: 'codex:gpt-6-codex', label: 'GPT-6 Codex', description: 'Forced' }],
+    });
+    expect(await screen.findByRole('option', { name: /GPT-6 Codex/ })).toBeTruthy();
+
+    resolveCatalog({
+      models: [{ value: 'codex:catalog-model', label: 'Catalog Refetch', description: 'Stale' }],
+    });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    expect(screen.getByRole('option', { name: /GPT-6 Codex/ })).toBeTruthy();
+    expect(screen.queryByRole('option', { name: /Catalog Refetch/ })).toBeNull();
+    const codexCacheWrites = mockSvelteDispatch.mock.calls.filter(
+      ([action]) =>
+        action?.type === 'providerModels/providerModelsLoaded' &&
+        (action.payload as [string, unknown])[0] === 'codex',
+    );
+    expect(codexCacheWrites).toHaveLength(1);
+    expect(
+      (codexCacheWrites[0][0].payload as [string, { models: { value: string }[] }])[1].models,
+    ).toEqual([{ value: 'codex:gpt-6-codex', label: 'GPT-6 Codex', description: 'Forced' }]);
+  });
+
   it('uses session effort levels when the selected catalog model has no levels', async () => {
     agentModelEffortLevels$.set(['low', 'medium', 'high']);
     mockModelState.availableModels = [
@@ -701,20 +1143,19 @@ describe('ModelPicker combined reasoning mode', () => {
     const trigger = screen.getByRole('button');
     expect(trigger.textContent).toContain('GPT-5.6-Sol');
     expect(trigger.textContent).not.toContain('Medium');
+    expect(screen.getByTestId('model-reasoning-effort-gauge').dataset.gaugeValue).toBe('1');
 
     await fireEvent.click(trigger);
     expect(screen.getByTestId('model-reasoning-section')).toBeTruthy();
-    const toggle = screen.getByTestId('model-reasoning-toggle');
-    expect(toggle.hasAttribute('disabled')).toBe(false);
-    expect(toggle.getAttribute('aria-disabled')).toBe('false');
-    expect(toggle.getAttribute('aria-expanded')).toBe('false');
+    const selectTrigger = effortTrigger() as HTMLButtonElement;
+    expect(selectTrigger.disabled).toBe(false);
+    expect(selectTrigger.getAttribute('aria-expanded')).toBe('false');
 
-    await fireEvent.click(toggle);
-    expect(screen.getByRole('slider').getAttribute('max')).toBe('3');
-    expect(screen.getAllByTestId('effort-slider-tick')).toHaveLength(4);
+    const effortListbox = await openEffortSelect();
+    expect(within(effortListbox).getAllByRole('option')).toHaveLength(4);
   });
 
-  it('omits the Default reasoning suffix from the trigger', async () => {
+  it('shows Auto for the provider-default state without guessing a concrete strength', async () => {
     reasoningEffort$.set(null);
 
     render(ModelPicker, {
@@ -729,15 +1170,60 @@ describe('ModelPicker combined reasoning mode', () => {
 
     const trigger = screen.getByRole('button');
     expect(trigger.textContent).toContain('GPT-5.6-Sol');
+    await waitFor(() => expect(trigger.textContent).toContain('Auto'));
+    expect(screen.getByLabelText('GPT-5.6-Sol · Auto')).toBeTruthy();
     expect(trigger.textContent).not.toContain('Default');
     expect(screen.queryByTestId('effort-gauge')).toBeNull();
 
     await fireEvent.click(trigger);
-    const toggle = screen.getByTestId('model-reasoning-toggle');
-    await waitFor(() => expect(toggle.hasAttribute('disabled')).toBe(false));
-    expect(toggle.textContent?.trim()).toBe('Reasoning effort · Default');
-    expect(toggle.className).toContain('text-xs');
-    expect(toggle.querySelector('[data-testid="effort-gauge"]')).toBeNull();
+    const selectTrigger = effortTrigger() as HTMLButtonElement;
+    await waitFor(() => expect(selectTrigger.disabled).toBe(false));
+    expect(selectTrigger.textContent?.trim()).toBe('Auto');
+    expect(selectTrigger.className).toContain('text-xs');
+    expect(screen.queryByTestId('effort-gauge')).toBeNull();
+  });
+
+  it('shows explicit none as Off in the composer, tooltip, accessibility label, and select', async () => {
+    reasoningEffort$.set('none');
+    agentModelEffortLevels$.set(['none', 'low', 'ultra']);
+
+    render(ModelPicker, {
+      props: {
+        selectedModel: 'codex:gpt-5.6-sol',
+        agentId: 'agent-1',
+        workspaceId: 'ws-1',
+        showReasoning: true,
+        portal: false,
+      },
+    });
+
+    const trigger = screen.getByRole('button');
+    const labeledTrigger = await waitFor(() => screen.getByLabelText('GPT-5.6-Sol · Off'));
+    expect(labeledTrigger.getAttribute('title')).toBe('GPT-5.6-Sol · Off');
+    expect(trigger.textContent).not.toContain('Off');
+    expect(screen.queryByTestId('model-reasoning-strength')).toBeNull();
+    expect(screen.queryByTestId('model-reasoning-effort-gauge')).toBeNull();
+
+    await fireEvent.click(trigger);
+    const selectTrigger = effortTrigger();
+    expect(selectTrigger.textContent?.trim()).toBe('Off');
+    expect(selectTrigger.getAttribute('aria-label')).toContain('Off');
+    const gauge = screen.getByTestId('effort-gauge');
+    expect(screen.getByTestId('model-reasoning-section').contains(gauge)).toBe(true);
+    expect(gauge.dataset.gaugeValue).toBe('0');
+    const listbox = await openEffortSelect();
+    expect(
+      within(listbox)
+        .getAllByRole('option')
+        .map((option) => option.textContent?.replace('✓', '').trim()),
+    ).toEqual(['Auto', 'Off', 'Low', 'ultra']);
+    expect(applyReasoningEffortMock).not.toHaveBeenCalled();
+    await selectEffort(listbox, 'Auto');
+    expect(screen.queryByTestId('effort-gauge')).toBeNull();
+
+    await waitFor(() => {
+      expect(applyReasoningEffortMock).toHaveBeenCalledWith('agent-1', 'ws-1', null, 'none');
+    });
   });
 });
 
@@ -780,6 +1266,20 @@ describe('ModelPicker multi-provider mode', () => {
       expect(getModelsForProvider).toHaveBeenCalledWith('auggie');
       expect(getModelsForProvider).toHaveBeenCalledWith('claude-code');
     });
+  });
+
+  it('cancels the debounced provider fetch when unmounted', async () => {
+    vi.useFakeTimers();
+    try {
+      const view = render(ModelPicker, { props: { selectedModel: 'gpt5.4' } });
+      await tick();
+      view.unmount();
+      await vi.advanceTimersByTimeAsync(100);
+
+      expect(getModelsForProviderForLoadingState).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('renders the active provider models while another provider is still loading', async () => {
@@ -957,7 +1457,10 @@ describe('ModelPicker multi-provider mode', () => {
 
     await fireEvent.click(screen.getByRole('option', { name: /Sonnet 4\.6/ }));
 
-    expect(onModelChange).toHaveBeenCalledWith('sonnet4.6');
+    expect(onModelChange).toHaveBeenCalledWith('sonnet4.6', {
+      providerId: 'auggie',
+      modelId: 'sonnet4.6',
+    });
   });
 
   it('surfaces an empty-with-warning provider as a visible disabled row instead of hiding the group', async () => {
@@ -1119,12 +1622,16 @@ describe('ModelPicker multi-provider mode', () => {
     render(ModelPicker, {
       props: {
         selectedModel: 'gpt5.4',
+        variant: 'outline',
       },
     });
 
     const container = document.body;
     expect(container).toBeTruthy();
     expect(container.querySelector('[data-icon="lock"]')).toBeNull();
+    expect(screen.getByRole('button').className).toContain('border-border!');
+    expect(screen.getByRole('button').className).toContain('focus-visible:border-ring!');
+    expect(screen.getByRole('button').className).toContain('focus-visible:ring-ring/40');
   });
 
   it('shows default model text when no model is explicitly selected', () => {
@@ -1235,6 +1742,46 @@ describe('ModelPicker multi-provider mode', () => {
     expect(vi.mocked(toast.info)).not.toHaveBeenCalled();
   });
 
+  it('never rewrites a <provider>:default selection mapped by D2 (no setModel, no fallback toast)', async () => {
+    const { agentClient } = await import('$features/agent/agent.client');
+    const { toast } = await import('svelte-sonner');
+    // Settled catalog with real rows but no isDefault row — the selection
+    // renders via the D2 first-model mapping; the persisted value must not
+    // be rewritten (filtering is display-only).
+    vi.mocked(getModelsForProvider).mockImplementation((providerId) => {
+      if (providerId === 'auggie') {
+        return Promise.resolve([
+          { value: 'auggie:sonnet4.6', label: 'Sonnet 4.6', description: 'Smart' },
+          { value: 'auggie:opus4.5', label: 'Opus 4.5', description: 'Smarter' },
+        ]);
+      }
+      return Promise.resolve([]);
+    });
+
+    enabledProviderIds$.set(['auggie']);
+    activeProviderId$.set('auggie');
+
+    const onModelChange = vi.fn();
+
+    render(ModelPicker, {
+      props: {
+        selectedModel: 'auggie:default',
+        agentId: 'test-agent',
+        onModelChange,
+      },
+    });
+
+    await waitFor(() => {
+      expect(vi.mocked(getModelsForProvider)).toHaveBeenCalledWith('auggie');
+    });
+    // Give the $effect scheduler a chance to run auto-fallback if it were going to
+    await new Promise((r) => setTimeout(r, 100));
+
+    expect(onModelChange).not.toHaveBeenCalled();
+    expect(vi.mocked(agentClient.setModel)).not.toHaveBeenCalled();
+    expect(vi.mocked(toast.info)).not.toHaveBeenCalled();
+  });
+
   it('still triggers fallback when a non-default-provider compound model ID is unavailable', async () => {
     const { toast } = await import('svelte-sonner');
     vi.mocked(getModelsForProvider).mockImplementation((providerId) => {
@@ -1267,7 +1814,10 @@ describe('ModelPicker multi-provider mode', () => {
     });
 
     await waitFor(() => {
-      expect(onModelChange).toHaveBeenCalledWith('opencode:real-model');
+      expect(onModelChange).toHaveBeenCalledWith('opencode:real-model', {
+        providerId: 'opencode',
+        modelId: 'real-model',
+      });
     });
     expect(vi.mocked(toast.info)).toHaveBeenCalled();
 
@@ -2037,7 +2587,10 @@ describe('ModelPicker global-default vs per-agent dispatch gating', () => {
 
     await pickModelOne();
 
-    expect(onModelChange).toHaveBeenCalledWith('model-1');
+    expect(onModelChange).toHaveBeenCalledWith('model-1', {
+      providerId: 'auggie',
+      modelId: 'model-1',
+    });
     expect(dispatchedTypes()).not.toContain(selectModel.type);
     expect(dispatchedTypes()).not.toContain('agentSession/updateSession');
     expect(vi.mocked(agentClient.setModel)).not.toHaveBeenCalled();
@@ -2136,6 +2689,55 @@ describe('ModelPicker global-default vs per-agent dispatch gating', () => {
     });
   });
 
+  it('bare pick from a non-default provider group resolves the owning provider (catalog ownership)', async () => {
+    const { agentClient } = await import('$features/agent/agent.client');
+    const onModelChange = vi.fn();
+    mockAgentSession$.set({ id: 'agent-1', workspaceId: 'ws-1', provider: 'auggie' });
+    // Catalog rows are bare for every provider — the codex group owns the
+    // bare 'gpt-5-codex' row, so a pick of it must attribute to codex, not
+    // blanket-attribute to the default provider (auggie).
+    enabledProviderIds$.set(['auggie', 'codex']);
+    vi.mocked(getModelsForProviderForLoadingState).mockImplementation(async (providerId) => ({
+      models:
+        providerId === 'codex'
+          ? [{ value: 'gpt-5-codex', label: 'GPT-5 Codex', description: 'Codex model' }]
+          : [{ value: 'model-1', label: 'Model 1', description: 'A model' }],
+    }));
+
+    render(ModelPicker, {
+      props: {
+        workspaceId: 'ws-1',
+        agentId: 'agent-1',
+        updateGlobalStore: true,
+        portal: false,
+        onModelChange,
+      },
+    });
+
+    await waitFor(() => {
+      expect(vi.mocked(getModelsForProviderForLoadingState)).toHaveBeenCalledWith('codex');
+    });
+    await fireEvent.click(screen.getByRole('button'));
+    await fireEvent.click(await screen.findByRole('option', { name: /GPT-5 Codex/ }));
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(onModelChange).toHaveBeenCalledWith('gpt-5-codex', {
+      providerId: 'codex',
+      modelId: 'gpt-5-codex',
+    });
+    await waitFor(() => {
+      expect(vi.mocked(agentClient.setModel)).toHaveBeenCalledWith(
+        'agent-1',
+        'gpt-5-codex',
+        'ws-1',
+        'codex',
+      );
+    });
+  });
+
+  // Legacy boundary: compound `provider:model` ids no longer exist as catalog
+  // rows, but persisted selections can still carry them — the prefix must win
+  // provider attribution outright.
   it('compound model pick sends the compound prefix as the explicit providerId', async () => {
     const { agentClient } = await import('$features/agent/agent.client');
     mockAgentSession$.set({ id: 'agent-1', workspaceId: 'ws-1', provider: 'auggie' });
@@ -2220,7 +2822,7 @@ describe('ModelPicker global-default vs per-agent dispatch gating', () => {
     const selectModelActions = mockSvelteDispatch.mock.calls
       .map(([action]) => action as { type?: string; payload?: unknown })
       .filter((action) => action.type === selectModel.type);
-    expect(selectModelActions[0]?.payload).toEqual(['model-1']);
+    expect(selectModelActions[0]?.payload).toEqual(['model-1', 'auggie']);
     expect(dispatchedTypes()).not.toContain('agentSession/updateSession');
   });
 });
@@ -2263,7 +2865,10 @@ describe('ModelPicker confirmModelChange gate', () => {
     await fireEvent.click(await screen.findByRole('option', { name: /Model 2/ }));
 
     await waitFor(() => {
-      expect(onModelChange).toHaveBeenCalledWith('model-2');
+      expect(onModelChange).toHaveBeenCalledWith('model-2', {
+        providerId: 'auggie',
+        modelId: 'model-2',
+      });
     });
     expect(confirmModelChange).toHaveBeenCalledWith('model-1', 'model-2');
   });
@@ -2364,7 +2969,10 @@ describe('ModelPicker confirmModelChange gate', () => {
 
     await new Promise((r) => setTimeout(r, 0));
     expect(confirmModelChange).not.toHaveBeenCalled();
-    expect(onModelChange).toHaveBeenCalledWith('model-1');
+    expect(onModelChange).toHaveBeenCalledWith('model-1', {
+      providerId: 'auggie',
+      modelId: 'model-1',
+    });
   });
 });
 
@@ -2491,12 +3099,32 @@ describe('ModelPicker specialist inherit state (default-option plumbing)', () =>
     await fireEvent.click(await screen.findByRole('option', { name: /Model 2/ }));
 
     await waitFor(() => {
-      expect(onModelChange).toHaveBeenCalledWith('model-2');
+      expect(onModelChange).toHaveBeenCalledWith('model-2', {
+        providerId: 'auggie',
+        modelId: 'model-2',
+      });
     });
   });
 });
 
 describe('ModelPicker cache hydration (stale-while-revalidate)', () => {
+  it('uses live Antigravity labels and preserves exact compound ids without effort controls', async () => {
+    enabledProviderIds$.set(['antigravity']);
+    activeProviderId$.set('antigravity');
+    const model = { value: 'antigravity:gemini-3.7-flash-high', label: 'Gemini 3.7 Flash (High)' };
+    vi.mocked(getModelsForProviderForLoadingState).mockResolvedValue({ models: [model] });
+    const onModelChange = vi.fn();
+    render(ModelPicker, { props: { selectedModel: undefined, onModelChange, portal: false } });
+    await fireEvent.click(screen.getByRole('button'));
+    await fireEvent.click(await screen.findByRole('option', { name: /Gemini 3.7 Flash \(High\)/ }));
+    await waitFor(() =>
+      expect(onModelChange).toHaveBeenCalledWith('antigravity:gemini-3.7-flash-high', {
+        providerId: 'antigravity',
+        modelId: 'gemini-3.7-flash-high',
+      }),
+    );
+    expect(screen.queryByRole('slider')).toBeNull();
+  });
   beforeEach(() => {
     vi.clearAllMocks();
     mockModelState.selectedModel = 'sonnet4.6';

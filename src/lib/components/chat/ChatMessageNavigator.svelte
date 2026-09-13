@@ -1,14 +1,14 @@
 <script lang="ts">
+  import { tick, untrack } from 'svelte';
   import { Popover } from 'bits-ui';
   import { Input } from '$lib/components/ui/input';
-  import Fa from 'svelte-fa';
-  import { faList } from '@fortawesome/free-solid-svg-icons';
+  import ChatTextIcon from 'phosphor-svelte/lib/ChatTextIcon';
   import { Button } from '$lib/components/ui/button';
   import { Tooltip } from '$lib/components/ui/tooltip';
+  import { Spinner } from '$lib/components/ui/indicators';
   import { cn } from '$lib/utils';
   import { m } from '$shared/paraglide/messages.js';
   import ScrollToBottomButton from './ScrollToBottomButton.svelte';
-  import { CHAT_ICON_SIZE } from './chat-icon-size';
   import type { UserMessageNavigationItem } from './chat-message-navigation';
 
   interface Props {
@@ -16,21 +16,37 @@
     isAtBottom: boolean;
     onSelectMessage: (messageId: string) => Promise<boolean> | boolean;
     onScrollToBottom: () => void;
+    /** Called each time the popover opens (used to refresh the full-history index). */
+    onOpen?: () => void;
+    /** True while the full-history index fetch is in flight (no cached index yet). */
+    isLoadingIndex?: boolean;
   }
 
-  let { messages, isAtBottom, onSelectMessage, onScrollToBottom }: Props = $props();
+  let {
+    messages,
+    isAtBottom,
+    onSelectMessage,
+    onScrollToBottom,
+    onOpen,
+    isLoadingIndex = false,
+  }: Props = $props();
   let open = $state(false);
   let query = $state('');
   let activeIndex = $state(0);
+  // While true the newest (last) item stays active even as async index rows
+  // are prepended; cleared once the user scrolls or moves the active item.
+  let anchorToEnd = $state(true);
+  // Identity of the active option so prepended index rows cannot silently
+  // change which message activeIndex points at once the anchor is released.
+  let activeMessageId: string | null = null;
+  // True while the scroll-into-view effect below scrolls programmatically, so
+  // its own scroll events do not release the end anchor.
+  let suppressScrollRelease = false;
   let searchInput: HTMLInputElement | null = $state(null);
   let triggerElement: HTMLElement | null = $state(null);
   let contentElement: HTMLElement | null = $state(null);
   let collisionBoundary: Element[] = $state([]);
-  let pointerDownOnTrigger = $state(false);
   let preserveOutsideFocusOnClose = $state(false);
-  let reopenOnNextPointerIntent = $state(false);
-  let suppressNextTriggerClick = $state(false);
-  let lastTriggerPointerPosition: { pointerId: number; x: number; y: number } | null = $state(null);
   const navigatorId = $props.id();
   const listboxId = `chat-message-navigator-listbox-${navigatorId}`;
   const filteredMessages = $derived.by(() => {
@@ -44,32 +60,73 @@
 
   function handleOpenChange(nextOpen: boolean) {
     open = nextOpen;
-    if (!nextOpen) {
-      suppressNextTriggerClick = false;
-      return;
-    }
+    if (!nextOpen) return;
     const panel = triggerElement?.closest('[data-panel-id]');
     collisionBoundary = panel ? [panel] : [];
-    reopenOnNextPointerIntent = false;
     query = '';
-    activeIndex = 0;
+    anchorToEnd = true;
+    activeIndex = Math.max(messages.length - 1, 0);
+    onOpen?.();
   }
 
   function handleInput(event: Event) {
     query = (event.currentTarget as HTMLInputElement).value;
-    activeIndex = 0;
+    anchorToEnd = true;
+    activeIndex = Math.max(filteredMessages.length - 1, 0);
   }
 
-  function handleTriggerFocus(event: FocusEvent) {
-    const previousTarget = event.relatedTarget;
-    if (
-      pointerDownOnTrigger ||
-      (previousTarget instanceof Element && previousTarget.closest('[data-popover-content]'))
-    ) {
+  function moveActiveTo(index: number) {
+    anchorToEnd = false;
+    activeIndex = index;
+    activeMessageId = filteredMessages[index]?.id ?? null;
+  }
+
+  function handleListboxScroll() {
+    if (suppressScrollRelease) return;
+    anchorToEnd = false;
+  }
+
+  // Keep the newest item active (and the list anchored at the bottom) while
+  // the user has not interacted, so the async index fetch prepending older
+  // rows does not yank the selection off the end. Once released, follow the
+  // active message by identity so prepends cannot shift what Enter selects.
+  $effect(() => {
+    if (!open) return;
+    const count = filteredMessages.length;
+    if (count === 0) return;
+    if (anchorToEnd) {
+      activeIndex = count - 1;
+      activeMessageId = filteredMessages[count - 1].id;
       return;
     }
-    handleOpenChange(true);
-  }
+    const currentIndex = untrack(() => activeIndex);
+    const preservedIndex =
+      activeMessageId === null
+        ? -1
+        : filteredMessages.findIndex((message) => message.id === activeMessageId);
+    if (preservedIndex >= 0) {
+      if (preservedIndex !== currentIndex) activeIndex = preservedIndex;
+    } else if (currentIndex >= count) {
+      activeIndex = count - 1;
+      activeMessageId = filteredMessages[count - 1].id;
+    } else {
+      activeMessageId = filteredMessages[currentIndex]?.id ?? null;
+    }
+  });
+
+  // Keep the active option visible whenever it or the list changes. The
+  // suppress flag spans the resulting scroll event (scroll events fire before
+  // the next animation frame) so programmatic scrolls keep the end anchor.
+  $effect(() => {
+    if (!open || !contentElement || filteredMessages.length === 0) return;
+    const option = document.getElementById(`${listboxId}-option-${activeIndex}`);
+    if (!option) return;
+    suppressScrollRelease = true;
+    option.scrollIntoView?.({ block: 'nearest' });
+    requestAnimationFrame(() => {
+      suppressScrollRelease = false;
+    });
+  });
 
   function handleTriggerKeydown(event: KeyboardEvent) {
     if (event.key !== 'Enter' && event.key !== ' ') return;
@@ -89,70 +146,11 @@
     return ownerContent?.dataset.chatMessageNavigatorContent === navigatorId;
   }
 
-  function handleWindowFocusIn(event: FocusEvent) {
+  function handleFocusOutside(event: FocusEvent) {
     if (!open || !(event.target instanceof Node)) return;
     if (triggerElement?.contains(event.target) || isNavigatorContentTarget(event.target)) return;
-    pointerDownOnTrigger = false;
     preserveOutsideFocusOnClose = true;
-    reopenOnNextPointerIntent = true;
     handleOpenChange(false);
-  }
-
-  function rememberTriggerPointerPosition(event: PointerEvent) {
-    lastTriggerPointerPosition = {
-      pointerId: event.pointerId,
-      x: event.clientX,
-      y: event.clientY,
-    };
-  }
-
-  function reopenFromPointerIntent() {
-    pointerDownOnTrigger = true;
-    triggerElement?.focus({ preventScroll: true });
-    pointerDownOnTrigger = false;
-    handleOpenChange(true);
-  }
-
-  function handleTriggerPointerOver(event: PointerEvent) {
-    if (event.pointerType === 'touch') return;
-    const enteredFromOutside =
-      !(event.relatedTarget instanceof Node) || !triggerElement?.contains(event.relatedTarget);
-    rememberTriggerPointerPosition(event);
-    if (reopenOnNextPointerIntent && enteredFromOutside) {
-      reopenFromPointerIntent();
-      suppressNextTriggerClick = true;
-    }
-  }
-
-  function handleTriggerPointerDown() {
-    pointerDownOnTrigger = true;
-    if (suppressNextTriggerClick) {
-      suppressNextTriggerClick = false;
-      open = false;
-    }
-  }
-
-  function handleTriggerPointerEnter(event: PointerEvent) {
-    if (event.pointerType === 'touch') return;
-    rememberTriggerPointerPosition(event);
-  }
-
-  function handleTriggerPointerMove(event: PointerEvent) {
-    if (event.pointerType === 'touch') return;
-    const moved =
-      lastTriggerPointerPosition !== null &&
-      (lastTriggerPointerPosition.pointerId !== event.pointerId ||
-        lastTriggerPointerPosition.x !== event.clientX ||
-        lastTriggerPointerPosition.y !== event.clientY);
-    rememberTriggerPointerPosition(event);
-    if (reopenOnNextPointerIntent && moved) reopenFromPointerIntent();
-  }
-
-  function handleTriggerPointerLeave(event: PointerEvent) {
-    if (event.pointerType !== 'touch') {
-      lastTriggerPointerPosition = null;
-      suppressNextTriggerClick = false;
-    }
   }
 
   function handleCloseAutoFocus(event: Event) {
@@ -162,8 +160,9 @@
   }
 
   async function selectMessage(messageId: string) {
-    await onSelectMessage(messageId);
     open = false;
+    await tick();
+    await onSelectMessage(messageId);
   }
 
   function handleSearchKeydown(event: KeyboardEvent) {
@@ -175,16 +174,16 @@
     if (filteredMessages.length === 0) return;
     if (event.key === 'ArrowDown') {
       event.preventDefault();
-      activeIndex = (activeIndex + 1) % filteredMessages.length;
+      moveActiveTo((activeIndex + 1) % filteredMessages.length);
     } else if (event.key === 'ArrowUp') {
       event.preventDefault();
-      activeIndex = (activeIndex - 1 + filteredMessages.length) % filteredMessages.length;
+      moveActiveTo((activeIndex - 1 + filteredMessages.length) % filteredMessages.length);
     } else if (event.key === 'Home') {
       event.preventDefault();
-      activeIndex = 0;
+      moveActiveTo(0);
     } else if (event.key === 'End') {
       event.preventDefault();
-      activeIndex = filteredMessages.length - 1;
+      moveActiveTo(filteredMessages.length - 1);
     } else if (event.key === 'Enter') {
       event.preventDefault();
       void selectMessage(filteredMessages[activeIndex].id);
@@ -192,39 +191,29 @@
   }
 </script>
 
-<svelte:window onfocusincapture={handleWindowFocusIn} />
-
 <div class="flex shrink-0 items-center gap-0" data-testid="chat-header-navigation-controls">
   <Popover.Root bind:open onOpenChange={handleOpenChange}>
-    <Popover.Trigger
-      bind:ref={triggerElement}
-      openOnHover
-      openDelay={120}
-      closeDelay={180}
-      onpointerover={handleTriggerPointerOver}
-      onpointerenter={handleTriggerPointerEnter}
-      onpointermove={handleTriggerPointerMove}
-      onpointerleave={handleTriggerPointerLeave}
-    >
+    <Popover.Trigger bind:ref={triggerElement}>
       {#snippet child({ props })}
         <Button
           {...props}
           variant="ghost-light"
           size="icon-sm"
-          class="focus-visible:border-border focus-visible:bg-muted focus-visible:ring-0"
           aria-label={m.chat_messageNavigator_open_ariaLabel()}
           tooltip={m.chat_messageNavigator_open_ariaLabel()}
           tooltipSide="bottom"
           tooltipDelayDuration={300}
           aria-expanded={open}
-          onfocus={handleTriggerFocus}
           onkeydown={handleTriggerKeydown}
-          onpointerdown={handleTriggerPointerDown}
-          onpointerup={() => (pointerDownOnTrigger = false)}
-          onpointercancel={() => (pointerDownOnTrigger = false)}
           data-testid="chat-message-navigator-trigger"
         >
-          <Fa icon={faList} size={CHAT_ICON_SIZE.header} class="size-3!" />
+          <ChatTextIcon
+            size={14}
+            mirrored
+            aria-hidden="true"
+            class="size-3.5!"
+            data-chat-message-navigator-chat-icon
+          />
         </Button>
       {/snippet}
     </Popover.Trigger>
@@ -241,6 +230,7 @@
         trapFocus={false}
         onOpenAutoFocus={handleOpenAutoFocus}
         onCloseAutoFocus={handleCloseAutoFocus}
+        onFocusOutside={handleFocusOutside}
         data-chat-message-navigator-content={navigatorId}
         class="z-(--layer-popover) flex min-w-0 max-h-[var(--bits-popover-content-available-height)] w-[28rem] max-w-[min(calc(100vw-var(--space-4)),calc(var(--bits-popover-content-available-width)-var(--space-2)))] flex-col overflow-hidden rounded-(--radius-medium) border border-border bg-popover p-[var(--space-1)] text-popover-foreground shadow-(--elevation-overlay) outline-none"
       >
@@ -264,10 +254,30 @@
             class="type-caption h-(--control-height-medium) w-full min-w-0 shrink-0 rounded-(--radius-small) border border-border bg-card px-[var(--space-2)] text-foreground caret-foreground outline-none placeholder:text-muted-foreground/70"
             data-testid="chat-message-navigator-search"
           />
+          <!-- Persistent live region: announcements only fire for content
+               changes inside an already-rendered live region, so the container
+               stays mounted and only the loading row toggles. -->
+          <div
+            role="status"
+            aria-live="polite"
+            class="shrink-0"
+            data-testid="chat-message-navigator-loading-region"
+          >
+            {#if isLoadingIndex}
+              <div
+                class="type-caption flex items-center gap-[var(--space-2)] px-[var(--space-2)] py-[var(--space-1)] text-muted-foreground"
+                data-testid="chat-message-navigator-loading"
+              >
+                <Spinner />
+                <span>{m.chat_messageNavigator_loading_label()}</span>
+              </div>
+            {/if}
+          </div>
           {#if filteredMessages.length > 0}
             <div
               id={listboxId}
               role="listbox"
+              onscroll={handleListboxScroll}
               class="mt-[var(--space-1)] min-h-0 min-w-0 flex-1 max-h-72 overflow-x-hidden overflow-y-auto overscroll-contain"
             >
               {#each filteredMessages as message, index (message.id)}
@@ -297,7 +307,9 @@
                         void selectMessage(message.id);
                       }
                     }}
-                    onpointerenter={() => (activeIndex = index)}
+                    onpointermove={() => {
+                      if (activeIndex !== index || anchorToEnd) moveActiveTo(index);
+                    }}
                     data-testid="chat-message-navigator-result"
                     data-navigation-message-id={message.id}
                   >
@@ -310,7 +322,7 @@
                 </Tooltip>
               {/each}
             </div>
-          {:else}
+          {:else if !isLoadingIndex}
             <div
               class="type-caption px-2 py-6 text-center text-muted-foreground"
               data-testid="chat-message-navigator-empty"

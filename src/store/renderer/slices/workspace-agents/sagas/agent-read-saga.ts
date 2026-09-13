@@ -1,6 +1,6 @@
 import { call, put, race, take, takeEvery } from 'typed-redux-saga';
 
-import { appClient } from '$lib/client';
+import { readAgentSession } from '$features/agent/agent-read-service';
 import { createLogger } from '$lib/utils/client-logger';
 import type { AgentSession } from '$shared/types';
 import { isAgentDeletionPending } from '$features/agent/utils/pending-agent-deletions';
@@ -8,18 +8,15 @@ import { isAgentNotFoundError } from '$features/agent/utils/agent-not-found-erro
 import { bulkUpsertSessions, upsertSession } from '../../agent-session/agent-session-slice';
 import { selectAgentSession } from '../../agent-session/agent-session-selectors';
 import { workspaceUnmounted } from '../../workspace-lifecycle/workspace-lifecycle-slice';
-import { closeTabsByAgentId } from '../../panel-layout/panel-layout-slice';
 import { ensureAgentSessionLoaded } from '../workspace-agents-slice';
+import { cleanupDeletedAgentTabs } from './deleted-agent-cleanup';
 
 const logger = createLogger('AgentReadSaga');
 
 function* loadAgentSessionSaga(wsId: string, agentId: string) {
   if (yield* call(isAgentDeletionPending, agentId)) return;
   try {
-    const session: AgentSession | null = yield* call(
-      [appClient.agents, appClient.agents.get],
-      agentId,
-    );
+    const session: AgentSession | null = yield* call(readAgentSession, agentId);
     if (!session || String(session.workspaceId) !== wsId) return;
     // Skip rows carrying the daemon's delete-grace-window deadline (PROTOCOL
     // §5.5 `pendingDeleteAt`, v6.7+) — the deletion is pending daemon-side.
@@ -33,11 +30,8 @@ function* loadAgentSessionSaga(wsId: string, agentId: string) {
   } catch (error) {
     if (isAgentNotFoundError(error)) {
       // Expected after deletion: a stale tab/route still references the
-      // agent (monorepo#1753). WARN once and close any panel tabs pointing at
-      // it so the workspace falls back to its home view; with no referencing
-      // tab (speculative load) the close is a no-op.
-      logger.warn('Agent no longer exists on daemon; closing stale tabs', { wsId, agentId });
-      yield* put(closeTabsByAgentId(wsId, agentId));
+      // agent (monorepo#1753) — close it instead of erroring.
+      yield* call(cleanupDeletedAgentTabs, wsId, agentId);
       return;
     }
     logger.error('Failed to load agent session', error);

@@ -13,10 +13,11 @@
   import LineChangeStats from '$lib/components/shared/LineChangeStats.svelte';
   import RelativeTime from '$lib/components/ui/RelativeTime.svelte';
   import {
-    selectAgentSession,
     selectAgentIsResponding,
+    selectAgentSession,
+    selectAgentPreview,
   } from '$store/renderer/slices/agent-session/agent-session-selectors';
-  import { selectChatReceivedFirstChunk } from '$store/renderer/slices/chat-state/chat-state-selectors';
+  import { selectPendingQuestionRecovery } from '$store/renderer/slices/chat-state/chat-state-selectors';
   import {
     deleteAgentWithUndoRequested,
     ensureAgentSessionLoaded,
@@ -26,16 +27,16 @@
 
   import { getAgentPeekData } from '$lib/utils/agent-peek-utils';
   import { getAgentAttentionRequest } from '$shared/utils/agent-attention';
-  import { getLastMeaningfulLine, stripUserMessagePrefixes } from '$lib/utils/text-utils';
-  import { classifyTool } from './tool-classifier';
-  import { deriveAgentCardPreview } from './agent-card-preview';
   import AgentPreviewToolLabel from './AgentPreviewToolLabel.svelte';
   import { renderInlineMarkdownPlainText } from './inline-markdown-snippet';
   import { selectAgentLineStats } from '$store/renderer/slices/changes/changes-selectors';
   import AgentAvatarWithState from '$features/agent/components/agent-avatar/AgentAvatarWithState.svelte';
   import { getAvatarStateForSession } from '$features/agent/components/agent-avatar/avatar-state';
+  import { isAgentRunningState, toAgentRuntimeStateInput } from '$shared/utils/agent-runtime-state';
   import { openAgentTabRequested } from '$store/renderer/slices/app-layout/app-layout-slice';
   import { selectPendingCount } from '$store/renderer/slices/permission/permission-selectors';
+  import { selectHudAgentHasPendingQuestion } from '$store/renderer/slices/hud/hud-selectors';
+  import { deriveWizardPendingQuestions } from './questions/wizard-gate';
   import { safeSlide } from '$lib/utils/animations';
   import { findSourcePanelId } from '$lib/utils/workspace-navigation';
   import { updateSession as updateAgentSessionFields } from '$store/renderer/slices/agent-session/agent-session-slice';
@@ -46,6 +47,8 @@
   import type { AgentSession, Workspace } from '$shared/types';
   import SidebarContextMenu from '$lib/components/ui/sidebar-context-menu/SidebarContextMenu.svelte';
   import HarnessFeaturesModal from './HarnessFeaturesModal.svelte';
+  import ReplaceAgentModal from '$lib/components/modals/ReplaceAgentModal.svelte';
+  import { sendMessage } from '$store/renderer/slices/chat-state/chat-state-slice';
 
   import type { SidebarMenuEntry } from '$lib/components/ui/sidebar-context-menu/types';
   import {
@@ -53,14 +56,18 @@
     faCircleInfo,
     faFolderOpen,
     faPen,
+    faRightLeft,
     faStop,
     faTrash,
+    faUserTie,
   } from '@fortawesome/free-solid-svg-icons';
+  import { selectSpecialistName } from '$store/renderer/slices/specialists/specialists-selectors';
   import { store as appStore } from '$store/renderer/store';
   import { m } from '$shared/paraglide/messages.js';
   import { invoke } from '$lib/electron-bridge';
   import { selectIsWorkspaceHostLocal } from '$store/renderer/slices/workspace/workspace-selectors';
-  import OpenPanelIndicator from '$lib/components/workspace/sidebar/OpenPanelIndicator.svelte';
+  import { isCmdClickModifier } from '$shared/utils/link-helpers';
+  import { isReplaceAgentEligible } from '$shared/utils/replace-agent-eligibility';
 
   interface Props {
     agentId: string;
@@ -106,8 +113,6 @@
     provider?: string;
     /** Optional actions rendered beside, never inside, the row activation button. */
     headerActions?: Snippet;
-    openPanelCount?: number;
-    activeInPanel?: boolean;
     /** Optional timestamp supplied by list data before the session selector is hydrated. */
     updatedAt?: AgentSession['updatedAt'];
     /** Disable navigation, mutation, editing, and file operations in isolated previews. */
@@ -135,8 +140,6 @@
     isCompleted = false,
     provider = undefined,
     headerActions,
-    openPanelCount = 0,
-    activeInPanel = false,
     updatedAt: updatedAtProp = undefined,
     readOnly = false,
   }: Props = $props();
@@ -151,6 +154,9 @@
   });
 
   const agentPermCount = selectPendingCount(agentIdStore);
+  const hasCapturedQuestion$ = selectHudAgentHasPendingQuestion(agentIdStore);
+  const pendingQuestionRecovery$ = selectPendingQuestionRecovery(agentIdStore);
+  const agentIsResponding$ = selectAgentIsResponding(agentIdStore);
 
   $effect(() => {
     const wsId = workspace?.id;
@@ -170,6 +176,9 @@
   // Read-only harness-features modal (opened from the context menu).
   let harnessModalOpen = $state(false);
 
+  // Replace Agent modal (opened from the context menu when eligible).
+  let replaceAgentModalOpen = $state(false);
+
   // Platform file-manager label (locality-gated reveal ⇒ daemon host is this
   // machine, so the client platform matches; PanelTabBar idiom).
   const isWindows = typeof navigator !== 'undefined' && navigator.platform?.startsWith('Win');
@@ -187,7 +196,7 @@
 
   // Start editing the agent name
   async function startEditing() {
-    if (readOnly) return;
+    if (readOnly || isEditing) return;
     editingValue = displayName;
     isEditing = true;
     await tick();
@@ -197,25 +206,28 @@
 
   // Save the edited name
   function saveEdit() {
-    if (editingValue.trim() && editingValue.trim() !== displayName) {
+    if (!isEditing) return;
+    const nextName = editingValue.trim();
+    isEditing = false;
+    editingValue = '';
+    if (nextName && nextName !== displayName) {
       const wsId = $agent$?.workspaceId
         ? String($agent$.workspaceId)
         : workspace?.id
           ? String(workspace.id)
           : undefined;
       if (wsId) {
-        const trimmed = editingValue.trim();
         // Capture previous values before the optimistic dispatch so a failed
         // rename can revert back to exactly what the user saw.
         const previousName = displayName;
         const previousNameExplicitlySet = $agent$?.nameExplicitlySet ?? false;
         appStore.dispatch(
           updateAgentSessionFields(agentId, {
-            name: trimmed,
+            name: nextName,
             nameExplicitlySet: true,
           } as any),
         );
-        const action = renameAgentSessionRequested(wsId, agentId, trimmed);
+        const action = renameAgentSessionRequested(wsId, agentId, nextName);
         appStore.dispatch(action);
         action.promise.catch(() => {
           // Revert the optimistic dispatch so Redux matches disk, then notify.
@@ -229,7 +241,6 @@
         });
       }
     }
-    cancelEdit();
   }
 
   // Cancel editing
@@ -240,15 +251,18 @@
 
   // Handle keyboard events during editing
   function handleEditKeydown(e: KeyboardEvent) {
-    if (e.key === 'Enter') {
+    e.stopPropagation();
+    if (e.key === 'Enter' && !e.isComposing) {
       e.preventDefault();
-      e.stopPropagation(); // Prevent bubbling to parent button which would trigger startEditing again
       saveEdit();
     } else if (e.key === 'Escape') {
       e.preventDefault();
-      e.stopPropagation();
       cancelEdit();
     }
+  }
+
+  function isolateEditEvent(e: Event) {
+    e.stopPropagation();
   }
 
   // Handle double-click on name
@@ -262,7 +276,11 @@
   // Handle keyboard events on the card button
   function handleCardKeydown(e: KeyboardEvent) {
     if (readOnly) return;
-    if (onclick && (e.key === 'Enter' || e.key === ' ')) {
+    if (e.key === 'Enter' && isCmdClickModifier({ event: e })) {
+      e.preventDefault();
+      e.stopPropagation();
+      handleClick(e);
+    } else if (onclick && (e.key === 'Enter' || e.key === ' ')) {
       e.preventDefault();
       e.stopPropagation();
       handleClick(e);
@@ -348,8 +366,11 @@
       });
     }
 
-    // Add stop option if agent is running
-    if (avatarState === 'running' || avatarState === 'responding') {
+    // Add stop option if agent is running. Gate on the canonical runtime
+    // state, not the display state: user-attention states (question,
+    // needs-permission, …) outrank `running` in getAvatarState, but a live
+    // turn must stay stoppable regardless of what the avatar shows.
+    if (isTurnRunning) {
       items.push({
         id: 'stop',
         label: m.chat_agentCard_menu_stop_label(),
@@ -379,6 +400,23 @@
     }
 
     items.push({ type: 'separator' });
+
+    // "Replace Agent" (peer-agent hand-off): hidden unless every
+    // session-derived eligibility gate passes (harnessFeatures.peerAgents
+    // snapshot true, top-level, non-background, not retired) — mirrors the
+    // AgentTabType panel menu.
+    if (!readOnly && !isBackground && isReplaceAgentEligible($agent$)) {
+      items.push({
+        id: 'replace-agent',
+        label: m.chat_agentCard_menu_replaceAgent_label(),
+        icon: faRightLeft,
+        onClick: () => {
+          replaceAgentModalOpen = true;
+          closeContextMenu();
+        },
+      });
+    }
+
     items.push({
       id: 'delete',
       label: m.chat_agentCard_menu_delete_label(),
@@ -409,14 +447,30 @@
       },
     });
 
-    // Read-only harness version stamp (PROTOCOL §5.5). Selecting the item
-    // opens the harness-features modal (monorepo#2459) — legacy sessions
-    // without a harnessFeatures snapshot open it too (every catalog feature
-    // renders OFF); sessions from daemons that predate the field omit the
-    // item entirely.
+    // Read-only info stamps. Specialist (monorepo#3498): resolved display
+    // name when the id is known, raw id fallback otherwise; omitted for
+    // agents without a specialist. Harness version (PROTOCOL §5.5): selecting
+    // the item opens the harness-features modal (monorepo#2459) — legacy
+    // sessions without a harnessFeatures snapshot open it too (every catalog
+    // feature renders OFF); sessions from daemons that predate the field omit
+    // the item entirely.
+    const specialistId = specialist;
     const harnessVersion = $agent$?.harnessVersion;
-    if (harnessVersion) {
+    if (specialistId || harnessVersion) {
       items.push({ type: 'separator' });
+    }
+    if (specialistId) {
+      const specialistName =
+        selectSpecialistName.select(appStore.state, specialistId) ?? specialistId;
+      items.push({
+        id: 'specialist',
+        label: m.chat_agentCard_menu_specialist_label({ name: specialistName }),
+        icon: faUserTie,
+        disabled: true,
+        onClick: () => {},
+      });
+    }
+    if (harnessVersion) {
       items.push({
         id: 'harness-version',
         label: m.chat_agentCard_menu_harnessVersion_label({ version: harnessVersion }),
@@ -434,7 +488,6 @@
   // Reactive agent session from Redux; ensureAgentSessionLoaded dispatch
   // above handles the disk restore.
   const agent$ = selectAgentSession(agentIdStore);
-  const agentIsResponding$ = selectAgentIsResponding(agentIdStore);
   const agentData = $derived(getAgentPeekData($agent$));
 
   // Get parent agent ID from metadata (for delegation info)
@@ -454,23 +507,38 @@
   // Get line changes for this agent
   const lineChanges$ = selectAgentLineStats(agentIdStore);
 
-  // Per-turn "response text landed this turn" flag (chat-state): reset by
-  // `agent:stream:end`, flipped by the first text-bearing activity ping.
-  const receivedFirstChunk$ = selectChatReceivedFirstChunk(agentIdStore);
-
   // Extract display data
   const displayName = $derived(agentData?.name || agentName || m.chat_shared_agentName_fallback());
-  // filter out [Currently viewing: ...] prefixes and @context[...] mentions
-  // (raw base64/pipe format) — shared with the HUD card line derivation.
-  const lastUserMsg = $derived(stripUserMessagePrefixes(agentData?.lastUserMessage ?? ''));
   // Pending attention request (discussion/blocker) from the daemon session
   // fields; null when none is pending (retired on agent:updated clear).
   const attentionRequest = $derived(getAgentAttentionRequest($agent$));
+
+  // Mirrors PanelHeaderAgentAvatar / the mini dock: captured HUD question or
+  // transcript-derived pending question set.
+  const hasQuestion = $derived.by(() => {
+    if ($hasCapturedQuestion$) return true;
+    // The shared gate reads the responding flag, the marker/dismissal metadata
+    // and the out-of-tail recovery result straight from store state; touching
+    // the readables here keeps this $derived reactive to changes that do not
+    // alter the session's message array (recovery settling, gate flips).
+    void $agentIsResponding$;
+    void $agent$?.metadata?.pendingQuestionsMessageId;
+    void $agent$?.metadata?.dismissedQuestionsMessageId;
+    void $pendingQuestionRecovery$;
+    return deriveWizardPendingQuestions(appStore.state, agentId, $agent$?.messages ?? []) !== null;
+  });
+
+  // Canonical running predicate for the session, independent of the display
+  // precedence applied by getAvatarState below.
+  const isTurnRunning = $derived(
+    $agent$ ? isAgentRunningState(toAgentRuntimeStateInput($agent$)) : false,
+  );
 
   // Use the canonical session state derivation for every agent surface.
   const avatarState = $derived(
     getAvatarStateForSession($agent$, {
       hasPermissionRequest: $agentPermCount > 0,
+      hasQuestion,
       isActive: selected,
       isCompleted,
       attentionKind: attentionRequest?.kind ?? null,
@@ -483,78 +551,54 @@
     return specialistId || null;
   });
 
+  // Send the (possibly edited) hand-off instruction through the normal chat
+  // send path so it lands in the transcript as a regular user message.
+  function handleReplaceAgentSend(text: string) {
+    const wsId = $agent$?.workspaceId
+      ? String($agent$.workspaceId)
+      : workspace?.id
+        ? String(workspace.id)
+        : undefined;
+    if (!wsId) return;
+    appStore.dispatch(sendMessage(agentId, { wsId, text, agentName: displayName }));
+  }
+
   // Sandbox directory for sandboxed agents (daemon-provided metadata).
   const agentSandboxPath = $derived.by(() => {
     const path = $agent$?.metadata?.sandboxPath || $agent$?.agentMetadata?.sandboxPath;
     return typeof path === 'string' && path.length > 0 ? path : null;
   });
 
-  // Preview precedence:
-  //   1. while a turn is live, the session's push-applied `lastAgentResponse`
-  //      (refreshed ~1s by `agent:stream:activity`, intentd#792; already
-  //      server-cleaned by `clean_response_text`) — gated on the per-turn
-  //      `receivedFirstChunk` flag (reset by `agent:stream:end`, flipped by
-  //      a text-bearing `agent:stream:activity`) so a leftover previous-turn
-  //      `lastAgentResponse` doesn't masquerade as this turn's text in the
-  //      pre-first-token window;
-  //   2. the persisted wire preview (idle agents) — agent-peek-utils serves
-  //      the wire `lastAgentResponse` verbatim; no stream buffer or
-  //      transcript re-derivation (monorepo#2843).
-  // Tool previews (lastToolUse) only kick in when there's no text to show.
-  const liveResponseLine = $derived.by(() => {
-    if ($agentIsResponding$ && $receivedFirstChunk$ && $agent$?.lastAgentResponse) {
-      const line = getLastMeaningfulLine($agent$.lastAgentResponse);
-      if (line) return line;
-    }
-    return '';
+  // Single preview value for the persistent container below, from the shared
+  // canonical selector (attention → live text → live tool → user line →
+  // digest/report → persisted fallbacks; see selectAgentPreview) so
+  // preview-source flips swap content in place instead of unmount/mounting
+  // sibling blocks with height animation. The event-data props
+  // (completionReport/lastResponseSummary) are component-side fallback inputs
+  // for the idle report arm — mirrored into writables and passed as selector
+  // args (smaller diff than re-folding the report-arm precedence here).
+  // svelte-ignore state_referenced_locally -- selectors are initialized with the current props; the effect below mirrors prop changes.
+  const completionReportStore = writable<string | undefined>(completionReport);
+  // svelte-ignore state_referenced_locally -- selectors are initialized with the current props; the effect below mirrors prop changes.
+  const lastResponseSummaryStore = writable<string | undefined>(lastResponseSummary);
+  $effect(() => {
+    completionReportStore.set(completionReport);
+    lastResponseSummaryStore.set(lastResponseSummary);
   });
-  const lastResponse = $derived(
-    liveResponseLine ||
-      (agentData?.lastResponse ? getLastMeaningfulLine(agentData.lastResponse) : ''),
-  );
-
-  // Freshness-wins preview: when the newest transcript message is the user's
-  // (wire `lastMessageRole`, transcript-derived fallback in agent-peek-utils)
-  // and no streamed text exists yet for an in-flight turn, the user's first
-  // line outranks digest/completionReport/lastResponse/lastToolUse (attention
-  // requests still take top precedence). Absent role (older daemon) keeps the
-  // existing precedence. Once streamed text lands (or the daemon overlay flips
-  // the role to "assistant"), the live-preview precedence above resumes.
-  // Text source: transcript-derived first, then the wire `lastUserMessage`
-  // (AgentLite list/get projection) — agent-peek-utils applies this fallback
-  // itself; the direct session read remains as a belt-and-braces fallback.
-  const userFirstLine = $derived(
-    stripUserMessagePrefixes(agentData?.lastUserMessage || $agent$?.lastUserMessage || '')
-      .split('\n')[0]
-      ?.trim() ?? '',
-  );
-
-  // Tool-use block to preview when the latest thing the agent did was a tool
-  // call (see agent-peek-utils). Only used when there's no text to display.
-  const lastToolUse = $derived(agentData?.lastToolUse);
-  const liveToolUse = $derived(
-    $agent$?.isStreaming && $agent$?.lastToolUse ? lastToolUse : undefined,
-  );
-  const liveToolDisplay = $derived(
-    liveToolUse
-      ? classifyTool(liveToolUse.name, (liveToolUse.input as Record<string, any>) || {})
-      : null,
-  );
-  const hasRenderableLiveTool = $derived(!!liveToolUse && !liveToolDisplay?.hidden);
-  const showUserMessagePreview = $derived(
-    agentData?.lastMessageRole === 'user' &&
-      !!userFirstLine &&
-      !liveResponseLine &&
-      !hasRenderableLiveTool,
+  const preview$ = selectAgentPreview(
+    agentIdStore,
+    completionReportStore,
+    lastResponseSummaryStore,
   );
 
   const updatedAt = $derived(updatedAtProp ?? $agent$?.updatedAt);
 
-  // Border color based on state - only show colored border if showStateBorder is true
-  const isRunning = $derived(avatarState === 'running' || avatarState === 'responding');
+  // Border color based on state - only show colored border if showStateBorder
+  // is true. Keyed on the display state (not isTurnRunning) so the amber/red
+  // attention shadows keep their precedence over the active glow.
   const glowClass = $derived.by(() => {
     if (!showStateBorder) return '';
-    if (isRunning) return 'agent-glow-active';
+    if (avatarState === 'running' || avatarState === 'responding') return 'agent-glow-active';
     if (avatarState === 'failed') return 'shadow shadow-red-500 shadow-sm';
     if (avatarState === 'needs-permission') return 'shadow shadow-amber-500 shadow-sm';
     if (avatarState === 'attention-discussion') return 'shadow shadow-amber-500 shadow-sm';
@@ -563,51 +607,8 @@
     return 'glow-transparent';
   });
 
-  // Show completion report if available - priority order:
-  // 0. Live session digest while responding (push-applied from
-  //    `agent:stream:activity` and cleared at each turn's first ping by the
-  //    events bridge, monorepo#1327 — so mid-turn it is this turn's digest,
-  //    modulo the sub-second window before that first ping lands, during
-  //    which the previous turn's digest may briefly linger)
-  // 1. Digest from <agent_digest> tag (most concise, agent-provided summary)
-  // 2. Completion report from report_to_parent tool (prop from event data)
-  // 3. Completion report from agent metadata
-  // 4. lastResponseSummary (fallback from event data)
-  // Sources 1-4 are previous-turn summaries: while the agent is responding
-  // they must never be the preview (monorepo#1327) — including the tool-only
-  // no-text window where no `receivedFirstChunk` flip has happened yet — so
-  // the derivation yields undefined and the render chain falls through to
-  // live text / newest user message / tool preview. They remain the fallback
-  // for idle agents between turns.
-  const effectiveCompletionReport = $derived.by(() => {
-    if ($agentIsResponding$) {
-      return $agent$?.digest || undefined;
-    }
-    return (
-      agentData?.digest || completionReport || agentData?.completionReport || lastResponseSummary
-    );
-  });
-
-  // Single preview value for the persistent container below: the precedence
-  // chain (attention → live text → live tool → user line → digest/report →
-  // persisted fallbacks) collapses into one { kind, text/toolUse } value so
-  // preview-source flips swap content in place instead of unmount/mounting
-  // sibling blocks with height animation.
-  const preview = $derived(
-    deriveAgentCardPreview({
-      attentionRequest,
-      liveResponseLine,
-      liveToolUse,
-      hasRenderableLiveTool,
-      showUserMessagePreview,
-      userFirstLine,
-      effectiveCompletionReport,
-      lastResponse,
-      lastToolUse,
-      lastUserMsg,
-    }),
-  );
   const inlinePreviewSource = $derived.by(() => {
+    const preview = $preview$;
     if (!preview || preview.kind === 'live-tool' || preview.kind === 'last-tool') return '';
     if (preview.kind !== 'attention') return preview.text;
     const label =
@@ -640,7 +641,7 @@
       onclick(event);
     } else {
       const sourcePanelId = findSourcePanelId(event.target);
-      const openInAdjacentPanel = event.metaKey || event.ctrlKey;
+      const openInAdjacentPanel = isCmdClickModifier({ event });
       const wsId = $agent$?.workspaceId
         ? String($agent$.workspaceId)
         : workspace?.id
@@ -661,28 +662,33 @@
 {#snippet agentCardContent()}
   <div
     style="padding-left: {depth * 10}px; container-type: inline-size;"
-    class="relative w-full min-w-0 max-w-full overflow-hidden agent-card-container"
+    class="relative w-full min-w-0 max-w-full {isEditing
+      ? 'overflow-visible'
+      : 'overflow-hidden'} agent-card-container"
     data-agent-id={agentId}
     data-testid="agent-list-item"
   >
-    <button
-      type="button"
-      class="flex w-full min-w-0 max-w-full overflow-hidden text-left gap-2 transition-colors duration-150 cursor-pointer group border {panelRow
-        ? 'h-10 items-center rounded-md border-transparent px-2 py-2 type-body font-normal hover:bg-muted/45 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring'
+    <svelte:element
+      this={isEditing ? 'div' : 'button'}
+      type={isEditing ? undefined : 'button'}
+      class="flex w-full min-w-0 max-w-full text-left gap-2 transition-colors duration-150 {isEditing
+        ? 'overflow-visible'
+        : 'overflow-hidden'} {isEditing ? 'cursor-text' : 'cursor-pointer'} group border {panelRow
+        ? 'h-10 items-center rounded-md border-transparent bg-transparent px-2 py-2 type-body font-normal text-foreground hover:bg-transparent active:bg-transparent focus-visible:-outline-offset-2 focus-visible:bg-transparent focus-visible:outline-2 focus-visible:outline-ring focus-visible:ring-0'
         : inline
           ? `type-body items-center rounded-md ${inlineRowClass}`
           : 'px-1.75 pt-1.25 pb-1.5'} {panelRow
-        ? selected
-          ? 'bg-muted/70 text-foreground'
-          : 'bg-transparent'
+        ? ''
         : selected || showBorder
           ? `bg-background border-border ${glowClass} shadow-xs`
           : 'border-transparent'} {typographyClass}"
-      onclick={handleClick}
-      onkeydown={handleCardKeydown}
-      oncontextmenu={handleContextMenu}
-      aria-disabled={readOnly}
-      tabindex={readOnly ? -1 : undefined}
+      onclick={isEditing ? undefined : handleClick}
+      onkeydown={isEditing ? undefined : handleCardKeydown}
+      oncontextmenu={isEditing ? undefined : handleContextMenu}
+      role={isEditing ? 'presentation' : undefined}
+      aria-disabled={isEditing ? undefined : readOnly}
+      aria-current={!isEditing && panelRow && selected ? 'true' : undefined}
+      tabindex={isEditing || readOnly ? -1 : undefined}
       data-agent-panel-row={panelRow ? agentId : undefined}
     >
       <div
@@ -703,13 +709,17 @@
       </div>
 
       <div
-        class="agent-card-content flex min-w-0 max-w-full flex-1 overflow-hidden {headerActions
-          ? 'mr-14'
-          : ''} {inline || panelRow ? 'flex-row items-center gap-2' : 'flex-col'}"
+        class="agent-card-content flex min-w-0 max-w-full flex-1 {isEditing
+          ? 'overflow-visible'
+          : 'overflow-hidden'} {headerActions ? 'mr-14' : ''} {inline || panelRow
+          ? 'flex-row items-center gap-2'
+          : 'flex-col'}"
       >
         <!-- Header row -->
         <div
-          class="agent-card-header flex w-full min-w-0 max-w-full items-center gap-1.5 overflow-hidden {inline
+          class="agent-card-header flex w-full min-w-0 max-w-full items-center gap-1.5 {isEditing
+            ? 'overflow-visible'
+            : 'overflow-hidden'} {inline
             ? 'inline-agent-card-header'
             : panelRow
               ? 'agent-panel-row-header'
@@ -719,43 +729,72 @@
 
           <div
             class="flex-1 min-w-0 flex items-center {panelRow
-              ? 'gap-1.5 overflow-hidden'
+              ? `gap-1.5 ${isEditing ? 'overflow-visible' : 'overflow-hidden'}`
               : inline
                 ? 'gap-0'
                 : 'gap-1.5'} {typographyClass
               ? 'font-normal'
               : panelRow
                 ? 'font-normal'
-                : 'font-medium'} {inline ? 'overflow-hidden' : ''}"
+                : 'font-medium'} {inline
+              ? isEditing
+                ? 'overflow-visible'
+                : 'overflow-hidden'
+              : ''}"
           >
-            {#if isEditing}
-              <!-- svelte-ignore a11y_autofocus -->
-              <input
-                bind:this={editInputRef}
-                type="text"
-                bind:value={editingValue}
-                onblur={saveEdit}
-                onkeydown={handleEditKeydown}
-                class="text-sm truncate bg-transparent border-none outline-none! ring-0! focus:ring-0! focus:outline-none! focus-visible:ring-0! focus-visible:outline-none! min-w-0 flex-1 text-foreground"
-                onclick={(e) => e.stopPropagation()}
-              />
-            {:else}
-              <!-- svelte-ignore a11y_no_static_element_interactions -->
-              <h3
-                class="whitespace-nowrap {panelRow
-                  ? 'min-w-0 flex-1 truncate type-body font-normal text-foreground'
-                  : inline
-                    ? typographyClass
-                      ? 'shrink-0 type-body font-normal text-foreground!'
-                      : 'shrink-0 type-body font-normal text-foreground'
-                    : 'shrink-0 text-sm font-normal text-foreground'}"
-                data-testid="agent-card-name"
-                data-agent-row-name={panelRow ? '' : undefined}
-                ondblclick={handleNameDoubleClick}
-              >
-                {displayName}
-              </h3>
-            {/if}
+            <div
+              class="relative flex min-w-0 items-center {isEditing || !inline
+                ? 'flex-1'
+                : ''} {isEditing ? 'overflow-visible' : 'overflow-hidden'}"
+            >
+              {#if isEditing}
+                <!-- svelte-ignore a11y_autofocus -->
+                <input
+                  bind:this={editInputRef}
+                  type="text"
+                  bind:value={editingValue}
+                  aria-label={m.chat_agentCard_menu_rename_label()}
+                  onblur={saveEdit}
+                  onkeydowncapture={handleEditKeydown}
+                  onkeyupcapture={isolateEditEvent}
+                  onfocusincapture={isolateEditEvent}
+                  onfocusoutcapture={isolateEditEvent}
+                  onpointerdowncapture={isolateEditEvent}
+                  onpointerupcapture={isolateEditEvent}
+                  onmousedowncapture={isolateEditEvent}
+                  onmouseupcapture={isolateEditEvent}
+                  onclickcapture={isolateEditEvent}
+                  ondblclickcapture={isolateEditEvent}
+                  oncontextmenucapture={isolateEditEvent}
+                  oncopycapture={isolateEditEvent}
+                  oncutcapture={isolateEditEvent}
+                  onpastecapture={isolateEditEvent}
+                  class="inline-edit-input relative z-10 min-w-0 flex-1 truncate border-none bg-transparent text-sm text-foreground outline-none! ring-0! focus:outline-none! focus:ring-0! focus-visible:outline-none! focus-visible:ring-0!"
+                />
+              {:else}
+                <!-- svelte-ignore a11y_no_static_element_interactions -->
+                <h3
+                  class="relative z-10 cursor-text whitespace-nowrap {panelRow
+                    ? 'min-w-0 flex-1 truncate type-body font-normal text-foreground'
+                    : inline
+                      ? typographyClass
+                        ? 'shrink-0 type-body font-normal text-foreground!'
+                        : 'shrink-0 type-body font-normal text-foreground'
+                      : 'shrink-0 text-sm font-normal text-foreground'}"
+                  data-testid="agent-card-name"
+                  data-agent-row-name={panelRow ? '' : undefined}
+                  ondblclick={handleNameDoubleClick}
+                >
+                  {displayName}
+                </h3>
+              {/if}
+              <span
+                aria-hidden="true"
+                class="pointer-events-none absolute z-0 rounded-(--radius-small) border transition-[inset,border-color,background-color] duration-(--motion-standard) ease-(--ease-standard) motion-reduce:transition-none {isEditing
+                  ? '-inset-x-2 -inset-y-1.5 border-ring/60 bg-background'
+                  : '-inset-x-1 -inset-y-0.5 border-transparent bg-transparent'}"
+              ></span>
+            </div>
             {#if statusLabel}
               <span
                 class="type-body shrink-0 truncate whitespace-nowrap font-normal text-muted-foreground"
@@ -790,14 +829,14 @@
             {/if}
 
             <!-- Inline mode: preview inline after name -->
-            {#if inline && !hidePreview && preview}
-              {#if preview.kind === 'live-tool' || preview.kind === 'last-tool'}
+            {#if inline && !hidePreview && $preview$}
+              {#if $preview$.kind === 'live-tool' || $preview$.kind === 'last-tool'}
                 <div
                   class="ml-2.5 min-w-0 flex-1 overflow-hidden whitespace-nowrap text-sm {INLINE_PEEK_TYPOGRAPHY_CLASS}"
                   data-testid="agent-card-preview"
                 >
                   <AgentPreviewToolLabel
-                    toolUse={preview.toolUse}
+                    toolUse={$preview$.toolUse}
                     showIcon={false}
                     class={INLINE_PEEK_TYPOGRAPHY_CLASS}
                   />
@@ -820,7 +859,6 @@
               class="flex shrink-0 items-center gap-1.5"
               data-agent-row-trailing={panelRow ? '' : undefined}
             >
-              <OpenPanelIndicator count={openPanelCount} active={activeInPanel} />
               {#if panelRow && isBackground}
                 <span
                   class="shrink-0 rounded bg-muted px-1 py-0.5 text-ui font-bold text-subtle"
@@ -850,55 +888,55 @@
         </div>
 
         <!-- Non-inline mode: preview below header as before -->
-        {#if !inline && !hidePreview && preview}
+        {#if !inline && !hidePreview && $preview$}
           <div
             class="mt-0.5 w-full min-w-0 max-w-full overflow-hidden"
             data-testid="agent-card-preview-row"
             transition:safeSlide={{ axis: 'y', duration: 150 }}
           >
-            {#if preview.kind === 'attention'}
+            {#if $preview$.kind === 'attention'}
               <p
-                class="block w-full min-w-0 max-w-full truncate whitespace-nowrap text-sm {preview
+                class="block w-full min-w-0 max-w-full truncate whitespace-nowrap text-sm {$preview$
                   .attention.kind === 'blocker'
                   ? 'text-red-500'
                   : 'text-amber-500'}"
                 data-testid="agent-card-attention"
               >
-                {preview.attention.kind === 'blocker'
+                {$preview$.attention.kind === 'blocker'
                   ? m.chat_agentCard_attentionBlocker_label()
-                  : m.chat_agentCard_attentionDiscussion_label()}{#if preview.attention.reason}<span
+                  : m.chat_agentCard_attentionDiscussion_label()}{#if $preview$.attention.reason}<span
                     class="text-subtle"
                   >
-                    · {preview.attention.reason}</span
+                    · {$preview$.attention.reason}</span
                   >{/if}
               </p>
-            {:else if preview.kind === 'live-tool' || preview.kind === 'last-tool'}
+            {:else if $preview$.kind === 'live-tool' || $preview$.kind === 'last-tool'}
               <div
                 class="block w-full min-w-0 max-w-full truncate whitespace-nowrap text-sm text-subtle"
                 data-testid="agent-card-preview"
               >
-                <AgentPreviewToolLabel toolUse={preview.toolUse} animate={isRunning} />
+                <AgentPreviewToolLabel toolUse={$preview$.toolUse} animate={isTurnRunning} />
               </div>
-            {:else if preview.kind === 'report'}
+            {:else if $preview$.kind === 'report'}
               <p
                 class="block w-full min-w-0 max-w-full truncate whitespace-nowrap text-sm text-subtle"
-                title={preview.text}
+                title={$preview$.text}
               >
-                {preview.text}
+                {$preview$.text}
               </p>
             {:else}
               <p
                 class="block w-full min-w-0 max-w-full truncate whitespace-nowrap text-sm text-subtle"
                 data-testid="agent-card-preview"
-                title={preview.text}
+                title={$preview$.text}
               >
-                {preview.text}
+                {$preview$.text}
               </p>
             {/if}
           </div>
         {/if}
       </div>
-    </button>
+    </svelte:element>
     {#if headerActions}
       <div
         class="absolute right-3 top-1/2 z-10 h-6 w-14 shrink-0 -translate-y-1/2"
@@ -938,7 +976,20 @@
   />
 {/if}
 
+{#if replaceAgentModalOpen}
+  <ReplaceAgentModal
+    bind:open={replaceAgentModalOpen}
+    agentName={displayName}
+    specialist={specialist as string | null}
+    onSend={handleReplaceAgentSend}
+  />
+{/if}
+
 <style>
+  input.inline-edit-input::selection {
+    background: hsl(var(--ring) / 0.3);
+  }
+
   .agent-card-avatar-wrapper {
     display: inline-flex;
     box-sizing: border-box;

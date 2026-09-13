@@ -36,6 +36,7 @@
     type AgentAvatarStackItem,
   } from '$features/agent/components/agent-avatar/AgentAvatarStack.svelte';
   import { getAvatarStateForSession } from '$features/agent/components/agent-avatar/avatar-state';
+  import { isAgentRunningState, toAgentRuntimeStateInput } from '$shared/utils/agent-runtime-state';
   import type { AgentSession } from '$shared/types';
 
   import {
@@ -44,6 +45,7 @@
     selectDelegationGroups,
     selectWokenUpInfo,
     selectWaitingState,
+    selectSubscriptionSnapshotStatus,
   } from '$store/renderer/slices/agent-subscription-ui/agent-subscription-ui-selectors';
   import {
     cancelAgentSubscriptionsRequested,
@@ -71,7 +73,6 @@
   import { openAgentTabRequested } from '$store/renderer/slices/app-layout/app-layout-slice';
   import { openWorkspaceTab } from '$store/renderer/slices/tab-state/tab-state-slice';
   import { selectCurrentWorkspaceTabId } from '$store/renderer/slices/tab-state/tab-state-selectors';
-  import { findSourcePanelId } from '$lib/utils/workspace-navigation';
   import { navigateToRoute } from '$lib/utils/navigation.client';
   import { dispatchWindowEvent } from '$lib/utils/window-events';
   import {
@@ -163,6 +164,7 @@
   const agentStatuses$ = selectAgentSubscriptionStatuses(workspaceIdStore, agentIdStore);
   const wokenUpInfo$ = selectWokenUpInfo(workspaceIdStore, agentIdStore);
   const waitingState$ = selectWaitingState(workspaceIdStore, agentIdStore);
+  const snapshotStatus$ = selectSubscriptionSnapshotStatus(workspaceIdStore, agentIdStore);
 
   // ── Derived display values ───────────────────────────────────────────
 
@@ -257,6 +259,28 @@
     }
     return ids;
   });
+  // Whether the agent's live session shows a running turn right now. Uses the
+  // same session→runtime-input mapping as getAvatarStateForSession so a row's
+  // grouping always agrees with the state its avatar renders.
+  function isSessionRunning(session: AgentSession | undefined): boolean {
+    if (!session) return false;
+    return isAgentRunningState(toAgentRuntimeStateInput(session));
+  }
+  // Effective finished set: delegation-group completion lists never un-complete
+  // when an agent is re-woken by a message, so an agent whose live session
+  // shows a running turn is treated as active again — same precedent as the
+  // completed-vs-running deferral in getAvatarState. It returns to finished on
+  // its own once the new turn settles.
+  const finishedAgentIdSet = $derived.by(() => {
+    if (isolatedPreview) return completedAgentIdSet;
+    const agentSessionsById = selectAgentSessionsById.select(rendererState);
+    const ids = new Set<string>();
+    for (const id of completedAgentIdSet) {
+      if (isSessionRunning(agentSessionsById[id])) continue;
+      ids.add(id);
+    }
+    return ids;
+  });
   function getHeaderStackItems(rows: readonly WaitingAgentRow[]): AgentAvatarStackItem[] {
     const agentSessionsById = selectAgentSessionsById.select(rendererState);
     return rows.map((row): AgentAvatarStackItem => {
@@ -266,7 +290,7 @@
         agentId: row.agentId,
         specialist: session?.metadata?.specialist ?? session?.agentMetadata?.specialist ?? null,
         state: getAvatarStateForSession(session, {
-          isCompleted: completedAgentIdSet.has(row.agentId),
+          isCompleted: finishedAgentIdSet.has(row.agentId),
         }),
       };
     });
@@ -289,7 +313,7 @@
     if (session.attentionRequestKind === 'discussion') return 1;
 
     // Terminal states
-    if (completedAgentIdSet.has(agentId)) return 4;
+    if (finishedAgentIdSet.has(agentId)) return 4;
 
     const status = String(session.status).toLowerCase();
 
@@ -302,7 +326,7 @@
 
   const activeAgentRows = $derived.by(() => {
     const agentSessionsById = selectAgentSessionsById.select(rendererState);
-    const nonTerminal = waitingAgentRows.filter((row) => !completedAgentIdSet.has(row.agentId));
+    const nonTerminal = waitingAgentRows.filter((row) => !finishedAgentIdSet.has(row.agentId));
     // Stable semantic sort: group by priority, preserve source order within each group
     // Build index map for stable tie-breaking
     const sourceIndexMap = new Map<string, number>();
@@ -322,7 +346,7 @@
   const finishedAgentRows = $derived.by(() => {
     const agentSessionsById = selectAgentSessionsById.select(rendererState);
     return waitingAgentRows
-      .filter((row) => completedAgentIdSet.has(row.agentId))
+      .filter((row) => finishedAgentIdSet.has(row.agentId))
       .sort((a, b) => {
         const aTimestamp = timestampMillis(agentSessionsById[a.agentId]?.updatedAt);
         const bTimestamp = timestampMillis(agentSessionsById[b.agentId]?.updatedAt);
@@ -420,7 +444,7 @@
   const showSubscriptionRow = $derived(isCompleted || waitingAgentRows.length > 0);
 
   $effect(() => {
-    visible = showSubscriptionRow || !!$wokenUpInfo$;
+    visible = showSubscriptionRow || !!$wokenUpInfo$ || $snapshotStatus$ !== 'ready';
     count = activeAgentRows.length;
     participantAgentIds = activeAgentRows.map((row) => row.agentId);
     participantAvatarItems = getHeaderStackItems(activeAgentRows);
@@ -534,23 +558,16 @@
     clearWatchedAgentFocusTimers();
   });
 
-  function openWatchedAgent(event: MouseEvent | KeyboardEvent, watchedAgentId: string) {
+  function openWatchedAgent(_event: MouseEvent | KeyboardEvent, watchedAgentId: string) {
     if (isolatedPreview) return;
     if (!workspaceId) return;
-    const sourcePanelId = findSourcePanelId(event.target);
     if (selectCurrentWorkspaceTabId.select(appStore.state) !== workspaceId) {
       appStore.dispatch(openWorkspaceTab(workspaceId));
       void navigateToRoute(`/workspace/${workspaceId}`).catch((error) => {
         logger.warn('Failed to switch workspace for watched agent', { watchedAgentId, error });
       });
     }
-    appStore.dispatch(
-      openAgentTabRequested(workspaceId, {
-        agentId: watchedAgentId,
-        sourcePanelId,
-        openInAdjacentPanel: true,
-      }),
-    );
+    appStore.dispatch(openAgentTabRequested(workspaceId, { agentId: watchedAgentId }));
     focusWatchedAgentPanel(watchedAgentId);
   }
 </script>
@@ -648,6 +665,24 @@
         </Tooltip.Content>
       </Tooltip.Root>
     </Tooltip.Provider>
+  </div>
+{/if}
+
+{#if !showSubscriptionRow && !$wokenUpInfo$ && $snapshotStatus$ !== 'ready'}
+  <div
+    class="flex min-h-10 items-center gap-2 px-3 py-2 text-muted-foreground {SUBSCRIPTION_ROW_TYPOGRAPHY_CLASS}"
+    data-testid="agent-subscriptions-snapshot-status"
+    data-snapshot-status={$snapshotStatus$}
+    role={$snapshotStatus$ === 'failed' ? 'alert' : 'status'}
+  >
+    {#if $snapshotStatus$ === 'loading'}
+      <span
+        class="size-3 shrink-0 animate-spin rounded-full border-2 border-muted-foreground/30 border-t-muted-foreground"
+      ></span>
+      <span>{m.chat_chatMessage_loading_label()}</span>
+    {:else}
+      <span>{m.chat_streamingStatus_responseFailed_label()}</span>
+    {/if}
   </div>
 {/if}
 
@@ -758,11 +793,11 @@
                   {summaryHeading}
                 </span>
               </span>
-              <span class="ml-auto flex min-w-0 flex-1 items-center justify-end">
+              <span class="ml-auto flex min-w-0 flex-1 items-center justify-end gap-2">
                 {#if waitingAgentsCollapsed}
                   <AgentAvatarStack
                     items={getHeaderStackItems(summaryAgentRows)}
-                    maxVisible={8}
+                    maxVisible={3}
                     adaptive
                   />
                 {:else}
@@ -797,7 +832,7 @@
             transition:safeSubscriptionSlide
           >
             {#each ungroupedAgentRows as row (row.agentId)}
-              {@render watchedAgentRow(row, completedAgentIdSet.has(row.agentId))}
+              {@render watchedAgentRow(row, finishedAgentIdSet.has(row.agentId))}
             {/each}
             {#if shouldGroupFinishedAgents}
               <div

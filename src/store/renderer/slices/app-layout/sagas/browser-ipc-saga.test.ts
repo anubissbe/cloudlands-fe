@@ -1,5 +1,6 @@
 import { runSaga } from 'redux-saga';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { createCollection } from '@augmentcode/themis/utils/collections/collection-utils';
 
 const mocks = vi.hoisted(() => ({
   isElectron: vi.fn(() => true),
@@ -34,8 +35,14 @@ vi.mock('../../../utils/safe-local-storage-saga', () => ({
 }));
 
 import { PANEL_LAYOUT_STORAGE_KEY_PREFIX } from '../../panel-layout/panel-layout-types';
-import { panelLayoutReducer } from '../../panel-layout/panel-layout-slice';
+import {
+  emptyWorkspaceState,
+  panelLayoutReducer as rawPanelLayoutReducer,
+} from '../../panel-layout/panel-layout-slice';
+import { withPanelLayoutInvariants } from '../../panel-layout/panel-layout-invariants.test-helpers';
 import { browserIpcSaga } from './browser-ipc-saga';
+
+const panelLayoutReducer = withPanelLayoutInvariants(rawPanelLayoutReducer);
 
 const NOW = new Date('2026-07-31T00:00:00.000Z').getTime();
 const TAB = (url: string) => ({
@@ -103,6 +110,7 @@ describe('browserIpcSaga', () => {
       ['browser:open-tab', handlers['browser:open-tab']],
       ['browser:close-tab', handlers['browser:close-tab']],
       ['browser:focus-tab', handlers['browser:focus-tab']],
+      ['browser:show-tab', handlers['browser:show-tab']],
       ['browser:list-tabs-request', handlers['browser:list-tabs-request']],
       ['browser:tab-navigated', handlers['browser:tab-navigated']],
       ['browser:tab-owner-changed', handlers['browser:tab-owner-changed']],
@@ -114,13 +122,14 @@ describe('browserIpcSaga', () => {
       ['browser:open-tab', 'browser:open-tab-listener'],
       ['browser:close-tab', 'browser:close-tab-listener'],
       ['browser:focus-tab', 'browser:focus-tab-listener'],
+      ['browser:show-tab', 'browser:show-tab-listener'],
       ['browser:list-tabs-request', 'browser:list-tabs-request-listener'],
       ['browser:tab-navigated', 'browser:tab-navigated-listener'],
       ['browser:tab-owner-changed', 'browser:tab-owner-changed-listener'],
     ]);
 
     const restarted = start();
-    expect(on).toHaveBeenCalledTimes(12);
+    expect(on).toHaveBeenCalledTimes(14);
     restarted.cancel();
     await restarted.toPromise();
   });
@@ -155,22 +164,20 @@ describe('browserIpcSaga', () => {
 
     expect(actions).toMatchObject([
       {
-        type: 'panelLayout/openTabInNewRootColumn',
+        type: 'panelLayout/openTabInRightmostColumnRequested',
         payload: {
           wsId: 'ws-1',
           tab: TAB('https://one.test'),
-          sourcePanelId: undefined,
           force: false,
           newTabId: `tab-${NOW}-i`,
           timestamp: NOW,
         },
       },
       {
-        type: 'panelLayout/openTabInNewRootColumn',
+        type: 'panelLayout/openTabInRightmostColumnRequested',
         payload: {
           wsId: 'ws-1',
           tab: TAB('https://two.test'),
-          sourcePanelId: undefined,
           force: false,
           newTabId: `tab-${NOW}-i`,
           timestamp: NOW,
@@ -188,11 +195,10 @@ describe('browserIpcSaga', () => {
         },
       },
       {
-        type: 'panelLayout/openTabInNewRootColumn',
+        type: 'panelLayout/openTabInRightmostColumnRequested',
         payload: {
           wsId: 'ws-2',
           tab: TAB('https://four.test'),
-          sourcePanelId: undefined,
           force: false,
           newTabId: `tab-${NOW}-i`,
           timestamp: NOW,
@@ -207,11 +213,10 @@ describe('browserIpcSaga', () => {
         payload: { wsId: 'ws-1', tabId: 'browser-1', panelId: undefined, timestamp: NOW },
       },
       {
-        type: 'panelLayout/openTab',
+        type: 'panelLayout/openTabInRightmostColumnRequested',
         payload: {
           wsId: 'ws-1',
           tab: TAB('https://new.test'),
-          panelId: undefined,
           newTabId: `tab-${NOW}-i`,
           force: false,
           timestamp: NOW,
@@ -264,9 +269,227 @@ describe('browserIpcSaga', () => {
         payload: ['ws-1', 'browser-checked', 'agent-1'],
       },
       {
-        type: 'panelLayout/setActiveTab',
+        type: 'panelLayout/activateVisibleTab',
         payload: { wsId: 'ws-1', tabId: 'browser-checked' },
       },
+      { type: 'panelLayout/consumePanelReveal', payload: ['ws-1', 'browser-checked'] },
+      { type: 'panelLayout/consumePendingFocus', payload: ['ws-1', 'browser-checked'] },
+    ]);
+    task.cancel();
+    await task.toPromise();
+  });
+
+  // An agent visible replace adopting an existing visible tab must activate
+  // it without moving focus, like every other agent-driven visible open
+  // (monorepo#3045). Driven through the real reducer: the adopted tab becomes
+  // active in its own panel (even one that is not focused), the reveal is
+  // marked preserveFocus (BrowserTabType's autofocus gate), and neither the
+  // focused panel nor the focus history changes. A user replace keeps its
+  // focusing setActiveTab path.
+  describe('agent visible position:replace adoption (monorepo#3045)', () => {
+    const twoPanelState = (focusedPanelId: 'left' | 'right') => ({
+      panelLayout: {
+        byWorkspaceId: {
+          'ws-1': {
+            ...emptyWorkspaceState,
+            root: {
+              type: 'split',
+              direction: 'horizontal',
+              children: [
+                { type: 'panel', panelId: 'left' },
+                { type: 'panel', panelId: 'right' },
+              ],
+              sizes: [50, 50],
+            },
+            panels: {
+              left: {
+                id: 'left',
+                tabs: [{ id: 'note-left', type: 'note', title: 'Left' }],
+                activeTabId: 'note-left',
+              },
+              right: {
+                id: 'right',
+                tabs: [
+                  { id: 'note-right', type: 'note', title: 'Right' },
+                  {
+                    id: 'browser-1',
+                    type: 'browser',
+                    title: 'Browser',
+                    browserUrl: 'https://old.test',
+                    ownerAgentId: 'agent-1',
+                    closable: true,
+                  },
+                ],
+                activeTabId: 'note-right',
+              },
+            },
+            focusedPanelId,
+          },
+        },
+      },
+      tabState: { workspaceStacks: [] },
+    });
+    const startWithReducer = () => {
+      const actions: unknown[] = [];
+      const task = start((action: any) => {
+        actions.push(action);
+        state = { ...state, panelLayout: panelLayoutReducer(state.panelLayout, action) };
+      });
+      return { actions, task };
+    };
+    const ws = () => state.panelLayout.byWorkspaceId['ws-1'];
+
+    it.each(['right', 'left'] as const)(
+      'activates the adopted tab in place without moving focus (focused panel: %s)',
+      async (focusedPanelId) => {
+        const { actions, task } = startWithReducer();
+        state = twoPanelState(focusedPanelId);
+
+        await emit({
+          url: 'https://replaced.test',
+          position: 'replace',
+          workspaceId: 'ws-1',
+          ownerAgentId: 'agent-1',
+          visible: true,
+          replaceTabId: 'browser-1',
+        });
+
+        expect(actions.map((a: any) => a.type)).toEqual([
+          'panelLayout/updateTabBrowserUrl',
+          'panelLayout/setTabOwnerAgent',
+          'panelLayout/activateVisibleTab',
+          'panelLayout/consumePanelReveal',
+          'panelLayout/consumePendingFocus',
+        ]);
+        expect(ws().panels.right.activeTabId).toBe('browser-1');
+        expect(ws().panels.right.tabs[1]).toMatchObject({ browserUrl: 'https://replaced.test' });
+        expect(ws().focusedPanelId).toBe(focusedPanelId);
+        expect(ws().focusHistory).toEqual([]);
+        // The queued reveal was consumed because jsdom's route is `/`, not
+        // this workspace (its preserveFocus marker is asserted below).
+        expect(ws().pendingPanelReveal).toBeNull();
+        expect(ws().pendingFocusTabId).toBeNull();
+        task.cancel();
+        await task.toPromise();
+      },
+    );
+
+    it('queues the reveal marked preserveFocus before the not-displayed drop', async () => {
+      const seen: unknown[] = [];
+      const task = start((action: any) => {
+        state = { ...state, panelLayout: panelLayoutReducer(state.panelLayout, action) };
+        if (action.type === 'panelLayout/activateVisibleTab') seen.push(ws().pendingPanelReveal);
+      });
+      state = twoPanelState('right');
+
+      await emit({
+        url: 'https://replaced.test',
+        position: 'replace',
+        workspaceId: 'ws-1',
+        ownerAgentId: 'agent-1',
+        visible: true,
+        replaceTabId: 'browser-1',
+      });
+
+      expect(seen).toEqual([
+        { panelId: 'right', tabId: 'browser-1', requestId: 'browser-1', preserveFocus: true },
+      ]);
+      task.cancel();
+      await task.toPromise();
+    });
+
+    it('a user replace still activates through the focusing setActiveTab path', async () => {
+      const { actions, task } = startWithReducer();
+      state = twoPanelState('right');
+
+      await emit({
+        url: 'https://user-replaced.test',
+        position: 'replace',
+        workspaceId: 'ws-1',
+        replaceTabId: 'browser-1',
+      });
+
+      expect(actions.map((a: any) => a.type)).toEqual([
+        'panelLayout/updateTabBrowserUrl',
+        'panelLayout/setActiveTab',
+      ]);
+      expect(ws().panels.right.activeTabId).toBe('browser-1');
+      expect(ws().focusHistory).toHaveLength(1);
+      task.cancel();
+      await task.toPromise();
+    });
+  });
+
+  // Hidden-replace (monorepo#2857): an AGENT replace bound to a hidden
+  // (user-closed) owned tab navigates it in place and leaves it hidden; an
+  // unowned (user) open never adopts a hidden tab — that would look like a
+  // no-op and retarget an agent-owned tab.
+  it('an agent replace bound to a hidden owned tab navigates it in place and keeps it hidden', async () => {
+    const actions: unknown[] = [];
+    const task = start((action) => actions.push(action));
+    state = {
+      panelLayout: {
+        byWorkspaceId: {
+          'ws-1': {
+            panels: { one: { tabs: [] } },
+            hiddenTabs: createCollection('id', [
+              { id: 'browser-hidden', type: 'browser', ownerAgentId: 'agent-1' },
+            ]),
+          },
+        },
+      },
+    };
+
+    await emit({
+      url: 'https://hidden.test',
+      position: 'replace',
+      workspaceId: 'ws-1',
+      ownerAgentId: 'agent-1',
+      replaceTabId: 'browser-hidden',
+    });
+
+    // Navigate + ownership only — no setActiveTab/openTab: the tab stays
+    // hidden (the user's close is respected).
+    expect(actions).toMatchObject([
+      {
+        type: 'panelLayout/updateTabBrowserUrl',
+        payload: ['ws-1', 'browser-hidden', 'https://hidden.test', null],
+      },
+      {
+        type: 'panelLayout/setTabOwnerAgent',
+        payload: ['ws-1', 'browser-hidden', 'agent-1'],
+      },
+    ]);
+    expect(actions.map((a: any) => a.type)).not.toContain('panelLayout/setActiveTab');
+    task.cancel();
+    await task.toPromise();
+  });
+
+  it('an unowned replace bound to a hidden tab never adopts it — opens a visible tab instead', async () => {
+    const actions: unknown[] = [];
+    const task = start((action) => actions.push(action));
+    state = {
+      panelLayout: {
+        byWorkspaceId: {
+          'ws-1': {
+            panels: { one: { tabs: [] } },
+            hiddenTabs: createCollection('id', [
+              { id: 'browser-hidden', type: 'browser', ownerAgentId: 'agent-1' },
+            ]),
+          },
+        },
+      },
+    };
+
+    await emit({
+      url: 'https://user.test',
+      position: 'replace',
+      workspaceId: 'ws-1',
+      replaceTabId: 'browser-hidden',
+    });
+
+    expect(actions.map((a: any) => a.type)).toEqual([
+      'panelLayout/openTabInRightmostColumnRequested',
     ]);
     task.cancel();
     await task.toPromise();
@@ -299,16 +522,26 @@ describe('browserIpcSaga', () => {
       ownerAgentId: 'agent-1',
     });
 
+    // The rightmost-column saga owns the fixed-column reconciliation and
+    // workspace-not-displayed reveal drop (monorepo#3045).
     expect(actions.map((a: any) => a.type)).toEqual([
-      'panelLayout/openTab',
-      'panelLayout/openTab',
+      'panelLayout/openTabInRightmostColumnRequested',
+      'panelLayout/openTabInRightmostColumnRequested',
     ]);
-    expect(actions).toMatchObject([
-      { payload: { wsId: 'ws-1', tab: { ...TAB('https://gone.test'), ownerAgentId: 'agent-1' } } },
-      {
-        payload: { wsId: 'ws-1', tab: { ...TAB('https://legacy.test'), ownerAgentId: 'agent-1' } },
+    expect(actions[0]).toMatchObject({
+      payload: {
+        wsId: 'ws-1',
+        agentDriven: true,
+        tab: { ...TAB('https://gone.test'), ownerAgentId: 'agent-1' },
       },
-    ]);
+    });
+    expect(actions[1]).toMatchObject({
+      payload: {
+        wsId: 'ws-1',
+        agentDriven: true,
+        tab: { ...TAB('https://legacy.test'), ownerAgentId: 'agent-1' },
+      },
+    });
     task.cancel();
     await task.toPromise();
   });
@@ -339,11 +572,10 @@ describe('browserIpcSaga', () => {
 
     expect(actions).toMatchObject([
       {
-        type: 'panelLayout/openTabInNewRootColumn',
+        type: 'panelLayout/openTabInRightmostColumnRequested',
         payload: {
           wsId: 'ws-1',
           tab: TAB('https://one.test'),
-          sourcePanelId: undefined,
           force: false,
           allowDuplicate: true,
           newTabId: 'tab-main-1',
@@ -363,11 +595,10 @@ describe('browserIpcSaga', () => {
         },
       },
       {
-        type: 'panelLayout/openTab',
+        type: 'panelLayout/openTabInRightmostColumnRequested',
         payload: {
           wsId: 'ws-1',
           tab: TAB('https://three.test'),
-          panelId: undefined,
           newTabId: 'tab-main-3',
           force: false,
           timestamp: NOW,
@@ -378,11 +609,11 @@ describe('browserIpcSaga', () => {
     await task.toPromise();
   });
 
-  it('pins the panel correlated to an explicit browser open request', async () => {
+  it('opens an explicit browser request without creating legacy panel pin state', async () => {
     const actions: any[] = [];
     const task = start((action: any) => {
       actions.push(action);
-      if (action.type === 'panelLayout/openTabInNewRootColumn') {
+      if (action.type === 'panelLayout/openTabInRightmostColumnRequested') {
         state.panelLayout.byWorkspaceId['ws-1'] = {
           panels: {},
           pendingPanelReveal: {
@@ -397,12 +628,8 @@ describe('browserIpcSaga', () => {
     await emit({ url: 'https://pinned.test', workspaceId: 'ws-1', tabId: 'request-1', pin: true });
 
     expect(actions.map((action) => action.type)).toEqual([
-      'panelLayout/openTabInNewRootColumn',
-      'panelLayout/setPanelPinned',
+      'panelLayout/openTabInRightmostColumnRequested',
     ]);
-    expect(actions[1]).toMatchObject({
-      payload: { wsId: 'ws-1', panelId: 'panel-resolved', pinned: true },
-    });
     task.cancel();
     await task.toPromise();
   });
@@ -432,14 +659,13 @@ describe('browserIpcSaga', () => {
 
     expect(actions).toMatchObject([
       {
-        type: 'panelLayout/openTabInNewRootColumn',
+        type: 'panelLayout/openTabInRightmostColumnRequested',
         payload: {
           wsId: 'ws-1',
           tab: {
             ...TAB('http://127.0.0.1:52345/'),
             browserRequestedUrl: 'http://daemon.localhost:3000/',
           },
-          sourcePanelId: undefined,
           force: false,
           newTabId: `tab-${NOW}-i`,
           timestamp: NOW,
@@ -462,7 +688,7 @@ describe('browserIpcSaga', () => {
     const actions: any[] = [];
     const task = start((action: any) => {
       actions.push(action);
-      if (action.type === 'panelLayout/openTabInNewRootColumn') {
+      if (action.type === 'panelLayout/openTabInRightmostColumnRequested') {
         state.panelLayout.byWorkspaceId['ws-1'] = {
           panels: {},
           pendingPanelReveal: {
@@ -476,7 +702,9 @@ describe('browserIpcSaga', () => {
 
     await emit({ url: 'https://stale.test', workspaceId: 'ws-1', tabId: 'request-1', pin: true });
 
-    expect(actions.map((action) => action.type)).toEqual(['panelLayout/openTabInNewRootColumn']);
+    expect(actions.map((action) => action.type)).toEqual([
+      'panelLayout/openTabInRightmostColumnRequested',
+    ]);
     task.cancel();
     await task.toPromise();
   });
@@ -542,6 +770,350 @@ describe('browserIpcSaga', () => {
     await task.toPromise();
   });
 
+  // Owner-changed events carry the emulated viewport (claims + resizes,
+  // monorepo#2857 §5.9): a well-formed size rides along, a malformed one is
+  // dropped rather than poisoning the tab record.
+  it('persists ownership with the emulated size via browser:tab-owner-changed', async () => {
+    const actions: unknown[] = [];
+    const task = start((action) => actions.push(action));
+    state = {
+      panelLayout: {
+        byWorkspaceId: {
+          'ws-1': { panels: { one: { tabs: [{ id: 'browser-1', type: 'browser' }] } } },
+        },
+      },
+    };
+
+    await emit(
+      {
+        tabId: 'browser-1',
+        workspaceId: 'ws-1',
+        ownerAgentId: 'agent-1',
+        emulatedSize: { width: 390, height: 844 },
+      },
+      'browser:tab-owner-changed',
+    );
+    // Legacy payload without a size, and a malformed size: owner only.
+    await emit(
+      { tabId: 'browser-1', workspaceId: 'ws-1', ownerAgentId: 'agent-1' },
+      'browser:tab-owner-changed',
+    );
+    await emit(
+      {
+        tabId: 'browser-1',
+        workspaceId: 'ws-1',
+        ownerAgentId: 'agent-1',
+        emulatedSize: { width: -1, height: 'x' },
+      },
+      'browser:tab-owner-changed',
+    );
+
+    expect(actions).toEqual([
+      {
+        type: 'panelLayout/setTabOwnerAgent',
+        payload: ['ws-1', 'browser-1', 'agent-1', { width: 390, height: 844 }],
+      },
+      { type: 'panelLayout/setTabOwnerAgent', payload: ['ws-1', 'browser-1', 'agent-1'] },
+      { type: 'panelLayout/setTabOwnerAgent', payload: ['ws-1', 'browser-1', 'agent-1'] },
+    ]);
+    task.cancel();
+    await task.toPromise();
+  });
+
+  it('persists an owned fit viewport in one store action', async () => {
+    const actions: unknown[] = [];
+    const task = start((action) => actions.push(action));
+    state = {
+      panelLayout: {
+        byWorkspaceId: {
+          'ws-1': { panels: { one: { tabs: [{ id: 'browser-1', type: 'browser' }] } } },
+        },
+      },
+    };
+
+    await emit(
+      {
+        tabId: 'browser-1',
+        workspaceId: 'ws-1',
+        ownerAgentId: 'agent-1',
+        emulatedSize: { width: 1280, height: 800 },
+        viewport: { mode: 'fit' },
+      },
+      'browser:tab-owner-changed',
+    );
+
+    expect(actions).toEqual([
+      {
+        type: 'panelLayout/setTabOwnerAgent',
+        payload: [
+          'ws-1',
+          'browser-1',
+          'agent-1',
+          { width: 1280, height: 800 },
+          undefined,
+          { mode: 'fit' },
+        ],
+      },
+    ]);
+    task.cancel();
+    await task.toPromise();
+  });
+
+  it('opens an agent tab with the payload emulatedSize persisted on the tab (§5.9)', async () => {
+    const actions: unknown[] = [];
+    const task = start((action) => actions.push(action));
+
+    await emit({
+      url: 'https://sized.test',
+      position: 'same',
+      workspaceId: 'ws-1',
+      ownerAgentId: 'agent-1',
+      emulatedSize: { width: 390, height: 844 },
+    });
+
+    expect(actions).toMatchObject([
+      {
+        type: 'panelLayout/openTab',
+        payload: {
+          wsId: 'ws-1',
+          tab: {
+            ...TAB('https://sized.test'),
+            ownerAgentId: 'agent-1',
+            emulatedSize: { width: 390, height: 844 },
+          },
+        },
+      },
+      { type: 'panelLayout/consumePanelReveal' },
+      { type: 'panelLayout/consumePendingFocus' },
+    ]);
+    task.cancel();
+    await task.toPromise();
+  });
+
+  // An agent-driven visible position:same open must activate the tab without
+  // moving focus, exactly like the adjacent branch (monorepo#3045): the
+  // preserveFocus flag rides on the openTab action; a user open never
+  // carries it.
+  it('activates an agent visible position:same open with preserveFocus', async () => {
+    const actions: unknown[] = [];
+    const task = start((action) => actions.push(action));
+
+    await emit({
+      url: 'https://agent-same.test',
+      position: 'same',
+      workspaceId: 'ws-1',
+      tabId: 'tab-main-1',
+      ownerAgentId: 'agent-1',
+      visible: true,
+    });
+    await emit({
+      url: 'https://user-same.test',
+      position: 'same',
+      workspaceId: 'ws-1',
+      tabId: 'tab-main-2',
+    });
+
+    expect(actions[0]).toMatchObject({
+      type: 'panelLayout/openTab',
+      payload: {
+        wsId: 'ws-1',
+        newTabId: 'tab-main-1',
+        preserveFocus: true,
+        tab: { ...TAB('https://agent-same.test'), ownerAgentId: 'agent-1' },
+      },
+    });
+    const userOpen = actions.find(
+      (a: any) => a.type === 'panelLayout/openTab' && a.payload.newTabId === 'tab-main-2',
+    ) as { payload: Record<string, unknown> } | undefined;
+    expect(userOpen).toBeDefined();
+    expect(userOpen?.payload).not.toHaveProperty('preserveFocus');
+    task.cancel();
+    await task.toPromise();
+  });
+
+  // Only owned tabs are emulated (§5.9): a size arriving without an owner is
+  // dropped at the boundary rather than recorded on a native tab.
+  it('drops emulatedSize on unowned opens', async () => {
+    const actions: unknown[] = [];
+    const task = start((action) => actions.push(action));
+
+    await emit({
+      url: 'https://native.test',
+      position: 'same',
+      workspaceId: 'ws-1',
+      emulatedSize: { width: 390, height: 844 },
+    });
+
+    expect(actions).toHaveLength(1);
+    const open = actions[0] as { type: string; payload: { tab: Record<string, unknown> } };
+    expect(open.type).toBe('panelLayout/openTab');
+    expect(open.payload.tab).not.toHaveProperty('ownerAgentId');
+    expect(open.payload.tab).not.toHaveProperty('emulatedSize');
+    task.cancel();
+    await task.toPromise();
+  });
+
+  // Agent opens are hidden by default (monorepo#3045): visible: false creates
+  // the tab straight into hiddenTabs — no panel mount, no focus/active-tab
+  // change — on every position branch.
+  it('creates an agent open with visible: false directly in hiddenTabs', async () => {
+    const actions: unknown[] = [];
+    const task = start((action) => actions.push(action));
+
+    await emit({
+      url: 'https://hidden.test',
+      workspaceId: 'ws-1',
+      tabId: 'tab-main-1',
+      ownerAgentId: 'agent-1',
+      emulatedSize: { width: 390, height: 844 },
+      visible: false,
+    });
+    await emit({
+      url: 'https://hidden-same.test',
+      position: 'same',
+      workspaceId: 'ws-1',
+      tabId: 'tab-main-2',
+      ownerAgentId: 'agent-1',
+      visible: false,
+    });
+
+    expect(actions).toMatchObject([
+      {
+        type: 'panelLayout/openHiddenTab',
+        payload: {
+          wsId: 'ws-1',
+          tab: {
+            ...TAB('https://hidden.test'),
+            ownerAgentId: 'agent-1',
+            emulatedSize: { width: 390, height: 844 },
+          },
+          newTabId: 'tab-main-1',
+        },
+      },
+      {
+        type: 'panelLayout/openHiddenTab',
+        payload: {
+          wsId: 'ws-1',
+          tab: { ...TAB('https://hidden-same.test'), ownerAgentId: 'agent-1' },
+          newTabId: 'tab-main-2',
+        },
+      },
+    ]);
+    expect(actions).toHaveLength(2);
+    task.cancel();
+    await task.toPromise();
+  });
+
+  it('visible: true keeps the panel-mounted open for agent tabs', async () => {
+    const actions: unknown[] = [];
+    const task = start((action) => actions.push(action));
+
+    await emit({
+      url: 'https://visible.test',
+      workspaceId: 'ws-1',
+      ownerAgentId: 'agent-1',
+      visible: true,
+    });
+
+    // The rightmost-column saga activates the tab without moving focus and
+    // drops the queued reveal when the workspace is not displayed
+    // (monorepo#3045); it is not running in this harness.
+    expect(actions).toMatchObject([
+      {
+        type: 'panelLayout/openTabInRightmostColumnRequested',
+        payload: {
+          wsId: 'ws-1',
+          agentDriven: true,
+          tab: { ...TAB('https://visible.test'), ownerAgentId: 'agent-1' },
+        },
+      },
+    ]);
+    task.cancel();
+    await task.toPromise();
+  });
+
+  // Only owned tabs can be hidden: hide-on-close and the sidebar restore
+  // affordance are ownership-scoped, so an unowned hidden tab would be
+  // unrestorable. visible: false without an owner opens visibly.
+  it('ignores visible: false on unowned opens', async () => {
+    const actions: unknown[] = [];
+    const task = start((action) => actions.push(action));
+
+    await emit({ url: 'https://user.test', workspaceId: 'ws-1', visible: false });
+
+    expect(actions).toMatchObject([
+      { type: 'panelLayout/openTabInRightmostColumnRequested', payload: { wsId: 'ws-1' } },
+    ]);
+    task.cancel();
+    await task.toPromise();
+  });
+
+  // A hidden (default) agent replace adopting a visible tab updates it in
+  // place but never activates it or moves focus — and never hides it
+  // (monorepo#3045).
+  it('a hidden agent replace adopting a visible tab skips activation and focus', async () => {
+    const actions: unknown[] = [];
+    const task = start((action) => actions.push(action));
+    state = {
+      panelLayout: {
+        byWorkspaceId: {
+          'ws-1': {
+            panels: { one: { tabs: [{ id: 'browser-1', type: 'browser' }] } },
+            hiddenTabs: createCollection('id'),
+          },
+        },
+      },
+    };
+
+    await emit({
+      url: 'https://adopt.test',
+      position: 'replace',
+      workspaceId: 'ws-1',
+      replaceTabId: 'browser-1',
+      ownerAgentId: 'agent-1',
+      visible: false,
+    });
+
+    expect(actions).toMatchObject([
+      {
+        type: 'panelLayout/updateTabBrowserUrl',
+        payload: ['ws-1', 'browser-1', 'https://adopt.test', null],
+      },
+      { type: 'panelLayout/setTabOwnerAgent', payload: ['ws-1', 'browser-1', 'agent-1'] },
+    ]);
+    expect(actions).toHaveLength(2);
+    task.cancel();
+    await task.toPromise();
+  });
+
+  it('a hidden agent replace with no adoption target opens into hiddenTabs', async () => {
+    const actions: unknown[] = [];
+    const task = start((action) => actions.push(action));
+
+    await emit({
+      url: 'https://replace-new.test',
+      position: 'replace',
+      workspaceId: 'ws-1',
+      tabId: 'tab-main-3',
+      ownerAgentId: 'agent-1',
+      visible: false,
+    });
+
+    expect(actions).toMatchObject([
+      {
+        type: 'panelLayout/openHiddenTab',
+        payload: {
+          wsId: 'ws-1',
+          tab: { ...TAB('https://replace-new.test'), ownerAgentId: 'agent-1' },
+          newTabId: 'tab-main-3',
+        },
+      },
+    ]);
+    expect(actions).toHaveLength(1);
+    task.cancel();
+    await task.toPromise();
+  });
+
   it('no-ops for invalid payloads and when neither workspace source is available', async () => {
     const actions: unknown[] = [];
     const task = start((action) => actions.push(action));
@@ -574,7 +1146,15 @@ describe('browserIpcSaga', () => {
     expect(actions).toEqual([
       {
         type: 'panelLayout/closeTab',
-        payload: { wsId: 'ws-2', tabId: 'browser-1', panelId: undefined, timestamp: NOW },
+        // Main-driven closes destroy (never hide) the tab (monorepo#2857).
+        payload: {
+          wsId: 'ws-2',
+          tabId: 'browser-1',
+          panelId: undefined,
+          timestamp: NOW,
+          destroy: true,
+          preservePanel: false,
+        },
       },
     ]);
     task.cancel();
@@ -648,7 +1228,7 @@ describe('browserIpcSaga', () => {
     expect(actions).toEqual([
       {
         type: 'appLayout/focusBrowserTabRequested',
-        payload: ['ws-background', 'browser-1', true],
+        payload: ['ws-background', 'browser-1', true, true],
       },
     ]);
     task.cancel();
@@ -665,6 +1245,341 @@ describe('browserIpcSaga', () => {
     await emit({ workspaceId: 'ws-1' }, 'browser:focus-tab');
 
     expect(actions).toEqual([]);
+    task.cancel();
+    await task.toPromise();
+  });
+
+  // showTab (monorepo#3045): activate an owned tab in a visible panel — a
+  // hidden tab is revealed, a visible-but-inactive one is brought to the
+  // front. focus: false (default) activates without moving panel focus;
+  // focus: true activates and focuses; already-displayed tabs are idempotent.
+  it('browser:show-tab restores a hidden tab without focus by default', async () => {
+    const actions: unknown[] = [];
+    const task = start((action) => actions.push(action));
+    state = {
+      panelLayout: {
+        byWorkspaceId: {
+          'ws-1': {
+            panels: { one: { tabs: [] } },
+            hiddenTabs: createCollection('id', [
+              { id: 'browser-hidden', type: 'browser', ownerAgentId: 'agent-1' },
+            ]),
+          },
+        },
+      },
+    };
+
+    await emit({ tabId: 'browser-hidden', workspaceId: 'ws-1' }, 'browser:show-tab');
+
+    // The no-focus reveal still activates the tab in a visible panel
+    // (monorepo#3112), so its queued reveal/scroll markers are dropped when
+    // this window is not displaying the workspace (jsdom's route is `/`).
+    expect(actions).toEqual([
+      {
+        type: 'panelLayout/restoreHiddenTab',
+        payload: {
+          wsId: 'ws-1',
+          tabId: 'browser-hidden',
+          timestamp: NOW,
+          focus: false,
+        },
+      },
+      { type: 'panelLayout/consumePanelReveal', payload: ['ws-1', 'browser-hidden'] },
+      { type: 'panelLayout/consumePendingFocus', payload: ['ws-1', 'browser-hidden'] },
+    ]);
+    task.cancel();
+    await task.toPromise();
+  });
+
+  it('browser:show-tab with focus: true restores and activates the hidden tab', async () => {
+    const actions: unknown[] = [];
+    const task = start((action) => actions.push(action));
+    state = {
+      panelLayout: {
+        byWorkspaceId: {
+          'ws-1': {
+            panels: { one: { tabs: [] } },
+            hiddenTabs: createCollection('id', [
+              { id: 'browser-hidden', type: 'browser', ownerAgentId: 'agent-1' },
+            ]),
+          },
+        },
+      },
+    };
+
+    await emit({ tabId: 'browser-hidden', workspaceId: 'ws-1', focus: true }, 'browser:show-tab');
+
+    // The focusing reveal is followed by the workspace-not-displayed drop
+    // (monorepo#3045): jsdom's route is `/`, not this workspace, so the
+    // mount/activation state stands but the queued UI reveal is consumed.
+    expect(actions).toEqual([
+      {
+        type: 'panelLayout/restoreHiddenTab',
+        payload: {
+          wsId: 'ws-1',
+          tabId: 'browser-hidden',
+          timestamp: NOW,
+          focus: true,
+        },
+      },
+      { type: 'panelLayout/consumePanelReveal', payload: ['ws-1', 'browser-hidden'] },
+      { type: 'panelLayout/consumePendingFocus', payload: ['ws-1', 'browser-hidden'] },
+    ]);
+    task.cancel();
+    await task.toPromise();
+  });
+
+  it('browser:show-tab on a visible-but-inactive tab activates it in place without focus', async () => {
+    const actions: unknown[] = [];
+    const task = start((action) => actions.push(action));
+    state = {
+      panelLayout: {
+        byWorkspaceId: {
+          'ws-1': {
+            panels: {
+              one: {
+                tabs: [
+                  { id: 'note-1', type: 'note' },
+                  { id: 'browser-1', type: 'browser' },
+                ],
+                activeTabId: 'note-1',
+              },
+            },
+            hiddenTabs: createCollection('id'),
+          },
+        },
+      },
+    };
+
+    await emit({ tabId: 'browser-1', workspaceId: 'ws-1' }, 'browser:show-tab');
+
+    // Focus-preserving in-place activation (monorepo#3045), followed by the
+    // workspace-not-displayed drop of its queued reveal (jsdom's route is `/`).
+    expect(actions).toEqual([
+      {
+        type: 'panelLayout/activateVisibleTab',
+        payload: { wsId: 'ws-1', tabId: 'browser-1', timestamp: NOW },
+      },
+      { type: 'panelLayout/consumePanelReveal', payload: ['ws-1', 'browser-1'] },
+      { type: 'panelLayout/consumePendingFocus', payload: ['ws-1', 'browser-1'] },
+    ]);
+    task.cancel();
+    await task.toPromise();
+  });
+
+  it('browser:show-tab on an already-visible tab with focus: true takes the focus path', async () => {
+    const actions: unknown[] = [];
+    const task = start((action) => actions.push(action));
+    state = {
+      panelLayout: {
+        byWorkspaceId: {
+          'ws-1': {
+            panels: { one: { tabs: [{ id: 'browser-1', type: 'browser' }] } },
+            hiddenTabs: createCollection('id'),
+          },
+        },
+      },
+    };
+
+    await emit({ tabId: 'browser-1', workspaceId: 'ws-1', focus: true }, 'browser:show-tab');
+    expect(actions).toEqual([
+      {
+        type: 'appLayout/focusBrowserTabRequested',
+        payload: ['ws-1', 'browser-1', undefined, true],
+      },
+    ]);
+    task.cancel();
+    await task.toPromise();
+  });
+
+  it('ignores browser:show-tab without workspaceId or tabId', async () => {
+    const actions: unknown[] = [];
+    const task = start((action) => actions.push(action));
+
+    await emit({}, 'browser:show-tab');
+    await emit({ tabId: 'browser-1' }, 'browser:show-tab');
+    await emit({ tabId: 7, workspaceId: 'ws-1' }, 'browser:show-tab');
+    await emit({ workspaceId: 'ws-1' }, 'browser:show-tab');
+
+    expect(actions).toEqual([]);
+    task.cancel();
+    await task.toPromise();
+  });
+
+  it('lists requested URLs for visible and hidden tabs but omits them for legacy tabs', async () => {
+    const task = start();
+    state = {
+      panelLayout: {
+        byWorkspaceId: {
+          'ws-1': {
+            panels: {
+              one: {
+                tabs: [
+                  {
+                    id: 'browser-visible',
+                    type: 'browser',
+                    browserUrl: 'http://a/',
+                    browserRequestedUrl: 'http://daemon.localhost:3000/',
+                    title: 'A',
+                    ownerAgentId: 'agent-1',
+                  },
+                  {
+                    id: 'browser-legacy',
+                    type: 'browser',
+                    browserUrl: 'http://legacy/',
+                    title: 'Legacy',
+                  },
+                ],
+                activeTabId: null,
+              },
+            },
+            hiddenTabs: createCollection('id', [
+              {
+                id: 'browser-hidden',
+                type: 'browser',
+                browserUrl: 'http://b/',
+                browserRequestedUrl: 'http://daemon.localhost:4000/',
+                title: 'B',
+                ownerAgentId: 'agent-1',
+              },
+            ]),
+          },
+        },
+      },
+    };
+
+    await emit({ workspaceId: 'ws-1', requestId: 'req-hidden' }, 'browser:list-tabs-request');
+
+    expect(mocks.invoke).toHaveBeenCalledExactlyOnceWith('browser:list-tabs-response', {
+      requestId: 'req-hidden',
+      tabs: [
+        {
+          tabId: 'browser-visible',
+          url: 'http://a/',
+          requestedUrl: 'http://daemon.localhost:3000/',
+          title: 'A',
+          closable: true,
+          ownerAgentId: 'agent-1',
+        },
+        {
+          tabId: 'browser-legacy',
+          url: 'http://legacy/',
+          title: 'Legacy',
+          closable: true,
+        },
+        {
+          tabId: 'browser-hidden',
+          url: 'http://b/',
+          requestedUrl: 'http://daemon.localhost:4000/',
+          title: 'B',
+          closable: true,
+          ownerAgentId: 'agent-1',
+          hidden: true,
+        },
+      ],
+    });
+    task.cancel();
+    await task.toPromise();
+  });
+
+  // A panel-mounted tab is `active` only when it is its panel's active tab
+  // (the only one the panel can paint); a mounted-but-inactive tab and a hidden tab
+  // carry no marker, even when a stale activeTabId still names the hidden one.
+  it("marks each panel's active tab with active: true in list replies", async () => {
+    const task = start();
+    state = {
+      panelLayout: {
+        byWorkspaceId: {
+          'ws-1': {
+            panels: {
+              one: {
+                tabs: [
+                  { id: 'browser-active', type: 'browser', browserUrl: 'http://a/', title: 'A' },
+                  { id: 'browser-inactive', type: 'browser', browserUrl: 'http://b/', title: 'B' },
+                ],
+                activeTabId: 'browser-active',
+              },
+              two: {
+                tabs: [
+                  { id: 'note-1', type: 'note', title: 'Note' },
+                  { id: 'browser-behind', type: 'browser', browserUrl: 'http://c/', title: 'C' },
+                ],
+                activeTabId: 'note-1',
+              },
+              three: { tabs: [], activeTabId: 'browser-hidden' },
+            },
+            hiddenTabs: createCollection('id', [
+              {
+                id: 'browser-hidden',
+                type: 'browser',
+                browserUrl: 'http://d/',
+                title: 'D',
+                ownerAgentId: 'agent-1',
+              },
+            ]),
+          },
+        },
+      },
+    };
+
+    await emit({ workspaceId: 'ws-1', requestId: 'req-active' }, 'browser:list-tabs-request');
+
+    expect(mocks.invoke).toHaveBeenCalledExactlyOnceWith('browser:list-tabs-response', {
+      requestId: 'req-active',
+      tabs: [
+        {
+          tabId: 'browser-active',
+          url: 'http://a/',
+          title: 'A',
+          closable: true,
+          active: true,
+        },
+        { tabId: 'browser-inactive', url: 'http://b/', title: 'B', closable: true },
+        { tabId: 'browser-behind', url: 'http://c/', title: 'C', closable: true },
+        {
+          tabId: 'browser-hidden',
+          url: 'http://d/',
+          title: 'D',
+          closable: true,
+          ownerAgentId: 'agent-1',
+          hidden: true,
+        },
+      ],
+    });
+    task.cancel();
+    await task.toPromise();
+  });
+
+  // The active marker is derived per panel: a stale activeTabId on a panel
+  // that no longer holds the tab must not mark the tab as displayed while it
+  // actually sits behind a sibling in another panel.
+  it('does not mark a tab active from a stale activeTabId on another panel', async () => {
+    const task = start();
+    state = {
+      panelLayout: {
+        byWorkspaceId: {
+          'ws-1': {
+            panels: {
+              stale: { tabs: [], activeTabId: 'browser-behind' },
+              holder: {
+                tabs: [
+                  { id: 'note-1', type: 'note', title: 'Note' },
+                  { id: 'browser-behind', type: 'browser', browserUrl: 'http://c/', title: 'C' },
+                ],
+                activeTabId: 'note-1',
+              },
+            },
+          },
+        },
+      },
+    };
+
+    await emit({ workspaceId: 'ws-1', requestId: 'req-stale' }, 'browser:list-tabs-request');
+
+    expect(mocks.invoke).toHaveBeenCalledExactlyOnceWith('browser:list-tabs-response', {
+      requestId: 'req-stale',
+      tabs: [{ tabId: 'browser-behind', url: 'http://c/', title: 'C', closable: true }],
+    });
     task.cancel();
     await task.toPromise();
   });
@@ -807,6 +1722,230 @@ describe('browserIpcSaga', () => {
     await task.toPromise();
   });
 
+  // Persisted emulated size (monorepo#2857): the size rides with the owner in
+  // both directions — list replies carry it to main for rehydration, and
+  // owner-changed events (claim / resizeTab) persist it on the layout tab.
+  it('includes persisted sizing state of owned tabs in list replies (valid sizes only)', async () => {
+    const task = start();
+    state = {
+      panelLayout: {
+        byWorkspaceId: {
+          'ws-1': {
+            panels: {
+              one: {
+                tabs: [
+                  {
+                    id: 'tab-owned',
+                    type: 'browser',
+                    browserUrl: 'http://a/',
+                    title: 'A',
+                    ownerAgentId: 'agent-1',
+                    emulatedSize: { width: 390, height: 844 },
+                    viewport: { mode: 'custom', width: 390, height: 844 },
+                  },
+                  {
+                    id: 'tab-bad-size',
+                    type: 'browser',
+                    browserUrl: 'http://b/',
+                    title: 'B',
+                    ownerAgentId: 'agent-2',
+                    emulatedSize: { width: -1, height: 0 },
+                  },
+                  { id: 'tab-user', type: 'browser', browserUrl: 'http://c/', title: 'C' },
+                ],
+              },
+            },
+          },
+        },
+      },
+    };
+
+    await emit({ workspaceId: 'ws-1', requestId: 'req-size' }, 'browser:list-tabs-request');
+
+    expect(mocks.invoke).toHaveBeenCalledExactlyOnceWith('browser:list-tabs-response', {
+      requestId: 'req-size',
+      tabs: [
+        {
+          tabId: 'tab-owned',
+          url: 'http://a/',
+          title: 'A',
+          closable: true,
+          ownerAgentId: 'agent-1',
+          emulatedSize: { width: 390, height: 844 },
+          viewport: { mode: 'custom', width: 390, height: 844 },
+        },
+        {
+          tabId: 'tab-bad-size',
+          url: 'http://b/',
+          title: 'B',
+          closable: true,
+          ownerAgentId: 'agent-2',
+        },
+        { tabId: 'tab-user', url: 'http://c/', title: 'C', closable: true },
+      ],
+    });
+    task.cancel();
+    await task.toPromise();
+  });
+
+  it('persists the emulatedSize from a tab-owner-changed event (and tolerates its absence)', async () => {
+    const actions: unknown[] = [];
+    const task = start((action) => actions.push(action));
+    state = {
+      panelLayout: {
+        byWorkspaceId: {
+          'ws-1': {
+            panels: { one: { tabs: [{ id: 'tab-1', type: 'browser' }] } },
+          },
+        },
+      },
+    };
+
+    await emit(
+      {
+        workspaceId: 'ws-1',
+        tabId: 'tab-1',
+        ownerAgentId: 'agent-1',
+        emulatedSize: { width: 390, height: 844 },
+      },
+      'browser:tab-owner-changed',
+    );
+    // Legacy/size-less payload: owner only.
+    await emit(
+      { workspaceId: 'ws-1', tabId: 'tab-1', ownerAgentId: 'agent-1' },
+      'browser:tab-owner-changed',
+    );
+
+    expect(actions).toMatchObject([
+      {
+        type: 'panelLayout/setTabOwnerAgent',
+        payload: ['ws-1', 'tab-1', 'agent-1', { width: 390, height: 844 }],
+      },
+      {
+        type: 'panelLayout/setTabOwnerAgent',
+        payload: ['ws-1', 'tab-1', 'agent-1'],
+      },
+    ]);
+    task.cancel();
+    await task.toPromise();
+  });
+
+  it('persists the emulatedSize from an agent open payload on the new tab', async () => {
+    const actions: unknown[] = [];
+    const task = start((action) => actions.push(action));
+
+    await emit({
+      url: 'https://sized.test',
+      workspaceId: 'ws-1',
+      ownerAgentId: 'agent-1',
+      emulatedSize: { width: 1024, height: 768 },
+    });
+
+    expect(actions).toMatchObject([
+      {
+        type: 'panelLayout/openTabInRightmostColumnRequested',
+        payload: {
+          wsId: 'ws-1',
+          agentDriven: true,
+          tab: {
+            ...TAB('https://sized.test'),
+            ownerAgentId: 'agent-1',
+            emulatedSize: { width: 1024, height: 768 },
+          },
+        },
+      },
+    ]);
+    task.cancel();
+    await task.toPromise();
+  });
+
+  // monorepo#3438: the owner's display name rides the open and owner-changed
+  // payloads and persists with the tab so the sidebar can label the owner
+  // group without an agent-store lookup.
+  it('persists the ownerAgentName from an agent open payload on the new tab', async () => {
+    const actions: unknown[] = [];
+    const task = start((action) => actions.push(action));
+
+    await emit({
+      url: 'https://named.test',
+      workspaceId: 'ws-1',
+      ownerAgentId: 'agent-1',
+      ownerAgentName: 'Docs Writer',
+    });
+
+    expect(actions).toMatchObject([
+      {
+        type: 'panelLayout/openTabInRightmostColumnRequested',
+        payload: {
+          wsId: 'ws-1',
+          agentDriven: true,
+          tab: {
+            ...TAB('https://named.test'),
+            ownerAgentId: 'agent-1',
+            ownerAgentName: 'Docs Writer',
+          },
+        },
+      },
+    ]);
+    task.cancel();
+    await task.toPromise();
+  });
+
+  it('ignores an ownerAgentName without an ownerAgentId on an open payload', async () => {
+    const actions: unknown[] = [];
+    const task = start((action) => actions.push(action));
+
+    await emit({
+      url: 'https://user.test',
+      workspaceId: 'ws-1',
+      ownerAgentName: 'Docs Writer',
+    });
+
+    expect(actions).toMatchObject([
+      {
+        type: 'panelLayout/openTabInRightmostColumnRequested',
+        payload: { wsId: 'ws-1', tab: TAB('https://user.test') },
+      },
+    ]);
+    expect((actions[0] as any).payload.tab.ownerAgentName).toBeUndefined();
+    task.cancel();
+    await task.toPromise();
+  });
+
+  it('persists the ownerAgentName from a tab-owner-changed event', async () => {
+    const actions: unknown[] = [];
+    const task = start((action) => actions.push(action));
+    state = {
+      panelLayout: {
+        byWorkspaceId: {
+          'ws-1': {
+            panels: { one: { tabs: [{ id: 'tab-1', type: 'browser' }] } },
+          },
+        },
+      },
+    };
+
+    await emit(
+      {
+        workspaceId: 'ws-1',
+        tabId: 'tab-1',
+        ownerAgentId: 'agent-1',
+        ownerAgentName: 'Docs Writer',
+        emulatedSize: { width: 390, height: 844 },
+      },
+      'browser:tab-owner-changed',
+    );
+
+    expect(actions).toMatchObject([
+      {
+        type: 'panelLayout/setTabOwnerAgent',
+        payload: ['ws-1', 'tab-1', 'agent-1', { width: 390, height: 844 }, 'Docs Writer'],
+      },
+    ]);
+    task.cancel();
+    await task.toPromise();
+  });
+
   describe('background hydration for hosted-but-unvisited workspaces (monorepo#2789)', () => {
     const startWithReducer = () => {
       const actions: unknown[] = [];
@@ -876,11 +2015,15 @@ describe('browserIpcSaga', () => {
       expect(mocks.invoke.mock.calls.map(([, payload]: any[]) => payload)).toEqual([
         {
           requestId: 'req-h3a',
-          tabs: [{ tabId: 'browser-1', url: 'http://a/', title: 'A', closable: true }],
+          tabs: [
+            { tabId: 'browser-1', url: 'http://a/', title: 'A', closable: true, active: true },
+          ],
         },
         {
           requestId: 'req-h3b',
-          tabs: [{ tabId: 'browser-1', url: 'http://a/', title: 'A', closable: true }],
+          tabs: [
+            { tabId: 'browser-1', url: 'http://a/', title: 'A', closable: true, active: true },
+          ],
         },
       ]);
       task.cancel();
@@ -931,14 +2074,17 @@ describe('browserIpcSaga', () => {
       ]);
       window.history.pushState({}, '', '/workspace/ws-routed-1');
       try {
-        await emit({ workspaceId: 'ws-routed-1', requestId: 'req-r1' }, 'browser:list-tabs-request');
+        await emit(
+          { workspaceId: 'ws-routed-1', requestId: 'req-r1' },
+          'browser:list-tabs-request',
+        );
       } finally {
         window.history.pushState({}, '', '/');
       }
 
       expect(mocks.invoke).toHaveBeenCalledExactlyOnceWith('browser:list-tabs-response', {
         requestId: 'req-r1',
-        tabs: [{ tabId: 'browser-1', url: 'http://a/', title: 'A', closable: true }],
+        tabs: [{ tabId: 'browser-1', url: 'http://a/', title: 'A', closable: true, active: true }],
       });
       task.cancel();
       await task.toPromise();
@@ -965,7 +2111,10 @@ describe('browserIpcSaga', () => {
       state = { panelLayout: { byWorkspaceId: {} }, tabState: { workspaceStacks: [] } };
       window.history.pushState({}, '', '/workspace/ws-routed-other');
       try {
-        await emit({ workspaceId: 'ws-not-here', requestId: 'req-r3' }, 'browser:list-tabs-request');
+        await emit(
+          { workspaceId: 'ws-not-here', requestId: 'req-r3' },
+          'browser:list-tabs-request',
+        );
       } finally {
         window.history.pushState({}, '', '/');
       }
@@ -1046,7 +2195,9 @@ describe('browserIpcSaga', () => {
         { requestId: 'req-e2a', error: 'layout hydration failed: storage exploded' },
         {
           requestId: 'req-e2b',
-          tabs: [{ tabId: 'browser-1', url: 'http://a/', title: 'A', closable: true }],
+          tabs: [
+            { tabId: 'browser-1', url: 'http://a/', title: 'A', closable: true, active: true },
+          ],
         },
       ]);
       task.cancel();
@@ -1067,7 +2218,7 @@ describe('browserIpcSaga', () => {
       await emit({ tabId: 'browser-1', workspaceId: 'ws-hyd-err-3' }, 'browser:focus-tab');
       expect(actions).toContainEqual({
         type: 'appLayout/focusBrowserTabRequested',
-        payload: ['ws-hyd-err-3', 'browser-1', undefined],
+        payload: ['ws-hyd-err-3', 'browser-1', undefined, true],
       });
 
       // The saga is still alive: a later healthy request is answered.
@@ -1081,7 +2232,7 @@ describe('browserIpcSaga', () => {
       await emit({ workspaceId: 'ws-hyd-ok', requestId: 'req-ok' }, 'browser:list-tabs-request');
       expect(mocks.invoke).toHaveBeenCalledWith('browser:list-tabs-response', {
         requestId: 'req-ok',
-        tabs: [{ tabId: 'browser-2', url: 'http://b/', title: 'B', closable: true }],
+        tabs: [{ tabId: 'browser-2', url: 'http://b/', title: 'B', closable: true, active: true }],
       });
       task.cancel();
       await task.toPromise();

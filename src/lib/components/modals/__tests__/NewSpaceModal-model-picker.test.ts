@@ -33,7 +33,8 @@ vi.mock('$store/renderer/store', async () => {
   return createAppStoreMockModule({
     state: () => ({
       providerCatalog,
-      providerSettings: { activeProviderId: 'auggie', enabledProviders: { auggie: true } },
+      providerSettings: { enabledProviders: { auggie: true } },
+      model: { defaultProviderId: 'auggie' },
       providerModels: { byProviderId: {}, clearEpoch: 0 },
       hardwareConsole: { pttRecording: false, voiceTranscribing: false },
     }),
@@ -45,14 +46,18 @@ vi.mock('$store/renderer/slices/workspace-initializer/workspace-initializer-sele
   selectWorkspaceInitializerHydrated: () => mocks.readable(true),
   selectCompactWorkspaceInitializerFormState: () => mocks.readable(null),
   selectWorkspaceInitializerLastSelectedRepo: () => mocks.readable(null),
-  selectWorkspaceInitializerLastSubmittedAgent: () => mocks.readable(null),
+  // A remembered orchestration choice: the modal opens in team mode so the
+  // team card's picker is live from the start.
+  selectWorkspaceInitializerLastSubmittedAgent: () =>
+    mocks.readable({ selectedSpecialist: 'spec-writer', isTeamMode: true }),
   selectWorkspaceInitializerRecentRepos: () => mocks.readable([]),
   selectWorkspaceInitializerPendingGitHubPrefill: () => mocks.readable(null),
 }));
 
 vi.mock('$store/renderer/slices/provider-settings/provider-settings-selectors', () => ({
   selectActiveProviderId: () => mocks.readable('auggie'),
-  selectEnabledProviderIds: () => mocks.readable(['auggie']),
+  selectModelFetchProviderIds: () => mocks.readable(['auggie']),
+  selectIsProviderModelAccessAllowed: () => mocks.readable(true),
   selectAvailableEnabledProviderIds: () => mocks.readable(['auggie']),
 }));
 
@@ -112,6 +117,25 @@ vi.mock('$store/renderer/slices/specialists/specialists-selectors', () => ({
   selectUserOverrides: () => mocks.readable({ modelOverrides: {} }),
   selectEffectiveBehaviorPrompt: { select: () => undefined },
   filterPickableSpecialists: (specialists: unknown[]) => specialists,
+  selectOrchestratorSpecialist: Object.assign(
+    () =>
+      mocks.readable({
+        id: 'spec-writer',
+        name: 'Coordinator',
+        description: '',
+        role: 'orchestrator',
+      }),
+    {
+      select: () => ({
+        id: 'spec-writer',
+        name: 'Coordinator',
+        description: '',
+        role: 'orchestrator',
+      }),
+    },
+  ),
+  filterModalPickableSpecialists: (specialists: Array<{ role?: string }>) =>
+    specialists.filter((s) => s.role !== 'internal'),
 }));
 
 vi.mock('$store/renderer/slices/github-auth/github-auth-selectors', () => ({
@@ -142,10 +166,11 @@ vi.mock('svelte-sonner', () => ({
   toast: { error: vi.fn(), info: vi.fn(), warning: vi.fn(), success: vi.fn() },
 }));
 
-vi.mock('$features/setup-scripts', () => ({
+vi.mock('$features/setup-scripts', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('$features/setup-scripts')>()),
   SETUP_SCRIPT_TEMPLATES: [],
   getTemplateContent: vi.fn(() => ''),
-  chooseDefaultSetupScript: vi.fn(() => ({ content: '', name: 'Custom' })),
+  chooseDefaultSetupScript: vi.fn(() => ({ content: '', name: 'Custom', source: 'custom' })),
   createRepoConfigProbeScheduler: vi.fn(() => ({
     onSelectionChange: vi.fn(),
     settled: vi.fn(async () => {}),
@@ -308,12 +333,23 @@ describe('NewSpaceModal model-picker composition', () => {
     });
 
     await fireEvent.click(pickerTrigger(team));
-    const reasoningToggle = await within(dialog).findByTestId('model-reasoning-toggle');
-    await fireEvent.click(reasoningToggle);
-    await fireEvent.change(within(dialog).getByRole('slider'), { target: { value: '3' } });
+    const reasoningTrigger = await within(dialog).findByTestId('effort-picker-trigger');
+    await fireEvent.click(reasoningTrigger);
+    const reasoningPopup = document.getElementById(
+      reasoningTrigger.getAttribute('aria-controls')!,
+    )!;
+    const reasoningListbox = within(reasoningPopup).getByRole('listbox');
+    await fireEvent.pointerUp(within(reasoningListbox).getByRole('option', { name: 'High' }), {
+      pointerType: 'mouse',
+    });
     await waitFor(() => {
       expect(persistedStates().at(-1)).toMatchObject({ selectedReasoningEffort: 'high' });
-      expect(pickerTrigger(team).querySelector('[data-testid="effort-gauge"]')).toBeTruthy();
+      const updatedTeamTrigger = pickerTrigger(team);
+      expect(within(updatedTeamTrigger).getByLabelText('GPT 5.6 · High')).toBeTruthy();
+      expect(updatedTeamTrigger.textContent).not.toContain('High');
+      const effortGauge = within(updatedTeamTrigger).getByTestId('model-reasoning-effort-gauge');
+      expect(effortGauge.dataset.gaugeValue).toBe('2');
+      expect(effortGauge.dataset.gaugeSize).toBe('compact');
     });
     await fireEvent.click(pickerTrigger(team));
     await waitFor(() => expect(screen.queryByRole('listbox')).toBeNull());
@@ -386,6 +422,46 @@ describe('NewSpaceModal model-picker composition', () => {
     await waitFor(() => expect(screen.queryByRole('listbox')).toBeNull());
     expect(document.activeElement).toBe(trigger);
     expect(screen.getByRole('dialog', { name: 'New Workspace' })).toBe(dialog);
+    expect(mocks.onClose).not.toHaveBeenCalled();
+  });
+
+  it('dismisses nested reasoning before the modal-aware model picker on Escape', async () => {
+    render(NewSpaceModal, { props: { open: true, onClose: mocks.onClose } });
+    const dialog = await screen.findByRole('dialog', { name: 'New Workspace' });
+    const team = modeCard(/Agent orchestration/i);
+    const modelTrigger = pickerTrigger(team);
+
+    await fireEvent.click(modelTrigger);
+    const modelListbox = await within(dialog).findByRole('listbox');
+    await fireEvent.click(
+      await within(modelListbox).findByRole('option', { name: /GPT 5\.6/ }, { timeout: 5000 }),
+    );
+    await waitFor(() => expect(modelTrigger.textContent).toContain('GPT 5.6'));
+
+    await fireEvent.click(modelTrigger);
+    const reasoningTrigger = await within(dialog).findByTestId('effort-picker-trigger');
+    reasoningTrigger.focus();
+    await fireEvent.keyDown(reasoningTrigger, { key: 'Enter' });
+    await waitFor(() => expect(screen.getAllByRole('listbox')).toHaveLength(2));
+    const persistedCount = persistedStates().length;
+
+    await fireEvent.keyDown(reasoningTrigger, { key: 'ArrowDown' });
+    expect(screen.getAllByRole('listbox')).toHaveLength(2);
+    await fireEvent.keyDown(reasoningTrigger, { key: 'Escape' });
+
+    await waitFor(() => {
+      expect(within(dialog).getAllByRole('listbox')).toHaveLength(1);
+      expect(reasoningTrigger.getAttribute('aria-expanded')).toBe('false');
+    });
+    expect(document.activeElement).toBe(reasoningTrigger);
+    expect(persistedStates()).toHaveLength(persistedCount);
+    expect(mocks.onClose).not.toHaveBeenCalled();
+
+    await fireEvent.keyDown(reasoningTrigger, { key: 'Escape' });
+    await waitFor(() => expect(screen.queryByRole('listbox')).toBeNull());
+    expect(document.activeElement).toBe(modelTrigger);
+    expect(screen.getByRole('dialog', { name: 'New Workspace' })).toBe(dialog);
+    expect(persistedStates()).toHaveLength(persistedCount);
     expect(mocks.onClose).not.toHaveBeenCalled();
   });
 

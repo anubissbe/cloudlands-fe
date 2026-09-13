@@ -2,10 +2,13 @@
   import { selectAgentSession } from '$store/renderer/slices/agent-session/agent-session-selectors';
   /* eslint-disable max-lines */
   import { onMount, tick } from 'svelte';
+  import { writable } from 'svelte/store';
   import { toast } from 'svelte-sonner';
+  import { withToastCountdown } from '$lib/components/ui/toast';
   import { createLogger } from '$lib/utils/client-logger';
   import type { Workspace } from '$shared/types';
-  import { parseCompoundModelId as parseCompoundModelIdWithDefault } from '$shared/utils/compound-model-id';
+  import { CHIEF_WORKSPACE_ID } from '$shared/types/branded-ids';
+  import { splitLegacyCompoundId } from '$shared/utils/legacy-model-id';
   import {
     selectEffectiveDefaultProviderId,
     selectNormalizedProviderId,
@@ -64,6 +67,11 @@
   import * as Menu from '$lib/components/ui/menu';
   import type { StackedMenuGroup } from '$lib/components/ui/menu';
   import { parseImageDataUrl } from './image-data-url';
+  import {
+    selectSkills,
+    selectSkillsError,
+    selectSkillsLoading,
+  } from '$store/renderer/slices/skills/skills-selectors';
 
   import {
     togglePanel as togglePanelAction,
@@ -94,7 +102,8 @@
     providerId: string;
     modelId: string;
   } {
-    return parseCompoundModelIdWithDefault(compoundModelId, $defaultProviderId$);
+    const { providerId, modelId } = splitLegacyCompoundId(compoundModelId);
+    return { providerId: providerId ?? $defaultProviderId$, modelId };
   }
 
   type MainPanelContext = {
@@ -143,12 +152,14 @@
     panelFocused?: boolean;
     /** Whether to use compact mode (shorter height for short panels) */
     compactMode?: boolean;
-    /** Dock to a panel edge with only a top divider. */
+    /** Render as the inset ChatPanel composer surface. */
     edgeDocked?: boolean;
     /** Padding/spacing class applied to the rich text editor content. */
     editorClassName?: string;
     /** Override the horizontal inset applied to context rows and the action bar. */
     contentInsetClassName?: string;
+    /** Override the action bar's important trailing-edge padding (defaults to `pr-1.5!`). */
+    actionBarEndClassName?: string;
     /**
      * The parent owns file drag-and-drop (e.g. ChatPanel's full-panel drop
      * target): the container's own drag handlers and drop overlay are disabled
@@ -177,12 +188,20 @@
   import {
     extractPlacementErrorDetail,
     isPlacementCancellation,
+    isRemoteBackend,
+    mintPlacementIdempotencyKey,
     placeAttachmentViaTransport,
   } from './attachment-placement';
+  import { splitDroppedItems } from '$lib/utils/drop-split';
   import { cn } from '$lib/utils';
   import { store as appStore } from '$store/renderer/store';
   import { m } from '$shared/paraglide/messages.js';
-  import { formatInteger } from '$lib/i18n/format';
+  import {
+    formatFileSize,
+    imageFilesToContextItems,
+    INLINE_IMAGE_MAX_BYTES,
+    REFERENCE_IMAGE_MAX_BYTES,
+  } from './image-context-items';
   export type { ContextItem };
 
   let {
@@ -212,6 +231,7 @@
     edgeDocked = false,
     editorClassName = 'px-2!',
     contentInsetClassName = undefined,
+    actionBarEndClassName = 'pr-1.5!',
     externalDropTarget = false,
     onsubmit,
     onforcesubmit,
@@ -256,6 +276,17 @@
   // svelte-ignore state_referenced_locally -- intentional initial snapshots for transition detection.
   let previousInputLocked = $state(inputLocked);
   let hasInlineImages = $state(false);
+
+  // Selector readables are created at component init; mirror the reactive prop
+  // so a composer moved between workspaces follows that workspace's skill roster.
+  // svelte-ignore state_referenced_locally -- intentional initial prop snapshot.
+  const workspaceIdStore = writable(workspace?.id ?? '');
+  $effect(() => {
+    workspaceIdStore.set(workspace?.id ?? '');
+  });
+  const skills$ = selectSkills(workspaceIdStore);
+  const skillsLoading$ = selectSkillsLoading(workspaceIdStore);
+  const skillsError$ = selectSkillsError(workspaceIdStore);
 
   // Derived state: whether there's content to send (text, context items, or inline images).
   // Blocked while any attachment placement is in flight or failed — a failed
@@ -308,7 +339,14 @@
       showVoiceSetupToast();
       return;
     }
-    toggleComposerMicRecording(micContext);
+    toggleComposerMicRecording(micContext, agentId);
+  }
+
+  // Toolbar-button pattern: swallow mousedown's default action (focus) so
+  // clicking the mic never blurs the editor — the caret stays in the input
+  // across start/stop/cancel clicks. The click itself still fires.
+  function handleMicMouseDown(event: MouseEvent) {
+    event.preventDefault();
   }
 
   function handleMicEscape(event: KeyboardEvent) {
@@ -496,6 +534,7 @@
   // Resize functionality
   let isResizing = $state(false);
   let containerHeight = $state<number | null>(null); // null = use auto-expand mode
+  let isComposerFocused = $state(false);
   let initialY = 0;
   let initialHeight = 0;
 
@@ -505,19 +544,26 @@
 
   // Height constraints for auto-expand
   const MIN_HEIGHT = 65;
+  const IDLE_MIN_HEIGHT = 56;
+  const DEFAULT_HEIGHT = 100;
+  const IDLE_DEFAULT_HEIGHT = 80;
   const COMPACT_PANEL_THRESHOLD = 640; // Keep the composer compact in short and stacked panels
   const MAX_HEIGHT_PERCENTAGE = 0.8; // Max 80% of parent panel
   const MAX_HEIGHT_ABSOLUTE = 800; // Absolute max in pixels
   const FALLBACK_MAX_HEIGHT = 300;
 
-  // Use 65px for short panels, larger default for taller panels
+  const hasComposerContent = $derived(
+    value.trim().length > 0 || contextItems.length > 0 || hasInlineImages,
+  );
+  const showPlaceholder = $derived(inputLocked || (isComposerFocused && !hasComposerContent));
+
+  // Automatic geometry expands only for real composer content. Focus reveals
+  // the placeholder without changing the compact idle height.
   let dynamicDefaultHeight = $derived.by(() => {
     if (parentPanelHeight && parentPanelHeight > COMPACT_PANEL_THRESHOLD) {
-      // Taller panel - use a larger default (but still reasonable)
-      return 100;
+      return hasComposerContent ? DEFAULT_HEIGHT : IDLE_DEFAULT_HEIGHT;
     }
-    // Short panel or unknown - use minimum
-    return MIN_HEIGHT;
+    return hasComposerContent ? MIN_HEIGHT : IDLE_MIN_HEIGHT;
   });
 
   // Calculate max height based on parent panel (80% of panel height, capped)
@@ -799,7 +845,29 @@
         enhancementUndoValue = originalPrompt;
         enhancedPromptValue = result.enhanced;
         updateValue(result.enhanced);
-        toast.success(m.chat_richInput_promptEnhanced_toast());
+        // Capture THIS enhancement's undo state in the closure: a lingering
+        // toast's Undo must not revert a newer enhancement (or a cancelled
+        // one) based on whatever the component state holds at click time.
+        const undoValueForToast = originalPrompt;
+        const enhancedValueForToast = result.enhanced;
+        toast.success(
+          m.chat_richInput_promptEnhanced_toast(),
+          withToastCountdown({
+            duration: 10000,
+            action: {
+              label: m.chat_richInput_undoEnhance_label(),
+              onClick: () => {
+                if (
+                  enhancementUndoValue !== undoValueForToast ||
+                  enhancedPromptValue !== enhancedValueForToast
+                ) {
+                  return;
+                }
+                handleUndoEnhance();
+              },
+            },
+          }),
+        );
       }
     } catch (error) {
       // Ignore errors from requests invalidated by cancellation or a newer request.
@@ -854,14 +922,6 @@
     target.value = '';
   }
 
-  function formatFileSize(bytes: number): string {
-    if (bytes === 0) return '0 Bytes';
-    const k = 1024;
-    const sizes = ['Bytes', 'KB', 'MB', 'GB'];
-    const i = Math.floor(Math.log(bytes) / Math.log(k));
-    return Math.round((bytes / Math.pow(k, i)) * 100) / 100 + ' ' + sizes[i];
-  }
-
   // Drag and drop state
   let isDragging = $state(false);
   let dragCounter = $state(0);
@@ -896,18 +956,82 @@
     isDragging = false;
     dragCounter = 0;
 
-    const files = e.dataTransfer?.files;
-    if (!files || files.length === 0) return;
+    // Folder detection must happen HERE, synchronously in the drop event —
+    // webkitGetAsEntry() returns null once the event loop turns.
+    const { files, folderFiles } = splitDroppedItems(e.dataTransfer);
+    if (files.length === 0 && folderFiles.length === 0) return;
 
-    await processImageFiles(Array.from(files));
+    await handleDroppedFiles({ files, folderFiles });
   }
 
   // Export for parents that own the drop target (externalDropTarget, e.g.
   // ChatPanel's full-panel drop zone) — forwards dropped files into the same
-  // attach pipeline as a direct drop on the input.
-  export async function handleDroppedFiles(files: File[]) {
-    if (files.length === 0) return;
-    await processImageFiles(files);
+  // attach pipeline as a direct drop on the input. Accepts either a plain
+  // File[] (legacy callers, no folder info) or a DropSplit captured at drop
+  // time — folder entries are only detectable inside the drop event, so the
+  // split travels with the files.
+  export async function handleDroppedFiles(
+    dropped: File[] | { files: File[]; folderFiles: File[] },
+  ) {
+    const { files, folderFiles } = Array.isArray(dropped)
+      ? { files: dropped, folderFiles: [] }
+      : dropped;
+    if (files.length === 0 && folderFiles.length === 0) return;
+
+    if (folderFiles.length > 0) {
+      // Folders are path-only references — the agent reads them off the
+      // host filesystem, which a remote daemon cannot do. Any folder in the
+      // drop rejects the WHOLE drop when remote (files included).
+      if (isRemoteBackend()) {
+        toast.error(m.chat_richInput_folderDropRemote_error());
+        return;
+      }
+      for (const folder of folderFiles) {
+        addFolderReference(folder);
+      }
+    }
+    if (files.length > 0) {
+      await processImageFiles(files);
+    }
+  }
+
+  /**
+   * Add a dropped folder as a path-only reference (local daemon only) —
+   * the same folder-mention chip an @-mention inserts, so the send path
+   * serializes the absolute host path into the message the same way
+   * (`toPromptToken` folder case) and `getMentionContextItems()` carries it
+   * as a context item. Never placed via `file.placeAttachment` (the daemon
+   * rejects directories).
+   *
+   * The whole feature is predicated on the absolute host path: when the
+   * Electron `getPathForFile` bridge is unavailable or returns '' (e.g.
+   * dev:web), the folder is SKIPPED with a toast — a bare folder name would
+   * serialize as a workspace-relative-looking mention that silently resolves
+   * to the wrong directory (or nothing) on the daemon side.
+   */
+  function addFolderReference(folder: File) {
+    const absolutePath =
+      (
+        window as unknown as { electronAPI?: { getPathForFile?: (f: File) => string } }
+      ).electronAPI?.getPathForFile?.(folder) ?? '';
+    if (!absolutePath) {
+      logger.warn('Dropped folder has no resolvable absolute path; skipping', {
+        name: folder.name,
+      });
+      toast.error(m.onboarding_promptStep_attachmentNoPath_error({ name: folder.name }));
+      return;
+    }
+    // Windows-aware basename fallback ('\' or '/' separators).
+    const label = folder.name || absolutePath.split(/[/\\]/).pop() || absolutePath;
+    tiptap?.insertMention?.({
+      // Same id convention as folder @-mentions (mention-system providers):
+      // path-keyed, so two dropped folders sharing a basename stay distinct.
+      id: `folder-${absolutePath}`,
+      label,
+      type: 'folder',
+      uri: `devspace://folder/${encodeURIComponent(absolutePath)}`,
+      meta: { path: absolutePath, fullPath: absolutePath },
+    });
   }
 
   // Handle clipboard paste for files (images and non-images alike)
@@ -932,25 +1056,18 @@
   }
 
   /**
-   * Convert a File to a base64 data URL
-   */
-  function fileToDataUrl(file: File): Promise<string> {
-    return new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload = () => resolve(reader.result as string);
-      reader.onerror = () => reject(new Error('Failed to read file'));
-      reader.readAsDataURL(file);
-    });
-  }
-
-  /**
-   * Process image files by inserting them inline in the editor
+   * Process dropped/pasted files: images become context items (attachment
+   * flow), non-image files are placed into the workspace via the daemon.
    */
   async function processImageFiles(files: File[]) {
-    const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
-    const addedCount = { value: 0 };
-    const oversizedFiles: string[] = [];
+    // Images travel as attachment-reference blocks (monorepo#3338), so the
+    // composer cap matches the daemon's 30 MiB reference-image limit. The
+    // chief virtual workspace has no attachment registry — its images stay
+    // inline, so it keeps the legacy 10 MB inline-frame cap.
+    const maxBytes =
+      workspace?.id === CHIEF_WORKSPACE_ID ? INLINE_IMAGE_MAX_BYTES : REFERENCE_IMAGE_MAX_BYTES;
 
+    const imageFiles: File[] = [];
     for (const file of files) {
       // Non-image files of ANY size are placed into the workspace via the
       // daemon (file.placeAttachment, PROTOCOL §5.9) and referenced by an
@@ -959,57 +1076,12 @@
         await placeNonImageFile(file);
         continue;
       }
-
-      if (file.size > MAX_FILE_SIZE) {
-        // Oversized images stay rejected — the inline limit is what the model
-        // can ingest.
-        oversizedFiles.push(file.name);
-        continue;
-      }
-
-      try {
-        const dataUrl = await fileToDataUrl(file);
-        // Extract base64 data from data URL (remove "data:image/...;base64," prefix)
-        const parsed = parseImageDataUrl(dataUrl);
-        if (!parsed) {
-          throw new Error('Invalid data URL format');
-        }
-        const { mimeType, data: base64Data } = parsed;
-
-        // Add image to context items (attachment flow) instead of inserting inline
-        const timestamp = Date.now();
-        const fileName = file.name || `image-${timestamp}.${mimeType.split('/')[1] || 'png'}`;
-        const contextItem: ContextItem = {
-          id: `file-upload-${timestamp}-${fileName}`,
-          type: 'file',
-          label: fileName,
-          description: `${mimeType} • ${formatFileSize(file.size)}`,
-          path: fileName,
-          file,
-          imageData: base64Data,
-          imageMimeType: mimeType,
-        };
-
-        contextItems = [...contextItems, contextItem];
-        oncontextAdd?.(contextItem);
-        addedCount.value++;
-      } catch (error) {
-        logger.error('Failed to add image to context', { fileName: file.name, error });
-        toast.error(m.chat_richInput_addImageFailed_error({ name: file.name }));
-      }
+      imageFiles.push(file);
     }
 
-    if (addedCount.value > 0) {
-      logger.debug(`Added ${addedCount.value} image(s) to context`);
-      toast.success(
-        addedCount.value === 1
-          ? m.chat_richInput_addedImages_toast_one()
-          : m.chat_richInput_addedImages_toast_many({ count: formatInteger(addedCount.value) }),
-      );
-    }
-
-    if (oversizedFiles.length > 0) {
-      toast.error(m.chat_richInput_filesTooLarge_error({ names: oversizedFiles.join(', ') }));
+    for (const item of await imageFilesToContextItems(imageFiles, { maxBytes })) {
+      contextItems = [...contextItems, item];
+      oncontextAdd?.(item);
     }
   }
 
@@ -1023,7 +1095,9 @@
    * Placement is sourcePath-only (never base64): the item is added
    * immediately in the `placing` state, then flips to `placed` or `failed`.
    * A failed item shows a retry affordance in the pill and blocks send until
-   * retried or removed.
+   * retried or removed. The item carries one placement `idempotencyKey`
+   * (v9.13) for its whole attempt series, so a retry after a lost reply
+   * replays the committed attachment instead of placing a duplicate.
    */
   async function placeNonImageFile(file: File) {
     const fileName =
@@ -1051,6 +1125,7 @@
       attachmentSize: file.size,
       placementStatus: 'placing',
       sourcePath,
+      placementIdempotencyKey: mintPlacementIdempotencyKey(),
     };
     contextItems = [...contextItems, contextItem];
 
@@ -1085,10 +1160,14 @@
       return;
     }
 
+    // Staged items (modal/onboarding) may predate the key — mint once here
+    // and keep it on the item so every later retry reuses it.
+    const idempotencyKey = item.placementIdempotencyKey ?? mintPlacementIdempotencyKey();
     patchItem({
       placementStatus: 'placing',
       placementError: undefined,
       placementProgress: undefined,
+      placementIdempotencyKey: idempotencyKey,
     });
     const aborter = new AbortController();
     placementAborters.set(itemId, aborter);
@@ -1099,6 +1178,7 @@
         {
           sourcePath: item.sourcePath,
           mimeType: item.attachmentMimeType,
+          ...(idempotencyKey !== undefined ? { idempotencyKey } : {}),
         },
         (fraction) => patchItem({ placementProgress: fraction }),
         aborter.signal,
@@ -1145,7 +1225,10 @@
     }
   }
 
-  // Set up ResizeObserver to track parent panel height
+  // Set up ResizeObserver to track parent panel height. The observer delivers
+  // an initial callback on observe() with the current size, so no synchronous
+  // clientHeight read (forced reflow) is needed here — and the effect must not
+  // read parentPanelHeight, or every resize would tear down and recreate it.
   $effect(() => {
     if (!containerRef) return;
 
@@ -1154,12 +1237,12 @@
 
     const resizeObserver = new ResizeObserver((entries) => {
       for (const entry of entries) {
-        parentPanelHeight = entry.contentRect.height;
+        if (entry.target === parentPanel) {
+          parentPanelHeight = entry.contentRect.height;
+        }
       }
     });
     resizeObserver.observe(parentPanel);
-    // Get initial height
-    parentPanelHeight = parentPanel.clientHeight;
 
     return () => {
       resizeObserver.disconnect();
@@ -1249,6 +1332,17 @@
     isResizing = false;
   }
 
+  function handleFocusIn() {
+    isComposerFocused = true;
+  }
+
+  function handleFocusOut(event: FocusEvent) {
+    const nextTarget = event.relatedTarget;
+    if (!(nextTarget instanceof Node) || !containerRef?.contains(nextTarget)) {
+      isComposerFocused = false;
+    }
+  }
+
   // Add global mouse event listeners for resize
   $effect(() => {
     if (isResizing) {
@@ -1330,9 +1424,12 @@
 <div
   bind:this={containerRef}
   class={cn(
-    'relative rich-input-container flex flex-col overflow-hidden text-card-foreground transition-[border-color,background-color,box-shadow] duration-(--motion-fast) motion-reduce:transition-none',
+    'relative rich-input-container flex flex-col overflow-hidden text-card-foreground duration-(--motion-fast) ease-(--ease-standard) motion-reduce:transition-none',
+    isAutoExpand
+      ? 'transition-[border-color,background-color,box-shadow,min-height]'
+      : 'transition-[border-color,background-color,box-shadow]',
     edgeDocked
-      ? 'rounded-none border-x-0 border-b-0 border-t border-border bg-transparent shadow-none'
+      ? 'rounded-lg border-0 bg-sidebar shadow-none'
       : 'rounded-lg border border-border shadow-(--elevation-raised) focus-within:border-ring focus-within:ring-0',
     {
       'border-primary border-dashed': isDragging,
@@ -1346,6 +1443,8 @@
   ondragover={externalDropTarget ? undefined : handleDragOver}
   ondrop={externalDropTarget ? undefined : handleDrop}
   onpaste={handlePaste}
+  onfocusin={handleFocusIn}
+  onfocusout={handleFocusOut}
   role="region"
   aria-label={m.chat_richInput_dropSupport_ariaLabel()}
   data-testid="message-input"
@@ -1438,9 +1537,10 @@
   <!-- svelte-ignore a11y_click_events_have_key_events -->
   <!-- svelte-ignore a11y_no_static_element_interactions -->
   <div
-    class="editor-wrapper relative min-h-0 cursor-text {isAutoExpand
+    class="editor-wrapper relative min-h-0 cursor-text pt-1 {isAutoExpand
       ? 'flex-1 overflow-y-auto'
       : 'flex-1 overflow-hidden'} {editMode ? 'pr-5' : ''}"
+    class:placeholder-hidden={!showPlaceholder}
     onclick={() => tiptap?.focus()}
   >
     <TipTapEditor
@@ -1456,6 +1556,9 @@
       editableWhileDisabled={editableWhileDisabled && !isEnhancing}
       {inputLocked}
       workspace={workspace ?? undefined}
+      skills={$skills$}
+      skillsLoading={$skillsLoading$}
+      skillsError={$skillsError$}
       onUpdate={(text) => {
         handleCancelEnhance();
         if (
@@ -1472,13 +1575,7 @@
       }}
       onSubmit={handleSubmit}
       onForceSubmit={handleForceSubmit}
-      onEscape={isEnhancing
-        ? handleCancelEnhance
-        : editMode
-          ? oncancel
-          : showStopButton
-            ? onstop
-            : undefined}
+      onEscape={isEnhancing ? handleCancelEnhance : editMode ? oncancel : undefined}
       {onHistoryPrev}
       {onHistoryNext}
       onSelectionChange={(selectedText) => (editorSelection = selectedText)}
@@ -1525,7 +1622,9 @@
   <input bind:this={fileInput} type="file" multiple class="hidden" onchange={handleFileChange} />
   <!-- Action Bar -->
   <div
-    class="action-bar flex items-center justify-between pb-1.5 pr-1.5! pt-0 text-muted-foreground transition-opacity duration-150 {contentInsetClasses}"
+    class="action-bar flex items-center justify-between pb-1.5 {actionBarEndClassName} pt-0 text-muted-foreground transition-opacity duration-150 {edgeDocked
+      ? 'flex-wrap gap-y-1'
+      : ''} {contentInsetClasses}"
     data-chat-input-action-bar
   >
     <div class="flex items-center gap-2 min-w-0" data-chat-input-primary-actions>
@@ -1544,11 +1643,13 @@
         updateGlobalStore
         showReasoning
         reasoningDisabled={disabled}
-        onModelChange={(newModel) => {
+        onModelChange={(newModel, pick) => {
           if (!newModel) return;
 
-          // Check if the model is from a different provider
-          const rawProvider = parseCompoundModelId(newModel).providerId;
+          // Check if the model is from a different provider. The picker
+          // resolves the pick's owning provider (catalog rows are bare for
+          // every provider); parsing the id is only a legacy fallback.
+          const rawProvider = pick?.providerId ?? parseCompoundModelId(newModel).providerId;
           const newProvider = normalizeProviderId(rawProvider);
           if (agentId && newProvider !== selectedProviderId) {
             // Provider is changing — run the full provider switch flow
@@ -1578,7 +1679,10 @@
       />
     </div>
 
-    <div class="flex items-center gap-1 min-w-0 shrink-0" data-chat-input-submit-actions>
+    <div
+      class="flex items-center gap-1 min-w-0 {edgeDocked ? 'flex-wrap justify-end' : 'shrink-0'}"
+      data-chat-input-submit-actions
+    >
       <div class="relative inline-block">
         <Menu.Root>
           <Menu.Trigger>
@@ -1605,6 +1709,7 @@
             variant="ghost-light"
             size="icon-sm"
             onclick={handleMicCancelTranscription}
+            onmousedown={handleMicMouseDown}
             aria-label={m.chat_richInput_micCancelTranscribing_label()}
             data-testid="composer-mic-button"
           >
@@ -1617,9 +1722,10 @@
             variant="ghost-light"
             size="icon-sm"
             onclick={handleMicClick}
+            onmousedown={handleMicMouseDown}
             aria-label={m.chat_richInput_micStop_label()}
             aria-pressed="true"
-            class="text-error-foreground animate-pulse"
+            class="text-danger animate-pulse"
             data-testid="composer-mic-button"
           >
             <Fa icon={faMicrophone} size="sm" />
@@ -1632,6 +1738,7 @@
             size="icon-sm"
             {disabled}
             onclick={handleMicClick}
+            onmousedown={handleMicMouseDown}
             aria-label={m.chat_richInput_micStart_label()}
             aria-pressed="false"
             data-testid="composer-mic-button"
@@ -1645,7 +1752,7 @@
         <!-- Stop button — visible whenever the agent is responding/running,
              mirroring the Thinking indicator so users can interrupt across
              the pre-first-chunk, streaming, and waiting-on-subagents windows. -->
-        <TooltipShortcut label={m.chat_richInput_stop_label()} shortcut="Escape" side="top">
+        <TooltipShortcut label={m.chat_richInput_stop_label()} side="top">
           <Button
             variant="ghost-light"
             size="icon-sm"
@@ -1752,6 +1859,16 @@
     position: relative;
   }
 
+  .editor-wrapper :global(.tiptap-editor p.is-editor-empty:first-child::before),
+  .editor-wrapper :global(.tiptap-editor p.is-empty:first-child::before) {
+    transition: opacity 300ms ease-in-out;
+  }
+
+  .editor-wrapper.placeholder-hidden :global(.tiptap-editor p.is-editor-empty:first-child::before),
+  .editor-wrapper.placeholder-hidden :global(.tiptap-editor p.is-empty:first-child::before) {
+    opacity: 0;
+  }
+
   /* Shimmer overlay for enhancement loading state */
   .shimmer-overlay-wrapper {
     position: absolute;
@@ -1791,20 +1908,15 @@
   }
 
   @media (prefers-reduced-motion: reduce) {
+    .editor-wrapper :global(.tiptap-editor p.is-editor-empty:first-child::before),
+    .editor-wrapper :global(.tiptap-editor p.is-empty:first-child::before) {
+      transition: none;
+    }
+
     .shimmer-overlay {
       animation: none;
       opacity: 0.5;
       transform: none;
     }
-  }
-
-  /* Hide placeholder when panel is not focused */
-  :global(.panel:not(.focused) .rich-input-container .is-editor-empty::before) {
-    opacity: 0;
-    transition: opacity 150ms;
-  }
-  :global(.panel.focused .rich-input-container .is-editor-empty::before) {
-    opacity: 1;
-    transition: opacity 150ms;
   }
 </style>

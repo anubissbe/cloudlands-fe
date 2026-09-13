@@ -253,9 +253,9 @@
   </div>
   <!-- Error display -->
   {#if toolState === 'error'}
-    <div class="border-b border-destructive/20 bg-destructive/10 px-4 py-3">
+    <div class="border-b border-danger/20 bg-danger-background/10 px-4 py-3">
       <div class="flex items-start gap-2">
-        <div class="type-caption text-destructive">
+        <div class="type-caption text-danger">
           {#if result}
             {typeof result === 'string' ? result : JSON.stringify(result, null, 2)}
           {:else}
@@ -341,7 +341,7 @@
 <ChatOperationalRow
   {leading}
   {summary}
-  {trailing}
+  trailing={toolState === 'running' ? undefined : trailing}
   showChevron={false}
   details={expanded ? details : undefined}
   interactive={isExpandable}

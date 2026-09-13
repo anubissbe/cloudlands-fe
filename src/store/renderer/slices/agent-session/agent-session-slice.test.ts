@@ -29,6 +29,7 @@ import {
   renameAgent,
   setProcessQueueHint,
   clearProcessQueueHint,
+  processEvicted,
   bulkUpsertSessions,
   removeWorkspaceSessions,
   clearAllSessions,
@@ -49,8 +50,14 @@ import {
   chatSendStarted,
   chatInitialized,
   chatReset,
+  chatTranscriptSnapshotApplied,
   streamCompleted,
 } from '../chat-state/chat-state-slice';
+import {
+  isConversationStartLoaded,
+  shouldRequestOlderHistory,
+  splitUnloadedRows,
+} from '$lib/components/chat/chat-scrollback-composition';
 import { eventReceived } from '../workspace-events/workspace-events-slice';
 import { workspaceDeleted } from '../workspace-lifecycle/workspace-lifecycle-slice';
 import {
@@ -382,6 +389,22 @@ describe('agent-session-slice reducer', () => {
       expect(next.byAgentId['a1'].lastMessageId).toBe('m-2');
     });
 
+    it('applies an AgentLite hydration when only the wire messageCount changes', () => {
+      const state = agentSessionReducer(
+        initialState,
+        upsertSession(makeSession('a1', 'ws-1', { messageCount: 0 })),
+      );
+
+      const next = agentSessionReducer(
+        state,
+        upsertSession(makeSession('a1', 'ws-1', { messageCount: 3 })),
+      );
+
+      expect(next).not.toBe(state);
+      expect(next.byAgentId['a1'].messages).toEqual([]);
+      expect(next.byAgentId['a1'].messageCount).toBe(3);
+    });
+
     it('applies an upsert when only hasUnread flips on an otherwise-equivalent session (marker convergence)', () => {
       const state = agentSessionReducer(
         initialState,
@@ -539,6 +562,29 @@ describe('agent-session-slice reducer', () => {
       expect(next.byAgentId['a1'].metadata?.dismissedQuestionsMessageId).toBe('msg-q1');
     });
 
+    it('applies marker-only pending-question updates, including an authoritative empty clear', () => {
+      const state = agentSessionReducer(initialState, upsertSession(makeSession('a1', 'ws-1')));
+
+      const cleared = agentSessionReducer(
+        state,
+        upsertSession(makeSession('a1', 'ws-1', { metadata: { pendingQuestionsMessageId: '' } })),
+      );
+
+      const pendingAgain = agentSessionReducer(
+        cleared,
+        upsertSession(
+          makeSession('a1', 'ws-1', {
+            metadata: { pendingQuestionsMessageId: 'msg-q2' },
+          }),
+        ),
+      );
+
+      expect(cleared).not.toBe(state);
+      expect(cleared.byAgentId['a1'].metadata?.pendingQuestionsMessageId).toBe('');
+      expect(pendingAgain).not.toBe(cleared);
+      expect(pendingAgain.byAgentId['a1'].metadata?.pendingQuestionsMessageId).toBe('msg-q2');
+    });
+
     it('applies an upsert when only metadata.lastSeenMessageId changes (agent:updated convergence)', () => {
       const state = agentSessionReducer(initialState, upsertSession(makeSession('a1', 'ws-1')));
 
@@ -641,8 +687,10 @@ describe('agent-session-slice reducer', () => {
       expect(state).toBe(initialState);
     });
 
-    it('prunes messages beyond 500', () => {
-      const msgs = Array.from({ length: 501 }, (_, i) => makeMessage(`m${i}`));
+    it('prunes messages beyond the cap', () => {
+      const msgs = Array.from({ length: MAX_MESSAGES_PER_AGENT + 1 }, (_, i) =>
+        makeMessage(`m${i}`),
+      );
       let state = agentSessionReducer(
         initialState,
         upsertSession(makeSession('a1', 'ws-1', { messages: [] })),
@@ -650,8 +698,8 @@ describe('agent-session-slice reducer', () => {
       for (const msg of msgs) {
         state = agentSessionReducer(state, addMessage('a1', msg));
       }
-      expect(getMsgs(state, 'a1')).toHaveLength(500);
-      // Should keep the latest messages (m1 .. m500), first message m0 should be pruned
+      expect(getMsgs(state, 'a1')).toHaveLength(MAX_MESSAGES_PER_AGENT);
+      // Should keep the latest messages (m1 ..), first message m0 should be pruned
       expect(getMsgs(state, 'a1')[0].id).toBe('m1');
     });
   });
@@ -821,6 +869,23 @@ describe('agent-session-slice reducer', () => {
       expect(getMsgs(state, 'a1')).toHaveLength(1);
     });
 
+    it('applies the sticky liveTurnOpen/liveTurnOpenedAt fields without touching updatedAt', () => {
+      // The daemon-events bridge marks a session live off an
+      // agent:stream:activity ping through updateSession; updatedAt is
+      // daemon-owned (STAB-19) and must stay whatever the session already had.
+      let state = agentSessionReducer(
+        initialState,
+        upsertSession(makeSession('a1', 'ws-1', { updatedAt: '2026-01-01T00:00:00.000Z' })),
+      );
+      state = agentSessionReducer(
+        state,
+        updateSession('a1', { liveTurnOpen: true, liveTurnOpenedAt: '2026-01-02T00:00:00.000Z' }),
+      );
+      expect(state.byAgentId['a1'].liveTurnOpen).toBe(true);
+      expect(state.byAgentId['a1'].liveTurnOpenedAt).toBe('2026-01-02T00:00:00.000Z');
+      expect(state.byAgentId['a1'].updatedAt).toBe('2026-01-01T00:00:00.000Z');
+    });
+
     it('deduplicates same-appMessageId messages in updateSession message arrays', () => {
       const appMessageId = 'app_msg_update';
       let state = agentSessionReducer(initialState, upsertSession(makeSession('a1')));
@@ -955,6 +1020,68 @@ describe('agent-session-slice reducer', () => {
 
       expect(state.byAgentId['a1'].isWaitingForOtherAgents).toBe(true);
       expect(state.byAgentId['a1'].waitingForAgentIds).toEqual(['child-1']);
+    });
+
+    describe('agent:updated pending-question marker projection (§6.5)', () => {
+      const updated = (data: Record<string, unknown>) =>
+        eventReceived('ws-1', {
+          id: 'evt-updated',
+          type: 'agent:updated',
+          timestamp: '2024-01-01T00:00:00.000Z',
+          workspaceId: 'ws-1',
+          data: { agentId: 'a1', ...data },
+        } as any);
+      const seeded = () =>
+        agentSessionReducer(
+          initialState,
+          upsertSession(
+            makeSession('a1', 'ws-1', {
+              metadata: { pendingQuestionsMessageId: 'msg-q1', specialist: 'implementor' },
+            }),
+          ),
+        );
+
+      it('applies a written empty-string clear synchronously and keeps unrelated metadata', () => {
+        const next = agentSessionReducer(seeded(), updated({ pendingQuestionsMessageId: '' }));
+
+        expect(next.byAgentId['a1'].metadata).toEqual({
+          pendingQuestionsMessageId: '',
+          specialist: 'implementor',
+        });
+      });
+
+      it('applies a marker set and the dismissal marker riding alongside it', () => {
+        const cleared = agentSessionReducer(seeded(), updated({ pendingQuestionsMessageId: '' }));
+        const set = agentSessionReducer(cleared, updated({ pendingQuestionsMessageId: 'msg-q2' }));
+        expect(set.byAgentId['a1'].metadata?.pendingQuestionsMessageId).toBe('msg-q2');
+
+        const dismissed = agentSessionReducer(
+          set,
+          updated({ dismissedQuestionsMessageId: 'msg-q2', pendingQuestionsMessageId: 'msg-q2' }),
+        );
+        expect(dismissed.byAgentId['a1'].metadata).toMatchObject({
+          dismissedQuestionsMessageId: 'msg-q2',
+          pendingQuestionsMessageId: 'msg-q2',
+        });
+      });
+
+      it('leaves the marker untouched when agent:updated omits it or carries a non-string', () => {
+        const state = seeded();
+
+        expect(agentSessionReducer(state, updated({ modelId: 'other' }))).toBe(state);
+        expect(agentSessionReducer(state, updated({ pendingQuestionsMessageId: null }))).toBe(
+          state,
+        );
+        expect(agentSessionReducer(state, updated({ pendingQuestionsMessageId: 'msg-q1' }))).toBe(
+          state,
+        );
+      });
+
+      it('does not create a session for an unknown agent', () => {
+        expect(agentSessionReducer(initialState, updated({ pendingQuestionsMessageId: '' }))).toBe(
+          initialState,
+        );
+      });
     });
 
     it('folds the agent:idle isWaitingForOtherAgents flag onto the session', () => {
@@ -1124,8 +1251,8 @@ describe('agent-session-slice reducer', () => {
     });
 
     it('a hydration whose only change is turnInFlight is not swallowed as a no-op', () => {
-      // STAB-125 turn-liveness (§5.5): the STAB-9 mid-turn agent.list
-      // re-hydration can differ from the stored session ONLY by
+      // STAB-125 turn-liveness (§5.5): the STAB-9 mid-turn per-agent
+      // agent.get re-hydration can differ from the stored session ONLY by
       // turnInFlight flipping — the HUD bucket gate reads it, so the upsert
       // must produce new state in both directions.
       let state = agentSessionReducer(
@@ -1221,6 +1348,63 @@ describe('agent-session-slice reducer', () => {
         } as any),
       );
       expect(state.byAgentId['a1'].liveTurnOpen).toBe(false);
+    });
+
+    it('a fresh running edge clears the previous turn lastToolUse; a mid-turn tick does not', () => {
+      // The persisted lastToolUse (AgentLite §5.5) survives idle, and the
+      // running status-changed edge makes the session live BEFORE the first
+      // activity ping of the new turn wipes it — without the reducer clear,
+      // a tool-only prior turn's tool renders as live during that window.
+      let state = agentSessionReducer(
+        initialState,
+        upsertSession(
+          makeSession('a1', 'ws-1', {
+            lastToolUse: { name: 'view' },
+          } as any),
+        ),
+      );
+      expect((state.byAgentId['a1'] as any).lastToolUse).toEqual({ name: 'view' });
+
+      // Fresh running edge (liveTurnOpen closed → open) clears the stale tool.
+      state = agentSessionReducer(
+        state,
+        eventReceived('ws-1', {
+          id: 'evt-running',
+          type: 'agent:status-changed',
+          timestamp: '2024-01-01T00:00:00.000Z',
+          workspaceId: 'ws-1',
+          data: { agentId: 'a1', status: 'active', isActive: true },
+        } as any),
+      );
+      expect(state.byAgentId['a1'].liveTurnOpen).toBe(true);
+      expect((state.byAgentId['a1'] as any).lastToolUse).toBeUndefined();
+
+      // The new turn's activity ping repopulates the field...
+      state = agentSessionReducer(
+        state,
+        updateSession('a1', { lastToolUse: { name: 'str-replace-editor', status: 'running' } }),
+      );
+      expect((state.byAgentId['a1'] as any).lastToolUse).toEqual({
+        name: 'str-replace-editor',
+        status: 'running',
+      });
+
+      // ...and a mid-turn status tick (slot already open) must NOT wipe it.
+      state = agentSessionReducer(
+        state,
+        eventReceived('ws-1', {
+          id: 'evt-midturn',
+          type: 'agent:status-changed',
+          timestamp: '2024-01-01T00:01:00.000Z',
+          workspaceId: 'ws-1',
+          data: { agentId: 'a1', status: 'active', isActive: true, isStreaming: true },
+        } as any),
+      );
+      expect(state.byAgentId['a1'].liveTurnOpen).toBe(true);
+      expect((state.byAgentId['a1'] as any).lastToolUse).toEqual({
+        name: 'str-replace-editor',
+        status: 'running',
+      });
     });
 
     it('a hydration with isActive:false or a terminal status closes the sticky liveTurnOpen slot', () => {
@@ -2057,6 +2241,59 @@ describe('agent-session-slice reducer', () => {
     });
   });
 
+  describe('processEvicted', () => {
+    it('clears the queue hint and stale busy flags and demotes a stale running status (monorepo#3040)', () => {
+      let state = agentSessionReducer(
+        initialState,
+        upsertSession(
+          makeSession('a1', 'ws-1', {
+            status: 'active' as any,
+            isStreaming: true,
+            isProcessing: true,
+            isResponding: true,
+          }),
+        ),
+      );
+      state = agentSessionReducer(state, setProcessQueueHint('a1', 3, 3, 'slots'));
+      state = agentSessionReducer(state, processEvicted('a1'));
+      const session = state.byAgentId['a1'];
+      expect(session.processQueueHint).toBeUndefined();
+      expect(session.isStreaming).toBe(false);
+      expect(session.isProcessing).toBe(false);
+      expect(session.isResponding).toBe(false);
+      expect(session.liveTurnOpen).toBe(false);
+      expect(session.liveTurnOpenedAt).toBeUndefined();
+      // §6.5 guarantees an evicted process is idle, so a stale RUNNING status
+      // ('active' here — e.g. a missed agent:idle) would keep
+      // isAgentRunningState/Thinking true on its own; demote it to 'idle'.
+      expect(session.status).toBe('idle');
+    });
+
+    it('leaves a non-running status untouched (eviction is not an agent-ended transition)', () => {
+      let state = agentSessionReducer(
+        initialState,
+        upsertSession(
+          makeSession('a1', 'ws-1', {
+            status: 'Waiting' as any,
+            isStreaming: true,
+          }),
+        ),
+      );
+      state = agentSessionReducer(state, processEvicted('a1'));
+      const session = state.byAgentId['a1'];
+      expect(session.isStreaming).toBe(false);
+      // Waiting/error/terminal are BE-owned signals the eviction says nothing
+      // about — only stale RUNNING statuses are demoted.
+      expect(session.status).toBe('Waiting');
+    });
+
+    it('is a no-op for an unknown agent', () => {
+      const state = agentSessionReducer(initialState, upsertSession(makeSession('a1')));
+      const next = agentSessionReducer(state, processEvicted('missing'));
+      expect(next).toBe(state);
+    });
+  });
+
   describe('renameSession', () => {
     it('renames session', () => {
       let state = agentSessionReducer(initialState, upsertSession(makeSession('a1')));
@@ -2307,6 +2544,40 @@ describe('agent-session-slice reducer', () => {
         isResponding: false,
         name: 'Restored Idle Snapshot',
       });
+    });
+
+    it('applies stale runtime-flag clears to selected rows in one mixed batch', () => {
+      let state = agentSessionReducer(
+        initialState,
+        bulkUpsertSessions([
+          makeSession('stale', 'ws-1', { isStreaming: true, isProcessing: true }),
+          makeSession('live', 'ws-1', { isStreaming: true, isProcessing: true }),
+          makeSession('new', 'ws-1'),
+        ]),
+      );
+
+      state = agentSessionReducer(
+        state,
+        bulkUpsertSessions(
+          [
+            makeSession('stale', 'ws-1', { isStreaming: false, isProcessing: false }),
+            makeSession('live', 'ws-1', { isStreaming: false, isProcessing: false }),
+            makeSession('new', 'ws-1', { name: 'Hydrated new' }),
+          ],
+          { staleRuntimeFlagClearAgentIds: ['stale'] },
+        ),
+      );
+
+      expect(state.byAgentId['stale']).toMatchObject({
+        isStreaming: false,
+        isProcessing: false,
+      });
+      expect(state.byAgentId['live']).toMatchObject({
+        isStreaming: true,
+        isProcessing: true,
+      });
+      expect(state.byAgentId['new'].name).toBe('Hydrated new');
+      expect(state.agentIdsByWorkspace['ws-1']).toEqual(['stale', 'live', 'new']);
     });
 
     it('still clears isProcessing via upsert once isStreaming was cleared first (safety timeout)', () => {
@@ -3193,6 +3464,33 @@ describe('agent-session selectors', () => {
 
       expect(selectAgentAttentionRequest.select(state, 'a1')).toBeNull();
       expect(selectAgentAttentionRequest.select(state, 'unknown')).toBeNull();
+    });
+
+    it('surfaces a pending request while the agent runs a live turn and once idle', () => {
+      // Automatic deliveries restart the agent without clearing the request,
+      // so it is still pending mid-turn — attention trumps running.
+      const live = makeSession('a1', 'ws-1', {
+        attentionRequestKind: 'blocker',
+        attentionRequestReason: 'sandbox broken',
+        isResponding: true,
+      });
+      const liveState = storeWith({ byAgentId: { a1: live }, agentIdsByWorkspace: {} });
+      expect(selectAgentAttentionRequest.select(liveState, 'a1')).toEqual({
+        kind: 'blocker',
+        reason: 'sandbox broken',
+        timestamp: undefined,
+      });
+
+      const settled = makeSession('a1', 'ws-1', {
+        attentionRequestKind: 'blocker',
+        attentionRequestReason: 'sandbox broken',
+      });
+      const settledState = storeWith({ byAgentId: { a1: settled }, agentIdsByWorkspace: {} });
+      expect(selectAgentAttentionRequest.select(settledState, 'a1')).toEqual({
+        kind: 'blocker',
+        reason: 'sandbox broken',
+        timestamp: undefined,
+      });
     });
   });
 
@@ -4399,15 +4697,15 @@ describe('computeMessageContentHash — media blocks', () => {
 });
 
 describe('MAX_MESSAGES_PER_AGENT shared transcript cap', () => {
-  it('is 500 — the prune cap the transcript pagers (chat-read-service, chat-read-saga) import as their fetch bound', () => {
-    expect(MAX_MESSAGES_PER_AGENT).toBe(500);
+  it('is 200 — the prune cap the transcript pagers (chat-read-service, chat-read-saga) import as their fetch bound', () => {
+    expect(MAX_MESSAGES_PER_AGENT).toBe(200);
   });
 });
 
 describe('pruneMessages sorts before pruning (prune-after-sort)', () => {
   it('keeps newest messages by timestamp when input exceeds prune limit and is out-of-order', () => {
-    // Create 502 messages. The first 2 (by array position) have the NEWEST timestamps,
-    // and the remaining 500 have older timestamps. With the old sort(prune(dedup(...)))
+    // Create cap+2 messages. The first 2 (by array position) have the NEWEST timestamps,
+    // and the remaining cap have older timestamps. With the old sort(prune(dedup(...)))
     // order, prune would run first on the unsorted list and drop the last 2 by array
     // position (which are actually old messages — correct by accident in-order, but
     // wrong when out-of-order). With the fix prune(sort(dedup(...))), sort runs first,
@@ -4416,18 +4714,18 @@ describe('pruneMessages sorts before pruning (prune-after-sort)', () => {
     // Two newest messages placed first in the array (out of order)
     messages.push(makeUniqueMessage('newest-1', 'user', '2025-12-31T23:59:58.000Z'));
     messages.push(makeUniqueMessage('newest-2', 'user', '2025-12-31T23:59:59.000Z'));
-    // 500 older messages
-    for (let i = 0; i < 500; i++) {
+    // MAX_MESSAGES_PER_AGENT older messages
+    for (let i = 0; i < MAX_MESSAGES_PER_AGENT; i++) {
       const ts = `2024-01-01T${String(Math.floor(i / 3600)).padStart(2, '0')}:${String(Math.floor((i % 3600) / 60)).padStart(2, '0')}:${String(i % 60).padStart(2, '0')}.000Z`;
       messages.push(makeUniqueMessage(`old-${i}`, 'user', ts));
     }
-    // Total: 502 messages, exceeds MAX_MESSAGES_PER_AGENT (500)
+    // Total: cap+2 messages, exceeds MAX_MESSAGES_PER_AGENT
 
     const session = makeSession('a1', 'ws-1', { messages });
     const state = agentSessionReducer(initialState, upsertSession(session));
     const result = getMsgs(state, 'a1');
 
-    expect(result).toHaveLength(500);
+    expect(result).toHaveLength(MAX_MESSAGES_PER_AGENT);
     // The two newest messages MUST survive (they should be at the end after sort+prune)
     const ids = result.map((m) => m.id);
     expect(ids).toContain('newest-1');
@@ -5651,6 +5949,56 @@ describe('history segment (scrollback)', () => {
       expect(getHistory(state, 'a1')!.holeRowsEstimate).toBe(250);
     });
 
+    it('capped serial walk: hole estimate grows by exactly the pruned count so the above split shrinks monotonically to 0', () => {
+      // Regression (termination bookkeeping): with the segment pinned at
+      // HISTORY_SEGMENT_MAX, every prepended page cap-prunes its row count
+      // into the history→tail hole. If holeRowsEstimate under-counted, the
+      // above split would stall and the settle-chained walk could not
+      // terminate before exhaustion.
+      const TOTAL_HISTORY = 2000;
+      const PAGE = 200;
+      const totalMessages = TOTAL_HISTORY + 1;
+      let state = withSession('a1', [makeUniqueMessage('tail-1', 'user', ts(TOTAL_HISTORY))]);
+
+      const aboveSplit = (s: AgentSessionState) => {
+        const segment = getHistory(s, 'a1')!;
+        return splitUnloadedRows({
+          totalMessages,
+          residentCount: segment.messages.length + 1,
+          exhausted: false,
+          startOrdinalEstimate: segment.startOrdinalEstimate ?? null,
+          gapToTail: segment.gapToTail,
+          holeRowsEstimate: segment.holeRowsEstimate ?? null,
+        }).above;
+      };
+
+      let cursor = TOTAL_HISTORY;
+      let prepended = 0;
+      let previousAbove = Number.POSITIVE_INFINITY;
+      while (cursor > 0) {
+        const start = cursor - PAGE;
+        state = agentSessionReducer(
+          state,
+          prependHistoryMessages(
+            'a1',
+            Array.from({ length: PAGE }, (_, i) => histMsg(start + i)),
+          ),
+        );
+        cursor = start;
+        prepended += PAGE;
+        const segment = getHistory(state, 'a1')!;
+        // Exact bookkeeping: every row pruned past the cap is in the hole.
+        expect(segment.holeRowsEstimate ?? 0).toBe(Math.max(0, prepended - HISTORY_SEGMENT_MAX));
+        // The above split must equal the unfetched-older row count exactly
+        // and strictly decrease with every page (monotonic termination).
+        const above = aboveSplit(state);
+        expect(above).toBe(cursor);
+        expect(above).toBeLessThan(previousAbove);
+        previousAbove = above;
+      }
+      expect(aboveSplit(state)).toBe(0);
+    });
+
     it('does not track a hole estimate on seek-seeded segments (start ordinal anchors the split)', () => {
       let state = withSession();
       const landing = Array.from({ length: HISTORY_SEGMENT_MAX }, (_, i) => histMsg(i + 500));
@@ -5844,7 +6192,10 @@ describe('history segment (scrollback)', () => {
     it('a prepend shifts the estimate down by the rows added before the first row (floor 0)', () => {
       let state = withSession('a1', [makeUniqueMessage('tail-1', 'user', ts(1000))]);
       state = agentSessionReducer(state, seedHistoryAround('a1', [histMsg(500)], 500));
-      state = agentSessionReducer(state, prependHistoryMessages('a1', [histMsg(498), histMsg(499)]));
+      state = agentSessionReducer(
+        state,
+        prependHistoryMessages('a1', [histMsg(498), histMsg(499)]),
+      );
       expect(getHistory(state, 'a1')!.startOrdinalEstimate).toBe(498);
       // Overshooting prepend floors at 0.
       const bigOlderPage = Array.from({ length: 499 }, (_, i) => histMsg(i));
@@ -5897,6 +6248,55 @@ describe('history segment (scrollback)', () => {
     it('clearHistorySegment is a no-op when no segment exists', () => {
       const state = withSession();
       expect(agentSessionReducer(state, clearHistorySegment('a1'))).toBe(state);
+    });
+  });
+
+  describe('transcript discard (§7.1 resumed:false snapshot)', () => {
+    it('drops the history segment in the same dispatch as the snapshot', () => {
+      let state = withSession();
+      state = agentSessionReducer(state, prependHistoryMessages('a1', [histMsg(0)]));
+      state = agentSessionReducer(
+        state,
+        chatTranscriptSnapshotApplied('a1', {
+          truncated: true,
+          totalMessages: 20,
+          resumed: false,
+        }),
+      );
+      expect(getHistory(state, 'a1')).toBeUndefined();
+    });
+
+    it('a resumed:true or plain snapshot keeps the segment', () => {
+      let state = withSession();
+      state = agentSessionReducer(state, prependHistoryMessages('a1', [histMsg(0)]));
+      state = agentSessionReducer(
+        state,
+        chatTranscriptSnapshotApplied('a1', {
+          truncated: true,
+          totalMessages: 20,
+          resumed: true,
+        }),
+      );
+      expect(getHistory(state, 'a1')).toBeDefined();
+      state = agentSessionReducer(
+        state,
+        chatTranscriptSnapshotApplied('a1', { truncated: true, totalMessages: 20 }),
+      );
+      expect(getHistory(state, 'a1')).toBeDefined();
+    });
+
+    it('is a no-op when the discarded agent has no segment', () => {
+      const state = withSession();
+      expect(
+        agentSessionReducer(
+          state,
+          chatTranscriptSnapshotApplied('a1', {
+            truncated: false,
+            totalMessages: 0,
+            resumed: false,
+          }),
+        ),
+      ).toBe(state);
     });
   });
 
@@ -5992,5 +6392,156 @@ describe('history segment (scrollback)', () => {
       const storeState = { agentSessions: state } as unknown as StoreState;
       expect(selectHistorySegmentMeta.select(storeState, 'a1').holeRowsEstimate).toBe(50);
     });
+  });
+});
+
+// ===========================================================================
+// Tail cap-pruned latch (live growth past MAX_MESSAGES_PER_AGENT)
+// ===========================================================================
+
+describe('tailCapPruned latch (live tail growth past the client cap)', () => {
+  const BASE_MS = Date.parse('2024-01-01T00:00:00.000Z');
+  const ts = (i: number) => new Date(BASE_MS + i * 1000).toISOString();
+  const liveMsg = (i: number) => makeUniqueMessage(`live-${i}`, 'user', ts(i));
+
+  it('live appends past the cap latch tailCapPruned so shouldRequestOlderHistory fires despite stale non-truncated snapshot meta', () => {
+    // Session under the cap + non-truncated snapshot: chat-init captured
+    // totalMessages = tailCount, truncated = false — and that meta is never
+    // refreshed by live growth.
+    const initialCount = MAX_MESSAGES_PER_AGENT - 1;
+    const tail = Array.from({ length: initialCount }, (_, i) => liveMsg(i));
+    let state = agentSessionReducer(
+      initialState,
+      upsertSession(makeSession('a1', 'ws-1', { messages: tail })),
+    );
+    expect(state.byAgentId['a1'].tailCapPruned).toBeUndefined();
+
+    // Live appends cross the cap: rows are silently dropped from the head.
+    state = agentSessionReducer(state, addMessage('a1', liveMsg(initialCount)));
+    expect(state.byAgentId['a1'].tailCapPruned).toBeUndefined();
+    state = agentSessionReducer(state, addMessage('a1', liveMsg(initialCount + 1)));
+    state = agentSessionReducer(state, addMessage('a1', liveMsg(initialCount + 2)));
+
+    const messages = state.byAgentId['a1'].messages;
+    expect(messages).toHaveLength(MAX_MESSAGES_PER_AGENT);
+    expect(messages.map((m) => m.id)).not.toContain('live-0');
+    expect(state.byAgentId['a1'].tailCapPruned).toBe(true);
+
+    // Trigger inputs as ChatPanel builds them: the stale snapshot meta alone
+    // (truncated=false, totalMessages=initialCount+3 never updated — use the
+    // stale initialCount) would NOT fire; OR-ing the latch makes it fire.
+    const staleMeta = { truncated: false, totalMessages: initialCount };
+    const baseParams = {
+      scrollTop: 0,
+      threshold: 240,
+      canScroll: true,
+      fetching: false,
+      exhausted: false,
+      historyCount: 0,
+      tailCount: messages.length,
+      totalMessages: staleMeta.totalMessages,
+    };
+    expect(shouldRequestOlderHistory({ ...baseParams, tailTruncated: staleMeta.truncated })).toBe(
+      false,
+    );
+    expect(
+      shouldRequestOlderHistory({
+        ...baseParams,
+        tailTruncated: staleMeta.truncated || state.byAgentId['a1'].tailCapPruned === true,
+      }),
+    ).toBe(true);
+    // And the intro-card gate stops claiming the start is loaded.
+    expect(
+      isConversationStartLoaded({
+        exhausted: false,
+        historyCount: 0,
+        tailCount: messages.length,
+        tailTruncated: staleMeta.truncated || state.byAgentId['a1'].tailCapPruned === true,
+        totalMessages: staleMeta.totalMessages,
+      }),
+    ).toBe(false);
+  });
+
+  it('tail cap prune severs a contiguous history segment: gapToTail flips true and holeRowsEstimate grows', () => {
+    // Tail at exactly the cap; a serial-walk history segment contiguous with
+    // the tail (gapToTail false, untracked start ordinal).
+    const tail = Array.from({ length: MAX_MESSAGES_PER_AGENT }, (_, i) => liveMsg(i + 1000));
+    let state = agentSessionReducer(
+      initialState,
+      upsertSession(makeSession('a1', 'ws-1', { messages: tail })),
+    );
+    state = agentSessionReducer(
+      state,
+      prependHistoryMessages('a1', [
+        makeUniqueMessage('hist-0', 'user', ts(0)),
+        makeUniqueMessage('hist-1', 'user', ts(1)),
+      ]),
+    );
+    expect(state.historySegmentsByAgentId?.['a1']?.gapToTail).toBe(false);
+
+    // Two live appends past the cap drop two tail-resident rows into the
+    // history→tail hole.
+    state = agentSessionReducer(state, addMessage('a1', liveMsg(2000)));
+    state = agentSessionReducer(state, addMessage('a1', liveMsg(2001)));
+
+    const segment = state.historySegmentsByAgentId?.['a1'];
+    expect(segment?.gapToTail).toBe(true);
+    expect(segment?.holeRowsEstimate).toBe(2);
+    expect(state.byAgentId['a1'].tailCapPruned).toBe(true);
+    expect(state.byAgentId['a1'].messages.map((m) => m.id)).not.toContain('live-1000');
+  });
+
+  it('replaceMessages (streaming transcript apply) past the cap latches; a prepend-shaped replacement does not', () => {
+    const tail = Array.from({ length: MAX_MESSAGES_PER_AGENT }, (_, i) => liveMsg(i + 1000));
+    let state = agentSessionReducer(
+      initialState,
+      upsertSession(makeSession('a1', 'ws-1', { messages: tail })),
+    );
+
+    // Prepend-shaped replacement: older rows added below the resident window
+    // get sliced right back off — they were never tail-resident, no latch.
+    state = agentSessionReducer(
+      state,
+      replaceMessages('a1', [makeUniqueMessage('older-0', 'user', ts(0)), ...tail]),
+    );
+    expect(state.byAgentId['a1'].tailCapPruned).toBeUndefined();
+
+    // Live-growth replacement: same resident rows + one newer row prunes a
+    // tail-resident row — latch.
+    state = agentSessionReducer(state, replaceMessages('a1', [...tail, liveMsg(3000)]));
+    expect(state.byAgentId['a1'].tailCapPruned).toBe(true);
+    expect(state.byAgentId['a1'].messages.map((m) => m.id)).not.toContain('live-1000');
+  });
+
+  it('the latch survives session upserts and clears on chatReset and a resumed:false snapshot', () => {
+    const tail = Array.from({ length: MAX_MESSAGES_PER_AGENT }, (_, i) => liveMsg(i));
+    let state = agentSessionReducer(
+      initialState,
+      upsertSession(makeSession('a1', 'ws-1', { messages: tail })),
+    );
+    state = agentSessionReducer(state, addMessage('a1', liveMsg(5000)));
+    expect(state.byAgentId['a1'].tailCapPruned).toBe(true);
+
+    // Wire sessions never carry the FE-owned latch — an upsert preserves it.
+    state = agentSessionReducer(
+      state,
+      upsertSession(makeSession('a1', 'ws-1', { messages: state.byAgentId['a1'].messages })),
+    );
+    expect(state.byAgentId['a1'].tailCapPruned).toBe(true);
+
+    // chatReset clears it (full transcript reset).
+    const afterReset = agentSessionReducer(state, chatReset('a1'));
+    expect(afterReset.byAgentId['a1'].tailCapPruned).toBe(false);
+
+    // A §7.1 resumed:false snapshot clears it too.
+    const afterFresh = agentSessionReducer(
+      state,
+      chatTranscriptSnapshotApplied('a1', {
+        resumed: false,
+        truncated: false,
+        totalMessages: 1,
+      }),
+    );
+    expect(afterFresh.byAgentId['a1'].tailCapPruned).toBe(false);
   });
 });

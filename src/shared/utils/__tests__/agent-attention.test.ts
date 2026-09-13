@@ -94,13 +94,51 @@ describe('getAgentAttentionRequest', () => {
       }),
     ).toEqual({ kind: 'discussion', reason: undefined, timestamp: undefined });
   });
+
+  describe('attention trumps a live turn (no live-turn gate)', () => {
+    const pending = {
+      attentionRequestKind: 'blocker',
+      attentionRequestReason: 'CI credentials expired',
+    } as const;
+    const expected = { kind: 'blocker', reason: 'CI credentials expired', timestamp: undefined };
+
+    it.each([
+      ['turnInFlight', { turnInFlight: true }],
+      ['liveTurnOpen', { liveTurnOpen: true }],
+      ['isStreaming', { isStreaming: true }],
+      ['isProcessing', { isProcessing: true }],
+      ['isResponding', { isResponding: true }],
+      ['isWaitingOnTool', { isWaitingOnTool: true }],
+      ['running lastToolUse', { lastToolUse: { status: 'running' } }],
+    ])('returns the pending request while the turn is live (%s)', (_label, activity) => {
+      expect(getAgentAttentionRequest({ ...pending, status: 'active', ...activity })).toEqual(
+        expected,
+      );
+    });
+
+    it('returns the request once the turn ends (flags cleared)', () => {
+      expect(getAgentAttentionRequest({ ...pending, status: 'idle', isResponding: false })).toEqual(
+        expected,
+      );
+    });
+
+    it('returns the request on a bare active status without turn evidence', () => {
+      expect(getAgentAttentionRequest({ ...pending, status: 'active' })).toEqual(expected);
+    });
+
+    it('returns the request on a terminal status with stale activity flags', () => {
+      expect(getAgentAttentionRequest({ ...pending, status: 'error', isResponding: true })).toEqual(
+        expected,
+      );
+    });
+  });
 });
 
 describe('getAgentStopReasonTimestamp', () => {
   it('reads the top-level session field', () => {
-    expect(
-      getAgentStopReasonTimestamp({ stopReasonTimestamp: '2026-07-30T10:00:00Z' }),
-    ).toBe('2026-07-30T10:00:00Z');
+    expect(getAgentStopReasonTimestamp({ stopReasonTimestamp: '2026-07-30T10:00:00Z' })).toBe(
+      '2026-07-30T10:00:00Z',
+    );
   });
 
   it('defensively falls back to a metadata-nested field (not part of the documented wire contract)', () => {

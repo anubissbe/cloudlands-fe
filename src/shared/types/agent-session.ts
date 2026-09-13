@@ -13,7 +13,7 @@
  */
 
 import type { AgentId, WorkspaceId } from './branded-ids';
-import { parseCompoundModelId } from '$shared/utils/compound-model-id';
+import { splitLegacyCompoundId } from '$shared/utils/legacy-model-id';
 import type { AgentMessage } from './agent-message';
 import { AgentStatus } from './agent.types';
 import type { AgentMetadata } from '../types';
@@ -51,8 +51,8 @@ export interface QueuedMessage {
   queuedAt: string;
   /** Optional context items attached to the message */
   contextItems?: QueuedMessageContextItem[];
-  /** Optional image blocks attached to the message */
-  imageBlocks?: Array<{ type: 'image'; data: string; mimeType: string }>;
+  /** Optional image blocks attached to the message (inline data or attachment reference) */
+  imageBlocks?: Array<{ type: 'image'; data?: string; mimeType?: string; attachmentId?: string }>;
   /** Optional attachment-reference file blocks attached to the message */
   fileBlocks?: Array<{
     type: 'file';
@@ -91,7 +91,6 @@ export interface QueuedMessage {
  * Tracks the lifecycle of agent activation from pending to active
  */
 export enum AgentActivationState {
-  PENDING = 'pending',
   ACTIVATING = 'activating',
   ACTIVE = 'active',
   ERROR = 'error',
@@ -236,7 +235,9 @@ export interface AgentSession {
    * lastMessageId !== metadata.lastSeenMessageId` (an absent seen marker
    * counts as unread). See `deriveAgentHasUnread` and
    * intent-hq/monorepo#1597. Always `false` for daemons that omit
-   * `lastMessageId`.
+   * `lastMessageId`, for background agents (`isBackground` /
+   * `metadata.isBackground`), and for delegated child agents
+   * (`metadata.createdByAgentId` set).
    */
   hasUnread?: boolean;
 
@@ -249,6 +250,15 @@ export interface AgentSession {
    *  daemon restart (the session survives). Rows carrying it are hidden from
    *  the FE agent list. */
   pendingDeleteAt?: string;
+
+  /** ISO timestamp of a soft retirement (PROTOCOL §5.5 soft retire, v7.5).
+   *  Presence-detected: served on `agent.get`/`agent.getSession` always and on
+   *  `agent.list` rows on retired-row reads (`retiredOnly: true`, v8.2 — the
+   *  FE seam's sole path to retired rows; `includeRetired` remains on the wire
+   *  for other clients but is not exposed here); omitted on active rows, never
+   *  `null`. A retired session is inert daemon-side (sends, queueing, watches,
+   *  retry all reject) until `agent.restore` clears it. */
+  retiredAt?: string;
 
   /** Harness version stamped at session creation (PROTOCOL §5.5, additive;
    *  e.g. "1.0" — legacy rows backfill to "1.0"). Immutable creation-time
@@ -271,6 +281,13 @@ export interface AgentSession {
 
   /** Last agent response */
   lastAgentResponse?: string;
+
+  /**
+   * Number of transcript messages (PROTOCOL.md §5.5 `AgentLite` additive
+   * field), served on `agent.list`/`agent.get` when messages are stripped.
+   * Rendered verbatim.
+   */
+  messageCount?: number;
 
   /**
    * Most recent tool call preview, from two wire sources sharing this field:
@@ -536,13 +553,13 @@ export function getAgentProvider(
     return explicit;
   }
 
-  // Fallback: infer provider from model ID.
-  // parseCompoundModelId handles both compound ('opencode:haiku4.5' -> 'opencode')
-  // and bare ('haiku4.5' -> default provider) model IDs. An empty resolution
-  // (bare id before catalog hydration, or a malformed ':model' prefix) is
-  // "unknown", never an empty-string provider id.
+  // Fallback: infer provider from model ID. Bare ids ('haiku4.5') attribute
+  // to the default provider; legacy persisted compound ids
+  // ('opencode:haiku4.5' -> 'opencode') still resolve via the lenient
+  // splitter. An empty resolution (bare id before catalog hydration, or a
+  // malformed ':model' prefix) is "unknown", never an empty-string provider id.
   if (session.model) {
-    return parseCompoundModelId(session.model, defaultProviderId).providerId || undefined;
+    return (splitLegacyCompoundId(session.model).providerId ?? defaultProviderId) || undefined;
   }
 
   return undefined;

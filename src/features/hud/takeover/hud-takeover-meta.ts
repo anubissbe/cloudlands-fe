@@ -1,12 +1,16 @@
 /**
  * Takeover overlay metadata — localized labels + mock-faithful colors for
  * takeover kinds (mock `ovDefs().kind/kc`) and task-map cells (mock
- * `taskMeta`). Plain functions so strings re-evaluate per render on locale
- * change; colors are CSS color expressions over the app theme tokens.
+ * `taskMeta`), plus small pure view derivations (spec-progress segments,
+ * WHAT CHANGED lines, roster elapsed timers). Plain functions so strings
+ * re-evaluate per render on locale change; colors are CSS color expressions
+ * over the app theme tokens.
  */
 import { m } from '$shared/paraglide/messages.js';
+import type { HudCardAgent } from '$store/renderer/slices/hud/hud-selectors';
 import type { HudAgentStateBucket } from '$store/renderer/slices/hud/hud-types';
 import { HUD_STATE_COLORS } from '../grid/hud-card-meta';
+import { formatHudTimer } from '../utils/hud-format';
 import type { HudTakeoverKind, HudTakeoverTrigger } from './hud-takeover-queue';
 
 /** Localized banner-chip label for a takeover kind. */
@@ -30,6 +34,8 @@ export function takeoverKindLabel(kind: HudTakeoverKind): string {
       return m.hud_takeover_kindPrOpen_label();
     case 'pr_ready':
       return m.hud_takeover_kindPrReady_label();
+    case 'pr_queued':
+      return m.hud_takeover_kindPrQueued_label();
     case 'pr_merged':
       return m.hud_takeover_kindPrMerged_label();
     case 'workspace_complete':
@@ -54,13 +60,14 @@ export function takeoverKindColor(kind: HudTakeoverKind): string {
     case 'manual':
       return 'hsl(var(--ring))';
     case 'agent_failed':
-      return 'hsl(var(--error-foreground))';
+      return 'hsl(var(--danger))';
     case 'question_asked':
       return 'hsl(var(--warning))';
     case 'workspace_idle':
       return HUD_STATE_COLORS.idle;
     case 'pr_open':
     case 'pr_ready':
+    case 'pr_queued':
       return HUD_STATE_COLORS.pr;
     case 'pr_merged':
       return HUD_STATE_COLORS.prMerged;
@@ -123,9 +130,9 @@ export function taskCellMeta(status: string): HudTakeoverCellMeta {
     case 'blocked':
       return {
         label: m.hud_takeover_taskBlocked_label(),
-        color: 'hsl(var(--error-foreground))',
+        color: 'hsl(var(--danger))',
         bg: 'hsl(0 70% 45% / 0.1)',
-        borderColor: 'hsl(var(--error-foreground))',
+        borderColor: 'hsl(var(--danger))',
         borderStyle: 'solid',
       };
     default:
@@ -160,7 +167,7 @@ export function takeoverAttentionChipLabel(signal: 'question' | 'blocker' | 'dis
  * shared per-signal prefixes (`Q:` / `Blocker:` / `Request Discussion:`) so
  * the takeover banner, footer snippet, and ATTENTION panel read identically.
  */
-export function takeoverAttentionSubtitle(
+function takeoverAttentionSubtitle(
   signal: 'question' | 'blocker' | 'discussion',
   text: string,
 ): string {
@@ -199,6 +206,7 @@ const WORKSPACE_HEADLINE_KINDS: ReadonlySet<HudTakeoverKind> = new Set([
   'workspace_idle',
   'pr_open',
   'pr_ready',
+  'pr_queued',
   'pr_merged',
   'workspace_complete',
 ]);
@@ -259,4 +267,34 @@ export function agentBucketLabel(bucket: HudAgentStateBucket): string {
     case 'idle':
       return m.hud_agentState_idle_label();
   }
+}
+
+/** Localized WHAT CHANGED line for a trigger (labels off `kind`). */
+export function takeoverChangeLine(trigger: HudTakeoverTrigger): string {
+  return trigger.detail
+    ? `${takeoverKindLabel(trigger.kind)} · ${trigger.detail}` // i18n-ignore (label + wire detail join)
+    : takeoverKindLabel(trigger.kind);
+}
+
+/** Spec-progress segment colors (mock `taskSegs`): done → inProgress → rest. */
+export function takeoverSpecSegments(
+  stats: { total: number; completed: number; inProgress: number } | undefined,
+): string[] {
+  if (!stats || stats.total === 0) return [];
+  const count = Math.min(stats.total, 24);
+  const done = Math.round((stats.completed / stats.total) * count);
+  const active = Math.round(((stats.completed + stats.inProgress) / stats.total) * count);
+  return Array.from({ length: count }, (_, i) => {
+    if (i < done) return 'hsl(var(--primary))';
+    if (i < active) return 'hsl(var(--ring))';
+    return 'hsl(var(--muted))';
+  });
+}
+
+/** Roster elapsed timer for an agent row; digit placeholder without a ts. */
+export function takeoverElapsedText(agent: HudCardAgent, nowMs: number): string {
+  if (!agent.lastActivityTs) return '--:--:--'; // i18n-ignore (digit placeholder)
+  const startedMs = Date.parse(agent.lastActivityTs);
+  if (!Number.isFinite(startedMs)) return '--:--:--'; // i18n-ignore (digit placeholder)
+  return formatHudTimer((nowMs - startedMs) / 1000);
 }

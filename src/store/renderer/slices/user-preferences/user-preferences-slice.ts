@@ -4,6 +4,14 @@ import { createBooleanPreference } from '@augmentcode/themis/utils/store/boolean
 import { SYSTEM_LANGUAGE_PREFERENCE } from '$shared/i18n/locale-matcher';
 import type { GithubLinkDefaultAction } from '$shared/utils/link-helpers';
 import type { UpdateChannel } from '$features/auto-update/types';
+import {
+  SHORTCUT_DEFAULTS,
+  isShortcutId,
+  normalizeShortcut,
+  sanitizeShortcutOverrides,
+  type ShortcutId,
+  type ShortcutOverrides,
+} from '$lib/utils/shortcut-bindings';
 
 export const SYSTEM_DEFAULT_FONT =
   "ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Monaco, Consolas, monospace";
@@ -11,11 +19,9 @@ export const SYSTEM_DEFAULT_FONT =
 export type FontStyle = 'sans' | 'monospace';
 export type AgentFontStyle = FontStyle;
 export type NoteFontStyle = FontStyle | 'serif';
-export type PanelOpenMode = 'normal' | 'pin';
-export type PanelStackDirection = 'left' | 'right';
 
 export const FONT_STYLES: FontStyle[] = ['sans', 'monospace'];
-export const NOTE_FONT_STYLES: NoteFontStyle[] = ['sans', 'serif', 'monospace'];
+const NOTE_FONT_STYLES: NoteFontStyle[] = ['sans', 'serif', 'monospace'];
 
 export interface FontOption {
   value: string;
@@ -23,7 +29,7 @@ export interface FontOption {
   fontFamily: string;
 }
 
-export interface ActivityLogFiltersPreference {
+interface ActivityLogFiltersPreference {
   showFileChanges: boolean;
   showAgentActivity: boolean;
   showSystemEvents: boolean;
@@ -47,6 +53,8 @@ export type UserPreferencesState = {
   hasCompletedProviderSetup: boolean;
   /** Whether reasoning (thinking) dropdowns are shown in chat transcripts. */
   showReasoningBlocks: boolean;
+  chatAuroraEnabled: boolean;
+  shellTransparencyEnabled: boolean;
   agentFontStyle: AgentFontStyle;
   noteFontStyle: NoteFontStyle;
   codeFontFamily: string;
@@ -59,18 +67,15 @@ export type UserPreferencesState = {
   /** BCP-47 locale tag of an available catalog, or "system" to follow the OS. */
   languagePreference: string;
   githubLinkDefaultAction: GithubLinkDefaultAction;
-  /** Global content-open policy shared by every workspace. */
-  panelOpenMode: PanelOpenMode;
-  /** Edge where newly opened or reusable panels are placed. */
-  panelStackDirection: PanelStackDirection;
+  shortcutOverrides: ShortcutOverrides;
 };
 
-export type FontSettingsState = Pick<
+type FontSettingsState = Pick<
   UserPreferencesState,
   'agentFontStyle' | 'noteFontStyle' | 'codeFontFamily' | 'systemFonts'
 >;
 
-export type NotificationSettingsState = Pick<
+type NotificationSettingsState = Pick<
   UserPreferencesState,
   'enabled' | 'soundEnabled' | 'soundOnlyWhenUnfocused' | 'volume'
 >;
@@ -97,13 +102,14 @@ export const initialState: UserPreferencesState = {
   groupByRepo: true,
   hasCompletedProviderSetup: false,
   showReasoningBlocks: false,
+  chatAuroraEnabled: true,
+  shellTransparencyEnabled: true,
   ...fontSettingsInitialState,
   ...notificationSettingsInitialState,
   activityLogPresets: [],
   languagePreference: SYSTEM_LANGUAGE_PREFERENCE,
   githubLinkDefaultAction: 'show-choices',
-  panelOpenMode: 'normal',
-  panelStackDirection: 'right',
+  shortcutOverrides: {},
 };
 
 export const setUpdateChannel = createAction<[channel: UpdateChannel]>(
@@ -177,17 +183,19 @@ export const setGithubLinkDefaultAction = createAction<[action: GithubLinkDefaul
   'userPreferences/setGithubLinkDefaultAction',
 );
 
-export const setPanelOpenMode = createAction<[mode: PanelOpenMode]>(
-  'userPreferences/setPanelOpenMode',
+export const hydrateShortcutOverrides = createAction<[overrides: unknown]>(
+  'userPreferences/hydrateShortcutOverrides',
 );
 
-export const togglePanelOpenMode = createAction('userPreferences/togglePanelOpenMode');
-
-export const setPanelStackDirection = createAction<[direction: PanelStackDirection]>(
-  'userPreferences/setPanelStackDirection',
+export const setShortcutOverride = createAction<[id: ShortcutId, shortcut: string]>(
+  'userPreferences/setShortcutOverride',
 );
 
-export const togglePanelStackDirection = createAction('userPreferences/togglePanelStackDirection');
+export const resetShortcutOverride = createAction<[id: ShortcutId]>(
+  'userPreferences/resetShortcutOverride',
+);
+
+export const resetAllShortcutOverrides = createAction('userPreferences/resetAllShortcutOverrides');
 
 const showArchivedPreference = createBooleanPreference<UserPreferencesState>({
   sliceName: 'userPreferences',
@@ -233,12 +241,36 @@ export const setShowReasoningBlocks = showReasoningBlocksPreference.setAction;
 
 export const toggleShowReasoningBlocks = showReasoningBlocksPreference.toggleAction;
 
+const chatAuroraPreference = createBooleanPreference<UserPreferencesState>({
+  sliceName: 'userPreferences',
+  field: 'chatAuroraEnabled',
+  setActionName: 'setChatAuroraEnabled',
+  toggleActionName: 'toggleChatAurora',
+});
+
+export const setChatAuroraEnabled = chatAuroraPreference.setAction;
+
+export const toggleChatAurora = chatAuroraPreference.toggleAction;
+
+const shellTransparencyPreference = createBooleanPreference<UserPreferencesState>({
+  sliceName: 'userPreferences',
+  field: 'shellTransparencyEnabled',
+  setActionName: 'setShellTransparencyEnabled',
+  toggleActionName: 'toggleShellTransparency',
+});
+
+export const setShellTransparencyEnabled = shellTransparencyPreference.setAction;
+
+export const toggleShellTransparency = shellTransparencyPreference.toggleAction;
+
 export const userPreferencesReducer = createReducer<UserPreferencesState>(initialState);
 spellcheckPreference.register(userPreferencesReducer);
 showArchivedPreference.register(userPreferencesReducer);
 groupByRepoPreference.register(userPreferencesReducer);
 hasCompletedProviderSetupPreference.register(userPreferencesReducer);
 showReasoningBlocksPreference.register(userPreferencesReducer);
+chatAuroraPreference.register(userPreferencesReducer);
+shellTransparencyPreference.register(userPreferencesReducer);
 userPreferencesReducer.with(setUpdateChannel, (state, { payload: [channel] }) => ({
   ...state,
   updateChannel: channel,
@@ -309,17 +341,26 @@ userPreferencesReducer.with(setGithubLinkDefaultAction, (state, { payload: [acti
   ...state,
   githubLinkDefaultAction: action,
 }));
-userPreferencesReducer.with(setPanelOpenMode, (state, { payload: [mode] }) =>
-  state.panelOpenMode === mode ? state : { ...state, panelOpenMode: mode },
-);
-userPreferencesReducer.with(togglePanelOpenMode, (state) => ({
+userPreferencesReducer.with(hydrateShortcutOverrides, (state, { payload: [overrides] }) => ({
   ...state,
-  panelOpenMode: state.panelOpenMode === 'pin' ? 'normal' : 'pin',
+  shortcutOverrides: sanitizeShortcutOverrides(overrides),
 }));
-userPreferencesReducer.with(setPanelStackDirection, (state, { payload: [direction] }) =>
-  state.panelStackDirection === direction ? state : { ...state, panelStackDirection: direction },
-);
-userPreferencesReducer.with(togglePanelStackDirection, (state) => ({
-  ...state,
-  panelStackDirection: state.panelStackDirection === 'right' ? 'left' : 'right',
-}));
+userPreferencesReducer.with(setShortcutOverride, (state, { payload: [id, shortcut] }) => {
+  if (!isShortcutId(id)) return state;
+  const normalized = normalizeShortcut(shortcut);
+  if (!normalized) return state;
+  const shortcutOverrides = { ...state.shortcutOverrides };
+  if (normalized === SHORTCUT_DEFAULTS[id]) delete shortcutOverrides[id];
+  else shortcutOverrides[id] = normalized;
+  return { ...state, shortcutOverrides };
+});
+userPreferencesReducer.with(resetShortcutOverride, (state, { payload: [id] }) => {
+  if (!(id in state.shortcutOverrides)) return state;
+  const shortcutOverrides = { ...state.shortcutOverrides };
+  delete shortcutOverrides[id];
+  return { ...state, shortcutOverrides };
+});
+userPreferencesReducer.with(resetAllShortcutOverrides, (state) => {
+  if (Object.keys(state.shortcutOverrides).length === 0) return state;
+  return { ...state, shortcutOverrides: {} };
+});

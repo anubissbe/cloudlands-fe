@@ -13,10 +13,15 @@
  * path carries no secrets). URLs are sanitized to strip userinfo and query
  * parameters (secrets/tokens).
  */
-import { getConnectionMode, getDaemonVersionInfo, getOrphanedSidecarInfo } from './connection-mode';
+import {
+  getConnectionMode,
+  getDaemonVersionInfo,
+  getLocalUpdateSupported,
+  getOrphanedSidecarInfo,
+} from './connection-mode';
 
 /** Renderer-facing transport mode union. */
-export type TransportMode = 'sidecar-uds' | 'external-uds' | 'external-ws';
+type TransportMode = 'sidecar-uds' | 'external-uds' | 'external-ws';
 
 /** Renderer-safe transport payload. */
 export interface TransportInfo {
@@ -24,8 +29,17 @@ export interface TransportInfo {
   target?: string;
   /** Version reported by an adopted external daemon (version handshake). */
   daemonVersion?: string;
+  /** Source commit reported by an adopted external daemon, when available. */
+  daemonBuildCommit?: string;
   /** True when the adopted daemon's version differs from the intentd.version pin (warn-only). */
   versionMismatch?: boolean;
+  /**
+   * Whether the adopted external daemon reports self-update support
+   * (`updateSupported` from `system.status`), captured after each local
+   * hello. Absent when unknown (capture pending, daemon too old to report
+   * the field) and in every non-external-uds mode.
+   */
+  updateSupported?: boolean;
   /** The bundled intentd.version pin, reported in every transport mode. */
   pinnedVersion?: string;
   /**
@@ -35,6 +49,13 @@ export interface TransportInfo {
    * kill-and-restart recovery for it.
    */
   isOrphanedSidecar?: boolean;
+  /**
+   * How a remote pinned `wss` connection reached the daemon: `'tunnel'` when
+   * the tailcat tunnel candidate won the connection race, `'direct'` when a
+   * host dial won. Absent when unknown (single-host dial, not connected) and
+   * in every non-wss mode. Refreshed on every (re)connect.
+   */
+  connectedVia?: 'direct' | 'tunnel';
 }
 
 /**
@@ -61,6 +82,8 @@ function sanitizeUrl(rawUrl: string): string | undefined {
  * Shape transport config into a renderer-safe payload. `pinnedVersion` is the
  * intentd.version pin (injected by the caller so this module stays free of fs
  * access); when provided it is reported in every transport mode.
+ * `connectedVia` is the live connection's race outcome (see
+ * `JsonRpcClient.getConnectedVia`); it is only reported for `wss`.
  */
 export function formatTransportInfo(
   config: {
@@ -71,6 +94,7 @@ export function formatTransportInfo(
     port?: number;
   },
   pinnedVersion?: string | null,
+  connectedVia?: 'direct' | 'tunnel' | null,
 ): TransportInfo {
   const pin = pinnedVersion ? { pinnedVersion } : {};
   if (config.transport === 'uds') {
@@ -79,15 +103,20 @@ export function formatTransportInfo(
     // resolution reports external-uds; `unknown` keeps the legacy default.
     if (getConnectionMode() === 'external') {
       const versionInfo = getDaemonVersionInfo();
+      const updateSupported = getLocalUpdateSupported();
       return {
         mode: 'external-uds',
         target: config.socketPath,
         ...(versionInfo
           ? {
               daemonVersion: versionInfo.daemonVersion ?? undefined,
+              ...(versionInfo.daemonBuildCommit
+                ? { daemonBuildCommit: versionInfo.daemonBuildCommit }
+                : {}),
               versionMismatch: versionInfo.versionMismatch,
             }
           : {}),
+        ...(updateSupported !== null ? { updateSupported } : {}),
         ...(getOrphanedSidecarInfo() ? { isOrphanedSidecar: true } : {}),
         ...pin,
       };
@@ -101,7 +130,12 @@ export function formatTransportInfo(
   if (config.transport === 'wss') {
     // Remote pinned WSS: host:port only — the token and cert fingerprint never
     // reach the renderer-facing payload.
-    return { mode: 'external-ws', target: `wss:${config.host}:${config.port}`, ...pin };
+    return {
+      mode: 'external-ws',
+      target: `wss:${config.host}:${config.port}`,
+      ...(connectedVia ? { connectedVia } : {}),
+      ...pin,
+    };
   }
   // TCP transport is a remote stub; treat it like external WebSocket for UI purposes.
   return { mode: 'external-ws', target: `tcp:${config.host}:${config.port}`, ...pin };

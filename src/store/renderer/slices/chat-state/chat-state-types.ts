@@ -7,6 +7,12 @@ export interface StatusEvent {
   message: string;
   level: 'info' | 'warn' | 'error';
   timestamp: number;
+  /**
+   * Additive on the daemon's `stalled` status event (monorepo#3402): the
+   * silence already measured when the event was emitted, so the live
+   * "No model activity for N" counter can anchor at `timestamp - silentMs`.
+   */
+  silentMs?: number;
 }
 
 export interface StreamStatusContext {
@@ -46,7 +52,26 @@ export interface ModelUnavailableInfo {
   nextAvailableModel: string;
 }
 
-export interface SendMessageOptions {
+/**
+ * A turn that failed because the provider's usage/quota limit was hit, as
+ * reported by the daemon's structured `errorCode: "quota-exceeded"` on
+ * `agent:failed`. Retrying the SAME provider cannot succeed (the daemon
+ * classifies quota rejections as terminal), so the recovery affordance is a
+ * switch to a different provider — hence `providerId`, the provider that ran
+ * out, which the banner excludes from the alternatives it offers.
+ *
+ * Structured rather than string-matched on purpose: the auth-failure banner
+ * matches prose against per-provider `authErrorPatterns`, which is fragile
+ * across provider CLI wording changes. `errorCode` is the daemon's own
+ * classification, so absent field means "not a quota failure" with no
+ * guessing.
+ */
+export interface QuotaExceededInfo {
+  /** Provider whose quota was exhausted; excluded from the retry options. */
+  providerId: string;
+}
+
+interface SendMessageOptions {
   contextItems?: SerializableContextItem[];
   noteIds?: string[];
   personality?: string;
@@ -56,9 +81,11 @@ export interface SendMessageOptions {
   contextReferences?: ContextReference[];
   /**
    * Image blocks the original send carried, recorded so "Try again" resends
-   * them with the message (#965). Plain base64 data — serializable/redux-safe.
+   * them with the message (#965). Inline arm carries plain base64 data;
+   * reference arm carries the attachment-registry UUID (monorepo#3338) —
+   * serializable/redux-safe either way.
    */
-  imageBlocks?: Array<{ type: 'image'; data: string; mimeType: string }>;
+  imageBlocks?: Array<{ type: 'image'; data?: string; mimeType?: string; attachmentId?: string }>;
   /**
    * Attachment-reference file blocks the original send carried, recorded so
    * "Try again" resends them. UUID + metadata only — no bytes.
@@ -73,7 +100,7 @@ export interface SendMessageOptions {
   /**
    * Opaque per-message tag the original send carried (PROTOCOL §5.5), recorded
    * so "Try again" resends it: an untagged retry of a wizard answer would leave
-   * the daemon's question hold pending and re-surface the answered wizard.
+   * the daemon's pending question set unanswered and re-surface the sticky wizard.
    */
   messageMetadata?: Record<string, unknown>;
 }
@@ -82,7 +109,7 @@ export interface SendMessageOptions {
  * Serializable subset of the chat input ContextItem.
  * Excludes the `file` field (a non-serializable `File` object).
  */
-export type SerializableContextItem = Omit<ChatInputContextItem, 'file'>;
+type SerializableContextItem = Omit<ChatInputContextItem, 'file'>;
 
 /**
  * Transcript hydration status: 'loading' while the newest window is unresolved,
@@ -90,6 +117,25 @@ export type SerializableContextItem = Omit<ChatInputContextItem, 'file'>;
  * first-window sources fail. Defaults to undefined (not yet started).
  */
 export type TranscriptHydrationStatus = 'loading' | 'settled' | 'error';
+
+/** One bounded lookup for an authoritative question marker outside the tail page. */
+interface PendingQuestionRecovery {
+  messageId: string;
+  status: 'loading' | 'found' | 'not-found' | 'error';
+  /** Wizard projection retained after one successful lookup; never transcript state. */
+  questions?: Question[];
+}
+
+/**
+ * One bounded lookup for a pending-proposal carrying message outside the
+ * loaded window. Unlike the single-slot question recovery, proposals may span
+ * multiple carrying messages, so these are kept in a per-messageId record.
+ */
+export interface PendingProposalRecovery {
+  status: 'loading' | 'found' | 'not-found' | 'error';
+  /** Tray projection retained after one successful lookup; never transcript state. */
+  proposals?: { proposalId: string; proposal: Proposal }[];
+}
 
 /**
  * Metadata of the LAST seq-0 snapshot the standing `chat.subscribe`
@@ -132,6 +178,11 @@ export type HydratedBlockEntry =
   | { status: 'loaded'; seq: number; block: ContentBlock }
   | { status: 'error'; seq: number; error: string };
 
+export interface StreamFailureCorrelation {
+  turnCorrelation?: string;
+  turnIdCorrelation?: string;
+}
+
 /**
  * Serializable per-agent chat state stored in Redux.
  * Serializable per-agent chat state without non-serializable fields
@@ -143,6 +194,7 @@ export interface ChatAgentState {
   // Read them from AgentSession via canonical agent-session selectors.
   isInterrupting: boolean;
   error: string | null;
+  failureCorrelation?: StreamFailureCorrelation;
   lastChunkTime: number | null;
   receivedFirstChunk: boolean;
   streamingStartTime: number | null;
@@ -158,6 +210,14 @@ export interface ChatAgentState {
    */
   queuedRetryRecords: Record<string, QueuedRetryRecord>;
   modelUnavailable: ModelUnavailableInfo | null;
+  /**
+   * Set when the last turn failed with the daemon's `quota-exceeded` code
+   * (null otherwise). Lives beside `modelUnavailable` because it drives the
+   * same kind of recovery banner, and follows the same lifecycle: preserved
+   * across the `agent:idle` reconcile so the affordance survives, cleared on
+   * the next send.
+   */
+  quotaExceeded: QuotaExceededInfo | null;
   statusEvents: StatusEvent[];
   /** Workspace ID last recorded by the rebind tracker (mirrors WorkspaceRebindTracker). */
   trackedWorkspaceId: string | null;
@@ -218,11 +278,28 @@ export interface ChatAgentState {
   /** True while an `aroundIndex` far-flick seek fetch is in flight. */
   fetchingHistorySeek: boolean;
   /**
+   * Monotonic §7.1 discard counter: bumped atomically by the
+   * `resumed: false` snapshot reducer (the same write that resets the walk
+   * cursors + fetching flags). Scrollback workers capture it before their
+   * wire call and drop the result when it changed mid-flight — a page that
+   * resolves after the discard was fetched against the discarded transcript
+   * and must not recreate a segment or persist a cursor.
+   */
+  scrollbackDiscardEpoch: number;
+  /**
    * True once the daemon rejected `aroundIndex` with INVALID_PARAMS —
    * a daemon predating the param. Seeks are disabled for this agent for the
    * rest of the session (the serial walk covers deep scrolls instead).
    */
   historySeekUnsupported: boolean;
+  /** State of the single targeted `aroundMessageId` lookup for the current marker. */
+  pendingQuestionRecovery?: PendingQuestionRecovery;
+  /**
+   * Targeted `aroundMessageId` lookups for pending-proposal carrying messages
+   * outside the loaded window, keyed by carrying messageId. Entries are
+   * pruned when the metadata refs no longer name the message.
+   */
+  pendingProposalRecovery?: Record<string, PendingProposalRecovery>;
   /**
    * Switch-back transcript reveal gate: true while the VIEWED conversation is
    * awaiting a fresh seq-0 snapshot from its (re)opening standing
@@ -234,19 +311,6 @@ export interface ChatAgentState {
    * the subscribe saga's bounded fallback timeout.
    */
   awaitingSwitchBackSnapshot?: boolean;
-  /**
-   * Utility-footer reveal gate: true while the transcript reveal is holding
-   * for the footer data sources (agent subscriptions, background hooks,
-   * monitored PRs) to settle their initial snapshots, so transcript and
-   * footer flip in the SAME paint. Armed by the first
-   * `transcriptHydrationSettled` (first open) and alongside
-   * `awaitingSwitchBackSnapshot` on `markAgentAsViewed` (switch-back);
-   * cleared by `chatUtilityFooterReady` (the subscribe saga observed
-   * `isUtilityFooterReady` flip true), by the subscription teardown
-   * (phase null), or by the saga's bounded fallback timeout — footer
-   * readiness must NEVER wedge the transcript reveal.
-   */
-  awaitingUtilityFooter?: boolean;
   /**
    * Lazily hydrated full content blocks, keyed `{messageId}|{blockId}`
    * (§5.5 slim projection → v7.2 `agent.getMessageBlock`). Read-through
@@ -271,8 +335,8 @@ export interface SendMessagePayload {
   serializedContextItems?: SerializableContextItem[];
   workspaceContextStr?: string;
   noteIds?: string[];
-  /** Image blocks extracted from serialized context items */
-  imageBlocks?: Array<{ type: 'image'; data: string; mimeType: string }>;
+  /** Image blocks extracted from serialized context items (inline or reference arm) */
+  imageBlocks?: Array<{ type: 'image'; data?: string; mimeType?: string; attachmentId?: string }>;
   /** Attachment-reference file blocks extracted from context items */
   fileBlocks?: Array<{
     type: 'file';
@@ -317,6 +381,8 @@ export interface InitializeChatOptions {
 import type { ContextItem as ChatInputContextItem } from '$lib/components/chat/input/context-api';
 import type { ContextReference } from '$features/agent/agent-context';
 import type { ContentBlock } from '$shared/types';
+import type { Question } from '$shared/types/question-resource';
+import type { Proposal } from '$shared/types/proposal';
 
 // ============================================================================
 // Top-level slice state (flat, agent-keyed)
@@ -325,15 +391,6 @@ import type { ContentBlock } from '$shared/types';
 export interface ChatStateSlice {
   byAgentId: Record<string, ChatAgentState>;
 }
-
-// ============================================================================
-// Constants
-// ============================================================================
-
-export const STATUS_EVENTS_STORAGE_KEY = 'chat-status-events';
-
-/** Minimum time between messages in ms (rate limiting) */
-export const MIN_MESSAGE_SEND_INTERVAL = 100;
 
 /**
  * Cap on parked `queuedRetryRecords` per agent (#973-family memory bound).

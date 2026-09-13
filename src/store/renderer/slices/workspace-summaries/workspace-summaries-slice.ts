@@ -1,21 +1,19 @@
-import type { WorkspaceDiffSummary, WorkspaceGitSummary } from "$shared/types";
-import { createAction } from "@augmentcode/themis/utils/store/create-action";
-import { createReducer } from "@augmentcode/themis/utils/store/create-reducer";
-import { createWorkspaceScopedHelpers } from "../../utils/workspace-scoped";
-import { workspaceUnmounted } from "../workspace-lifecycle/workspace-lifecycle-slice";
-import { removeWorkspaceEntity } from "../workspace/workspace-slice";
+import type { WorkspaceDiffSummary, WorkspaceGitSummary } from '$shared/types';
+import { createAction } from '@augmentcode/themis/utils/store/create-action';
+import { createReducer } from '@augmentcode/themis/utils/store/create-reducer';
+import { createWorkspaceScopedHelpers } from '../../utils/workspace-scoped';
+import { workspaceUnmounted } from '../workspace-lifecycle/workspace-lifecycle-slice';
+import { removeWorkspaceEntity } from '../workspace/workspace-slice';
 import type {
   WorkspaceSummariesState,
   WorkspaceSummariesWorkspaceState,
-} from "./workspace-summaries-types";
+} from './workspace-summaries-types';
 
-export type { WorkspaceSummariesState, WorkspaceSummariesWorkspaceState };
+export type { WorkspaceSummariesState };
 
-export const emptyWorkspaceSummariesState: WorkspaceSummariesWorkspaceState = {
+const emptyWorkspaceSummariesState: WorkspaceSummariesWorkspaceState = {
   diffSummary: null,
   gitSummary: null,
-  loading: false,
-  error: null,
   initialized: false,
 };
 
@@ -23,17 +21,13 @@ export const initialState: WorkspaceSummariesState = {
   byWorkspaceId: {},
 };
 
-const { getWorkspaceState, setWorkspaceState, clearWorkspaceState } =
-  createWorkspaceScopedHelpers(emptyWorkspaceSummariesState);
+const { getWorkspaceState, setWorkspaceState, clearWorkspaceState } = createWorkspaceScopedHelpers(
+  emptyWorkspaceSummariesState,
+);
 
 // ---------------------------------------------------------------------------
 // Actions
 // ---------------------------------------------------------------------------
-
-/** Saga trigger: fetch on-demand diff/git summaries for a workspace. */
-export const loadWorkspaceSummariesRequested = createAction<[workspaceId: string]>(
-  "workspaceSummaries/loadWorkspaceSummariesRequested"
-);
 
 export const loadWorkspaceSummariesSucceeded = createAction<
   [
@@ -41,15 +35,11 @@ export const loadWorkspaceSummariesSucceeded = createAction<
     diffSummary: WorkspaceDiffSummary | null,
     gitSummary: WorkspaceGitSummary | null,
   ]
->("workspaceSummaries/loadWorkspaceSummariesSucceeded");
-
-export const loadWorkspaceSummariesFailed = createAction<[workspaceId: string, error: string]>(
-  "workspaceSummaries/loadWorkspaceSummariesFailed"
-);
+>('workspaceSummaries/loadWorkspaceSummariesSucceeded');
 
 /** Clear all summary state for a workspace. */
 export const clearWorkspaceSummaries = createAction<[workspaceId: string]>(
-  "workspaceSummaries/clearWorkspaceSummaries"
+  'workspaceSummaries/clearWorkspaceSummaries',
 );
 
 // ---------------------------------------------------------------------------
@@ -57,41 +47,24 @@ export const clearWorkspaceSummaries = createAction<[workspaceId: string]>(
 // ---------------------------------------------------------------------------
 
 export const workspaceSummariesReducer = createReducer<WorkspaceSummariesState>(initialState);
-workspaceSummariesReducer.with(loadWorkspaceSummariesRequested, (state, { payload: [workspaceId] }) => {
-    const ws = getWorkspaceState(state, workspaceId);
-    if (ws.loading && ws.error === null) return state;
-    return setWorkspaceState(state, workspaceId, {
-      ...ws,
-      loading: true,
-      error: null,
-    });
-  });
 workspaceSummariesReducer.with(
-    loadWorkspaceSummariesSucceeded,
-    (state, { payload: [workspaceId, diffSummary, gitSummary] }) => {
-      const ws = getWorkspaceState(state, workspaceId);
-      return setWorkspaceState(state, workspaceId, {
-        ...ws,
-        diffSummary,
-        gitSummary,
-        loading: false,
-        error: null,
-        initialized: true,
-      });
-    }
-  );
-workspaceSummariesReducer.with(loadWorkspaceSummariesFailed, (state, { payload: [workspaceId, error] }) => {
+  loadWorkspaceSummariesSucceeded,
+  (state, { payload: [workspaceId, diffSummary, gitSummary] }) => {
     const ws = getWorkspaceState(state, workspaceId);
-    if (!ws.loading && ws.error === error) return state;
     return setWorkspaceState(state, workspaceId, {
       ...ws,
-      loading: false,
-      error,
+      diffSummary,
+      gitSummary,
+      initialized: true,
     });
-  });
+  },
+);
 workspaceSummariesReducer.with(clearWorkspaceSummaries, (state, { payload: [workspaceId] }) =>
-    clearWorkspaceState(state, workspaceId)
-  );
-workspaceSummariesReducer.with(workspaceUnmounted, (state, { payload: [wsId] }) => clearWorkspaceState(state, wsId));
-workspaceSummariesReducer.with(removeWorkspaceEntity, (state, { payload: [wsId] }) => clearWorkspaceState(state, wsId));
-
+  clearWorkspaceState(state, workspaceId),
+);
+workspaceSummariesReducer.with(workspaceUnmounted, (state, { payload: [wsId] }) =>
+  clearWorkspaceState(state, wsId),
+);
+workspaceSummariesReducer.with(removeWorkspaceEntity, (state, { payload: [wsId] }) =>
+  clearWorkspaceState(state, wsId),
+);

@@ -2,14 +2,17 @@
   import { writable } from 'svelte/store';
   import Fa from 'svelte-fa';
   import type { ScriptStatus } from '$features/scripts/types';
+  import { getPanelLayoutManager } from '$features/layout/panel-layout-adapter';
   import { isLiveScriptStatus } from '$features/scripts/utils/script-status';
   import { Button } from '$lib/components/ui/button';
   import {
     faExclamationTriangle,
+    faChevronDown,
     faPlay,
     faRotateRight,
     faSpinner,
     faStop,
+    faTableColumns,
   } from '$lib/icons/phosphor-icons';
   import {
     selectWorkspaceScriptEntries,
@@ -22,11 +25,15 @@
   } from '$store/renderer/slices/scripts/scripts-slice';
   import {
     selectActiveTerminalIdForWorkspace,
+    selectTerminalPlacement,
     selectTerminalsForWorkspace,
+    selectWorkspaceTerminalState,
   } from '$store/renderer/slices/terminals/terminals-selectors';
   import {
+    closeTerminalOverlay,
     openTerminalOverlay,
     selectScript,
+    setTerminalPlacement,
   } from '$store/renderer/slices/terminals/terminals-slice';
   import { store as appStore } from '$store/renderer/store';
   import { m } from '$shared/paraglide/messages.js';
@@ -46,13 +53,62 @@
     ),
   );
 
-  function openTerminal(terminalId: string) {
+  function lastPlacement(id: string) {
+    return selectTerminalPlacement.select(appStore.state, workspaceId, id);
+  }
+
+  // Default click: reopen where the terminal/script was last shown.
+  function openTerminal(terminalId: string, title: string) {
+    if (lastPlacement(terminalId) === 'panel') openTerminalInPanel(terminalId, title);
+    else showTerminalInOverlay(terminalId);
+  }
+
+  function openScript(scriptId: string, title: string) {
+    if (lastPlacement(scriptId) === 'panel') openScriptInPanel(scriptId, title);
+    else showScriptInOverlay(scriptId);
+  }
+
+  // Explicit surface actions override the remembered placement (the
+  // `openTerminalOverlay` reducer records 'overlay' for the shown target).
+  function showTerminalInOverlay(terminalId: string) {
     appStore.dispatch(openTerminalOverlay(workspaceId, terminalId));
   }
 
-  function openScript(scriptId: string) {
+  function showScriptInOverlay(scriptId: string) {
     appStore.dispatch(selectScript(workspaceId, scriptId));
     appStore.dispatch(openTerminalOverlay(workspaceId));
+  }
+
+  // `openUserTab` activates an equivalent existing terminal/script tab
+  // instead of opening a duplicate (see panel-tab-identity).
+  function openTerminalInPanel(terminalId: string, title: string) {
+    getPanelLayoutManager(workspaceId).openUserTab({
+      type: 'terminal',
+      title,
+      terminalId,
+      workspaceId,
+      closable: true,
+    });
+    appStore.dispatch(setTerminalPlacement(workspaceId, terminalId, 'panel'));
+    const state = selectWorkspaceTerminalState.select(appStore.state, workspaceId);
+    if (state.isOpen && state.selectedScriptId === null && state.activeTerminalId === terminalId) {
+      appStore.dispatch(closeTerminalOverlay(workspaceId));
+    }
+  }
+
+  function openScriptInPanel(scriptId: string, title: string) {
+    getPanelLayoutManager(workspaceId).openUserTab({
+      type: 'terminal',
+      title,
+      scriptId,
+      workspaceId,
+      closable: true,
+    });
+    appStore.dispatch(setTerminalPlacement(workspaceId, scriptId, 'panel'));
+    const state = selectWorkspaceTerminalState.select(appStore.state, workspaceId);
+    if (state.isOpen && state.selectedScriptId === scriptId) {
+      appStore.dispatch(closeTerminalOverlay(workspaceId));
+    }
   }
 
   function runScript(scriptId: string, action: 'start' | 'stop' | 'restart', event: MouseEvent) {
@@ -88,23 +144,57 @@
     <div class="flex flex-col gap-0">
       {#each $terminals$ as terminal (terminal.id)}
         {@const active = terminal.id === $activeTerminalId$}
-        <Button
-          variant="plain"
-          class="flex h-8 w-full cursor-pointer items-center justify-start gap-2 rounded-md px-0 py-0 text-left hover:bg-muted focus-visible:bg-muted"
-          onclick={() => openTerminal(terminal.id)}
+        {@const terminalName =
+          terminal.customName || terminal.name || m.workspace_terminalDock_terminal_fallback()}
+        <div
+          class="group/terminal flex h-8 min-w-0 items-center gap-2 rounded-md hover:bg-muted focus-within:bg-muted"
           data-sidebar-shell-terminal={terminal.id}
           data-active={active || undefined}
         >
-          <span
-            class="size-1.5 shrink-0 rounded-full {active
-              ? 'bg-success'
-              : 'bg-muted-foreground/40'}"
-            aria-hidden="true"
-          ></span>
-          <span class="min-w-0 truncate text-sm font-medium text-foreground">
-            {terminal.customName || terminal.name || m.workspace_terminalDock_terminal_fallback()}
-          </span>
-        </Button>
+          <Button
+            variant="plain"
+            class="flex h-full min-w-0 flex-1 cursor-pointer items-center justify-start gap-2 p-0! text-left"
+            onclick={() => openTerminal(terminal.id, terminalName)}
+          >
+            <span
+              class="size-1.5 shrink-0 rounded-full {active
+                ? 'bg-success'
+                : 'bg-muted-foreground/40'}"
+              aria-hidden="true"
+            ></span>
+            <span class="min-w-0 truncate text-sm font-medium text-foreground">{terminalName}</span>
+          </Button>
+          <div class="flex shrink-0 items-center" data-surface-actions>
+            <Button
+              variant="ghost-light"
+              size="icon-xs"
+              iconOnly
+              class="size-7"
+              tooltip={m.workspace_shell_showInPanel_tooltip()}
+              tooltipSide="left"
+              onclick={(event) => {
+                event.stopPropagation();
+                openTerminalInPanel(terminal.id, terminalName);
+              }}
+            >
+              <Fa icon={faTableColumns} class="size-3" />
+            </Button>
+            <Button
+              variant="ghost-light"
+              size="icon-xs"
+              iconOnly
+              class="size-7"
+              tooltip={m.workspace_shell_showInBottomBar_tooltip()}
+              tooltipSide="left"
+              onclick={(event) => {
+                event.stopPropagation();
+                showTerminalInOverlay(terminal.id);
+              }}
+            >
+              <Fa icon={faChevronDown} class="size-3" />
+            </Button>
+          </div>
+        </div>
       {:else}
         <p class="px-0 py-1.5 text-sm text-muted-foreground">
           {m.terminal_sidebar_noTerminals_label()}
@@ -134,7 +224,7 @@
           <Button
             variant="plain"
             class="flex h-full min-w-0 flex-1 cursor-pointer items-center justify-start gap-2 p-0! text-left"
-            onclick={() => openScript(script.id)}
+            onclick={() => openScript(script.id, script.name)}
           >
             <span
               class="size-1.5 shrink-0 rounded-full {live
@@ -155,7 +245,7 @@
             >
           </Button>
           <span
-            class="flex size-4 shrink-0 items-center justify-center text-destructive"
+            class="flex size-4 shrink-0 items-center justify-center text-danger"
             role={errorLabel ? 'alert' : undefined}
             aria-label={errorLabel}
             title={errorLabel}
@@ -165,69 +255,106 @@
               <Fa icon={faExclamationTriangle} class="size-3" />
             {/if}
           </span>
-          {#if live}
-            {@const stopLabel = m.terminal_quakeOverlay_stop_label()}
-            {@const restartLabel = m.workspace_devScripts_restart_ariaLabel({ name: script.name })}
+          <div class="flex shrink-0 items-center" data-surface-actions>
             <Button
-              variant="plain"
+              variant="ghost-light"
               size="icon-xs"
               iconOnly
-              class="size-7 shrink-0"
-              disabled={operation?.pending ?? false}
-              aria-busy={operation?.pending && operation.action === 'stop' ? true : undefined}
-              aria-label={stopLabel}
-              tooltip={stopLabel}
+              class="size-7"
+              tooltip={m.workspace_shell_showInPanel_tooltip()}
               tooltipSide="left"
-              onclick={(event) => runScript(script.id, 'stop', event)}
-              data-script-action="stop"
+              onclick={(event) => {
+                event.stopPropagation();
+                openScriptInPanel(script.id, script.name);
+              }}
             >
-              {#if operation?.pending && operation.action === 'stop'}
-                <Fa icon={faSpinner} class="size-3 animate-spin motion-reduce:animate-none" />
-              {:else}
-                <Fa icon={faStop} class="size-3" />
-              {/if}
+              <Fa icon={faTableColumns} class="size-3" />
             </Button>
             <Button
-              variant="plain"
+              variant="ghost-light"
               size="icon-xs"
               iconOnly
-              class="size-7 shrink-0"
-              disabled={operation?.pending ?? false}
-              aria-busy={operation?.pending && operation.action === 'restart' ? true : undefined}
-              aria-label={restartLabel}
-              tooltip={restartLabel}
+              class="size-7"
+              tooltip={m.workspace_shell_showInBottomBar_tooltip()}
               tooltipSide="left"
-              onclick={(event) => runScript(script.id, 'restart', event)}
-              data-script-action="restart"
+              onclick={(event) => {
+                event.stopPropagation();
+                showScriptInOverlay(script.id);
+              }}
             >
-              {#if operation?.pending && operation.action === 'restart'}
-                <Fa icon={faSpinner} class="size-3 animate-spin motion-reduce:animate-none" />
-              {:else}
-                <Fa icon={faRotateRight} class="size-3" />
-              {/if}
+              <Fa icon={faChevronDown} class="size-3" />
             </Button>
-          {:else}
-            {@const startLabel = m.workspace_devScripts_start_ariaLabel({ name: script.name })}
-            <Button
-              variant="plain"
-              size="icon-xs"
-              iconOnly
-              class="size-7 shrink-0"
-              disabled={operation?.pending ?? false}
-              aria-busy={operation?.pending || undefined}
-              aria-label={startLabel}
-              tooltip={startLabel}
-              tooltipSide="left"
-              onclick={(event) => runScript(script.id, 'start', event)}
-              data-script-action="start"
-            >
-              {#if operation?.pending}
-                <Fa icon={faSpinner} class="size-3 animate-spin motion-reduce:animate-none" />
-              {:else}
-                <Fa icon={faPlay} class="size-3" />
-              {/if}
-            </Button>
-          {/if}
+          </div>
+          <div
+            class="flex shrink-0 items-center rounded-md bg-secondary/80 px-1"
+            data-script-actions
+          >
+            {#if live}
+              {@const stopLabel = m.terminal_quakeOverlay_stop_label()}
+              {@const restartLabel = m.workspace_devScripts_restart_ariaLabel({
+                name: script.name,
+              })}
+              <Button
+                variant="ghost-light"
+                size="icon-xs"
+                iconOnly
+                class="size-7 shrink-0 text-danger hover:text-danger active:bg-accent/80"
+                disabled={operation?.pending ?? false}
+                aria-busy={operation?.pending && operation.action === 'stop' ? true : undefined}
+                aria-label={stopLabel}
+                tooltip={stopLabel}
+                tooltipSide="left"
+                onclick={(event) => runScript(script.id, 'stop', event)}
+                data-script-action="stop"
+              >
+                {#if operation?.pending && operation.action === 'stop'}
+                  <Fa icon={faSpinner} class="size-3 animate-spin motion-reduce:animate-none" />
+                {:else}
+                  <Fa icon={faStop} class="size-3" />
+                {/if}
+              </Button>
+              <Button
+                variant="ghost-light"
+                size="icon-xs"
+                iconOnly
+                class="size-7 shrink-0 active:bg-accent/80"
+                disabled={operation?.pending ?? false}
+                aria-busy={operation?.pending && operation.action === 'restart' ? true : undefined}
+                aria-label={restartLabel}
+                tooltip={restartLabel}
+                tooltipSide="left"
+                onclick={(event) => runScript(script.id, 'restart', event)}
+                data-script-action="restart"
+              >
+                {#if operation?.pending && operation.action === 'restart'}
+                  <Fa icon={faSpinner} class="size-3 animate-spin motion-reduce:animate-none" />
+                {:else}
+                  <Fa icon={faRotateRight} class="size-3" />
+                {/if}
+              </Button>
+            {:else}
+              {@const startLabel = m.workspace_devScripts_start_ariaLabel({ name: script.name })}
+              <Button
+                variant="ghost-light"
+                size="icon-xs"
+                iconOnly
+                class="size-7 shrink-0 active:bg-accent/80"
+                disabled={operation?.pending ?? false}
+                aria-busy={operation?.pending || undefined}
+                aria-label={startLabel}
+                tooltip={startLabel}
+                tooltipSide="left"
+                onclick={(event) => runScript(script.id, 'start', event)}
+                data-script-action="start"
+              >
+                {#if operation?.pending}
+                  <Fa icon={faSpinner} class="size-3 animate-spin motion-reduce:animate-none" />
+                {:else}
+                  <Fa icon={faPlay} class="size-3" />
+                {/if}
+              </Button>
+            {/if}
+          </div>
         </div>
       {:else}
         <p class="px-0 py-1.5 text-sm text-muted-foreground">

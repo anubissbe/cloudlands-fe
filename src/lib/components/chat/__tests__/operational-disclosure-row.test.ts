@@ -14,7 +14,7 @@ vi.mock('$store/renderer/slices/agent-session/agent-session-selectors', () => ({
   selectAgentSession: { select: () => undefined },
 }));
 
-vi.mock('../tool-classifier', async () => {
+vi.mock('$lib/utils/tool-classifier', async () => {
   const { faWrench } = await import('@fortawesome/free-solid-svg-icons');
   return {
     classifyTool: (name: string) => {
@@ -84,8 +84,22 @@ import {
   OPERATIONAL_SECONDARY_CLASS,
   OPERATIONAL_ROW_TONE_CLASS,
   OPERATIONAL_SUMMARY_CLASS,
+  getOperationalClusterSpacingClass,
   safeOperationalDetailsTransition,
 } from '../operational-disclosure-row';
+
+describe('getOperationalClusterSpacingClass', () => {
+  const thinking = { type: 'thinking', id: 'thinking-1', text: 'Reasoning' } as ContentBlock;
+  const text = { type: 'text', text: 'Response' } as ContentBlock;
+  const tool = { type: 'tool_use', id: 'tool-1', name: 'view', input: {} } as ContentBlock;
+
+  it('adds 24px only from reasoning to following prose', () => {
+    expect(getOperationalClusterSpacingClass([thinking, text], 1)).toBe('pt-6');
+    expect(getOperationalClusterSpacingClass([text, thinking], 1)).toBe('pt-4');
+    expect(getOperationalClusterSpacingClass([tool, text], 1)).toBe('pt-4');
+    expect(getOperationalClusterSpacingClass([thinking, tool], 1)).toBe('');
+  });
+});
 
 function createToolUse(
   id: string,
@@ -306,13 +320,14 @@ describe('shared operational disclosure-row contract', () => {
     );
   });
 
-  it('keeps running icons readable and stateful without reintroducing decorative group icons', () => {
+  it('keeps leading running icons as the only active tool cue', () => {
     const { container } = render(ToolCall, {
       props: { toolUse: genericTool, toolState: 'running' },
     });
     const toolIcon = container.querySelector('[data-tool-icon]')!;
     expectClasses(toolIcon, CHAT_OPERATIONAL_LEADING_CLASS);
-    expect(toolIcon.className).toContain('animate-pulse');
+    expect(toolIcon.hasAttribute('data-streaming-pulse')).toBe(true);
+    expect(toolIcon.className).not.toContain('animate-pulse');
     cleanup();
 
     render(ContextEngineToolCall, { props: { toolUse: contextTool, toolState: 'running' } });
@@ -320,17 +335,21 @@ describe('shared operational disclosure-row contract', () => {
       .getByTestId('context-engine-tool-call')
       .querySelector('[data-tool-icon]')!;
     expectClasses(searchIcon, CHAT_OPERATIONAL_LEADING_CLASS);
-    expect(searchIcon.className).toContain('animate-pulse');
-    const runningStatus = screen.getByTestId('tool-call-status');
-    expect(runningStatus.getAttribute('data-tool-status')).toBe('running');
-    expect(runningStatus.getAttribute('aria-label')).toBe('Running');
-    expect(runningStatus.querySelector('[data-icon="spinner"]')).toBeTruthy();
+    expect(searchIcon.hasAttribute('data-streaming-pulse')).toBe(true);
+    expect(screen.queryByTestId('tool-call-status')).toBeNull();
+    expect(document.querySelector('[data-operational-trailing]')).toBeNull();
     cleanup();
 
     render(ThinkingBlock, { props: { content: 'Thinking', isStreaming: true } });
-    const brain = screen.getByTestId('reasoning-tool-call').querySelector('[data-icon="brain"]')!;
+    const reasoningRow = screen.getByTestId('reasoning-tool-call');
+    const brain = reasoningRow.querySelector('[data-icon="brain"]')!;
     expectClasses(brain, CHAT_OPERATIONAL_ICON_CLASS);
-    expect(brain.className).toContain('animate-pulse');
+    expect(brain.className).not.toContain('animate-pulse');
+    expect(
+      reasoningRow
+        .querySelector('[data-operational-leading]')!
+        .hasAttribute('data-streaming-pulse'),
+    ).toBe(true);
     cleanup();
 
     const group = render(ResponseGroup, {
@@ -362,6 +381,19 @@ describe('shared operational disclosure-row contract', () => {
     expect(guide).toBeTruthy();
     expect(guide.className).toContain('operational-group-guide');
     expect(expanded.className).not.toContain('pl-');
+  });
+
+  it('adds bottom space only while a response group is expanded', async () => {
+    const group = render(ResponseGroup, { props: { name: 'Group', children } });
+    const container = group.container.querySelector('[data-operational-row-container]')!;
+    const trigger = screen.getByTestId('response-group-disclosure');
+
+    expect(container.classList.contains('mb-3')).toBe(false);
+    await fireEvent.click(trigger);
+    expect(container.classList.contains('mb-3')).toBe(true);
+
+    await fireEvent.click(trigger);
+    expect(container.classList.contains('mb-3')).toBe(false);
   });
 
   it('preserves completed and error disclosure semantics and specialized expanded content', async () => {
@@ -672,7 +704,7 @@ describe('shared operational disclosure-row contract', () => {
 
       expect(within(row).queryByRole('button')).toBeNull();
       expect(icon.tagName).toBe('DIV');
-      expect(icon.className).toContain('animate-pulse');
+      expect(icon.hasAttribute('data-streaming-pulse')).toBe(true);
       expect(icon.className).not.toContain('cursor-pointer');
     });
   });

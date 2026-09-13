@@ -305,6 +305,28 @@ describe('LiveAgentsClient mutations (fake transport)', () => {
     });
   });
 
+  it('queue forwards messageMetadata on agent.queueMessage params when supplied (§5.5)', async () => {
+    // The Q&A wizard's answer tag must survive queue-on-send so the daemon
+    // resolves the pending set when the queued entry drains.
+    const messageMetadata = { type: 'question_answers', answeredQuestionsMessageId: 'msg-q1' };
+    const queuedMessage = {
+      id: 'qm-meta-1',
+      content: 'Q: Auth method\nA: OAuth',
+      queuedAt: '2026-06-29T00:00:00.000Z',
+      position: 0,
+      messageMetadata,
+    };
+    backend.onRequest('agent.queueMessage', () => ({ success: true, queuedMessage }));
+    const client = new LiveAgentsClient();
+
+    const result = await client.queue('agent-1', 'Q: Auth method\nA: OAuth', { messageMetadata });
+    expect(result).toEqual({ success: true, queuedMessage });
+    expect(backend.requests[0]).toEqual({
+      method: 'agent.queueMessage',
+      params: { agentId: 'agent-1', content: 'Q: Auth method\nA: OAuth', messageMetadata },
+    });
+  });
+
   it('queue omits the imageBlocks key entirely when no images are supplied', async () => {
     backend.onRequest('agent.queueMessage', () => ({ success: true }));
     const client = new LiveAgentsClient();
@@ -315,6 +337,7 @@ describe('LiveAgentsClient mutations (fake transport)', () => {
       params: { agentId: 'agent-1', content: 'no images' },
     });
     expect('imageBlocks' in (backend.requests[0]?.params as object)).toBe(false);
+    expect('messageMetadata' in (backend.requests[0]?.params as object)).toBe(false);
   });
 
   it('removeQueued forwards agent.removeQueuedMessage with PROTOCOL §5.5 params and folds the idempotent BE body into success', async () => {
@@ -778,6 +801,80 @@ describe('LiveAgentsClient mutations (fake transport)', () => {
     expect(result.error).toContain('not found: agent session');
   });
 
+  it('resolveProposal forwards agent.resolveProposal with §5.5 params and folds the ack into success', async () => {
+    // PROTOCOL §5.5: agent.resolveProposal takes `{ workspaceId, agentId,
+    // proposalId, outcome }` plus optional `detail`, removes the id from the
+    // session-metadata `pendingProposals` set, persists the resolution, and
+    // emits `agent:updated`. `detail` must be ABSENT when unset — never an
+    // explicit `undefined` on the wire.
+    backend.onRequest('agent.resolveProposal', () => ({ success: true }));
+    const client = new LiveAgentsClient();
+
+    const result = await client.resolveProposal({
+      agentId: 'agent-1',
+      workspaceId: 'ws-1',
+      proposalId: 'toolu-apply-1',
+      outcome: 'dismissed',
+    });
+    expect(result).toEqual({ success: true });
+    expect(backend.requests[0]).toEqual({
+      method: 'agent.resolveProposal',
+      params: {
+        workspaceId: 'ws-1',
+        agentId: 'agent-1',
+        proposalId: 'toolu-apply-1',
+        outcome: 'dismissed',
+      },
+    });
+    expect('detail' in (backend.requests[0]!.params as Record<string, unknown>)).toBe(false);
+  });
+
+  it('resolveProposal forwards the applied outcome with detail on the wire', async () => {
+    backend.onRequest('agent.resolveProposal', () => ({ success: true }));
+    const client = new LiveAgentsClient();
+
+    const result = await client.resolveProposal({
+      agentId: 'agent-1',
+      workspaceId: 'ws-1',
+      proposalId: 'toolu-apply-2',
+      outcome: 'applied',
+      detail: 'created workspace ws-new',
+    });
+    expect(result).toEqual({ success: true });
+    expect(backend.requests[0]).toEqual({
+      method: 'agent.resolveProposal',
+      params: {
+        workspaceId: 'ws-1',
+        agentId: 'agent-1',
+        proposalId: 'toolu-apply-2',
+        outcome: 'applied',
+        detail: 'created workspace ws-new',
+      },
+    });
+  });
+
+  it('resolveProposal folds a daemon NotFound rejection into {success:false,error} (no throw)', async () => {
+    // Workspace mismatch / unknown agent rejects with NotFound (-32004) per
+    // the §5.5 contract — the mutation seam never throws.
+    backend.onRequest('agent.resolveProposal', () => {
+      throw new BackendError(
+        buildErrorPayload('BACKEND_ERROR', 'not found: agent session agent-x', {
+          rpcCode: -32004,
+        }),
+      );
+    });
+    const client = new LiveAgentsClient();
+
+    const result = await client.resolveProposal({
+      agentId: 'agent-x',
+      workspaceId: 'ws-1',
+      proposalId: 'toolu-apply-1',
+      outcome: 'dismissed',
+    });
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('not found: agent session');
+  });
+
   it('markSeen forwards agent.markSeen with §5.5 params and folds the ack into success', async () => {
     // PROTOCOL §5.5: agent.markSeen takes `{ workspaceId, agentId,
     // messageId }` (all required) and returns `{ success: true,
@@ -1133,6 +1230,97 @@ describe('LiveAgentsClient reads thread daemon activity flags (PROTOCOL §5.5)',
     });
   });
 
+  it('list sends retiredOnly only when true — omitted when unset or false (§5.5, v8.2)', async () => {
+    backend.onRequest('agent.list', () => ({ agents: [], retiredCount: 0 }));
+    const client = new LiveAgentsClient();
+
+    await client.list('ws-1');
+    expect(backend.requests[0]).toEqual({
+      method: 'agent.list',
+      params: { workspaceId: 'ws-1' },
+    });
+
+    await client.list('ws-1', { retiredOnly: true });
+    expect(backend.requests[1]).toEqual({
+      method: 'agent.list',
+      params: { workspaceId: 'ws-1', retiredOnly: true },
+    });
+
+    // The daemon treats absent and `false` identically, so an explicit
+    // `retiredOnly: false` stays off the wire and the default read carries
+    // no flags for every non-retired caller.
+    await client.list('ws-1', { retiredOnly: false });
+    expect(backend.requests[2]).toEqual({
+      method: 'agent.list',
+      params: { workspaceId: 'ws-1' },
+    });
+  });
+
+  it('listWithMeta surfaces retiredCount and defaults it to 0 when absent (§5.5, v8.2)', async () => {
+    backend.onRequest('agent.list', () => ({
+      agents: [{ id: 'agent-active', workspaceId: 'ws-1', name: 'Active', status: 'active' }],
+      retiredCount: 3,
+    }));
+    const client = new LiveAgentsClient();
+
+    const { agents, retiredCount } = await client.listWithMeta('ws-1');
+    expect(backend.requests[0]).toEqual({
+      method: 'agent.list',
+      params: { workspaceId: 'ws-1' },
+    });
+    expect(agents).toHaveLength(1);
+    expect(agents[0].retiredAt).toBeUndefined();
+    expect(retiredCount).toBe(3);
+
+    backend.onRequest('agent.list', () => ({ agents: [] }));
+    const fallback = await client.listWithMeta('ws-1');
+    expect(fallback.retiredCount).toBe(0);
+  });
+
+  it('list carries retiredAt verbatim on the retired-only read (§5.5 soft retire)', async () => {
+    backend.onRequest('agent.list', () => ({
+      agents: [
+        {
+          id: 'agent-retired',
+          workspaceId: 'ws-1',
+          name: 'Old timer',
+          status: 'idle',
+          retiredAt: '2026-08-20T00:00:00.000Z',
+        },
+      ],
+      retiredCount: 1,
+    }));
+    const client = new LiveAgentsClient();
+
+    const agents = await client.list('ws-1', { retiredOnly: true });
+    expect(agents[0]).toMatchObject({ id: 'agent-retired', retiredAt: '2026-08-20T00:00:00.000Z' });
+  });
+
+  it('restore forwards agent.restore and folds success/error into a MutationResult (§5.5)', async () => {
+    backend.onRequest('agent.restore', () => ({ success: true }));
+    const client = new LiveAgentsClient();
+
+    const result = await client.restore('agent-retired', 'ws-1');
+    expect(result).toEqual({ success: true });
+    expect(backend.requests[0]).toEqual({
+      method: 'agent.restore',
+      params: { agentId: 'agent-retired', workspaceId: 'ws-1' },
+    });
+
+    resetMockBackend();
+    backend = installMockBackend();
+    backend.onRequest('agent.restore', () => {
+      throw new BackendError(buildErrorPayload(-32602, 'agent not retired'));
+    });
+    const failure = await new LiveAgentsClient().restore('agent-retired');
+    expect(failure.success).toBe(false);
+    expect(failure.error).toMatch(/not retired/);
+    expect(backend.requests[0]).toEqual({
+      method: 'agent.restore',
+      params: { agentId: 'agent-retired' },
+    });
+  });
+
   it('list and get preserve the AgentLite specialist metadata and model verbatim', async () => {
     const coordinator = {
       id: 'agent-coordinator',
@@ -1251,6 +1439,54 @@ describe('LiveAgentsClient reads thread daemon activity flags (PROTOCOL §5.5)',
 
     const agent = await client.get('agent-1');
     expect(agent?.hasUnread).toBe(true);
+  });
+
+  it('derives hasUnread: false for a background agent despite an unseen assistant message', async () => {
+    backend.onRequest('agent.list', () => ({
+      agents: [
+        {
+          id: 'agent-bg',
+          workspaceId: 'ws-1',
+          name: 'BG',
+          status: 'idle',
+          isBackground: true,
+          lastMessageRole: 'assistant',
+          lastMessageId: 'm-9',
+          metadata: { lastSeenMessageId: 'm-5' },
+        },
+        {
+          id: 'agent-meta-bg',
+          workspaceId: 'ws-1',
+          name: 'MetaBG',
+          status: 'idle',
+          lastMessageRole: 'assistant',
+          lastMessageId: 'm-9',
+          metadata: { lastSeenMessageId: 'm-5', isBackground: true },
+        },
+      ],
+    }));
+    const client = new LiveAgentsClient();
+
+    const agents = await client.list('ws-1');
+    expect(agents.map((a) => a.hasUnread)).toEqual([false, false]);
+  });
+
+  it('derives hasUnread: false for a delegated child agent (metadata.createdByAgentId)', async () => {
+    backend.onRequest('agent.get', () => ({
+      agent: {
+        id: 'agent-child',
+        workspaceId: 'ws-1',
+        name: 'Child',
+        status: 'idle',
+        lastMessageRole: 'assistant',
+        lastMessageId: 'm-9',
+        metadata: { lastSeenMessageId: 'm-5', createdByAgentId: 'agent-parent' },
+      },
+    }));
+    const client = new LiveAgentsClient();
+
+    const agent = await client.get('agent-child');
+    expect(agent?.hasUnread).toBe(false);
   });
 
   it('derives hasUnread: false when the daemon omits lastMessageId (older daemon)', async () => {
@@ -1543,6 +1779,105 @@ describe('LiveAgentsClient reads thread daemon activity flags (PROTOCOL §5.5)',
     await expect(client.getMessageBlock('agent-1', 'msg-1', 'msg-1:99')).rejects.toThrow(
       'unknown block id',
     );
+  });
+
+  describe('listUserMessages', () => {
+    // PROTOCOL §5.5 (v7.3): `agent.listUserMessages` returns every user-role
+    // message as lightweight index items, oldest→newest, unpaged —
+    // `{ agentId, items: [{ id, preview, createdAt, metadata? }], total }`.
+    it('forwards agent.listUserMessages with agentId only and returns the typed index', async () => {
+      backend.onRequest('agent.listUserMessages', () => ({
+        agentId: 'agent-1',
+        items: [
+          { id: 'msg-1', preview: 'first question', createdAt: '2026-08-01T00:00:00Z' },
+          {
+            id: 'msg-2',
+            preview: '[WORKSPACE EVENTS] automated wake',
+            createdAt: '2026-08-02T00:00:00Z',
+            metadata: { source: 'system' },
+          },
+        ],
+        total: 2,
+      }));
+      const client = new LiveAgentsClient();
+
+      const result = await client.listUserMessages('agent-1');
+      // `previewChars` must be absent when the caller omitted it so the
+      // daemon default (300) applies.
+      expect(backend.requests[0]).toEqual({
+        method: 'agent.listUserMessages',
+        params: { agentId: 'agent-1' },
+      });
+      expect(result).toEqual({
+        ok: true,
+        items: [
+          { id: 'msg-1', preview: 'first question', createdAt: '2026-08-01T00:00:00Z' },
+          {
+            id: 'msg-2',
+            preview: '[WORKSPACE EVENTS] automated wake',
+            createdAt: '2026-08-02T00:00:00Z',
+            // metadata passes through verbatim (automated-row filtering
+            // stays client-side).
+            metadata: { source: 'system' },
+          },
+        ],
+        total: 2,
+      });
+      // metadata must be ABSENT (not defaulted) on items that omit it.
+      if (!result.ok) throw new Error('expected ok result');
+      expect('metadata' in result.items[0]).toBe(false);
+    });
+
+    it('forwards previewChars when supplied', async () => {
+      backend.onRequest('agent.listUserMessages', () => ({
+        agentId: 'agent-1',
+        items: [],
+        total: 0,
+      }));
+      const client = new LiveAgentsClient();
+
+      const result = await client.listUserMessages('agent-1', 120);
+      expect(backend.requests[0]).toEqual({
+        method: 'agent.listUserMessages',
+        params: { agentId: 'agent-1', previewChars: 120 },
+      });
+      expect(result).toEqual({ ok: true, items: [], total: 0 });
+    });
+
+    it('marks an old daemon lacking the method as unsupported (no throw)', async () => {
+      // -32601 = Method not found: the daemon predates protocol v7.3. The
+      // typed failure lets the navigator degrade to tail-only items.
+      backend.onRequest('agent.listUserMessages', () => {
+        throw new BackendError(
+          buildErrorPayload('BACKEND_ERROR', 'Method not found', { rpcCode: -32601 }),
+        );
+      });
+      const client = new LiveAgentsClient();
+
+      const result = await client.listUserMessages('agent-old');
+      expect(result).toEqual({ ok: false, unsupported: true, error: 'Method not found' });
+    });
+
+    it('folds other daemon failures into ok:false without the unsupported flag', async () => {
+      // e.g. the §5.5 not-found scope guard (-32602, unknown agentId) or a
+      // transport failure — typed, ignorable, but NOT an old-daemon marker.
+      backend.onRequest('agent.listUserMessages', () => {
+        throw new BackendError(
+          buildErrorPayload('INVALID_PARAMS', 'not found: agent session agent-ghost', {
+            rpcCode: -32602,
+            data: { code: 'not-found' },
+          }),
+        );
+      });
+      const client = new LiveAgentsClient();
+
+      const result = await client.listUserMessages('agent-ghost');
+      expect(result).toEqual({
+        ok: false,
+        unsupported: false,
+        error: 'not found: agent session agent-ghost',
+      });
+    });
   });
 
   describe('retry', () => {

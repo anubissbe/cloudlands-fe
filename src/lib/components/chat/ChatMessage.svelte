@@ -34,7 +34,13 @@
   import { handleLink } from '$features/navigation/link-handler';
   import { selectAllNotes } from '$store/renderer/slices/workspace-notes/workspace-notes-selectors';
   import { selectAgentMessageById } from '$store/renderer/slices/agent-session/agent-session-selectors';
+  import { selectHydratedBlocks } from '$store/renderer/slices/chat-state/chat-state-selectors';
+  import { messageBlockHydrationRequested } from '$store/renderer/slices/chat-state/chat-state-slice';
+  import { isHydrationPending, mergeHydratedContent } from './block-hydration';
+  import { createLogger } from '$lib/utils/client-logger';
   import { shouldShowStoppedIndicator as resolveShouldShowStoppedIndicator } from './message-display-utils';
+  import { splitTextByUrls } from './message-link-utils';
+  import { findInlineMentions } from './mention-match-utils';
   import { USER_MESSAGE_SURFACE_CLASS, USER_MESSAGE_TEXT_CLASS } from './user-message-surface';
   import {
     isQuestionOnlyContent,
@@ -43,6 +49,8 @@
   } from './message-display-utils';
   import ImageLightbox from '$lib/components/ui/ImageLightbox.svelte';
   import EditRegenerateConfirmDialog from './EditRegenerateConfirmDialog.svelte';
+  import { evictAttachmentImageUrl, resolveAttachmentImageUrl } from './attachment-image-url';
+  import { onBackendReconnected } from '$lib/client/live/backend-transport';
   import { isImageBlock } from '$shared/types/content-block.guards';
   import type { ContentBlock } from '$shared/types/content-block';
   import AgentMessageAttributionHeader from './AgentMessageAttributionHeader.svelte';
@@ -60,6 +68,10 @@
   } from './subscription-disclosure';
   import QuestionsDismissedNotice from './QuestionsDismissedNotice.svelte';
   import { getQuestionsDismissedNotice } from './questions-dismissed-notice';
+  import AutoUnarchivedNotice from './AutoUnarchivedNotice.svelte';
+  import { getAutoUnarchivedNotice } from './auto-unarchived-notice';
+  import ChatOperationalRow from './ChatOperationalRow.svelte';
+  import { CHAT_OPERATIONAL_ICON_CLASS } from './operational-disclosure-row';
 
   import { WorkspaceId } from '$shared/types/branded-ids';
   import { store as appStore } from '$store/renderer/store';
@@ -70,30 +82,34 @@
     openWorkspaceNote,
   } from '$store/renderer/slices/workspace-navigation/workspace-navigation-slice';
   import { getWorkspaceRouteContext } from '$lib/utils/workspace-route-context';
+  import { parseFilePathLineSuffix } from '$shared/utils/link-helpers';
 
   const routeWorkspaceId = getWorkspaceRouteContext()?.workspaceId ?? undefined;
+
+  const logger = createLogger('ChatMessage');
 
   function getOwningWorkspaceId(): string | undefined {
     return workspace?.id ? String(workspace.id) : routeWorkspaceId;
   }
 
-  function getPanelOptions(event?: MouseEvent) {
+  function getPanelOptions(event?: MouseEvent, line?: number) {
     const target = event?.target;
     const sourcePanelId =
       target instanceof HTMLElement
         ? target.closest<HTMLElement>('[data-panel-id]')?.dataset.panelId
         : undefined;
     return {
+      ...(line !== undefined ? { line } : {}),
       openInAdjacentPanel: Boolean(event?.metaKey || event?.ctrlKey),
       sourcePanelId,
     };
   }
 
-  function openChatFile(path: string, event?: MouseEvent) {
+  function openChatFile(path: string, event?: MouseEvent, line?: number) {
     if (readOnly) return;
     const workspaceId = getOwningWorkspaceId();
     if (!workspaceId) return;
-    appStore.dispatch(openWorkspaceFile(workspaceId, path, getPanelOptions(event)));
+    appStore.dispatch(openWorkspaceFile(workspaceId, path, getPanelOptions(event, line)));
   }
 
   function openChatNote(noteId: string, event?: MouseEvent) {
@@ -110,6 +126,7 @@
     icon: typeof faFile;
     /** File path for file/diff pills */
     path?: string;
+    line?: number;
     /** Note ID for note pills */
     noteId?: string;
     /** External URL for external references */
@@ -153,6 +170,7 @@
         identifier?: string;
         icon: typeof faFile;
         path?: string;
+        line?: number;
         noteId?: string;
         url?: string;
       };
@@ -209,6 +227,13 @@
     readOnly?: boolean;
     /** False when an outer transcript row owns the canonical message identity attributes. */
     ownsMessageIdentity?: boolean;
+    /**
+     * Drop the automated wake card's external top margin when the preceding
+     * batched-delivery gap already owns the seam.
+     */
+    suppressAutomatedWakeTopSpacing?: boolean;
+    /** True when this message is the conversation's final assistant message. */
+    isLastConversationMessage?: boolean;
   }
 
   let {
@@ -235,6 +260,8 @@
     suppressCoordinationStoppedIndicator = false,
     readOnly = false,
     ownsMessageIdentity = true,
+    suppressAutomatedWakeTopSpacing = false,
+    isLastConversationMessage = false,
   }: Props = $props();
 
   // Per-message Redux subscription. Must be called at component-init time
@@ -244,6 +271,14 @@
   // Svelte's `$store` auto-subscription.
   // svelte-ignore state_referenced_locally -- intentional initial snapshot; keyed component identity is fixed.
   const storeMessage$ = selectAgentMessageById(agentId ?? '', messageId ?? '');
+
+  // Lazy full-block hydration (§5.5 slim projection → v7.2
+  // agent.getMessageBlock) for user-message attached images: the slim
+  // projection may serve them as write-time thumbnails (dataTruncated /
+  // dataIsThumbnail), so the lightbox fetches the original on demand.
+  // Init-time subscription per src/store/renderer/AGENTS.md §5.
+  // svelte-ignore state_referenced_locally -- intentional initial snapshot; keyed component identity is fixed.
+  const hydratedBlocks$ = selectHydratedBlocks(agentId ?? '');
 
   // Looked-up message drives ALL downstream $derived values, the optional identity
   // attributes, and the `{#if !message}` guard. When both ids are provided we use
@@ -277,6 +312,9 @@
   let modelChangeNotice = $derived(getModelChangeNotice(message));
 
   let questionsDismissedNotice = $derived(getQuestionsDismissedNotice(message));
+
+  // Daemon-persisted auto-unarchive transcript row (metadata type "auto_unarchived")
+  let autoUnarchivedNotice = $derived(getAutoUnarchivedNotice(message));
 
   // Daemon-persisted attention-request row (meta.kind "discussion-request"/"blocker-report")
   let attentionNotice = $derived(getAttentionNotice(message));
@@ -446,6 +484,7 @@
           foundMatch = true;
           let label: string;
           let path: string | undefined;
+          let line: number | undefined;
           let noteId: string | undefined;
 
           if ('label' in pattern && pattern.label) {
@@ -467,7 +506,9 @@
 
           // Capture path/noteId based on type
           if (pattern.type === 'file' || pattern.type === 'diff') {
-            path = match[1]; // File path
+            const parsedTarget = parseFilePathLineSuffix(match[1]);
+            path = parsedTarget.path;
+            line = parsedTarget.line;
           } else if (pattern.type === 'note') {
             // For notes, the label is the title - we'd need the ID to navigate
             // Store the title as noteId for now (the navigation will need to look it up)
@@ -481,6 +522,7 @@
             label,
             icon: pattern.icon,
             path,
+            line,
             noteId,
           });
           cleanText = cleanText.replace(pattern.regex, '');
@@ -501,17 +543,10 @@
   ): MessageSegment[] {
     const segments: MessageSegment[] = [];
 
-    // Regex to match @mentions:
-    // - @context[provider|identifier|title] - context mentions (Linear, GitHub, etc.)
-    // - @note/{noteId} - note mentions
-    // - @{path} - file/folder mentions (paths with / or file extensions)
-    const mentionRegex =
-      /@(context\[[^\]]+\]|note\/[^\s]+|[^\s@]+\.[a-zA-Z]+(?::[L\d-]+)?|[^\s@]*\/[^\s]+)/g;
-
     let lastIndex = 0;
-    let match;
 
-    while ((match = mentionRegex.exec(text)) !== null) {
+    // Matching (shared with StickyMessageHeader) lives in mention-match-utils
+    for (const match of findInlineMentions(text)) {
       // Add text before the match
       if (match.index > lastIndex) {
         const textBefore = text.slice(lastIndex, match.index);
@@ -520,8 +555,8 @@
         }
       }
 
-      const fullMatch = match[0]; // e.g., "@context[linear|AU-123|Title]" or "@note/spec"
-      const captured = match[1]; // e.g., "context[linear|AU-123|Title]" or "note/spec"
+      const fullMatch = match.fullMatch; // e.g., "@context[linear|AU-123|Title]" or "@note/spec"
+      const captured = match.captured; // e.g., "context[linear|AU-123|Title]" or "note/spec"
 
       if (captured.startsWith('context[')) {
         // Context mention: @context[provider|identifier|title] or @context[base64JSON]
@@ -600,16 +635,18 @@
         });
       } else {
         // File/folder mention: @path/to/file.ext
-        const path = captured;
+        const { path, line } = parseFilePathLineSuffix(captured);
         const fileName = path.split('/').pop() || path;
+        const suffix = captured.slice(path.length);
 
         segments.push({
           type: 'mention',
           mentionType: 'file',
-          label: fileName,
+          label: `${fileName}${suffix}`,
           id: path,
           icon: faFile,
           path,
+          line,
         });
       }
 
@@ -693,21 +730,25 @@
       }
       // Handle file references
       else if (refType === 'file') {
+        const parsedTarget = parseFilePathLineSuffix(ref.path || '');
         pills.push({
           type: 'file',
           label: ref.path?.split('/').pop() || ref.title || m.chat_shared_file_fallback(),
           icon: faFile,
-          path: ref.path,
+          path: parsedTarget.path || undefined,
+          line: parsedTarget.line,
           content: ref.content,
         });
       }
       // Handle diff references
       else if (refType === 'diff') {
+        const parsedTarget = parseFilePathLineSuffix(ref.path || '');
         pills.push({
           type: 'diff',
           label: ref.path?.split('/').pop() || m.chat_shared_diff_fallback(),
           icon: faCodeCompare,
-          path: ref.path,
+          path: parsedTarget.path || undefined,
+          line: parsedTarget.line,
           content: ref.content,
         });
       }
@@ -742,10 +783,10 @@
     if (pill.type === 'spec') {
       openChatNote('spec', event);
     } else if (pill.type === 'file' && pill.path) {
-      openChatFile(pill.path, event);
+      openChatFile(pill.path, event, pill.line);
     } else if (pill.type === 'diff' && pill.path) {
       // For diffs, open the file - the diff view would need to be triggered separately
-      openChatFile(pill.path, event);
+      openChatFile(pill.path, event, pill.line);
     } else if (pill.type === 'note' && pill.noteId) {
       // noteId is actually the note title from the context string
       // Look up the actual note ID from the title
@@ -757,7 +798,7 @@
         openChatNote(matchingNote.id, event);
       }
     } else if (pill.type === 'selection' && pill.path) {
-      openChatFile(pill.path, event);
+      openChatFile(pill.path, event, pill.line);
     }
   }
 
@@ -772,23 +813,134 @@
     return '';
   }
 
-  // Extract image blocks from contentBlocks
+  // Extract image blocks from contentBlocks, substituting cached full blocks
+  // for slim-truncated ones (§5.5) so a hydrated attachment renders/opens at
+  // full resolution. Includes attachment-reference blocks (attachmentId, no
+  // bytes — monorepo#3338); those resolve to workspace-file:// URLs below.
   const imageBlocks = $derived.by(() => {
     if (!message?.contentBlocks || !Array.isArray(message.contentBlocks)) {
       return [];
     }
-    return message.contentBlocks.filter(
-      (block: any) => block.type === 'image' && block.data && block.mimeType,
+    return mergeHydratedContent(
+      message.contentBlocks,
+      message?.id ?? messageId,
+      $hydratedBlocks$,
+    ).filter(
+      (block: any) =>
+        block.type === 'image' && ((block.data && block.mimeType) || block.attachmentId),
     );
   });
 
-  // Open image in lightbox
+  // Resolved workspace-file:// URLs for attachment-reference image blocks,
+  // keyed by attachmentId. Registry rows are immutable so each id resolves
+  // once (module-level cache dedupes across messages); a failed resolve
+  // leaves the key unset and the thumbnail renders a placeholder.
+  let referenceImageUrls = $state<Record<string, string>>({});
+  // Attachment ids whose resolved <img> failed to load in this instance: they
+  // keep the placeholder here (no resolve/fail loop), while the evicted
+  // module cache lets the next render elsewhere retry.
+  let failedReferenceImages = $state<Record<string, true>>({});
+  // A backend drop fails every thumbnail read closed (no retry window), so
+  // once the window's backend reconnects, forget the failures and let the
+  // resolve effect below fetch those attachments again.
+  $effect(() =>
+    onBackendReconnected(() => {
+      if (Object.keys(failedReferenceImages).length === 0) return;
+      failedReferenceImages = {};
+    }),
+  );
+  $effect(() => {
+    const wsId = getOwningWorkspaceId();
+    if (!wsId) return;
+    for (const block of imageBlocks) {
+      const attachmentId = (block as ContentBlock).attachmentId;
+      if (
+        !attachmentId ||
+        referenceImageUrls[attachmentId] !== undefined ||
+        failedReferenceImages[attachmentId]
+      ) {
+        continue;
+      }
+      void resolveAttachmentImageUrl(wsId, attachmentId).then((url) => {
+        if (url) referenceImageUrls = { ...referenceImageUrls, [attachmentId]: url };
+      });
+    }
+  });
+
+  /** Renderable src for an image block: inline data URL or resolved reference URL. */
+  function imageBlockSrc(block: ContentBlock): string | null {
+    if (block.attachmentId) {
+      if (failedReferenceImages[block.attachmentId]) return null;
+      return referenceImageUrls[block.attachmentId] ?? null;
+    }
+    if (block.data && block.mimeType) return `data:${block.mimeType};base64,${block.data}`;
+    return null;
+  }
+
+  // A resolved reference thumbnail failed to load (the protocol handler
+  // refused the read, e.g. its backend is disconnected): fall back to the
+  // placeholder tile and evict the URL so the next render re-resolves.
+  function handleReferenceImageError(block: ContentBlock, src: string) {
+    const attachmentId = block.attachmentId;
+    if (!attachmentId) return;
+    logger.warn('Attachment thumbnail failed to load', { attachmentId, url: src });
+    const wsId = getOwningWorkspaceId();
+    if (wsId) evictAttachmentImageUrl(wsId, attachmentId);
+    const { [attachmentId]: _dropped, ...rest } = referenceImageUrls;
+    referenceImageUrls = rest;
+    failedReferenceImages = { ...failedReferenceImages, [attachmentId]: true };
+  }
+
+  // Truncated attachment awaiting hydration before its lightbox opens.
+  // Keeps the pre-click thumbnail block so the settle effect can still open
+  // something if the block list shifts underneath the fetch.
+  let pendingLightboxHydration = $state<{
+    blockId: string;
+    openerElement: HTMLButtonElement;
+    index: number;
+    thumbnailBlock: ContentBlock & { data: string; mimeType: string };
+  } | null>(null);
+
+  function isAttachmentHydrationLoading(blockId: string | undefined): boolean {
+    return blockId
+      ? isHydrationPending($hydratedBlocks$, message?.id ?? messageId, [blockId])
+      : false;
+  }
+
+  // Open image in lightbox. A slim-truncated attachment (thumbnail-only data,
+  // §5.5) first fetches the original via agent.getMessageBlock; the effect
+  // below opens the lightbox once hydration settles. Attachment-reference
+  // blocks open their resolved workspace-file:// URL directly (full bytes
+  // served by the protocol handler — no hydration round-trip needed).
   function openImageLightbox(
-    imageBlock: ContentBlock & { data: string; mimeType: string },
+    imageBlock: ContentBlock,
     openerElement: HTMLButtonElement,
     index: number = 0,
   ) {
     if (readOnly) return;
+    if (imageBlock.attachmentId) {
+      const url = referenceImageUrls[imageBlock.attachmentId];
+      if (!url) return;
+      lightboxImageUrl = url;
+      lightboxImageName =
+        imageBlock.fileName ||
+        m.chat_chatMessage_attachedImage_fallback({ number: formatInteger(index + 1) });
+      lightboxOpenerElement = openerElement;
+      lightboxOpen = true;
+      return;
+    }
+    if (!isImageBlock(imageBlock)) return;
+    const hydrationMessageId = message?.id ?? messageId;
+    if (imageBlock.dataTruncated === true && agentId && hydrationMessageId && imageBlock.id) {
+      pendingLightboxHydration = {
+        blockId: imageBlock.id,
+        openerElement,
+        index,
+        thumbnailBlock: imageBlock,
+      };
+      appStore.dispatch(messageBlockHydrationRequested(agentId, hydrationMessageId, imageBlock.id));
+      return;
+    }
     lightboxImageUrl = `data:${imageBlock.mimeType};base64,${imageBlock.data}`;
     lightboxImageName =
       imageBlock.fileName ||
@@ -796,6 +948,49 @@
     lightboxOpenerElement = openerElement;
     lightboxOpen = true;
   }
+
+  // Once the pending block's fetch settles, open the lightbox with the merged
+  // block: hydrated full data on success, the original thumbnail on failure
+  // (graceful fallback — the merge leaves errored blocks untouched). The
+  // block is looked up by id only — an index fallback could open a different
+  // image if the block list shifted between click and settle. If the id is
+  // gone (or the merged block is no longer a valid image), fall back to the
+  // pre-click thumbnail so the click never silently no-ops.
+  $effect(() => {
+    const pending = pendingLightboxHydration;
+    if (!pending) return;
+    // Reactive trigger only: the throttled selector readable re-runs this
+    // effect on each store cadence tick.
+    const hydratedFromReadable = $hydratedBlocks$;
+    // Decide on a FRESH store read, not the readable: its emit lags the
+    // request dispatch by up to one cadence tick (throttledSelectorFrequency),
+    // so on the click's own flush it still shows the pre-request map — no
+    // `loading` entry — and this effect would open the thumbnail immediately.
+    const hydrated = agentId
+      ? selectHydratedBlocks.select(appStore.state, agentId)
+      : hydratedFromReadable;
+    const hydrationMessageId = message?.id ?? messageId;
+    if (isHydrationPending(hydrated, hydrationMessageId, [pending.blockId])) return;
+    const mergedContent = Array.isArray(message?.contentBlocks)
+      ? mergeHydratedContent(message.contentBlocks, hydrationMessageId, hydrated)
+      : [];
+    const merged = mergedContent.find((b: any) => b.id === pending.blockId);
+    const block = merged && isImageBlock(merged) ? merged : pending.thumbnailBlock;
+    if (block === pending.thumbnailBlock || block.dataTruncated === true) {
+      logger.warn(
+        // i18n-ignore (diagnostic log line, not user-facing)
+        'Attachment lightbox falling back to thumbnail: hydration did not yield a full image block',
+        { agentId, messageId: hydrationMessageId, blockId: pending.blockId },
+      );
+    }
+    pendingLightboxHydration = null;
+    lightboxImageUrl = `data:${block.mimeType};base64,${block.data}`;
+    lightboxImageName =
+      block.fileName ||
+      m.chat_chatMessage_attachedImage_fallback({ number: formatInteger(pending.index + 1) });
+    lightboxOpenerElement = pending.openerElement;
+    lightboxOpen = true;
+  });
 
   // Extract file blocks from contentBlocks — both the legacy inline-data
   // variant (data + mimeType) and attachment-reference blocks (attachmentId,
@@ -1022,7 +1217,23 @@
     // Extract image blocks from contentBlocks and add as context items
     if (message?.contentBlocks && Array.isArray(message.contentBlocks)) {
       message.contentBlocks.forEach((block: any, index: number) => {
-        if (block.type === 'image' && block.data && block.mimeType) {
+        if (block.type === 'image' && block.attachmentId) {
+          // Attachment-reference image block (monorepo#3338): restore as a
+          // placed image item (UUID + mime marker, no bytes) so the edit
+          // re-sends the same reference without re-uploading.
+          contextItemsForEdit.push({
+            id: `image-attachment-${block.attachmentId}`,
+            type: 'file',
+            label: `Image ${index + 1}`,
+            description: block.mimeType || 'image',
+            attachmentId: block.attachmentId,
+            // `imageMimeType` doubles as the image marker downstream; a
+            // reference persisted without a mime keeps the neutral 'image'
+            // marker rather than fabricating one — the wire mimeType is
+            // optional on the reference arm and is omitted at re-send.
+            imageMimeType: block.mimeType || 'image',
+          });
+        } else if (block.type === 'image' && block.data && block.mimeType) {
           contextItemsForEdit.push({
             id: `image-${message.id}-${index}`,
             type: 'file',
@@ -1084,15 +1295,29 @@
   // handleCancelEdit exits edit mode.
   function handleConfirmEditSubmit() {
     showEditConfirm = false;
+    // An attachmentId item marked as an image (imageMimeType) re-sends as an
+    // image-reference block (monorepo#3338); inline imageData items re-send
+    // inline (the edit saga places them and swaps to references).
     const imageBlocks: ImageBlock[] = editContextItems
-      .filter((item) => item.imageData && item.imageMimeType)
-      .map((item) => ({
-        type: 'image' as const,
-        data: item.imageData!,
-        mimeType: item.imageMimeType!,
-      }));
+      .filter((item) => (item.imageData || item.attachmentId) && item.imageMimeType)
+      .map((item) =>
+        item.attachmentId
+          ? {
+              type: 'image' as const,
+              attachmentId: item.attachmentId,
+              // The neutral 'image' marker (reference restored without a
+              // mime) stays off the wire — mimeType is optional on the
+              // reference arm.
+              ...(item.imageMimeType!.includes('/') ? { mimeType: item.imageMimeType! } : {}),
+            }
+          : {
+              type: 'image' as const,
+              data: item.imageData!,
+              mimeType: item.imageMimeType!,
+            },
+      );
     const fileBlocks: FileBlock[] = editContextItems
-      .filter((item) => item.attachmentId)
+      .filter((item) => item.attachmentId && !item.imageMimeType)
       .map((item) => ({
         type: 'file' as const,
         attachmentId: item.attachmentId!,
@@ -1174,6 +1399,9 @@
   />
 {:else if questionsDismissedNotice}
   <QuestionsDismissedNotice title={extractAllContent(message) || undefined} />
+{:else if autoUnarchivedNotice}
+  <!-- Daemon-persisted auto-unarchive notice row - centered inline divider -->
+  <AutoUnarchivedNotice title={extractAllContent(message) || undefined} />
 {:else if questionOnlyTurn && !shouldShowStoppedIndicator && !finishReasonNoticeLabel}
   <!-- Agent Q&A is wizard-only: question-only turns render no bubble -->{:else}
   <div
@@ -1209,13 +1437,13 @@
           data-testid="user-message-surface"
           data-conversation-role="user"
           data-automated-wake-card={automatedWakePresentation ? '' : undefined}
-          data-external-spacing-owner={automatedWakePresentation
+          data-external-spacing-owner={automatedWakePresentation && !suppressAutomatedWakeTopSpacing
             ? 'automated-wake-card'
             : undefined}
           class="{agentAttribution
             ? `${SUBSCRIPTION_CARD_CONTAINMENT_CLASS} ${SUBSCRIPTION_CARD_SURFACE_CLASS}`
             : automatedWakePresentation
-              ? `relative ${SUBSCRIPTION_IN_THREAD_CARD_SPACING_CLASS} ${SUBSCRIPTION_CARD_CONTAINMENT_CLASS} ${SUBSCRIPTION_CARD_SURFACE_CLASS}`
+              ? `relative ${suppressAutomatedWakeTopSpacing ? 'mt-0' : SUBSCRIPTION_IN_THREAD_CARD_SPACING_CLASS} ${SUBSCRIPTION_CARD_CONTAINMENT_CLASS} ${SUBSCRIPTION_CARD_SURFACE_CLASS}`
               : USER_MESSAGE_SURFACE_CLASS} {onEditSubmit &&
           !agentAttribution &&
           !hookWakeAttribution &&
@@ -1351,7 +1579,22 @@
                 <!-- Render text with inline @mentions as chips -->
                 {#each parsedMessage.segments as segment, i (i)}
                   {#if segment.type === 'text'}
-                    <span class="whitespace-pre-wrap">{segment.content}</span>
+                    <span class="whitespace-pre-wrap"
+                      >{#each splitTextByUrls(segment.content) as part, j (j)}{#if part.type === 'link'}<a
+                            href={part.url}
+                            class="cursor-pointer break-all underline underline-offset-2 hover:opacity-80"
+                            title={part.url}
+                            onclick={(e) => {
+                              e.preventDefault();
+                              e.stopPropagation();
+                              const wsId = getOwningWorkspaceId();
+                              handleLink(part.url, {
+                                workspaceId: wsId ? WorkspaceId(wsId) : undefined,
+                                event: e,
+                              });
+                            }}>{part.url}</a
+                          >{:else}{part.content}{/if}{/each}</span
+                    >
                   {:else if segment.type === 'mention'}
                     {@const isContextProvider = ['linear', 'github', 'sentry', 'browser'].includes(
                       segment.mentionType,
@@ -1381,7 +1624,7 @@
                             });
                           }
                         } else if (segment.path) {
-                          openChatFile(segment.path, e);
+                          openChatFile(segment.path, e, segment.line);
                         } else if (segment.noteId) {
                           if (segment.mentionType === 'spec') {
                             openChatNote('spec', e);
@@ -1415,13 +1658,14 @@
               {#if imageBlocks.length > 0 && !isSticky}
                 <div class="flex flex-wrap gap-1.5 mt-2">
                   {#each imageBlocks as imageBlock, i (i)}
+                    {@const src = imageBlockSrc(imageBlock)}
                     <button
                       type="button"
                       class="relative group/image p-0 border-0 bg-transparent cursor-pointer overflow-hidden w-10 h-10 shrink-0 focus:outline-none focus:ring-2 focus:ring-primary rounded"
+                      class:animate-pulse={isAttachmentHydrationLoading(imageBlock.id)}
+                      aria-busy={isAttachmentHydrationLoading(imageBlock.id)}
                       onclick={(e) => {
-                        if (isImageBlock(imageBlock)) {
-                          openImageLightbox(imageBlock, e.currentTarget, i);
-                        }
+                        openImageLightbox(imageBlock, e.currentTarget, i);
                       }}
                       onkeydown={(e) => {
                         if (e.key === 'Enter' || e.key === ' ') {
@@ -1434,11 +1678,24 @@
                         total: formatInteger(imageBlocks.length),
                       })}
                     >
-                      <img
-                        src="data:{imageBlock.mimeType};base64,{imageBlock.data}"
-                        alt={m.chat_chatMessage_attachedImage_alt({ number: formatInteger(i + 1) })}
-                        class="w-full h-full rounded border border-border object-cover hover:opacity-90 transition-opacity"
-                      />
+                      {#if src}
+                        <img
+                          {src}
+                          alt={m.chat_chatMessage_attachedImage_alt({
+                            number: formatInteger(i + 1),
+                          })}
+                          class="w-full h-full rounded border border-border object-cover hover:opacity-90 transition-opacity"
+                          onerror={() => handleReferenceImageError(imageBlock, src)}
+                        />
+                      {:else}
+                        <!-- Reference still resolving, failed to load, or its
+                         file is gone: neutral placeholder tile instead of a
+                         broken img. -->
+                        <div
+                          class="w-full h-full rounded border border-border bg-muted/50"
+                          data-testid="chat-message-image-placeholder"
+                        ></div>
+                      {/if}
                     </button>
                   {/each}
                 </div>
@@ -1479,7 +1736,7 @@
               <!-- Send failure indicator for optimistic user messages -->
               {#if message?.error}
                 <div
-                  class="type-caption mt-2 flex items-center gap-2 font-medium text-destructive"
+                  class="type-caption mt-2 flex items-center gap-2 font-medium text-danger"
                   title={message.error}
                 >
                   <Fa icon={faCircleExclamation} class="size-2.5 mt-px" />
@@ -1497,25 +1754,46 @@
           content={combinedContent}
           {isStreaming}
           {hideToolCalls}
-          workspaceId={workspace?.id ? String(workspace.id) : undefined}
+          workspaceId={getOwningWorkspaceId()}
           {agentId}
           messageId={message?.id ?? messageId}
+          {isLastConversationMessage}
         />
+
+        {#snippet stoppedIndicatorLeading()}
+          <Fa icon={faSquare} class="{CHAT_OPERATIONAL_ICON_CLASS} text-subtle opacity-50" />
+        {/snippet}
+        {#snippet stoppedIndicatorSummary()}
+          <span class="font-medium text-subtle">{stoppedIndicatorLabel}</span>
+        {/snippet}
+        {#snippet finishReasonLeading()}
+          <Fa
+            icon={faCircleExclamation}
+            class="{CHAT_OPERATIONAL_ICON_CLASS} text-subtle opacity-50"
+          />
+        {/snippet}
+        {#snippet finishReasonSummary()}
+          <span class="font-medium text-subtle">{finishReasonNoticeLabel}</span>
+        {/snippet}
 
         <!-- Stopped indicator for interrupted messages -->
         {#if shouldShowStoppedIndicator}
-          <div class="type-caption mt-5 flex items-center gap-2 font-medium text-subtle">
-            <Fa icon={faSquare} class="size-2.5 opacity-50 mt-px" />
-            <span>{stoppedIndicatorLabel}</span>
-          </div>
+          <ChatOperationalRow
+            leading={stoppedIndicatorLeading}
+            summary={stoppedIndicatorSummary}
+            class="mt-5"
+            testId="stopped-indicator"
+          />
         {/if}
 
         <!-- Abnormal-finish notice (refusal / token limit, PROTOCOL §7.3) -->
         {#if finishReasonNoticeLabel}
-          <div class="type-caption mt-5 flex items-center gap-2 font-medium text-subtle">
-            <Fa icon={faCircleExclamation} class="size-2.5 opacity-50 mt-px" />
-            <span>{finishReasonNoticeLabel}</span>
-          </div>
+          <ChatOperationalRow
+            leading={finishReasonLeading}
+            summary={finishReasonSummary}
+            class="mt-5"
+            testId="finish-reason-notice"
+          />
         {/if}
 
         <!-- Actions for assistant messages: overlay without shifting content on hover/focus -->

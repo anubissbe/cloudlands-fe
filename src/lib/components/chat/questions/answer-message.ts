@@ -1,4 +1,4 @@
-import type { ContentBlock } from '$shared/types/content-block';
+import type { ContentBlock } from '$shared/types';
 import type { Question } from '$shared/types/question-resource';
 
 /**
@@ -40,7 +40,7 @@ export function flattenAnswersToMessage(answers: readonly QuestionAnswer[]): str
 }
 
 /** `messageMetadata.type` marking a wizard answer message. */
-export const QUESTION_ANSWERS_METADATA_TYPE = 'question_answers';
+const QUESTION_ANSWERS_METADATA_TYPE = 'question_answers';
 
 /** The answer tag carried on the wizard's `agent.sendMessage` request. */
 export type QuestionAnswersMetadata = {

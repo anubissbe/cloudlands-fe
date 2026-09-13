@@ -11,7 +11,15 @@ vi.mock('../../../utils/safe-local-storage-saga', () => ({
   },
 }));
 
-import { loadScrollPositions, loadWorkspaceTabsState, openWorkspaceTab, saveScrollPosition, TAB_SCROLL_POSITIONS_STORAGE_KEY, WORKSPACE_TABS_STORAGE_KEY, workspaceTabsHydrated } from '../tab-state-slice';
+import {
+  loadScrollPositions,
+  loadWorkspaceTabsState,
+  openWorkspaceTab,
+  saveScrollPosition,
+  TAB_SCROLL_POSITIONS_STORAGE_KEY,
+  WORKSPACE_TABS_STORAGE_KEY,
+  workspaceTabsHydrated,
+} from '../tab-state-slice';
 import { LOCAL_CONNECTION_ID } from '$shared/types/connections';
 import { connectionsListReceived } from '../../connections/connections-slice';
 import { tabStateSaga } from './tab-state-saga';
@@ -24,8 +32,9 @@ const persistedTabs = {
   optimisticTabs: ['optimistic-1'],
   tabOrder: ['ws-1'],
   workspaceStacks: [['ws-1']],
-  viewMode: 'columns' as const,
 };
+
+const legacyPersistedTabs = { ...persistedTabs, viewMode: 'columns' as const };
 
 const state = {
   tabState: {
@@ -37,16 +46,15 @@ const state = {
     optimisticTabs: { 'optimistic-1': true },
     tabOrder: ['ws-1'],
     workspaceStacks: [['ws-1']],
-    viewMode: 'columns' as const,
   },
   workspace: { hasLoaded: true },
-  connections: { activeId: LOCAL_CONNECTION_ID },
+  connections: { activeId: LOCAL_CONNECTION_ID, windowBackendId: LOCAL_CONNECTION_ID },
 };
 
 const REMOTE_ID = 'remote-1';
 const REMOTE_TABS_KEY = `backend:${REMOTE_ID}:${WORKSPACE_TABS_STORAGE_KEY}`;
 const REMOTE_SCROLL_KEY = `backend:${REMOTE_ID}:${TAB_SCROLL_POSITIONS_STORAGE_KEY}`;
-const remoteState = { ...state, connections: { activeId: REMOTE_ID } };
+const remoteState = { ...state, connections: { activeId: REMOTE_ID, windowBackendId: REMOTE_ID } };
 
 const settle = async () => {
   await Promise.resolve();
@@ -57,9 +65,9 @@ const settle = async () => {
 describe('tabStateSaga', () => {
   beforeEach(() => vi.clearAllMocks());
 
-  it('hydrates scroll positions before the exact persisted workspace-tab snapshot', async () => {
+  it('hydrates scroll positions before an old persisted workspace-tab snapshot', async () => {
     storage.getJSON.mockImplementation((key: string) =>
-      key === TAB_SCROLL_POSITIONS_STORAGE_KEY ? { 'ws-1-note': 42 } : persistedTabs,
+      key === TAB_SCROLL_POSITIONS_STORAGE_KEY ? { 'ws-1-note': 42 } : legacyPersistedTabs,
     );
     const dispatch = vi.fn();
     const task = runSaga({ channel: stdChannel(), dispatch, getState: () => state }, tabStateSaga);
@@ -67,7 +75,7 @@ describe('tabStateSaga', () => {
 
     expect(dispatch.mock.calls.map(([action]) => action)).toEqual([
       loadScrollPositions({ 'ws-1-note': 42 }),
-      loadWorkspaceTabsState(persistedTabs),
+      loadWorkspaceTabsState(legacyPersistedTabs),
       workspaceTabsHydrated(LOCAL_CONNECTION_ID),
     ]);
     task.cancel();
@@ -123,7 +131,13 @@ describe('tabStateSaga', () => {
       dispatch.mockClear();
 
       current = remoteState;
-      channel.put(connectionsListReceived({ connections: [], activeId: REMOTE_ID }));
+      channel.put(
+        connectionsListReceived({
+          connections: [],
+          activeId: REMOTE_ID,
+          windowBackendId: REMOTE_ID,
+        }),
+      );
       await settle();
 
       expect(dispatch.mock.calls.map(([action]) => action)).toEqual([
@@ -145,7 +159,10 @@ describe('tabStateSaga', () => {
         {
           channel,
           dispatch,
-          getState: () => ({ ...state, connections: { activeId: backendId } }),
+          getState: () => ({
+            ...state,
+            connections: { activeId: backendId, windowBackendId: backendId },
+          }),
         },
         tabStateSaga,
       );
@@ -159,12 +176,17 @@ describe('tabStateSaga', () => {
         optimisticTabs: [],
         tabOrder: ['ws-2'],
         workspaceStacks: [['ws-2']],
-        viewMode: 'single',
       });
 
       backendId = 'remote-backend';
       dispatch.mockClear();
-      channel.put(connectionsListReceived({ connections: [], activeId: 'remote-backend' }));
+      channel.put(
+        connectionsListReceived({
+          connections: [],
+          activeId: 'remote-backend',
+          windowBackendId: 'remote-backend',
+        }),
+      );
       await new Promise(setImmediate);
 
       const loadActions = dispatch.mock.calls.filter(

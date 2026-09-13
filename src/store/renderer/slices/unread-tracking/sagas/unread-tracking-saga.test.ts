@@ -3,17 +3,33 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { CHIEF_WORKSPACE_ID } from '$shared/types/branded-ids';
 
-const marks = vi.hoisted(() => ({ boundary: vi.fn(), finish: vi.fn(), send: vi.fn() }));
+const marks = vi.hoisted(() => ({
+  boundary: vi.fn(),
+  finish: vi.fn(),
+  hydrated: vi.fn(),
+  release: vi.fn(),
+  send: vi.fn(),
+  view: vi.fn(),
+}));
 vi.mock('$features/agent/mark-agent-seen', async (importOriginal) => {
   const actual = await importOriginal<typeof import('$features/agent/mark-agent-seen')>();
   return {
     ...actual,
     markAgentSeenAtBoundary: marks.boundary,
+    markAgentSeenOnTranscriptHydrated: marks.hydrated,
     markAgentSeenOnTurnFinish: marks.finish,
     markAgentSeenOnUserSend: marks.send,
+    markAgentSeenOnView: marks.view,
+    releaseViewAwaitingTranscript: marks.release,
   };
 });
 
+import {
+  clearChatScrollCacheForTests,
+  getCachedChatScroll,
+  setCachedChatScroll,
+} from '$lib/components/chat/chat-scroll-cache';
+import { replaceMessages } from '../../agent-session/agent-session-slice';
 import { sendMessage } from '../../chat-state/chat-state-slice';
 import { closeTab } from '../../panel-layout/panel-layout-slice';
 import { closePanel } from '../../sidebar-nav/sidebar-nav-slice';
@@ -21,6 +37,7 @@ import { openWorkspaceTab } from '../../tab-state/tab-state-slice';
 import { agentStreamUpdateReceived } from '../../workspace-agents/workspace-agents-stream-slice';
 import type { StoreState } from '../../../types';
 import type { DividerBoundarySnapshot } from '../unread-tracking-selectors';
+import { clearCurrentlyViewedAgent, markAgentAsViewed } from '../unread-tracking-slice';
 import { detectDividerSessionBoundary, unreadTrackingSaga } from './unread-tracking-saga';
 
 const snapshot = (overrides: Partial<DividerBoundarySnapshot> = {}): DividerBoundarySnapshot => ({
@@ -35,6 +52,7 @@ const snapshot = (overrides: Partial<DividerBoundarySnapshot> = {}): DividerBoun
 function state(
   current: DividerBoundarySnapshot,
   agentSessionsByAgentId: Record<string, { messages: unknown[]; isStreaming?: boolean }> = {},
+  currentlyViewedAgentId: string | null = null,
 ): StoreState {
   return {
     tabState: { currentTabId: current.activeWorkspaceId },
@@ -44,7 +62,7 @@ function state(
       hoveredItem: null,
     },
     unreadTracking: {
-      currentlyViewedAgentId: null,
+      currentlyViewedAgentId,
       dividerSessionByAgentId: Object.fromEntries(
         current.dividerSessionAgentIds.map((id) => [id, { anchorId: null }]),
       ),
@@ -128,11 +146,13 @@ describe('detectDividerSessionBoundary', () => {
       nextWorkspaceId: 'ws-2',
     });
   });
-
 });
 
 describe('unreadTrackingSaga', () => {
-  beforeEach(() => vi.clearAllMocks());
+  beforeEach(() => {
+    vi.clearAllMocks();
+    clearChatScrollCacheForTests();
+  });
 
   it('owns user-send and terminal-stream mark-seen triggers', async () => {
     const channel = stdChannel();
@@ -150,6 +170,71 @@ describe('unreadTrackingSaga', () => {
     await settle();
     expect(marks.send).toHaveBeenCalledWith('a1');
     expect(marks.finish).toHaveBeenCalledWith('a1');
+    task.cancel();
+    await task.toPromise();
+  });
+
+  it('owns the view trigger: markAgentAsViewed schedules markAgentSeenOnView', async () => {
+    // Opening an already-finished conversation: the panel dispatches
+    // markAgentAsViewed and the saga schedules the (self-gating) view
+    // trigger — this is the only path that can clear an agent whose turn
+    // finished before the conversation was opened.
+    const channel = stdChannel();
+    const current = snapshot();
+    const { task } = startSaga(channel, vi.fn(), () => state(current));
+    channel.put(markAgentAsViewed('a1'));
+    await settle();
+    expect(marks.view).toHaveBeenCalledWith('a1');
+    task.cancel();
+    await task.toPromise();
+  });
+
+  it('re-arms the view trigger when the viewed agent transcript hydrates late', async () => {
+    // Remote daemon: the chat.subscribe seq-0 snapshot (replaceMessages) can
+    // land after the view debounce fired against an empty transcript; it must
+    // re-trigger the view path for the agent still on screen — exactly once.
+    const channel = stdChannel();
+    const current = snapshot();
+    const { task } = startSaga(channel, vi.fn(), () => state(current, {}, 'a1'));
+    channel.put(replaceMessages('a1', []));
+    await settle();
+    expect(marks.hydrated).toHaveBeenCalledTimes(1);
+    expect(marks.hydrated).toHaveBeenCalledWith('a1');
+    task.cancel();
+    await task.toPromise();
+  });
+
+  it('releases the late-transcript re-arm when the viewed conversation is cleared', async () => {
+    const channel = stdChannel();
+    const current = snapshot();
+    const { task } = startSaga(channel, vi.fn(), () => state(current, {}, null));
+    channel.put(clearCurrentlyViewedAgent());
+    await settle();
+    expect(marks.release).toHaveBeenCalledTimes(1);
+    task.cancel();
+    await task.toPromise();
+  });
+
+  it('keeps the re-arm when a scoped clear was ignored because another agent is viewed', async () => {
+    // A deactivating background panel's trailing clear(a1) after a2 became
+    // viewed is a reducer no-op (monorepo#1215); it must not release a2's arm.
+    const channel = stdChannel();
+    const current = snapshot();
+    const { task } = startSaga(channel, vi.fn(), () => state(current, {}, 'a2'));
+    channel.put(clearCurrentlyViewedAgent('a1'));
+    await settle();
+    expect(marks.release).not.toHaveBeenCalled();
+    task.cancel();
+    await task.toPromise();
+  });
+
+  it('ignores transcript hydration for agents that are not the viewed one', async () => {
+    const channel = stdChannel();
+    const current = snapshot();
+    const { task } = startSaga(channel, vi.fn(), () => state(current, {}, 'a1'));
+    channel.put(replaceMessages('a2', []));
+    await settle();
+    expect(marks.hydrated).not.toHaveBeenCalled();
     task.cancel();
     await task.toPromise();
   });
@@ -240,6 +325,74 @@ describe('unreadTrackingSaga', () => {
     expect(dispatch).toHaveBeenCalledWith({
       type: 'unreadTracking/endDividerSession',
       payload: ['a1'],
+    });
+    task.cancel();
+    await task.toPromise();
+  });
+
+  it('clears the cached chat scroll for affected agents on tab close', async () => {
+    // Regression (top-landing on re-entry): a stale cached position must not
+    // survive a tab-close boundary — the next open lands at the bottom or
+    // the divider, not at a clamped old scrollTop.
+    setCachedChatScroll('ws-1', 'a1', { scrollTop: 987, shouldFollowBottom: false });
+    setCachedChatScroll('ws-1', 'other', { scrollTop: 55, shouldFollowBottom: false });
+    const channel = stdChannel();
+    let current = snapshot({ dividerSessionAgentIds: ['a1'], openAgentTabIds: ['a1'] });
+    const { task } = startSaga(channel, vi.fn(), () => state(current));
+    await settle();
+    current = snapshot({ dividerSessionAgentIds: ['a1'] });
+    channel.put(closeTab('ws-1', 'tab-a1'));
+    await settle();
+    expect(getCachedChatScroll('ws-1', 'a1')).toBeUndefined();
+    expect(getCachedChatScroll('ws-1', 'other')).toEqual({
+      scrollTop: 55,
+      shouldFollowBottom: false,
+    });
+    task.cancel();
+    await task.toPromise();
+  });
+
+  // NOTE: the boundary clear runs in the dispatch tick, BEFORE Svelte's
+  // microtask teardown flush destroys the departing ChatPanel. The panel's
+  // destroy-time cache write cannot repopulate the cleared entry because it
+  // is suppressed state-side (canRecordChatScroll refuses once
+  // endDividerSession — dispatched in the same finishBoundary — has ended
+  // the agent's session); that cross-layer regression is pinned in
+  // ChatPanel-lifecycle.test.ts, which can mount a real panel.
+
+  it('clears the cached chat scroll for affected agents on workspace switch', async () => {
+    setCachedChatScroll('ws-1', 'a1', { scrollTop: 987, shouldFollowBottom: false });
+    const channel = stdChannel();
+    let current = snapshot({ activeWorkspaceId: 'ws-1', dividerSessionAgentIds: ['a1'] });
+    const { task, notify } = startSaga(channel, vi.fn(), () => state(current));
+    await settle();
+    current = { ...current, activeWorkspaceId: 'ws-2' };
+    notify();
+    await settle();
+    expect(getCachedChatScroll('ws-1', 'a1')).toBeUndefined();
+    task.cancel();
+    await task.toPromise();
+  });
+
+  it('keeps the cached chat scroll on a chief-card-close boundary', async () => {
+    setCachedChatScroll('ws-1', 'chief-1', { scrollTop: 321, shouldFollowBottom: false });
+    const channel = stdChannel();
+    let current = snapshot({
+      chiefCardVisible: true,
+      chiefSessionAgentIds: ['chief-1'],
+      dividerSessionAgentIds: ['chief-1'],
+    });
+    const { task } = startSaga(channel, vi.fn(), () => state(current));
+    await settle();
+    current = snapshot({
+      chiefSessionAgentIds: ['chief-1'],
+      dividerSessionAgentIds: ['chief-1'],
+    });
+    channel.put(closePanel());
+    await settle();
+    expect(getCachedChatScroll('ws-1', 'chief-1')).toEqual({
+      scrollTop: 321,
+      shouldFollowBottom: false,
     });
     task.cancel();
     await task.toPromise();

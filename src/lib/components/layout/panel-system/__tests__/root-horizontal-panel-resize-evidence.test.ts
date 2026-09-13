@@ -9,12 +9,13 @@ import {
   initializeLayout,
   panelLayoutScopeMounted,
   panelLayoutScopeUnmounted,
-  resizePanelLayoutAtHorizontalPanel,
+  resizePanelLayoutAtRootDivider,
   setRestoreStatus,
 } from '$store/renderer/slices/panel-layout/panel-layout-slice';
 import { selectPanelCanvasWidth } from '$store/renderer/slices/panel-layout/panel-layout-selectors';
 import { panelLayoutSaga } from '$store/renderer/slices/panel-layout/sagas/panel-layout-saga';
 import { PANEL_LAYOUT_STORAGE_KEY_PREFIX } from '$store/renderer/slices/panel-layout/panel-layout-types';
+import { resizePanelWidthsAtDivider } from '$shared/panel-layout-sizing';
 import PanelLayout from '../PanelLayout.svelte';
 
 const STORE_CONTEXT = 'redux-store-context';
@@ -29,6 +30,11 @@ let storeContext: ReduxStoreContext | undefined;
 let sagaTask: Task | undefined;
 let sagaChannel: ReturnType<typeof stdChannel> | undefined;
 let storage = new Map<string, string>();
+
+function storageWriteCount(): number {
+  // eslint-disable-next-line themis/direct-local-storage-usage -- Test inspects the mocked boundary.
+  return vi.mocked(localStorage.setItem).mock.calls.length;
+}
 
 class TestResizeObserver {
   static instances = new Set<TestResizeObserver>();
@@ -74,8 +80,9 @@ function flexWidth(element: HTMLElement): number {
 }
 
 function canvasWidth(): number {
-  const canvas = document.querySelector<HTMLElement>('.panel-canvas-resize-handle')?.parentElement;
-  return Number.parseFloat(canvas?.style.width ?? '0');
+  let node = document.querySelector<HTMLElement>('.panel-split-container.horizontal');
+  while (node && !node.style.width) node = node.parentElement;
+  return Number.parseFloat(node?.style.width ?? '0');
 }
 
 function panelWidths(): number[] {
@@ -96,9 +103,22 @@ function expectWidths(expected: number[]) {
 }
 
 function widthsAfterDelta(index: number, delta: number): number[] {
+  return resizePanelWidthsAtDivider(panelWidths(), index, delta).panelWidths;
+}
+
+function widthsAfterOuterDelta(delta: number): number[] {
   const expected = panelWidths();
-  expected[index] = Math.max(96, expected[index] + delta);
+  expected[expected.length - 1] += delta;
   return expected;
+}
+
+function widthsAfterFixedViewportOuterDelta(delta: number): number[] {
+  const current = panelWidths();
+  const currentTotal = current.reduce((sum, width) => sum + width, 0);
+  const scale = currentTotal / (currentTotal + delta);
+  return current.map((width, index) =>
+    index === current.length - 1 ? (width + delta) * scale : width * scale,
+  );
 }
 
 function splitHandle(index: number): HTMLButtonElement {
@@ -292,11 +312,13 @@ describe('root horizontal resize release evidence', () => {
     expect(inset.scrollLeft).toBe(173);
     await releaseAndSample(splitHandle(1), 200, [180, 160, 140], widthsAfterDelta(1, -60));
     expect(inset.scrollLeft).toBe(173);
-    await releaseAndSample(outerHandle(), 1000, [1030, 1060, 1090], widthsAfterDelta(2, 90));
+    const outerExpected =
+      mode === 'tab' ? widthsAfterFixedViewportOuterDelta(90) : widthsAfterOuterDelta(90);
+    await releaseAndSample(outerHandle(), 1000, [1030, 1060, 1090], outerExpected);
     expect(inset.scrollLeft).toBe(173);
   });
 
-  it('preserves siblings through repeated expand, shrink, rapid input, and the minimum clamp', async () => {
+  it('keeps totals valid through repeated proportional resize and minimum clamps', async () => {
     await mount('columns');
     await releaseAndSample(splitHandle(0), 100, [140, 196], widthsAfterDelta(0, 96));
     await releaseAndSample(splitHandle(0), 100, [80, 20, -40], widthsAfterDelta(0, -140));
@@ -317,8 +339,10 @@ describe('root horizontal resize release evidence', () => {
     await settleSaga();
     const persistedWidths = widthsAfterDelta(0, 88);
     const trace = await releaseAndSample(splitHandle(0), 100, [188], persistedWidths);
-    sagaChannel!.put({ type: resizePanelLayoutAtHorizontalPanel.type, payload: [WORKSPACE_ID] });
+    const writesBeforePersist = storageWriteCount();
+    sagaChannel!.put({ type: resizePanelLayoutAtRootDivider.type, payload: [WORKSPACE_ID] });
     await settleSaga();
+    expect(storageWriteCount()).toBe(writesBeforePersist + 1);
 
     const serialized = JSON.parse(storage.get(STORAGE_KEY) ?? 'null');
     const persistedCanvasWidth = canvasWidth();
@@ -357,6 +381,21 @@ describe('root horizontal resize release evidence', () => {
     );
     result.unmount();
 
+    sagaChannel!.put(panelLayoutScopeUnmounted(WORKSPACE_ID));
+    await settleSaga();
+    sagaChannel!.put(panelLayoutScopeMounted(WORKSPACE_ID));
+    await settleSaga();
+    const secondRestore = await mount('columns', persistedCanvasWidth);
+    expectWidths(persistedWidths);
+    secondRestore.unmount();
+
+    // A same-session scope remount keeps the live in-memory layout (#4835), so
+    // a legacy stored shape is only migrated on a real restart: stop the saga
+    // and the store before mounting against the legacy fixture.
+    sagaChannel!.put(panelLayoutScopeUnmounted(WORKSPACE_ID));
+    await settleSaga();
+    await stopSaga();
+    storeContext?.dispose();
     storage.set(
       STORAGE_KEY,
       JSON.stringify({
@@ -366,7 +405,8 @@ describe('root horizontal resize release evidence', () => {
         canvasWidth: 1600,
       }),
     );
-    sagaChannel!.put(panelLayoutScopeUnmounted(WORKSPACE_ID));
+    storeContext = initAppStore(appStore);
+    startProductionSaga();
     await settleSaga();
     sagaChannel!.put(panelLayoutScopeMounted(WORKSPACE_ID));
     await settleSaga();
@@ -381,8 +421,31 @@ describe('root horizontal resize release evidence', () => {
     });
     await waitFor(() => expect(canvasWidth()).toBe(500));
     expect(selectPanelCanvasWidth.select(appStore.state, WORKSPACE_ID)).toBeNull();
-    expect(appStore.state.panelLayout.byWorkspaceId[WORKSPACE_ID].canvasWidthSource).toBeNull();
+    expect(appStore.state.panelLayout.byWorkspaceId[WORKSPACE_ID]).toMatchObject({
+      root: { type: 'panel', panelId: 'legacy' },
+      columnCount: 1,
+      canvasWidthSource: null,
+    });
     expect(document.querySelector('[data-panel-id="legacy"]')).not.toBeNull();
     legacy.unmount();
+  });
+
+  it('does not persist or alter history for a no-op divider drag', async () => {
+    await mount('columns');
+    startProductionSaga();
+    await settleSaga();
+    const workspaceBefore = appStore.state.panelLayout.byWorkspaceId[WORKSPACE_ID];
+    const writesBefore = storageWriteCount();
+
+    fireEvent.mouseDown(splitHandle(0), { clientX: 100 });
+    fireEvent.mouseUp(document, { clientX: 100 });
+    await tick();
+    await settleSaga();
+
+    expect(appStore.state.panelLayout.byWorkspaceId[WORKSPACE_ID]).toBe(workspaceBefore);
+    expect(appStore.state.panelLayout.byWorkspaceId[WORKSPACE_ID].layoutHistory).toBe(
+      workspaceBefore.layoutHistory,
+    );
+    expect(storageWriteCount()).toBe(writesBefore);
   });
 });

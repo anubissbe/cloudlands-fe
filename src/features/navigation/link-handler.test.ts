@@ -1,6 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { handleLink, createGlobalLinkClickHandler, createLinkClickHandler } from './link-handler';
-import { openTerminalTabRequested } from '$store/renderer/slices/app-layout/app-layout-slice';
 import { openWorkspaceFile } from '$store/renderer/slices/workspace-navigation/workspace-navigation-slice';
 import type { WorkspaceId } from '$shared/types/branded-ids';
 import type { Workspace } from '$shared/types';
@@ -30,9 +29,7 @@ vi.mock('../../shared/generated/ipc-client', () => ({
 }));
 
 // Entry-point URL resolution (loopback rewrite/probe/tunnel); echoes by default
-const resolveBrowserLinkForOpenMock = vi.hoisted(() =>
-  vi.fn(async (url: string) => ({ url })),
-);
+const resolveBrowserLinkForOpenMock = vi.hoisted(() => vi.fn(async (url: string) => ({ url })));
 vi.mock('$lib/utils/browser-link-open', () => ({
   resolveBrowserLinkForOpen: resolveBrowserLinkForOpenMock,
 }));
@@ -89,7 +86,7 @@ describe('handleLink – devspace://terminal routing', () => {
     reduxDispatchMock.mockClear();
   });
 
-  it('should dispatch openTerminalTabRequested for devspace://terminal/{id}', async () => {
+  it('should dispatch panel-layout openTab for devspace://terminal/{id}', async () => {
     const result = await handleLink('devspace://terminal/term-123', {
       workspaceId: TEST_WORKSPACE_ID,
     });
@@ -97,7 +94,17 @@ describe('handleLink – devspace://terminal routing', () => {
     expect(result).toBe(true);
     expect(reduxDispatchMock).toHaveBeenCalledOnce();
     expect(reduxDispatchMock).toHaveBeenCalledWith(
-      openTerminalTabRequested(TEST_WORKSPACE_ID, { terminalId: 'term-123' }),
+      expect.objectContaining({
+        type: 'panelLayout/openTab',
+        payload: expect.objectContaining({
+          wsId: TEST_WORKSPACE_ID,
+          tab: expect.objectContaining({
+            type: 'terminal',
+            terminalId: 'term-123',
+            closable: true,
+          }),
+        }),
+      }),
     );
   });
 
@@ -108,7 +115,39 @@ describe('handleLink – devspace://terminal routing', () => {
 
     expect(result).toBe(true);
     expect(reduxDispatchMock).toHaveBeenCalledWith(
-      openTerminalTabRequested(TEST_WORKSPACE_ID, { terminalId: 'terminal with spaces' }),
+      expect.objectContaining({
+        type: 'panelLayout/openTab',
+        payload: expect.objectContaining({
+          wsId: TEST_WORKSPACE_ID,
+          tab: expect.objectContaining({
+            type: 'terminal',
+            terminalId: 'terminal with spaces',
+          }),
+        }),
+      }),
+    );
+  });
+
+  it('should open the terminal beside the source panel on Cmd/Ctrl+Click', async () => {
+    const result = await handleLink('devspace://terminal/term-123', {
+      workspaceId: TEST_WORKSPACE_ID,
+      sourcePanelId: 'panel-chat',
+      modifiers: { metaKey: true, ctrlKey: true },
+    });
+
+    expect(result).toBe(true);
+    expect(reduxDispatchMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'panelLayout/openTabInAdjacentOrSplit',
+        payload: expect.objectContaining({
+          wsId: TEST_WORKSPACE_ID,
+          sourcePanelId: 'panel-chat',
+          tab: expect.objectContaining({
+            type: 'terminal',
+            terminalId: 'term-123',
+          }),
+        }),
+      }),
     );
   });
 
@@ -187,7 +226,7 @@ describe('createGlobalLinkClickHandler – click-path regression', () => {
     document.body.innerHTML = '';
   });
 
-  it('should route devspace://terminal links to openTerminalTabRequested via click', async () => {
+  it('should route devspace://terminal links to a panel-layout openTab via click', async () => {
     const { container, anchor } = buildContainerWithLink('devspace://terminal/abc-456');
     const cleanup = createGlobalLinkClickHandler(container, { workspaceId: TEST_WORKSPACE_ID });
 
@@ -200,7 +239,13 @@ describe('createGlobalLinkClickHandler – click-path regression', () => {
     });
 
     expect(reduxDispatchMock).toHaveBeenCalledWith(
-      openTerminalTabRequested(TEST_WORKSPACE_ID, { terminalId: 'abc-456' }),
+      expect.objectContaining({
+        type: 'panelLayout/openTab',
+        payload: expect.objectContaining({
+          wsId: TEST_WORKSPACE_ID,
+          tab: expect.objectContaining({ type: 'terminal', terminalId: 'abc-456' }),
+        }),
+      }),
     );
 
     cleanup();
@@ -274,7 +319,13 @@ describe('createLinkClickHandler (deprecated) – click-path regression', () => 
     await handler(event);
 
     expect(reduxDispatchMock).toHaveBeenCalledWith(
-      openTerminalTabRequested(TEST_WORKSPACE_ID, { terminalId: 'legacy-term' }),
+      expect.objectContaining({
+        type: 'panelLayout/openTab',
+        payload: expect.objectContaining({
+          wsId: TEST_WORKSPACE_ID,
+          tab: expect.objectContaining({ type: 'terminal', terminalId: 'legacy-term' }),
+        }),
+      }),
     );
   });
 });
@@ -328,6 +379,58 @@ describe('handleLink – path-like targets → workspace file viewer', () => {
     );
   });
 
+  it('keeps exact relative and absolute ignored artifact paths in the owning workspace', async () => {
+    const relative = '.demo-artifacts/20260824T234627Z-frontend-preview/frontend-preview.webm';
+    await handleLink(resolvedUrl(relative), { workspaceId: TEST_WORKSPACE_ID, rawHref: relative });
+    await handleLink(`${TEST_WORKTREE_ROOT}/${relative}`, {
+      workspaceId: TEST_WORKSPACE_ID,
+      rawHref: `${TEST_WORKTREE_ROOT}/${relative}`,
+    });
+
+    expect(reduxDispatchMock).toHaveBeenNthCalledWith(
+      1,
+      openWorkspaceFile(TEST_WORKSPACE_ID, relative, {
+        line: undefined,
+        openInAdjacentPanel: false,
+      }),
+    );
+    expect(reduxDispatchMock).toHaveBeenNthCalledWith(
+      2,
+      openWorkspaceFile(TEST_WORKSPACE_ID, relative, {
+        line: undefined,
+        openInAdjacentPanel: false,
+      }),
+    );
+  });
+
+  it('relativizes an absolute path inside the frontend submodule', async () => {
+    const rawHref = `${TEST_WORKTREE_ROOT}/packages/cloudlands-fe/src/app.html`;
+    await handleLink(resolvedUrl(rawHref), { workspaceId: TEST_WORKSPACE_ID, rawHref });
+
+    expect(reduxDispatchMock).toHaveBeenCalledWith(
+      openWorkspaceFile(TEST_WORKSPACE_ID, 'packages/cloudlands-fe/src/app.html', {
+        line: undefined,
+        openInAdjacentPanel: false,
+      }),
+    );
+  });
+
+  it.each([
+    '../outside.png',
+    'src/../../outside.webm',
+    `${TEST_WORKTREE_ROOT}/../outside.png`,
+    `${TEST_WORKTREE_ROOT}/%2e%2e/outside.png`,
+  ])('rejects traversal in workspace file links: %s', async (rawHref) => {
+    const result = await handleLink(resolvedUrl(rawHref), {
+      workspaceId: TEST_WORKSPACE_ID,
+      rawHref,
+    });
+
+    expect(result).toBe(false);
+    expect(reduxDispatchMock).not.toHaveBeenCalled();
+    expect(invokeIpcMock).not.toHaveBeenCalled();
+  });
+
   it('should open absolute paths outside the worktree root in the external editor', async () => {
     const rawHref = '/other/place/file.rs';
     const result = await handleLink(resolvedUrl(rawHref), {
@@ -341,6 +444,20 @@ describe('handleLink – path-like targets → workspace file viewer', () => {
       url: 'vscode://file//other/place/file.rs',
     });
     expect(openBrowserPanelMock).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['/other/place/file.rs:17', 'vscode://file//other/place/file.rs:17'],
+    ['/other/place/file.rs:17:4', 'vscode://file//other/place/file.rs:17:4'],
+  ])('preserves locations on outside-worktree paths: %s', async (rawHref, expectedUrl) => {
+    const result = await handleLink(resolvedUrl(rawHref), {
+      workspaceId: TEST_WORKSPACE_ID,
+      rawHref,
+    });
+
+    expect(result).toBe(true);
+    expect(reduxDispatchMock).not.toHaveBeenCalled();
+    expect(invokeIpcMock).toHaveBeenCalledWith('shell:openExternal', { url: expectedUrl });
   });
 
   it('should route self-origin resolved URLs without rawHref to the file viewer, not the browser panel', async () => {
@@ -369,6 +486,22 @@ describe('handleLink – path-like targets → workspace file viewer', () => {
     expect(reduxDispatchMock).toHaveBeenCalledWith(
       openWorkspaceFile(TEST_WORKSPACE_ID, 'src/main.rs', {
         line: 42,
+        openInAdjacentPanel: false,
+      }),
+    );
+  });
+
+  it('should map a trailing :<line> suffix to the line option', async () => {
+    const rawHref = 'src/main.rs:17';
+    const result = await handleLink(resolvedUrl(rawHref), {
+      workspaceId: TEST_WORKSPACE_ID,
+      rawHref,
+    });
+
+    expect(result).toBe(true);
+    expect(reduxDispatchMock).toHaveBeenCalledWith(
+      openWorkspaceFile(TEST_WORKSPACE_ID, 'src/main.rs', {
+        line: 17,
         openInAdjacentPanel: false,
       }),
     );
@@ -405,7 +538,15 @@ describe('handleLink – path-like targets → workspace file viewer', () => {
       event,
     });
 
-    expect(reduxDispatchMock).toHaveBeenCalledWith(
+    expect(reduxDispatchMock).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({
+        type: 'panelLayout/focusPanel',
+        payload: expect.objectContaining({ wsId: TEST_WORKSPACE_ID, panelId: 'panel-chat' }),
+      }),
+    );
+    expect(reduxDispatchMock).toHaveBeenNthCalledWith(
+      2,
       openWorkspaceFile(TEST_WORKSPACE_ID, 'src/scoped.ts', {
         line: undefined,
         openInAdjacentPanel: false,
@@ -414,7 +555,7 @@ describe('handleLink – path-like targets → workspace file viewer', () => {
     );
   });
 
-  it('opens browser links in the workspace-column layout and source panel', async () => {
+  it('opens browser links in the current workspace and source panel', async () => {
     const panel = document.createElement('div');
     panel.dataset.panelId = 'panel-chat';
     const anchor = document.createElement('a');
@@ -427,6 +568,12 @@ describe('handleLink – path-like targets → workspace file viewer', () => {
       event,
     });
 
+    expect(reduxDispatchMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'panelLayout/focusPanel',
+        payload: expect.objectContaining({ wsId: TEST_WORKSPACE_ID, panelId: 'panel-chat' }),
+      }),
+    );
     expect(getPanelLayoutManagerMock).toHaveBeenCalledWith('ws-1');
     expect(openBrowserPanelMock).toHaveBeenCalledWith(
       'https://example.com/docs',
@@ -442,6 +589,12 @@ describe('handleLink – path-like targets → workspace file viewer', () => {
       sourcePanelId: 'panel-chat',
     });
 
+    expect(reduxDispatchMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'panelLayout/focusPanel',
+        payload: expect.objectContaining({ wsId: TEST_WORKSPACE_ID, panelId: 'panel-chat' }),
+      }),
+    );
     expect(handleIntentLinkMock).toHaveBeenCalledWith('intent://local/note/spec', {
       workspaceId: TEST_WORKSPACE_ID,
       sourcePanelId: 'panel-chat',

@@ -15,7 +15,6 @@ import { getItem, getItems } from '@augmentcode/themis/utils/collections/collect
 import type { StoreState } from '../../types';
 import { sumHudUsageTotals, type HudFeedEntry } from './hud-slice';
 import {
-  WORKSPACE_DISPLAY_STATUS_VALUES,
   WorkspaceStatus,
   isWorkspaceDisplayStatus,
   type NoteId,
@@ -44,11 +43,14 @@ import {
 import {
   selectAgentIsResponding,
   selectAgentIsWaiting,
+  selectAgentPreview,
+  type AgentPreview,
 } from '../agent-session/agent-session-selectors';
 import { getAgentAttentionRequest } from '$shared/utils/agent-attention';
 import { isAgentDeletionPending } from '$features/agent/utils/pending-agent-deletions';
 import { isQuestionMessageDismissed } from '$shared/utils/question-dismissal';
-import { deriveAgentPreviewLine } from '$lib/utils/text-utils';
+import { classifyTool } from '$lib/utils/tool-classifier';
+import { getLastMeaningfulLine } from '$lib/utils/text-utils';
 import { selectHardwareConsoleKeySlots } from '../hardware-console/hardware-console-selectors';
 
 export const selectHudActive = store.createSelector((state) => state.hud.active);
@@ -87,6 +89,12 @@ export interface HudSystemView {
   version: string | null;
   /** Epoch-ms of the last successful poll; null before the first one. */
   fetchedAtMs: number | null;
+  /**
+   * Short daemon hostname (everything before the first `.`) when connected
+   * to a REMOTE daemon (`hostLocality === 'remote'`, §5.7/§5.14) and the poll
+   * reported one; null for local daemons, unknown locality, or no hostname.
+   */
+  remoteHostname: string | null;
 }
 
 /**
@@ -100,12 +108,15 @@ export interface HudSystemView {
  * rendered and the SYSTEM panel freezes the last-known uptime while down.
  */
 export const selectHudSystem = store.createSelector((state): HudSystemView => {
-  const { health, stats, lastUpdated } = state.daemonHealth;
+  const { health, stats, lastUpdated, hostLocality } = state.daemonHealth;
+  const hostname = stats?.hostname;
   return {
     online: health !== 'down',
     uptimeSeconds: typeof stats?.uptimeSeconds === 'number' ? stats.uptimeSeconds : null,
     version: stats?.version ?? null,
     fetchedAtMs: lastUpdated ? Date.parse(lastUpdated) : null,
+    remoteHostname:
+      hostLocality === 'remote' && hostname ? (hostname.split('.', 1)[0] ?? hostname) : null,
   };
 });
 
@@ -148,7 +159,7 @@ function effectiveDisplayStatus(
 }
 
 /** Non-archived workspaces the HUD renders, with live displayStatus applied. */
-export const selectHudWorkspaces = store.createSelector((state): Workspace[] => {
+const selectHudWorkspaces = store.createSelector((state): Workspace[] => {
   const overrides = state.hud.displayStatusByWorkspaceId;
   return getItems(state.workspace.workspaces)
     .filter(
@@ -163,20 +174,6 @@ export const selectHudWorkspaces = store.createSelector((state): Workspace[] => 
         : workspace;
     });
 });
-
-/** WORKSPACES panel state bars: count per displayStatus wire value. */
-export const selectHudWorkspaceStateCounts = store.createSelector(
-  (state): Record<WorkspaceDisplayStatus, number> => {
-    const counts = Object.fromEntries(
-      WORKSPACE_DISPLAY_STATUS_VALUES.map((value) => [value, 0]),
-    ) as Record<WorkspaceDisplayStatus, number>;
-    for (const workspace of selectHudWorkspaces.select(state)) {
-      const status = workspace.displayStatus;
-      if (status) counts[status] += 1;
-    }
-    return counts;
-  },
-);
 
 /**
  * The `agentSummary` aggregate is typed as the slim `WorkspaceAgentIdSummary`
@@ -243,7 +240,7 @@ export interface HudWorkspaceStateBars {
    * disjoint buckets below, which each count a card once).
    */
   waiting: number;
-  /** `pr_open` + `pr_ready`. */
+  /** `pr_open` + `pr_ready` + `pr_queued`. */
   prOpen: number;
   /** `pr_merged`. */
   prMerged: number;
@@ -305,6 +302,7 @@ export const selectHudWorkspaceStateBars = store.createSelector((state): HudWork
         break;
       case 'pr_open':
       case 'pr_ready':
+      case 'pr_queued':
         bars.prOpen += 1;
         break;
       case 'pr_merged':
@@ -318,7 +316,7 @@ export const selectHudWorkspaceStateBars = store.createSelector((state): HudWork
 });
 
 /** Discriminates what raised an ATTENTION panel row. */
-export type HudAttentionKind = 'agent_waiting' | 'agent_failed' | 'workspace_attention';
+type HudAttentionKind = 'agent_waiting' | 'agent_failed' | 'workspace_attention';
 
 /** One ATTENTION panel row. */
 export interface HudAttentionItem {
@@ -349,7 +347,7 @@ export interface HudAttentionItem {
  * agentId → display name across all HUD workspaces' `agentSummary.agents`
  * (PROTOCOL §5.1). The join point for "never show raw agent UUIDs".
  */
-export const selectHudAgentNamesById = store.createSelector((state): Record<string, string> => {
+const selectHudAgentNamesById = store.createSelector((state): Record<string, string> => {
   const names: Record<string, string> = {};
   for (const workspace of selectHudWorkspaces.select(state)) {
     for (const agent of agentInfosOf(workspace)) {
@@ -366,18 +364,22 @@ function sinceMs(item: HudAttentionItem): number {
 }
 
 /**
- * ATTENTION panel rows, newest first: agents in the needs-attention/failed
- * buckets (from `agentSummary.agents`, PROTOCOL §5.1, via the attention-aware
- * `agentBucketOf`) plus workspaces whose live `workspace:attention-changed`
- * flag is raised (the hud slice mirrors the event stream; the wire attention
- * enum is only `none | unread | review_required` (§9.9) —
- * question/blocker/discussion attention never travels on it, so the
- * `review_required` allowlist stays exact and `unread` stays excluded). An
- * attention card state (`wait`/`blocked`/`failed` — the BE rollup, §5.1) no
- * other row already covers raises a generic workspace row — the same
- * authoritative-rollup fallback the ATTN counter applies, so a question hold
- * the FE never captured still gets a panel row. Rows for workspaces no longer
- * in the list are dropped.
+ * ATTENTION panel rows, newest first: TOP-LEVEL NON-BACKGROUND agents in the
+ * needs-attention/failed buckets (via `cardAgentsOf`, so the rows derive
+ * from the exact inputs the ATTN counter uses — the daemon's step-0
+ * `needs_attention` gating, intentd#825, mirrored per-agent for ALL signals
+ * including `failed` per the spec decision: delegated (`parentAgentId`,
+ * §5.1 v2.9) and background agents never raise rows) plus workspaces whose
+ * live `workspace:attention-changed` flag is raised (the hud slice mirrors
+ * the event stream; the wire attention enum is only
+ * `none | unread | review_required` (§9.9) — question/blocker/discussion
+ * attention never travels on it, so the `review_required` allowlist stays
+ * exact and `unread` stays excluded). An attention card state
+ * (`wait`/`blocked`/`failed` — the BE rollup, §5.1) no other row already
+ * covers raises a generic workspace row — the same authoritative-rollup
+ * fallback the ATTN counter applies, so a pending question set the FE never
+ * captured still gets a panel row. Rows for workspaces no longer in the
+ * list are dropped.
  */
 export const selectHudAttentionItems = store.createSelector((state): HudAttentionItem[] => {
   const flags = state.hud.attentionByWorkspaceId;
@@ -386,9 +388,13 @@ export const selectHudAttentionItems = store.createSelector((state): HudAttentio
   for (const workspace of selectHudWorkspaces.select(state)) {
     const workspaceId = String(workspace.id);
     let covered = false;
-    for (const agent of agentInfosOf(workspace)) {
-      const { bucket, attentionKind, hasQuestion } = agentBucketOf(state, agent);
+    for (const agent of cardAgentsOf(workspace, state)) {
+      const { bucket, attentionKind, hasQuestion } = agent;
       if (bucket !== 'needs-attention' && bucket !== 'failed') continue;
+      // Same per-agent gating as `selectHudAttnCount`: only a top-level
+      // non-background agent raises a row — sub-agent/background signals are
+      // the coordinator's business, never the user's call to action.
+      if (!agent.topLevel || agent.isBackground) continue;
       // Raising signal + detail text: the agent's outstanding §7.1 question
       // block (most actionable — the user can answer it verbatim), else the
       // §5.5 attention-request kind/reason from the tracked session; attention
@@ -408,7 +414,7 @@ export const selectHudAttentionItems = store.createSelector((state): HudAttentio
         ...(bucket === 'needs-attention' && signal ? { signal } : {}),
         agentName: agent.name,
         message: question?.question ?? attentionReason ?? null,
-        sinceTs: agent.lastActivity ?? null,
+        sinceTs: agent.lastActivityTs,
       });
       covered = true;
     }
@@ -471,12 +477,12 @@ export interface HudCardAgent {
   lastActivityTs: string | null;
   /**
    * Latest activity line for the swap animation (wire/agent content;
-   * i18n-exempt), else null. Derived by the shared
-   * `deriveAgentPreviewLine` helper (same precedence as the AgentCard
-   * footer preview: live response > newest user message > digest/report >
-   * persisted `lastAgentResponse`) over the AgentLite projection
-   * (`agent.list`, §5.5) folded in by the HUD's per-workspace hydration and
-   * kept fresh by live status events.
+   * i18n-exempt), else null. The canonical `selectAgentPreview` derivation
+   * (same precedence chain as the AgentCard footer: attention → live text →
+   * live tool → user line → digest/report → persisted fallbacks) rendered to
+   * a plain string over the AgentLite projection (`agent.list`, §5.5) folded
+   * in by the HUD's per-workspace hydration and kept fresh by live status
+   * events.
    */
   line: string | null;
   /** Delegating agent's id (`parentAgentId`, PROTOCOL §5.1 v2.9); null on roots. */
@@ -494,7 +500,14 @@ export interface HudCardAgent {
    * workspace-level NEEDS INPUT / BLOCKED derivation.
    */
   topLevel: boolean;
-  /** Background agent (session `isBackground` / `metadata.isBackground`, §5.5). */
+  /**
+   * Background agent: the §5.1 summary row's additive `isBackground`
+   * (intent-hq/intent#3789 — served before any session hydration, so a
+   * summary-only failed background agent never transiently passes the
+   * top-level gating in `selectHudAttentionItems` / `selectHudAttnCount`),
+   * else the tracked session's `isBackground` / `metadata.isBackground`
+   * (§5.5) for pre-#3789 daemons.
+   */
   isBackground: boolean;
   /**
    * Pending attention request kind (PROTOCOL §5.5 `attentionRequestKind`,
@@ -577,7 +590,7 @@ export interface HudWorkspaceCard {
   keySlot: number | null;
   /** BE-owned task rollup (`task.list` stats; zeros until loaded). */
   tasks: { total: number; completed: number; inProgress: number };
-  /** Sum of the four token counters from the workspace usage rollup. */
+  /** Five-counter token sum from the workspace usage rollup (§5.23). */
   tokens: number;
   /** Live agents only (running / needs-attention / failed buckets), wire order. */
   agents: HudCardAgent[];
@@ -669,14 +682,57 @@ const LIVE_BUCKETS: ReadonlySet<HudAgentStateBucket> = new Set([
 ]);
 
 /**
- * Depth-first delegation-tree order over the summary agents: roots in wire
- * order, each followed by its children (`parentAgentId`, PROTOCOL §5.1 v2.9).
- * Agents with no / unknown / self parent are roots (flat fallback when
- * parentage is absent); parent cycles degrade to flat roots via the seen
- * guard.
+ * Epoch-ms recency key for sibling ordering: lenient `Date.parse` of the
+ * summary `lastActivity`; missing/unparseable timestamps yield -Infinity so
+ * they sort last within their partition under descending recency.
+ */
+function lastActivityMs(info: WorkspaceAgentInfo): number {
+  const ms = typeof info.lastActivity === 'string' ? Date.parse(info.lastActivity) : NaN;
+  return Number.isFinite(ms) ? ms : -Infinity;
+}
+
+/**
+ * Sibling-group comparator for the card's delegation tree: the coordinator
+ * (`specialist: 'spec-writer'` on the wire summary) first even when idle —
+ * matching the agents list's coordinator-first rule so both surfaces agree
+ * on the top row — then non-idle agents (LIVE_BUCKETS —
+ * running/needs-attention/failed), each partition ordered by last activity
+ * descending (missing timestamps last), with a stable agent-id tiebreak so
+ * rows don't jump between refreshes.
+ */
+function siblingOrderComparator(
+  bucketById: ReadonlyMap<string, HudAgentBucketInfo>,
+): (a: WorkspaceAgentInfo, b: WorkspaceAgentInfo) => number {
+  const isIdle = (info: WorkspaceAgentInfo): number => {
+    const bucket = bucketById.get(info.id)?.bucket;
+    return bucket !== undefined && LIVE_BUCKETS.has(bucket) ? 0 : 1;
+  };
+  return (a, b) => {
+    const aIsCoordinator = a.specialist === 'spec-writer';
+    const bIsCoordinator = b.specialist === 'spec-writer';
+    if (aIsCoordinator !== bIsCoordinator) return aIsCoordinator ? -1 : 1;
+    const idleDelta = isIdle(a) - isIdle(b);
+    if (idleDelta !== 0) return idleDelta;
+    const aMs = lastActivityMs(a);
+    const bMs = lastActivityMs(b);
+    // Strict inequality (not subtraction): two -Infinity keys must fall
+    // through to the id tiebreak, not yield a NaN delta.
+    if (aMs !== bMs) return bMs - aMs;
+    return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+  };
+}
+
+/**
+ * Depth-first delegation-tree order over the summary agents: each parent
+ * followed by its children (`parentAgentId`, PROTOCOL §5.1 v2.9), with roots
+ * and every sibling group ordered by `compare` — a child never moves above
+ * its parent. Agents with no / unknown / self parent are roots (flat
+ * fallback when parentage is absent); parent cycles degrade to flat roots
+ * via the seen guard.
  */
 function orderAgentTree(
   infos: WorkspaceAgentInfo[],
+  compare: (a: WorkspaceAgentInfo, b: WorkspaceAgentInfo) => number,
 ): Array<{ info: WorkspaceAgentInfo; depth: number; parentAgentId: string | null }> {
   const ids = new Set(infos.map((info) => info.id));
   const childrenByParent = new Map<string, WorkspaceAgentInfo[]>();
@@ -696,6 +752,8 @@ function orderAgentTree(
       roots.push(info);
     }
   }
+  roots.sort(compare);
+  for (const siblings of childrenByParent.values()) siblings.sort(compare);
   const ordered: Array<{ info: WorkspaceAgentInfo; depth: number; parentAgentId: string | null }> =
     [];
   const seen = new Set<string>();
@@ -734,7 +792,7 @@ interface HudAgentBucketInfo {
  * Genuine turn work still buckets running — a coordinator can take a turn
  * while its watches pend: the daemon's `turnInFlight` (§5.5 STAB-125, the
  * emit-time "a worker is draining a turn NOW" signal, refreshed by the
- * STAB-9 `agent.list` re-hydration on every status event) or the FE-owned
+ * STAB-9 per-agent `agent.get` refresh on every status event) or the FE-owned
  * `isStreaming`/`isProcessing` send signals defeat the waiting gate. THEN an in-flight
  * turn wins (`selectAgentIsResponding` — BE activity flags including
  * `isWaitingOnTool`, §5.5: a mid-turn tool call is running work, not idle),
@@ -781,7 +839,7 @@ function agentBucketOf(state: StoreState, info: WorkspaceAgentInfo): HudAgentBuc
   // derived at emit time (never a persisted lag like `status: "active"`).
   // Watch-pending and turn-running are ORTHOGONAL: a coordinator holding a
   // completion watch on a child still takes turns of its own, and the
-  // `agent.list` hydration the events bridge refires on every
+  // per-agent `agent.get` refresh the events bridge refires on every
   // `agent:status-changed` (STAB-9) reports isWaitingForOtherAgents: true
   // THROUGHOUT that turn — so waiting may only win while no turn is in
   // flight, else the card square stays grey for the whole turn while the
@@ -853,12 +911,69 @@ function isTopLevelAgent(info: WorkspaceAgentInfo, metadata: Record<string, unkn
   return !(typeof createdBy === 'string' && createdBy.length > 0 && createdBy !== info.id);
 }
 
-/** Tree-ordered card agent rows for a workspace (prefixes empty until kept). */
+/**
+ * Background-ness: the §5.1 summary row's additive `isBackground`
+ * (intent-hq/intent#3789; available before session hydration), else the
+ * tracked session's `isBackground` / `metadata.isBackground` (§5.5).
+ */
+function isBackgroundAgent(
+  info: WorkspaceAgentInfo,
+  session: { isBackground?: boolean } | undefined,
+  metadata: Record<string, unknown>,
+): boolean {
+  return (
+    info.isBackground === true || session?.isBackground === true || metadata.isBackground === true
+  );
+}
+
+/**
+ * Render the canonical structured preview to the HUD's plain-string line:
+ * text kinds carry their text, tool kinds render the classified tool label
+ * (verb + subject + path, mirroring AgentPreviewToolLabel; hidden labels
+ * render nothing), attention renders the request's reason text. The swap
+ * line is single-line: multi-line text kinds (report / last-user carry raw
+ * multi-line text; live-text / last-response / user arrive pre-reduced) are
+ * reduced to their last meaningful line.
+ */
+function previewLineText(preview: AgentPreview | null): string | null {
+  if (!preview) return null;
+  switch (preview.kind) {
+    case 'attention':
+      return preview.attention.reason ?? null;
+    case 'live-tool':
+    case 'last-tool': {
+      const display = classifyTool(
+        preview.toolUse.name,
+        (preview.toolUse.input as Record<string, unknown>) || {},
+      );
+      if (display.hidden) return null;
+      const label = [display.verb, display.subject, display.path].filter(Boolean).join(' ').trim();
+      return label || null;
+    }
+    default: {
+      const text = preview.text || '';
+      if (!text) return null;
+      if (!text.includes('\n')) return text;
+      return getLastMeaningfulLine(text) || null;
+    }
+  }
+}
+
+/**
+ * Tree-ordered card agent rows for a workspace (prefixes empty until kept):
+ * buckets are computed up front so the sibling ordering (non-idle by
+ * recency first, idle last — `siblingOrderComparator`) and the rows share
+ * one `agentBucketOf` evaluation per agent.
+ */
 function cardAgentsOf(workspace: Workspace, state: StoreState): HudCardAgent[] {
-  return orderAgentTree(agentInfosOf(workspace)).map(({ info, depth, parentAgentId }) => {
+  const infos = agentInfosOf(workspace);
+  const bucketById = new Map(infos.map((info) => [info.id, agentBucketOf(state, info)] as const));
+  const tree = orderAgentTree(infos, siblingOrderComparator(bucketById));
+  return tree.map(({ info, depth, parentAgentId }) => {
     const session = state.agentSessions?.byAgentId[info.id];
     const metadata = (session?.metadata ?? {}) as Record<string, unknown>;
-    const { bucket, attentionKind, hasQuestion } = agentBucketOf(state, info);
+    const { bucket, attentionKind, hasQuestion } =
+      bucketById.get(info.id) ?? agentBucketOf(state, info);
     const waitingForAgentIds = Array.isArray(session?.waitingForAgentIds)
       ? session.waitingForAgentIds.filter((id): id is string => typeof id === 'string')
       : [];
@@ -867,25 +982,14 @@ function cardAgentsOf(workspace: Workspace, state: StoreState): HudCardAgent[] {
       name: info.name,
       bucket,
       lastActivityTs: info.lastActivity ?? null,
-      // Same precedence as the AgentCard footer preview (shared helper) over
-      // the AgentLite fields the HUD hydration carries.
-      line: session
-        ? deriveAgentPreviewLine({
-            lastAgentResponse: session.lastAgentResponse,
-            lastUserMessage: session.lastUserMessage,
-            lastMessageRole: session.lastMessageRole,
-            digest: session.digest,
-            isResponding: session.isResponding === true,
-            completionReport:
-              typeof metadata.completionReport === 'string' ? metadata.completionReport : null,
-            lastToolUse: session.lastToolUse,
-          })
-        : null,
+      // Canonical preview chain (selectAgentPreview — same precedence as the
+      // AgentCard footer) rendered to the HUD's plain-string line.
+      line: previewLineText(selectAgentPreview.select(state, info.id)),
       parentAgentId,
       depth,
       treePrefix: '',
       topLevel: isTopLevelAgent(info, metadata),
-      isBackground: session?.isBackground === true || metadata.isBackground === true,
+      isBackground: isBackgroundAgent(info, session, metadata),
       attentionKind,
       hasQuestion,
       isWaitingForAgents:
@@ -999,12 +1103,7 @@ export const selectHudWorkspaceCards = store.createSelector((state): HudWorkspac
       tasks: stats
         ? { total: stats.total, completed: stats.completed, inProgress: stats.inProgress }
         : ZERO_TASKS,
-      tokens: usageTotals
-        ? usageTotals.inputTokens +
-          usageTotals.outputTokens +
-          usageTotals.cacheReadTokens +
-          usageTotals.cacheCreationTokens
-        : 0,
+      tokens: usageTotals ? sumHudUsageTotals(usageTotals) : 0,
       agents: keepLiveWithAncestors(agents),
     };
   });
@@ -1022,7 +1121,7 @@ function isCurrentUserRelevantTabAgent(
     return false;
   const metadata = (session.metadata ?? {}) as Record<string, unknown>;
   if (!isTopLevelAgent(info, metadata)) return false;
-  return session.isBackground !== true && metadata.isBackground !== true;
+  return !isBackgroundAgent(info, session, metadata);
 }
 
 /** Actionable tab axes derived from the same live inputs as the HUD. */
@@ -1101,29 +1200,29 @@ export const selectWorkspaceTabStatuses = store.createSelector(
 );
 
 /**
- * Header ATTN counter (mock `stats.attn` — per-agent wait + fail): counts
- * exactly what renders an attention state on the grid, so the blinking
- * counter always agrees with the cards. An agent counts when it would raise
- * its card's banner — `failed` bucket (ungated, like `cardStateKey`), or a
- * TOP-LEVEL NON-BACKGROUND agent with a pending attention request /
- * outstanding question (the daemon's step-0 `needs_attention` gating,
- * intentd#825, mirrored per-agent; delegated (`parentAgentId`, §5.1 v2.9 —
- * the parentage signal main's #573 uses to skip toasts) and background
- * agents never count). Each raised workspace-level attention flag adds one
- * (it renders NEEDS ATTENTION with no raising agent), as does an attention
- * card state (`wait`/`blocked`/`failed` — the BE rollup, §5.1) no per-agent
- * signal already covered (the daemon rollup is authoritative — e.g. a
- * question hold the FE never captured must still blink). Pending requests
- * clear only on user-origin deliveries (`attentionRequestCleared`, §5.5), so
- * a cleared request drops out live — no stale entries linger.
+ * Header ATTN counter (mock `stats.attn` — per-agent wait + fail). An agent
+ * counts when it is a TOP-LEVEL NON-BACKGROUND agent in the `failed` bucket
+ * or with a pending attention request / outstanding question (the daemon's
+ * step-0 `needs_attention` gating, intentd#825, mirrored per-agent for ALL
+ * signals — failed included, per the spec decision; delegated
+ * (`parentAgentId`, §5.1 v2.9 — the parentage signal main's #573 uses to
+ * skip toasts) and background agents never count, so a failed sub-agent is
+ * the coordinator's business, not a user call to action). Each raised
+ * workspace-level attention flag adds one (it renders NEEDS ATTENTION with
+ * no raising agent), as does an attention card state
+ * (`wait`/`blocked`/`failed` — the BE rollup, §5.1) no per-agent signal
+ * already covered (the daemon rollup is authoritative — e.g. a question
+ * hold the FE never captured must still blink). Pending requests clear only
+ * on user-origin deliveries (`attentionRequestCleared`, §5.5), so a cleared
+ * request drops out live — no stale entries linger. The ATTENTION panel
+ * (`selectHudAttentionItems`) applies this exact per-agent rule, so the
+ * counter and the panel rows always agree.
  *
- * The ungated `failed` bucket is a DELIBERATE per-agent axis, not a leftover
- * of the removed card-state synthesis: the BE rollup deliberately ignores
- * child/background sessions, so a failed delegated agent leaves every card
- * `in_progress` while still being actionable. The counter and the ATTENTION
- * panel share this rule (they stay mutually consistent), and the card keeps
- * rendering the daemon value verbatim — the per-agent counter is a separate
- * axis over the agent roster, not a second opinion on the workspace status.
+ * The per-agent axis is a SEPARATE axis over the agent roster, not a second
+ * opinion on the workspace card state: a failed top-level agent counts even
+ * while the BE rollup leaves the card `in_progress` (the card keeps
+ * rendering the daemon value verbatim), so the counter and the cards can
+ * legitimately disagree.
  */
 export const selectHudAttnCount = store.createSelector((state): number => {
   const flags = state.hud.attentionByWorkspaceId;
@@ -1132,10 +1231,9 @@ export const selectHudAttnCount = store.createSelector((state): number => {
     let agentCounted = false;
     for (const agent of cardAgentsOf(workspace, state)) {
       if (
-        agent.bucket === 'failed' ||
-        (agent.topLevel &&
-          !agent.isBackground &&
-          (agent.attentionKind !== null || agent.hasQuestion))
+        agent.topLevel &&
+        !agent.isBackground &&
+        (agent.bucket === 'failed' || agent.attentionKind !== null || agent.hasQuestion)
       ) {
         count += 1;
         agentCounted = true;
@@ -1209,6 +1307,8 @@ export interface HudTakeoverView {
  * `completionReport` (session `metadata`, `agent.reportToParent` §5.5) when
  * any linked session carries one, else the task note's own content (the task
  * id IS its note id, §5.4) — both served verbatim; null when neither has text.
+ * Slim-projection rows (§5.2) carry no content; their `contentPreview`
+ * (first ~500 chars) stands in until the full body is loaded.
  */
 function completeTaskReport(
   state: StoreState,
@@ -1224,7 +1324,8 @@ function completeTaskReport(
     if (typeof report === 'string' && report.trim().length > 0) return report;
   }
   const notes = state.workspaceNotes?.byWorkspaceId[workspaceId]?.notes;
-  const content = notes ? getItem(notes, taskId as NoteId)?.content : undefined;
+  const note = notes ? getItem(notes, taskId as NoteId) : undefined;
+  const content = note?.content || note?.contentPreview;
   return typeof content === 'string' && content.trim().length > 0 ? content : null;
 }
 

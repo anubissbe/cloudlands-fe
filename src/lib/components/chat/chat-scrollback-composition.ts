@@ -7,7 +7,7 @@
 import type { AgentMessage } from '$shared/types';
 import { groupMessagesByDate, type MessageGroup } from '$lib/utils/timeFormatting';
 
-export interface ComposedTranscriptGroup extends MessageGroup<AgentMessage> {
+interface ComposedTranscriptGroup extends MessageGroup<AgentMessage> {
   /**
    * Stable turn-key base consumed by `indexConversationTurns` for orphan-turn
    * keys. Present only when history rows are rendered: keyed by origin + day
@@ -59,9 +59,13 @@ function withStableGroupKeys(
  * rehydration and a seq-0 snapshot replaces it wholesale, so a row paged
  * into history can later re-enter the tail. Without this render-time guard
  * each such row renders twice (duplicate sections after repeated
- * scroll-up/scroll-down cycles).
+ * scroll-up/scroll-down cycles). Exported so the regenerate saga resolves
+ * its source against the same composed list the transcript renders.
  */
-function dropTailResidentRows(history: AgentMessage[], tail: AgentMessage[]): AgentMessage[] {
+export function dropTailResidentRows(
+  history: AgentMessage[],
+  tail: AgentMessage[],
+): AgentMessage[] {
   if (history.length === 0 || tail.length === 0) return history;
   const tailIds = new Set(tail.map((message) => message.id));
   const tailAppMessageIds = new Set(
@@ -195,6 +199,53 @@ export function shouldChainOlderHistoryOnSettle(
   params: OlderHistoryTriggerParams,
 ): boolean {
   return settled && shouldRequestOlderHistory(params);
+}
+
+/**
+ * Quiet window (ms) after the older-history walk stops before the top
+ * "Loading older messages" indicator hides. Long enough to bridge the
+ * settle→chain gap of a back-to-back restart (a scroll-triggered refire
+ * lands well inside it), short enough that the indicator disappears
+ * promptly once the walk truly stops.
+ */
+export const OLDER_HISTORY_INDICATOR_QUIET_MS = 300;
+
+export interface OlderHistoryIndicatorParams {
+  /** An older-history page fetch is in flight. */
+  fetching: boolean;
+  /** The settle-chain re-evaluation (tick + double-rAF) has not run yet. */
+  chainEvaluationPending: boolean;
+  /** The indicator is currently rendered. */
+  visible: boolean;
+  /** The quiet-window hide timer is armed. */
+  hideArmed: boolean;
+}
+
+export type OlderHistoryIndicatorAction = 'show' | 'arm-hide' | 'none';
+
+/**
+ * Chain-scoped visibility for the "Loading older messages" indicator. The
+ * raw fetching flag toggles false between every page of a settle-chained
+ * walk, so rendering it directly blinks the indicator once per page. The
+ * walk instead counts as ACTIVE while a fetch is in flight OR the settle
+ * re-evaluation is pending:
+ *
+ * - Active → `'show'` (also cancels an armed hide, so a chain refire inside
+ *   the quiet window keeps the indicator up); `'none'` when it is already
+ *   visible with no hide armed.
+ * - Inactive and visible with no hide armed → `'arm-hide'`: hide only after
+ *   `OLDER_HISTORY_INDICATOR_QUIET_MS` of quiet, absorbing chain restarts
+ *   the pending flag cannot see (a scroll-triggered refire).
+ * - Otherwise `'none'`: hidden stays hidden; an armed hide keeps counting.
+ */
+export function olderHistoryIndicatorAction(
+  params: OlderHistoryIndicatorParams,
+): OlderHistoryIndicatorAction {
+  const { fetching, chainEvaluationPending, visible, hideArmed } = params;
+  if (fetching || chainEvaluationPending) {
+    return visible && !hideArmed ? 'none' : 'show';
+  }
+  return visible && !hideArmed ? 'arm-hide' : 'none';
 }
 
 export interface VirtualSpacerParams {
@@ -363,10 +414,8 @@ export function reconcileVirtualSpacer(
     rowHeightEma = smoothRowHeightEstimate(rowHeightEma, residentContentHeight / residentCount);
   }
   const unloadedRows = params.unloadedRows ?? totalMessages - residentCount;
-  const atBoundary =
-    exhausted || totalMessages <= 0 || residentCount <= 0 || unloadedRows <= 0;
-  const target =
-    atBoundary || rowHeightEma === null ? 0 : Math.round(unloadedRows * rowHeightEma);
+  const atBoundary = exhausted || totalMessages <= 0 || residentCount <= 0 || unloadedRows <= 0;
+  const target = atBoundary || rowHeightEma === null ? 0 : Math.round(unloadedRows * rowHeightEma);
   const drift = Math.abs(target - currentSpacerHeight);
   if (drift === 0) {
     return { spacerHeight: currentSpacerHeight, rowHeightEma, applied: false, scrollTopDelta: 0 };
@@ -439,6 +488,172 @@ export function classifyScrollbackGesture(params: ScrollbackGestureParams): 'ser
   const rowHeight = clampRowHeight(rowHeightEstimate ?? Number.NaN);
   const rowsAboveSegmentStart = (spacerAboveHeight - Math.max(0, scrollTop)) / rowHeight;
   return rowsAboveSegmentStart > nearPages * pageSize ? 'seek' : 'serial';
+}
+
+// ── Rapid-scroll detection ───────────────────────────────────────────────
+
+/**
+ * Window (ms) over which scroll displacement accumulates when deciding
+ * rapid vs gentle. The panel derives its seek settle debounce
+ * (SEEK_DEBOUNCE_MS) from this constant, so "rapid" means "moving faster
+ * than one settle window can absorb" by construction.
+ */
+export const RAPID_SCROLL_WINDOW_MS = 200;
+
+/**
+ * Displacement threshold as a multiple of the viewport height: a burst
+ * covering more than this many viewports inside the window is rapid.
+ */
+export const RAPID_SCROLL_VIEWPORT_FACTOR = 1;
+
+export interface ScrollSample {
+  /** scrollTop of the transcript scroll container at this event. */
+  scrollTop: number;
+  /** Monotonic timestamp (ms) of the event, e.g. performance.now(). */
+  timestamp: number;
+}
+
+/**
+ * Append a scroll sample to the burst buffer, dropping samples older than
+ * `windowMs` before the new sample. Pure — returns a new array; the caller
+ * keeps the returned buffer and feeds it back on the next scroll event, so
+ * it never grows past one window of events.
+ */
+export function appendScrollSample(
+  samples: readonly ScrollSample[],
+  sample: ScrollSample,
+  windowMs: number = RAPID_SCROLL_WINDOW_MS,
+): ScrollSample[] {
+  const cutoff = sample.timestamp - windowMs;
+  return [...samples.filter((s) => s.timestamp >= cutoff), sample];
+}
+
+export interface RapidScrollParams {
+  /** Recent scroll samples, oldest first (see `appendScrollSample`). */
+  samples: readonly ScrollSample[];
+  /** Container clientHeight (px). */
+  viewportHeight: number;
+  /** Displacement window (ms); defaults to RAPID_SCROLL_WINDOW_MS. */
+  windowMs?: number;
+  /** Threshold in viewports; defaults to RAPID_SCROLL_VIEWPORT_FACTOR. */
+  viewportFactor?: number;
+}
+
+/**
+ * Classify a scroll burst as `'rapid'` or `'gentle'`.
+ *
+ * Heuristic: accumulated absolute scrollTop displacement per settle window,
+ * relative to the viewport height — sum |delta| across consecutive samples
+ * within `windowMs` of the newest sample and compare against
+ * `viewportFactor` viewports. A wheel flick or scrollbar-thumb drag covers
+ * more than one viewport inside one settle window (200ms), which a serial
+ * page walk cannot usefully chase — the caller defers paging to the settle
+ * debounce. A gentle reading-pace scroll stays under the threshold and
+ * keeps today's immediate edge-triggered serial fetch. Absolute deltas (not
+ * net) so a fast up-down jiggle still counts as rapid.
+ *
+ * Deterministic and conservative: fewer than two in-window samples, or a
+ * degenerate viewport height, classify `'gentle'` (missing data never
+ * defers a fetch). Exactly at the threshold is NOT past it — gentle.
+ */
+export function classifyScrollBurst(params: RapidScrollParams): 'rapid' | 'gentle' {
+  const {
+    samples,
+    viewportHeight,
+    windowMs = RAPID_SCROLL_WINDOW_MS,
+    viewportFactor = RAPID_SCROLL_VIEWPORT_FACTOR,
+  } = params;
+  if (viewportHeight <= 0 || samples.length < 2) return 'gentle';
+  const cutoff = samples[samples.length - 1].timestamp - windowMs;
+  const inWindow = samples.filter((s) => s.timestamp >= cutoff);
+  if (inWindow.length < 2) return 'gentle';
+  let displacement = 0;
+  for (let i = 1; i < inWindow.length; i += 1) {
+    displacement += Math.abs(inWindow[i].scrollTop - inWindow[i - 1].scrollTop);
+  }
+  return displacement > viewportHeight * viewportFactor ? 'rapid' : 'gentle';
+}
+
+// ── Settle-point classification ──────────────────────────────────────────
+
+export type SettleDriver = 'seek' | 'serial' | 'none';
+
+export interface SettleClassificationParams {
+  /** Settled scrollTop of the transcript scroll container. */
+  scrollTop: number;
+  /** Height (px) of the virtual spacer above the resident rows. */
+  spacerAboveHeight: number;
+  /** Smoothed per-row height estimate; null before the first seed. */
+  rowHeightEstimate: number | null;
+  /**
+   * `historySeekUnsupported` latch: aroundIndex seeks are unavailable, so
+   * far positions fall back to the serial walk.
+   */
+  seekUnsupported?: boolean;
+  /**
+   * Snapshot `totalMessages` (0 when unknown) — a seek needs a known total
+   * to map the settled position to a target ordinal.
+   */
+  totalMessages: number;
+  /** Near-top serial trigger params, re-evaluated at the settled position. */
+  serial: OlderHistoryTriggerParams;
+  /** Rows per scrollback page (defaults to SCROLLBACK_PAGE_ROWS). */
+  pageSize?: number;
+  /** Near threshold in pages (defaults to SCROLLBACK_SEEK_NEAR_PAGES). */
+  nearPages?: number;
+}
+
+/**
+ * Classify a SETTLED position into the above-spacer driver to run. Call at
+ * ANY settle point — the seek debounce firing or an in-flight
+ * older-history/gap-fill page settling — so every settle re-classifies the
+ * parked position instead of blindly chaining the serial walk: a viewport
+ * parked deep in the spacer issues one aroundIndex jump rather than being
+ * reached page-by-page.
+ *
+ * - `'seek'` — the position sits deeper in the above-spacer than the serial
+ *   walk covers (`classifyScrollbackGesture`), seeks are supported, and the
+ *   snapshot total is known (the ordinal mapping needs it).
+ * - `'serial'` — otherwise, when the near-top trigger fires at the settled
+ *   position (`shouldRequestOlderHistory` over `serial`): near-spacer and
+ *   no-spacer near-top positions both land here, as does a far position
+ *   whose seek path is unavailable (unsupported / unknown total).
+ * - `'none'` — no above driver applies.
+ *
+ * Boundary: the below-spacer drivers (bounded gap refill, collapse-at-tail)
+ * stay PANEL-SIDE — they need DOM measurement (the below spacer's rendered
+ * position) this dependency-light module cannot see. The panel checks them
+ * around this classification exactly as today.
+ *
+ * This helper is the REFERENCE implementation of the panel's settle
+ * decision, not the production call path: ChatPanel's
+ * maybeDispatchSettledSeek implements the 'seek' arm via
+ * seekTargetOrdinalAt (which also covers the below-spacer hole, a branch
+ * this DOM-free module cannot see) and the serial/none arms via its
+ * trigger guard. The full-walk harness keeps the two in agreement by
+ * asserting this classification against the mirrored panel drivers at the
+ * settled positions (chat-scrollback-full-walk.test.ts, settledParams).
+ */
+export function classifySettledPosition(params: SettleClassificationParams): SettleDriver {
+  const {
+    scrollTop,
+    spacerAboveHeight,
+    rowHeightEstimate,
+    seekUnsupported = false,
+    totalMessages,
+    serial,
+    pageSize,
+    nearPages,
+  } = params;
+  const gesture = classifyScrollbackGesture({
+    scrollTop,
+    spacerAboveHeight,
+    rowHeightEstimate,
+    pageSize,
+    nearPages,
+  });
+  if (gesture === 'seek' && !seekUnsupported && totalMessages > 0) return 'seek';
+  return shouldRequestOlderHistory(serial) ? 'serial' : 'none';
 }
 
 export interface ScrollToOrdinalParams {

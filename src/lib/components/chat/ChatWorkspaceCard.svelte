@@ -15,6 +15,12 @@
     requestDeleteWorkspace,
   } from '$store/renderer/slices/workspace-operations/workspace-operations-slice';
   import { openWorkspaceInNewWindow } from '$lib/components/layout/sidebar-nav/utils/openWorkspaceInNewWindow';
+  import { openAgentTabRequested } from '$store/renderer/slices/app-layout/app-layout-slice';
+  import {
+    selectActiveAgentId,
+    selectWorkspaceForegroundAgentIds,
+  } from '$store/renderer/slices/workspace-agents/workspace-agents-selectors';
+  import { openWorkspaceTab } from '$store/renderer/slices/tab-state/tab-state-slice';
   import { selectWorkspaceById } from '$store/renderer/slices/workspace/workspace-selectors';
   import type { Workspace } from '$shared/types';
   import { m } from '$shared/paraglide/messages.js';
@@ -78,6 +84,20 @@
       await goto(`/workspace/${workspaceId}`);
     } catch (error) {
       console.warn('Failed to navigate to workspace:', error);
+      return;
+    }
+
+    appStore.dispatch(openWorkspaceTab(workspaceId));
+    const foregroundAgentIds = selectWorkspaceForegroundAgentIds
+      .select(appStore.state, workspaceId)
+      .map(String);
+    const activeAgentId = selectActiveAgentId.select(appStore.state, workspaceId);
+    const targetAgentId =
+      activeAgentId && foregroundAgentIds.includes(activeAgentId)
+        ? activeAgentId
+        : foregroundAgentIds[0];
+    if (targetAgentId) {
+      appStore.dispatch(openAgentTabRequested(workspaceId, { agentId: targetAgentId }));
     }
   }
 
@@ -121,31 +141,31 @@
 </script>
 
 {#if workspaceIds.length > 0}
-  <div class="my-2 flex w-full flex-col gap-1.5" use:blockContextMenuCapture>
+  <div class="my-3 flex w-full flex-col gap-2" use:blockContextMenuCapture>
     {#each workspaceIds as workspaceId (workspaceId)}
       {@const workspace = workspacesById[workspaceId]}
       {#if workspace}
         <WorkspaceCard
           {workspace}
           variant="compact"
-          class="rounded-md border border-border bg-background/40"
+          isolateHoverReveal
+          class="mx-0 rounded-md border border-border bg-background/40"
           onClick={(event) => handleWorkspaceClick(workspaceId, event)}
         >
           {#snippet actions()}
             <SidebarOverflowMenu
               items={getOverflowMenuItems(workspaceId)}
-              orientation="horizontal"
+              orientation="vertical"
               class="flex h-5 w-5 -my-1 cursor-pointer items-center justify-center rounded text-ghost transition-all hover:bg-muted/50 hover:text-foreground focus-visible:bg-muted/50 focus-visible:text-foreground focus-visible:outline-none"
               ariaLabel={m.chat_chatWorkspaceCard_actionsFor_ariaLabel({
-                name: workspace.title || workspace.id,
+                name: workspace.title || m.workspace_links_untitled_label(),
               })}
             />
           {/snippet}
         </WorkspaceCard>
       {:else}
         <div class="rounded-md border border-border bg-muted/10 px-3 py-2 text-left">
-          <div class="truncate font-mono text-xs text-foreground">{workspaceId}</div>
-          <div class="mt-0.5 text-xs text-subtle">
+          <div class="text-xs text-subtle">
             {m.chat_chatWorkspaceCard_notFound_label()}
           </div>
         </div>

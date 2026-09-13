@@ -19,7 +19,6 @@
   import { refreshFileExplorer } from '$store/renderer/slices/file-explorer/file-explorer-slice';
   import { selectEffectiveFileExplorerWorkspacePath } from '$store/renderer/slices/file-explorer/file-explorer-selectors';
   import { writable } from 'svelte/store';
-  import type { PanelTab } from '$store/renderer/slices/panel-layout/panel-layout-types';
 
   import { store as appStore } from '$store/renderer/store';
 
@@ -78,15 +77,13 @@
   interface Props {
     workspaceId: string;
     selectedFile?: string | null;
-    onOpenFile?: (filePath: string) => void;
+    onOpenFile?: (filePath: string, event?: MouseEvent | KeyboardEvent) => void;
     onCreateFile?: (folderPath: string, fileName?: string) => void | Promise<void>;
     onFileRenamed?: (oldPath: string, newPath: string) => void;
-    onSelectAgent?: (agentId: string) => void;
+    onSelectAgent?: (agentId: string, event?: MouseEvent | KeyboardEvent) => void;
     showOnlyChanged?: boolean;
     searchQuery?: string;
     class?: string;
-    openPanelTabs?: PanelTab[];
-    activePanelTab?: PanelTab | null;
   }
 
   let {
@@ -99,8 +96,6 @@
     showOnlyChanged = false,
     searchQuery = '',
     class: className,
-    openPanelTabs = [],
-    activePanelTab,
   }: Props = $props();
 
   const effectiveWsId = $derived(workspaceId);
@@ -436,8 +431,6 @@
         selectedFile={selectedFile ?? ''}
         {showOnlyChanged}
         {searchQuery}
-        {openPanelTabs}
-        {activePanelTab}
       />
     </div>
   {:else}

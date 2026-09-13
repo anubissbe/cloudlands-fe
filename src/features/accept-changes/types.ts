@@ -57,7 +57,7 @@ export interface WorkspaceGitStatus {
 }
 
 /** File changed in a commit */
-export interface CommitFile {
+interface CommitFile {
   path: string;
   additions: number;
   deletions: number;
@@ -83,20 +83,8 @@ export interface LocalCommitInfo {
   linkedNoteId?: string;
 }
 
-/** Request to get the current accept changes status */
-export interface GetAcceptStatusRequest {
-  workspaceId: WorkspaceId;
-}
-
-/** Request to prepare for accept changes (validation) */
-export interface PrepareAcceptRequest {
-  workspaceId: WorkspaceId;
-  action: AcceptAction;
-  files?: string[];
-}
-
 /** File info in prepare response */
-export interface PrepareAcceptFile {
+interface PrepareAcceptFile {
   path: string;
   additions: number;
   deletions: number;
@@ -181,5 +169,3 @@ export interface AcceptChangesResult {
   };
   error?: string;
 }
-
-

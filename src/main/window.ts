@@ -4,8 +4,11 @@ import type { BrowserWindow as BrowserWindowType } from 'electron';
 import fs from 'fs';
 import fsAsync from 'fs/promises';
 import { Logger } from '../shared/logger';
-import { resolveAppTitle } from './utils/resolve-app-title';
+import { registerWindowTitleListener, resolveAppTitle } from './utils/resolve-app-title';
 import { DeepLinkHandler } from '../features/deeplink/deep-link-handler';
+import { scrubToken } from '../features/deeplink/utils/scrub-token';
+import { findIntentUrl } from '../features/deeplink/utils/find-intent-url';
+import { isPairingUri } from '../shared/utils/pairing-uri';
 import { getMainWindow, setMainWindow } from './state';
 import { LOCAL_CONNECTION_ID } from '../shared/types/connections';
 import { fileURLToPath } from 'url';
@@ -14,6 +17,7 @@ import {
   getWindowAppearanceOptions,
   getWindowTitleBarOptions,
 } from '../shared/main/window-appearance';
+import { resolveAppDockIconPath, resolveAppIconPath } from './utils/resolve-app-icon';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -22,39 +26,43 @@ const logger = new Logger('Main');
 
 // ---- Shared Window Helpers ----
 
+// Backend stamping lives in the dependency-light window-backend.ts (so
+// hud-window.ts and other small modules can read stamps without this
+// module's graph); re-exported here for the existing import sites.
+import { HUD_ROUTE_PREFIX, registerHudWindow } from './hud-window';
+import {
+  getBackendIdForWebContents,
+  getBackendIdForWindow,
+  stampWindowWithBackend,
+} from './window-backend';
+
+export { getBackendIdForWebContents, getBackendIdForWindow, stampWindowWithBackend };
+
+/** The focused window's backend; falls back to the main window, then local. */
+export function getFocusedWindowBackendId(): string {
+  const focused = BrowserWindow.getFocusedWindow();
+  if (focused && !focused.isDestroyed()) return getBackendIdForWindow(focused);
+  const main = getMainWindow();
+  return main && !main.isDestroyed() ? getBackendIdForWindow(main) : LOCAL_CONNECTION_ID;
+}
+
 /**
- * Resolve the app icon path for dev mode. In production, the icon is baked into the binary.
- * Optionally sets the macOS dock icon.
+ * Resolve the development window icon and optionally set the macOS Dock icon.
  */
 function resolveIcon(setDockIcon: boolean): string | undefined {
-  const isDev = process.env.NODE_ENV === 'development';
-  if (!isDev) return undefined;
+  const resolutionOptions = {
+    isPackaged: app.isPackaged,
+    nodeEnv: process.env.NODE_ENV,
+    platform: process.platform,
+  };
+  const iconPath = resolveAppIconPath(resolutionOptions);
+  const dockIconPath = resolveAppDockIconPath(resolutionOptions);
 
-  const iconPngPath = path.join(__dirname, '../../src/assets/icons/icon.png');
-  const iconIcoPath = path.join(__dirname, '../../src/assets/icons/icon.ico');
-  const iconIcnsPath = path.join(__dirname, '../../src/assets/icons/icon.icns');
-
-  const platformIconPath = process.platform === 'win32' ? iconIcoPath : iconPngPath;
-  let iconPath: string | undefined;
-  if (fs.existsSync(platformIconPath)) {
-    iconPath = platformIconPath;
-  } else if (fs.existsSync(iconPngPath)) {
-    iconPath = iconPngPath;
-  } else if (fs.existsSync(iconIcoPath)) {
-    iconPath = iconIcoPath;
-  } else if (fs.existsSync(iconIcnsPath)) {
-    iconPath = iconIcnsPath;
-  }
-
-  if (setDockIcon && process.platform === 'darwin') {
+  if (dockIconPath && setDockIcon) {
     try {
-      if (fs.existsSync(iconPngPath)) {
-        app.dock?.setIcon(nativeImage.createFromPath(iconPngPath));
-      } else if (fs.existsSync(iconIcnsPath)) {
-        app.dock?.setIcon(nativeImage.createFromPath(iconIcnsPath));
-      }
+      app.dock?.setIcon(nativeImage.createFromPath(dockIconPath));
     } catch (e) {
-      logger.warn('Failed to set dev dock icon:', e);
+      logger.warn('Failed to set Dock icon:', e);
     }
   }
 
@@ -111,6 +119,12 @@ function buildWindowOptions(opts: {
     ...getWindowAppearanceOptions(isDarkMode),
     ...(opts.iconPath && { icon: opts.iconPath }),
   };
+}
+
+function createConfiguredWindow(opts: Parameters<typeof buildWindowOptions>[0]): BrowserWindowType {
+  const window = new BrowserWindow(buildWindowOptions(opts));
+  registerWindowTitleListener(window);
+  return window;
 }
 
 // Bounds for the renderer-console forwarder: per-message size cap and
@@ -205,12 +219,15 @@ function buildLoadUrl(route: string = DEFAULT_WINDOW_ROUTE): string {
 
 // ---- Window Session Persistence ----
 // Saves and restores window sessions so the app reopens with the same
-// workspaces/windows. Sessions are keyed by the active backend id (T2's
-// connections store), so each backend restores its own window layout on switch.
+// workspaces/windows. Sessions are keyed by backend id (T2's connections
+// store), so each backend restores its own window layout at boot.
 
 export interface WindowSession {
   route: string;
   bounds: { x: number; y: number; width: number; height: number };
+  // Optional for backward compat: legacy session entries carry no flag
+  // (missing → windowed restore, exactly as before).
+  isFullScreen?: boolean;
 }
 
 /**
@@ -264,12 +281,100 @@ function readSessionsMap(): WindowSessionsMap {
 // fallback when saveWindowSessions() is invoked after all windows are already
 // gone (e.g., non-macOS window-all-closed, where BrowserWindow.getAllWindows()
 // returns empty and there is nothing live left to serialize).
-let lastKnownSessions: WindowSession[] | null = null;
+let lastKnownSessions: WindowSessionsMap = {};
 
-function buildSessionsFromOpenWindows(): WindowSession[] {
+// Backends whose final window was explicitly closed while another backend
+// stayed open. Keep the tombstone until a live window is saved so a stale
+// on-disk bucket cannot be restored before the next aggregate save removes it.
+const closedBackendSessions = new Set<string>();
+
+// True once the app has entered a quit/update-install teardown. Window closes
+// during teardown are not deliberate per-backend closes: the close listener
+// must keep refreshing the in-memory snapshot but must NOT tombstone/prune a
+// backend whose windows are only closing because the whole app is exiting —
+// otherwise gracefulShutdown()'s mainWindow.close() wipes the bucket that
+// before-quit/installUpdate() just saved. One-way on the gracefulShutdown()
+// path (that path always exits); the auto-update service unmarks it when
+// quitAndInstall() fails and the process keeps running.
+let isQuitTeardownInProgress = false;
+
+/**
+ * Mark the start of an app-quit/update-install teardown so subsequent window
+ * closes are not treated as deliberate per-backend closes. Registered callers
+ * are index.ts (gracefulShutdown, which every quit path — before-quit,
+ * window-all-closed, SIGTERM/SIGINT — funnels through) and the auto-update
+ * service (before quitAndInstall(), which closes windows before before-quit
+ * fires on macOS) — a plain setter, so window.ts never imports those modules.
+ */
+export function markWindowSessionTeardown(): void {
+  isQuitTeardownInProgress = true;
+}
+
+/**
+ * Revert markWindowSessionTeardown() when a teardown aborts and the process
+ * keeps running — e.g. quitAndInstall() throws in installUpdate(). Without the
+ * revert, a later deliberate last-window close in the still-running session
+ * would skip tombstoning/pruning and wrongly restore the closed backend on the
+ * next launch. gracefulShutdown() never calls this: that path always exits.
+ */
+export function unmarkWindowSessionTeardown(): void {
+  isQuitTeardownInProgress = false;
+}
+
+/**
+ * Synchronously drop one backend's bucket from window-sessions.json.
+ * Runs inside the window `close` listener (captureWindowSessionsSnapshot), so
+ * it must be sync — the tombstone alone is process-local and a crash before
+ * the next aggregate save would leave the stale bucket to be restored by the
+ * boot-wide enumeration.
+ */
+function pruneSessionsBucketFromDisk(backendId: string): void {
+  try {
+    const map = readSessionsMap();
+    if (!(backendId in map)) return;
+    delete map[backendId];
+    fs.writeFileSync(getWindowSessionsPath(), JSON.stringify(map), 'utf-8');
+    logger.debug('Pruned closed backend session bucket from disk', { backendId });
+  } catch (err) {
+    logger.warn('Failed to prune closed backend session bucket:', err);
+  }
+}
+
+/**
+ * Write the sessions map while honoring tombstones on both sides of the async
+ * write. Tombstoned buckets are stripped before serialization, and because a
+ * window `close` listener can tombstone + sync-prune a bucket while the write
+ * is in flight (the completing write would silently resurrect the pruned
+ * bucket on disk), any bucket tombstoned mid-write is re-pruned after the
+ * write settles.
+ */
+async function writeSessionsMapRespectingTombstones(map: WindowSessionsMap): Promise<void> {
+  for (const backendId of closedBackendSessions) delete map[backendId];
+  await fsAsync.writeFile(getWindowSessionsPath(), JSON.stringify(map), 'utf-8');
+  for (const backendId of closedBackendSessions) {
+    if (backendId in map) pruneSessionsBucketFromDisk(backendId);
+  }
+}
+
+// Invoked when a non-local backend's last window is explicitly closed while
+// another backend's windows survive, so its pooled JSON-RPC client (socket,
+// reconnect timers, subscriptions) can be disposed. Registered by index.ts —
+// which wraps the quit guard around disconnectBackendClient() — so window.ts
+// never imports the backend IPC module graph.
+type LastWindowClosedForBackendHandler = (backendId: string) => void;
+let onLastWindowClosedForBackend: LastWindowClosedForBackendHandler | null = null;
+
+export function setOnLastWindowClosedForBackend(
+  handler: LastWindowClosedForBackendHandler | null,
+): void {
+  onLastWindowClosedForBackend = handler;
+}
+
+function buildSessionsFromOpenWindows(backendId: string): WindowSession[] {
   return BrowserWindow.getAllWindows()
     .filter((w: BrowserWindowType) => {
       if (w.isDestroyed()) return false;
+      if (getBackendIdForWindow(w) !== backendId) return false;
       const url = w.webContents.getURL();
       // Skip windows that haven't loaded yet (about:blank) or have empty URLs
       if (!url || url === 'about:blank') return false;
@@ -292,7 +397,12 @@ function buildSessionsFromOpenWindows(): WindowSession[] {
       } catch {
         // Fall back to the workspace bootstrap route.
       }
-      return { route, bounds };
+      const session: WindowSession = { route, bounds };
+      // Persist fullscreen so restore can re-enter it. getBounds() during
+      // fullscreen returns that display's bounds, which is exactly what lets
+      // restore land on the right monitor via getDisplayMatching().
+      if (w.isFullScreen()) session.isFullScreen = true;
+      return session;
     });
 }
 
@@ -302,13 +412,49 @@ function buildSessionsFromOpenWindows(): WindowSession[] {
  * cache holds the final layout right before the window is destroyed — the
  * non-macOS window-all-closed path fires after BrowserWindow.getAllWindows()
  * has already emptied, at which point saveWindowSessions() would otherwise
- * have nothing to write.
+ * have nothing to write. Electron invokes EventEmitter listeners with the
+ * closing BrowserWindow as `this`, which also lets us distinguish one closed
+ * backend from a whole-process last-window close.
  */
-export function captureWindowSessionsSnapshot(): void {
+export function captureWindowSessionsSnapshot(this: BrowserWindowType | void): void {
   try {
-    const sessions = buildSessionsFromOpenWindows();
-    if (sessions.length > 0) {
-      lastKnownSessions = sessions;
+    const liveWindows = BrowserWindow.getAllWindows().filter((window) => !window.isDestroyed());
+    const backendIds = new Set(liveWindows.map(getBackendIdForWindow));
+    for (const backendId of backendIds) {
+      const sessions = buildSessionsFromOpenWindows(backendId);
+      if (sessions.length > 0) lastKnownSessions[backendId] = sessions;
+    }
+
+    // During app-quit/update-install teardown, window closes are a side effect
+    // of the whole process exiting — refresh the snapshot above, but never
+    // tombstone/prune a backend the user did not deliberately close.
+    if (!isQuitTeardownInProgress && this && typeof this.isDestroyed === 'function') {
+      const closingBackendId = getBackendIdForWindow(this);
+      const isLastForBackend =
+        liveWindows.filter((window) => getBackendIdForWindow(window) === closingBackendId)
+          .length === 1;
+      const hasSurvivingBackend = liveWindows.some(
+        (window) => getBackendIdForWindow(window) !== closingBackendId,
+      );
+      if (isLastForBackend && hasSurvivingBackend) {
+        closedBackendSessions.add(closingBackendId);
+        delete lastKnownSessions[closingBackendId];
+        // The tombstone is process-local: prune the on-disk bucket now so a
+        // crash/force-quit before the next aggregate save cannot resurrect the
+        // explicitly closed backend's windows at the next boot-wide restore.
+        pruneSessionsBucketFromDisk(closingBackendId);
+        // Explicit last-window close for this backend: dispose its pooled
+        // client so no socket or reconnect timer keeps dialing a daemon with
+        // no windows left ("Open" reconnects on demand). Local is exempt —
+        // the sidecar management must stay alive.
+        if (closingBackendId !== LOCAL_CONNECTION_ID) {
+          try {
+            onLastWindowClosedForBackend?.(closingBackendId);
+          } catch (err) {
+            logger.warn('Failed to dispose backend client on last window close:', err);
+          }
+        }
+      }
     }
   } catch (err) {
     logger.warn('Failed to capture window sessions snapshot:', err);
@@ -317,15 +463,20 @@ export function captureWindowSessionsSnapshot(): void {
 
 export async function saveWindowSessions(backendId: string): Promise<void> {
   try {
-    let sessions = buildSessionsFromOpenWindows();
+    let sessions = buildSessionsFromOpenWindows(backendId);
 
     if (sessions.length > 0) {
       // Refresh the cache whenever we have a live non-empty list.
-      lastKnownSessions = sessions;
-    } else if (lastKnownSessions && lastKnownSessions.length > 0) {
+      closedBackendSessions.delete(backendId);
+      lastKnownSessions[backendId] = sessions;
+    } else if (closedBackendSessions.has(backendId)) {
+      delete lastKnownSessions[backendId];
+      await writeSessionsMapRespectingTombstones(readSessionsMap());
+      return;
+    } else if (lastKnownSessions[backendId]?.length > 0) {
       // No live windows (e.g., non-macOS window-all-closed). Fall back to the
       // last pre-close snapshot so the latest layout still persists.
-      sessions = lastKnownSessions;
+      sessions = lastKnownSessions[backendId];
       logger.info('saveWindowSessions: using last-known snapshot (no live windows)', {
         count: sessions.length,
       });
@@ -336,7 +487,7 @@ export async function saveWindowSessions(backendId: string): Promise<void> {
       // never clobbers another backend's saved sessions.
       const map = readSessionsMap();
       map[backendId] = sessions;
-      await fsAsync.writeFile(getWindowSessionsPath(), JSON.stringify(map), 'utf-8');
+      await writeSessionsMapRespectingTombstones(map);
       logger.debug('Saved window sessions', {
         backendId,
         count: sessions.length,
@@ -345,6 +496,38 @@ export async function saveWindowSessions(backendId: string): Promise<void> {
     }
   } catch (err) {
     logger.warn('Failed to save window sessions:', err);
+  }
+}
+
+/** Persist every live/cached backend bucket without treating activeId as process-global. */
+export async function saveAllWindowSessions(): Promise<void> {
+  try {
+    const backendIds = new Set([
+      ...Object.keys(lastKnownSessions),
+      ...closedBackendSessions,
+      ...BrowserWindow.getAllWindows()
+        .filter((window) => !window.isDestroyed())
+        .map(getBackendIdForWindow),
+    ]);
+    const map = readSessionsMap();
+    for (const backendId of backendIds) {
+      const live = buildSessionsFromOpenWindows(backendId);
+      if (live.length > 0) closedBackendSessions.delete(backendId);
+      if (closedBackendSessions.has(backendId)) {
+        delete lastKnownSessions[backendId];
+        delete map[backendId];
+        continue;
+      }
+      const sessions = live.length > 0 ? live : lastKnownSessions[backendId];
+      if (!sessions?.length) continue;
+      lastKnownSessions[backendId] = sessions;
+      map[backendId] = sessions;
+    }
+    if (backendIds.size > 0) {
+      await writeSessionsMapRespectingTombstones(map);
+    }
+  } catch (err) {
+    logger.warn('Failed to save all window sessions:', err);
   }
 }
 
@@ -359,7 +542,7 @@ export async function saveWindowSessions(backendId: string): Promise<void> {
  * cached snapshot, and resurrect the file the user deliberately cleared.
  */
 export function clearWindowSessionsSnapshot(): void {
-  lastKnownSessions = null;
+  lastKnownSessions = {};
 }
 
 /**
@@ -368,12 +551,16 @@ export function clearWindowSessionsSnapshot(): void {
  */
 export function _resetWindowSessionsCacheForTests(): void {
   clearWindowSessionsSnapshot();
+  closedBackendSessions.clear();
+  onLastWindowClosedForBackend = null;
+  isQuitTeardownInProgress = false;
 }
 
 export function isValidWindowSession(s: unknown): s is WindowSession {
   if (typeof s !== 'object' || s === null) return false;
   const obj = s as Record<string, unknown>;
   if (typeof obj.route !== 'string') return false;
+  if (obj.isFullScreen !== undefined && typeof obj.isFullScreen !== 'boolean') return false;
   if (typeof obj.bounds !== 'object' || obj.bounds === null) return false;
   const b = obj.bounds as Record<string, unknown>;
   return (
@@ -386,6 +573,7 @@ export function isValidWindowSession(s: unknown): s is WindowSession {
 
 export function loadWindowSessions(backendId: string): WindowSession[] | null {
   try {
+    if (closedBackendSessions.has(backendId)) return null;
     const valid = readSessionsMap()[backendId];
     if (valid && valid.length > 0) {
       // Cap per backend to guard against a corrupted sessions file.
@@ -407,14 +595,31 @@ export function loadWindowSessions(backendId: string): WindowSession[] | null {
  * Create a window to restore a saved session.
  * Similar to createWindow() but accepts a specific route and bounds.
  */
-export function createWindowForSession(session: WindowSession, setAsMain: boolean): void {
+export function createWindowForSession(
+  session: WindowSession,
+  setAsMain: boolean,
+  backendId: string = LOCAL_CONNECTION_ID,
+): void {
   const iconPath = resolveIcon(setAsMain);
-  const { workArea } = screen.getPrimaryDisplay();
+  // Validate against the display the saved bounds actually land on, not the
+  // primary display — otherwise a layout saved on a secondary monitor fails
+  // the visibility check and is reset to the primary work area. For bounds on
+  // a disconnected monitor, getDisplayMatching() returns the nearest display
+  // and validateBounds() then clamps/falls back within it.
+  const { workArea } = screen.getDisplayMatching(session.bounds);
   const bounds = validateBounds(session.bounds, workArea);
 
-  const window = new BrowserWindow(
-    buildWindowOptions({ bounds, title: resolveAppTitle(), iconPath }),
-  );
+  const window = createConfiguredWindow({ bounds, title: resolveAppTitle(), iconPath });
+  // A restored HUD session keeps its saved backend bucket — the HUD is bound
+  // to the backend it was opened on, not forced to local. Register it as THE
+  // HUD for that backend right away (stamp first — the registry keys off the
+  // stamp): its URL is still loading during startup restore, so the URL-scan
+  // fallback would miss it and a concurrent open-HUD request could create a
+  // duplicate.
+  stampWindowWithBackend(window, backendId);
+  if (session.route.startsWith(HUD_ROUTE_PREFIX)) {
+    registerHudWindow(window);
+  }
   forwardRendererConsoleToMainLog(window);
 
   if (setAsMain) {
@@ -429,6 +634,13 @@ export function createWindowForSession(session: WindowSession, setAsMain: boolea
       .catch((error: unknown) =>
         logger.error('Failed to clear cache for session-restored window:', error as Error),
       );
+  }
+
+  // Re-enter fullscreen on the display the validated bounds landed on — a
+  // session saved fullscreen restores fullscreen, not windowed at
+  // screen-sized bounds.
+  if (session.isFullScreen) {
+    window.setFullScreen(true);
   }
 
   const route = session.route === '/' ? DEFAULT_WINDOW_ROUTE : session.route;
@@ -465,61 +677,131 @@ export function createWindowForSession(session: WindowSession, setAsMain: boolea
 }
 
 /**
- * Backend-switch window hook — capture + teardown half (consumed by T3's
- * switch orchestration).
- *
- * Persists the currently-open workspace/HUD windows under `fromBackendId` (so
- * switching back restores them), then tears them all down. Split from
- * `restoreWindowsForBackend` so the orchestrator can dispose the old client,
- * connect the new one, and flip the active id in between — the windows it later
- * restores then hit the NEW daemon.
- *
- * Windows are `destroy()`ed, not `close()`d, so the graceful close-snapshot /
- * debounced-save handlers can't race a stale layout back into the wrong
- * backend's bucket.
- */
-export async function captureAndCloseWindowsForBackendSwitch(fromBackendId: string): Promise<void> {
-  // Persist the outgoing backend's layout while its windows are still live.
-  await saveWindowSessions(fromBackendId);
-  // That capture belongs to fromBackendId; wipe the id-agnostic snapshot cache
-  // so a later save for the incoming backend can't resurrect it.
-  clearWindowSessionsSnapshot();
-
-  // Tear down every workspace/HUD window.
-  for (const w of BrowserWindow.getAllWindows()) {
-    if (!w.isDestroyed()) w.destroy();
-  }
-  setMainWindow(null);
-}
-
-/**
- * Backend-switch window hook — restore half (consumed by T3's switch
- * orchestration).
- *
- * Restores `toBackendId`'s saved window layout, or opens one fresh default
- * window when that backend has no saved sessions. Call AFTER the new client is
- * connected and the active id has been flipped, so restored windows load
- * against the incoming daemon.
+ * Restore `toBackendId`'s saved window layout, or open one fresh default
+ * window when that backend has no saved sessions. Call AFTER the backend's
+ * client is connected, so restored windows load against a live daemon.
+ * Consumed by the boot-wide restore and Open-with-saved-sessions paths.
  */
 export function restoreWindowsForBackend(toBackendId: string): void {
   const savedSessions = loadWindowSessions(toBackendId);
   if (savedSessions && savedSessions.length > 0) {
-    logger.info('Restoring window sessions for backend switch', {
+    logger.info('Restoring window sessions for backend', {
       backendId: toBackendId,
       count: savedSessions.length,
     });
     for (let i = 0; i < savedSessions.length; i++) {
-      createWindowForSession(savedSessions[i], i === 0);
+      createWindowForSession(savedSessions[i], i === 0, toBackendId);
     }
   } else {
     logger.info('No saved sessions for backend; opening a fresh window', {
       backendId: toBackendId,
     });
-    createWindow();
+    createWindow(toBackendId);
   }
 }
 
-export function createWindow() {
+/**
+ * Enumerate the backend ids that have a non-empty saved session bucket on
+ * disk, excluding backends whose final window was explicitly closed this
+ * session (tombstoned — see `closedBackendSessions`).
+ */
+export function listSavedSessionBackendIds(): string[] {
+  try {
+    return Object.entries(readSessionsMap())
+      .filter(([id, sessions]) => sessions.length > 0 && !closedBackendSessions.has(id))
+      .map(([id]) => id);
+  } catch (err) {
+    logger.warn('Failed to enumerate saved window session backends:', err);
+    return [];
+  }
+}
+
+/**
+ * Boot/dock-activate restore across EVERY backend that has a saved session
+ * bucket, not just the active one. The active backend restores first so its
+ * first window becomes the main window; every bucket gets a pooled client
+ * connected via `connectBackend` (injected — window.ts must not import
+ * backend.ipc; idempotent for already-connected backends) BEFORE its windows
+ * open, so restored windows resolve their own
+ * daemon. Fail-soft per bucket: a backend whose client config cannot even be
+ * built (forgotten remote, missing token) is skipped with a log, while an
+ * unreachable-but-buildable backend still restores — client construction does
+ * not await reachability, and the per-window stopped overlay shows until its
+ * client connects. Returns true when at least one window was restored.
+ */
+export async function restoreAllBackendWindowSessions(
+  activeBackendId: string,
+  connectBackend: (backendId: string) => Promise<unknown>,
+): Promise<boolean> {
+  const backendIds = listSavedSessionBackendIds();
+  // Stable sort: active bucket first, others keep their on-disk order.
+  backendIds.sort((a, b) => Number(b === activeBackendId) - Number(a === activeBackendId));
+  let restoredAny = false;
+  for (const backendId of backendIds) {
+    // Connect every bucket unconditionally — connectBackend is idempotent
+    // (returns the existing pooled client when one is already connected), so
+    // this holds no assumption about which client boot already created.
+    try {
+      await connectBackend(backendId);
+    } catch (err) {
+      logger.warn('Skipping window restore for backend without a connectable client', {
+        backendId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      continue;
+    }
+    const sessions = loadWindowSessions(backendId);
+    if (!sessions || sessions.length === 0) continue;
+    logger.info('Restoring window sessions', { backendId, count: sessions.length });
+    for (let i = 0; i < sessions.length; i++) {
+      createWindowForSession(sessions[i], !restoredAny && i === 0, backendId);
+    }
+    restoredAny = true;
+  }
+  return restoredAny;
+}
+
+/** Focus a live window for a backend, or add that backend's saved/fresh windows. */
+export function openOrFocusWindowsForBackend(backendId: string): void {
+  const existing = BrowserWindow.getAllWindows().find(
+    (window) =>
+      !window.isDestroyed() && getBackendIdForWebContents(window.webContents) === backendId,
+  );
+  if (existing) {
+    if (existing.isMinimized()) existing.restore();
+    existing.show();
+    existing.focus();
+    setMainWindow(existing);
+    return;
+  }
+  restoreWindowsForBackend(backendId);
+}
+
+/** Ensure closing one backend cannot destroy the app's final live window. */
+export function ensureLocalWindowBeforeClosingBackend(backendId: string): void {
+  const liveWindows = BrowserWindow.getAllWindows().filter((window) => !window.isDestroyed());
+  const closesAnyWindow = liveWindows.some((window) => getBackendIdForWindow(window) === backendId);
+  const hasSurvivingWindow = liveWindows.some(
+    (window) => getBackendIdForWindow(window) !== backendId,
+  );
+  if (closesAnyWindow && !hasSurvivingWindow) {
+    openOrFocusWindowsForBackend(LOCAL_CONNECTION_ID);
+  }
+}
+
+/** Destroy only windows bound to one backend, preserving every other backend. */
+export function closeWindowsForBackend(backendId: string): void {
+  const windows = BrowserWindow.getAllWindows();
+  for (const window of windows) {
+    if (!window.isDestroyed() && getBackendIdForWindow(window) === backendId) window.destroy();
+  }
+  const main = getMainWindow();
+  if (main?.isDestroyed()) {
+    setMainWindow(windows.find((window) => !window.isDestroyed()) ?? null);
+  }
+}
+
+export function createWindow(backendId: string = LOCAL_CONNECTION_ID) {
   const iconPath = resolveIcon(true);
   const { workArea } = screen.getPrimaryDisplay();
 
@@ -552,12 +834,19 @@ export function createWindow() {
           width: savedBounds.width,
           height: savedBounds.height,
         };
-        const validated = validateBounds(resolved, workArea);
-        if (validated === resolved) {
-          windowBounds = resolved;
+        // Validate against the display the saved bounds land on, not the
+        // primary display, so bounds saved on a secondary monitor survive. In
+        // the fallback case validateBounds() returns that matched display's
+        // work area, so use its result either way instead of snapping back to
+        // the primary display.
+        windowBounds = validateBounds(resolved, screen.getDisplayMatching(resolved).workArea);
+        if (windowBounds === resolved) {
           logger.info('Using saved window bounds:', windowBounds);
         } else {
-          logger.info('Saved window bounds not reasonable for current display, using defaults');
+          logger.info(
+            'Saved window bounds not reasonable, using matched display work area:',
+            windowBounds,
+          );
         }
       }
     }
@@ -565,9 +854,12 @@ export function createWindow() {
     logger.warn('Failed to load saved window bounds:', err);
   }
 
-  const window = new BrowserWindow(
-    buildWindowOptions({ bounds: windowBounds, title: resolveAppTitle(), iconPath }),
-  );
+  const window = createConfiguredWindow({
+    bounds: windowBounds,
+    title: resolveAppTitle(),
+    iconPath,
+  });
+  stampWindowWithBackend(window, backendId);
   forwardRendererConsoleToMainLog(window);
 
   setMainWindow(window);
@@ -603,11 +895,14 @@ export function createWindow() {
       .catch((error: unknown) => logger.error('Failed to clear cache:', error as Error));
   }
 
-  // Check process.argv for intent:// URL on cold start
-  const intentUrl = process.argv.find((arg: string) => arg.startsWith('intent://'));
+  // Check process.argv for intent:// URL on cold start. Pair links are
+  // excluded: they are handled fully in the main process (parked at startup,
+  // processed once the window is ready) and must never be embedded in the
+  // renderer load URL — the pairing bearer token would leak to the renderer.
+  const intentUrl = findIntentUrl(process.argv);
   let loadUrl = buildLoadUrl();
 
-  if (intentUrl) {
+  if (intentUrl && !isPairingUri(intentUrl)) {
     const deepLinkHandler = new DeepLinkHandler();
     const action = deepLinkHandler.parseDeepLink(intentUrl);
     if (action) {
@@ -636,7 +931,16 @@ export async function createWindowForDeepLink(
   deepLinkUrl: string,
   deepLinkHandler: DeepLinkHandler,
 ) {
-  logger.info('Creating window for deep link:', { url: deepLinkUrl });
+  logger.info('Creating window for deep link:', { url: scrubToken(deepLinkUrl) });
+
+  // Pair links never touch the renderer (no window, no IPC): route straight
+  // to the main-process pair handler. Dynamic import — pair-deep-link reaches
+  // backend.ipc, which imports this module (a static import would cycle).
+  if (isPairingUri(deepLinkUrl)) {
+    const { handlePairDeepLink } = await import('../features/deeplink/main/pair-deep-link');
+    await handlePairDeepLink(deepLinkUrl);
+    return;
+  }
 
   // Parse the deep link to extract action and params
   const action = deepLinkHandler.parseDeepLink(deepLinkUrl);
@@ -672,7 +976,9 @@ export async function createWindowForDeepLink(
   const { workArea } = screen.getPrimaryDisplay();
   const bounds = { x: workArea.x, y: workArea.y, width: workArea.width, height: workArea.height };
 
-  const newWindow = new BrowserWindow(buildWindowOptions({ bounds, title: resolveAppTitle() }));
+  const iconPath = resolveIcon(false);
+  const newWindow = createConfiguredWindow({ bounds, title: resolveAppTitle(), iconPath });
+  stampWindowWithBackend(newWindow);
   forwardRendererConsoleToMainLog(newWindow);
 
   const encodedAction = encodeURIComponent(JSON.stringify(action));

@@ -17,7 +17,7 @@
   import SidebarContextMenu from '$lib/components/ui/sidebar-context-menu/SidebarContextMenu.svelte';
   import type { SidebarMenuEntry } from '$lib/components/ui/sidebar-context-menu/types';
   import { m } from '$shared/paraglide/messages.js';
-  import OpenPanelIndicator from '$lib/components/workspace/sidebar/OpenPanelIndicator.svelte';
+  import { isCmdClickModifier } from '$shared/utils/link-helpers';
 
   interface Props {
     file: UIFileChange;
@@ -33,7 +33,12 @@
     selected?: boolean;
     /** Whether this file has keyboard focus */
     focused?: boolean;
-    onFileClick?: (path: string, commitHash?: string, staged?: boolean, event?: MouseEvent) => void;
+    onFileClick?: (
+      path: string,
+      commitHash?: string,
+      staged?: boolean,
+      event?: MouseEvent | KeyboardEvent,
+    ) => void;
     /** Called when file is shift+clicked for multi-select */
     onSelectClick?: (path: string, event: MouseEvent) => void;
     onStage?: (path: string) => void;
@@ -41,7 +46,6 @@
     onRevert?: (path: string) => void;
     /** Callback to open the file in the external editor (e.g., VS Code) */
     onOpenFile?: (path: string) => void;
-    openPanelCount?: number;
     activeInPanel?: boolean;
   }
 
@@ -61,7 +65,6 @@
     onUnstage,
     onRevert,
     onOpenFile,
-    openPanelCount = 0,
     activeInPanel = false,
   }: Props = $props();
 
@@ -191,7 +194,7 @@
   class="group/row relative flex items-center gap-1 w-full text-left rounded -mx-1 -mb-px pl-1 border {muted
     ? 'text-muted-foreground'
     : ''} {active || selected || focused
-    ? 'bg-background text-foreground border-border shadow-xs'
+    ? 'bg-background text-foreground border-transparent'
     : 'border-transparent'}"
   oncontextmenu={handleContextMenu}
 >
@@ -206,6 +209,11 @@
       } else {
         onFileClick?.(file.path, undefined, file.staged, e);
       }
+    }}
+    onkeydown={(event: KeyboardEvent) => {
+      if (event.key !== 'Enter' || !isCmdClickModifier({ event })) return;
+      event.preventDefault();
+      onFileClick?.(file.path, undefined, file.staged, event);
     }}
   >
     <!-- File info -->
@@ -224,7 +232,6 @@
         <span class="text-ui text-subtle truncate">{dirPath}</span>
       {/if}
     </div>
-    <OpenPanelIndicator count={openPanelCount} active={activeInPanel} />
   </button>
 
   <!-- Action buttons container - shown on hover -->

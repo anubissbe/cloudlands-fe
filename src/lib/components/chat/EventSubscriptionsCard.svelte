@@ -1,8 +1,14 @@
 <script lang="ts">
   import type { Snippet } from 'svelte';
-  import { tick } from 'svelte';
+  import { tick, untrack } from 'svelte';
+  import { store as appStore } from '$store/renderer/store';
+  import {
+    prMonitorsSubscribeRequested,
+    prMonitorsUnsubscribeRequested,
+  } from '$store/renderer/slices/pr-monitor/pr-monitor-slice';
   import AgentSubscriptions from './AgentSubscriptions.svelte';
   import BackgroundHooksRow from './BackgroundHooksRow.svelte';
+  import BrowserTabsRow from './BrowserTabsRow.svelte';
   import MonitoredPrsRow from './MonitoredPrsRow.svelte';
   import { m } from '$shared/paraglide/messages.js';
   import { formatInteger } from '$lib/i18n/format';
@@ -31,6 +37,8 @@
     workspaceId: string;
     agentId: string;
     compact?: boolean;
+    /** Whether the owning chat is active, independent of disclosure state. */
+    isActive?: boolean;
     visible?: boolean;
     /** Static, daemon-free content used by catalog and visual-test previews. */
     isolatedPreview?: {
@@ -46,6 +54,7 @@
     workspaceId,
     agentId,
     compact = false,
+    isActive = true,
     visible = $bindable(false),
     isolatedPreview,
     previewContent,
@@ -53,9 +62,11 @@
   let agentsVisible = $state(false);
   let hooksVisible = $state(false);
   let prsVisible = $state(false);
+  let browserTabsVisible = $state(false);
   let agentCount = $state(0);
   let hookCount = $state(0);
   let prCount = $state(0);
+  let browserTabCount = $state(0);
   let participantAgentIds = $state<string[]>([]);
   let participantAvatarItems = $state<AgentAvatarStackItem[]>([]);
   let isCollapsed = $state(false);
@@ -65,9 +76,21 @@
   let bodyElement: HTMLElement | undefined = $state();
   const componentId = $props.id();
   const bodyId = `event-subscriptions-body-${componentId}`;
-  const hasSubscriptions = $derived(
+
+  // The visible chat owns this lease, not the selected workspace tab or the
+  // collapsible row. Chief lives outside the tab strip; collapse must not
+  // interrupt its snapshot or live updates.
+  $effect(() => {
+    if (isolatedPreview || !workspaceId || !isActive) return;
+    const currentWorkspaceId = workspaceId;
+    untrack(() => appStore.dispatch(prMonitorsSubscribeRequested(currentWorkspaceId)));
+    return () => appStore.dispatch(prMonitorsUnsubscribeRequested(currentWorkspaceId));
+  });
+
+  const hasEventSubscriptions = $derived(
     isolatedPreview ? isolatedPreview.count > 0 : agentsVisible || hooksVisible || prsVisible,
   );
+  const hasSubscriptions = $derived(hasEventSubscriptions || browserTabsVisible);
   const totalCount = $derived(
     isolatedPreview ? isolatedPreview.count : agentCount + hookCount + prCount,
   );
@@ -106,6 +129,14 @@
         ? m.chat_eventSubscriptions_heading_one({ count: formatInteger(totalCount) })
         : m.chat_eventSubscriptions_heading_many({ count: formatInteger(totalCount) });
   });
+
+  // A tabs-only card has no event subscriptions, so labelling it "Subscribed
+  // to events" would be wrong — use the browser-tabs heading instead.
+  const cardAriaLabel = $derived(
+    hasEventSubscriptions || !browserTabsVisible
+      ? heading
+      : m.chat_browserTabs_heading({ count: formatInteger(browserTabCount) }),
+  );
 
   $effect(() => {
     visible = hasSubscriptions;
@@ -151,9 +182,9 @@
     class="w-full min-w-0 max-w-full overflow-hidden rounded-lg border border-border bg-card/80 shadow-sm font-family-child"
     data-conversation-layer="event-subscriptions"
     data-testid="event-subscriptions-card"
-    aria-label={heading}
+    aria-label={cardAriaLabel}
   >
-    {#if !isAgentOnly}
+    {#if !isAgentOnly && hasEventSubscriptions}
       <h2 data-testid="event-subscriptions-outer-header">
         <Button
           variant="plain"
@@ -287,6 +318,23 @@
             />
           </div>
         {/if}
+      </div>
+    {/if}
+    {#if !isolatedPreview}
+      <!-- Parallel "Browser tabs (N)" section: stays visible while the events
+           disclosure above is collapsed (it has its own expand state). -->
+      <div
+        class={hasEventSubscriptions ? 'border-t border-border' : ''}
+        class:hidden={!browserTabsVisible}
+        data-testid="event-subscriptions-browser-tabs"
+      >
+        <BrowserTabsRow
+          {workspaceId}
+          {agentId}
+          embedded
+          bind:visible={browserTabsVisible}
+          bind:count={browserTabCount}
+        />
       </div>
     {/if}
   </section>

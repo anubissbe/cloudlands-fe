@@ -6,6 +6,12 @@
  * Labels/titles use property getters so they re-resolve on locale change.
  */
 import { m } from '$shared/paraglide/messages.js';
+import {
+  resolveShortcut,
+  SHORTCUT_DEFAULTS,
+  type ShortcutId,
+  type ShortcutOverrides,
+} from './shortcut-bindings';
 
 // Detect platform once
 const isMac =
@@ -120,17 +126,23 @@ export const SHORTCUTS = {
   CLOSE_TAB: {
     key: 'mod+w',
     get label() {
-      return m.ui_shortcuts_closeTab_label();
+      return m.workspace_shortcuts_closePanelTab_description();
+    },
+  },
+  CLOSE_WORKSPACE_TAB: {
+    key: 'mod+shift+w',
+    get label() {
+      return m.workspace_shortcuts_closeSpaceTab_description();
     },
   },
   GO_BACK: {
-    key: 'mod+[ / mod+←',
+    key: 'mod+←',
     get label() {
       return m.ui_shortcuts_goBack_label();
     },
   },
   GO_FORWARD: {
-    key: 'mod+] / mod+→',
+    key: 'mod+→',
     get label() {
       return m.ui_shortcuts_goForward_label();
     },
@@ -153,21 +165,24 @@ export const SHORTCUTS = {
       return m.ui_shortcuts_prevSpace_label();
     },
   },
-  MOVE_SPACE_TAB_LEFT: { key: 'alt+shift+left', label: 'Move Space Tab Left' },
-  MOVE_SPACE_TAB_RIGHT: { key: 'alt+shift+right', label: 'Move Space Tab Right' },
+  MOVE_SPACE_TAB_LEFT: {
+    key: 'mod+alt+shift+left',
+    get label() {
+      return m.ui_shortcuts_moveSpaceTabLeft_label();
+    },
+  },
+  MOVE_SPACE_TAB_RIGHT: {
+    key: 'mod+alt+shift+right',
+    get label() {
+      return m.ui_shortcuts_moveSpaceTabRight_label();
+    },
+  },
   SEARCH: {
     key: 'mod+f',
     get label() {
       return m.ui_shortcuts_search_label();
     },
   },
-  WORKSPACE_VIEW_MODE: {
-    key: 'mod+shift+l',
-    get label() {
-      return m.ui_shortcuts_workspaceViewMode_label();
-    },
-  },
-
   // ============================================================================
   // Dock / Agent Navigation
   // ============================================================================
@@ -197,12 +212,6 @@ export const SHORTCUTS = {
     key: 'shift+enter',
     get label() {
       return m.ui_shortcuts_newLine_label();
-    },
-  },
-  STOP: {
-    key: 'esc',
-    get label() {
-      return m.ui_shortcuts_stopGeneration_label();
     },
   },
   FOCUS_INPUT: {
@@ -418,16 +427,46 @@ export const SHORTCUTS = {
       return m.ui_shortcuts_growPanel_label();
     },
   },
-  SPLIT_PANEL_HORIZONTAL: {
+  PREVIOUS_PANE: {
+    key: 'mod+[',
+    get label() {
+      return m.ui_shortcuts_prevTab_label();
+    },
+  },
+  NEXT_PANE: {
+    key: 'mod+]',
+    get label() {
+      return m.ui_shortcuts_nextTab_label();
+    },
+  },
+  FOCUS_PREVIOUS_COLUMN: {
+    key: 'mod+shift+[',
+    get label() {
+      return m.ui_shortcuts_prevPanel_label();
+    },
+  },
+  FOCUS_NEXT_COLUMN: {
+    key: 'mod+shift+]',
+    get label() {
+      return m.ui_shortcuts_nextPanel_label();
+    },
+  },
+  MOVE_PANE_PREVIOUS_COLUMN: {
+    key: 'mod+alt+pageup',
+    get label() {
+      return m.ui_shortcuts_movePanePreviousColumn_label();
+    },
+  },
+  MOVE_PANE_NEXT_COLUMN: {
+    key: 'mod+alt+pagedown',
+    get label() {
+      return m.ui_shortcuts_movePaneNextColumn_label();
+    },
+  },
+  CREATE_COLUMN_RIGHT: {
     key: 'mod+\\',
     get label() {
       return m.ui_shortcuts_splitPanelHorizontal_label();
-    },
-  },
-  SPLIT_PANEL_VERTICAL: {
-    key: 'mod+shift+\\',
-    get label() {
-      return m.ui_shortcuts_splitPanelVertical_label();
     },
   },
   COPY_BROWSER_URL: {
@@ -491,19 +530,81 @@ export function isMacPlatform(): boolean {
 }
 
 /**
- * Get the modifier key name for the current platform
- */
-export function getModifierKey(): string {
-  return isMac ? '⌘' : 'Ctrl';
-}
-
-/**
  * Shortcut entry with display information
  */
 export interface ShortcutEntry {
   key: string;
   label: string;
   contexts?: ShortcutContext[];
+}
+
+const SHORTCUT_IDS_BY_CATEGORY: Record<ShortcutCategory, readonly ShortcutId[]> = {
+  global: [
+    'global.command-palette',
+    'global.settings',
+    'global.keyboard-shortcuts',
+    'global.command-palette-alt',
+    'global.toggle-spaces',
+    'global.new-space',
+    'global.search',
+    'global.next-space',
+    'global.previous-space',
+  ],
+  navigation: [
+    'navigation.go-to-tab',
+    'navigation.new-tab',
+    'navigation.close-tab',
+    'navigation.close-space-tab',
+    'navigation.reopen-tab',
+    'navigation.move-space-tab-left',
+    'navigation.move-space-tab-right',
+  ],
+  chat: [
+    'chat.send',
+    'chat.force-send',
+    'chat.new-line',
+    'chat.focus-input',
+    'chat.mention-context',
+  ],
+  editor: [
+    'editor.go-to-line',
+    'editor.save',
+    'editor.undo',
+    'editor.redo',
+    'editor.toggle-task-list',
+    'editor.toggle-word-wrap',
+    'editor.copy',
+    'editor.select-all',
+  ],
+  panel: [
+    'panel.toggle-sidebar',
+    'panel.create-column-right',
+    'panel.focus-next-column',
+    'panel.maximize',
+    'panel.focus-previous-column',
+    'panel.next-pane',
+    'panel.previous-pane',
+    'panel.move-pane-next-column',
+    'panel.move-pane-previous-column',
+    'panel.copy-browser-url',
+  ],
+  leader: [
+    'leader.navigate-panels',
+    'leader.resize-panels',
+    'leader.split-right',
+    'leader.toggle-zoom',
+    'leader.close-panel',
+    'leader.next-previous-panel',
+    'leader.equalize-sizes',
+    'leader.jump-to-panel',
+    'leader.cycle-layout',
+  ],
+};
+
+export interface ShortcutDefinition extends ShortcutEntry {
+  id: ShortcutId;
+  category: ShortcutCategory;
+  defaultKey: string;
 }
 
 /**
@@ -554,13 +655,6 @@ export const SHORTCUT_CATEGORIES: Record<
         contexts: ['global'],
       },
       {
-        key: SHORTCUTS.WORKSPACE_VIEW_MODE.key,
-        get label() {
-          return SHORTCUTS.WORKSPACE_VIEW_MODE.label;
-        },
-        contexts: ['global'],
-      },
-      {
         key: 'mod+n',
         get label() {
           return m.workspace_page_newSpace_title();
@@ -596,20 +690,6 @@ export const SHORTCUT_CATEGORIES: Record<
     },
     shortcuts: [
       {
-        key: 'mod+[',
-        get label() {
-          return m.ui_shortcuts_goBack_label();
-        },
-        contexts: ['global'],
-      },
-      {
-        key: 'mod+]',
-        get label() {
-          return m.ui_shortcuts_goForward_label();
-        },
-        contexts: ['global'],
-      },
-      {
         key: 'mod+1-9',
         get label() {
           return m.ui_shortcuts_goToTab_label();
@@ -624,9 +704,16 @@ export const SHORTCUT_CATEGORIES: Record<
         contexts: ['global'],
       },
       {
-        key: 'mod+w',
+        key: SHORTCUTS.CLOSE_TAB.key,
         get label() {
-          return m.ui_shortcuts_closeTab_label();
+          return SHORTCUTS.CLOSE_TAB.label;
+        },
+        contexts: ['global'],
+      },
+      {
+        key: SHORTCUTS.CLOSE_WORKSPACE_TAB.key,
+        get label() {
+          return SHORTCUTS.CLOSE_WORKSPACE_TAB.label;
         },
         contexts: ['global'],
       },
@@ -637,6 +724,8 @@ export const SHORTCUT_CATEGORIES: Record<
         },
         contexts: ['global'],
       },
+      { ...SHORTCUTS.MOVE_SPACE_TAB_LEFT, contexts: ['global'] },
+      { ...SHORTCUTS.MOVE_SPACE_TAB_RIGHT, contexts: ['global'] },
     ],
   },
   chat: {
@@ -662,13 +751,6 @@ export const SHORTCUT_CATEGORIES: Record<
         key: 'shift+enter',
         get label() {
           return m.ui_shortcuts_newLine_label();
-        },
-        contexts: ['chat'],
-      },
-      {
-        key: 'esc',
-        get label() {
-          return m.ui_shortcuts_stopGeneration_label();
         },
         contexts: ['chat'],
       },
@@ -764,16 +846,16 @@ export const SHORTCUT_CATEGORIES: Record<
         contexts: ['panel'],
       },
       {
-        key: 'mod+\\',
+        key: SHORTCUTS.CREATE_COLUMN_RIGHT.key,
         get label() {
-          return m.ui_shortcuts_splitHorizontally_label();
+          return SHORTCUTS.CREATE_COLUMN_RIGHT.label;
         },
         contexts: ['global'],
       },
       {
-        key: 'mod+shift+\\',
+        key: SHORTCUTS.FOCUS_NEXT_COLUMN.key,
         get label() {
-          return m.ui_shortcuts_splitVertically_label();
+          return SHORTCUTS.FOCUS_NEXT_COLUMN.label;
         },
         contexts: ['global'],
       },
@@ -785,30 +867,37 @@ export const SHORTCUT_CATEGORIES: Record<
         contexts: ['global'],
       },
       {
-        key: 'mod+shift+pagedown',
+        key: SHORTCUTS.FOCUS_PREVIOUS_COLUMN.key,
         get label() {
-          return m.ui_shortcuts_nextPanel_label();
+          return SHORTCUTS.FOCUS_PREVIOUS_COLUMN.label;
         },
         contexts: ['global'],
       },
       {
-        key: 'mod+shift+pageup',
+        key: SHORTCUTS.NEXT_PANE.key,
         get label() {
-          return m.ui_shortcuts_prevPanel_label();
+          return SHORTCUTS.NEXT_PANE.label;
         },
         contexts: ['global'],
       },
       {
-        key: 'mod+pagedown',
+        key: SHORTCUTS.PREVIOUS_PANE.key,
         get label() {
-          return m.ui_shortcuts_nextTab_label();
+          return SHORTCUTS.PREVIOUS_PANE.label;
         },
         contexts: ['global'],
       },
       {
-        key: 'mod+pageup',
+        key: SHORTCUTS.MOVE_PANE_NEXT_COLUMN.key,
         get label() {
-          return m.ui_shortcuts_prevTab_label();
+          return SHORTCUTS.MOVE_PANE_NEXT_COLUMN.label;
+        },
+        contexts: ['global'],
+      },
+      {
+        key: SHORTCUTS.MOVE_PANE_PREVIOUS_COLUMN.key,
+        get label() {
+          return SHORTCUTS.MOVE_PANE_PREVIOUS_COLUMN.label;
         },
         contexts: ['global'],
       },
@@ -844,13 +933,6 @@ export const SHORTCUT_CATEGORIES: Record<
         key: '%',
         get label() {
           return m.ui_shortcuts_splitRight_label();
-        },
-        contexts: ['panel'],
-      },
-      {
-        key: '"',
-        get label() {
-          return m.ui_shortcuts_splitDown_label();
         },
         contexts: ['panel'],
       },
@@ -900,6 +982,32 @@ export const SHORTCUT_CATEGORIES: Record<
   },
 };
 
+export const SHORTCUT_REGISTRY: readonly ShortcutDefinition[] = (
+  Object.entries(SHORTCUT_CATEGORIES) as [
+    ShortcutCategory,
+    { title: string; shortcuts: ShortcutEntry[] },
+  ][]
+).flatMap(([category, data]) =>
+  data.shortcuts.map((entry, index) => {
+    const id = SHORTCUT_IDS_BY_CATEGORY[category][index];
+    if (!id || SHORTCUT_DEFAULTS[id] !== entry.key) {
+      throw new Error(`Shortcut registry mismatch for ${category} entry ${index}`);
+    }
+    return {
+      id,
+      category,
+      defaultKey: SHORTCUT_DEFAULTS[id],
+      get key() {
+        return entry.key;
+      },
+      get label() {
+        return entry.label;
+      },
+      contexts: entry.contexts,
+    };
+  }),
+);
+
 /**
  * Get shortcuts for a specific context
  */
@@ -927,6 +1035,24 @@ export function getShortcutsForContext(
 /**
  * Get all shortcuts organized by category
  */
-export function getAllShortcutCategories(): typeof SHORTCUT_CATEGORIES {
-  return SHORTCUT_CATEGORIES;
+export function getAllShortcutCategories(
+  overrides: ShortcutOverrides = {},
+): Record<ShortcutCategory, { title: string; shortcuts: ShortcutEntry[] }> {
+  return Object.fromEntries(
+    (
+      Object.entries(SHORTCUT_CATEGORIES) as [
+        ShortcutCategory,
+        (typeof SHORTCUT_CATEGORIES)[ShortcutCategory],
+      ][]
+    ).map(([category, data]) => [
+      category,
+      {
+        title: data.title,
+        shortcuts: data.shortcuts.map((shortcut, index) => ({
+          ...shortcut,
+          key: resolveShortcut(SHORTCUT_IDS_BY_CATEGORY[category][index], overrides),
+        })),
+      },
+    ]),
+  ) as Record<ShortcutCategory, { title: string; shortcuts: ShortcutEntry[] }>;
 }

@@ -8,9 +8,9 @@
 import { m } from '$shared/paraglide/messages.js';
 import type { McpTransportType, McpAuthType } from './types';
 
-export type UserInputType = 'argument' | 'environmentVariable';
+type UserInputType = 'argument' | 'environmentVariable';
 
-export interface UserInputConfig {
+interface UserInputConfig {
   label: string;
   description?: string;
   placeholder?: string;
@@ -47,6 +47,17 @@ export const mcpOptions: McpInstallOption[] = [
     type: 'http',
     url: 'https://mcp.figma.com/mcp',
     authType: 'oauth',
+  },
+  {
+    // i18n-ignore (stable server-name identifier containing the Figma brand)
+    label: 'Figma Desktop',
+    get description() {
+      return m.settings_mcp_preset_figmaDesktop_description();
+    },
+    iconName: 'figma',
+    type: 'http',
+    url: 'http://127.0.0.1:3845/mcp',
+    authType: 'none',
   },
   {
     label: 'Redis',

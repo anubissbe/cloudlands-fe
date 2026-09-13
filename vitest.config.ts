@@ -1,6 +1,24 @@
 import { defineConfig } from 'vitest/config';
 import path from 'path';
+import os from 'os';
 import { readFileSync } from 'fs';
+import { gitignoreDirExcludes } from './scripts/gitignore-dir-excludes.mjs';
+
+// CI-only tuning for shared self-hosted runners (intent-hq/monorepo#3082; the
+// recurrence class #3032/#2586/#1406/#1171/#545). The CI unit job runs on the
+// 64-core tinybox, which hosts up to 8 concurrent jobs across repos (including
+// intentd cargo builds): 50% of cores there means 32 jsdom forks on an
+// already-loaded box, and under external load rotating test files blow the 30s
+// budget (observed ~34s for tests that take ~8s locally) while passing in
+// isolation. CI caps workers at min(50%, 16) — halving the fork count on the
+// big shared box while leaving the 8-core GH-hosted burst runner (4 workers)
+// unchanged. Local runs keep the plain 50% cap.
+// std-env semantics (what vitest itself uses): CI=false in a dev shell means
+// "not CI", so the local path keeps the plain 50% cap there too.
+const isCI = !!process.env.CI && process.env.CI !== 'false';
+// Math.round matches how vitest resolves '50%' (getWorkersCountByPercentage),
+// so on any core count the CI path differs from '50%' only via the 16 cap.
+const ciMaxWorkers = Math.max(1, Math.min(16, Math.round(os.availableParallelism() / 2)));
 
 export default defineConfig(async () => {
   const { svelte } = await import('@sveltejs/vite-plugin-svelte');
@@ -24,73 +42,50 @@ export default defineConfig(async () => {
       globals: true,
       environment: 'jsdom',
       setupFiles: ['./src/test-setup.ts'],
+      // Redirects every worker's os.tmpdir() into a private root and fails the
+      // run if a test leaves a temp entry behind (see src/test-global-setup.ts).
+      globalSetup: ['./src/test-global-setup.ts'],
       // Cap workers at 50% of logical cores. Vitest defaults to one worker per
       // core; ~20 jsdom workers oversubscribe the CPU and, when the machine is
       // under external load (builds, other agents), heavy component suites blow
       // past their timeouts in full-suite runs while passing in isolation.
-      // See intent-hq/monorepo#545.
-      maxWorkers: '50%',
+      // See intent-hq/monorepo#545. On CI the cap is further bounded at 16
+      // workers for shared self-hosted runners (see ciMaxWorkers above).
+      maxWorkers: isCI ? ciMaxWorkers : '50%',
       // 30s (up from 10s) gives slow-machine/loaded-machine headroom for the
       // heavy sidebar/component suites (intent-hq/monorepo#545). Genuine hangs
-      // still fail, just a bit later.
-      testTimeout: 30000,
-      hookTimeout: 30000,
+      // still fail, just a bit later. CI doubles the budget to 60s: external
+      // runner load can starve a worker ~4x (intent-hq/monorepo#3082), and the
+      // concurrency cap alone cannot absorb every load spike.
+      testTimeout: isCI ? 60_000 : 30_000,
+      hookTimeout: isCI ? 60_000 : 30_000,
       teardownTimeout: 10000,
       exclude: [
         '**/node_modules/**',
         '**/dist/**',
         '**/build/**',
         '**/.{idea,git,cache,output,temp}/**',
-        // Exclude any untracked git-worktree dirs (e.g. .wt-commit-details/) so
-        // vitest doesn't double-collect their test files alongside the primary tree.
-        '**/.wt-*/**',
+        // Scratch/sandbox excludes (worktrees, probes, .dev/, etc.) come from .gitignore.
+        ...gitignoreDirExcludes(path.join(__dirname, '.gitignore')),
         'test/**', // Exclude Playwright tests directory (package-root only; do not swallow src/test/**)
         // Required CI runs this suite separately with its Node-specific setup.
         'tests/integration/**',
         '**/*.ct.spec.ts', // Exclude Playwright component tests
         '**/*.visual.spec.ts', // Exclude Playwright visual harnesses (browser-owned environment)
-        '**/remote-env.test.ts', // Exclude remote env tests - requires real environment
-        '**/remote-git.test.ts', // Exclude remote git tests - requires real environment
+        // Remote-environment suites need a real daemon/host; not part of the unit gate.
+        '**/remote-env.test.ts',
+        '**/remote-git.test.ts',
         // ================================================================================
-        // PRE-EXISTING BUGS: Tests below have code bugs (wrong imports, missing schemas)
-        // that existed before being excluded. They now run but fail due to these bugs.
-        // TODO: Fix these tests and remove exclusions.
+        // Known-broken tests kept excluded until triaged (repair, migrate, or delete).
+        // Only list files that exist; drop the entry when the file is fixed or removed.
         // ================================================================================
-        // Tests with wrong import paths (../notes.service instead of ../main/notes.service)
-        '**/features/notes/__tests__/add-dependency.test.ts',
-        '**/features/notes/__tests__/add-dependency-edge-cases.test.ts',
-        '**/features/notes/__tests__/assign-agent-to-task.test.ts',
-        '**/features/notes/__tests__/create-prerequisite-note.test.ts',
-        '**/features/notes/__tests__/cycle-detection.test.ts',
-        '**/features/notes/__tests__/edit-events.test.ts',
-        '**/features/notes/__tests__/get-children.test.ts',
-        '**/features/notes/__tests__/get-dependencies.test.ts',
-        '**/features/notes/__tests__/get-task-notes.test.ts',
-        '**/features/notes/__tests__/mark-as-task.test.ts',
-        '**/features/notes/__tests__/mark-as-task-edge-cases.test.ts',
-        '**/features/notes/__tests__/notes-service-comment-id-validation.test.ts',
-        '**/features/notes/__tests__/remove-dependency.test.ts',
-        '**/features/notes/__tests__/remove-task-metadata.test.ts',
-        '**/features/notes/__tests__/update-task-status.test.ts',
-        '**/features/notes/__tests__/update-task-status-edge-cases.test.ts',
-        // Tests with missing schema exports (NoteDependencySchema undefined)
+        // Missing schema export (NoteDependencySchema undefined).
         '**/features/notes/__tests__/dependency-types.test.ts',
-        // Tests with file system checks for build artifacts
-        '**/agent-providers/__tests__/acp-provider-mcp-config.test.ts',
-        // Integration tests with various pre-existing issues
-        '**/tests/event-integration.test.ts',
-
-        '**/features/file-tracking/__tests__/file-tracking-integration.test.ts',
-        '**/features/workspace/__tests__/remote-change-detector.test.ts',
-        '**/features/agent/main/__tests__/edge-cases.test.ts',
-        '**/features/agent/main/__tests__/migration.test.ts',
-        '**/features/agent/main/__tests__/streaming.test.ts',
-        '**/features/agent/services/__tests__/chat-session-resume.test.ts',
+        // Pre-existing failures in notes/task helper coverage.
         '**/features/notes/utils/__tests__/task-agent-message-builder.test.ts',
         '**/features/notes/__tests__/notes-primitives-roundtrip.test.ts',
-        '**/features/agent/main/__tests__/persistence-ipc.test.ts',
+        // Legacy top-level unit tests with pre-existing failures.
         '**/tests/unit/edge-cases.test.ts',
-        '**/lib/utils/__tests__/markdown-processor.test.ts',
         // Pre-existing test-fixture bug newly surfaced by the `**/test/**` →
         // `test/**` exclude narrowing (unrelated to the scripted-transport
         // fixture): the faker workspace-name assertion expects "Workspace"
@@ -126,10 +121,7 @@ export default defineConfig(async () => {
           __dirname,
           './src/lib/icons/phosphor-icons.ts',
         ),
-        'svelte-fa': path.resolve(
-          __dirname,
-          './src/lib/components/shared/icons/fa-proxy.ts',
-        ),
+        'svelte-fa': path.resolve(__dirname, './src/lib/components/shared/icons/fa-proxy.ts'),
         // Test-only stub: avoid resolving the real monaco-editor (heavy and ESM-export sensitive)
         'monaco-editor': path.resolve(__dirname, './src/__mocks__/monaco-editor'),
         // Test-only stub: avoid resolving protocol-adapter's complex dependency chain

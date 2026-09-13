@@ -28,12 +28,12 @@
     faExpand,
     faCompress,
     faTableColumns,
-    faGripLines,
-    faThumbtack,
     faArrowLeft,
     faArrowRight,
+    faArrowUp,
+    faArrowDown,
     faCheck,
-    faMagnifyingGlass,
+    faComment,
   } from '@fortawesome/free-solid-svg-icons';
   import { invoke } from '$lib/electron-bridge';
   import { toast } from '$lib/components/ui/toast';
@@ -45,28 +45,22 @@
   import * as Menu from '$lib/components/ui/menu';
   import Portal from '$lib/components/ui/Portal.svelte';
   import { onDestroy, tick } from 'svelte';
+  import type { TransitionConfig } from 'svelte/transition';
   import { Button } from '$lib/components/ui/button';
-  import { Input } from '$lib/components/ui/input';
   import { selectIsDragging } from '$store/renderer/slices/tab-state/tab-state-selectors';
   import { startDrag, endDrag } from '$store/renderer/slices/tab-state/tab-state-slice';
   import {
-    reopenClosedTab,
-    restorePanelDragLayout,
-    setPanelPinned,
+    setPanelColumnCount,
     toggleExpandPanel,
   } from '$store/renderer/slices/panel-layout/panel-layout-slice';
+  import { selectPanelColumnCount } from '$store/renderer/slices/panel-layout/panel-layout-selectors';
+  import { isPanelColumnCount } from '$store/renderer/slices/panel-layout/panel-layout-types';
   import {
-    selectPanelLayoutWorkspace,
-    selectRecentlyClosed,
-  } from '$store/renderer/slices/panel-layout/panel-layout-selectors';
-  import {
-    PANEL_DRAG_MIME,
-    clearDraggedPanelState,
-    createPanelDragImage,
-    getDraggedPanelId,
-    setPanelDragSnapshot,
-    setDraggedPanelId,
-    takePanelDragSnapshot,
+    PANE_DRAG_MIME,
+    clearDraggedPaneState,
+    createPaneDragImage,
+    getDraggedPane,
+    setDraggedPane,
   } from './panel-drag';
 
   import EditableName from '$lib/components/ui/EditableName.svelte';
@@ -79,6 +73,8 @@
   } from '$store/renderer/slices/specialists/specialists-selectors';
   import { selectGitHubAuthIsAuthenticated } from '$store/renderer/slices/github-auth/github-auth-selectors';
   import AgentAvatar from '$features/agent/components/agent-avatar/AgentAvatar.svelte';
+  import PanelHeaderAgentAvatar from './PanelHeaderAgentAvatar.svelte';
+  import BrowserFavicon from './BrowserFavicon.svelte';
   import { navigateToSettings } from '$lib/utils/workspace-navigation';
   import {
     selectIsWorkspaceHostLocal,
@@ -86,38 +82,19 @@
   } from '$store/renderer/slices/workspace/workspace-selectors';
   import { selectAllWorkspaceAgents } from '$store/renderer/slices/workspace-agents/workspace-agents-selectors';
   import { writable } from 'svelte/store';
-  import AgentAvatarWithState from '$features/agent/components/agent-avatar/AgentAvatarWithState.svelte';
-  import {
-    type AvatarState,
-    getAvatarStateForSession,
-  } from '$features/agent/components/agent-avatar/avatar-state';
-  import { getAgentAvatarStateLabel } from '$features/agent/components/agent-avatar/avatar-state-label';
-  import { selectPermissionRequests } from '$store/renderer/slices/permission/permission-selectors';
-  import {
-    selectPanelOpenMode,
-    selectPanelStackDirection,
-  } from '$store/renderer/slices/user-preferences/user-preferences-selectors';
   import { tabTypeRegistry } from '$features/layout/tab-types/registry';
   import { stripWorkspacePrefix } from '$lib/utils/file-utils';
   import { toNativePath } from '$lib/utils/path-utils';
   import { writeTextToClipboard } from '$lib/utils/clipboard';
   import { createLogger } from '$lib/utils/client-logger';
-  import { selectAgentSession } from '$store/renderer/slices/agent-session/agent-session-selectors';
+  import { formatShortcut } from '$lib/utils/shortcuts';
   import { m } from '$shared/paraglide/messages.js';
   import { store as appStore } from '$store/renderer/store';
+  import { effectiveShortcutReadable } from '$lib/utils/effective-shortcuts';
   import type { PanelHeaderActions } from './panel-header-context.svelte';
   import ResourceIconTile from '$lib/components/shared/ResourceIconTile.svelte';
   import { getResourceIconKind, RESOURCE_ICON_BY_KIND } from '$lib/components/shared/resource-icon';
-  import {
-    filterPanelTabs,
-    getAdjacentPanelTabId,
-    getDistinctPanelIdentityValue,
-    getPanelIdentityContext,
-    PANEL_IDENTITY_SEARCH_THRESHOLD,
-  } from './panel-identity-history';
-
-  const panelOpenMode$ = selectPanelOpenMode();
-  const panelStackDirection$ = selectPanelStackDirection();
+  import { getPanelExternalOpenTarget } from './panel-external-open-target';
 
   // Detect platform for file manager labels
   const isWindows = typeof navigator !== 'undefined' && navigator.platform?.startsWith('Win');
@@ -132,24 +109,41 @@
       ? m.layout_panelTabBar_fileManagerFinder_label()
       : m.layout_panelTabBar_fileManagerGeneric_label();
   const logger = createLogger('PanelTabBar');
-  const copyBrowserUrlShortcutHint = isMac ? '⇧⌘C' : 'Ctrl+Shift+C';
+  const copyBrowserUrlShortcut$ = effectiveShortcutReadable('panel.copy-browser-url');
+  const closePaneShortcut$ = effectiveShortcutReadable('navigation.close-tab');
+  const createColumnRightShortcut$ = effectiveShortcutReadable('panel.create-column-right');
+  const movePaneLeftShortcut$ = effectiveShortcutReadable('panel.move-pane-previous-column');
+  const movePaneRightShortcut$ = effectiveShortcutReadable('panel.move-pane-next-column');
+  const previousPaneShortcut$ = effectiveShortcutReadable('panel.previous-pane');
+  const nextPaneShortcut$ = effectiveShortcutReadable('panel.next-pane');
+  const copyBrowserUrlShortcutHint = $derived(formatShortcut($copyBrowserUrlShortcut$));
+  const closePaneShortcutHint = $derived(formatShortcut($closePaneShortcut$));
+  const createColumnRightShortcutHint = $derived(formatShortcut($createColumnRightShortcut$));
+  const addColumnLinkModifierHint = formatShortcut('mod');
+  const movePaneLeftShortcutHint = $derived(formatShortcut($movePaneLeftShortcut$));
+  const movePaneRightShortcutHint = $derived(formatShortcut($movePaneRightShortcut$));
+  const previousPaneShortcutHint = $derived(formatShortcut($previousPaneShortcut$));
+  const nextPaneShortcutHint = $derived(formatShortcut($nextPaneShortcut$));
+  const MAX_VISIBLE_PANE_STACK_LINES = 6;
+  const PANE_STACK_LINE_BOTTOM_Y = 12;
+  const PANE_STACK_LINE_GAP = 2;
   const CONTEXT_MENU_MARGIN = 8;
   const CONTEXT_MENU_OFFSET = 4;
   const CONTEXT_MENU_FALLBACK_WIDTH = 224;
   const CONTEXT_MENU_FALLBACK_HEIGHT = 360;
   const PANEL_HEADER_INTERACTIVE_SELECTOR =
     'button, a, input, textarea, select, [role="button"], [role="tab"], [contenteditable="true"]';
-  const IDENTITY_HOVER_OPEN_DELAY = 140;
-  const IDENTITY_HOVER_CLOSE_DELAY = 40;
 
   interface Props {
     tabs: PanelTab[];
     activeTabId: string | null;
+    attentionTabIds?: string[];
     panelId: string;
-    pinned?: boolean;
     workspaceId: string;
     layoutId?: string;
+    availableCanvasWidth?: number;
     isFocused?: boolean;
+    isRightmostPanel?: boolean;
     /** Content-specific items to merge into the grouped panel action menu. */
     contentActions?: PanelHeaderActions | null;
     /** Legacy tab strip; the tabless shell renders only the content header. */
@@ -165,6 +159,12 @@
     onTabReorder?: (fromIndex: number, toIndex: number) => void;
     /** Handler for moving a tab from another panel to this panel's tab bar */
     onTabMoveToPanel?: (tabId: string, fromPanelId: string, insertIndex?: number) => void;
+    /** Idempotently finishes the active-pane drag before layout mutation. */
+    onPaneDragFinish?: () => void;
+    onMovePaneLeft?: () => void;
+    onMovePaneRight?: () => void;
+    onMoveLeft?: () => void;
+    onMoveRight?: () => void;
     onCloseOtherTabs?: (tabId: string) => void;
     onCloseTabsToRight?: (tabId: string) => void;
     onCloseAllTabs?: () => void;
@@ -179,18 +179,18 @@
     onTabRename?: (tab: PanelTab, newName: string) => void;
     /** Split panel horizontally (side by side) */
     onSplitHorizontal?: () => void;
-    /** Split panel vertically (top and bottom) */
-    onSplitVertical?: () => void;
   }
 
   let {
     tabs,
     activeTabId,
+    attentionTabIds = [],
     panelId,
-    pinned = false,
     workspaceId,
     layoutId,
+    availableCanvasWidth,
     isFocused = false,
+    isRightmostPanel: _isRightmostPanel = false,
     contentActions = null,
     showTabStrip = false,
     onCreateAgent,
@@ -202,6 +202,11 @@
     onTabClose,
     onTabReorder,
     onTabMoveToPanel,
+    onPaneDragFinish,
+    onMovePaneLeft,
+    onMovePaneRight,
+    onMoveLeft,
+    onMoveRight,
     onCloseOtherTabs,
     onCloseTabsToRight,
     // eslint-disable-next-line @typescript-eslint/no-unused-vars
@@ -212,14 +217,14 @@
     isZoomed = false,
     onTabRename,
     onSplitHorizontal,
-    onSplitVertical,
   }: Props = $props();
 
-  const isDragging = selectIsDragging();
-  const allPermissionRequests = selectPermissionRequests();
-  const activeAgentIdStore = writable<string>('');
-  const activeAgentSession$ = selectAgentSession(activeAgentIdStore);
+  // Panel identity is immutable for this component lifetime. Cleanup must not
+  // re-read a parent prop after reactive layout removal has started.
+  // svelte-ignore state_referenced_locally
+  const stablePanelId = panelId;
 
+  const isDragging = selectIsDragging();
   // Context menu state
   let contextMenuTab = $state<{
     source: 'tab' | 'panel';
@@ -229,16 +234,14 @@
   } | null>(null);
   let contextMenuElement = $state<HTMLDivElement | null>(null);
 
-  // Identity history menu state is local presentation state.
-  let identityMenuOpen = $state(false);
-  let identitySearchQuery = $state('');
-  let identityTriggerRef = $state<HTMLButtonElement | null>(null);
-  let identityMenuRef = $state<HTMLDivElement | null>(null);
-  let identityHoverTimer: ReturnType<typeof setTimeout> | null = null;
-  let suppressNextIdentityFocusOpen = false;
-  let identityTriggerHovered = false;
-  let identityMenuHovered = false;
-  let identityPointerPosition: { x: number; y: number } | null = null;
+  let paneStackMenuOpen = $state(false);
+  let panelActionsMenuOpen = $state({ tabBar: false, compact: false });
+
+  $effect(() => {
+    void activeTabId;
+    panelActionsMenuOpen.tabBar = false;
+    panelActionsMenuOpen.compact = false;
+  });
 
   // Tab rename state - tracks which tab is being renamed inline
   let renamingTabId = $state<string | null>(null);
@@ -266,7 +269,7 @@
   // state, specialist, and delegation info all derive from this store so the
   // UI updates when agents rename or their session metadata changes.
   const workspaceAgents$ = selectAllWorkspaceAgents(workspaceIdStore);
-  const recentlyClosed$ = selectRecentlyClosed(panelLayoutIdStore);
+  const panelColumnCount$ = selectPanelColumnCount(panelLayoutIdStore);
 
   // Reactive store subscription for specialist names - ensures re-render when specialists change
   const specialists$ = selectSpecialists();
@@ -311,6 +314,8 @@
         return agent.name;
       }
     }
+    // A browser tab's title is canonical registry data; none yet shows the label.
+    if (tab.type === 'browser') return tab.title || m.layout_panelLayout_browser_fallback();
     // Fall back to the tab's stored title
     return tab.title;
   }
@@ -323,45 +328,6 @@
     if (tab.type !== 'agent' || !tab.agentId) return false;
     const agent = $workspaceAgents$.find((a) => a.id === tab.agentId);
     return !!(agent?.isBackground || (agent?.metadata as any)?.isBackground);
-  }
-
-  /**
-   * Get the specialist display name for an agent tab
-   * Uses $workspaceAgents$ for reactive updates when session metadata changes
-   * Uses unified specialist lookup that includes built-in, custom, AND team specialists
-   */
-  function getAgentSpecialist(tab: PanelTab) {
-    if (tab.type !== 'agent' || !tab.agentId) return null;
-    const agent = $workspaceAgents$.find((a) => a.id === tab.agentId);
-    const specialistId = agent?.metadata?.specialist || (agent as any)?.agentMetadata?.specialist;
-    if (!specialistId) return null;
-    return $specialists$.find((specialist) => specialist.id === specialistId) ?? null;
-  }
-
-  /**
-   * Get the avatar state for an agent tab.
-   * Uses canonical agent-session selectors for live running/waiting state.
-   */
-  function getAgentAvatarState(tab: PanelTab): AvatarState {
-    if (tab.type !== 'agent' || !tab.agentId) return 'idle';
-    if (tab.agentId === activeTab?.agentId) return activeAgentAvatarState;
-    const agent = $workspaceAgents$.find((a) => a.id === tab.agentId);
-    if (!agent) return 'idle';
-    return getAvatarStateForSession(agent, {
-      hasPermissionRequest: $allPermissionRequests.some((r) => r.sessionId === tab.agentId),
-    });
-  }
-
-  /**
-   * Get the specialist ID for an agent tab (for avatar overlay)
-   * Uses $workspaceAgents$ for reactive updates when session metadata changes
-   * Returns any specialist ID (team coordinators included), or null if no specialist
-   */
-  function getAgentSpecialistType(tab: PanelTab): string | null {
-    if (tab.type !== 'agent' || !tab.agentId) return null;
-    const agent = $workspaceAgents$.find((a) => a.id === tab.agentId);
-    const specialistId = agent?.metadata?.specialist || (agent as any)?.agentMetadata?.specialist;
-    return specialistId || null;
   }
 
   /**
@@ -388,131 +354,38 @@
     onTabClick?.(tabId);
   }
 
-  const identityTabs = $derived([
-    ...tabs,
-    ...(!pinned
-      ? $recentlyClosed$.filter((entry) => entry.panelId === panelId).map((entry) => entry.tab)
-      : []),
-  ]);
-  const backPanelTabId = $derived(getAdjacentPanelTabId(identityTabs, activeTabId, 1));
-  const forwardPanelTabId = $derived(getAdjacentPanelTabId(identityTabs, activeTabId, -1));
-  const filteredIdentityTabs = $derived(
-    filterPanelTabs(identityTabs, identitySearchQuery, getTabTitle),
+  function isAgentOwnedBrowserPane(tab: PanelTab): boolean {
+    return tab.type === 'browser' && Boolean(tab.ownerAgentId);
+  }
+
+  const attentionPaneIds = $derived(new Set(attentionTabIds));
+  const inactiveAttentionCount = $derived(
+    tabs.filter((tab) => tab.id !== activeTabId && attentionPaneIds.has(tab.id)).length,
   );
-  const showIdentityHistory = $derived(identityTabs.length > 1);
-  const showIdentitySearch = $derived(identityTabs.length >= PANEL_IDENTITY_SEARCH_THRESHOLD);
+  const activePaneIndex = $derived(tabs.findIndex((tab) => tab.id === activeTabId));
+  const previousPane = $derived(activePaneIndex > 0 ? tabs[activePaneIndex - 1] : undefined);
+  const nextPane = $derived(
+    activePaneIndex >= 0 && activePaneIndex < tabs.length - 1
+      ? tabs[activePaneIndex + 1]
+      : undefined,
+  );
 
-  function clearIdentityHoverTimer() {
-    if (!identityHoverTimer) return;
-    clearTimeout(identityHoverTimer);
-    identityHoverTimer = null;
-  }
-
-  function scheduleIdentityMenuOpen() {
-    clearIdentityHoverTimer();
-    identityHoverTimer = setTimeout(() => {
-      identityMenuOpen = true;
-      identityHoverTimer = null;
-    }, IDENTITY_HOVER_OPEN_DELAY);
-  }
-
-  function updateIdentityPointerPosition(event: PointerEvent) {
-    identityPointerPosition = { x: event.clientX, y: event.clientY };
-  }
-
-  function isIdentityPointerWithin(node: HTMLElement | null) {
-    if (!node || !identityPointerPosition) return false;
-    const rect = node.getBoundingClientRect();
-    return (
-      identityPointerPosition.x > rect.left &&
-      identityPointerPosition.x < rect.right &&
-      identityPointerPosition.y > rect.top &&
-      identityPointerPosition.y < rect.bottom
+  function handleAddPanelColumn() {
+    const nextCount = $panelColumnCount$ + 1;
+    if (!isPanelColumnCount(nextCount)) return;
+    appStore.dispatch(
+      setPanelColumnCount(layoutId ?? workspaceId, nextCount, undefined, availableCanvasWidth),
     );
   }
 
-  function handleIdentityWindowPointerMove(event: PointerEvent) {
-    if (!identityMenuOpen) return;
-    updateIdentityPointerPosition(event);
-    identityTriggerHovered = isIdentityPointerWithin(identityTriggerRef);
-    identityMenuHovered = isIdentityPointerWithin(identityMenuRef);
-    if (identityTriggerHovered || identityMenuHovered) {
-      clearIdentityHoverTimer();
-      return;
-    }
-    if (!identityHoverTimer) scheduleIdentityMenuClose();
+  function activatePane(tabId: string) {
+    handleTabClick(tabId);
+    paneStackMenuOpen = false;
   }
 
-  function handleIdentityTriggerPointerEnter(event: PointerEvent) {
-    updateIdentityPointerPosition(event);
-    identityTriggerHovered = true;
-    scheduleIdentityMenuOpen();
+  function panePosition(tabId: string): number {
+    return tabs.findIndex((tab) => tab.id === tabId) + 1;
   }
-
-  function handleIdentityTriggerPointerLeave(event: PointerEvent) {
-    updateIdentityPointerPosition(event);
-    identityTriggerHovered = false;
-    scheduleIdentityMenuClose();
-  }
-
-  function handleIdentityMenuPointerEnter(event: PointerEvent) {
-    updateIdentityPointerPosition(event);
-    identityMenuHovered = true;
-    clearIdentityHoverTimer();
-  }
-
-  function handleIdentityMenuPointerLeave(event: PointerEvent) {
-    updateIdentityPointerPosition(event);
-    identityMenuHovered = false;
-    scheduleIdentityMenuClose();
-  }
-
-  function scheduleIdentityMenuClose() {
-    clearIdentityHoverTimer();
-    identityHoverTimer = setTimeout(() => {
-      if (
-        identityTriggerHovered ||
-        identityMenuHovered ||
-        identityTriggerRef?.matches(':hover') ||
-        identityMenuRef?.matches(':hover') ||
-        isIdentityPointerWithin(identityTriggerRef) ||
-        isIdentityPointerWithin(identityMenuRef)
-      ) {
-        identityHoverTimer = null;
-        return;
-      }
-      handleIdentityOpenChange(false);
-      identityHoverTimer = null;
-    }, IDENTITY_HOVER_CLOSE_DELAY);
-  }
-
-  function handleIdentityOpenChange(open: boolean) {
-    if (!open) {
-      suppressNextIdentityFocusOpen = document.activeElement !== identityTriggerRef;
-      identitySearchQuery = '';
-    }
-    identityMenuOpen = open;
-  }
-
-  function handleIdentityTriggerFocus() {
-    if (suppressNextIdentityFocusOpen) {
-      suppressNextIdentityFocusOpen = false;
-      return;
-    }
-    identityMenuOpen = true;
-  }
-
-  function activateIdentityTab(tabId: string | null) {
-    if (!tabId) return;
-    if (tabs.some((tab) => tab.id === tabId)) {
-      handleTabClick(tabId);
-    } else {
-      appStore.dispatch(reopenClosedTab(layoutId ?? workspaceId, undefined, tabId));
-    }
-    handleIdentityOpenChange(false);
-  }
-
-  onDestroy(clearIdentityHoverTimer);
 
   function handleTabClose(e: MouseEvent, tabId: string) {
     e.stopPropagation();
@@ -524,9 +397,12 @@
     contextMenuTab = { source: 'tab', tabId, x: e.clientX, y: e.clientY };
   }
 
-  function handlePanelContextMenu(e: MouseEvent, tabId: string) {
+  function handlePanelContextMenu(e: MouseEvent) {
+    const target = e.target;
+    if (target instanceof Element && target.closest(PANEL_HEADER_INTERACTIVE_SELECTOR)) return;
     e.preventDefault();
-    contextMenuTab = { source: 'panel', tabId, x: e.clientX, y: e.clientY };
+    contextMenuTab = null;
+    panelActionsMenuOpen.compact = true;
   }
 
   function getContextMenuPosition() {
@@ -829,7 +705,7 @@
   }
 
   // Custom MIME type to prevent editors from interpreting drop as text paste
-  const TAB_DRAG_MIME = 'application/x-panel-tab';
+  const TAB_DRAG_MIME = PANE_DRAG_MIME;
 
   // Drag state
   let draggedTabId = $state<string | null>(null);
@@ -901,7 +777,7 @@
     if (!e.dataTransfer) return;
     draggedTabId = tabId;
     e.dataTransfer.effectAllowed = 'move';
-    e.dataTransfer.setData(TAB_DRAG_MIME, JSON.stringify({ tabId, panelId }));
+    e.dataTransfer.setData(TAB_DRAG_MIME, JSON.stringify({ tabId, panelId: stablePanelId }));
 
     // Update global drag state
     appStore.dispatch(startDrag());
@@ -925,8 +801,8 @@
     appStore.dispatch(endDrag());
   }
 
-  // --- Panel drag (grab the header to reorder whole panels) ---
-  function handlePanelDragStart(e: DragEvent) {
+  // --- Active pane drag (grab the header to move only the visible pane) ---
+  function handlePaneDragStart(e: DragEvent) {
     if (!e.dataTransfer) return;
     // Don't hijack drags that started on an interactive control
     const target = e.target as HTMLElement;
@@ -934,44 +810,43 @@
       e.preventDefault();
       return;
     }
-    setDraggedPanelId(panelId);
-    const activeLayoutId = layoutId ?? workspaceId;
-    const layout = selectPanelLayoutWorkspace.select(appStore.state, activeLayoutId);
-    setPanelDragSnapshot(activeLayoutId, {
-      root: layout.root,
-      focusedPanelId: layout.focusedPanelId,
-      layoutHistory: layout.layoutHistory,
-      historyIndex: layout.historyIndex,
-    });
+    if (!activeTab) {
+      e.preventDefault();
+      return;
+    }
+    const draggedPane = { tabId: activeTab.id, panelId: stablePanelId };
+    setDraggedPane(draggedPane);
     e.dataTransfer.effectAllowed = 'move';
-    e.dataTransfer.setData(PANEL_DRAG_MIME, JSON.stringify({ panelId }));
+    e.dataTransfer.setData(PANE_DRAG_MIME, JSON.stringify(draggedPane));
 
-    const dragImage = createPanelDragImage(activeTab?.title ?? '');
+    const dragImage = createPaneDragImage(activeTab.title ?? '');
     e.dataTransfer.setDragImage(dragImage, 16, 16);
     requestAnimationFrame(() => dragImage.remove());
 
     appStore.dispatch(startDrag());
   }
 
-  function handlePanelDragEnd(e: DragEvent) {
-    if (e.dataTransfer?.dropEffect === 'none') restorePanelDragStartLayout();
-    clearDraggedPanelState();
-    appStore.dispatch(endDrag());
+  function finishPaneDrag() {
+    const finish = onPaneDragFinish;
+    if (finish) finish();
+    else {
+      clearDraggedPaneState();
+      appStore.dispatch(endDrag());
+    }
   }
 
-  function restorePanelDragStartLayout() {
-    const snapshot = takePanelDragSnapshot();
-    if (!snapshot) return;
-    const { layoutId: snapshotLayoutId, ...layoutSnapshot } = snapshot;
-    appStore.dispatch(restorePanelDragLayout(snapshotLayoutId, layoutSnapshot));
+  function handlePaneDragEnd() {
+    if (getDraggedPane()?.panelId === stablePanelId) finishPaneDrag();
   }
 
-  function handlePanelDragKeyDown(e: KeyboardEvent) {
-    if (e.key !== 'Escape' || getDraggedPanelId() !== panelId) return;
-    restorePanelDragStartLayout();
-    clearDraggedPanelState();
-    appStore.dispatch(endDrag());
+  function handlePaneDragKeyDown(e: KeyboardEvent) {
+    if (e.key !== 'Escape' || getDraggedPane()?.panelId !== stablePanelId) return;
+    finishPaneDrag();
   }
+
+  onDestroy(() => {
+    if (getDraggedPane()?.panelId === stablePanelId) finishPaneDrag();
+  });
 
   // Check if a tab drag is happening (from this panel or another)
   function isTabDrag(e: DragEvent): boolean {
@@ -1059,7 +934,7 @@
       }
 
       // Same panel reorder
-      if (fromPanelId === panelId) {
+      if (fromPanelId === stablePanelId) {
         const fromIndex = tabs.findIndex((t) => t.id === sourceTabId);
         if (fromIndex === -1) {
           draggedTabId = null;
@@ -1142,7 +1017,7 @@
       }
 
       // Same panel: reorder
-      if (fromPanelId === panelId) {
+      if (fromPanelId === stablePanelId) {
         const fromIndex = tabs.findIndex((t) => t.id === sourceTabId);
         if (fromIndex === -1) {
           draggedTabId = null;
@@ -1183,43 +1058,16 @@
 
   // Get the currently active tab
   const activeTab = $derived(tabs.find((t) => t.id === activeTabId) || tabs[0] || null);
-  $effect(() => {
-    activeAgentIdStore.set(
-      activeTab?.type === 'agent' && activeTab.agentId ? activeTab.agentId : '',
-    );
-  });
-  const activeAgentAvatarState = $derived.by((): AvatarState => {
-    const agentId = activeTab?.type === 'agent' ? activeTab.agentId : null;
-    const session = $activeAgentSession$;
-    if (!agentId || !session || session.id !== agentId) return 'idle';
 
-    return getAvatarStateForSession(session, {
-      isActive: true,
-      hasPermissionRequest: $allPermissionRequests.some((request) => request.sessionId === agentId),
-    });
-  });
-
-  /**
-   * "Delegated by" parent-agent attribution for the active agent tab.
-   *
-   * The parent agent ID is mirrored into a writable store so selectAgentSession
-   * re-evaluates reactively — the label appears as soon as the parent session
-   * lands in Redux (e.g. after a workspace switch loads sessions), without
-   * requiring any user interaction.
-   */
-  const activeAgentParentId = $derived.by(() => {
-    if (!activeTab || activeTab.type !== 'agent' || !activeTab.agentId) return null;
-    const agent = $workspaceAgents$.find((a) => a.id === activeTab.agentId);
-    return (agent?.metadata?.createdByAgentId as string | undefined) ?? null;
-  });
-  const activeAgentParentIdStore = writable<string>('');
-  $effect(() => {
-    activeAgentParentIdStore.set(activeAgentParentId ?? '');
-  });
-  const activeAgentParent$ = selectAgentSession(activeAgentParentIdStore);
-  const activeAgentDelegatedByName = $derived(
-    activeAgentParentId ? $activeAgentParent$?.name || null : null,
-  );
+  function paneStackLineMotion(_node: Element, { offset }: { offset: number }): TransitionConfig {
+    const reducedMotion =
+      typeof window !== 'undefined' &&
+      window.matchMedia?.('(prefers-reduced-motion: reduce)').matches === true;
+    return {
+      duration: reducedMotion ? 0 : 160,
+      css: (t) => `opacity: ${t}; transform: translateY(${(1 - t) * offset}px);`,
+    };
+  }
 
   /**
    * Check if a tab can be renamed.
@@ -1297,13 +1145,13 @@
     if (
       !(target instanceof Element) ||
       target.closest(PANEL_HEADER_INTERACTIVE_SELECTOR) ||
-      getDraggedPanelId() !== null
+      getDraggedPane() !== null
     ) {
       return;
     }
     e.preventDefault();
     e.stopPropagation();
-    appStore.dispatch(toggleExpandPanel(layoutId ?? workspaceId, panelId));
+    appStore.dispatch(toggleExpandPanel(layoutId ?? workspaceId, stablePanelId));
   }
 
   // Check if a tab type can be located in the sidebar
@@ -1337,41 +1185,13 @@
   }
 </script>
 
-{#snippet panelPinButton()}
-  <Tooltip
-    content={pinned
-      ? m.layout_panelTabBar_unpinPanel_label()
-      : m.layout_panelTabBar_pinPanel_label()}
+{#snippet panelActionsDropdown(location: 'tabBar' | 'compact')}
+  <DropdownMenu
+    bind:open={panelActionsMenuOpen[location]}
+    align="end"
     side="bottom"
-    delayDuration={300}
+    contentClass="panel-actions-menu-content w-72 [&_[data-slot=menu-command-item]>kbd]:text-muted-foreground"
   >
-    <Button
-      variant="ghost-light"
-      size="icon-sm"
-      class={pinned ? 'text-primary' : 'text-muted-foreground opacity-40 hover:opacity-100'}
-      onclick={() =>
-        appStore.dispatch(
-          setPanelPinned(workspaceId, panelId, !pinned, undefined, $panelStackDirection$),
-        )}
-      aria-label={pinned
-        ? m.layout_panelTabBar_unpinPanel_label()
-        : m.layout_panelTabBar_pinPanel_label()}
-      aria-pressed={pinned}
-      data-panel-pin
-    >
-      <span
-        class="inline-flex transition-transform duration-[var(--motion-fast)] motion-reduce:transition-none"
-        style:transform={pinned ? 'rotate(-45deg)' : undefined}
-        data-panel-pin-icon
-      >
-        <Fa icon={faThumbtack} size="xs" />
-      </span>
-    </Button>
-  </Tooltip>
-{/snippet}
-
-{#snippet panelActionsDropdown()}
-  <DropdownMenu align="end" side="bottom" contentClass="w-56">
     <!-- i18n-ignore -->
     {#snippet trigger({ props }: { props: Record<string, unknown> })}
       <Tooltip content={m.ui_breadcrumb_more_label()} side="bottom" delayDuration={300}>
@@ -1382,7 +1202,7 @@
           aria-label={m.ui_breadcrumb_more_label()}
           data-testid="panel-actions-trigger"
         >
-          <KebabIcon class="pointer-events-none size-3!" />
+          <KebabIcon class="pointer-events-none size-3.5!" />
         </Button>
       </Tooltip>
     {/snippet}
@@ -1404,6 +1224,24 @@
             close();
           }}
         />
+        <Menu.CommandItem
+          icon={faArrowLeft}
+          label={m.layout_panelTabBar_moveLeft_label()}
+          disabled={!onMoveLeft}
+          onclick={() => {
+            onMoveLeft?.();
+            close();
+          }}
+        />
+        <Menu.CommandItem
+          icon={faArrowRight}
+          label={m.layout_panelTabBar_moveRight_label()}
+          disabled={!onMoveRight}
+          onclick={() => {
+            onMoveRight?.();
+            close();
+          }}
+        />
       </div>
 
       <Menu.Separator />
@@ -1414,51 +1252,152 @@
       <div data-panel-actions-section="actions">
         {@render contentActions?.actions?.()}
         <Menu.CommandItem
-          icon={faThumbtack}
-          label={pinned
-            ? m.layout_panelTabBar_unpinPanel_label()
-            : m.layout_panelTabBar_pinPanel_label()}
+          icon={faArrowLeft}
+          label={m.layout_panelTabBar_movePaneLeft_label()}
+          shortcut={movePaneLeftShortcutHint}
+          disabled={!onMovePaneLeft}
           onclick={() => {
-            appStore.dispatch(
-              setPanelPinned(workspaceId, panelId, !pinned, undefined, $panelStackDirection$),
-            );
+            onMovePaneLeft?.();
+            close();
+          }}
+        />
+        <Menu.CommandItem
+          icon={faArrowRight}
+          label={m.layout_panelTabBar_movePaneRight_label()}
+          shortcut={movePaneRightShortcutHint}
+          disabled={!onMovePaneRight}
+          onclick={() => {
+            onMovePaneRight?.();
             close();
           }}
         />
         <Menu.CommandItem
           icon={faTableColumns}
           label={m.layout_panelTabBar_splitRight_label()}
-          shortcut="⌘\"
+          shortcut={createColumnRightShortcutHint}
           disabled={!onSplitHorizontal}
           onclick={() => {
             onSplitHorizontal?.();
             close();
           }}
         />
-        <Menu.CommandItem
-          icon={faGripLines}
-          label={m.layout_panelTabBar_splitDown_label()}
-          shortcut="⇧⌘\"
-          disabled={!onSplitVertical}
-          onclick={() => {
-            onSplitVertical?.();
-            close();
-          }}
-        />
       </div>
+
+      {#if $isWorkspaceHostLocal$ || activeTab?.type === 'browser'}
+        {#if activeTab}
+          {@const externalTarget = getPanelExternalOpenTarget(
+            activeTab,
+            workspaceId,
+            $isWorkspaceHostLocal$,
+          )}
+          <div data-panel-actions-section="open-in">
+            <Menu.Separator />
+            {#if externalTarget.kind === 'browser'}
+              <Menu.CommandItem
+                icon={faArrowUpRightFromSquare}
+                label={m.layout_panelTabBar_openInBrowser_label()}
+                onclick={() => {
+                  openInExternalBrowser(activeTab);
+                  close();
+                }}
+              />
+            {:else if externalTarget.kind === 'path'}
+              {#await import('$features/workspace/components/WorkspaceActionsMenu.svelte') then module}
+                {@const WorkspaceActionsMenu = module.default}
+                <WorkspaceActionsMenu
+                  filePath={externalTarget.filePath}
+                  workspaceId={externalTarget.workspaceId}
+                  isDirectory={externalTarget.isDirectory}
+                  isDiff={externalTarget.isDiff ?? false}
+                  isWorkspaceRoot={externalTarget.isWorkspaceRoot ?? false}
+                  workspaceFolderPath={externalTarget.workspaceFolderPath ?? ''}
+                  showDeleteOption={false}
+                  showArchiveOption={false}
+                  showFileNameCopy={false}
+                  layout="submenu"
+                  onClose={close}
+                />
+              {/await}
+            {:else}
+              <Menu.CommandItem
+                icon={faArrowUpRightFromSquare}
+                label={m.ui_fileActions_noRepoPath_tooltip()}
+                disabled
+              />
+            {/if}
+          </div>
+        {/if}
+      {/if}
     {/snippet}
   </DropdownMenu>
 {/snippet}
 
-{#snippet panelCloseButton()}
-  {#if onClosePanel}
-    <Tooltip content={m.layout_panelTabBar_closePanel_label()} side="bottom" delayDuration={300}>
+{#snippet addPanelColumnButton()}
+  {@const atColumnLimit = $panelColumnCount$ === 4}
+  <Button
+    variant="ghost-light"
+    size="icon-sm"
+    class="aria-disabled:pointer-events-auto"
+    aria-label={atColumnLimit
+      ? m.workspace_sidebarHeader_panelColumns_addLimit_ariaLabel({ count: 4 })
+      : m.workspace_sidebarHeader_panelColumns_add_ariaLabel()}
+    aria-disabled={atColumnLimit}
+    tooltip={atColumnLimit
+      ? m.workspace_sidebarHeader_panelColumns_addLimit_tooltip({ count: 4 })
+      : m.workspace_sidebarHeader_panelColumns_add_tooltip({
+          modifier: addColumnLinkModifierHint,
+        })}
+    tooltipSide="bottom"
+    tooltipDelayDuration={300}
+    onclick={handleAddPanelColumn}
+    data-add-panel-column
+  >
+    <Fa icon={faPlus} size="xs" />
+  </Button>
+{/snippet}
+
+{#snippet contentActionsDivider()}
+  {#if contentActions?.primary}
+    <span
+      class="mx-1 h-4 border-l border-border"
+      aria-hidden="true"
+      data-panel-content-actions-divider
+    ></span>
+  {/if}
+{/snippet}
+
+{#snippet panelControlsDivider()}
+  <span
+    class="mx-1 h-4 border-l border-border"
+    aria-hidden="true"
+    data-panel-content-actions-divider
+    data-panel-controls-divider
+  ></span>
+{/snippet}
+
+{#snippet panelCloseButton(tab: PanelTab | null = null)}
+  {#if (tab && onTabClose) || (!tab && onClosePanel)}
+    {@const isOwnedBrowser = tab?.type === 'browser' && tab.ownerAgentId}
+    {@const closeLabel = tab
+      ? isOwnedBrowser
+        ? m.layout_panelTabBar_hideOwnedTab_ariaLabel()
+        : m.layout_panelTabBar_closePane_ariaLabel()
+      : m.layout_panelTabBar_closePanel_label()}
+    {@const closeTooltip =
+      tab && !isOwnedBrowser
+        ? m.layout_panelTabBar_actionWithShortcut_tooltip({
+            label: closeLabel,
+            shortcut: closePaneShortcutHint,
+          })
+        : closeLabel}
+    <Tooltip content={closeTooltip} side="bottom" delayDuration={300}>
       <Button
         variant="ghost-light"
         size="icon-sm"
-        onclick={onClosePanel}
-        aria-label={m.layout_panelTabBar_closePanel_label()}
+        onclick={() => (tab ? onTabClose?.(tab.id) : onClosePanel?.())}
+        aria-label={closeLabel}
         data-testid="panel-close-button"
+        data-pane-close={tab?.id}
       >
         <Fa icon={faXmark} size={14} class="size-3.5!" />
       </Button>
@@ -1468,24 +1407,17 @@
 
 {#snippet panelIdentity(tab: PanelTab, compact = false)}
   {@const resourceKind = getResourceIconKind(tab.type)}
-  {#if tab.type === 'agent' && tab.agentId}
-    <AgentAvatarWithState
-      agentId={tab.agentId}
-      variant={compact ? 'standard' : 'emphasized'}
-      state={getAgentAvatarState(tab)}
-      specialist={getAgentSpecialistType(tab) as
-        import('$lib/constants/specialists').BuiltinSpecialistId | null}
+  {#if tab.type === 'agent'}
+    <Fa
+      icon={faComment}
+      size={compact ? 14 : 16}
+      class="shrink-0 text-muted-foreground"
+      data-panel-agent-chat-glyph
     />
   {:else if resourceKind}
     <ResourceIconTile kind={resourceKind} variant={compact ? 'standard' : 'emphasized'} />
-  {:else if tab.faviconUrl}
-    <img
-      src={tab.faviconUrl}
-      alt=""
-      width={compact ? 14 : 16}
-      height={compact ? 14 : 16}
-      class="rounded-sm"
-    />
+  {:else if tab.type === 'browser'}
+    <BrowserFavicon faviconUrl={tab.faviconUrl} size={compact ? 14 : 16} />
   {:else}
     <Fa
       icon={getTabIcon(tab.type)}
@@ -1495,7 +1427,143 @@
   {/if}
 {/snippet}
 
-<svelte:window onkeydown={handlePanelDragKeyDown} onpointermove={handleIdentityWindowPointerMove} />
+{#snippet paneStackSelector()}
+  <span class="pane-stack-selector relative z-10 shrink-0 self-center">
+    <Menu.Root bind:open={paneStackMenuOpen}>
+      <Menu.Trigger>
+        {#snippet child({ props })}
+          {@const selectorLabel = m.layout_panelTabBar_paneSelector_ariaLabel({
+            count: tabs.length,
+          })}
+          <Tooltip content={selectorLabel} side="bottom" delayDuration={300}>
+            <Button
+              {...props}
+              variant="plain"
+              size="icon-sm"
+              iconOnly
+              class={cn(
+                'relative flex size-7 shrink-0 items-center justify-center rounded-sm border-0 bg-transparent p-0 text-muted-foreground shadow-none outline-none hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1 focus-visible:ring-offset-background',
+                inactiveAttentionCount > 0 && 'text-foreground',
+              )}
+              aria-label={selectorLabel}
+              data-testid="pane-stack-selector-trigger"
+              data-pane-stack-selector-trigger
+              data-attention={inactiveAttentionCount > 0 ? '' : undefined}
+            >
+              <svg
+                width="14"
+                height="14"
+                viewBox="0 0 14 14"
+                fill="none"
+                aria-hidden="true"
+                class="pane-stack-glyph size-3.5! shrink-0"
+                data-pane-stack-glyph
+                data-pane-stack-visible-lines={Math.min(tabs.length, MAX_VISIBLE_PANE_STACK_LINES)}
+                data-pane-stack-total={tabs.length}
+              >
+                {#each Array.from({ length: Math.min(tabs.length, MAX_VISIBLE_PANE_STACK_LINES) }, (_, index) => index + 1) as line (line)}
+                  {@const targetY = PANE_STACK_LINE_BOTTOM_Y - (line - 1) * PANE_STACK_LINE_GAP}
+                  {@const offset = line * PANE_STACK_LINE_GAP}
+                  <g
+                    transition:paneStackLineMotion={{ offset }}
+                    data-pane-stack-line={line}
+                    data-pane-stack-line-target-y={targetY}
+                    data-pane-stack-line-transition-offset={offset}
+                  >
+                    <line
+                      x1="2"
+                      x2="12"
+                      y1={targetY}
+                      y2={targetY}
+                      stroke="currentColor"
+                      stroke-width="1.25"
+                      stroke-linecap="round"
+                      vector-effect="non-scaling-stroke"
+                    />
+                  </g>
+                {/each}
+              </svg>
+              {#if inactiveAttentionCount > 0}
+                <span
+                  class="absolute right-0.5 top-0.5 size-1.5 rounded-full bg-primary"
+                  aria-hidden="true"
+                ></span>
+              {/if}
+            </Button>
+          </Tooltip>
+        {/snippet}
+      </Menu.Trigger>
+      <Menu.Content
+        align="start"
+        side="bottom"
+        collisionPadding={8}
+        class="w-64 max-w-[calc(100vw-1rem)] p-1.5"
+        maxHeight="min(28rem, calc(100dvh - 1rem))"
+        aria-label={m.layout_panelTabBar_paneMenu_ariaLabel()}
+        data-pane-stack-menu
+      >
+        <Menu.CommandItem
+          icon={faArrowUp}
+          label={m.layout_panelTabBar_openPaneAbove_label()}
+          shortcut={previousPaneShortcutHint}
+          disabled={!previousPane}
+          onclick={() => previousPane && activatePane(previousPane.id)}
+          data-pane-stack-open-above
+        />
+        <Menu.CommandItem
+          icon={faArrowDown}
+          label={m.layout_panelTabBar_openPaneBelow_label()}
+          shortcut={nextPaneShortcutHint}
+          disabled={!nextPane}
+          onclick={() => nextPane && activatePane(nextPane.id)}
+          data-pane-stack-open-below
+        />
+        <Menu.Separator />
+        <div class="max-h-64 overflow-y-auto overscroll-contain" data-pane-stack-list>
+          {#each tabs as tab (tab.id)}
+            {@const current = tab.id === activeTabId}
+            <Menu.Item
+              class={cn('min-h-8', current && 'bg-accent/60 text-accent-foreground')}
+              aria-current={current ? 'page' : undefined}
+              aria-label={attentionPaneIds.has(tab.id)
+                ? m.layout_panelTabBar_paneMenuAttention_ariaLabel({ title: getTabTitle(tab) })
+                : getTabTitle(tab)}
+              onclick={() => activatePane(tab.id)}
+              data-pane-stack-item={tab.id}
+              data-attention={attentionPaneIds.has(tab.id) ? '' : undefined}
+            >
+              <span
+                class="flex size-5 shrink-0 items-center justify-center"
+                data-pane-stack-item-identity={tab.type}
+              >
+                {#if tab.type === 'agent' && tab.agentId}
+                  <AgentAvatar agentId={tab.agentId} variant="standard" />
+                {:else}
+                  {@render panelIdentity(tab, true)}
+                {/if}
+              </span>
+              <span class="min-w-0 flex-1 truncate">{getTabTitle(tab)}</span>
+              {#if attentionPaneIds.has(tab.id)}
+                <span class="size-1.5 shrink-0 rounded-full bg-primary" aria-hidden="true"></span>
+              {/if}
+              {#if current}
+                <span
+                  class="flex size-4 shrink-0 items-center justify-center"
+                  aria-hidden="true"
+                  data-pane-stack-current-check
+                >
+                  <Fa icon={faCheck} size="xs" class="text-primary" />
+                </span>
+              {/if}
+            </Menu.Item>
+          {/each}
+        </div>
+      </Menu.Content>
+    </Menu.Root>
+  </span>
+{/snippet}
+
+<svelte:window onkeydown={handlePaneDragKeyDown} />
 
 <!-- Tab bar + Header wrapper -->
 <div class="panel-tab-wrapper flex flex-col">
@@ -1504,7 +1572,7 @@
   <div
     bind:this={tabBarRef}
     class={cn(
-      'panel-tab-bar group/tabbar relative flex items-center h-[var(--panel-header-height)] border-b border-border bg-card',
+      'panel-tab-bar group/tabbar relative flex items-center h-[var(--panel-header-height)] bg-card',
       !showTabStrip && 'hidden',
     )}
     data-panel-tab-bar
@@ -1573,37 +1641,21 @@
             <div
               class={cn('flex items-center gap-1.5 pl-2.5 pr-2 py-1 h-9 text-ui whitespace-nowrap')}
             >
-              {#if tab.type === 'agent' && tab.agentId}
-                <AgentAvatarWithState
-                  agentId={tab.agentId}
+              {#if tab.type === 'agent'}
+                <Fa
+                  icon={faComment}
                   size={16}
-                  state={getAgentAvatarState(tab)}
-                  specialist={getAgentSpecialistType(tab) as
-                    import('$lib/constants/specialists').BuiltinSpecialistId | null}
-                  class="shrink-0"
+                  class="shrink-0 text-muted-foreground"
+                  data-panel-agent-chat-glyph
                 />
               {:else if resourceKind}
                 <ResourceIconTile kind={resourceKind} />
-              {:else if tab.faviconUrl}
-                <img
-                  src={tab.faviconUrl}
-                  alt=""
-                  width="16"
-                  height="16"
-                  class="shrink-0 rounded-sm"
-                  onerror={(e) => {
-                    // On favicon load failure, hide the img so the fallback icon shows
-                    const target = e.currentTarget as HTMLImageElement;
-                    target.style.display = 'none';
-                    // Show the sibling fallback icon
-                    const fallback = target.nextElementSibling as HTMLElement | null;
-                    if (fallback) fallback.style.display = '';
-                  }}
+              {:else if tab.type === 'browser'}
+                <BrowserFavicon
+                  faviconUrl={tab.faviconUrl}
+                  size={16}
+                  fallbackClass="tab-icon opacity-50"
                 />
-                <!-- Fallback icon, hidden by default, shown if favicon fails to load -->
-                <span style="display: none;">
-                  <Fa icon={getTabIcon(tab.type)} size={16} class="tab-icon shrink-0 opacity-50" />
-                </span>
               {:else}
                 <Fa icon={getTabIcon(tab.type)} size={16} class="tab-icon shrink-0 opacity-50" />
               {/if}
@@ -1642,6 +1694,8 @@
               {/if}
 
               {#if tab.closable}
+                <!-- User close of an agent-owned browser tab hides it (webview
+                     kept alive for the agent, monorepo#2857) — say so. -->
                 <button
                   class={cn(
                     'tab-close ml-1 p-0.5 rounded transition-opacity cursor-pointer',
@@ -1650,7 +1704,12 @@
                       : 'opacity-0 group-hover:opacity-60 group-focus-within:opacity-60',
                   )}
                   onclick={(e) => handleTabClose(e, tab.id)}
-                  aria-label={m.layout_panelTabBar_closeTab_ariaLabel()}
+                  title={isAgentOwnedBrowserPane(tab)
+                    ? m.layout_panelTabBar_hideOwnedTab_tooltip()
+                    : undefined}
+                  aria-label={isAgentOwnedBrowserPane(tab)
+                    ? m.layout_panelTabBar_hideOwnedTab_ariaLabel()
+                    : m.layout_panelTabBar_closeTab_ariaLabel()}
                 >
                   <Fa icon={faXmark} size="xs" />
                 </button>
@@ -1677,6 +1736,7 @@
           class="shrink-0 flex items-center self-stretch pl-1 pr-1 transition-opacity sticky right-0 bg-card"
         >
           <DropdownMenu align="start" side="bottom">
+            <!-- i18n-ignore (Svelte snippet signature, not user-facing text) -->
             {#snippet trigger({ props }: { props: Record<string, unknown> })}
               <Tooltip
                 content={m.layout_panelTabBar_new_tooltip()}
@@ -1706,7 +1766,7 @@
                       close();
                     }}
                   >
-                    <AgentAvatar agentId="blank" size={16} />
+                    <AgentAvatar agentId="blank" variant="compact" />
                     <span>{m.layout_panelTabBar_blankAgent_label()}</span>
                   </button>
                   <!-- Specialist options -->
@@ -1718,7 +1778,12 @@
                         close();
                       }}
                     >
-                      <AgentAvatar agentId="blank" size={16} specialist={specialist.id} />
+                      <AgentAvatar
+                        agentId="blank"
+                        variant="compact"
+                        specialist={specialist.id}
+                        icon={specialist.icon}
+                      />
                       <span>{specialist.name}</span>
                     </button>
                   {/each}
@@ -1794,12 +1859,10 @@
         class="panel-actions flex items-center gap-0 px-1 opacity-30 group-hover/tabbar:opacity-100 focus-within:opacity-100 transition-opacity z-20"
         data-panel-header-actions
       >
-        {#if $panelOpenMode$ === 'pin'}
-          {@render panelPinButton()}
-        {/if}
+        {@render panelActionsDropdown('tabBar')}
+        {@render contentActionsDivider()}
         {@render contentActions?.primary?.()}
-        {@render panelActionsDropdown()}
-        {@render panelCloseButton()}
+        {@render panelCloseButton(activeTab)}
       </div>
     </div>
   </div>
@@ -1808,268 +1871,177 @@
   {#if activeTab}
     {@const activeTabPath = getTabPath(activeTab)}
     {@const activeTabTitle = getTabTitle(activeTab)}
-    {@const activeIdentityContext = getPanelIdentityContext(
-      activeTabTitle,
-      activeTabPath ?? activeTab.browserUrl ?? null,
-    )}
-    {@const activeAgentSpecialist = getAgentSpecialist(activeTab)}
-    {@const activeAgentSpecialistName = getDistinctPanelIdentityValue(activeAgentSpecialist?.name, [
-      activeTabTitle,
-    ])}
-    {@const activeAgentSpecialistDescription = getDistinctPanelIdentityValue(
-      activeAgentSpecialist?.description,
-      [activeTabTitle, activeAgentSpecialistName],
-    )}
-    {@const activeAgentDelegatedBy = getDistinctPanelIdentityValue(activeAgentDelegatedByName, [
-      activeTabTitle,
-    ])}
-    {@const activeAgentStateLabel =
-      activeTab.type === 'agent' ? getAgentAvatarStateLabel(activeAgentAvatarState) : null}
     <!-- svelte-ignore a11y_no_static_element_interactions -->
     <div
       class={cn(
-        'panel-header group/header relative flex h-[var(--panel-header-height)] cursor-grab items-center border-b border-border bg-card pr-2.5 active:cursor-grabbing',
+        'panel-header group/header relative flex h-[var(--panel-header-height)] cursor-grab items-center bg-card pr-2.5 active:cursor-grabbing',
         isFocused && 'focused',
       )}
-      oncontextmenu={(event) => handlePanelContextMenu(event, activeTab.id)}
+      data-column-focused={isFocused ? '' : undefined}
+      oncontextmenu={handlePanelContextMenu}
       ondblclick={handlePanelHeaderDoubleClick}
       draggable="true"
-      ondragstart={handlePanelDragStart}
-      ondragend={handlePanelDragEnd}
+      ondragstart={handlePaneDragStart}
+      ondragend={handlePaneDragEnd}
       data-panel-tabless-header
       data-panel-content-header
+      role="group"
+      aria-label={m.layout_panelTabBar_paneStack_ariaLabel({ count: tabs.length })}
+      data-pane-stack
+      data-pane-stack-size={tabs.length}
     >
-      <!-- Left: one content title + optional context (changes tabs provide their own header). -->
-      <div class="flex min-w-0 flex-1 items-center gap-2">
-        <!-- Type identity opens the existing ordered tabs for this panel column. -->
-        <span
-          class="shrink-0 self-center"
-          onpointerenter={handleIdentityTriggerPointerEnter}
-          onpointerleave={handleIdentityTriggerPointerLeave}
+      {#if activeTab.type === 'agent'}
+        <!-- Agent headers keep the current avatar and editable name. -->
+        <div
+          class="flex min-w-0 shrink items-center gap-2 bg-card pl-1"
+          aria-label={m.layout_panelTabBar_activePane_ariaLabel({
+            title: activeTabTitle,
+            position: panePosition(activeTab.id),
+            count: tabs.length,
+          })}
+          aria-current="true"
+          data-pane-stack-active={activeTab.id}
+          data-attention={attentionPaneIds.has(activeTab.id) ? '' : undefined}
+          data-panel-agent-header-identity
         >
-          <Menu.Root bind:open={identityMenuOpen} onOpenChange={handleIdentityOpenChange}>
-            <Menu.Trigger>
-              {#snippet child({ props })}
-                <button
-                  {...props}
-                  bind:this={identityTriggerRef}
-                  type="button"
-                  class="panel-header-leading-surface flex size-6 items-center justify-center rounded-md outline-none hover:bg-accent focus-visible:bg-accent focus-visible:text-accent-foreground"
-                  aria-label={m.layout_panelTabBar_identityHistory_ariaLabel()}
-                  onfocus={handleIdentityTriggerFocus}
-                  data-testid={activeTab.type === 'agent'
-                    ? 'panel-header-agent-avatar-slot'
-                    : 'panel-identity-history-trigger'}
-                  data-panel-identity-history-trigger
-                  data-panel-header-leading-surface
-                >
-                  {@render panelIdentity(activeTab)}
-                </button>
-              {/snippet}
-            </Menu.Trigger>
-            <Menu.Content
-              bind:ref={identityMenuRef}
-              align="start"
-              side="bottom"
-              collisionPadding={8}
-              class="w-64 max-w-[calc(100vw-1rem)] p-1.5 focus-visible:border-border focus-visible:ring-0 data-[state=closed]:animate-none!"
-              maxHeight="min(28rem, calc(100dvh - 1rem))"
-              aria-label={m.layout_panelTabBar_identityHistory_ariaLabel()}
-              onpointerenter={handleIdentityMenuPointerEnter}
-              onpointerleave={handleIdentityMenuPointerLeave}
-              data-panel-identity-history-menu
-            >
-              <div
-                class="flex min-w-0 items-start gap-2 px-2 pb-1.5 pt-1"
-                data-panel-identity-current
+          <span
+            class="panel-header-leading-surface flex size-6 shrink-0 items-center justify-center self-center"
+            data-testid="panel-header-agent-avatar-slot"
+            data-panel-header-leading-surface
+          >
+            {#if activeTab.agentId}
+              {#key activeTab.agentId}
+                <PanelHeaderAgentAvatar agentId={activeTab.agentId} />
+              {/key}
+            {/if}
+          </span>
+          <div class="panel-header-title min-w-0 shrink" data-panel-header-title>
+            {#if onTabRename}
+              <EditableName
+                value={activeTabTitle}
+                onSave={(newName) => handleTabRename(activeTab, newName)}
+                textClass="text-sm shrink font-medium {isFocused
+                  ? 'text-foreground'
+                  : 'text-subtle'}"
+                title={m.ui_editableName_rename_tooltip()}
+                maxWidth={240}
+              />
+            {:else}
+              <span
+                class="block truncate text-sm font-medium {isFocused
+                  ? 'text-foreground'
+                  : 'text-subtle'}"
               >
-                <span class="flex size-5 shrink-0 items-center justify-center" aria-hidden="true">
-                  {@render panelIdentity(activeTab, true)}
-                </span>
-                <div class="min-w-0 flex-1">
-                  <div
-                    class="truncate text-sm font-medium text-foreground"
-                    data-panel-identity-title
-                  >
-                    {activeTabTitle}
-                  </div>
-                  {#if activeAgentStateLabel}
-                    <div
-                      class="type-caption truncate text-muted-foreground"
-                      data-panel-identity-agent-state
-                    >
-                      {activeAgentStateLabel}
-                    </div>
-                  {/if}
-                  {#if activeIdentityContext}
-                    <div
-                      class="type-caption truncate text-muted-foreground"
-                      data-panel-identity-context
-                    >
-                      {activeIdentityContext}
-                    </div>
-                  {/if}
-                  {#if activeAgentSpecialistName}
-                    <div
-                      class="type-caption truncate text-muted-foreground"
-                      data-panel-identity-specialist
-                    >
-                      {m.layout_panelTabBar_specialistAgent_label({
-                        specialist: activeAgentSpecialistName,
-                      })}
-                    </div>
-                  {/if}
-                  {#if activeAgentSpecialistDescription}
-                    <div
-                      class="type-caption line-clamp-2 text-muted-foreground"
-                      data-panel-identity-specialist-description
-                    >
-                      {activeAgentSpecialistDescription}
-                    </div>
-                  {/if}
-                  {#if activeAgentDelegatedBy}
-                    <div
-                      class="type-caption truncate text-muted-foreground"
-                      data-panel-identity-delegated-by
-                    >
-                      {m.layout_panelTabBar_delegatedBy_label({ name: activeAgentDelegatedBy })}
-                    </div>
-                  {/if}
-                </div>
-              </div>
-              {#if showIdentityHistory}
-                <div data-panel-identity-history-section>
-                  <Menu.Separator />
-                  <div class="flex items-center gap-2 px-1 py-1" data-panel-identity-navigation>
-                    <div
-                      class="shrink-0 px-1 text-base font-medium text-muted-foreground"
-                      data-panel-identity-history-title
-                    >
-                      {m.layout_panelTabBar_identityHistory_ariaLabel()}
-                    </div>
-                    {#if showIdentitySearch}
-                      <label class="relative min-w-0 flex-1">
-                        <span class="sr-only">{m.ui_searchableSelect_search_placeholder()}</span>
-                        <Fa
-                          icon={faMagnifyingGlass}
-                          size="xs"
-                          class="pointer-events-none absolute left-2 top-1/2 -translate-y-1/2 text-muted-foreground"
-                        />
-                        <Input
-                          bind:value={identitySearchQuery}
-                          type="search"
-                          noFocusStyle
-                          aria-label={m.ui_searchableSelect_search_placeholder()}
-                          placeholder={m.ui_searchableSelect_search_placeholder()}
-                          class="h-7 w-full rounded-md border border-border bg-transparent pl-7 pr-2 text-xs outline-none focus:border-input focus:ring-1 focus:ring-border"
-                          data-panel-identity-search
-                        />
-                      </label>
-                    {/if}
-                    <div class="ml-auto flex shrink-0 items-center gap-1">
-                      <Button
-                        variant="ghost-light"
-                        size="icon-sm"
-                        class="focus:border-border focus:bg-accent focus:text-accent-foreground focus:ring-0 focus-visible:border-border focus-visible:ring-0"
-                        disabled={!backPanelTabId}
-                        aria-label={m.ui_contentHeader_goBack_tooltip()}
-                        onclick={() => activateIdentityTab(backPanelTabId)}
-                        data-panel-identity-back
-                      >
-                        <Fa icon={faArrowLeft} size="xs" />
-                      </Button>
-                      <Button
-                        variant="ghost-light"
-                        size="icon-sm"
-                        class="focus:border-border focus:bg-accent focus:text-accent-foreground focus:ring-0 focus-visible:border-border focus-visible:ring-0"
-                        disabled={!forwardPanelTabId}
-                        aria-label={m.ui_contentHeader_goForward_tooltip()}
-                        onclick={() => activateIdentityTab(forwardPanelTabId)}
-                        data-panel-identity-forward
-                      >
-                        <Fa icon={faArrowRight} size="xs" />
-                      </Button>
-                    </div>
-                  </div>
-                  <div class="max-h-64 overflow-y-auto overscroll-contain" data-panel-identity-list>
-                    {#each filteredIdentityTabs as tab (tab.id)}
-                      {@const current = tab.id === activeTabId}
-                      <Menu.Item
-                        class="min-h-8"
-                        aria-current={current ? 'page' : undefined}
-                        onclick={() => activateIdentityTab(tab.id)}
-                        data-panel-identity-item={tab.id}
-                        data-panel-identity-type={tab.type}
-                      >
-                        <span class="flex size-5 shrink-0 items-center justify-center">
-                          {@render panelIdentity(tab, true)}
-                        </span>
-                        <span class="min-w-0 flex-1 truncate">{getTabTitle(tab)}</span>
-                        {#if current}
-                          <Fa icon={faCheck} size="xs" class="shrink-0 text-primary" />
-                        {/if}
-                      </Menu.Item>
-                    {:else}
-                      <div class="px-2 py-3 text-center text-xs text-muted-foreground">
-                        {m.ui_combobox_noOptions_message()}
-                      </div>
-                    {/each}
-                  </div>
-                </div>
-              {/if}
-            </Menu.Content>
-          </Menu.Root>
-        </span>
-        <!-- Single content title; type/category is conveyed by the content itself. -->
-        <div class="panel-header-title min-w-0 shrink" data-panel-header-title>
-          {#if isTabRenameable(activeTab) && onTabRename}
-            <EditableName
-              value={activeTabTitle}
-              onSave={(newName) => handleTabRename(activeTab, newName)}
-              textClass="text-sm shrink font-medium {isFocused ? 'text-foreground' : 'text-subtle'}"
-              title={m.ui_editableName_rename_tooltip()}
-              maxWidth={240}
-            />
-          {:else}
-            <span
-              class="block truncate text-sm font-medium {isFocused
-                ? 'text-foreground'
-                : 'text-subtle'}"
-            >
-              {activeTabTitle}
-            </span>
-          {/if}
+                {activeTabTitle}
+              </span>
+            {/if}
+          </div>
         </div>
-
-        <!-- Path (for file-based tabs) -->
-        {#if activeTabPath}
-          {@const lastSlash = activeTabPath.lastIndexOf('/')}
-          {@const dirPath = lastSlash > 0 ? activeTabPath.substring(0, lastSlash) : null}
-          {#if dirPath}
-            <span class="text-xs truncate {isFocused ? 'text-subtle' : 'text-ghost'}">
-              {dirPath}
+      {:else}
+        <!-- Non-agent panes retain the current flat identity and complete selector. -->
+        <div
+          class="pane-stack-control flex min-w-0 shrink items-center overflow-hidden"
+          data-panel-header-identity
+        >
+          <div
+            class="pane-stack-active flex min-w-0 shrink items-center gap-2 overflow-hidden bg-card pl-1"
+            aria-label={m.layout_panelTabBar_activePane_ariaLabel({
+              title: activeTabTitle,
+              position: panePosition(activeTab.id),
+              count: tabs.length,
+            })}
+            aria-current="true"
+            data-pane-stack-active={activeTab.id}
+            data-attention={attentionPaneIds.has(activeTab.id) ? '' : undefined}
+          >
+            <span
+              class="panel-header-leading-surface flex size-6 shrink-0 items-center justify-center self-center"
+              data-panel-header-leading-surface
+            >
+              {@render panelIdentity(activeTab)}
             </span>
-          {/if}
-        {/if}
+            <!-- Single content title; type/category is conveyed by the content itself. -->
+            <div class="panel-header-title min-w-0 shrink" data-panel-header-title>
+              {#if isTabRenameable(activeTab) && onTabRename}
+                <EditableName
+                  value={activeTabTitle}
+                  onSave={(newName) => handleTabRename(activeTab, newName)}
+                  textClass="text-sm shrink font-medium {isFocused
+                    ? 'text-foreground'
+                    : 'text-subtle'}"
+                  title={m.ui_editableName_rename_tooltip()}
+                  maxWidth={240}
+                />
+              {:else}
+                <span
+                  class="block truncate text-sm font-medium {isFocused
+                    ? 'text-foreground'
+                    : 'text-subtle'}"
+                >
+                  {activeTabTitle}
+                </span>
+              {/if}
+            </div>
 
-        <!-- Commit hash (for diff tabs with committed changes) -->
-        {#if activeTab.type === 'diff'}
-          {@const change = activeTab.data?.change as { commitHash?: string } | undefined}
-          {#if change?.commitHash}
-            <span class="text-xs font-mono {isFocused ? 'text-subtle' : 'text-ghost'}">
-              @ {change.commitHash.substring(0, 7)}
-            </span>
-          {/if}
-        {/if}
-      </div>
+            {#if attentionPaneIds.has(activeTab.id)}
+              <span class="size-1.5 shrink-0 rounded-full bg-primary" aria-hidden="true"></span>
+            {/if}
+            <!-- Path (for file-based tabs) -->
+            {#if activeTabPath}
+              {@const lastSlash = activeTabPath.lastIndexOf('/')}
+              {@const dirPath = lastSlash > 0 ? activeTabPath.substring(0, lastSlash) : null}
+              {#if dirPath}
+                <span class="text-xs truncate {isFocused ? 'text-subtle' : 'text-ghost'}">
+                  {dirPath}
+                </span>
+              {/if}
+            {/if}
 
-      <!-- Right: stable content controls, grouped actions, and close. -->
+            <!-- Commit hash (for diff tabs with committed changes) -->
+            {#if activeTab.type === 'diff'}
+              {@const change = activeTab.data?.change as { commitHash?: string } | undefined}
+              {#if change?.commitHash}
+                <span class="text-xs font-mono {isFocused ? 'text-subtle' : 'text-ghost'}">
+                  @ {change.commitHash.substring(0, 7)}
+                </span>
+              {/if}
+            {/if}
+          </div>
+        </div>
+      {/if}
+
+      <div class="min-w-0 flex-1" aria-hidden="true"></div>
+
+      <!-- Right: all actions at the far edge in stable order. -->
       <div class="flex shrink-0 items-center gap-0" data-panel-header-actions>
-        {#if $panelOpenMode$ === 'pin'}
-          {@render panelPinButton()}
+        {#if contentActions?.primary}
+          <span class="flex items-center" data-panel-header-content-actions>
+            {@render contentActions.primary()}
+          </span>
         {/if}
-        {@render contentActions?.primary?.()}
-        {@render panelActionsDropdown()}
+        {@render panelActionsDropdown('compact')}
+        {@render panelControlsDivider()}
+        {#if tabs.length > 1}
+          {@render paneStackSelector()}
+        {/if}
+        {@render addPanelColumnButton()}
+        {@render panelCloseButton(activeTab)}
+      </div>
+    </div>
+  {:else}
+    <div
+      class={cn(
+        'panel-header group/header relative flex items-center bg-sidebar pr-2.5',
+        isFocused && 'focused',
+      )}
+      style:height="var(--panel-header-height)"
+      data-column-focused={isFocused ? '' : undefined}
+      data-panel-tabless-header
+      data-empty-panel-header
+    >
+      <div class="min-w-0 flex-1" aria-hidden="true"></div>
+      <div class="flex shrink-0 items-center gap-0" data-panel-header-actions>
+        {@render addPanelColumnButton()}
         {@render panelCloseButton()}
       </div>
     </div>
@@ -2307,8 +2279,71 @@
         </button>
         <div class="border-t border-border"></div>
         <!-- Split options -->
+        {#if contextMenuTab.source === 'panel'}
+          <Button
+            variant="ghost-light"
+            size="sm"
+            class="h-auto w-full justify-start rounded-none px-3 py-1.5 text-left"
+            disabled={!onMoveLeft}
+            onclick={() => {
+              onMoveLeft?.();
+              closeContextMenu();
+            }}
+          >
+            <Fa icon={faArrowLeft} size="xs" class="text-ghost" />
+            {m.layout_panelTabBar_moveLeft_label()}
+          </Button>
+          <Button
+            variant="ghost-light"
+            size="sm"
+            class="h-auto w-full justify-start rounded-none px-3 py-1.5 text-left"
+            disabled={!onMoveRight}
+            onclick={() => {
+              onMoveRight?.();
+              closeContextMenu();
+            }}
+          >
+            <Fa icon={faArrowRight} size="xs" class="text-ghost" />
+            {m.layout_panelTabBar_moveRight_label()}
+          </Button>
+          <div class="border-t border-border"></div>
+        {/if}
+        <Button
+          variant="ghost-light"
+          size="sm"
+          class="h-auto w-full justify-between rounded-none px-3 py-1.5 text-left"
+          disabled={!onMovePaneLeft}
+          onclick={() => {
+            onMovePaneLeft?.();
+            closeContextMenu();
+          }}
+        >
+          <span class="flex items-center gap-2">
+            <Fa icon={faArrowLeft} size="xs" class="text-ghost" />
+            {m.layout_panelTabBar_movePaneLeft_label()}
+          </span>
+          <span class="text-subtle text-xs">{movePaneLeftShortcutHint}</span>
+        </Button>
+        <Button
+          variant="ghost-light"
+          size="sm"
+          class="h-auto w-full justify-between rounded-none px-3 py-1.5 text-left"
+          disabled={!onMovePaneRight}
+          onclick={() => {
+            onMovePaneRight?.();
+            closeContextMenu();
+          }}
+        >
+          <span class="flex items-center gap-2">
+            <Fa icon={faArrowRight} size="xs" class="text-ghost" />
+            {m.layout_panelTabBar_movePaneRight_label()}
+          </span>
+          <span class="text-subtle text-xs">{movePaneRightShortcutHint}</span>
+        </Button>
+        <div class="border-t border-border"></div>
         <button
-          class="w-full px-3 py-1.5 text-sm text-left hover:bg-sidebar cursor-pointer flex items-center justify-between"
+          class="w-full px-3 py-1.5 text-sm text-left hover:bg-sidebar cursor-pointer flex items-center justify-between disabled:cursor-not-allowed disabled:opacity-50"
+          disabled={!onSplitHorizontal}
           onclick={() => {
             onSplitHorizontal?.();
             closeContextMenu();
@@ -2340,42 +2375,7 @@
             </svg>
             {m.layout_panelTabBar_splitRight_label()}
           </span>
-          <span class="text-subtle text-xs">⌘\</span>
-        </button>
-        <button
-          class="w-full px-3 py-1.5 text-sm text-left hover:bg-sidebar cursor-pointer flex items-center justify-between"
-          onclick={() => {
-            onSplitVertical?.();
-            closeContextMenu();
-          }}
-        >
-          <span class="flex items-center gap-2">
-            <svg
-              class="text-subtle overflow-visible w-2.5! transform rotate-90"
-              viewBox="0 0 1 1"
-              fill="none"
-              stroke="currentColor"
-              stroke-width="0.8"
-            >
-              <rect
-                width="0.5"
-                height="1"
-                rx="0.03"
-                stroke-width="0.8"
-                vector-effect="non-scaling-stroke"
-              />
-              <rect
-                x="0.5"
-                width="0.5"
-                height="1"
-                rx="0.03"
-                stroke-width="0.8"
-                vector-effect="non-scaling-stroke"
-              />
-            </svg>
-            {m.layout_panelTabBar_splitDown_label()}
-          </span>
-          <span class="text-subtle text-xs">⇧⌘\</span>
+          <span class="text-subtle text-xs">{createColumnRightShortcutHint}</span>
         </button>
         <div class="border-t border-border"></div>
         {#if contextMenuTab.source === 'tab'}
@@ -2387,7 +2387,7 @@
             }}
           >
             {m.layout_panelTabBar_close_label()}
-            <span class="text-subtle text-xs">⌘W</span>
+            <span class="text-subtle text-xs">{closePaneShortcutHint}</span>
           </button>
           <button
             class="w-full px-3 py-1.5 text-sm text-left hover:bg-sidebar cursor-pointer flex items-center justify-between"
@@ -2436,6 +2436,11 @@
 {/if}
 
 <style>
+  :global(.panel-actions-menu-content) {
+    min-width: min(14rem, calc(100vw - 1rem));
+    max-width: calc(100vw - 1rem);
+  }
+
   /* CSS variables for panel tab bar heights */
   .panel-tab-wrapper {
     --panel-header-height: clamp(2rem, 3rem, 10cqh);
@@ -2450,5 +2455,17 @@
   .panel-header-leading-surface {
     position: relative;
     top: 0.5px;
+  }
+
+  .pane-stack-glyph {
+    color: currentColor;
+    overflow: visible;
+  }
+
+  @media (forced-colors: active) {
+    .pane-stack-glyph {
+      color: CanvasText;
+      forced-color-adjust: auto;
+    }
   }
 </style>

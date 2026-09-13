@@ -24,7 +24,7 @@ export const ProviderCatalogRequestSchema = z.object({}).strict();
  * stripped. No row carries a default designation: the effective default
  * provider is derived from user settings, never from the registry.
  */
-export const ProviderCatalogEntrySchema = z
+const ProviderCatalogEntrySchema = z
   .object({
     id: z.string().min(1),
     displayName: z.string(),
@@ -37,6 +37,10 @@ export const ProviderCatalogEntrySchema = z
     requiresEnvVar: z.string().optional(),
     requiresFeatureCode: z.string().optional(),
     visible: z.boolean(),
+    // Always present on rows from a v9.3+ daemon; optional here so an older
+    // daemon's rows (no `host.providerTestPrompt` RPC) still validate —
+    // consumers treat absence as unsupported.
+    supportsTestPrompt: z.boolean().optional(),
   })
   .passthrough();
 

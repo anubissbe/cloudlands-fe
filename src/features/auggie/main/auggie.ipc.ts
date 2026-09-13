@@ -5,16 +5,15 @@ import * as path from 'path';
 import { MINIMUM_NODE_VERSION } from '../../../shared/constants/auggie';
 import { AUGGIE_CHANNELS } from '../../../shared/ipc/channels';
 import { Logger } from '../../../shared/logger';
-import { findAuggiePathAsync, getEnhancedPath } from './auggie-path';
+import { findAuggiePathAsync } from './auggie-path';
 import { hostExec } from '../../../shared/main/host-exec';
 import { getProviderAuthVerdict } from '../../../shared/main/provider-auth-status';
 import { getProviderModelsEnvelope } from '../../../main/utils/daemon-model-catalog';
-import { getBackendClient } from '../../backend/main/backend.ipc';
+import { getBackendClient, getBackendClientForIpcEvent } from '../../backend/main/backend.ipc';
 import { JsonRpcError } from '../../backend/main/json-rpc-errors';
 import { m } from '../../../shared/paraglide/messages.js';
 
 // Re-export path helpers for backwards compatibility with existing consumers.
-export { findAuggiePathAsync, getEnhancedPath };
 
 const logger = new Logger('AuggieIPC');
 
@@ -197,12 +196,14 @@ export function setupAuggieIPC() {
   // the setup UI can show "logged in" once the user finishes the flow.
   ipcMain.handle(
     AUGGIE_CHANNELS.AUTHENTICATE,
-    async (_, _params?: { action?: 'start' | 'complete' | 'poll'; authResponse?: string }) => {
-      // Re-check via the daemon so callers get the current install state.
+    async (event, _params?: { action?: 'start' | 'complete' | 'poll'; authResponse?: string }) => {
+      // Re-check via the calling window's daemon so callers get the current
+      // install state of the backend they are actually connected to.
+      const { client: backendClient } = getBackendClientForIpcEvent(event);
       let auggiePath: string | null = null;
       let installed = false;
       try {
-        const check = await getBackendClient().request<{
+        const check = await backendClient.request<{
           available: boolean;
           path?: string;
         }>('host.checkAuggie');
@@ -241,7 +242,9 @@ export function setupAuggieIPC() {
       // Otherwise return the instruction to run `auggie login` interactively
       // (the daemon cannot host the OAuth interactive TTY session; the user
       // runs it in their own terminal).
-      const authenticated = (await getProviderAuthVerdict('auggie', { force: true })) === true;
+      const authenticated =
+        (await getProviderAuthVerdict('auggie', { force: true }, backendClient))?.authenticated ===
+        true;
 
       if (authenticated) {
         return {
@@ -268,8 +271,8 @@ export function setupAuggieIPC() {
   );
 
   // Get available models for auggie — daemon-owned catalog (PROTOCOL §6.7)
-  ipcMain.handle(AUGGIE_CHANNELS.GET_MODELS, async (_event, params?: { forceRefresh?: boolean }) =>
-    getProviderModelsEnvelope('auggie', params),
+  ipcMain.handle(AUGGIE_CHANNELS.GET_MODELS, async (event, params?: { forceRefresh?: boolean }) =>
+    getProviderModelsEnvelope('auggie', params, event),
   );
 
   // Get the latest session file
@@ -448,9 +451,7 @@ export function setupAuggieIPC() {
     try {
       logger.info('Uninstalling MCP from Claude Code');
 
-      const { findBinary, getCommonNpmPaths } = await import(
-        '../../../shared/main/find-binary'
-      );
+      const { findBinary, getCommonNpmPaths } = await import('../../../shared/main/find-binary');
       const claudePath = await findBinary('claude', {
         commonPaths: getCommonNpmPaths('claude'),
       });

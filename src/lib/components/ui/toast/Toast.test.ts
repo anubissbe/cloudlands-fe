@@ -14,8 +14,13 @@ vi.mock('$store/renderer/slices/theme/theme-selectors', () => ({
 }));
 
 describe('Toast', () => {
-  afterEach(() => {
+  afterEach(async () => {
     toast.dismiss();
+    // Since svelte-sonner 1.2, dismiss() only flags toasts; they leave the
+    // module-level state when the still-mounted toaster's removal timer
+    // fires. Wait for that (DOM removal tracks state removal) before
+    // cleanup(), or dismissed toasts leak into the next test's toaster.
+    await waitFor(() => expect(document.querySelectorAll('[data-sonner-toast]')).toHaveLength(0));
     cleanup();
   });
 
@@ -41,6 +46,23 @@ describe('Toast', () => {
     expect(clearAll.getAttribute('aria-controls')).toBe('app-toast-region');
     expect(clearAll.getAttribute('type')).toBe('button');
     expect(screen.getByLabelText(/Notifications/)).toBeTruthy();
+  });
+
+  it('renders stacked toasts expanded so a behind toast never collapses into a blank slab', async () => {
+    render(Toast);
+    toast.success('Short front toast', { id: 'short', duration: Number.POSITIVE_INFINITY });
+    toast.warning(
+      'A much longer warning message that wraps onto multiple lines and is taller than the toast in front of it',
+      { id: 'tall', duration: Number.POSITIVE_INFINITY },
+    );
+
+    await screen.findByText('Short front toast');
+    await screen.findByText(/A much longer warning message/);
+    const toastElements = Array.from(document.querySelectorAll<HTMLElement>('[data-sonner-toast]'));
+    expect(toastElements).toHaveLength(2);
+    await waitFor(() =>
+      expect(toastElements.every((el) => el.getAttribute('data-expanded') === 'true')).toBe(true),
+    );
   });
 
   it('uses the same responsive width contract for standard and custom toasts', async () => {

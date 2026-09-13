@@ -28,13 +28,21 @@
   import ShimmerOverlay from '$lib/components/ui/ShimmerOverlay.svelte';
   import OpenComboButton from '$features/external-editors/components/OpenComboButton.svelte';
   import { TooltipRich } from '$lib/components/ui/tooltip';
-  import { getSpecialistById } from '$lib/constants/specialists';
+  import {
+    DEFAULT_NEW_WORKSPACE_SPECIALIST_ID,
+    getSpecialistById,
+  } from '$lib/constants/specialists';
   import { navigateToSettings } from '$lib/utils/workspace-navigation';
+  import { selectSpecialists } from '$store/renderer/slices/specialists/specialists-selectors';
   import { selectWorkspaceCreateProgress } from '$store/renderer/slices/workspace-create-progress/workspace-create-progress-selectors';
   import {
     createProgressLabel,
     formatCreateProgressPercent,
   } from '$lib/components/workspace/initializer/create-progress-label';
+  import {
+    CHAT_OPERATIONAL_SUMMARY_TONE_CLASS,
+    OPERATIONAL_ROW_GEOMETRY_TOKENS_CLASS,
+  } from '$lib/components/chat/operational-disclosure-row';
 
   type StepStatus = 'pending' | 'active' | 'done';
 
@@ -61,9 +69,12 @@
     setupScriptContent?: string;
     /** Callback to focus the setup terminal */
     onFocusSetupTerminal?: () => void;
-    /** Name of the specialist/agent (e.g. "Coordinator") */
+    /**
+     * Fallback display name when `specialistId` resolves to nothing (neither
+     * the live catalog nor the bundled constants know the id).
+     */
     specialistName?: string;
-    /** The specialist ID for tooltip/settings linking */
+    /** The specialist ID for name resolution, tooltip and settings linking */
     specialistId?: string;
     /** Whether the user provided an initial prompt */
     hasPrompt?: boolean;
@@ -110,6 +121,7 @@
   // one it ever renders. An absent id binds a never-matching key (null entry).
   // svelte-ignore state_referenced_locally
   const progressEntry$ = selectWorkspaceCreateProgress(progressId ?? '');
+  const specialists$ = selectSpecialists();
 
   // Monotonic floor: track the highest percent seen so the label and bar
   // never move backwards even if frames arrive out of order. Clamped to 100
@@ -127,8 +139,23 @@
   const displayBranch = $derived(baseRef.replace(/^[^/]+\//, ''));
 
   const specialist = $derived(specialistId ? getSpecialistById(specialistId) : undefined);
-  /** Use the specialist's canonical name when available, fall back to the passed-in prop */
-  const displaySpecialistName = $derived(specialist?.name || specialistName);
+  /**
+   * Resolve the name by id: the live catalog first (file / project overrides
+   * of a bundled specialist carry their configured name), then the bundled
+   * constants, then the passed-in `specialistName`. Callers such as ChatPanel
+   * pass the agent *session* name, which must not shadow the specialist name
+   * once the id resolves (a renamed agent still shows its specialist here).
+   */
+  const catalogSpecialist = $derived(
+    specialistId ? $specialists$.find((s) => s.id === specialistId) : undefined,
+  );
+  const displaySpecialistName = $derived(
+    catalogSpecialist?.name || specialist?.name || specialistName,
+  );
+  /** Both the Coordinator and the Developer write a spec before implementing. */
+  const writesSpecFirst = $derived(
+    specialistId === 'spec-writer' || specialistId === DEFAULT_NEW_WORKSPACE_SPECIALIST_ID,
+  );
 
   const steps = $derived.by(() => {
     const all: StepStatus[] = [repoStatus, branchStatus];
@@ -161,9 +188,14 @@
   }
 </script>
 
-<div class="w-full overflow-hidden transition-all duration-500">
+<div
+  class="{OPERATIONAL_ROW_GEOMETRY_TOKENS_CLASS} w-full overflow-hidden transition-all duration-500"
+>
   <!-- Header -->
-  <div class="px-4 pt-3 pb-2 flex items-baseline gap-2.5">
+  <div
+    class="flex items-baseline gap-2.5 pt-3 pb-2"
+    style:padding-inline="var(--operational-row-inline-padding)"
+  >
     <div class="inline-grid *:[grid-area:1/1]">
       {#key allDone}
         <h3
@@ -198,7 +230,7 @@
   </div>
 
   <!-- Steps -->
-  <div class="px-4 pb-4 space-y-0.5">
+  <div class="space-y-0.5 pb-4">
     {#snippet stepRow(
       status: StepStatus,
       icon: typeof faFolderOpen,
@@ -207,7 +239,9 @@
       doneContent: import('svelte').Snippet,
     )}
       <div
-        class="flex items-start gap-2.5 text-base leading-relaxed py-0.75 px-2 -mx-1 rounded-md relative overflow-hidden"
+        class="relative flex items-start overflow-hidden rounded-md py-0.75 text-base leading-relaxed"
+        style:gap="var(--operational-leading-gap)"
+        style:padding-inline="var(--operational-row-inline-padding)"
         transition:slide={{ duration: 300, easing: cubicOut }}
       >
         {#if status === 'active'}
@@ -215,7 +249,10 @@
             <ShimmerOverlay />
           </div>
         {/if}
-        <span class="mt-1 shrink-0 w-4 opacity-30 text-center relative z-10">
+        <span
+          class="{CHAT_OPERATIONAL_SUMMARY_TONE_CLASS} relative z-10 mt-1 flex size-[var(--operational-leading-slot-size)] shrink-0 items-center justify-start"
+          data-testid="workspace-setup-step-icon"
+        >
           <Fa {icon} size={14} class={iconClass} />
         </span>
         <span class="text-muted-foreground font-normal leading-snug relative z-10">
@@ -266,9 +303,7 @@
             percent: formatCreateProgressPercent(maxPercent),
           })}
         </span>
-        <div
-          class="mt-1 h-[2px] w-full max-w-64 rounded-full bg-secondary overflow-hidden"
-        >
+        <div class="mt-1 h-[2px] w-full max-w-64 rounded-full bg-secondary overflow-hidden">
           <div
             class="h-full bg-foreground/60 transition-[width] duration-300 ease-out"
             style="width: {maxPercent}%"
@@ -453,7 +488,7 @@
         {m.onboarding_setupCard_agentReadyNamed_after()}
       {:else if !hasPrompt}
         {m.onboarding_setupCard_agentReady_label()}
-      {:else if specialistId === 'spec-writer'}
+      {:else if writesSpecFirst}
         {m.onboarding_setupCard_specStartingUp_before()}
         {@render specialistWithTooltip()}
         {m.onboarding_setupCard_specStartingUp_after()}
@@ -472,7 +507,7 @@
         {m.onboarding_setupCard_agentReadyNamed_after()}
       {:else if !hasPrompt}
         {m.onboarding_setupCard_agentReady_label()}
-      {:else if specialistId === 'spec-writer'}
+      {:else if writesSpecFirst}
         {m.onboarding_setupCard_specDone_before()}
         {@render specialistWithTooltip()}
         {m.onboarding_setupCard_specDone_after()}

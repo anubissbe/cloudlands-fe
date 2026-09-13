@@ -3,6 +3,12 @@ import { tick } from 'svelte';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { resetAgentSubscriptionsViewStateForTests } from '../agent-subscriptions-view-state';
 
+vi.mock('$store/renderer/store', async () => {
+  const { createAppStoreMockModule } =
+    await import('$store/renderer/utils/test-helpers/store-mock');
+  return createAppStoreMockModule();
+});
+
 vi.mock('../AgentSubscriptions.svelte', async () => ({
   default: (await import('./mocks/MockAgentEventSection.svelte')).default,
 }));
@@ -11,6 +17,9 @@ vi.mock('../BackgroundHooksRow.svelte', async () => ({
 }));
 vi.mock('../MonitoredPrsRow.svelte', async () => ({
   default: (await import('./mocks/MockPrEventSection.svelte')).default,
+}));
+vi.mock('../BrowserTabsRow.svelte', async () => ({
+  default: (await import('./mocks/MockBrowserTabsSection.svelte')).default,
 }));
 
 import EventSubscriptionsCard from '../EventSubscriptionsCard.svelte';
@@ -56,6 +65,11 @@ describe('EventSubscriptionsCard', () => {
   ])('shows one bounded card for a %s-only subscription', async (agentId, testId) => {
     const card = await renderCard(agentId);
     expect(card.parentElement?.classList.contains('hidden')).toBe(false);
+    expect(card.className).toContain('rounded-lg');
+    expect(card.className).toContain('border');
+    expect(card.className).toContain('border-border');
+    expect(card.className).toContain('bg-card/80');
+    expect(card.className).toContain('shadow-sm');
     expect(screen.getByTestId(testId)).toBeTruthy();
     expect(screen.getByText('Subscribed to 1 event')).toBeTruthy();
   });
@@ -119,6 +133,26 @@ describe('EventSubscriptionsCard', () => {
     const card = await renderCard('none');
     expect(card.parentElement?.classList.contains('hidden')).toBe(true);
     expect(card.parentElement?.getAttribute('data-has-subscriptions')).toBe('false');
+  });
+
+  it('shows the card for a browser-tabs-only agent without the events header', async () => {
+    const card = await renderCard('tabs');
+    expect(card.parentElement?.classList.contains('hidden')).toBe(false);
+    expect(screen.getByTestId('mock-browser-tabs-section')).toBeTruthy();
+    expect(screen.queryByTestId('event-subscriptions-outer-header')).toBeNull();
+    // Tabs-only card must not be labelled "Subscribed to events".
+    expect(card.getAttribute('aria-label')).toBe('Browser tabs (2)');
+  });
+
+  it('renders browser tabs parallel to a collapsed events disclosure', async () => {
+    await renderCard('hooks-tabs');
+    const section = screen.getByTestId('event-subscriptions-browser-tabs');
+    expect(section.classList.contains('hidden')).toBe(false);
+    expect(screen.getByTestId('mock-browser-tabs-section')).toBeTruthy();
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Subscribed to 1 event' }));
+    await waitFor(() => expect(screen.queryByTestId('event-subscriptions-body')).toBeNull());
+    expect(screen.getByTestId('mock-browser-tabs-section')).toBeTruthy();
   });
 
   it.each([

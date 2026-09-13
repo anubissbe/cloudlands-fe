@@ -22,10 +22,7 @@ import type { ActionKeyId, HardwareDeviceModel, LogicalKeyId } from '../input/ty
 export const ACTION_KEY_COUNT = 7;
 
 /** Supported device models, in a stable order for per-model records. */
-export const HARDWARE_CONSOLE_MODELS: readonly HardwareDeviceModel[] = [
-  'creator-micro-2',
-  'codex-micro',
-];
+const HARDWARE_CONSOLE_MODELS: readonly HardwareDeviceModel[] = ['creator-micro-2', 'codex-micro'];
 
 /** Action key ids in slot order: slot 0 = ACT06 … slot 6 = ACT12. */
 export const ACTION_KEY_IDS: readonly ActionKeyId[] = [
@@ -52,6 +49,7 @@ export const ACTION_KEY_ACTION_IDS = [
   'new-agent',
   'new-workspace',
   'switch-window-layouts',
+  'cycle-open-windows',
   'push-to-talk',
   'none',
 ] as const;
@@ -59,9 +57,7 @@ export const ACTION_KEY_ACTION_IDS = [
 export type ActionKeyActionId = (typeof ACTION_KEY_ACTION_IDS)[number];
 
 export function isActionKeyActionId(value: unknown): value is ActionKeyActionId {
-  return (
-    typeof value === 'string' && (ACTION_KEY_ACTION_IDS as readonly string[]).includes(value)
-  );
+  return typeof value === 'string' && (ACTION_KEY_ACTION_IDS as readonly string[]).includes(value);
 }
 
 /**
@@ -77,27 +73,24 @@ export const CODEX_MIC_LINKED_SLOT = 5;
  * Per-model default mappings on ACT06–ACT12.
  *
  * CM2 (7 discrete keys): creation/navigation actions first, then row 4
- * (ACT10–ACT12, Settings-graphic keys 2/3/4) = push-to-talk, in-progress
+ * (ACT10–ACT12, Settings-graphic keys 2/3/4) = push-to-talk, open-window
  * cycling, unread cycling; `cycle-workspace-agents`,
- * `cycle-attention-agents`, `stop-agent`, and `toggle-sidebar-tabs` ship
- * unassigned (all stay assignable).
+ * `cycle-in-progress-agents`, `cycle-attention-agents`, `stop-agent`, and
+ * `toggle-sidebar-tabs` ship unassigned (all stay assignable).
  *
  * Codex Micro (6 printed caps): row 3 = lightning (ACT06), checkmark
  * (ACT07), x-mark (ACT08), branching (ACT09); row 4 = the linked 2U Mic
  * pair (push-to-talk on ACT10, ACT11 unset by default) and the logo key
  * (ACT12 = unread cycling).
  */
-export const DEFAULT_ACTION_MAPPINGS: Record<
-  HardwareDeviceModel,
-  readonly ActionKeyActionId[]
-> = {
+export const DEFAULT_ACTION_MAPPINGS: Record<HardwareDeviceModel, readonly ActionKeyActionId[]> = {
   'creator-micro-2': [
     'new-workspace',
     'new-agent',
     'see-spec',
     'switch-window-layouts',
     'push-to-talk',
-    'cycle-in-progress-agents',
+    'cycle-open-windows',
     'cycle-unread-agents',
   ],
   'codex-micro': [
@@ -155,11 +148,27 @@ export const PRE_PTT_CM2_DEFAULT_ACTION_MAPPING: readonly ActionKeyActionId[] = 
   'cycle-unread-agents',
 ];
 
+/**
+ * CM2 defaults before open-window cycling landed on slot 5 (ACT11) — that
+ * slot still carried `cycle-in-progress-agents`. Used only by the one-shot
+ * hydration migration below.
+ */
+export const PRE_WINDOW_CYCLE_CM2_DEFAULT_ACTION_MAPPING: readonly ActionKeyActionId[] = [
+  'new-workspace',
+  'new-agent',
+  'see-spec',
+  'switch-window-layouts',
+  'push-to-talk',
+  'cycle-in-progress-agents',
+  'cycle-unread-agents',
+];
+
 /** Every prior CM2 default generation the migration recognizes. */
 const PRIOR_CM2_DEFAULT_ACTION_MAPPINGS: readonly (readonly ActionKeyActionId[])[] = [
   LEGACY_CM2_DEFAULT_ACTION_MAPPING,
   PREVIOUS_CM2_DEFAULT_ACTION_MAPPING,
   PRE_PTT_CM2_DEFAULT_ACTION_MAPPING,
+  PRE_WINDOW_CYCLE_CM2_DEFAULT_ACTION_MAPPING,
 ];
 
 /**
@@ -196,8 +205,7 @@ function migratePriorDefaultActionMapping(
 ): boolean {
   const mapping = mappings[model];
   const isPriorDefault = priors.some(
-    (prior) =>
-      mapping.length === prior.length && mapping.every((id, slot) => id === prior[slot]),
+    (prior) => mapping.length === prior.length && mapping.every((id, slot) => id === prior[slot]),
   );
   if (!isPriorDefault) return false;
   mappings[model] = [...DEFAULT_ACTION_MAPPINGS[model]];
@@ -239,9 +247,7 @@ export const DEFAULT_ACTION_MAPPING: readonly ActionKeyActionId[] =
   DEFAULT_ACTION_MAPPINGS['creator-micro-2'];
 
 /** The default mapping for a device model. */
-export function getDefaultActionMapping(
-  model: HardwareDeviceModel,
-): readonly ActionKeyActionId[] {
+export function getDefaultActionMapping(model: HardwareDeviceModel): readonly ActionKeyActionId[] {
   return DEFAULT_ACTION_MAPPINGS[model];
 }
 
@@ -286,10 +292,7 @@ export function normalizeActionMappingsByModel(
   for (const model of HARDWARE_CONSOLE_MODELS) {
     let entry = record[model];
     if (entry === undefined && model === 'creator-micro-2') entry = legacyMapping;
-    result[model] = normalizeActionMapping(
-      Array.isArray(entry) ? entry : undefined,
-      model,
-    );
+    result[model] = normalizeActionMapping(Array.isArray(entry) ? entry : undefined, model);
   }
   return result;
 }

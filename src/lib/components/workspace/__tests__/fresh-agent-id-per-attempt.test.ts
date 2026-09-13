@@ -7,7 +7,7 @@
  * (STAB-143): with no client id on the wire, a failed create can no longer
  * poison retries with a duplicate agent_session.id.
  */
-import { cleanup, render, waitFor } from '@testing-library/svelte';
+import { cleanup, render, screen, waitFor } from '@testing-library/svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => {
@@ -30,21 +30,48 @@ const mocks = vi.hoisted(() => {
         value = next;
         for (const run of subscribers) run(next);
       },
+      get() {
+        return value;
+      },
     };
   }
+  const coordinator = {
+    id: 'spec-writer',
+    name: 'Coordinator',
+    description: '',
+    role: 'orchestrator',
+  };
+  const developer = { id: 'developer', name: 'Developer', description: '' };
   return {
     readable,
     dispatch: vi.fn(),
     goto: vi.fn(),
     create: vi.fn(),
     update: vi.fn(),
+    pull: vi.fn(async () => ({ success: true })),
     setReasoningEffort: vi.fn(),
     hydrated$: writable(false),
     compactFormState$: writable<{
+      selectedSpecialist?: string | null;
       selectedModel?: string;
       modelWasOverridden?: boolean;
       selectedReasoningEffort?: string;
+      isTeamMode?: boolean;
+      skipIsolation?: boolean;
     } | null>(null),
+    lastSubmittedAgent$: writable<{
+      selectedSpecialist: string | null;
+      selectedModel?: string;
+      modelWasOverridden?: boolean;
+      selectedReasoningEffort?: string;
+      isTeamMode: boolean;
+      selectedProvider?: string;
+    } | null>(null),
+    specialists$: writable([coordinator, developer]),
+    customSpecialistsLoaded$: writable(true),
+    fileSpecialistsLoaded$: writable(true),
+    coordinator,
+    developer,
   };
 });
 
@@ -53,14 +80,17 @@ vi.mock('$app/navigation', () => ({ goto: mocks.goto }));
 vi.mock('$store/renderer/store', async () => {
   const { createAppStoreMockModule } =
     await import('$store/renderer/utils/test-helpers/store-mock');
-  return createAppStoreMockModule({ state: () => ({}), dispatch: mocks.dispatch });
+  return createAppStoreMockModule({
+    state: () => ({ workspaceCreateProgress: { byProgressId: {} } }),
+    dispatch: mocks.dispatch,
+  });
 });
 
 vi.mock('$store/renderer/slices/workspace-initializer/workspace-initializer-selectors', () => ({
   selectWorkspaceInitializerHydrated: () => mocks.hydrated$,
   selectCompactWorkspaceInitializerFormState: () => mocks.compactFormState$,
   selectWorkspaceInitializerLastSelectedRepo: () => mocks.readable(() => null),
-  selectWorkspaceInitializerLastSubmittedAgent: () => mocks.readable(() => null),
+  selectWorkspaceInitializerLastSubmittedAgent: () => mocks.lastSubmittedAgent$,
   selectWorkspaceInitializerRecentRepos: () => mocks.readable(() => []),
   selectWorkspaceInitializerPendingGitHubPrefill: () => mocks.readable(() => null),
   selectWorkspaceInitializerDefaultParentPath: () => mocks.readable(() => ''),
@@ -75,20 +105,35 @@ vi.mock('$store/renderer/slices/provider-settings/provider-settings-selectors', 
   selectActiveProviderId: () => mocks.readable(() => 'auggie'),
 }));
 
+vi.mock('$store/renderer/slices/hardware-console/hardware-console-selectors', () => ({
+  selectPttRecording: () => mocks.readable(() => false),
+  selectVoiceTranscribing: () => mocks.readable(() => false),
+}));
+
+vi.mock('$store/renderer/slices/voice-settings/voice-settings-selectors', () => ({
+  selectEffectiveVoiceEngine: () => mocks.readable(() => 'os'),
+}));
+
 vi.mock('$store/renderer/slices/specialists/specialists-selectors', () => ({
-  selectSpecialists: Object.assign(() => mocks.readable(() => []), {
-    select: vi.fn(() => []),
+  selectSpecialists: Object.assign(() => mocks.specialists$, {
+    select: vi.fn(() => mocks.specialists$.get()),
   }),
+  selectCustomSpecialistsLoaded: () => mocks.customSpecialistsLoaded$,
+  selectFileSpecialistsLoaded: () => mocks.fileSpecialistsLoaded$,
   selectEffectiveBehaviorPrompt: { select: vi.fn(() => undefined) },
   selectEffectiveModel: { select: vi.fn(() => undefined) },
   selectEffectiveCodingAgent: { select: vi.fn(() => undefined) },
   selectUserOverrides: { select: vi.fn(() => ({ modelOverrides: {} })) },
+  selectOrchestratorSpecialist: Object.assign(() => mocks.readable(() => mocks.coordinator), {
+    select: vi.fn(() => mocks.coordinator),
+  }),
 }));
 
-vi.mock('$features/setup-scripts', () => ({
+vi.mock('$features/setup-scripts', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('$features/setup-scripts')>()),
   SETUP_SCRIPT_TEMPLATES: [],
   getTemplateContent: vi.fn(() => ''),
-  chooseDefaultSetupScript: vi.fn(() => ({ content: '', name: 'Custom' })),
+  chooseDefaultSetupScript: vi.fn(() => ({ content: '', name: 'Custom', source: 'custom' })),
   fetchRepoConfigSetupScript: vi.fn(async () => null),
   fetchGitHubRepoConfigSetupScript: vi.fn(async () => null),
   probeRepoConfigSetupScript: vi.fn(),
@@ -109,7 +154,7 @@ vi.mock('$lib/config/debug', () => ({
 vi.mock('$lib/client', () => ({
   appClient: {
     agents: { setReasoningEffort: mocks.setReasoningEffort },
-    git: { pull: vi.fn(async () => ({ success: true })) },
+    git: { pull: mocks.pull },
     drafts: {
       get: vi.fn(async () => null),
       set: vi.fn(async () => undefined),
@@ -173,7 +218,7 @@ vi.mock('$lib/components/workspace/initializer/IssueSuggestions.svelte', async (
 }));
 
 vi.mock('$lib/components/workspace/initializer/RepoAndBranchPicker.svelte', async () => ({
-  default: (await import('../initializer/__tests__/mocks/MockComponent.svelte')).default,
+  default: (await import('./mocks/MockRepoAndBranchPicker.svelte')).default,
 }));
 
 vi.mock('$lib/components/chat/AttachmentPreview.svelte', async () => ({
@@ -212,6 +257,10 @@ describe('CompactWorkspaceInitializer omits client agent ID on create', () => {
     sessionStorage.clear();
     mocks.hydrated$.set(false);
     mocks.compactFormState$.set(null);
+    mocks.lastSubmittedAgent$.set(null);
+    mocks.specialists$.set([mocks.coordinator, mocks.developer]);
+    mocks.customSpecialistsLoaded$.set(true);
+    mocks.fileSpecialistsLoaded$.set(true);
     mocks.setReasoningEffort.mockResolvedValue({ success: true });
   });
 
@@ -220,18 +269,192 @@ describe('CompactWorkspaceInitializer omits client agent ID on create', () => {
     sessionStorage.clear();
   });
 
+  it('creates a single Developer agent when nothing has been remembered', async () => {
+    mocks.create.mockResolvedValue({ ok: false, error: 'stop after payload capture' });
+    seedAutoCreatePrefill();
+    const { component } = render(CompactWorkspaceInitializer, { props: { isExpanded: false } });
+
+    await component.applyPrefill();
+    await waitFor(() => expect(mocks.create).toHaveBeenCalledTimes(1));
+
+    expect(mocks.create.mock.calls[0][0].initialAgent.specialist).toBe('developer');
+  });
+
+  it('falls back to General when the Developer specialist is absent and nothing is remembered', async () => {
+    mocks.specialists$.set([mocks.coordinator]);
+    mocks.create.mockResolvedValue({ ok: false, error: 'stop after payload capture' });
+    seedAutoCreatePrefill();
+    const { component } = render(CompactWorkspaceInitializer, { props: { isExpanded: false } });
+
+    await component.applyPrefill();
+    await waitFor(() => expect(mocks.create).toHaveBeenCalledTimes(1));
+
+    expect(mocks.create.mock.calls[0][0].initialAgent.specialist).toBeUndefined();
+  });
+
+  it('keeps a remembered General in the form state over a remembered Developer last-submitted agent', async () => {
+    mocks.compactFormState$.set({ selectedSpecialist: null, isTeamMode: false });
+    mocks.lastSubmittedAgent$.set({ selectedSpecialist: 'developer', isTeamMode: false });
+    mocks.create.mockResolvedValue({ ok: false, error: 'stop after payload capture' });
+    seedAutoCreatePrefill();
+    const { component } = render(CompactWorkspaceInitializer, { props: { isExpanded: false } });
+
+    await component.applyPrefill();
+    await waitFor(() => expect(mocks.create).toHaveBeenCalledTimes(1));
+
+    const { initialAgent } = mocks.create.mock.calls[0][0];
+    expect(initialAgent.specialist).toBeUndefined();
+    expect(initialAgent.metadata.specialist).toBeUndefined();
+    expect(initialAgent.metadata.workMode).toBe('single');
+  });
+
+  it('keeps a remembered General last-submitted agent over the Developer default', async () => {
+    mocks.lastSubmittedAgent$.set({ selectedSpecialist: null, isTeamMode: false });
+    mocks.create.mockResolvedValue({ ok: false, error: 'stop after payload capture' });
+    seedAutoCreatePrefill();
+    const { component } = render(CompactWorkspaceInitializer, { props: { isExpanded: false } });
+
+    await component.applyPrefill();
+    await waitFor(() => expect(mocks.create).toHaveBeenCalledTimes(1));
+
+    const { initialAgent } = mocks.create.mock.calls[0][0];
+    expect(initialAgent.specialist).toBeUndefined();
+    expect(initialAgent.metadata.specialist).toBeUndefined();
+    expect(initialAgent.metadata.workMode).toBe('single');
+  });
+
+  it('requests a fresh specialist roster once when mounted', () => {
+    render(CompactWorkspaceInitializer, { props: { isExpanded: false } });
+
+    const refetches = mocks.dispatch.mock.calls.filter(
+      ([action]) => action.type === 'specialists/refetchRequested',
+    );
+    expect(refetches).toHaveLength(1);
+  });
+
+  it.each([
+    { isTeamMode: false, expectedSpecialist: undefined },
+    { isTeamMode: true, expectedSpecialist: 'spec-writer' },
+  ])(
+    'replaces a stale persisted specialist before submit when team mode is $isTeamMode',
+    async ({ isTeamMode, expectedSpecialist }) => {
+      mocks.compactFormState$.set({ selectedSpecialist: 'deleted-specialist', isTeamMode });
+      mocks.create.mockResolvedValue({ ok: false, error: 'stop after payload capture' });
+      seedAutoCreatePrefill();
+      const { component } = render(CompactWorkspaceInitializer, { props: { isExpanded: false } });
+
+      await component.applyPrefill();
+      await waitFor(() => expect(mocks.create).toHaveBeenCalledTimes(1));
+
+      expect(mocks.create.mock.calls[0][0].initialAgent.specialist).toBe(expectedSpecialist);
+    },
+  );
+
+  it('waits for an authoritative roster before resetting a persisted custom specialist', async () => {
+    const customSpecialist = {
+      id: 'custom-specialist',
+      name: 'Custom specialist',
+      description: '',
+    };
+    mocks.compactFormState$.set({ selectedSpecialist: customSpecialist.id, isTeamMode: false });
+    mocks.customSpecialistsLoaded$.set(false);
+    mocks.fileSpecialistsLoaded$.set(false);
+    mocks.create.mockResolvedValue({ ok: false, error: 'stop after payload capture' });
+
+    seedAutoCreatePrefill();
+    const { component } = render(CompactWorkspaceInitializer, { props: { isExpanded: false } });
+    await component.applyPrefill();
+    await waitFor(() => expect(mocks.create).toHaveBeenCalledTimes(1));
+    expect(mocks.create.mock.calls[0][0].initialAgent.specialist).toBe(customSpecialist.id);
+
+    mocks.customSpecialistsLoaded$.set(true);
+    mocks.fileSpecialistsLoaded$.set(true);
+    seedAutoCreatePrefill();
+    await component.applyPrefill();
+    await waitFor(() => expect(mocks.create).toHaveBeenCalledTimes(2));
+    expect(mocks.create.mock.calls[1][0].initialAgent.specialist).toBeUndefined();
+
+    cleanup();
+    mocks.compactFormState$.set({ selectedSpecialist: customSpecialist.id, isTeamMode: false });
+    mocks.specialists$.set([mocks.coordinator, customSpecialist]);
+    seedAutoCreatePrefill();
+    const { component: loadedComponent } = render(CompactWorkspaceInitializer, {
+      props: { isExpanded: false },
+    });
+    await loadedComponent.applyPrefill();
+    await waitFor(() => expect(mocks.create).toHaveBeenCalledTimes(3));
+    expect(mocks.create.mock.calls[2][0].initialAgent.specialist).toBe(customSpecialist.id);
+  });
+
+  it('refreshes and resets an unknown specialist so retry succeeds without reopening', async () => {
+    const deletedSpecialist = {
+      id: 'deleted-specialist',
+      name: 'Deleted specialist',
+      description: '',
+    };
+    mocks.specialists$.set([mocks.coordinator, deletedSpecialist]);
+    mocks.compactFormState$.set({
+      selectedSpecialist: deletedSpecialist.id,
+      isTeamMode: false,
+    });
+    mocks.create
+      .mockResolvedValueOnce({
+        ok: false,
+        error:
+          'unknown specialist: deleted-specialist (known specialists: spec-writer; aliases are accepted)',
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        data: {
+          workspace: {
+            id: 'ws-created',
+            title: 'Created workspace',
+            path: '/tmp/ws-created',
+            repositoryPath: '/tmp/test-repo',
+            worktreePath: '/tmp/ws-created',
+            status: 'Active',
+          },
+          initialAgent: { id: 'agent-created' },
+        },
+      });
+
+    seedAutoCreatePrefill();
+    const { component } = render(CompactWorkspaceInitializer, { props: { isExpanded: true } });
+    await component.applyPrefill();
+
+    expect(
+      await screen.findByText(
+        'That specialist no longer exists. The specialist list has been refreshed; try again.',
+      ),
+    ).toBeTruthy();
+    expect(mocks.create.mock.calls[0][0].initialAgent.specialist).toBe(deletedSpecialist.id);
+    expect(
+      mocks.dispatch.mock.calls.filter(
+        ([action]) => action.type === 'specialists/refetchRequested',
+      ),
+    ).toHaveLength(2);
+
+    seedAutoCreatePrefill();
+    await component.applyPrefill();
+    await waitFor(() => expect(mocks.create).toHaveBeenCalledTimes(2));
+
+    expect(mocks.create.mock.calls[1][0].initialAgent.specialist).toBeUndefined();
+    await waitFor(() => expect(mocks.goto).toHaveBeenCalledWith('/workspace/ws-created'));
+  });
+
   it('never sends initialAgent.agentId, including on the retry after a failed create', async () => {
     mocks.create.mockRejectedValue(new Error('daemon rejected create'));
 
     seedAutoCreatePrefill();
     const { component } = render(CompactWorkspaceInitializer, {
-      props: { isExpanded: false },
+      props: { isExpanded: true },
     });
 
     // First attempt: applyPrefill() arms pendingAutoCreate; the auto-submit
     // $effect fires once the async git check makes the form valid.
     await component.applyPrefill();
     await waitFor(() => expect(mocks.create).toHaveBeenCalledTimes(1));
+    await screen.findByText('daemon rejected create');
 
     // Retry after failure via the same auto-create path.
     seedAutoCreatePrefill();
@@ -259,7 +482,68 @@ describe('CompactWorkspaceInitializer omits client agent ID on create', () => {
     expect(sessionStorage.getItem('compact-workspace-initializer-agent-id')).toBeNull();
   });
 
+  it('does not pull a behind source checkout for isolated creation', async () => {
+    mocks.create.mockResolvedValue({ ok: false, error: 'stop after payload capture' });
+    seedAutoCreatePrefill();
+    const { component } = render(CompactWorkspaceInitializer, { props: { isExpanded: true } });
+    const picker = await waitFor(
+      () =>
+        (
+          window as unknown as {
+            __mockRepoAndBranchPicker?: {
+              onBranchStatusChange?: (status: Record<string, unknown>) => void;
+            };
+          }
+        ).__mockRepoAndBranchPicker,
+    );
+    picker?.onBranchStatusChange?.({
+      behind: 2,
+      hasUncommittedChanges: true,
+      currentBranch: 'main',
+      isCurrentBranch: true,
+      isLoading: false,
+    });
+
+    await component.applyPrefill();
+    await waitFor(() => expect(mocks.create).toHaveBeenCalledTimes(1));
+    expect(mocks.pull).not.toHaveBeenCalled();
+  });
+
+  it('pulls a behind source checkout before direct creation', async () => {
+    mocks.create.mockResolvedValue({ ok: false, error: 'stop after payload capture' });
+    seedAutoCreatePrefill();
+    const { component } = render(CompactWorkspaceInitializer, { props: { isExpanded: true } });
+    const picker = await waitFor(
+      () =>
+        (
+          window as unknown as {
+            __mockRepoAndBranchPicker?: {
+              onBranchStatusChange?: (status: Record<string, unknown>) => void;
+              onSkipIsolationChange?: (value: boolean) => void;
+            };
+          }
+        ).__mockRepoAndBranchPicker,
+    );
+    picker?.onSkipIsolationChange?.(true);
+    picker?.onBranchStatusChange?.({
+      behind: 2,
+      hasUncommittedChanges: false,
+      currentBranch: 'main',
+      isCurrentBranch: true,
+      isLoading: false,
+    });
+
+    await component.applyPrefill();
+    await waitFor(() => expect(mocks.create).toHaveBeenCalledTimes(1));
+    expect(mocks.pull).toHaveBeenCalledWith('/tmp/test-repo', 'main');
+    expect(mocks.pull.mock.invocationCallOrder[0]).toBeLessThan(
+      mocks.create.mock.invocationCallOrder[0],
+    );
+  });
+
   it('hydrates the daemon-created agent before opening and navigating to the workspace', async () => {
+    // Remembered orchestration choice — the coordinator layout is bootstrapped.
+    mocks.compactFormState$.set({ selectedSpecialist: 'spec-writer', isTeamMode: true });
     mocks.create.mockResolvedValue({
       ok: true,
       data: {

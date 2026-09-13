@@ -9,7 +9,7 @@ import type { LastAttemptedMessage } from '$store/renderer/slices/chat-state/cha
  *
  * The opaque `messageMetadata` tag rides along too, so a retried wizard answer
  * keeps its `question_answers` tag (an untagged resend would leave the daemon's
- * question hold pending).
+ * pending question set unanswered and the sticky wizard visible).
  *
  * Single construction site shared by chat-send-service (direct/queue-on-send
  * recording) and agent-send (auto-queue park, #1011) — the park reducer's
@@ -21,7 +21,12 @@ export function buildRecordedAttempt(
   options: {
     noteIds?: string[];
     model?: string;
-    imageBlocks?: Array<{ type: 'image'; data: string; mimeType: string }>;
+    imageBlocks?: Array<{
+      type: 'image';
+      data?: string;
+      mimeType?: string;
+      attachmentId?: string;
+    }>;
     fileBlocks?: Array<{
       type: 'file';
       attachmentId: string;
@@ -37,9 +42,7 @@ export function buildRecordedAttempt(
     ...(options.model !== undefined ? { model: options.model } : {}),
     ...(options.imageBlocks !== undefined ? { imageBlocks: options.imageBlocks } : {}),
     ...(options.fileBlocks !== undefined ? { fileBlocks: options.fileBlocks } : {}),
-    ...(options.messageMetadata !== undefined
-      ? { messageMetadata: options.messageMetadata }
-      : {}),
+    ...(options.messageMetadata !== undefined ? { messageMetadata: options.messageMetadata } : {}),
   };
   return {
     text,

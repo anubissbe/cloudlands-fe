@@ -87,16 +87,16 @@ describe('SettingsChangeCard', () => {
 
     expect(screen.getByText('Theme preset: Dracula')).toBeTruthy();
     expect(screen.getByText('Switch the theme preset to Dracula.')).toBeTruthy();
-    expect(container.textContent).toContain('Theme preset: Default → Dracula');
-    expect(screen.getByRole('button', { name: 'Discard' })).toBeTruthy();
+    expect(
+      container.querySelector('[data-proposal-before-after-row="theme.activePresetId"]')
+        ?.textContent,
+    ).toContain('Default → Dracula');
+    expect(screen.getByRole('button', { name: 'Not now' })).toBeTruthy();
     expect(screen.getByRole('button', { name: 'Apply' })).toBeTruthy();
     expect(container.textContent).not.toContain('app-settings.proposal.json');
-    const card = container.querySelector('[data-proposal-kind="settings-change"]');
-    expect(card?.className).toContain('rounded-(--radius-medium)');
-    expect(card?.className).toContain('bg-card');
-    expect(screen.getByRole('heading', { name: 'Theme preset: Dracula' }).className).toContain(
-      'type-body',
-    );
+    expect(
+      screen.getByRole('heading', { name: 'Apply these settings changes?' }).className,
+    ).toContain('type-title');
     expect(container.innerHTML).not.toContain('text-subtle');
   });
 
@@ -149,7 +149,7 @@ describe('SettingsChangeCard', () => {
     expect(status.textContent).toContain('Applying…');
     expect(status.getAttribute('aria-live')).toBe('polite');
     expect(screen.getByRole('button', { name: 'Applying…' }).hasAttribute('disabled')).toBe(true);
-    expect(screen.getByRole('button', { name: 'Discard' }).hasAttribute('disabled')).toBe(true);
+    expect(screen.getByRole('button', { name: 'Not now' }).hasAttribute('disabled')).toBe(true);
   });
 
   it('renders undo progress for applied settings proposals', () => {
@@ -175,5 +175,37 @@ describe('SettingsChangeCard', () => {
     await fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
 
     expect(onApply).toHaveBeenCalledWith(expect.objectContaining({ proposal: makeProposal() }));
+  });
+
+  it('restores initialEditedFields and reports enum edits via onEditedFieldsChange', async () => {
+    const proposal = makeProposal();
+    proposal.payload = { changes: [{ path: 'theme.activePresetId', value: null }] };
+    proposal.preview.fields = [
+      { key: 'theme.activePresetId', label: 'Theme preset', before: 'dracula', after: 'Default' },
+    ];
+    const onEditedFieldsChange = vi.fn();
+    const onApply = vi.fn();
+    render(SettingsChangeCard, {
+      props: {
+        proposal,
+        onApply,
+        onEditedFieldsChange,
+        initialEditedFields: { 'theme.activePresetId': 'dracula' },
+      },
+    });
+
+    // Restored edit overrides the proposal's own value on apply.
+    await fireEvent.click(screen.getByRole('button', { name: 'Apply' }));
+    expect(onApply.mock.calls[0]?.[0].editedFields['theme.activePresetId']).toBe('dracula');
+
+    // A fresh edit reports string-serialized fields for persistence.
+    const trigger = screen.getByLabelText('Theme preset');
+    await fireEvent.keyDown(trigger, { key: 'Enter' });
+    await fireEvent.keyDown(trigger, { key: 'ArrowUp' });
+    await fireEvent.keyDown(trigger, { key: 'Enter' });
+    await waitFor(() => expect(onEditedFieldsChange).toHaveBeenCalled());
+    const reported = onEditedFieldsChange.mock.calls.at(-1)?.[0];
+    expect(typeof reported).toBe('object');
+    expect(Object.values(reported).every((value) => typeof value === 'string')).toBe(true);
   });
 });

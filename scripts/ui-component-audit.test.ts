@@ -1,3 +1,4 @@
+// @ui-invariant
 import { spawnSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
@@ -127,7 +128,6 @@ describe('UI component inventory gate', () => {
       'src/features/layout/tab-types/NoteViewSettingsDropdown.svelte',
       'src/lib/component-catalog/CatalogControls.svelte',
       'src/lib/component-catalog/renderers/BasicCatalogPreview.svelte',
-      'src/lib/components/file-tracking/CodeChangesPanel.svelte',
       'src/lib/components/settings/ColorThemeSettings.svelte',
     ]);
     expect(dropdownMenu?.callers).toHaveLength(17);

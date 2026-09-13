@@ -26,7 +26,7 @@
   } from '$lib/components/shared/resource-icon';
 
   import { openCheatSheet } from '$store/renderer/slices/shortcuts-cheatsheet/shortcuts-cheatsheet-slice';
-  import { SHORTCUTS, formatShortcut } from '$lib/utils/shortcuts';
+  import { formatShortcut } from '$lib/utils/shortcuts';
   import { openPalette } from '$store/renderer/slices/palette/palette-slice';
   import { toggleSidebar } from '$store/renderer/slices/ui-layout/ui-layout-slice';
   import {
@@ -37,6 +37,7 @@
   import { selectTerminalsForWorkspace } from '$store/renderer/slices/terminals/terminals-selectors';
 
   import { store as appStore } from '$store/renderer/store';
+  import { effectiveShortcutReadable } from '$lib/utils/effective-shortcuts';
 
   interface Props {
     workspaceId: string;
@@ -95,6 +96,12 @@
     return filtered.slice(0, 5);
   });
 
+  // A browser tab's title is canonical registry data; none yet shows the label.
+  function getTabTitle(tab: PanelTab): string {
+    if (tab.type === 'browser') return tab.title || m.layout_panelLayout_browser_fallback();
+    return tab.title;
+  }
+
   // Get icon for tab type
   function getTabIcon(type: PanelTab['type']) {
     switch (type) {
@@ -126,8 +133,12 @@
     return m.layout_panelEmptyState_daysAgo_label({ days: Math.floor(diff / 86400000) });
   }
 
-  function handleReopenItem() {
+  function handleReopenLatest() {
     layoutManager?.reopenClosedTab();
+  }
+
+  function handleReopenItem(closedTabId: string) {
+    layoutManager?.reopenClosedTab(closedTabId, panelId);
   }
 
   function handleCreateAgent() {
@@ -186,37 +197,42 @@
         ]
       : []),
   ]);
-  const utilityActions = [
+  const newTabShortcut$ = effectiveShortcutReadable('navigation.new-tab');
+  const commandPaletteShortcut$ = effectiveShortcutReadable('global.command-palette-alt');
+  const reopenTabShortcut$ = effectiveShortcutReadable('navigation.reopen-tab');
+  const toggleSidebarShortcut$ = effectiveShortcutReadable('panel.toggle-sidebar');
+  const keyboardShortcutsShortcut$ = effectiveShortcutReadable('global.keyboard-shortcuts');
+  const utilityActions = $derived([
     {
-      key: SHORTCUTS.NEW_TAB.key,
+      key: $newTabShortcut$,
       label: m.layout_panelEmptyState_newPanel_label(),
       action: handleCreatePanel,
     },
     {
-      key: 'mod+k',
+      key: $commandPaletteShortcut$,
       label: m.layout_panelEmptyState_commandPalette_label(),
       action: () => appStore.dispatch(openPalette()),
     },
     {
-      key: SHORTCUTS.REOPEN_TAB.key,
+      key: $reopenTabShortcut$,
       label: m.layout_panelEmptyState_reopenClosed_label(),
-      action: handleReopenItem,
+      action: handleReopenLatest,
     },
     {
-      key: 'mod+b',
+      key: $toggleSidebarShortcut$,
       label: m.layout_panelEmptyState_toggleSidebar_label(),
       action: () => appStore.dispatch(toggleSidebar()),
     },
     {
-      key: 'mod+?',
+      key: $keyboardShortcutsShortcut$,
       label: m.layout_panelEmptyState_allShortcuts_label(),
       action: () => appStore.dispatch(openCheatSheet('global')),
     },
-  ];
+  ]);
 </script>
 
 <div
-  class="empty-state flex h-full items-center justify-center overflow-y-auto bg-sidebar px-6 py-10 text-sidebar-foreground"
+  class="empty-state flex h-full items-center justify-center overflow-y-auto bg-sidebar px-6 py-10 text-foreground"
   data-panel-empty-state
 >
   <section
@@ -256,17 +272,18 @@
         </div>
         {#each recentItems as item (item.tab.id + '-' + item.closedAt)}
           {@const resourceKind = getResourceIconKind(item.tab.type)}
+          {@const tabTitle = getTabTitle(item.tab)}
           <button
             class="recent-item type-caption flex w-full cursor-pointer items-center gap-2 rounded-md px-1.5 py-1 text-left text-muted-foreground transition-colors hover:bg-accent hover:text-accent-foreground focus-visible:outline-none motion-reduce:transition-none"
-            onclick={handleReopenItem}
-            title={m.layout_panelEmptyState_reopen_tooltip({ title: item.tab.title })}
+            onclick={() => handleReopenItem(item.tab.id)}
+            title={m.layout_panelEmptyState_reopen_tooltip({ title: tabTitle })}
           >
             {#if resourceKind}
               <ResourceIconTile kind={resourceKind} />
             {:else}
               <Fa icon={getTabIcon(item.tab.type)} class="size-3 shrink-0 opacity-70" />
             {/if}
-            <span class="flex-1 truncate">{item.tab.title}</span>
+            <span class="flex-1 truncate">{tabTitle}</span>
             <span class="shrink-0 opacity-70">{formatTime(item.closedAt)}</span>
           </button>
         {/each}

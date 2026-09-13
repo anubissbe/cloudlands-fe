@@ -1,6 +1,12 @@
 /**
  * App Settings Service (Main Process)
  *
+ * Backend policy: local-only. Every RPC goes through the shared
+ * `getLocalBackendClient()` (fail-closed when the local backend has no live
+ * client — never falls back to the primary), and all listeners are pinned to
+ * `LOCAL_CONNECTION_ID`: these values feed local filesystem/git paths in the
+ * Electron main process.
+ *
  * Sync accessors for the three workspace-scoped app settings consumed on
  * synchronous main-process paths (branch-prefix injection, worktree layout,
  * git-env SSH key). The source of truth is the daemon settings catalog
@@ -11,8 +17,8 @@
  *   - `workspace.sshKeyPath`        → `getSshKeyPath()`  (plain string,
  *                                     see intent-services/settings.rs A9)
  *
- * `initAppSettingsService()` hydrates each value into a module-level cache
- * via `settings.get` at process start; the sync getters serve the cached
+ * `initAppSettingsService()` hydrates each value from the LOCAL backend into
+ * a module-level cache via `settings.get` at process start; the sync getters serve the cached
  * value and fall back to `''` while unhydrated (matches the pre-P3-4
  * behaviour when the electron-store key was absent). This mirrors the
  * hydration-cache pattern used by workspace-settings.service.ts and
@@ -25,12 +31,14 @@
  * first attempt can race the daemon socket, see main/index.ts).
  *
  * Saved settings refresh in-session: the service owns ONE long-lived
- * `events.subscribe(['settings:changed'])` subscription (§6.5, same
+ * LOCAL-backend `events.subscribe(['settings:changed'])` subscription (§6.5, same
  * pattern as notification.service.ts) and applies deltas for the three
  * paths straight into the cache, so `settings.update` from the Git &
  * Workspace settings panel takes effect without a relaunch. The
  * subscription is re-issued on backend reconnect (RESUB-1) alongside a
- * full re-fetch to cover changes missed while disconnected.
+ * full re-fetch to cover changes missed while disconnected. Remote backend
+ * changes are intentionally ignored: these values feed local filesystem/git
+ * paths in the Electron main process.
  *
  * The legacy `settings` electron-store, its `getSetting`/`setSetting`
  * facade, and the dead `websocketApi-*` helpers are retired here — no
@@ -39,11 +47,12 @@
 
 import { Logger } from '../../../shared/logger';
 import {
-  getBackendClient,
+  getLocalBackendClient,
   onBackendNotification,
   onBackendReconnected,
   onBackendStatus,
 } from '../../backend/main/backend.ipc';
+import { LOCAL_CONNECTION_ID } from '../../backend/main/connections-store';
 import type { ConnectionStatus, JsonRpcNotification } from '../../backend/main/json-rpc-client';
 
 const logger = new Logger({ category: 'AppSettingsService' });
@@ -121,7 +130,7 @@ function allHydrated(): boolean {
 }
 
 async function fetchStringSetting(path: string): Promise<string> {
-  const result = (await getBackendClient().request('settings.get', {
+  const result = (await getLocalBackendClient().request('settings.get', {
     path,
   })) as { value?: unknown } | null;
   const value = result?.value;
@@ -195,7 +204,8 @@ function handleBackendNotification(n: JsonRpcNotification): void {
 async function subscribeToSettingsChanges(): Promise<void> {
   const epoch = subscribeEpoch;
   try {
-    const result = (await getBackendClient().request('events.subscribe', {
+    const client = getLocalBackendClient();
+    const result = (await client.request('events.subscribe', {
       eventTypes: ['settings:changed'],
     })) as { subscriptionId?: string } | undefined;
     const id = result?.subscriptionId;
@@ -203,9 +213,7 @@ async function subscribeToSettingsChanges(): Promise<void> {
       // A reconnect ran while subscribe was in flight; this id belongs to
       // the previous connection generation. Best-effort release it.
       if (id) {
-        void getBackendClient()
-          .request('events.unsubscribe', { subscriptionId: id })
-          .catch(() => {});
+        void client.request('events.unsubscribe', { subscriptionId: id }).catch(() => {});
       }
       return;
     }
@@ -248,7 +256,7 @@ function armStatusRetry(): void {
   };
   // Register on the stable status forwarder so the retry survives a backend
   // switch instead of stranding on the disposed client.
-  statusRetryDisposer = onBackendStatus(listener);
+  statusRetryDisposer = onBackendStatus(listener, LOCAL_CONNECTION_ID);
 }
 
 function clearStatusRetry(): void {
@@ -290,7 +298,7 @@ function clearSubscribeRetry(): void {
 function attachSettingsListeners(): Promise<void> {
   if (listenersAttached) return Promise.resolve();
   listenersAttached = true;
-  notificationDisposer = onBackendNotification(handleBackendNotification);
+  notificationDisposer = onBackendNotification(handleBackendNotification, LOCAL_CONNECTION_ID);
   reconnectDisposer = onBackendReconnected(() => {
     // The daemon dropped every in-memory subscription on reconnect; the
     // stale id belonged to the previous connection. Re-subscribe FIRST,
@@ -304,7 +312,7 @@ function attachSettingsListeners(): Promise<void> {
       await subscribeToSettingsChanges();
       await refreshSettings(APP_SETTING_PATHS);
     })();
-  });
+  }, LOCAL_CONNECTION_ID);
   return subscribeToSettingsChanges();
 }
 

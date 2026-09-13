@@ -18,11 +18,11 @@
   import GitHubRepoTab from './GitHubRepoTab.svelte';
   import NewProjectTab from './NewProjectTab.svelte';
   import {
-  selectWorkspaceInitializerBranchByRepo,
-  selectWorkspaceInitializerDefaultParentPath,
-  selectWorkspaceInitializerHydrated,
-  selectWorkspaceInitializerLastSelectedRepo,
-} from '$store/renderer/slices/workspace-initializer/workspace-initializer-selectors';
+    selectWorkspaceInitializerBranchByRepo,
+    selectWorkspaceInitializerDefaultParentPath,
+    selectWorkspaceInitializerHydrated,
+    selectWorkspaceInitializerLastSelectedRepo,
+  } from '$store/renderer/slices/workspace-initializer/workspace-initializer-selectors';
   import type { WorkspaceInitializerRepoSelection } from '$store/renderer/slices/workspace-initializer/workspace-initializer-types';
 
   const logger = createLogger('ProjectPickerMessage');
@@ -52,6 +52,8 @@
     githubUrl?: string;
     projectName?: string;
     isValid: boolean;
+    /** Local folder exists but has no Git repo; the daemon must initialize it. */
+    initGit?: boolean;
   }
 
   interface Props {
@@ -75,6 +77,7 @@
   // Local repo state
   let localRepoPath = $state('');
   let localBranch = $state('');
+  let localInitGit = $state(false);
 
   // GitHub repo state — a picked repo is identified by its URL only; the
   // daemon owns the checkout location (picked-repo flow).
@@ -93,8 +96,10 @@
   function getProjectNameError(name: string): string | undefined {
     if (!name || name.trim().length === 0) return undefined; // empty handled by isValid check
     const t = name.trim();
-    if (t.includes('/') || t.includes('\\')) return m.onboarding_projectPicker_pathSeparators_error();
-    if (t === '..' || t === '.' || /^\.+$/.test(t)) return m.onboarding_projectPicker_dotName_error();
+    if (t.includes('/') || t.includes('\\'))
+      return m.onboarding_projectPicker_pathSeparators_error();
+    if (t === '..' || t === '.' || /^\.+$/.test(t))
+      return m.onboarding_projectPicker_dotName_error();
     if (t.includes('\0')) return m.onboarding_projectPicker_nullChars_error();
     if (/[<>:"|?*]/.test(t)) return m.onboarding_projectPicker_invalidChars_error();
     if (t.length > 255) return m.onboarding_projectPicker_nameTooLong_error();
@@ -158,8 +163,7 @@
   // (even git repos) should be selected through the Local tab instead.
   const newProjectDirError = $derived.by(() => {
     if (!newProjectDirStatus?.exists) return undefined;
-    if (!newProjectDirStatus.isEmpty)
-      return m.onboarding_projectPicker_targetExists_error();
+    if (!newProjectDirStatus.isEmpty) return m.onboarding_projectPicker_targetExists_error();
     return undefined;
   });
 
@@ -190,6 +194,7 @@
     if (data.type === 'local' && data.path) {
       localRepoPath = data.path;
       localScope = data.scope;
+      localInitGit = false;
       activeTab = 'local';
       localBranch = $branchByRepo$[data.path] || localBranch;
     } else if (data.type === 'github' && data.githubUrl) {
@@ -208,8 +213,9 @@
       const data = JSON.parse(prefill);
       if (data.repoPath) {
         localRepoPath = data.repoPath;
-        localBranch = data.branch || 'main';
+        localBranch = typeof data.branch === 'string' ? data.branch : '';
         localScope = data.scope;
+        localInitGit = false;
         activeTab = 'local';
       } else if (data.githubUrl) {
         githubUrl = data.githubUrl;
@@ -244,6 +250,7 @@
         branch: localBranch,
         scope: localScope,
         isValid: !!localRepoPath,
+        ...(localInitGit ? { initGit: true } : {}),
       };
     } else if (activeTab === 'github') {
       // Branch is chosen in the prompt/configuration step via the shared
@@ -357,12 +364,13 @@
         {#if activeTab === 'local'}
           <LocalRepoTab
             selectedPath={localRepoPath}
-            onSelect={(path, scope) => {
+            onSelect={(path, scope, initGit) => {
               localRepoPath = path;
               localScope = scope;
+              localInitGit = initGit === true;
               notifyParent();
             }}
-            onSelectAndAdvance={(path, scope) => {
+            onSelectAndAdvance={(path, scope, initGit) => {
               // Capture reactive prop before state changes invalidate it.
               // Use typeof guard: during component teardown the Svelte 5
               // reactive proxy can return a truthy non-callable value,
@@ -370,6 +378,7 @@
               const advance = onSelectAndAdvance;
               localRepoPath = path;
               localScope = scope;
+              localInitGit = initGit === true;
               notifyParent();
               if (typeof advance === 'function') advance();
             }}

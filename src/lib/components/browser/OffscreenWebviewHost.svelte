@@ -22,7 +22,9 @@
    */
   import { untrack } from 'svelte';
   import { BROWSER_PANEL_PARTITION, BROWSER_PROTOCOLS } from '../../../shared/constants';
+  import { selectOwnClientId } from '$store/renderer/slices/browser-clients/browser-clients-selectors';
   import { selectPanelLayoutWorkspaces } from '$store/renderer/slices/panel-layout/panel-layout-selectors';
+  import type { PanelTab } from '$store/renderer/slices/panel-layout/panel-layout-types';
   import { offscreenWebview } from './offscreen-webview-action';
   import {
     areOffscreenWebviewCachesEqual,
@@ -40,6 +42,7 @@
   let { excludedWorkspaceIds, maxWebviews = MAX_OFFSCREEN_WEBVIEWS }: Props = $props();
 
   const layouts$ = selectPanelLayoutWorkspaces();
+  const ownClientId$ = selectOwnClientId();
 
   function isKeepAliveUrl(url: string): boolean {
     try {
@@ -49,17 +52,54 @@
     }
   }
 
+  // Only the tab's host mounts a guest (REV-2 §5.45); a tab the registry
+  // homes on another client is a mirror here and never gets a webview.
+  function isHostedHere(tab: PanelTab, ownClientId: string | null): boolean {
+    return tab.hostClientId === undefined || tab.hostClientId === ownClientId;
+  }
+
   const candidates = $derived.by(() => {
     const out: OffscreenWebviewCandidate[] = [];
+    const ownClientId = $ownClientId$;
     for (const [workspaceId, layout] of Object.entries($layouts$)) {
-      if (excludedWorkspaceIds.has(workspaceId)) continue;
-      for (const panel of Object.values(layout.panels)) {
-        for (const tab of panel.tabs) {
-          if (tab.type !== 'browser' || !tab.browserUrl || !isKeepAliveUrl(tab.browserUrl)) {
-            continue;
+      if (!excludedWorkspaceIds.has(workspaceId)) {
+        for (const panel of Object.values(layout.panels)) {
+          for (const tab of panel.tabs) {
+            if (
+              tab.type !== 'browser' ||
+              !tab.browserUrl ||
+              !isKeepAliveUrl(tab.browserUrl) ||
+              !isHostedHere(tab, ownClientId)
+            ) {
+              continue;
+            }
+            // Agent-owned tabs stay mounted for the agent's lifetime:
+            // pinned entries are exempt from the cap (monorepo#2857).
+            const pinned =
+              typeof tab.ownerAgentId === 'string' && tab.ownerAgentId.length > 0
+                ? { pinned: true }
+                : {};
+            out.push({ tabId: tab.id, workspaceId, url: tab.browserUrl, ...pinned });
           }
-          out.push({ tabId: tab.id, workspaceId, url: tab.browserUrl });
         }
+      }
+      // Hidden (user-closed) owned tabs have no visible EmbeddedBrowser even
+      // in the displayed workspace, so they always mount here — pinned, kept
+      // alive until agent deletion or workspace archive/delete
+      // (monorepo#2857). hiddenTabs is a Collection; read its ids/map here
+      // since components must not import collection-utils.
+      for (const id of layout.hiddenTabs?.ids ?? []) {
+        const tab = layout.hiddenTabs.map[id];
+        if (
+          !tab ||
+          tab.type !== 'browser' ||
+          !tab.browserUrl ||
+          !isKeepAliveUrl(tab.browserUrl) ||
+          !isHostedHere(tab, ownClientId)
+        ) {
+          continue;
+        }
+        out.push({ tabId: tab.id, workspaceId, url: tab.browserUrl, pinned: true });
       }
     }
     return out;
@@ -94,32 +134,45 @@
     }
   });
 
-  const entries = $derived.by(() =>
-    [...cache.keys()].flatMap((tabId) => {
+  const entries = $derived.by(() => {
+    // Live persisted URL per tab: the frozen mount URL never changes, but an
+    // external browserUrl update (agent openTab replacing a hidden tab,
+    // monorepo#2857) must reach the live guest via the action's update hook.
+    const liveUrlByTabId = new Map(candidates.map((c) => [c.tabId, c.url]));
+    return [...cache.keys()].flatMap((tabId) => {
       const frozen = frozenByTabId.get(tabId);
-      return frozen ? [{ tabId, ...frozen }] : [];
-    }),
-  );
+      return frozen ? [{ tabId, ...frozen, desiredUrl: liveUrlByTabId.get(tabId) }] : [];
+    });
+  });
 </script>
 
 <!--
-  Kept offscreen at real size: display:none guests stop painting, which breaks
-  CDP screenshot/capture, so the container sits outside the viewport instead.
+  Kept in-viewport but visually hidden: display:none guests stop painting,
+  and out-of-viewport guests (the old left:-10000px parking) get
+  viewport-culled by the compositor — no BeginFrames, so CDP
+  Page.captureScreenshot and webContents.capturePage() hang until the
+  caller's budget kills them (monorepo#3366). A 1x1 overflow-hidden
+  container at the viewport origin (opacity 0, no pointer events) keeps
+  the full-size guests genuinely painting while staying invisible and
+  non-interactive. `inert` removes the (focusable) webviews from the tab
+  order; harness-verified to not suppress BeginFrames.
 -->
 <div
-  class="fixed top-0 h-[800px] w-[1280px]"
-  style:left="-10000px"
+  class="pointer-events-none fixed left-0 top-0 h-px w-px overflow-hidden opacity-0"
   aria-hidden="true"
+  inert
   data-offscreen-webview-host
 >
-  {#each entries as entry (entry.tabId)}
-    <webview
-      class="absolute inset-0 h-full w-full border-none"
-      src={entry.url}
-      partition={BROWSER_PANEL_PARTITION}
-      allowpopups
-      data-offscreen-webview-tab={entry.tabId}
-      use:offscreenWebview={entry}
-    ></webview>
-  {/each}
+  <div class="relative h-[800px] w-[1280px]">
+    {#each entries as entry (entry.tabId)}
+      <webview
+        class="absolute inset-0 h-full w-full border-none"
+        src={entry.url}
+        partition={BROWSER_PANEL_PARTITION}
+        allowpopups
+        data-offscreen-webview-tab={entry.tabId}
+        use:offscreenWebview={entry}
+      ></webview>
+    {/each}
+  </div>
 </div>

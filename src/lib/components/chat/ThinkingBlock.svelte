@@ -60,15 +60,16 @@
   const reasoningContent = $derived(extractReasoningHeading(content));
   const instanceId = $props.id();
   const detailsId = `reasoning-details-${instanceId}`;
-  const toggleLabel = $derived(reasoningContent.heading ?? m.chat_thinkingBlock_thinking_label());
+  const toggleLabel = $derived(
+    reasoningContent.heading ??
+      (isStreaming
+        ? m.chat_thinkingBlock_thinking_label()
+        : m.chat_thinkingBlock_reasoning_label()),
+  );
 </script>
 
 {#snippet leading()}
-  <Fa
-    icon={faBrain}
-    size={16}
-    class="{CHAT_OPERATIONAL_ICON_CLASS} {isStreaming ? 'animate-pulse' : ''}"
-  />
+  <Fa icon={faBrain} size={16} class={CHAT_OPERATIONAL_ICON_CLASS} />
 {/snippet}
 
 {#snippet summary()}
@@ -109,15 +110,13 @@
 />
 
 <style>
-  .reasoning-expanded-body :global(.markdown-viewer),
-  .reasoning-expanded-body :global(.markdown-viewer > .ProseMirror) {
+  .reasoning-expanded-body :global(.markdown-viewer) {
     display: flex;
     flex-direction: column;
     row-gap: 0.5rem;
   }
 
-  .reasoning-expanded-body :global(.markdown-viewer > *),
-  .reasoning-expanded-body :global(.markdown-viewer > .ProseMirror > *) {
+  .reasoning-expanded-body :global(.markdown-viewer > *) {
     margin-block: 0 !important;
   }
 

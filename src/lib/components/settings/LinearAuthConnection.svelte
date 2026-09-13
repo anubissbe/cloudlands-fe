@@ -18,18 +18,10 @@
     selectLinearRequiresDaemonAuth,
   } from '$store/renderer/slices/linear-auth/linear-auth-selectors';
   import {
-    initializeLinearAuth,
     connectLinear,
     logoutLinear,
   } from '$store/renderer/slices/linear-auth/linear-auth-slice';
   import Input from '$lib/components/ui/input/input.svelte';
-
-  interface Props {
-    /** Skip initialization if parent already initialized the store */
-    skipInitialize?: boolean;
-  }
-
-  let { skipInitialize = false }: Props = $props();
 
   const isAuthenticated$ = selectLinearIsAuthenticated();
   const isAuthenticating$ = selectLinearIsAuthenticating();
@@ -50,9 +42,6 @@
   const LINEAR_ISSUE_FILTER_STORAGE_KEY = 'linearIssueFilter';
 
   onMount(() => {
-    if (!skipInitialize) {
-      appStore.dispatch(initializeLinearAuth());
-    }
     loadFilter();
   });
 
@@ -116,7 +105,7 @@
         {m.settings_connections_linear_description()}
       </p>
       {#if $error$}
-        <p class="text-xs text-error-foreground pl-6">{$error$}</p>
+        <p class="text-xs text-danger pl-6">{$error$}</p>
       {/if}
     </div>
 
@@ -134,7 +123,7 @@
         <span class="text-ghost">·</span>
         <button
           type="button"
-          class="text-muted-foreground hover:text-error-foreground cursor-pointer transition-colors"
+          class="text-muted-foreground hover:text-danger cursor-pointer transition-colors"
           onclick={handleLinearDisconnect}
           disabled={isDisconnectingLinear}
         >

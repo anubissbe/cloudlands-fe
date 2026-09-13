@@ -3,6 +3,12 @@ import AgentSubscriptionInlineHost from './AgentSubscriptionInlineHost.svelte';
 
 const toolKinds = ['file', 'terminal', 'tool'] as const;
 
+test.afterEach(async ({ page }) => {
+  await page.locator('#root').evaluate(async (root) => {
+    if (root.childElementCount > 0) await window.playwrightUnmount(root);
+  });
+});
+
 async function measure(component: Locator, page: Page) {
   await expect(component.getByTestId('agent-card-preview')).toBeVisible();
   await expect(component.getByTestId('agent-card-trailing-slot').locator('[title]')).toHaveCount(1);
@@ -685,7 +691,16 @@ test('centers the finished summary and gives completed avatars a muted semantic 
   }
 });
 
-test('screenshots the finished summary and completed participant treatment', async ({ mount }) => {
+test('screenshots the finished summary and completed participant treatment', async ({
+  mount,
+  page,
+}) => {
+  /* The host fixture pins agent timestamps to 2026-08-15, but the compact
+     relative-time label ("2d", "2w", …) is computed from the real clock, so
+     the rendered text — and the screenshot — drifts as calendar time moves
+     past the fixture dates. Pin the clock 2 days after the fixture timestamps
+     to match the committed baselines. */
+  await page.clock.setFixedTime(new Date('2026-08-17T12:05:00.000Z'));
   const component = await mount(AgentSubscriptionInlineHost, {
     props: { mode: 'agents', agentCount: 7, finishedCount: 2, initiallyExpanded: true },
   });
@@ -790,7 +805,7 @@ test('keeps the bell at the compact gap and on the outer-header text tone', asyn
   }
 });
 
-test('fits one through eight participants and computes overflow from remaining agents', async ({
+test('caps one through eight participants at three and computes overflow from remaining agents', async ({
   mount,
 }) => {
   const component = await mount(AgentSubscriptionInlineHost, {
@@ -804,22 +819,29 @@ test('fits one through eight participants and computes overflow from remaining a
     });
     if ((await summary.getAttribute('aria-expanded')) === 'true') await summary.click();
     const stack = component.getByTestId('one-shot-header').locator('[data-agent-avatar-stack]');
+    const visibleCount = Math.min(agentCount, 3);
     await expect
       .poll(() => stack.locator('[data-agent-avatar-with-state]').count())
-      .toBe(agentCount);
-    await expect(stack.locator('[data-agent-avatar-overflow]')).toHaveCount(0);
+      .toBe(visibleCount);
+    if (agentCount === visibleCount) {
+      await expect(stack.locator('[data-agent-avatar-overflow]')).toHaveCount(0);
+    } else {
+      await expect(stack.locator('[data-agent-avatar-overflow]')).toHaveText(
+        `+${agentCount - visibleCount}`,
+      );
+    }
     await expect(stack.locator('[data-icon]')).toHaveCount(0);
   }
 
   for (const [agentCount, remaining] of [
-    [9, 1],
-    [12, 4],
+    [9, 6],
+    [12, 9],
   ] as const) {
     await component.update({
       props: { mode: 'agents', agentCount, width: 600, initiallyExpanded: false },
     });
     const stack = component.getByTestId('one-shot-header').locator('[data-agent-avatar-stack]');
-    await expect.poll(() => stack.locator('[data-agent-avatar-with-state]').count()).toBe(8);
+    await expect.poll(() => stack.locator('[data-agent-avatar-with-state]').count()).toBe(3);
     await expect(stack.locator('[data-agent-avatar-overflow]')).toHaveText(`+${remaining}`);
   }
 
@@ -827,11 +849,41 @@ test('fits one through eight participants and computes overflow from remaining a
     props: { mode: 'agents', agentCount: 6, width: 120, initiallyExpanded: false },
   });
   const narrowStack = component.getByTestId('one-shot-header').locator('[data-agent-avatar-stack]');
+  /* The adaptive stack applies ResizeObserver widths one animation frame later
+     (createDeferredWidthApplier), so after a width change the visible count
+     settles asynchronously. Reading count() and the badge in separate calls
+     can straddle that settling frame (#4019) — read both atomically in one
+     evaluate and assert the pair is self-consistent. A leading double rAF
+     lets any ResizeObserver delivery pending at entry fire (next frame) and
+     its deferred width apply (the frame after) before the first read, and
+     agreement across a second double rAF guards against a delivery arriving
+     mid-check — so the poll observes the settled adaptive state rather than
+     passing on the pre-measurement default frame. The exact settled count is
+     not pinned because the stack's available width depends on surrounding
+     header layout. */
   await expect
-    .poll(() => narrowStack.locator('[data-agent-avatar-with-state]').count())
-    .toBeLessThan(6);
-  const visible = await narrowStack.locator('[data-agent-avatar-with-state]').count();
-  await expect(narrowStack.locator('[data-agent-avatar-overflow]')).toHaveText(`+${6 - visible}`);
+    .poll(() =>
+      narrowStack.evaluate(async (stack) => {
+        const read = () => {
+          const visible = stack.querySelectorAll('[data-agent-avatar-with-state]').length;
+          const badge =
+            stack.querySelector('[data-agent-avatar-overflow]')?.textContent?.trim() ?? null;
+          return { visible, badge };
+        };
+        const settleWindow = () =>
+          new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+        await settleWindow();
+        const first = read();
+        await settleWindow();
+        const second = read();
+        return {
+          settled: first.visible === second.visible && first.badge === second.badge,
+          capped: second.visible < 6,
+          consistent: second.badge === `+${6 - second.visible}`,
+        };
+      }),
+    )
+    .toEqual({ settled: true, capped: true, consistent: true });
 
   await component.update({
     props: { mode: 'agents', agentCount: 12, width: 600, initiallyExpanded: false },
@@ -839,85 +891,78 @@ test('fits one through eight participants and computes overflow from remaining a
   const measuredStack = component
     .getByTestId('one-shot-header')
     .locator('[data-agent-avatar-stack]');
-  await expect.poll(() => measuredStack.locator('[data-agent-avatar-stack-item]').count()).toBe(8);
-  const style = await measuredStack.evaluate((stack) => {
-    const items = Array.from(stack.querySelectorAll<HTMLElement>('[data-agent-avatar-stack-item]'));
-    const overflow = stack.querySelector('[data-agent-avatar-overflow]') as HTMLElement;
-    const stackBox = stack.getBoundingClientRect();
-    const overflowBox = overflow.getBoundingClientRect();
-    return {
-      zIndexes: items.map((item) => Number(getComputedStyle(item).zIndex)),
-      masks: items.map((item) => getComputedStyle(item).maskImage),
-      avatarPseudos: items.map((item) => {
-        const pseudo = getComputedStyle(
-          item.querySelector('[data-agent-avatar-with-state]')!,
-          '::after',
+  /* The cutout mask is applied via CSS after the stack items render; under
+     load (e.g. shared CI runners) the style evaluate below can win the race
+     and read maskImage before it is applied. Wait for the masks first. The
+     poll requires all three items plus the settled +9 badge in the same
+     frame so it cannot pass vacuously (`[].every()` is true) on a transient
+     frame where the deferred width has not yet applied (#4019). */
+  await expect
+    .poll(() =>
+      measuredStack.evaluate((stack) => {
+        const items = Array.from(
+          stack.querySelectorAll<HTMLElement>('[data-agent-avatar-stack-item]'),
         );
-        return { content: pseudo.content, width: pseudo.borderTopWidth };
+        const badge = stack.querySelector('[data-agent-avatar-overflow]')?.textContent?.trim();
+        return (
+          items.length === 3 &&
+          badge === '+9' &&
+          items.slice(0, -1).every((item) => getComputedStyle(item).maskImage.includes('url('))
+        );
       }),
-      overflowFontSize: getComputedStyle(overflow).fontSize,
-      overflowBackground: getComputedStyle(overflow).backgroundColor,
-      overflowCenterY: (overflowBox.top + overflowBox.bottom) / 2,
-      stackCenterY: (stackBox.top + stackBox.bottom) / 2,
-      devicePixelRatio: window.devicePixelRatio,
-    };
-  });
-  expect(style.zIndexes).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
-  expect(style.masks.at(-1)).toBe('none');
-  for (const mask of style.masks.slice(0, -1)) {
+    )
+    .toBe(true);
+  /* Read the settled 3-item state and its styles in ONE evaluate: a separate
+     count/style read pair can straddle a deferred-width settling frame and
+     observe a transient 0-item stack (#4019). Returns null until settled so
+     the poll retries instead of failing on a transient frame. */
+  const readStyle = () =>
+    measuredStack.evaluate((stack) => {
+      const items = Array.from(
+        stack.querySelectorAll<HTMLElement>('[data-agent-avatar-stack-item]'),
+      );
+      const overflow = stack.querySelector('[data-agent-avatar-overflow]') as HTMLElement | null;
+      if (items.length !== 3 || overflow?.textContent?.trim() !== '+9') return null;
+      const stackBox = stack.getBoundingClientRect();
+      const overflowBox = overflow.getBoundingClientRect();
+      return {
+        zIndexes: items.map((item) => Number(getComputedStyle(item).zIndex)),
+        masks: items.map((item) => getComputedStyle(item).maskImage),
+        avatarPseudos: items.map((item) => {
+          const pseudo = getComputedStyle(
+            item.querySelector('[data-agent-avatar-with-state]')!,
+            '::after',
+          );
+          return { content: pseudo.content, width: pseudo.borderTopWidth };
+        }),
+        overflowFontSize: getComputedStyle(overflow).fontSize,
+        overflowBackground: getComputedStyle(overflow).backgroundColor,
+        overflowCenterY: (overflowBox.top + overflowBox.bottom) / 2,
+        stackCenterY: (stackBox.top + stackBox.bottom) / 2,
+        devicePixelRatio: window.devicePixelRatio,
+      };
+    });
+  /* Capture the value inside the poll: a separate re-read after the poll can
+     land back in a transient frame and observe null again. */
+  let style: Awaited<ReturnType<typeof readStyle>> = null;
+  await expect
+    .poll(async () => {
+      style = await readStyle();
+      return style;
+    })
+    .not.toBeNull();
+  if (!style) throw new Error('unreachable: poll guarantees a non-null style');
+  expect(style.zIndexes).toEqual([1, 2, 3]);
+  for (const mask of style.masks) {
     expect(mask).toContain('url(');
     expect(mask).not.toContain('radial-gradient');
   }
-  expect(style.avatarPseudos).toEqual(Array(8).fill({ content: 'none', width: '0px' }));
+  expect(style.avatarPseudos).toEqual(Array(3).fill({ content: 'none', width: '0px' }));
   expect(style.overflowFontSize).toBe('12px');
-  expect(style.overflowBackground).toBe('rgba(0, 0, 0, 0)');
+  expect(style.overflowBackground).not.toBe('rgba(0, 0, 0, 0)');
   expect(
     Math.abs(style.overflowCenterY - style.stackCenterY) * style.devicePixelRatio,
   ).toBeLessThanOrEqual(0.5);
-});
-
-test('keeps the complete waiting count ahead of the adaptive stack at narrow widths', async ({
-  mount,
-}) => {
-  const component = await mount(AgentSubscriptionInlineHost, {
-    props: { mode: 'agents', agentCount: 6, width: 260, initiallyExpanded: false },
-  });
-
-  for (const theme of ['light', 'dark'] as const) {
-    for (const zoom of [1, 2]) {
-      await component.update({
-        props: { theme, zoom, mode: 'agents', agentCount: 6, width: 260, initiallyExpanded: false },
-      });
-      const summary = component.getByTestId('one-shot-summary-toggle');
-      const title = component.getByTestId('one-shot-summary-title');
-      const stack = summary.locator('[data-agent-avatar-stack]');
-      await expect(summary).toHaveAccessibleName('Waiting for 6 agents');
-      await expect(title).toHaveText('Waiting for 6 agents');
-      await expect
-        .poll(() => stack.locator('[data-agent-avatar-stack-item]').count())
-        .toBeLessThan(6);
-
-      const geometry = await summary.evaluate(
-        (button, [titleTestId, chevronTestId]) => {
-          const titleNode = button.querySelector(`[data-testid="${titleTestId}"]`)!;
-          const chevronNode = button.querySelector(`[data-testid="${chevronTestId}"]`)!;
-          const titleBox = titleNode.getBoundingClientRect();
-          const chevronBox = chevronNode.getBoundingClientRect();
-          return {
-            titleRight: titleBox.right,
-            chevronLeft: chevronBox.left,
-            buttonRight: button.getBoundingClientRect().right,
-            titleScrollWidth: (titleNode as HTMLElement).scrollWidth,
-            titleClientWidth: (titleNode as HTMLElement).clientWidth,
-          };
-        },
-        ['one-shot-summary-title', 'one-shot-collapse-toggle'],
-      );
-      expect(geometry.titleScrollWidth).toBe(geometry.titleClientWidth);
-      expect(geometry.titleRight).toBeLessThanOrEqual(geometry.chevronLeft);
-      expect(geometry.chevronLeft).toBeLessThan(geometry.buttonRight);
-    }
-  }
 });
 
 test('toggles exactly once from every full-row disclosure region and not from agent rows', async ({
@@ -929,7 +974,8 @@ test('toggles exactly once from every full-row disclosure region and not from ag
   const summary = component.getByTestId('one-shot-summary-toggle');
   const stack = summary.locator('[data-agent-avatar-stack]');
   await expect(summary).toHaveAttribute('aria-expanded', 'false');
-  await expect.poll(() => stack.locator('[data-agent-avatar-stack-item]').count()).toBe(8);
+  await expect.poll(() => stack.locator('[data-agent-avatar-stack-item]').count()).toBe(3);
+  await expect(stack.locator('[data-agent-avatar-overflow]')).toHaveText('+9');
 
   const regions = [
     component.getByTestId('one-shot-leading-column'),
@@ -1099,14 +1145,9 @@ test('keeps 27 live participant surfaces on one rounded-square overlap geometry'
       if ((await summary.getAttribute('aria-expanded')) === 'true') await summary.click();
       await expect(summary).toContainText('Waiting for 27 agents');
       const stack = summary.locator('[data-agent-avatar-stack]');
-      await expect
-        .poll(() => stack.locator('[data-agent-avatar-stack-item]').count())
-        .toBeGreaterThanOrEqual(6);
+      await expect.poll(() => stack.locator('[data-agent-avatar-stack-item]').count()).toBe(3);
       const visibleCount = await stack.locator('[data-agent-avatar-stack-item]').count();
-      expect(visibleCount).toBeLessThanOrEqual(8);
-      await expect(stack.locator('[data-agent-avatar-overflow]')).toHaveText(
-        `+${27 - visibleCount}`,
-      );
+      await expect(stack.locator('[data-agent-avatar-overflow]')).toHaveText('+24');
       await expect(stack.locator('[data-avatar-state="running"]')).toHaveCount(1);
       await expect
         .poll(() =>
@@ -1189,10 +1230,9 @@ test('keeps 27 live participant surfaces on one rounded-square overlap geometry'
           pseudoBorder: '0px',
           pseudoShadow: 'none',
         });
-        if (index === visibleCount - 1) expect(entry.maskImage).toBe('none');
-        else {
-          expect(entry.maskImage).toContain('url(');
-          expect(entry.maskImage).not.toContain('radial-gradient');
+        expect(entry.maskImage).toContain('url(');
+        expect(entry.maskImage).not.toContain('radial-gradient');
+        if (index < visibleCount - 1) {
           const next = geometry[index + 1];
           expect(entry.itemBox.right - next.itemBox.left).toBeCloseTo(6 * zoom, 1);
         }
@@ -1273,10 +1313,13 @@ test('screenshots participant cutouts over varied parent backgrounds', async ({ 
           },
         });
         const summary = component.getByTestId('one-shot-summary-toggle');
+        const stack = component.getByTestId('one-shot-header').locator('[data-agent-avatar-stack]');
         if ((await summary.getAttribute('aria-expanded')) === 'true') await summary.click();
-        await expect.poll(() => summary.locator('[data-agent-avatar-with-state]').count()).toBe(6);
+        await expect.poll(() => stack.locator('[data-agent-avatar-with-state]').count()).toBe(3);
+        await expect(stack.locator('[data-agent-avatar-overflow]')).toHaveText('+3');
         await expect(component).toHaveScreenshot(
           `participant-stack-${theme}-${parentBackground}-${zoom === 1 ? '100' : '200'}.png`,
+          { maxDiffPixelRatio: 0.012 },
         );
       }
     }

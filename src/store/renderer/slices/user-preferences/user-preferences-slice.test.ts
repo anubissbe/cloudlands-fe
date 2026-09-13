@@ -3,21 +3,25 @@ import {
   cycleNoteFontStyle,
   deleteActivityLogPreset,
   hydrateActivityLogPresets,
+  hydrateShortcutOverrides,
   initialState,
   resetNotificationSettings,
+  resetAllShortcutOverrides,
+  resetShortcutOverride,
   saveActivityLogPreset,
+  setChatAuroraEnabled,
   setCodeFontFamily,
   setGroupByRepo,
   setGithubLinkDefaultAction,
   setHasCompletedProviderSetup,
   setNotificationEnabled,
-  setPanelOpenMode,
-  setPanelStackDirection,
   setNoteFontStyle,
   setLanguagePreference,
   setShowArchived,
   setSpellcheckEnabled,
   setShowReasoningBlocks,
+  setShellTransparencyEnabled,
+  setShortcutOverride,
   setSoundEnabled,
   setSoundOnlyWhenUnfocused,
   setSystemFonts,
@@ -26,12 +30,12 @@ import {
   type AgentFontStyle,
   toggleGroupByRepo,
   toggleHasCompletedProviderSetup,
+  toggleChatAurora,
   toggleShowArchived,
   toggleShowReasoningBlocks,
+  toggleShellTransparency,
   setUpdateChannel,
   toggleSpellcheck,
-  togglePanelOpenMode,
-  togglePanelStackDirection,
   type UserPreferencesState,
   userPreferencesReducer,
 } from './user-preferences-slice';
@@ -39,6 +43,7 @@ import {
   selectAgentFontStyle,
   selectAgentFontStyleLabel,
   selectActivityLogPresets,
+  selectChatAuroraEnabled,
   selectCodeFontFamily,
   selectCodeFontFamilyCSS,
   selectCodeFontFamilyLabel,
@@ -53,10 +58,9 @@ import {
   selectNoteFontStyleLabel,
   selectNotificationEnabled,
   selectNotificationVolume,
-  selectPanelOpenMode,
-  selectPanelStackDirection,
   selectShowArchived,
   selectShowReasoningBlocks,
+  selectShellTransparencyEnabled,
   selectSoundEnabled,
   selectSoundOnlyWhenUnfocused,
 } from './user-preferences-selectors';
@@ -65,6 +69,46 @@ describe('userPreferencesReducer', () => {
   it('should return initial state', () => {
     const state = userPreferencesReducer(undefined, { type: '@@INIT' });
     expect(state).toEqual(initialState);
+  });
+
+  describe('shortcut overrides', () => {
+    it('saves normalized values and resets one or all overrides', () => {
+      const saved = userPreferencesReducer(
+        initialState,
+        setShortcutOverride('global.settings', ' Command + Shift + , '),
+      );
+      expect(saved.shortcutOverrides).toEqual({ 'global.settings': 'mod+shift+,' });
+
+      const second = userPreferencesReducer(saved, setShortcutOverride('global.search', 'alt+f'));
+      expect(
+        userPreferencesReducer(second, resetShortcutOverride('global.settings')).shortcutOverrides,
+      ).toEqual({ 'global.search': 'alt+f' });
+      expect(userPreferencesReducer(second, resetAllShortcutOverrides()).shortcutOverrides).toEqual(
+        {},
+      );
+    });
+
+    it('does not let malformed input replace a working binding', () => {
+      const state = {
+        ...initialState,
+        shortcutOverrides: { 'global.search': 'alt+f' } as const,
+      };
+      expect(userPreferencesReducer(state, setShortcutOverride('global.search', 'mod+'))).toBe(
+        state,
+      );
+    });
+
+    it('sanitizes loaded data and omits values equal to defaults', () => {
+      const state = userPreferencesReducer(
+        initialState,
+        hydrateShortcutOverrides({
+          'global.search': 'Option+F',
+          'global.settings': 'mod+,',
+          invalid: 'mod+x',
+        }),
+      );
+      expect(state.shortcutOverrides).toEqual({ 'global.search': 'alt+f' });
+    });
   });
 
   describe('update channel actions', () => {
@@ -116,34 +160,6 @@ describe('userPreferencesReducer', () => {
         toggleSpellcheck(),
       );
       expect(state.spellcheckEnabled).toBe(false);
-    });
-  });
-
-  describe('panel open mode', () => {
-    it('defaults to normal and supports set and toggle actions', () => {
-      expect(initialState.panelOpenMode).toBe('normal');
-      const pinned = userPreferencesReducer(initialState, setPanelOpenMode('pin'));
-      expect(pinned.panelOpenMode).toBe('pin');
-      expect(userPreferencesReducer(pinned, togglePanelOpenMode()).panelOpenMode).toBe('normal');
-    });
-
-    it('selects normal for legacy state without the preference', () => {
-      expect(selectPanelOpenMode.select({ userPreferences: undefined } as any)).toBe('normal');
-    });
-  });
-
-  describe('panel stack direction', () => {
-    it('defaults to right and supports set and toggle actions', () => {
-      expect(initialState.panelStackDirection).toBe('right');
-      const left = userPreferencesReducer(initialState, setPanelStackDirection('left'));
-      expect(left.panelStackDirection).toBe('left');
-      expect(userPreferencesReducer(left, togglePanelStackDirection()).panelStackDirection).toBe(
-        'right',
-      );
-    });
-
-    it('selects right for legacy state without the preference', () => {
-      expect(selectPanelStackDirection.select({ userPreferences: undefined } as any)).toBe('right');
     });
   });
 
@@ -328,6 +344,27 @@ describe('userPreferencesReducer', () => {
     });
   });
 
+  describe('appearance preference actions', () => {
+    it('defaults both preferences to enabled', () => {
+      expect(initialState.chatAuroraEnabled).toBe(true);
+      expect(initialState.shellTransparencyEnabled).toBe(true);
+    });
+
+    it('sets and toggles chatAuroraEnabled', () => {
+      const disabled = userPreferencesReducer(initialState, setChatAuroraEnabled(false));
+      const enabled = userPreferencesReducer(disabled, toggleChatAurora());
+      expect(disabled.chatAuroraEnabled).toBe(false);
+      expect(enabled.chatAuroraEnabled).toBe(true);
+    });
+
+    it('sets and toggles shellTransparencyEnabled', () => {
+      const disabled = userPreferencesReducer(initialState, setShellTransparencyEnabled(false));
+      const enabled = userPreferencesReducer(disabled, toggleShellTransparency());
+      expect(disabled.shellTransparencyEnabled).toBe(false);
+      expect(enabled.shellTransparencyEnabled).toBe(true);
+    });
+  });
+
   describe('language preference actions', () => {
     it('defaults to the system preference', () => {
       expect(initialState.languagePreference).toBe('system');
@@ -390,6 +427,21 @@ describe('userPreferencesReducer', () => {
         } as any),
       ).toBe(true);
       expect(selectShowReasoningBlocks.select({} as any)).toBe(false);
+    });
+
+    it('selects appearance preferences with enabled fallbacks', () => {
+      expect(
+        selectChatAuroraEnabled.select({
+          userPreferences: { ...initialState, chatAuroraEnabled: false },
+        } as any),
+      ).toBe(false);
+      expect(
+        selectShellTransparencyEnabled.select({
+          userPreferences: { ...initialState, shellTransparencyEnabled: false },
+        } as any),
+      ).toBe(false);
+      expect(selectChatAuroraEnabled.select({} as any)).toBe(true);
+      expect(selectShellTransparencyEnabled.select({} as any)).toBe(true);
     });
 
     it('selects font settings from userPreferences', () => {

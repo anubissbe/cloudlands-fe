@@ -33,6 +33,8 @@
     collisionPadding?: number;
     /** Whether search is enabled */
     searchable?: boolean;
+    /** Current search text */
+    searchValue?: string;
     /** Selection mode */
     multiple?: boolean;
     /** Whether the dropdown is disabled */
@@ -84,6 +86,7 @@
     collisionBoundary = null,
     collisionPadding = 8,
     searchable = true,
+    searchValue = $bindable(''),
     multiple = false,
     disabled = false,
     open = $bindable(false),
@@ -113,7 +116,6 @@
   let inlineContentRef = $state.raw<HTMLDivElement | null>(null);
   let inlineStyle = $state('');
   let inlineSide = $state<'top' | 'bottom'>('bottom');
-  let searchValue = $state('');
   let containerRef = $state.raw<HTMLDivElement | null>(null);
   let inputRef = $state.raw<HTMLInputElement | null>(null);
 
@@ -168,7 +170,7 @@
         options: deduplicateOptions(
           group.options.filter((opt) => {
             const haystack =
-              `${group.label ?? ''} ${opt.label} ${opt.description ?? ''}`.toLowerCase();
+              `${group.label ?? ''} ${group.searchLabel ?? ''} ${opt.label} ${opt.description ?? ''}`.toLowerCase();
             return terms.every((term) => haystack.includes(term));
           }),
         ),
@@ -416,7 +418,17 @@
     const isInsideContent =
       (portalContentRef?.contains(target) ?? false) ||
       (inlineContentRef?.contains(target) ?? false);
-    if (!isInsideContainer && !isInsideContent) {
+    // Nested controls can portal their popup outside our clipped content.
+    // Only treat popups owned by controls in THIS dropdown as inside.
+    const content = portalContentRef ?? inlineContentRef;
+    const isInsideOwnedPopup = Array.from(content?.querySelectorAll('[aria-controls]') ?? []).some(
+      (control) =>
+        control
+          .getAttribute('aria-controls')
+          ?.split(/\s+/)
+          .some((id) => document.getElementById(id)?.contains(target)),
+    );
+    if (!isInsideContainer && !isInsideContent && !isInsideOwnedPopup) {
       handleClose();
     }
   }
@@ -480,6 +492,7 @@
         e.preventDefault();
         e.stopPropagation();
         handleClose();
+        triggerRef?.focus();
         break;
     }
   }

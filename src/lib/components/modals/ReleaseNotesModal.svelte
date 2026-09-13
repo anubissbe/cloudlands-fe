@@ -74,7 +74,7 @@
       {#if loading}
         <p class="text-sm text-muted-foreground">{m.releaseNotes_modal_loading_message()}</p>
       {:else if displayNotes}
-        <MarkdownViewer content={displayNotes} />
+        <MarkdownViewer content={displayNotes} forceExternalLinks />
       {:else}
         <p class="text-sm text-muted-foreground">{m.releaseNotes_modal_unavailable_message()}</p>
       {/if}
@@ -149,6 +149,12 @@
 
   .release-notes-body :global(.markdown-viewer li::marker) {
     color: hsl(var(--muted-foreground) / 0.6);
+  }
+
+  /* Cumulative startup notes separate each release body with a thematic break. */
+  .release-notes-body :global(.markdown-viewer hr) {
+    margin: 2rem 0;
+    border-color: hsl(var(--border));
   }
 
   /* PR-number links → subtle inline chips */

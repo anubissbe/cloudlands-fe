@@ -4,17 +4,18 @@
  * Derived state selectors for the panel layout slice.
  */
 
+import { createCollection, getItems } from '@augmentcode/themis/utils/collections/collection-utils';
 import { store } from '../../store';
-import { emptyWorkspaceState } from './panel-layout-slice';
+import { emptyWorkspaceState, isRecentlyClosedPanelColumnRestorable } from './panel-layout-slice';
 import {
   countHorizontalPanelColumns,
   getAutomaticPanelLayoutCanvasWidth,
   getHorizontalPanelColumnDefaultWidthTiers,
-  getHorizontalPanelColumnDefaultWidths,
   getPanelOrder,
 } from './panel-layout-tabless';
 import { panelTabsAreEquivalent } from './panel-tab-identity';
 import type { PanelDefaultWidthTier } from '../../../../shared/panel-layout-sizing';
+import type { BrowserTab } from '../../../../shared/types/browser-clients';
 import type {
   WorkspacePanelLayoutState,
   PanelLayoutNode,
@@ -23,6 +24,8 @@ import type {
   PanelTab,
   PanelTabType,
   RecentlyClosedTab,
+  RecentlyClosedPanelColumn,
+  PanelColumnCount,
 } from './panel-layout-types';
 
 const emptyFileContentPrunePaths: string[] = [];
@@ -45,18 +48,6 @@ export const selectPendingPanelReveal = store.createSelector((state, wsId: strin
   const workspace = state.panelLayout.byWorkspaceId[wsId] ?? emptyWorkspaceState;
   return workspace.pendingPanelReveal ?? null;
 });
-
-export const selectPanelRevealRequestsByWorkspaceId = store.createSelector((state) =>
-  Object.fromEntries(
-    Object.entries(state.panelLayout.byWorkspaceId).flatMap(([workspaceId, layout]) =>
-      layout.pendingPanelReveal ? [[workspaceId, layout.pendingPanelReveal]] : [],
-    ),
-  ),
-);
-
-export const selectPanelLayoutWorkspaceIds = store.createSelector((state) =>
-  Object.keys(state.panelLayout.byWorkspaceId),
-);
 
 export type PanelTabIdentityRequest = Pick<PanelTab, 'type'> &
   Partial<Omit<PanelTab, 'id' | 'type'>>;
@@ -184,6 +175,19 @@ export const selectActiveTab = store.createSelector<[wsId: string], PanelTab | u
   },
 );
 
+/** Most recently focused agent tab, ignoring later browser/tool focus and stale history entries. */
+export const selectMostRecentAgentTab = store.createSelector<[wsId: string], PanelTab | undefined>(
+  (state, wsId) => {
+    const ws = state.panelLayout.byWorkspaceId[wsId] ?? emptyWorkspaceState;
+    for (let index = ws.focusHistory.length - 1; index >= 0; index -= 1) {
+      const entry = ws.focusHistory[index];
+      const tab = ws.panels[entry.panelId]?.tabs.find((candidate) => candidate.id === entry.tabId);
+      if (tab?.type === 'agent') return tab;
+    }
+    return undefined;
+  },
+);
+
 /** Select the active tab in a specific panel */
 export const selectActiveTabInPanel = store.createSelector<
   [wsId: string, panelId: string],
@@ -201,14 +205,55 @@ export const selectAllTabs = store.createSelector<[wsId: string], PanelTab[]>((s
   return Object.values(ws.panels).flatMap((p) => p.tabs);
 });
 
-export const selectPanelTabCountsByWorkspaceId = store.createSelector((state) => {
-  return Object.fromEntries(
-    Object.entries(state.panelLayout.byWorkspaceId).map(([workspaceId, layout]) => [
-      workspaceId,
-      Object.values(layout.panels).reduce((count, panel) => count + panel.tabs.length, 0),
-    ]),
-  );
+/** Hidden (user-closed) agent-owned browser tabs, kept alive offscreen (monorepo#2857). */
+export const selectHiddenTabs = store.createSelector<[wsId: string], PanelTab[]>((state, wsId) => {
+  const ws = state.panelLayout.byWorkspaceId[wsId] ?? emptyWorkspaceState;
+  // Pre-#2857 persisted/test states may lack the field.
+  return getItems(ws.hiddenTabs ?? emptyWorkspaceState.hiddenTabs);
 });
+
+export type BrowserTabVisibility = BrowserTab['visibility'];
+export type LayoutBrowserTab = {
+  tab: PanelTab;
+  visibility: BrowserTabVisibility;
+  /**
+   * Layout fact, not a paint guarantee: visible AND its panel's active tab
+   * (the same rule the local `listTabs` fallback applies). A hidden tab is
+   * never displayed.
+   */
+  displayed: boolean;
+};
+
+/**
+ * Every browser tab in a workspace layout — live or mirror — with where it
+ * lives: `visible` in a panel's tab bar, `hidden` in `hiddenTabs`
+ * (monorepo#2857), and whether the layout displays it. Shared by the
+ * registry report and the sidebar's driving-client gate so both see the
+ * same set.
+ */
+export function collectBrowserTabs(layout: WorkspacePanelLayoutState): LayoutBrowserTab[] {
+  const out: LayoutBrowserTab[] = [];
+  for (const panel of Object.values(layout.panels)) {
+    for (const tab of panel.tabs) {
+      if (tab.type === 'browser') {
+        out.push({ tab, visibility: 'visible', displayed: panel.activeTabId === tab.id });
+      }
+    }
+  }
+  // Pre-#2857 persisted/test states may lack the field.
+  for (const tab of getItems(layout.hiddenTabs ?? emptyWorkspaceState.hiddenTabs)) {
+    if (tab.type === 'browser') out.push({ tab, visibility: 'hidden', displayed: false });
+  }
+  return out;
+}
+
+/** Whether the workspace layout holds any browser tab (local or mirror, visible or hidden). */
+export const selectWorkspaceHasBrowserTabs = store.createSelector<[wsId: string], boolean>(
+  (state, wsId) => {
+    const ws = state?.panelLayout?.byWorkspaceId[wsId] ?? emptyWorkspaceState;
+    return collectBrowserTabs(ws).length > 0;
+  },
+);
 
 /** Select visible horizontal panel-column counts for workspace width reservation. */
 export const selectPanelColumnCountsByWorkspaceId = store.createSelector((state) => {
@@ -220,15 +265,6 @@ export const selectPanelColumnCountsByWorkspaceId = store.createSelector((state)
   );
 });
 
-export const selectPanelColumnDefaultWidthsByWorkspaceId = store.createSelector((state) => {
-  return Object.fromEntries(
-    Object.entries(state.panelLayout.byWorkspaceId).map(([workspaceId, layout]) => [
-      workspaceId,
-      getHorizontalPanelColumnDefaultWidths(layout.root, layout.panels),
-    ]),
-  );
-});
-
 export const selectPanelColumnDefaultWidthTiers = store.createSelector<
   [wsId: string],
   PanelDefaultWidthTier[]
@@ -236,13 +272,6 @@ export const selectPanelColumnDefaultWidthTiers = store.createSelector<
   const layout = state.panelLayout.byWorkspaceId[wsId] ?? emptyWorkspaceState;
   return getHorizontalPanelColumnDefaultWidthTiers(layout.root, layout.panels);
 });
-
-export const selectPanelColumnDefaultWidths = store.createSelector<[wsId: string], number[]>(
-  (state, wsId) => {
-    const layout = state.panelLayout.byWorkspaceId[wsId] ?? emptyWorkspaceState;
-    return getHorizontalPanelColumnDefaultWidths(layout.root, layout.panels);
-  },
-);
 
 export const selectPanelCanvasWidthsByWorkspaceId = store.createSelector((state) => {
   return Object.fromEntries(
@@ -271,10 +300,10 @@ export const selectPanelCanvasWidthSource = store.createSelector<
 );
 
 /** Select the horizontal column count for one mounted layout scope. */
-export const selectPanelColumnCount = store.createSelector<[wsId: string], number>(
+export const selectPanelColumnCount = store.createSelector<[wsId: string], PanelColumnCount>(
   (state, wsId) => {
     const layout = state.panelLayout.byWorkspaceId[wsId] ?? emptyWorkspaceState;
-    return countHorizontalPanelColumns(layout.root);
+    return layout.columnCount;
   },
 );
 
@@ -337,6 +366,44 @@ export const selectPanelIds = store.createSelector<[wsId: string], string[]>((st
   return getPanelOrder(ws.root);
 });
 
+export interface PanelColumnStack {
+  panelId: string;
+  panes: PanelTab[];
+  activePaneId: string | null;
+  attentionPaneIds: string[];
+}
+
+function getPanelColumnStacks(layout: WorkspacePanelLayoutState): PanelColumnStack[] {
+  return getPanelOrder(layout.root).flatMap((panelId) => {
+    const panel = layout.panels[panelId];
+    if (!panel) return [];
+    return [
+      {
+        panelId,
+        panes: panel.tabs,
+        activePaneId: panel.activeTabId,
+        attentionPaneIds: panel.attentionTabIds ?? [],
+      },
+    ];
+  });
+}
+
+/** Ordered pane stacks for every workspace panel layout. */
+export const selectPanelColumnStacks = store.createSelector<[wsId: string], PanelColumnStack[]>(
+  (state, wsId) =>
+    getPanelColumnStacks(state.panelLayout.byWorkspaceId[wsId] ?? emptyWorkspaceState),
+);
+
+/** Pane stack for one workspace panel layout. */
+export const selectPanelColumnStack = store.createSelector<
+  [wsId: string, panelId: string],
+  PanelColumnStack | undefined
+>((state, wsId, panelId) =>
+  getPanelColumnStacks(state.panelLayout.byWorkspaceId[wsId] ?? emptyWorkspaceState).find(
+    (stack) => stack.panelId === panelId,
+  ),
+);
+
 function getPanelNavigatorItems(layout: WorkspacePanelLayoutState) {
   return getPanelOrder(layout.root).flatMap((panelId) => {
     const panel = layout.panels[panelId];
@@ -355,16 +422,6 @@ export const selectPanelNavigatorItems = store.createSelector<
   getPanelNavigatorItems(state.panelLayout.byWorkspaceId[wsId] ?? emptyWorkspaceState),
 );
 
-/** Generic panel order and titles for every mounted workspace. */
-export const selectPanelNavigatorItemsByWorkspaceId = store.createSelector((state) =>
-  Object.fromEntries(
-    Object.entries(state.panelLayout.byWorkspaceId).map(([workspaceId, layout]) => [
-      workspaceId,
-      getPanelNavigatorItems(layout),
-    ]),
-  ),
-);
-
 // ============================================================================
 // History Selectors
 // ============================================================================
@@ -374,29 +431,16 @@ export const selectRecentlyClosed = store.createSelector<[wsId: string], Recentl
   (state, wsId) => (state.panelLayout.byWorkspaceId[wsId] ?? emptyWorkspaceState).recentlyClosed,
 );
 
-/** Select whether we can go back in layout history */
-export const selectCanGoBack = store.createSelector<[wsId: string], boolean>((state, wsId) => {
-  const ws = state.panelLayout.byWorkspaceId[wsId] ?? emptyWorkspaceState;
-  return ws.historyIndex > 0 && ws.layoutHistory.length > 0;
+/** Select the newest column close that can be applied to the current layout. */
+export const selectLastClosedPanelColumn = store.createSelector<
+  [wsId: string],
+  RecentlyClosedPanelColumn | null
+>((state, wsId) => {
+  const workspace = state.panelLayout.byWorkspaceId[wsId] ?? emptyWorkspaceState;
+  return (
+    getItems(
+      workspace.recentlyClosedColumns ??
+        createCollection<RecentlyClosedPanelColumn, 'historyId'>('historyId'),
+    ).find((closed) => isRecentlyClosedPanelColumnRestorable(workspace, closed)) ?? null
+  );
 });
-
-/** Select whether we can go forward in layout history */
-export const selectCanGoForward = store.createSelector<[wsId: string], boolean>((state, wsId) => {
-  const ws = state.panelLayout.byWorkspaceId[wsId] ?? emptyWorkspaceState;
-  return ws.historyIndex < ws.layoutHistory.length - 1;
-});
-
-// ============================================================================
-// Compatibility helpers (for use in non-component code like sagas)
-// ============================================================================
-
-/**
- * Get the workspace panel layout state from the store state.
- * Use this for direct state reads in sagas/callbacks instead of selectors.
- */
-export function getWorkspacePanelLayout(
-  state: { panelLayout: { byWorkspaceId: Record<string, WorkspacePanelLayoutState> } },
-  wsId: string,
-): WorkspacePanelLayoutState {
-  return state.panelLayout.byWorkspaceId[wsId] ?? emptyWorkspaceState;
-}

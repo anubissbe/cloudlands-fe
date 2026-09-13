@@ -1,3 +1,5 @@
+// @verify-changed-triggers: src/**/*.svelte, src/app.css
+
 import { readFileSync, readdirSync } from 'node:fs';
 import { extname, join, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -22,15 +24,20 @@ describe('empty panel chrome', () => {
     expect(emptyState).toContain('grid-template-columns: repeat(2, minmax(0, 1fr))');
     expect(emptyState).toContain('grid-template-columns: repeat(4, minmax(0, 1fr))');
     expect(emptyState).toContain('min-h-16 cursor-pointer');
-    expect(emptyState).toContain('bg-sidebar px-6 py-10 text-sidebar-foreground');
+    expect(emptyState).toContain('bg-sidebar px-6 py-10 text-foreground');
     expect(emptyState).not.toContain('border-t border-border');
   });
 
-  it('closes tabless panels without making the panel itself focusable', () => {
+  it('closes tabless panels from their semantic header without making the panel focusable', () => {
     const panel = source('../Panel.svelte');
+    const tabBar = source('../PanelTabBar.svelte');
 
-    expect(panel).toContain('data-empty-panel-close');
+    expect(panel).not.toContain('data-empty-panel-close');
     expect(panel).not.toContain('tabindex="-1"');
+    expect(tabBar).toContain('data-empty-panel-header');
+    expect(tabBar).toContain('{@render addPanelColumnButton()}');
+    expect(tabBar).not.toContain('panelColumnCountMenu');
+    expect(tabBar).toContain('{@render panelCloseButton()}');
   });
 
   it('keeps empty-state actions pristine until their content replaces the panel', () => {

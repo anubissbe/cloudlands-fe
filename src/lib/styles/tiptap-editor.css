@@ -71,6 +71,18 @@
   max-width: 100%;
 }
 
+/* Failed renders have no diagram to show: keep the error card (and its
+   expanded source details) aligned with the prose column instead of the
+   wide lane. The wrapper reports the render state, see MermaidBlockNodeView. */
+.tiptap-editor.ProseMirror
+  > .node-mermaidBlock:has(> [data-node-view-wrapper][data-render-state='error']) {
+  display: block;
+  width: 100%;
+  max-width: 100%;
+  margin-left: 0;
+  margin-right: 0;
+}
+
 /* Monospace mode: code blocks don't need breakout since they're already
    styled differently (transparent bg, triple backtick fences) */
 .note-font-monospace .tiptap-editor.ProseMirror > pre {
@@ -328,6 +340,8 @@
   border: none;
   padding: 0;
   position: relative;
+  font-size: inherit;
+  line-height: inherit;
 }
 
 .note-font-monospace .tiptap-editor pre::before {
@@ -364,7 +378,7 @@
   border-radius: 4px;
   font-weight: 500;
   cursor: pointer;
-  transition: all 0.15s ease;
+  transition: background-color 0.15s ease;
   white-space: nowrap;
   vertical-align: baseline;
   text-decoration: none;
@@ -378,6 +392,26 @@
 }
 
 .mention-chip:focus {
+  outline: 2px solid hsl(var(--ring));
+  outline-offset: 1px;
+}
+
+/* Selected slash commands use the same compact chip rhythm as mentions. */
+.skill-command-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 6px;
+  background: hsl(var(--muted) / 0.7);
+  color: hsl(var(--muted-foreground));
+  border: 1px solid hsl(var(--border));
+  border-radius: var(--radius-small);
+  white-space: nowrap;
+  vertical-align: baseline;
+  box-decoration-break: clone;
+  -webkit-box-decoration-break: clone;
+}
+
+.skill-command-chip.ProseMirror-selectednode {
   outline: 2px solid hsl(var(--ring));
   outline-offset: 1px;
 }
@@ -400,7 +434,7 @@
   font-weight: 500;
   font-size: 0.75rem;
   cursor: default;
-  transition: all 0.15s ease;
+  transition: background-color 0.15s ease;
   white-space: nowrap;
   vertical-align: baseline;
   line-height: 1.5;
@@ -587,7 +621,7 @@ div.tiptap-editor ol {
   background: hsl(var(--muted));
   cursor: pointer;
   position: relative;
-  transition: all 0.15s ease;
+  transition: background-color 0.15s ease;
 }
 
 .tiptap-editor .task-item-checkbox:hover {
@@ -629,7 +663,9 @@ div.tiptap-editor ol {
 
 .tiptap-editor .task-item-menu-button {
   color: hsl(var(--muted-foreground));
-  transition: all 0.15s ease;
+  transition:
+    background-color 0.15s ease,
+    color 0.15s ease;
 }
 
 .tiptap-editor .task-item-menu-button:hover {
@@ -672,7 +708,7 @@ code:has(.is-file-path) {
   font-size: 1em;
   font-weight: 500;
   cursor: pointer;
-  transition: all 0.15s ease;
+  transition: background-color 0.15s ease;
   vertical-align: baseline;
   text-decoration: none;
   line-height: 1.5;
@@ -704,7 +740,7 @@ code.is-file-path {
   font-size: 1em;
   font-weight: 500;
   cursor: pointer;
-  transition: all 0.15s ease;
+  transition: background-color 0.15s ease;
   vertical-align: baseline;
   text-decoration: none;
   line-height: 1.5;
@@ -731,11 +767,11 @@ code.is-file-path:focus {
   color: hsl(var(--muted-foreground));
   border: none;
   border-radius: 0.25rem;
-  padding: 0.8rem 1.3rem;
+  padding: 0.75rem 1rem;
   margin: 1rem 0;
   overflow-x: auto;
-  font-size: 1em;
-  line-height: 1.5;
+  font-size: 0.8125rem;
+  line-height: 20px;
 }
 
 .tiptap-editor pre code {
@@ -1127,7 +1163,12 @@ code.is-file-path:focus {
 .suggestion {
   position: relative;
   cursor: pointer;
-  transition: all 0.2s ease;
+  transition:
+    background-color 0.2s ease,
+    border-color 0.2s ease,
+    color 0.2s ease,
+    opacity 0.2s ease,
+    transform 0.2s ease;
 }
 
 /* Addition suggestions - green underline */
@@ -1220,7 +1261,10 @@ code.is-file-path:focus {
   background: hsl(var(--background));
   color: hsl(var(--foreground));
   cursor: pointer;
-  transition: all 0.2s ease;
+  transition:
+    background-color 0.2s ease,
+    border-color 0.2s ease,
+    color 0.2s ease;
 }
 
 .suggestion-tooltip-actions button:hover {

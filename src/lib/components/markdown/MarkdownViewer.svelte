@@ -1,21 +1,22 @@
 <script lang="ts">
-  import { onMount, onDestroy } from 'svelte';
-  import { Editor } from '@tiptap/core';
-  import StarterKit from '@tiptap/starter-kit';
-  import CodeBlockLowlight from '@tiptap/extension-code-block-lowlight';
-  import TaskList from '@tiptap/extension-task-list';
-  import TaskItem from '@tiptap/extension-task-item';
-  import { Table } from '@tiptap/extension-table';
-  import { TableRow } from '@tiptap/extension-table-row';
-  import { TableHeader } from '@tiptap/extension-table-header';
-  import { TableCell } from '@tiptap/extension-table-cell';
-  import { safeLowlight } from '$lib/utils/safe-lowlight';
+  import { mount, onDestroy, unmount } from 'svelte';
   import { logger } from '$lib/utils/client-logger';
   import { processMarkdownToHTML } from '$lib/utils/markdown-processor';
-  import { createIntentLink } from '$lib/utils/tiptap-link-extension';
-  import { TasksBlock } from '$lib/components/tiptap/TasksBlock';
   import { handleLink } from '$features/navigation/link-handler';
   import { getWorkspaceRouteContext } from '$lib/utils/workspace-route-context';
+  import ImageLightbox from '$lib/components/ui/ImageLightbox.svelte';
+  import ImageActionsMenu from '$lib/components/ui/ImageActionsMenu.svelte';
+  import VideoActionsMenu from '$lib/components/ui/VideoActionsMenu.svelte';
+  import ChatVideoBlock from '$lib/components/chat/ChatVideoBlock.svelte';
+  import { splitWorkspaceVideoMarkdown } from '$lib/utils/workspace-file-video';
+  import RecursiveMarkdownViewer from './MarkdownViewer.svelte';
+  import MediaUnavailable from '$lib/components/ui/MediaUnavailable.svelte';
+  import { parseWorkspaceFileImageUrl } from '$lib/utils/image-actions';
+  import {
+    createWorkspaceFileVersion,
+    parseIntentFileTarget,
+    workspaceAssetVideoSource,
+  } from '$lib/utils/workspace-file-image';
 
   import {
     openWorkspaceFile,
@@ -23,9 +24,9 @@
   } from '$store/renderer/slices/workspace-navigation/workspace-navigation-slice';
   import { store as appStore } from '$store/renderer/store';
   import { WorkspaceId } from '$shared/types/branded-ids';
+  import { isCmdClickModifier } from '$shared/utils/link-helpers';
 
-  // Use shared safe lowlight instance (handles unregistered languages gracefully)
-  const lowlight = safeLowlight;
+  type MediaUnavailableReason = 'missing' | 'unsupported' | 'load-failed';
 
   interface Props {
     content: string;
@@ -35,9 +36,15 @@
     onCodeBlockAction?: (action: string, code: string, language?: string) => void;
     onFileClick?: (
       path: string,
-      options?: { openInAdjacentPanel?: boolean; sourcePanelId?: string },
+      options?: { line?: number; openInAdjacentPanel?: boolean; sourcePanelId?: string },
     ) => void;
     taskBlockRenderMode?: 'placeholder' | 'content';
+    /** Chat transcript only: render inline workspace-file images as fixed square thumbnails. */
+    chatImageThumbnails?: boolean;
+    /** Open all http(s) links directly in the external browser (e.g. release notes). */
+    forceExternalLinks?: boolean;
+    /** Show rich fenced blocks as source when no TipTap node views are mounted. */
+    renderRichFencesAsCode?: boolean;
   }
 
   let {
@@ -49,20 +56,36 @@
     onCodeBlockAction: _onCodeBlockAction,
     onFileClick,
     taskBlockRenderMode = 'placeholder',
+    chatImageThumbnails = false,
+    forceExternalLinks = false,
+    renderRichFencesAsCode = false,
   }: Props = $props();
+
+  // One cache-busting token per viewer instance: re-processing the same
+  // message (streaming ticks, prop changes) keeps its image URLs stable, while
+  // a newly mounted viewer fetches the file's current bytes.
+  const workspaceFileVersion = createWorkspaceFileVersion();
+
+  const mediaSegments = $derived(splitWorkspaceVideoMarkdown(content, workspaceId));
+  const hasVideoSegments = $derived(mediaSegments.some((segment) => segment.type === 'video'));
+  const markdownContent = $derived(
+    !hasVideoSegments && mediaSegments.length === 1 && mediaSegments[0].type === 'markdown'
+      ? mediaSegments[0].content
+      : content,
+  );
 
   // PERF: Detect content complexity to choose rendering strategy
   // - Simple: plain text, no markdown - render as <p>
-  // - Static: has markdown but can use processed HTML without TipTap
-  // - Complex: needs TipTap for interactivity (task lists, etc.)
+  // - Static: has markdown - render the processed HTML directly (no TipTap)
+  //
+  // Read-only rendering never needs a live ProseMirror view: the markdown
+  // processor already emits final HTML for task lists (read-only checkboxes),
+  // tables, images, and intent:// links, and the container click/keydown
+  // handlers below provide the interactivity.
 
-  // Patterns that REQUIRE TipTap for interactivity
-  const needsTipTapPatterns = [
-    /^\s*[-*]\s*\[[ x]\]/m, // Task lists - TipTap handles checkbox interaction
-  ];
-
-  // Patterns that need markdown processing but not TipTap
+  // Patterns that need markdown processing (rendered as processed static HTML)
   const needsProcessingPatterns = [
+    /^\s*[-*]\s*\[[ x]\]/m, // Task lists (rendered read-only)
     // i18n-ignore (scanner false positive: backticks in regex literal confuse the string tracker)
     /```/, // Code blocks (triple backticks)
     /`[^`]+`/, // Inline code (single backticks)
@@ -92,13 +115,9 @@
   ];
 
   const contentComplexity = $derived.by(() => {
-    if (!content) return 'simple';
-    // Check if needs TipTap interactivity
-    if (needsTipTapPatterns.some((pattern) => pattern.test(content))) {
-      return 'complex';
-    }
+    if (!markdownContent) return 'simple';
     // Check if needs markdown processing
-    if (needsProcessingPatterns.some((pattern) => pattern.test(content))) {
+    if (needsProcessingPatterns.some((pattern) => pattern.test(markdownContent))) {
       return 'static';
     }
     return 'simple';
@@ -107,12 +126,14 @@
   // Track static content element for click handling
   let staticContentElement: HTMLElement | null = $state(null);
 
-  let editorElement: HTMLElement = $state(null!);
-  let editor: Editor | null = null;
   let processedContent = $state('');
   let lastProcessedContent = '';
+  // The rendered HTML also depends on workspaceId (short-form intent://local/file/
+  // image links resolve against it), so it participates in the memoization guard
+  let lastProcessedWorkspaceId: string | undefined;
+  let lastRenderRichFencesAsCode = false;
 
-  // PERF: Track streaming state to avoid expensive TipTap updates during streaming
+  // PERF: Track streaming state to throttle re-renders during streaming
   let isCurrentlyStreaming = false;
   let streamingContentElement: HTMLElement | null = $state(null);
 
@@ -122,16 +143,22 @@
   let pendingUpdateRafId: number | null = null;
   let pendingContent: string | null = null;
 
-  // Process markdown to HTML (full processing with TipTap)
+  // Process markdown to HTML for the static render path
   async function updateContentFull(markdown: string) {
     // Skip if content hasn't actually changed
-    if (markdown === lastProcessedContent) {
+    if (
+      markdown === lastProcessedContent &&
+      workspaceId === lastProcessedWorkspaceId &&
+      renderRichFencesAsCode === lastRenderRichFencesAsCode
+    ) {
       return;
     }
 
     if (!markdown) {
       processedContent = '';
       lastProcessedContent = '';
+      lastProcessedWorkspaceId = workspaceId;
+      lastRenderRichFencesAsCode = renderRichFencesAsCode;
       return;
     }
 
@@ -141,17 +168,15 @@
         skipIfHTML: false,
         preserveAnchors: true,
         taskBlockRenderMode,
+        workspaceId,
+        renderRichFencesAsCode,
+        workspaceFileVersion,
       });
       processedContent = html;
       lastProcessedContent = markdown;
-
-      // Update editor content if it exists
-      if (editor && !editor.isDestroyed) {
-        // Use a transaction to batch updates
-        editor.commands.setContent(html, { emitUpdate: false });
-        // Note: Scroll management is handled by the parent component via followBottom action
-        // Do NOT call scrollIntoView here as it overrides user scroll position
-      }
+      lastProcessedWorkspaceId = workspaceId;
+      lastRenderRichFencesAsCode = renderRichFencesAsCode;
+      // Note: Scroll management is handled by the parent component via followBottom action
     } catch (error) {
       logger.error('Failed to process markdown:', error);
       // Escape HTML for safety — processedContent is injected with {@html}
@@ -161,18 +186,25 @@
       );
       processedContent = `<p>${escaped}</p>`;
       lastProcessedContent = markdown;
+      lastProcessedWorkspaceId = workspaceId;
     }
   }
 
-  // PERF: Lightweight streaming update - uses innerHTML directly instead of TipTap
+  // PERF: Lightweight streaming update - writes innerHTML directly
   async function updateContentStreaming(markdown: string) {
     // Skip if content hasn't actually changed
-    if (markdown === lastProcessedContent) {
+    if (
+      markdown === lastProcessedContent &&
+      workspaceId === lastProcessedWorkspaceId &&
+      renderRichFencesAsCode === lastRenderRichFencesAsCode
+    ) {
       return;
     }
 
     if (!markdown) {
       lastProcessedContent = '';
+      lastProcessedWorkspaceId = workspaceId;
+      lastRenderRichFencesAsCode = renderRichFencesAsCode;
       if (streamingContentElement) {
         streamingContentElement.innerHTML = '';
       }
@@ -185,17 +217,19 @@
         skipIfHTML: false,
         preserveAnchors: true,
         taskBlockRenderMode,
+        workspaceId,
+        renderRichFencesAsCode,
+        workspaceFileVersion,
       });
       lastProcessedContent = markdown;
+      lastProcessedWorkspaceId = workspaceId;
+      lastRenderRichFencesAsCode = renderRichFencesAsCode;
       processedContent = html;
 
-      // PERF: During streaming, update innerHTML directly instead of TipTap's setContent
-      // This is much faster as it avoids TipTap's internal diffing and transaction system
+      // PERF: During streaming, update innerHTML directly to avoid re-rendering
+      // the whole {@html} block on every throttled tick
       if (streamingContentElement) {
         streamingContentElement.innerHTML = html;
-      } else if (editor && !editor.isDestroyed) {
-        // Fallback to editor if no streaming element
-        editor.commands.setContent(html, { emitUpdate: false });
       }
     } catch (error) {
       logger.error('Failed to process streaming markdown:', error);
@@ -208,6 +242,7 @@
         streamingContentElement.innerHTML = `<p>${escaped}</p>`;
       }
       lastProcessedContent = markdown;
+      lastProcessedWorkspaceId = workspaceId;
     }
   }
 
@@ -253,25 +288,170 @@
 
     if (isStreaming) {
       // Use throttled streaming update
-      scheduleStreamingUpdate(content);
+      scheduleStreamingUpdate(markdownContent);
     } else {
       // Clean up pending updates when streaming ends
       if (wasStreaming) {
         cancelPendingUpdates();
       }
       // Direct update when not streaming
-      updateContentFull(content);
+      updateContentFull(markdownContent);
     }
   });
 
-  // PERF: Single reusable link click handler - shared between TipTap and static content
+  // Lightbox state for inline workspace-file images
+  let lightboxOpen = $state(false);
+  let lightboxImageUrl = $state('');
+  let lightboxImageAlt = $state<string | undefined>(undefined);
+  let lightboxOpenerElement = $state<HTMLElement | null>(null);
+
+  // Hover overlay: workspace-backed images get an image actions menu.
+  // The images live in {@html}-managed DOM, so a single Svelte-rendered
+  // trigger is positioned over whichever image is hovered or focused.
+  let hoveredImage = $state<HTMLImageElement | null>(null);
+  let hoveredImagePosition = $state({ top: 0, left: 0 });
+  let imageActionsOpen = $state(false);
+  let imageActionsOverlayElement = $state<HTMLElement | null>(null);
+
+  function isWorkspaceImage(image: HTMLImageElement): boolean {
+    const src = image.getAttribute('src') || '';
+    return src.startsWith('workspace-file://') || src.startsWith('workspace-asset://');
+  }
+
+  function handleImageInteraction(event: MouseEvent | FocusEvent): void {
+    const target = event.target;
+    if (target instanceof HTMLImageElement && isWorkspaceImage(target)) {
+      if (hoveredImage === target) return;
+      const container = event.currentTarget as HTMLElement;
+      const imageRect = target.getBoundingClientRect();
+      const containerRect = container.getBoundingClientRect();
+      hoveredImage = target;
+      hoveredImagePosition = {
+        top: imageRect.top - containerRect.top + 6,
+        left: imageRect.right - containerRect.left - 34,
+      };
+    } else if (hoveredImage && !imageActionsOpen) {
+      // Keep the overlay while the pointer is on the trigger itself.
+      if (target instanceof Node && imageActionsOverlayElement?.contains(target)) return;
+      hoveredImage = null;
+    }
+  }
+
+  function handleImageHoverLeave(): void {
+    if (!imageActionsOpen) hoveredImage = null;
+  }
+
+  function mediaFallbacks(node: HTMLElement) {
+    const mountedPlaceholders = new Map<HTMLElement, ReturnType<typeof mount>>();
+
+    function replaceMedia(
+      media: HTMLImageElement | HTMLVideoElement,
+      reason: MediaUnavailableReason,
+    ) {
+      const source = media.getAttribute('src') || media.getAttribute('data-media-src') || '';
+      const workspaceFile = parseWorkspaceFileImageUrl(source);
+      const intentFile = parseIntentFileTarget(source, workspaceId);
+      const path = workspaceFile?.path ?? intentFile?.path;
+      const owningWorkspaceId = workspaceFile?.workspaceId ?? intentFile?.workspaceId;
+      const name =
+        media.getAttribute('data-name') ||
+        media.getAttribute('alt') ||
+        path?.split('/').pop() ||
+        undefined;
+      const host = document.createElement(media instanceof HTMLVideoElement ? 'div' : 'span');
+      host.className = 'media-unavailable-host';
+      media.replaceWith(host);
+      if (hoveredImage === media) hoveredImage = null;
+      const fallback = mount(MediaUnavailable, {
+        target: host,
+        props: { name, reason, path, workspaceId: owningWorkspaceId },
+      });
+      mountedPlaceholders.set(host, fallback);
+      if (media instanceof HTMLVideoElement) {
+        host.classList.add('flex', 'items-center', 'gap-2');
+        const actionsHost = host.appendChild(document.createElement('span'));
+        mountedPlaceholders.set(
+          actionsHost,
+          mount(VideoActionsMenu, {
+            target: actionsHost,
+            props: {
+              videoUrl: source,
+              videoName: name,
+              sourceKind: 'workspace',
+              mimeType: workspaceAssetVideoSource(source, workspaceId)?.mimeType,
+            },
+          }),
+        );
+      }
+    }
+
+    function reconcile() {
+      for (const image of node.querySelectorAll<HTMLImageElement>('img')) {
+        if (isWorkspaceImage(image)) {
+          image.tabIndex = 0;
+          image.setAttribute('role', 'button');
+        }
+      }
+      for (const media of node.querySelectorAll<HTMLImageElement>('[data-media-unsupported]')) {
+        replaceMedia(media, 'unsupported');
+      }
+      for (const media of node.querySelectorAll<HTMLImageElement>('[data-media-unavailable]')) {
+        replaceMedia(media, 'load-failed');
+      }
+      for (const [host, component] of mountedPlaceholders) {
+        if (!node.contains(host)) {
+          void unmount(component);
+          mountedPlaceholders.delete(host);
+        }
+      }
+    }
+
+    function handleMediaError(event: Event) {
+      const media = event.target;
+      if (!(media instanceof HTMLImageElement || media instanceof HTMLVideoElement)) return;
+      // Decode and transport errors do not establish that the underlying asset is absent.
+      replaceMedia(media, 'load-failed');
+    }
+
+    const observer = new MutationObserver(reconcile);
+    observer.observe(node, { childList: true, subtree: true });
+    node.addEventListener('error', handleMediaError, true);
+    queueMicrotask(reconcile);
+
+    return {
+      destroy() {
+        observer.disconnect();
+        node.removeEventListener('error', handleMediaError, true);
+        for (const component of mountedPlaceholders.values()) void unmount(component);
+        mountedPlaceholders.clear();
+      },
+    };
+  }
+
+  // PERF: Single reusable link click handler - shared between streaming and static content
   // Routes all link clicks through the unified link handler for consistent behavior:
   // - Click → embedded browser panel (for http/https)
   // - Cmd+Click → external browser
   // - intent:// → internal navigation
-  function handleLinkClick(event: MouseEvent): void {
+  function handleLinkClick(event: MouseEvent | KeyboardEvent): void {
     const target = event.target as HTMLElement;
     const anchor = target.closest('a');
+
+    // Inline workspace-file images open in the lightbox (unless wrapped in a
+    // link, in which case the link wins)
+    if (!anchor && target instanceof HTMLImageElement) {
+      const src = target.getAttribute('src') || '';
+      if (src.startsWith('workspace-file://') || src.startsWith('workspace-asset://')) {
+        event.preventDefault();
+        event.stopPropagation();
+        event.stopImmediatePropagation();
+        lightboxImageUrl = src;
+        lightboxImageAlt = target.getAttribute('alt') || undefined;
+        lightboxOpenerElement = target;
+        lightboxOpen = true;
+        return;
+      }
+    }
 
     if (anchor?.href) {
       event.preventDefault();
@@ -284,10 +464,9 @@
       handleLink(anchor.href, {
         workspaceId: owningWorkspaceId,
         sourcePanelId,
-        openInAdjacentPanel: true,
-        openInNewAdjacentPanel: true,
         event,
         rawHref: anchor.getAttribute('href') ?? undefined,
+        ...(forceExternalLinks ? { forceExternal: true } : {}),
       });
       return;
     }
@@ -309,16 +488,20 @@
 
         // Get source panel ID for same-panel navigation
         const sourcePanelId = getSourcePanelId(event);
-        const openInAdjacentPanel = true;
+        const openInAdjacentPanel = isCmdClickModifier({ event });
 
         // Use onFileClick callback if provided, otherwise use direct navigation
         if (onFileClick) {
-          onFileClick(filePath, { openInAdjacentPanel, sourcePanelId });
+          onFileClick(filePath, { line: meta.line, openInAdjacentPanel, sourcePanelId });
         } else {
           const wsId = workspaceId;
           if (wsId) {
             appStore.dispatch(
-              openWorkspaceFile(wsId, filePath, { openInAdjacentPanel, sourcePanelId }),
+              openWorkspaceFile(wsId, filePath, {
+                line: meta.line,
+                openInAdjacentPanel,
+                sourcePanelId,
+              }),
             );
           }
         }
@@ -332,14 +515,13 @@
 
         // Get source panel ID for same-panel navigation
         const sourcePanelId = getSourcePanelId(event);
-        const openInAdjacentPanel = event.metaKey || event.ctrlKey;
+        const openInAdjacentPanel = isCmdClickModifier({ event });
 
         const wsIdNote = workspaceId;
         if (wsIdNote) {
           appStore.dispatch(
             openWorkspaceNote(wsIdNote, noteId, {
               openInAdjacentPanel,
-              openInNewAdjacentPanel: true,
               sourcePanelId,
             }),
           );
@@ -348,210 +530,123 @@
     }
   }
 
-  function getSourcePanelId(event: MouseEvent): string | undefined {
+  function handleLinkKeydown(event: KeyboardEvent): void {
+    if (
+      event.target instanceof HTMLImageElement &&
+      isWorkspaceImage(event.target) &&
+      (event.key === 'Enter' || event.key === ' ')
+    ) {
+      handleLinkClick(event);
+      return;
+    }
+    if (event.key !== 'Enter' || !isCmdClickModifier({ event })) return;
+    handleLinkClick(event);
+  }
+
+  function getSourcePanelId(event: MouseEvent | KeyboardEvent): string | undefined {
     const target = event.target;
     if (!(target instanceof HTMLElement)) return undefined;
     return target.closest<HTMLElement>('[data-panel-id]')?.dataset.panelId;
   }
 
-  // Store file click handler for cleanup
-  let fileClickHandler: ((event: MouseEvent) => void) | null = null;
-
-  // Function to initialize the editor (called when editorElement is available)
-  function initializeEditor(element: HTMLElement) {
-    // Attach link click handler (using the shared handler function)
-    element.addEventListener('click', handleLinkClick, true);
-
-    // Create a new TipTap editor for this element
-    // NOTE: Editor pooling was disabled because TipTap editors cannot be reliably
-    // reattached to new DOM elements after creation. The setOptions({ element })
-    // approach doesn't work - the ProseMirror view remains bound to the original element.
-    editor = new Editor({
-      element: element,
-      editable: false,
-      content: processedContent,
-      extensions: [
-        StarterKit.configure({
-          codeBlock: false,
-          link: false,
-        }),
-        createIntentLink({
-          openOnClick: false,
-          HTMLAttributes: {
-            class: 'markdown-link cursor-pointer',
-          },
-        }),
-        TaskList.configure({
-          HTMLAttributes: {
-            class: 'task-list',
-          },
-        }),
-        TaskItem.configure({
-          nested: true,
-          HTMLAttributes: {
-            class: 'task-item',
-          },
-        }),
-        CodeBlockLowlight.configure({
-          lowlight,
-          HTMLAttributes: {
-            class: 'code-block',
-          },
-        }),
-        Table.configure({
-          resizable: false,
-          HTMLAttributes: {
-            class: 'note-table',
-          },
-        }),
-        TableRow,
-        TableHeader.configure({
-          HTMLAttributes: {
-            class: 'note-table-header',
-          },
-        }),
-        TableCell.configure({
-          HTMLAttributes: {
-            class: 'note-table-cell',
-          },
-        }),
-        TasksBlock,
-      ],
-      // Disable the buggy 'delete' core extension that emits delete events.
-      // It has a bug where it calls nodeAt(newStart - 1) without checking if newStart is 0,
-      // causing "Position -1 outside of fragment" errors.
-      enableCoreExtensions: {
-        delete: false,
-      },
-      editorProps: {
-        handleClick: (_view, _pos, event) => {
-          const target = event.target as HTMLElement;
-          const anchor = target.closest('a');
-          if (anchor?.href?.startsWith('intent://')) {
-            return true;
-          }
-          return false;
-        },
-      },
-    });
-
-    // Set initial content if available
-    if (processedContent && editor) {
-      editor.commands.setContent(processedContent, { emitUpdate: false });
-    }
-
-    // Add click handler for file references
-    fileClickHandler = (event: MouseEvent) => {
-      const target = event.target as HTMLElement;
-
-      // Check if clicked element is a file reference (starts with @ or is in backticks)
-      const text = target.textContent || '';
-
-      // Pattern to match file paths
-      const filePathPattern = /^@?([\/\w\-\.]+\.\w+)$/;
-      const match = text.match(filePathPattern);
-
-      if (match && onFileClick) {
-        event.preventDefault();
-        const filePath = match[1];
-        logger.info('File reference clicked in markdown', { filePath });
-        onFileClick(filePath, {
-          openInAdjacentPanel: event.metaKey || event.ctrlKey,
-          sourcePanelId: getSourcePanelId(event),
-        });
-      }
-
-      // Also check for code elements that might contain file paths
-      if (target.tagName === 'CODE' && text.includes('/')) {
-        const cleanPath = text.replace(/^@/, '').replace(/`/g, '');
-        if (cleanPath.includes('.') && onFileClick) {
-          event.preventDefault();
-          logger.info('Code file reference clicked', { cleanPath });
-          onFileClick(cleanPath, {
-            openInAdjacentPanel: event.metaKey || event.ctrlKey,
-            sourcePanelId: getSourcePanelId(event),
-          });
-        }
-      }
-    };
-
-    element.addEventListener('click', fileClickHandler);
-  }
-
-  // Track if editor has been initialized
-  let editorInitialized = false;
-
-  onMount(() => {
-    // If editorElement is already available (not streaming), initialize immediately
-    if (editorElement && !isStreaming) {
-      initializeEditor(editorElement);
-      editorInitialized = true;
-    }
-  });
-
-  // Effect to initialize editor when switching from streaming to non-streaming
-  $effect(() => {
-    if (editorElement && !isStreaming && !editorInitialized) {
-      initializeEditor(editorElement);
-      editorInitialized = true;
-    }
-  });
-
   onDestroy(() => {
-    // Clean up link click handler from TipTap editor element
-    if (editorElement) {
-      editorElement.removeEventListener('click', handleLinkClick, true);
-    }
-
-    // Clean up file click handler
-    if (fileClickHandler && editorElement) {
-      editorElement.removeEventListener('click', fileClickHandler);
-    }
-
     // Clean up pending streaming updates
     cancelPendingUpdates();
-
-    // Destroy the editor
-    if (editor) {
-      editor.destroy();
-      editor = null;
-    }
   });
 </script>
 
 <!-- PERF: Use separate rendering paths based on content complexity -->
 <!-- streaming: live updates with processed HTML -->
 <!-- simple: plain text, no markdown - just <p> -->
-<!-- static: processed HTML without TipTap (for links, code blocks, etc.) -->
-<!-- complex: full TipTap for interactive content (task lists) -->
-{#if isStreaming}
-  <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
+<!-- static: processed HTML without TipTap (links, code blocks, task lists, tables, etc.) -->
+{#snippet imageActionsOverlay()}
+  {#if hoveredImage}
+    <div
+      bind:this={imageActionsOverlayElement}
+      class="absolute z-10"
+      style="top: {hoveredImagePosition.top}px; left: {hoveredImagePosition.left}px;"
+      data-testid="markdown-image-actions-overlay"
+    >
+      <ImageActionsMenu
+        imageUrl={hoveredImage.getAttribute('src') || ''}
+        imageName={hoveredImage.getAttribute('alt') || undefined}
+        bind:open={imageActionsOpen}
+      />
+    </div>
+  {/if}
+{/snippet}
+
+{#if hasVideoSegments}
+  <div class="markdown-video-segments {className}">
+    {#each mediaSegments as segment}
+      {#if segment.type === 'video'}
+        <ChatVideoBlock source={segment.source} name={segment.name} poster={segment.poster} />
+      {:else}
+        <RecursiveMarkdownViewer
+          content={segment.content}
+          {isStreaming}
+          {workspaceId}
+          onCodeBlockAction={_onCodeBlockAction}
+          {onFileClick}
+          {taskBlockRenderMode}
+          {chatImageThumbnails}
+          {forceExternalLinks}
+          {renderRichFencesAsCode}
+        />
+      {/if}
+    {/each}
+  </div>
+{:else if isStreaming}
+  <!-- svelte-ignore a11y_click_events_have_key_events, a11y_mouse_events_have_key_events, a11y_no_static_element_interactions, a11y_no_noninteractive_element_interactions -->
   <div
+    role="group"
     class="markdown-viewer streaming-content {className}"
+    class:chat-image-thumbnails={chatImageThumbnails}
     bind:this={streamingContentElement}
+    use:mediaFallbacks
     onclick={handleLinkClick}
+    onkeydown={handleLinkKeydown}
+    onmouseover={handleImageInteraction}
+    onfocusin={handleImageInteraction}
+    onmouseleave={handleImageHoverLeave}
   >
     {@html processedContent}
+    {@render imageActionsOverlay()}
   </div>
 {:else if contentComplexity === 'simple'}
   <!-- PERF: Simple text - render directly without any processing -->
   <div class="markdown-viewer simple-content {className}">
-    <p class="whitespace-pre-wrap">{content}</p>
-  </div>
-{:else if contentComplexity === 'static'}
-  <!-- PERF: Static content - use processed HTML without TipTap -->
-  <!-- This path handles links, code blocks, etc. without the overhead of TipTap -->
-  <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
-  <div
-    class="markdown-viewer static-content {className}"
-    bind:this={staticContentElement}
-    onclick={handleLinkClick}
-  >
-    {@html processedContent}
+    <p class="whitespace-pre-wrap">{markdownContent}</p>
   </div>
 {:else}
-  <!-- Complex content - needs TipTap for interactivity (task lists, etc.) -->
-  <div class="markdown-viewer {className}" bind:this={editorElement}></div>
+  <!-- PERF: Static content - use processed HTML without TipTap -->
+  <!-- This path handles links, code blocks, task lists, tables, etc. without the overhead of TipTap -->
+  <!-- svelte-ignore a11y_click_events_have_key_events, a11y_mouse_events_have_key_events, a11y_no_static_element_interactions, a11y_no_noninteractive_element_interactions -->
+  <div
+    role="group"
+    class="markdown-viewer static-content {className}"
+    class:chat-image-thumbnails={chatImageThumbnails}
+    bind:this={staticContentElement}
+    use:mediaFallbacks
+    onclick={handleLinkClick}
+    onkeydown={handleLinkKeydown}
+    onmouseover={handleImageInteraction}
+    onfocusin={handleImageInteraction}
+    onmouseleave={handleImageHoverLeave}
+  >
+    {@html processedContent}
+    {@render imageActionsOverlay()}
+  </div>
+{/if}
+
+{#if lightboxImageUrl}
+  <ImageLightbox
+    bind:open={lightboxOpen}
+    imageUrl={lightboxImageUrl}
+    imageName={lightboxImageAlt}
+    openerElement={lightboxOpenerElement}
+    showActionsMenu
+  />
 {/if}
 
 <style>
@@ -590,19 +685,8 @@
     margin-top: 0.75rem;
   }
 
-  /* ProseMirror container styles */
-  .markdown-viewer :global(.ProseMirror) {
-    outline: none;
-    min-height: 1em;
-  }
-
   /* PERF: Apply same styles to streaming content (direct children) */
-  /* Use .markdown-viewer prefix for specificity parity with .ProseMirror rule */
   .markdown-viewer.streaming-content > :global(* + *) {
-    margin-top: 0.75rem;
-  }
-
-  .markdown-viewer :global(.ProseMirror > * + *) {
     margin-top: 0.75rem;
   }
 
@@ -612,6 +696,21 @@
     white-space: pre-wrap;
     word-break: break-word;
     text-wrap: pretty;
+  }
+
+  .markdown-viewer :global(.markdown-video) {
+    display: block;
+    width: 100%;
+    max-width: 42rem;
+    aspect-ratio: 16 / 9;
+    border: 1px solid hsl(var(--border));
+    border-radius: 0.5rem;
+    background: black;
+    object-fit: contain;
+  }
+
+  .markdown-viewer.chat-image-thumbnails :global(.markdown-video) {
+    cursor: pointer;
   }
 
   .markdown-viewer :global(strong) {
@@ -961,6 +1060,22 @@
     max-width: 100%;
     height: auto;
     border-radius: 0.375rem;
+  }
+
+  /* Workspace-backed images open in a lightbox on click */
+  .markdown-viewer :global(img[src^='workspace-file://']),
+  .markdown-viewer :global(img[src^='workspace-asset://']) {
+    cursor: zoom-in;
+  }
+
+  /* Chat transcript: inline workspace file images render as fixed square
+     bordered thumbnails (cropped), matching ChatImageBlock */
+  .markdown-viewer.chat-image-thumbnails :global(img[src^='workspace-file://']) {
+    width: 10rem;
+    height: 10rem;
+    object-fit: cover;
+    border: 1px solid hsl(var(--border));
+    border-radius: 0.5rem;
   }
 
   /* Task Block - Skeleton loader styled like final checkbox state */

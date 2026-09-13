@@ -1,4 +1,4 @@
-import { store } from "../../store";
+import { store } from '../../store';
 import type { StoreState } from '../../types';
 import { emptyChatAgentState } from './chat-state-slice';
 import type {
@@ -8,8 +8,10 @@ import type {
   LastAttemptedMessage,
   LiveStreamPhase,
   ModelUnavailableInfo,
+  QuotaExceededInfo,
   TranscriptHydrationStatus,
   TranscriptSnapshotMeta,
+  StreamFailureCorrelation,
 } from './chat-state-types';
 import { hydratedBlockKey } from './chat-state-types';
 
@@ -26,33 +28,33 @@ function getAgentChatState(state: StoreState, agentId: string): ChatAgentState {
 // ============================================================================
 
 /** Select the full agent chat state object */
-export const selectChatAgentState = store.createSelector(
-  (state, agentId: string): ChatAgentState =>
-    getAgentChatState(state, agentId),
+export const selectChatAgentState = store.createSelector((state, agentId: string): ChatAgentState =>
+  getAgentChatState(state, agentId),
 );
 
-/** Select interrupting flag */
-export const selectChatIsInterrupting = store.createSelector(
-  (state, agentId: string): boolean =>
-    getAgentChatState(state, agentId).isInterrupting,
+/** All agent ids holding a chat-state entry (bulk hygiene sweeps in sagas). */
+export const selectChatAgentIds = store.createSelector((state): string[] =>
+  Object.keys(state.chatState?.byAgentId ?? {}),
 );
 
 /** Select error */
 export const selectChatError = store.createSelector(
-  (state, agentId: string): string | null =>
-    getAgentChatState(state, agentId).error,
+  (state, agentId: string): string | null => getAgentChatState(state, agentId).error,
+);
+
+export const selectChatFailureCorrelation = store.createSelector(
+  (state, agentId: string): StreamFailureCorrelation | undefined =>
+    getAgentChatState(state, agentId).failureCorrelation,
 );
 
 /** Select streaming start time */
 export const selectChatStreamingStartTime = store.createSelector(
-  (state, agentId: string): number | null =>
-    getAgentChatState(state, agentId).streamingStartTime,
+  (state, agentId: string): number | null => getAgentChatState(state, agentId).streamingStartTime,
 );
 
 /** Select last chunk time */
 export const selectChatLastChunkTime = store.createSelector(
-  (state, agentId: string): number | null =>
-    getAgentChatState(state, agentId).lastChunkTime,
+  (state, agentId: string): number | null => getAgentChatState(state, agentId).lastChunkTime,
 );
 
 /** Select last attempted message (for retry) */
@@ -67,51 +69,29 @@ export const selectChatModelUnavailable = store.createSelector(
     getAgentChatState(state, agentId).modelUnavailable,
 );
 
+/**
+ * Select the provider usage-limit failure for this agent, if the last turn
+ * died on one (#4455). Non-null drives the "retry on another provider"
+ * banner, the quota sibling of the model-unavailable recovery banner.
+ */
+export const selectChatQuotaExceeded = store.createSelector(
+  (state, agentId: string): QuotaExceededInfo | null =>
+    getAgentChatState(state, agentId).quotaExceeded,
+);
+
 /** Select status events */
 export const selectChatStatusEvents = store.createSelector(
-  (state, agentId: string): StatusEvent[] =>
-    getAgentChatState(state, agentId).statusEvents,
+  (state, agentId: string): StatusEvent[] => getAgentChatState(state, agentId).statusEvents,
 );
 
 /** Select received first chunk flag */
 export const selectChatReceivedFirstChunk = store.createSelector(
-  (state, agentId: string): boolean =>
-    getAgentChatState(state, agentId).receivedFirstChunk,
-);
-
-/** Select rebinding flag */
-export const selectChatIsRebinding = store.createSelector(
-  (state, agentId: string): boolean =>
-    getAgentChatState(state, agentId).isRebinding,
-);
-
-/** Select tracked workspace ID (for rebind detection) */
-export const selectChatTrackedWorkspaceId = store.createSelector(
-  (state, agentId: string): string | null =>
-    getAgentChatState(state, agentId).trackedWorkspaceId,
+  (state, agentId: string): boolean => getAgentChatState(state, agentId).receivedFirstChunk,
 );
 
 /** Select last message send time (for rate limiting) */
 export const selectChatLastMessageTime = store.createSelector(
-  (state, agentId: string): number =>
-    getAgentChatState(state, agentId).lastMessageTime,
-);
-
-/** Select last chunk received at timestamp (for reconciliation skip logic) */
-export const selectChatLastChunkReceivedAt = store.createSelector(
-  (state, agentId: string): number =>
-    getAgentChatState(state, agentId).lastChunkReceivedAt,
-);
-
-/**
- * Select chat state for the given agent, falling back to an empty default state.
- * Equivalent to selectChatAgentState (which already defaults via emptyChatAgentState),
- * but explicitly named for consumers that need
- * a guaranteed non-null ChatAgentState without wrapper methods.
- */
-export const selectChatStateOrDefault = store.createSelector(
-  (state, agentId: string): ChatAgentState =>
-    getAgentChatState(state, agentId),
+  (state, agentId: string): number => getAgentChatState(state, agentId).lastMessageTime,
 );
 
 /**
@@ -158,20 +138,17 @@ export const selectTranscriptSnapshotMeta = store.createSelector(
 
 /** True while an on-demand older-history scrollback page fetch is in flight. */
 export const selectFetchingOlderHistory = store.createSelector(
-  (state, agentId: string): boolean =>
-    getAgentChatState(state, agentId).fetchingOlderHistory,
+  (state, agentId: string): boolean => getAgentChatState(state, agentId).fetchingOlderHistory,
 );
 
 /** True while an on-demand gap-refill scrollback page fetch is in flight. */
 export const selectFetchingGapFill = store.createSelector(
-  (state, agentId: string): boolean =>
-    getAgentChatState(state, agentId).fetchingGapFill,
+  (state, agentId: string): boolean => getAgentChatState(state, agentId).fetchingGapFill,
 );
 
 /** True while an `aroundIndex` far-flick seek fetch is in flight. */
 export const selectFetchingHistorySeek = store.createSelector(
-  (state, agentId: string): boolean =>
-    getAgentChatState(state, agentId).fetchingHistorySeek,
+  (state, agentId: string): boolean => getAgentChatState(state, agentId).fetchingHistorySeek,
 );
 
 /**
@@ -179,8 +156,7 @@ export const selectFetchingHistorySeek = store.createSelector(
  * predating the param. Far-flick seeks fall back to the serial walk.
  */
 export const selectHistorySeekUnsupported = store.createSelector(
-  (state, agentId: string): boolean =>
-    getAgentChatState(state, agentId).historySeekUnsupported,
+  (state, agentId: string): boolean => getAgentChatState(state, agentId).historySeekUnsupported,
 );
 
 /**
@@ -192,6 +168,16 @@ export const selectHistorySeekUnsupported = store.createSelector(
 export const selectHistoryExhausted = store.createSelector(
   (state, agentId: string): boolean =>
     state.agentSessions?.historySegmentsByAgentId?.[agentId]?.oldestReached === true,
+);
+
+/** Result of the bounded authoritative question-marker recovery, if attempted. */
+export const selectPendingQuestionRecovery = store.createSelector(
+  (state, agentId: string) => getAgentChatState(state, agentId).pendingQuestionRecovery,
+);
+
+/** Per-messageId results of the pending-proposal carrying-message recoveries. */
+export const selectPendingProposalRecovery = store.createSelector(
+  (state, agentId: string) => getAgentChatState(state, agentId).pendingProposalRecovery,
 );
 
 /**
@@ -206,30 +192,12 @@ export const selectAwaitingSwitchBackSnapshot = store.createSelector(
 );
 
 /**
- * Utility-footer reveal gate: true while the transcript reveal is holding for
- * the footer data sources (agent subscriptions, background hooks, monitored
- * PRs) to settle, so transcript and footer flip in the same paint. Cleared by
- * the subscribe saga when `isUtilityFooterReady` composes true, by its
- * bounded fallback, or on subscription teardown (see
- * `shouldDeferTranscriptReveal` in chat-panel-visibility.ts).
- */
-export const selectAwaitingUtilityFooter = store.createSelector(
-  (state, agentId: string): boolean =>
-    getAgentChatState(state, agentId).awaitingUtilityFooter === true,
-);
-
-/**
  * Select one lazily hydrated content block entry (§5.5 slim projection →
  * v7.2 `agent.getMessageBlock`), or undefined when never requested. Keyed by
  * `{messageId}|{blockId}` via `hydratedBlockKey`.
  */
 export const selectHydratedBlock = store.createSelector(
-  (
-    state,
-    agentId: string,
-    messageId: string,
-    blockId: string,
-  ): HydratedBlockEntry | undefined =>
+  (state, agentId: string, messageId: string, blockId: string): HydratedBlockEntry | undefined =>
     getAgentChatState(state, agentId).hydratedBlocks?.[hydratedBlockKey(messageId, blockId)],
 );
 
@@ -244,6 +212,3 @@ export const selectHydratedBlocks = store.createSelector(
   (state, agentId: string): Record<string, HydratedBlockEntry> | undefined =>
     getAgentChatState(state, agentId).hydratedBlocks,
 );
-
-
-

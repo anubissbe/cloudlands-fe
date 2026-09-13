@@ -1,6 +1,7 @@
 <script lang="ts">
   import { tick, untrack } from 'svelte';
   import { Button } from '$lib/components/ui/button';
+  import { faSliders } from '@fortawesome/free-solid-svg-icons';
   import { Select } from '$lib/components/ui/select';
   import {
     findAppSettingDefinition,
@@ -20,6 +21,7 @@
   } from '$store/renderer/slices/proposal-lifecycle/proposal-lifecycle-selectors';
   import { getProposalId } from './proposal-id';
   import { m } from '$shared/paraglide/messages.js';
+  import ProposalCardHeader from './ProposalCardHeader.svelte';
 
   interface Props {
     proposal: SettingsChangeProposal;
@@ -27,6 +29,15 @@
     onApply?: (detail: ProposalActionDetail) => void;
     onDiscard?: (detail: ProposalActionDetail) => void;
     onUndo?: (proposalId: string) => void;
+    /** Tray-hosted Dismiss: skip the local "Discarded" tombstone state. */
+    suppressLocalDiscard?: boolean;
+    /**
+     * Tray-hosted restore: enum edits captured by a previous mount,
+     * string-serialized ('' encodes null). Applied once at init.
+     */
+    initialEditedFields?: Record<string, string> | null;
+    /** Reports every enum-edit change (string-serialized) for persistence. */
+    onEditedFieldsChange?: (fields: Record<string, string>) => void;
   }
 
   type SettingsChangePayload = { path: string; value: unknown; apply?: AppSettingApplyPlan };
@@ -39,11 +50,20 @@
     editable: boolean;
   };
 
-  let { proposal, disabled = false, onApply, onDiscard, onUndo }: Props = $props();
+  let {
+    proposal,
+    disabled = false,
+    onApply,
+    onDiscard,
+    onUndo,
+    suppressLocalDiscard = false,
+    initialEditedFields = null,
+    onEditedFieldsChange,
+  }: Props = $props();
   let rootElement = $state<HTMLElement | undefined>();
   let statusElement = $state<HTMLElement | undefined>();
   let isDismissed = $state(false);
-  let editedFields = $state<Record<string, unknown>>({});
+  let editedFields = $state<Record<string, unknown>>(restoreEditedFields());
   let now = $state(Date.now());
 
   const proposalId = $derived(getProposalId(proposal));
@@ -55,6 +75,7 @@
   const isUndoing = $derived($lifecycleStatus === 'undoing');
   const isFailed = $derived($lifecycleStatus === 'failed');
   const isApplied = $derived($lifecycleStatus === 'applied' || Boolean($appliedState));
+  const showDismissed = $derived(isDismissed);
   const actionDisabled = $derived(disabled || isApplying || isUndoing);
   const timeAgo = $derived($appliedState ? formatTimeAgo(now - $appliedState.appliedAt) : '');
   const statusMessage = $derived(getStatusMessage());
@@ -72,6 +93,18 @@
     if (!statusMessage) return;
     void tick().then(() => statusElement?.focus());
   });
+
+  // Enum edits are string-serialized for draft persistence ('' encodes the
+  // nullable clear), matching handleEnumEdit's own value space.
+  function restoreEditedFields(): Record<string, unknown> {
+    if (!initialEditedFields) return {};
+    const restored: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(initialEditedFields)) {
+      const definition = findAppSettingDefinition(key);
+      restored[key] = definition?.nullable === true && value === '' ? null : value;
+    }
+    return restored;
+  }
 
   function getProposalChanges(currentProposal: SettingsChangeProposal): SettingsChangePayload[] {
     return currentProposal.payload.changes;
@@ -152,6 +185,14 @@
       ...editedFields,
       [row.key]: definition?.nullable === true && value === '' ? null : value,
     };
+    onEditedFieldsChange?.(
+      Object.fromEntries(
+        Object.entries(editedFields).map(([key, edited]) => [
+          key,
+          edited === null || edited === undefined ? '' : String(edited),
+        ]),
+      ),
+    );
   }
 
   function enumValueLabel(definition: AppSettingDefinition, value: string): string {
@@ -195,7 +236,7 @@
 
   function handleDiscard() {
     const detail = buildDetail();
-    isDismissed = true;
+    if (!suppressLocalDiscard) isDismissed = true;
     onDiscard?.(detail);
     emitAction('proposaldiscard', detail);
   }
@@ -206,44 +247,39 @@
   }
 </script>
 
-{#if isDismissed}
-  <div
-    class="type-body my-2 rounded-(--radius-medium) border border-border bg-muted/30 px-3 py-2 text-muted-foreground"
-  >
+{#if showDismissed}
+  <div class="type-body px-3 py-2 text-muted-foreground">
     {m.chat_shared_discarded_label()}
     {proposal.preview.title}
   </div>
 {:else}
   <section
     bind:this={rootElement}
-    class="my-2 min-w-0 w-full max-w-xl overflow-hidden rounded-(--radius-medium) border border-border bg-card shadow-(--elevation-raised)"
+    class="min-w-0 w-full overflow-hidden rounded-(--radius-large) border border-border bg-card shadow-(--elevation-raised)"
     data-proposal-kind={proposal.kind}
     data-apply-tool-call-id={proposal.applyToolCallId}
     title={proposal.applyToolCallId
       ? m.chat_shared_tool_title({ id: proposal.applyToolCallId })
       : undefined}
   >
-    <div class="px-3 pt-3">
-      <h3 class="type-body font-medium leading-snug text-foreground">{proposal.preview.title}</h3>
-      {#if proposal.preview.summary}
-        <p class="type-body mt-1 leading-relaxed text-muted-foreground">
-          {proposal.preview.summary}
-        </p>
-      {/if}
+    <div class="px-5 pt-5">
+      <ProposalCardHeader
+        icon={faSliders}
+        title={m.chat_proposalCard_settingsQuestion_title()}
+        summary={proposal.preview.summary}
+      />
     </div>
 
-    <div class="space-y-2 px-3 py-2.5">
+    <div class="space-y-2 px-5 py-4">
+      <p class="type-body font-medium text-foreground">{proposal.preview.title}</p>
       {#each rows as row (row.key)}
         <div
-          class="min-w-0 rounded-(--radius-medium) border border-border bg-background px-3 py-2.5"
+          class="min-w-0 rounded-(--radius-large) border border-border bg-muted/20 px-3 py-2.5"
           data-proposal-field={row.key}
         >
           <div class="type-body min-w-0 break-words">
-            <span class="font-medium text-foreground">{row.label}</span><span
-              class="text-muted-foreground"
-              >:
-            </span>
-            <span class="text-muted-foreground" data-proposal-before-after-row={row.key}
+            <span class="type-caption block font-medium text-muted-foreground">{row.label}</span>
+            <span class="mt-1 block text-foreground" data-proposal-before-after-row={row.key}
               >{formatRowValue(row, row.before)} → {formatRowValue(row, row.after)}</span
             >
           </div>
@@ -287,7 +323,7 @@
       <div
         bind:this={statusElement}
         class={isFailed
-          ? 'type-caption border-t border-border px-3 py-2 text-error-foreground focus:outline-none'
+          ? 'type-caption border-t border-border px-3 py-2 text-danger focus:outline-none'
           : 'type-caption border-t border-border px-3 py-2 text-muted-foreground focus:outline-none'}
         role="status"
         aria-live={isFailed ? 'assertive' : 'polite'}
@@ -313,11 +349,16 @@
         </Button>
       </div>
     {:else}
-      <div class="flex items-center justify-end gap-2 border-t border-border bg-muted/10 px-3 py-3">
+      <div class="flex items-center justify-end gap-2 border-t border-border bg-muted/30 px-5 py-4">
         <Button variant="outline" size="sm" disabled={actionDisabled} onclick={handleDiscard}
           >{m.chat_shared_discard_label()}</Button
         >
-        <Button size="sm" disabled={actionDisabled} onclick={handleApply}>
+        <Button
+          size="sm"
+          class="border-primary bg-primary text-primary-foreground hover:border-primary hover:bg-primary/90 hover:text-primary-foreground active:bg-primary/80"
+          disabled={actionDisabled}
+          onclick={handleApply}
+        >
           {isApplying
             ? m.chat_shared_applying_label()
             : isFailed

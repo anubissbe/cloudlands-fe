@@ -29,10 +29,11 @@ import { setConnectionMode, setDaemonVersionInfo, setOrphanedSidecarInfo } from 
 import { compareToPinnedVersion } from '$shared/intentd-version-compare';
 import { readPinnedVersion } from './intentd-version-pin';
 import { detectOrphanedSidecar } from './intentd-orphan';
+import { resolveTailcatBinaryPath } from './tailcat-tunnel';
 // Re-export from the policy module so existing importers keep working; consumers
 // that only need the decision (e.g. `backend-connection.ts`) import it from
 // `intentd-spawn-policy` directly to avoid pulling in the sidecar manager.
-export { shouldSpawnSidecar, type ShouldSpawnDecision } from './intentd-spawn-policy';
+export { shouldSpawnSidecar } from './intentd-spawn-policy';
 import { shouldSpawnSidecar } from './intentd-spawn-policy';
 
 const logger = new Logger('Sidecar');
@@ -351,7 +352,7 @@ export function __resetIntentdSidecarForTesting(): void {
  * in for a startup handshake probe against a live local daemon.
  * @internal
  */
-export function __setLocalDaemonProtocolVersionForTesting(version: string | null): void {
+function __setLocalDaemonProtocolVersionForTesting(version: string | null): void {
   localDaemonProtocolVersion = version;
 }
 
@@ -464,6 +465,7 @@ export function resolveSocketPath(
 export interface DaemonVersionProbeResult {
   alive: boolean;
   version?: string;
+  buildCommit?: string;
   protocolVersion?: string;
 }
 
@@ -517,11 +519,13 @@ export async function probeDaemonVersion(
       if (newlineIndex === -1) return;
       try {
         const parsed = JSON.parse(buffer.slice(0, newlineIndex)) as {
-          result?: { version?: unknown; protocolVersion?: unknown };
+          result?: { version?: unknown; buildCommit?: unknown; protocolVersion?: unknown };
         };
         finish({
           alive: true,
           version: typeof parsed.result?.version === 'string' ? parsed.result.version : undefined,
+          buildCommit:
+            typeof parsed.result?.buildCommit === 'string' ? parsed.result.buildCommit : undefined,
           protocolVersion:
             typeof parsed.result?.protocolVersion === 'string'
               ? parsed.result.protocolVersion
@@ -789,6 +793,34 @@ function startHealthWatchdog(socketPath: string, delayMs = 2000): void {
 }
 
 /**
+ * Build the env for a sidecar spawn. Exported for unit tests.
+ *
+ * Besides normalizing `INTENTD_DATA_DIR`, this points the daemon at the
+ * app-bundled tailcat client via `INTENTD_TAILCAT_BIN`: intentd's own
+ * tunnel binary probing (env → libexec next to its exe → sibling → PATH)
+ * cannot find the Electron-packaged binary, which lives under
+ * `Resources/tailcat/` while the daemon runs from `Resources/intentd/`, so
+ * enabling the tunnel in a packaged app would fail with ENOENT. An
+ * explicitly-set `INTENTD_TAILCAT_BIN` from the user's env always wins,
+ * and when no bundled tailcat exists the var is simply not set (fail-soft,
+ * intentd probes as before).
+ */
+export function buildSidecarSpawnEnv(
+  env: NodeJS.ProcessEnv,
+  resolveTailcat: () => string | null = () => resolveTailcatBinaryPath(env),
+): NodeJS.ProcessEnv {
+  const spawnEnv = { ...env };
+  if (env.INTENTD_DATA_DIR?.trim()) {
+    spawnEnv.INTENTD_DATA_DIR = env.INTENTD_DATA_DIR.trim();
+  }
+  if (!env.INTENTD_TAILCAT_BIN?.trim()) {
+    const tailcatPath = resolveTailcat();
+    if (tailcatPath) spawnEnv.INTENTD_TAILCAT_BIN = tailcatPath;
+  }
+  return spawnEnv;
+}
+
+/**
  * Spawn the sidecar daemon process.
  *
  * Internal helper extracted from startIntentdSidecar for restart path reuse.
@@ -802,10 +834,7 @@ async function spawnSidecarProcess(
 
   logger.info('Spawning intentd sidecar', { binaryPath, socketPath });
 
-  const spawnEnv = { ...env };
-  if (env.INTENTD_DATA_DIR?.trim()) {
-    spawnEnv.INTENTD_DATA_DIR = env.INTENTD_DATA_DIR.trim();
-  }
+  const spawnEnv = buildSidecarSpawnEnv(env);
 
   const proc = spawn(binaryPath, ['serve'], {
     env: spawnEnv,
@@ -917,6 +946,21 @@ async function spawnSidecarProcess(
 }
 
 /**
+ * Re-run backend.ipc's local updateSupported capture after resolving an
+ * `external` connection mode. The pooled local client can connect (and run
+ * its hello-time capture) BEFORE `startIntentdSidecar` resolves the mode —
+ * `setupConfigIPC` constructs it earlier in startup — so that capture saw
+ * `unknown` and skipped; without this recapture the Devices row never gets
+ * the flag until a reconnect. Fire-and-forget/fail-soft; dynamic import
+ * because backend.ipc statically imports this module.
+ */
+function refreshLocalUpdateSupportedAfterModeResolution(): void {
+  void import('./backend.ipc')
+    .then(({ refreshLocalUpdateSupported }) => refreshLocalUpdateSupported())
+    .catch(() => {});
+}
+
+/**
  * Start the intentd sidecar if the spawn policy allows it.
  *
  * Before spawning, probes the target socket (version handshake) to adopt an
@@ -939,6 +983,7 @@ export async function startIntentdSidecar(
     // an already-running daemon on the default socket, or the two-terminal
     // dev-daemon flow) is not managed by us.
     setConnectionMode('external');
+    refreshLocalUpdateSupportedAfterModeResolution();
     logger.info('Sidecar spawn disabled', { reason: decision.reason });
     return;
   }
@@ -964,6 +1009,7 @@ export async function startIntentdSidecar(
     const versionMismatch = comparison === 'older' || comparison === 'newer';
     setDaemonVersionInfo({
       daemonVersion: probe.version ?? null,
+      ...(probe.buildCommit ? { daemonBuildCommit: probe.buildCommit } : {}),
       pinnedVersion,
       versionMismatch,
     });
@@ -978,6 +1024,7 @@ export async function startIntentdSidecar(
     const details = {
       socketPath,
       daemonVersion: probe.version ?? null,
+      daemonBuildCommit: probe.buildCommit ?? null,
       protocolVersion: probe.protocolVersion ?? null,
       pinnedVersion,
       comparison,
@@ -998,6 +1045,9 @@ export async function startIntentdSidecar(
     } else {
       logger.info('Adopted external intentd (no sidecar spawned)', details);
     }
+    // The local client's hello may have raced this mode resolution — re-run
+    // the updateSupported capture now that the adopted `external` mode is set.
+    refreshLocalUpdateSupportedAfterModeResolution();
     return;
   }
 
@@ -1104,7 +1154,7 @@ export async function stopIntentdSidecar(gracePeriodMs = 3000): Promise<void> {
 /**
  * Check if the sidecar is currently running (process spawned and alive).
  */
-export function isSidecarRunning(): boolean {
+function isSidecarRunning(): boolean {
   return sidecarProcess !== null && sidecarProcess.exitCode === null && !sidecarProcess.killed;
 }
 
@@ -1165,6 +1215,10 @@ async function doSpawnSidecarOnDemand(
   const socketPath = resolveSocketPath(env);
   if (await healthCheckProbe(socketPath)) {
     setConnectionMode('external');
+    // The client hello that reconnected to this revived socket may have fired
+    // while the mode was still 'sidecar' (clearing the flag) — re-run the
+    // capture now that the adopted `external` mode is set.
+    refreshLocalUpdateSupportedAfterModeResolution();
     logger.info('Spawn-on-demand skipped: a live daemon answers on the socket', { socketPath });
     return { ok: true, spawned: false, reason: 'live daemon already serving the socket' };
   }

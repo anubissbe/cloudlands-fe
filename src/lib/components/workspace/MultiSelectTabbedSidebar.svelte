@@ -1,8 +1,6 @@
 <script lang="ts">
   /* eslint-disable max-lines -- splitting this workspace sidebar is outside launcher-only scope */
-  import { navigateAfterWorkspaceRemoval } from '$lib/utils/workspace-navigation';
-  import { handleLink } from '$features/navigation/link-handler';
-  import { WorkspaceId } from '$shared/types/branded-ids';
+  import { isCmdClickModifier } from '$shared/utils/link-helpers';
   import type { AgentSession } from '$shared/types';
   import './multi-select-sidebar-transitions.css';
   import {
@@ -15,7 +13,6 @@
     selectActiveTab,
     selectAllTabs,
     selectFocusedPanelId,
-    getPanelTabOpenState,
   } from '$store/renderer/slices/panel-layout/panel-layout-selectors';
   import AgentAvatarStack, {
     type AgentAvatarStackItem,
@@ -34,17 +31,23 @@
     markNoteRead,
     refreshUnreadNotes,
   } from '$store/renderer/slices/note-read-tracking/note-read-tracking-slice';
-  import { initializeNotes } from '$store/renderer/slices/workspace-notes/workspace-notes-slice';
+  import {
+    fetchRetiredAgentsRequested,
+    restoreRetiredAgentRequested,
+  } from '$store/renderer/slices/workspace-agents/workspace-agents-slice';
   import {
     selectAllWorkspaceAgents,
     selectIsLoadingAgents,
+    selectIsLoadingRetiredAgents,
+    selectRetiredAgentsLoaded,
+    selectRetiredCount,
+    selectWorkspaceHasUnreadForegroundAgents,
   } from '$store/renderer/slices/workspace-agents/workspace-agents-selectors';
   import { selectAgentIsRunning } from '$store/renderer/slices/agent-session/agent-session-selectors';
-  import { workspaceClient } from '$store/renderer/slices/workspace/utils/workspace.client';
   import { cn } from '$lib/utils';
   import { scrollFade } from '$lib/actions/scroll-fade';
+  import { scheduleLayoutRead } from '$lib/utils/layout-phases';
 
-  import { loadWorkspacesRequested } from '$store/renderer/slices/workspace/workspace-slice';
   import {
     locateItemInSidebarConsumed,
     openAgentTabRequested,
@@ -52,14 +55,16 @@
   import { selectPendingLocateInSidebar } from '$store/renderer/slices/app-layout/app-layout-selectors';
   import {
     faArrowUpRightFromSquare,
-    faCodePullRequest,
     faCompressAlt,
     faExpandAlt,
     faPencil,
     faPlus,
   } from '@fortawesome/free-solid-svg-icons';
+  import { buildWorkspacePRPresentationModel } from './sidebar/workspace-pr-presentation';
+  import { constructPrUrl, legacyWorkspacePullRequest } from './sidebar/sidebar-changes-utils';
+  import { selectPrMonitors } from '$store/renderer/slices/pr-monitor/pr-monitor-selectors';
 
-  import { onMount, tick } from 'svelte';
+  import { onDestroy, onMount, tick } from 'svelte';
   import { cubicIn, cubicOut } from 'svelte/easing';
   import { writable } from 'svelte/store';
   import Fa from 'svelte-fa';
@@ -73,6 +78,7 @@
   import SidebarHeaderAction from './sidebar/SidebarHeaderAction.svelte';
   import WorkspaceProgressCard from './sidebar/WorkspaceProgressCard.svelte';
   import SidebarLauncherHoverCard from './sidebar/SidebarLauncherHoverCard.svelte';
+  import SidebarPrDropdown from './sidebar/SidebarPrDropdown.svelte';
   import WorkspaceAgentsList from './WorkspaceAgentsList.svelte';
   import WorkspaceTerminalDock from './WorkspaceTerminalDock.svelte';
   import WorkspaceShellList from './WorkspaceShellList.svelte';
@@ -81,7 +87,7 @@
   import SidebarBrowserList from './SidebarBrowserList.svelte';
   import { selectEffectiveFileExplorerWorkspacePath } from '$store/renderer/slices/file-explorer/file-explorer-selectors';
   import {
-    selectWorkspaceActivePrSummary,
+    selectWorkspaceActivePullRequest,
     selectWorkspaceById,
   } from '$store/renderer/slices/workspace/workspace-selectors';
   import {
@@ -114,15 +120,14 @@
     type TabId,
   } from './multi-select-sidebar-tabs';
   import { getFixedContainingBlockOffset } from './utils/fixed-containing-block';
+  import { applyContentReveal } from './utils/sidebar-card-morph';
   import { pushEscapeLayer } from '$lib/utils/escapeLayers';
   import { formatInteger } from '$lib/i18n/format';
   import { m } from '$shared/paraglide/messages.js';
-  import OpenPanelIndicator from './sidebar/OpenPanelIndicator.svelte';
 
   interface Props {
     workspaceId: string;
     panelLayoutId?: string;
-    availablePanelCanvasWidth?: number;
     onCreateNote?: () => void;
     onCreateFile?: (folderPath: string, fileName?: string) => void | Promise<void>;
     onFileRenamed?: (oldPath: string, newPath: string) => void;
@@ -130,15 +135,12 @@
     onCreateAgent?: () => void;
     onCreateAgentWithSpecialist?: (specialistId: string | null) => void;
     onAcceptChanges?: () => void;
-    onCloseWorkspace?: (event: MouseEvent) => void;
-    draggableTitleRegion?: boolean;
     class?: string;
   }
 
   let {
     workspaceId,
     panelLayoutId = workspaceId,
-    availablePanelCanvasWidth = 0,
     onCreateNote,
     onCreateFile,
     onFileRenamed,
@@ -146,19 +148,18 @@
     onCreateAgent,
     onCreateAgentWithSpecialist,
     onAcceptChanges,
-    onCloseWorkspace,
-    draggableTitleRegion = false,
     class: className,
   }: Props = $props();
 
   // Reactive writable store that mirrors workspaceId so Redux selectors
   // re-evaluate whenever the prop changes (called at component init time).
-  // svelte-ignore state_referenced_locally - intentional initial capture; the $effect below syncs later changes
+  // svelte-ignore state_referenced_locally - intentional initial capture; the $effect.pre below syncs later changes
   const workspaceIdStore = writable(workspaceId);
   const LAUNCHER_ICON_LIMIT = 6;
   const LAUNCHER_TARGET_SIZE = 36;
   const LAUNCHER_VISIBLE_SIZE = 20;
   const LAUNCHER_STEP_SIZE = 15;
+  const LAUNCHER_VISIBLE_OFFSET = (LAUNCHER_TARGET_SIZE - LAUNCHER_VISIBLE_SIZE) / 2;
   let launcherIconLimit = $state(LAUNCHER_ICON_LIMIT);
   const LAUNCHER_ICON_STACK_CLASS =
     'isolate grid h-9 w-full min-w-0 grid-flow-col items-start overflow-visible text-muted-foreground';
@@ -167,10 +168,10 @@
   const LAUNCHER_GLYPH_CLASS = 'launcher-glyph relative flex size-5 items-center justify-center';
   const LAUNCHER_OVERFLOW_BUTTON_CLASS =
     // i18n-ignore (Tailwind utility classes)
-    'launcher-overflow-button pointer-events-auto relative z-10 flex h-5 w-auto shrink-0 cursor-pointer items-center justify-center border-0! bg-transparent! px-0! text-xs font-medium leading-3 whitespace-nowrap text-muted-foreground shadow-none! outline-none transition-colors hover:z-20 hover:text-foreground focus-visible:z-30 focus-visible:text-foreground';
+    'launcher-overflow-button pointer-events-auto relative z-10 flex h-5 min-w-5 w-auto shrink-0 cursor-pointer items-center justify-center rounded-md! border-0! bg-muted! px-1.5! text-xs font-medium leading-3 whitespace-nowrap text-muted-foreground shadow-none! outline-none transition-colors hover:z-20 hover:bg-muted/80! hover:text-foreground focus-visible:z-30 focus-visible:text-foreground';
   const LAUNCHER_OVERFLOW_STYLE =
-    'line-height: 12px; font-weight: 500; border-radius: 0; padding: 0; background: transparent; box-shadow: none;';
-  $effect(() => {
+    'min-width: 20px; line-height: 12px; font-weight: 500; border-radius: 6px; padding: 0 6px; background: hsl(var(--muted)); box-shadow: none;';
+  $effect.pre(() => {
     workspaceIdStore.set(workspaceId);
   });
   const fileExplorerWorkspacePath = selectEffectiveFileExplorerWorkspacePath(workspaceIdStore);
@@ -179,7 +180,27 @@
   const pendingLocateInSidebar$ = selectPendingLocateInSidebar();
 
   const workspace = selectWorkspaceById(workspaceIdStore);
-  const activePrSummary$ = selectWorkspaceActivePrSummary(workspaceIdStore);
+  const activePullRequest$ = selectWorkspaceActivePullRequest(workspaceIdStore);
+  const prMonitors$ = selectPrMonitors(workspaceIdStore);
+  // Every PR attributable to the workspace (branch PRs, cross-repo entries,
+  // agent PR monitors), deduplicated and ordered by status priority.
+  const workspacePrRows = $derived.by(() => {
+    const ws = $workspace;
+    if (!ws) return [];
+    const workspaceRepo =
+      ws.repositoryOwner && ws.repositoryName
+        ? `${ws.repositoryOwner}/${ws.repositoryName}`
+        : undefined;
+    return buildWorkspacePRPresentationModel({
+      workspacePRs: ws.pullRequests,
+      activePR: $activePullRequest$ ?? ws.activePullRequest ?? legacyWorkspacePullRequest(ws),
+      monitors: $prMonitors$,
+      workspaceRepo,
+      buildPrUrl: (prNumber, fallbackUrl) =>
+        constructPrUrl(prNumber, ws.repositoryOwner, ws.repositoryName, fallbackUrl),
+      getDisplayTitle: (pr) => pr.title,
+    });
+  });
   const notes = selectAllNotes(workspaceIdStore);
   const launcherNoteState = $derived(
     deriveNoteLauncherItems(
@@ -189,6 +210,7 @@
     ),
   );
   const launcherNotes = $derived(launcherNoteState.launcherNotes);
+  const launcherHasSpecNote = $derived(launcherNotes.some((note) => isSpecNote(note.id as string)));
   const launcherNoteOverflowCount = $derived(launcherNoteState.overflowCount);
   const launcherNoteOverflowLabel = $derived(
     m.lib_commandPalette_showMoreNotes_label({
@@ -198,6 +220,10 @@
   const notesLoading$ = selectNotesLoading(workspaceIdStore);
   const allWorkspaceAgents = selectAllWorkspaceAgents(workspaceIdStore);
   const agentsLoading = selectIsLoadingAgents(workspaceIdStore);
+  const retiredCount$ = selectRetiredCount(workspaceIdStore);
+  const retiredAgentsLoaded$ = selectRetiredAgentsLoaded(workspaceIdStore);
+  const loadingRetired$ = selectIsLoadingRetiredAgents(workspaceIdStore);
+  const hasUnreadForegroundAgents$ = selectWorkspaceHasUnreadForegroundAgents(workspaceIdStore);
   const hudQuestionsByAgentId$ = selectHudQuestionsByAgentId();
 
   function getLauncherAvatarState(agent: AgentSession): AvatarState {
@@ -268,10 +294,22 @@
   function launcherGridTemplateColumns(tabId: string): string {
     const itemCount = launcherItemCount(tabId);
     const hasOverflow = tabId === 'context' && launcherNoteOverflowCount > 0;
+    if (tabId === 'context' && launcherHasSpecNote) {
+      const additionalNoteCount = launcherNotes.length - 1;
+      const columns = ['max-content'];
+      if (additionalNoteCount > 0) {
+        if (additionalNoteCount > 1) {
+          columns.push(`repeat(${additionalNoteCount - 1}, ${LAUNCHER_STEP_SIZE}px)`);
+        }
+        columns.push(`${hasOverflow ? LAUNCHER_TARGET_SIZE : LAUNCHER_VISIBLE_SIZE}px`);
+      }
+      if (hasOverflow) columns.push('max-content');
+      return columns.join(' ');
+    }
     if (hasOverflow) {
       return itemCount > 2
-        ? `repeat(${itemCount - 2}, ${LAUNCHER_STEP_SIZE}px) ${LAUNCHER_TARGET_SIZE}px max-content`
-        : `${LAUNCHER_TARGET_SIZE}px max-content`;
+        ? `repeat(${itemCount - 2}, ${LAUNCHER_STEP_SIZE}px) ${LAUNCHER_VISIBLE_OFFSET + LAUNCHER_STEP_SIZE}px max-content`
+        : `${LAUNCHER_VISIBLE_OFFSET + LAUNCHER_STEP_SIZE}px max-content`;
     }
     return itemCount > 1
       ? `repeat(${itemCount - 1}, ${LAUNCHER_STEP_SIZE}px) ${LAUNCHER_VISIBLE_SIZE}px`
@@ -283,26 +321,76 @@
   let contextSearchQuery = $state('');
   const expandedStripTabs = $derived(
     TAB_DEFINITIONS.filter((definition) => definition.id !== 'overview').map(
-      ({ id, label, icon }) => ({ id, label, icon }),
+      ({ id, label, icon }) => ({
+        id,
+        label,
+        icon,
+        unread: id === 'agents' && $hasUnreadForegroundAgents$,
+        unreadLabel:
+          id === 'agents'
+            ? m.workspace_multiSelectSidebar_agentsTabUnread_ariaLabel({ label })
+            : undefined,
+      }),
     ),
   );
   let sidebarTabSwitchDirection = $state<'left' | 'right' | 'none'>('none');
   let openLauncherHoverKey = $state<string | null>(null);
+  const LAUNCHER_HOVER_INITIAL_DELAY_MS = 400;
+  const LAUNCHER_HOVER_SESSION_RESET_DELAY_MS = 300;
+  let launcherHoverSessionActive = $state(false);
+  let launcherHoverSessionResetTimer: ReturnType<typeof setTimeout> | null = null;
+  const launcherHoverDelay = $derived(
+    launcherHoverSessionActive ? 0 : LAUNCHER_HOVER_INITIAL_DELAY_MS,
+  );
   const launcherRects = new Map<LauncherTabId, DOMRect>();
   const expandedCardRects = new Map<LauncherTabId, DOMRect>();
+  // svelte-ignore state_referenced_locally - intentional initial capture for change detection
+  let motionWorkspaceId = workspaceId;
+
+  $effect.pre(() => {
+    if (motionWorkspaceId === workspaceId) return;
+    motionWorkspaceId = workspaceId;
+    sidebarTabSwitchDirection = 'none';
+    launcherRects.clear();
+    expandedCardRects.clear();
+  });
 
   function handleLauncherHoverOpenChange(key: string, open: boolean) {
     if (open) {
+      clearLauncherHoverSessionResetTimer();
+      launcherHoverSessionActive = true;
       openLauncherHoverKey = key;
     } else if (openLauncherHoverKey === key) {
       openLauncherHoverKey = null;
+      clearLauncherHoverSessionResetTimer();
+      launcherHoverSessionResetTimer = setTimeout(() => {
+        launcherHoverSessionResetTimer = null;
+        launcherHoverSessionActive = false;
+      }, LAUNCHER_HOVER_SESSION_RESET_DELAY_MS);
     }
   }
 
+  function clearLauncherHoverSessionResetTimer() {
+    if (launcherHoverSessionResetTimer === null) return;
+    clearTimeout(launcherHoverSessionResetTimer);
+    launcherHoverSessionResetTimer = null;
+  }
+
+  onDestroy(clearLauncherHoverSessionResetTimer);
+
   function cardMorph(
     node: HTMLElement,
-    { tabId, direction }: { tabId: LauncherTabId; direction: 'expand' | 'collapse' },
+    {
+      tabId,
+      direction,
+      cardWorkspaceId,
+    }: {
+      tabId: LauncherTabId;
+      direction: 'expand' | 'collapse';
+      cardWorkspaceId: string;
+    },
   ): TransitionConfig {
+    if (cardWorkspaceId !== workspaceId) return { duration: 0 };
     if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) return { duration: 0 };
 
     if (sidebarTabSwitchDirection !== 'none') {
@@ -336,15 +424,16 @@
     const fixedContainingBlockOffset = getFixedContainingBlockOffset(node);
     const fixedLeft = cardRect.left - fixedContainingBlockOffset.x;
     const fixedTop = cardRect.top - fixedContainingBlockOffset.y;
+    const content = node.querySelector<HTMLElement>('[data-sidebar-expanded-content]');
 
     return {
       duration: 300,
       css: (t) => {
         const shellProgress = direction === 'expand' ? cubicOut(t) : cubicIn(t);
         const shellInverse = 1 - shellProgress;
-        const contentProgress = Math.max(0, Math.min(1, (t - 0.72) / 0.28));
-        return `position: fixed; left: ${fixedLeft}px; top: ${fixedTop}px; width: ${cardRect.width}px; height: ${cardRect.height}px; transform-origin: top left; transform: translate(${shellInverse * translateX}px, ${shellInverse * translateY}px) scale(${scaleX + shellProgress * (1 - scaleX)}, ${scaleY + shellProgress * (1 - scaleY)}); background-color: hsl(var(--sidebar)); --sidebar-card-content-opacity: ${contentProgress}; --sidebar-card-content-y: ${(1 - contentProgress) * 4}px; will-change: transform;`;
+        return `position: fixed; left: ${fixedLeft}px; top: ${fixedTop}px; width: ${cardRect.width}px; height: ${cardRect.height}px; transform-origin: top left; transform: translate(${shellInverse * translateX}px, ${shellInverse * translateY}px) scale(${scaleX + shellProgress * (1 - scaleX)}, ${scaleY + shellProgress * (1 - scaleY)}); background-color: hsl(var(--sidebar)); will-change: transform;`;
       },
+      tick: (t) => applyContentReveal(content, t),
     };
   }
 
@@ -433,19 +522,11 @@
   const focusedContentAgentId = $derived($activeTab$?.agentId ?? null);
   const focusedContentFilePath = $derived($activeTab$?.filePath ?? null);
   const focusedContentDiffPath = $derived($activeTab$?.diffPath ?? null);
-  let lastInitializedNotesWorkspaceId: string | null = null;
 
   $effect(() => {
     workspaceId;
     agentSearchQuery = '';
     contextSearchQuery = '';
-  });
-
-  $effect(() => {
-    if (!workspaceId || lastInitializedNotesWorkspaceId === workspaceId) return;
-    lastInitializedNotesWorkspaceId = workspaceId;
-    const initialSelectedNoteId = focusedContentType === 'note' ? focusedContentNoteId : undefined;
-    appStore.dispatch(initializeNotes(workspaceId, initialSelectedNoteId ?? undefined));
   });
 
   const effectiveSelectedNoteId = $derived(
@@ -483,53 +564,63 @@
     return null;
   });
   const effectiveIsAllChangesViewActive = $derived(focusedContentType === 'local-changes');
-  function getNotePanelState(noteId: string) {
-    return getPanelTabOpenState($allPanelTabs$, $activeTab$, workspaceId, {
-      type: 'note',
-      noteId,
-      workspaceId,
-    });
+
+  type PaneOpenEvent = MouseEvent | KeyboardEvent;
+
+  function isAdjacentOpen(event?: PaneOpenEvent): boolean {
+    return event ? isCmdClickModifier({ event }) : false;
   }
 
-  function handleOpenAgentInPanel(agentId: string) {
+  function handleOpenAgentInPanel(agentId: string, event?: PaneOpenEvent) {
     if (!$allWorkspaceAgents.some((agent) => agent.id === agentId)) return;
     const sourcePanelId = selectFocusedPanelId.select(appStore.state, panelLayoutId) ?? undefined;
+    const openInAdjacentPanel = isAdjacentOpen(event);
     appStore.dispatch(
       openAgentTabRequested(workspaceId, {
         agentId,
         sourcePanelId,
         panelLayoutId,
-        openInNewColumn: true,
-        adaptiveFirstChat: true,
-        availablePanelCanvasWidth,
+        ...(openInAdjacentPanel ? { openInAdjacentPanel: true } : {}),
       }),
     );
   }
 
-  function handleOpenNoteInPanel(noteId: string) {
+  function handleOpenNoteInPanel(noteId: string, event?: PaneOpenEvent) {
     const note = $notes.find((n) => n.id === noteId);
     const title = note?.title || m.workspace_addContext_note_label();
-    panelLayoutManager.openUserTab({
+    const tab = {
       type: 'note',
       title,
       closable: true,
       noteId,
       workspaceId,
-    });
+    } as const;
+    if (isAdjacentOpen(event)) {
+      const sourcePanelId = selectFocusedPanelId.select(appStore.state, panelLayoutId) ?? undefined;
+      panelLayoutManager.openTabInAdjacentOrSplit(tab, sourcePanelId, { force: true });
+    } else {
+      panelLayoutManager.openUserTab(tab);
+    }
 
     // Mark note as read when opened to clear unread indicator
     appStore.dispatch(markNoteRead(workspaceId, noteId));
   }
 
-  function handleOpenFileInPanel(filePath: string) {
+  function handleOpenFileInPanel(filePath: string, event?: PaneOpenEvent) {
     const fileName = filePath.split('/').pop() || filePath;
-    panelLayoutManager.openTab({
+    const tab = {
       type: 'file',
       title: fileName,
       closable: true,
       filePath,
       workspaceId,
-    });
+    } as const;
+    if (isAdjacentOpen(event)) {
+      const sourcePanelId = selectFocusedPanelId.select(appStore.state, panelLayoutId) ?? undefined;
+      panelLayoutManager.openTabInAdjacentOrSplit(tab, sourcePanelId, { force: true });
+    } else {
+      panelLayoutManager.openTab(tab);
+    }
   }
 
   function handleOpenCodeReviewInPanel() {
@@ -539,33 +630,6 @@
       closable: true,
       workspaceId,
     });
-  }
-
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  async function handleArchiveWorkspace() {
-    if (!$workspace) return;
-    const { toast } = await import('svelte-sonner');
-    const workspaceTitle = $workspace.title || m.workspace_multiSelectSidebar_space_label();
-
-    const result = await workspaceClient.archive($workspace.id);
-    if (result.ok) {
-      appStore.dispatch(loadWorkspacesRequested());
-      toast.warning(m.workspace_multiSelectSidebar_archivedSpace_toast({ title: workspaceTitle }), {
-        duration: 15000,
-        action: {
-          label: m.workspace_multiSelectSidebar_undo_label(),
-          onClick: async () => {
-            const undoResult = await workspaceClient.unarchive($workspace.id);
-            if (undoResult.ok) {
-              appStore.dispatch(loadWorkspacesRequested());
-            }
-          },
-        },
-      });
-      await navigateAfterWorkspaceRemoval($workspace.id);
-    } else {
-      toast.error(m.workspace_multiSelectSidebar_archiveFailed_error());
-    }
   }
 
   // File panel state
@@ -636,28 +700,29 @@
   }
 
   onMount(() => {
-    updateExpandedOverlayBounds();
-    updateLauncherIconLimit();
-    const frame = requestAnimationFrame(() => {
+    // Measurement is deferred to ResizeObserver's guaranteed initial
+    // delivery (after layout, pre-paint) instead of running synchronously
+    // here: mount happens mid-flush on workspace switches, where the
+    // getBoundingClientRect sweep forces a reflow.
+    let cancelRead: (() => void) | null = null;
+    const measure = () => {
       updateExpandedOverlayBounds();
       updateLauncherIconLimit();
-    });
+    };
     if (typeof ResizeObserver === 'undefined' || !sidebarElement) {
-      return () => cancelAnimationFrame(frame);
+      cancelRead = scheduleLayoutRead(() => {
+        cancelRead = null;
+        measure();
+      });
+      return () => cancelRead?.();
     }
 
-    const observer = new ResizeObserver(() => {
-      updateExpandedOverlayBounds();
-      updateLauncherIconLimit();
-    });
+    const observer = new ResizeObserver(measure);
     observer.observe(sidebarElement);
     const titleRegion = sidebarElement.querySelector<HTMLElement>('[data-workspace-title-region]');
     if (titleRegion) observer.observe(titleRegion);
     if (bottomLaunchersElement) observer.observe(bottomLaunchersElement);
-    return () => {
-      cancelAnimationFrame(frame);
-      observer.disconnect();
-    };
+    return () => observer.disconnect();
   });
 
   // Map registry sidebar tab IDs to MultiSelectTabbedSidebar tab IDs
@@ -771,6 +836,9 @@
       (id) => id !== 'overview' && selectedTabs.has(id),
     ),
   );
+  const orderedSelectedCards = $derived(
+    orderedSelectedTabs.map((tabId) => ({ tabId, workspaceId })),
+  );
   const isLauncherOverview = $derived(isTabSelected('overview'));
 
   $effect(() => {
@@ -807,6 +875,7 @@
       emptyText={m.layout_sidebarNav_noMessages_label()}
       kind="agent"
       gridPosition="start"
+      delayDuration={launcherHoverDelay}
       open={openLauncherHoverKey === `agent:${agent.id}`}
       onOpenChange={(open) => {
         handleLauncherHoverOpenChange(`agent:${agent.id}`, open);
@@ -823,7 +892,7 @@
         onpointerdown={(event) => event.stopPropagation()}
         onclick={(event) => {
           event.stopPropagation();
-          handleOpenAgentInPanel(agent.id);
+          handleOpenAgentInPanel(agent.id, event);
         }}
       >
         <AgentAvatarWithState
@@ -842,13 +911,8 @@
   class={cn('relative flex h-full flex-col overflow-hidden bg-transparent', className)}
 >
   <!-- Fixed Top Section: Progress Card -->
-  <div class="shrink-0 px-6 pb-2 pt-5" data-workspace-title-region draggable={draggableTitleRegion}>
-    <WorkspaceProgressCard
-      {workspaceId}
-      onOpenNote={handleOpenNoteInPanel}
-      {onCloseWorkspace}
-      hideActionsMenu={!isLauncherOverview}
-    />
+  <div class="shrink-0 px-6 pb-2 pt-5" data-workspace-title-region>
+    <WorkspaceProgressCard {workspaceId} onOpenNote={handleOpenNoteInPanel} />
   </div>
 
   {#if !isNewWorkspaceSession}
@@ -867,24 +931,29 @@
           {@html '<!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->'}
           <div
             role="presentation"
-            class="absolute inset-x-0 z-20 grid min-h-0 min-w-0 overflow-hidden px-4 pb-1 pt-3"
+            class="sidebar-expanded-card-shell absolute inset-x-0 z-20 grid min-h-0 min-w-0 overflow-hidden px-4 pb-1 pt-3"
             style={`top: ${expandedOverlayTop}px; bottom: ${expandedOverlayBottom}px;`}
             data-sidebar-overlay
             data-sidebar-switch-direction={sidebarTabSwitchDirection}
             onclick={handleExpandedOverlayClick}
           >
-            {#each orderedSelectedTabs as tabId (tabId)}
+            {#each orderedSelectedCards as selectedCard (`${selectedCard.workspaceId}:${selectedCard.tabId}`)}
+              {@const { tabId, workspaceId: cardWorkspaceId } = selectedCard}
               {@const tab = TAB_DEFINITIONS.find((t) => t.id === tabId)}
               <div
-                class="sidebar-expanded-card relative z-10 flex h-full min-h-0 w-full min-w-0 flex-col overflow-hidden rounded-lg border border-border bg-sidebar"
+                class="sidebar-expanded-card relative z-10 flex min-h-0 w-full min-w-0 flex-col overflow-hidden rounded-lg border border-border bg-sidebar"
                 data-sidebar-card-surface
+                data-sidebar-card-workspace={cardWorkspaceId}
+                data-sidebar-card-tab={tabId}
                 in:cardMorph|global={{
                   tabId: tabId as LauncherTabId,
                   direction: 'expand',
+                  cardWorkspaceId,
                 }}
                 out:cardMorph|global={{
                   tabId: tabId as LauncherTabId,
                   direction: 'collapse',
+                  cardWorkspaceId,
                 }}
               >
                 <div
@@ -931,6 +1000,8 @@
                               label={m.menu_new_terminal()}
                               onclick={createTerminal}
                             />
+                          {:else if tabId === 'changes' && workspacePrRows.length > 0}
+                            <SidebarPrDropdown rows={workspacePrRows} {workspaceId} side="bottom" />
                           {/if}
                           <SidebarHeaderAction
                             icon="close"
@@ -953,7 +1024,7 @@
                             >.
                           {:else if tabId === 'context' && $workspace?.path}
                             {tab.description}
-                            {m.workspace_multiSelectSidebar_notesLiveIn_before()}
+                            {m.workspace_multiSelectSidebar_contextAndMetadataLiveIn_before()}
                             <span class="inline-flex items-baseline gap-1">
                               <OpenComboButton
                                 filePath={$workspace.path + '/.workspace'}
@@ -1008,6 +1079,7 @@
                       class="min-h-0 flex-1 pt-2 {tabId === 'files'
                         ? 'overflow-hidden pb-0'
                         : 'overflow-y-auto pb-6'}"
+                      data-sidebar-expanded-scroll
                       use:scrollFade
                     >
                       {#if tabId === 'agents'}
@@ -1018,10 +1090,17 @@
                             searchQuery={agentSearchQuery}
                             runningAgentIds={runningLauncherAgents.map((agent) => agent.id)}
                             selectedAgentId={effectiveSelectedAgentId}
-                            {workspaceId}
-                            openPanelTabs={$allPanelTabs$}
-                            activePanelTab={$activeTab$}
-                            onSelect={({ agentId }) => handleOpenAgentInPanel(agentId)}
+                            retiredCount={$retiredCount$}
+                            retiredAgentsLoaded={$retiredAgentsLoaded$}
+                            loadingRetired={$loadingRetired$}
+                            onLoadRetired={() => {
+                              appStore.dispatch(fetchRetiredAgentsRequested(workspaceId));
+                            }}
+                            onSelect={({ agentId, event }) =>
+                              handleOpenAgentInPanel(agentId, event)}
+                            onRestoreRetired={({ agentId }) => {
+                              appStore.dispatch(restoreRetiredAgentRequested(workspaceId, agentId));
+                            }}
                           />
                         </div>
                       {:else if tabId === 'context'}
@@ -1051,11 +1130,16 @@
                               activeFilePath={effectiveActiveFilePath}
                               activeFileStaged={effectiveActiveFileStaged}
                               isAllChangesViewActive={effectiveIsAllChangesViewActive}
-                              onOpenChange={(change) => {
+                              onOpenChange={(change, event) => {
+                                const sourcePanelId =
+                                  selectFocusedPanelId.select(appStore.state, panelLayoutId) ??
+                                  undefined;
                                 appStore.dispatch(
                                   openWorkspaceDiff(workspaceId, change as never, {
                                     filePath: change.relativePath || change.file,
                                     changeId: change.id,
+                                    openInAdjacentPanel: isAdjacentOpen(event),
+                                    sourcePanelId,
                                   }),
                                 );
                               }}
@@ -1129,8 +1213,6 @@
                             onSelectAgent={handleOpenAgentInPanel}
                             showOnlyChanged={showOnlyChangedFiles}
                             searchQuery={fileSearchQuery}
-                            openPanelTabs={$allPanelTabs$}
-                            activePanelTab={$activeTab$}
                           />
                         </div>
                       {:else if tabId === 'browser'}
@@ -1174,7 +1256,7 @@
                     ? undefined
                     : m.ui_vscodePanel_expand_ariaLabel()}
                   aria-labelledby={isAgentLauncherTab(tab.id)
-                    ? `sidebar-launcher-label-${tab.id}-${workspaceId} sidebar-launcher-agent-count-${workspaceId}`
+                    ? `sidebar-launcher-label-${tab.id}-${workspaceId} sidebar-launcher-agent-count-${workspaceId}${$hasUnreadForegroundAgents$ ? ` sidebar-launcher-agents-unread-${workspaceId}` : ''}`
                     : undefined}
                 ></Button>
                 <div
@@ -1195,8 +1277,7 @@
                       : LAUNCHER_TARGET_SIZE}
                     data-launcher-visible-size={LAUNCHER_VISIBLE_SIZE}
                     data-launcher-step-size={LAUNCHER_STEP_SIZE}
-                    data-launcher-visible-offset={(LAUNCHER_TARGET_SIZE - LAUNCHER_VISIBLE_SIZE) /
-                      2}
+                    data-launcher-visible-offset={LAUNCHER_VISIBLE_OFFSET}
                   >
                     {#if tab.id === 'agents'}
                       <AgentAvatarStack
@@ -1211,39 +1292,47 @@
                       />
                     {:else if tab.id === 'context'}
                       {#each launcherNotes as note, index (note.id)}
-                        {@const panelState = getNotePanelState(note.id as string)}
-                        <SidebarLauncherHoverCard
-                          title={note.title || m.chat_mentions_untitledNote_label()}
-                          rows={[{ text: getNoteLauncherPreview(note) }]}
-                          emptyText="Empty note"
-                          kind="note"
-                          gridPosition="start"
-                          open={openLauncherHoverKey === `note:${note.id}`}
-                          onOpenChange={(open) =>
-                            handleLauncherHoverOpenChange(`note:${note.id}`, open)}
+                        {@const isSpec = isSpecNote(note.id as string)}
+                        <div
+                          class={isSpec ? 'flex h-9 items-center' : 'contents'}
+                          data-context-spec-summary-row={isSpec ? 'true' : undefined}
                         >
-                          <Button
-                            variant="plain"
-                            class={LAUNCHER_ICON_BUTTON_CLASS}
-                            onclick={() => handleOpenNoteInPanel(note.id as string)}
-                            aria-label={note.title || m.chat_mentions_untitledNote_label()}
-                            data-sidebar-context={note.id}
-                            data-launcher-leading-item={index === 0 ? 'true' : undefined}
-                            data-launcher-preview-item
+                          <SidebarLauncherHoverCard
+                            title={note.title || m.chat_mentions_untitledNote_label()}
+                            rows={[{ text: getNoteLauncherPreview(note) }]}
+                            emptyText="Empty note"
+                            kind="note"
+                            gridPosition="start"
+                            delayDuration={launcherHoverDelay}
+                            open={openLauncherHoverKey === `note:${note.id}`}
+                            onOpenChange={(open) =>
+                              handleLauncherHoverOpenChange(`note:${note.id}`, open)}
                           >
-                            <span class={LAUNCHER_GLYPH_CLASS} data-sidebar-launcher-glyph>
-                              <ResourceIconTile
-                                kind="note"
-                                class="transition-colors group-hover/preview:bg-background/70! group-focus-visible/preview:bg-background/80!"
-                              />
-                              <OpenPanelIndicator
-                                count={panelState.count}
-                                active={panelState.isActive}
-                                overlay
-                              />
-                            </span>
-                          </Button>
-                        </SidebarLauncherHoverCard>
+                            <Button
+                              variant="plain"
+                              class={LAUNCHER_ICON_BUTTON_CLASS}
+                              onclick={(event) => handleOpenNoteInPanel(note.id as string, event)}
+                              aria-label={note.title || m.chat_mentions_untitledNote_label()}
+                              data-sidebar-context={note.id}
+                              data-launcher-leading-item={index === 0 ? 'true' : undefined}
+                              data-launcher-preview-item
+                            >
+                              <span class={LAUNCHER_GLYPH_CLASS} data-sidebar-launcher-glyph>
+                                <ResourceIconTile
+                                  kind="note"
+                                  class="transition-colors group-hover/preview:bg-background/70! group-focus-visible/preview:bg-background/80!"
+                                />
+                              </span>
+                            </Button>
+                          </SidebarLauncherHoverCard>
+                          {#if isSpec}
+                            <span
+                              class="pointer-events-none whitespace-nowrap text-[11px] leading-none font-medium text-muted-foreground /* a11y-ignore: product requires an 11px compact Context summary */"
+                              data-context-capability-summary
+                              >{m.workspace_multiSelectSidebar_contextSummary_label()}</span
+                            >
+                          {/if}
+                        </div>
                       {/each}
                       {#if launcherNoteOverflowCount > 0}
                         <Button
@@ -1280,24 +1369,17 @@
                         tab.id === 'changes' ? 'min-w-0 flex-1' : '',
                       )}>{tab.label}</span
                     >
-                    {#if tab.id === 'changes' && $activePrSummary$}
-                      {@const pr = $activePrSummary$}
-                      <Button
-                        variant="plain"
-                        size="icon"
-                        class="pointer-events-auto relative z-20 ml-auto size-6 shrink-0 cursor-pointer rounded text-muted-foreground transition-colors hover:bg-background/70 hover:text-foreground focus-visible:bg-background/80 focus-visible:text-foreground"
-                        aria-label={pr.actionLabel}
-                        title={pr.actionTooltip}
-                        data-sidebar-pr-link
-                        data-sidebar-pr-url={pr.url}
-                        onpointerdown={(event) => event.stopPropagation()}
-                        onclick={(event) => {
-                          event.stopPropagation();
-                          handleLink(pr.url, { workspaceId: WorkspaceId(workspaceId) });
-                        }}
-                      >
-                        <Fa icon={faCodePullRequest} class="size-4!" />
-                      </Button>
+                    {#if tab.id === 'agents' && $hasUnreadForegroundAgents$}
+                      <span
+                        id={`sidebar-launcher-agents-unread-${workspaceId}`}
+                        class="mr-auto size-1.5 shrink-0 rounded-full bg-[hsl(var(--workspace-status-unread))] forced-colors:bg-[CanvasText]"
+                        role="img"
+                        aria-label={m.workspace_multiSelectSidebar_agentsUnread_ariaLabel()}
+                        data-sidebar-agents-unread-dot
+                      ></span>
+                    {/if}
+                    {#if tab.id === 'changes' && workspacePrRows.length > 0}
+                      <SidebarPrDropdown rows={workspacePrRows} {workspaceId} class="ml-auto" />
                     {/if}
                     {#if tab.id === 'agents'}
                       <span id={`sidebar-launcher-agent-count-${workspaceId}`} class="sr-only">

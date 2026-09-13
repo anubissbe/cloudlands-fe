@@ -6,8 +6,15 @@
  */
 
 import { z } from 'zod';
+import { BROWSER_PROTOCOLS } from '../shared/constants';
 import { FirstVisitStateSchema, WorkspaceStatusMessageSchema } from '../shared/schemas';
 import { isValidWorkspaceId } from '../shared/types/branded-ids';
+import {
+  CONNECTION_ACCENTS,
+  DETECTED_DEVICE_KINDS,
+  DEVICE_KINDS,
+  type DeviceKind,
+} from '../shared/types/connections';
 // IPC allow-list of workspace event-type strings.
 //
 // Mirrors the runtime values declared in `features/events/types.ts`
@@ -34,6 +41,7 @@ export const WORKSPACE_EVENT_TYPE_LITERALS = [
   'agent:created',
   'agent:deleted',
   'agent:restored',
+  'agent:retired',
   'agent:renamed',
   'agent:idle',
   'agent:status-changed',
@@ -126,7 +134,6 @@ const WorkspaceIdSchema = z
     isValidWorkspaceId,
     'Invalid workspace ID format (expected slug like "amber-forest" or "amber-forest-2", UUID, or __root__)',
   );
-const AgentIdSchema = z.string().min(1, 'Agent ID is required');
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
 const SessionIdSchema = z.string().min(1, 'Session ID is required');
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
@@ -194,8 +201,18 @@ export const WorkspaceCreateSchema = z.object({
       specialist: z.string().optional(), // Specialist or team coordinator ID (flexible to support any specialist)
       behaviorPrompt: z.string().optional(), // Custom behavior instructions (from team coordinator or specialist)
       contextReferences: z.array(z.any()).optional(),
+      // Inline arm (data + mimeType) or attachment-registry reference arm
+      // (attachmentId, monorepo#3338) — exactly one of data / attachmentId
+      // per block, enforced daemon-side.
       imageBlocks: z
-        .array(z.object({ type: z.literal('image'), data: z.string(), mimeType: z.string() }))
+        .array(
+          z.object({
+            type: z.literal('image'),
+            data: z.string().optional(),
+            mimeType: z.string().optional(),
+            attachmentId: z.string().optional(),
+          }),
+        )
         .optional(),
       metadata: z.record(z.any()).optional(),
     })
@@ -295,10 +312,6 @@ export const WorkspaceImportSchema = z.object({
 
 export const WorkspaceListSchema = z.object({
   lite: z.boolean().optional(), // When true, skip heavy computations to avoid blocking other IPC operations
-});
-
-export const WorkspaceTestWatcherSchema = z.object({
-  workspaceId: WorkspaceIdSchema,
 });
 
 export const WorkspaceGetRecentSchema = z.object({});
@@ -497,67 +510,6 @@ export const FileGetDirectoryStatusSchema = z.object({
 });
 
 // ============================================================================
-// Git Schemas
-// ============================================================================
-
-export const GitIsRepositorySchema = z.object({
-  path: z.string().min(1, 'Path is required'),
-});
-
-export const GitStatusSchema = z.object({
-  workspaceId: WorkspaceIdSchema,
-});
-
-export const GitStageSchema = z.object({
-  workspaceId: WorkspaceIdSchema,
-  paths: z.array(z.string()).min(1, 'At least one path is required'),
-});
-
-export const GitUnstageSchema = z.object({
-  workspaceId: WorkspaceIdSchema,
-  paths: z.array(z.string()).min(1, 'At least one path is required'),
-});
-
-export const GitCommitSchema = z.object({
-  workspaceId: WorkspaceIdSchema,
-  message: z.string().min(1, 'Commit message is required'),
-  description: z.string().optional(),
-});
-
-export const GitPushSchema = z.object({
-  workspaceId: WorkspaceIdSchema,
-  force: z.boolean().optional(),
-});
-
-export const GitPullSchema = z.object({
-  workspaceId: WorkspaceIdSchema,
-});
-
-export const GitDiffSchema = z.object({
-  workspaceId: WorkspaceIdSchema,
-  paths: z.array(z.string()).optional(),
-  staged: z.boolean().optional(),
-});
-
-export const GitHistorySchema = z.object({
-  workspaceId: WorkspaceIdSchema,
-  limit: z.number().optional(),
-  since: z.string().optional(),
-  baseRef: z.string().optional(),
-  baseCommitSha: z.string().optional(),
-});
-
-export const GitRemoveLockSchema = z.object({
-  workspaceId: WorkspaceIdSchema,
-});
-
-export const GitRenameBranchSchema = z.object({
-  workspaceId: WorkspaceIdSchema,
-  oldBranchName: z.string().min(1, 'Old branch name is required'),
-  newBranchName: z.string().min(1, 'New branch name is required'),
-});
-
-// ============================================================================
 // Config Schemas
 // ============================================================================
 
@@ -569,48 +521,6 @@ export const ConfigSetSchema = z.object({
   key: z.string().min(1, 'Key is required'),
   value: z.any(),
 });
-
-// ============================================================================
-// Agent schemas retired with the daemon IPC migration: agent CRUD, send,
-// queue, and rename flows validate daemon-side (agent.* RPCs, PROTOCOL.md
-// §5.5); the legacy agent:* / agent:backend:* main-process handlers were
-// deleted along with their request schemas.
-// ============================================================================
-
-// ============================================================================
-// MCP Schemas
-// ============================================================================
-
-// Optimistic workspace IDs have format: optimistic-{timestamp}-{random}
-const OptimisticWorkspaceIdSchema = z
-  .string()
-  .regex(/^optimistic-\d+-[a-z0-9]+$/i, 'Invalid optimistic workspace ID format');
-
-// Some MCP IPC calls can occur while a workspace is still being created.
-// Allow either a real UUID workspaceId or an optimistic ID and resolve it in main.
-const McpWorkspaceIdSchema = z.union([WorkspaceIdSchema, OptimisticWorkspaceIdSchema]);
-
-export const McpTransitionWorkspaceSchema = z.object({
-  optimisticId: OptimisticWorkspaceIdSchema,
-  realId: WorkspaceIdSchema,
-});
-
-export const McpCallToolSchema = z.object({
-  workspaceId: McpWorkspaceIdSchema,
-  toolName: z.string().min(1, 'Tool name is required').max(100, 'Tool name too long'),
-  arguments: z.record(z.any()).optional(),
-});
-
-export const McpListToolsSchema = z.object({
-  workspaceId: McpWorkspaceIdSchema,
-});
-
-export const McpCreateServerSchema = z.object({
-  workspaceId: WorkspaceIdSchema,
-  workspacePath: z.string().min(1, 'Workspace path is required'),
-});
-
-export const McpGetStatusSchema = z.object({});
 
 // ============================================================================
 // Config Schemas (Additional)
@@ -633,24 +543,6 @@ const EventActorSchema = z.object({
     .transform((v) => v || 'Unknown'),
   email: z.string().email().optional(),
   metadata: z.record(z.any()).optional(),
-});
-
-// Event filter schema
-const EventFilterSchema = z.object({
-  field: z.string(),
-  operator: z.enum([
-    'equals',
-    'not_equals',
-    'greater_than',
-    'less_than',
-    'starts_with',
-    'ends_with',
-    'contains',
-    'matches',
-    'in',
-    'not_in',
-  ]),
-  value: z.any(), // value is required, not optional
 });
 
 export const EventsEmitSchema = z.object({
@@ -699,212 +591,8 @@ export const EventsGetLastEventSchema = z.object({
 
 export const EventsGetStatisticsSchema = z.object({});
 
-// New Events schemas for handlers that need object parameters
-export const EventsInitializeSchema = z.object({
-  workspaceId: WorkspaceIdSchema,
-});
-
-export const EventsQueryHandlerSchema = z.object({
-  workspaceId: WorkspaceIdSchema,
-  filters: z.array(EventFilterSchema).nullable().optional(),
-  limit: z.number().optional(),
-});
-
-export const EventsGetRecentFilesHandlerSchema = z.object({
-  workspaceId: WorkspaceIdSchema,
-  limit: z.number().default(10).optional(),
-});
-
-export const EventsGetAgentActivityHandlerSchema = z.object({
-  workspaceId: WorkspaceIdSchema,
-  minutesAgo: z.number().default(30).optional(),
-});
-
-export const EventsGetSummaryHandlerSchema = z.object({
-  workspaceId: WorkspaceIdSchema,
-  minutesAgo: z.number().default(60).optional(),
-});
-
-export const EventsGetStatsHandlerSchema = z.object({
-  workspaceId: WorkspaceIdSchema,
-});
-
-export const EventsClearHandlerSchema = z.object({
-  workspaceId: WorkspaceIdSchema,
-});
-
-export const EventsSubscribeHandlerSchema = z.object({
-  workspaceId: WorkspaceIdSchema,
-  filters: z.array(EventFilterSchema).nullable().optional(),
-});
-
-export const EventsUnsubscribeHandlerSchema = z.object({
-  subscriptionId: z.string().min(1, 'Subscription ID is required'),
-});
-
-// ============================================================================
-// Git Tracking Schemas
-// ============================================================================
-
-export const GitTrackingGetStateSchema = z.object({
-  workspaceId: WorkspaceIdSchema,
-});
-
-export const GitTrackingGetSyncStatusSchema = z.object({
-  workspaceId: WorkspaceIdSchema,
-});
-
-export const GitTrackingSyncSchema = z.object({
-  workspaceId: WorkspaceIdSchema,
-});
-
-export const GitTrackingGetFileDiffSchema = z.object({
-  workspaceId: WorkspaceIdSchema,
-  filePath: z.string().min(1, 'File path is required'),
-  staged: z.boolean(),
-});
-
-export const GitTrackingIsGithubAuthenticatedSchema = z.object({});
-
-export const GitTrackingGetGithubBranchesSchema = z.object({
-  owner: z.string().min(1, 'Owner is required'),
-  repo: z.string().min(1, 'Repository is required'),
-});
-
-export const GitTrackingGetPullRequestsSchema = z.object({
-  owner: z.string().min(1, 'Owner is required'),
-  repo: z.string().min(1, 'Repository is required'),
-  options: z.any().optional(),
-  force: z.boolean().optional(),
-});
-
-export const GitTrackingSearchPullRequestsSchema = z.object({
-  owner: z.string().min(1, 'Owner is required'),
-  repo: z.string().min(1, 'Repository is required'),
-  options: z
-    .object({
-      filter: z.enum(['all', 'assigned', 'created', 'review-requested', 'involves']).optional(),
-      state: z.enum(['open', 'closed']).optional(),
-      query: z.string().optional(),
-      nextToken: z.string().optional(),
-      per_page: z.number().optional(),
-    })
-    .optional(),
-  force: z.boolean().optional(),
-});
-
-export const GitTrackingGetPullRequestSchema = z.object({
-  owner: z.string().min(1, 'Owner is required'),
-  repo: z.string().min(1, 'Repository is required'),
-  number: z.number().int().positive('Pull request number must be positive'),
-  force: z.boolean().optional(),
-});
-
-export const GitTrackingCreatePullRequestSchema = z.object({
-  owner: z.string().min(1, 'Owner is required'),
-  repo: z.string().min(1, 'Repository is required'),
-  options: z.any(),
-});
-
-export const GitTrackingGetCheckRunsSchema = z.object({
-  owner: z.string().min(1, 'Owner is required'),
-  repo: z.string().min(1, 'Repository is required'),
-  commitSha: z.string().min(1, 'Commit SHA is required'),
-});
-
-export const GitTrackingGetPRReviewsSchema = z.object({
-  owner: z.string().min(1, 'Owner is required'),
-  repo: z.string().min(1, 'Repository is required'),
-  number: z.number().int().positive('Pull request number must be positive'),
-});
-
-export const GitTrackingGetGithubIssuesSchema = z.object({
-  owner: z.string().min(1, 'Owner is required'),
-  repo: z.string().min(1, 'Repository is required'),
-  options: z.any().optional(),
-});
-
-export const GitTrackingSearchGithubIssuesSchema = z.object({
-  owner: z.string().min(1, 'Owner is required'),
-  repo: z.string().min(1, 'Repository is required'),
-  options: z
-    .object({
-      filter: z.enum(['all', 'assigned', 'created', 'review-requested', 'involves']).optional(),
-      state: z.enum(['open', 'closed']).optional(),
-      query: z.string().optional(),
-      nextToken: z.string().optional(),
-      per_page: z.number().optional(),
-    })
-    .optional(),
-});
-
-export const GitTrackingGetRemoteUrlSchema = z.object({
-  repoPath: z.string().min(1, 'Repository path is required'),
-});
-
-// ============================================================================
-// Agent Testing Schemas
-// ============================================================================
-
-export const AgentTestingRunSchema = z.object({
-  type: z.enum(['ipc', 'component', 'integration', 'unit', 'e2e']),
-  workspaceId: z.string().min(1, 'Workspace ID is required'),
-  agentId: z.string().min(1, 'Agent ID is required'),
-  tests: z.array(z.any()),
-  options: z
-    .object({
-      coverage: z.boolean().optional(),
-      parallel: z.boolean().optional(),
-      timeout: z.number().optional(),
-      outputPath: z.string().optional(),
-    })
-    .optional(),
-});
-
-export const AgentTestingGetReportSchema = z.object({
-  requestId: z.string().min(1, 'Request ID is required'),
-});
-
-export const AgentTestingGetAgentReportsSchema = z.object({
-  agentId: z.string().min(1, 'Agent ID is required'),
-});
-
-export const AgentTestingCleanupSchema = z.object({
-  daysToKeep: z.number().min(0, 'Days to keep must be non-negative'),
-});
-
-// ============================================================================
-// System Schemas
-// ============================================================================
-
-export const SystemGetInfoSchema = z.object({});
-
-export const SystemGetVersionSchema = z.object({});
-
 export const SystemWriteClipboardSchema = z.object({
   text: z.string(),
-});
-
-export const SystemOpenExternalSchema = z.object({
-  url: z.string().url('Invalid URL'),
-});
-
-// ============================================================================
-// Terminal Schemas
-// ============================================================================
-
-export const TerminalCreateSchema = z.object({
-  workspaceId: WorkspaceIdSchema,
-  cwd: z.string().optional(),
-});
-
-export const TerminalExecuteSchema = z.object({
-  terminalId: z.string().min(1, 'Terminal ID is required'),
-  command: z.string().min(1, 'Command is required'),
-});
-
-export const TerminalCloseSchema = z.object({
-  terminalId: z.string().min(1, 'Terminal ID is required'),
 });
 
 // Professional Terminal Schemas
@@ -962,22 +650,7 @@ export const TerminalCreateWithCommandSchema = z.object({
    * Defaults to `false` (existing auto-run behavior).
    */
   pasteOnly: z.boolean().optional(),
-});
-
-// Legacy Terminal Schemas
-// ============================================================================
-// Agent Context Schemas
-// ============================================================================
-
-export const AgentContextGetSchema = z.object({
-  agentId: AgentIdSchema,
-  workspaceId: WorkspaceIdSchema,
-});
-
-export const AgentContextSetSchema = z.object({
-  agentId: AgentIdSchema,
-  workspaceId: WorkspaceIdSchema,
-  context: z.any(),
+  interactive: z.boolean().optional(),
 });
 
 export const AgentContextUpdateSchema = z.object({
@@ -991,78 +664,6 @@ export const AgentContextUpdateSchema = z.object({
 export const AgentContextGetByWorkspaceSchema = z.string().min(1, 'Workspace ID is required');
 
 export const AgentContextGetBySessionSchema = z.string().min(1, 'Session ID is required');
-
-// ============================================================================
-// Notes Schemas
-// ============================================================================
-
-export const NotesListSchema = z.object({
-  workspaceId: WorkspaceIdSchema,
-  summariesOnly: z.boolean().optional(),
-});
-
-export const NotesGetSchema = z.object({
-  noteId: z.string().min(1, 'Note ID is required'),
-  workspaceId: WorkspaceIdSchema,
-});
-
-export const NotesCreateSchema = z.object({
-  workspaceId: WorkspaceIdSchema,
-  title: z.string().min(1, 'Title is required'),
-  content: z.string(), // Allow empty content for new notes
-  contentType: z.string().optional(),
-  tags: z.array(z.string()).optional(),
-  parentId: z.string().optional(),
-  visibility: z.string().optional(),
-  id: z.string().optional(),
-  isDefault: z.boolean().optional(),
-  isPinned: z.boolean().optional(),
-});
-
-export const NotesUpdateSchema = z.object({
-  id: z.string().min(1, 'Note ID is required'),
-  workspaceId: WorkspaceIdSchema,
-  content: z.string().optional(),
-  title: z.string().optional(),
-  tags: z.array(z.string()).optional(),
-  isPinned: z.boolean().optional(),
-  isArchived: z.boolean().optional(),
-  visibility: z.string().optional(),
-  metadata: z.record(z.any()).optional(),
-  isUserAction: z.boolean().optional(),
-});
-
-export const NotesDeleteSchema = z.object({
-  id: z.string().min(1, 'Note ID is required'),
-  workspaceId: WorkspaceIdSchema,
-});
-
-export const NotesRestoreSpecSchema = z.object({
-  workspaceId: WorkspaceIdSchema,
-  versionId: z.string().min(1, 'Version ID is required'),
-});
-
-export const NotesBatchListSchema = z.object({
-  workspaceIds: z.array(WorkspaceIdSchema).min(1, 'At least one workspace ID is required'),
-});
-
-// ============================================================================
-// Assets Schemas
-// ============================================================================
-
-export const AssetsGetSchema = z.object({
-  workspaceId: WorkspaceIdSchema,
-  assetId: z.string().min(1, 'Asset ID is required'),
-});
-
-export const AssetsDeleteSchema = z.object({
-  workspaceId: WorkspaceIdSchema,
-  assetId: z.string().min(1, 'Asset ID is required'),
-});
-
-export const AssetsListSchema = z.object({
-  workspaceId: WorkspaceIdSchema,
-});
 
 // ============================================================================
 // System Schemas
@@ -1105,6 +706,7 @@ export const WindowCreateSchema = z.object({
 
 export const WindowOpenNewSchema = z.object({
   route: z.string().optional(),
+  requestId: z.string().min(1).max(256).optional(),
 });
 
 export const WindowSetThemeSchema = z.object({
@@ -1151,25 +753,24 @@ export const DialogOpenSchema = z.object({
 export const ShellOpenExternalSchema = z.object({
   url: z.string().refine(
     (val) => {
-      // Allow http, https, mailto, and other common protocols
-      return /^(https?|mailto|tel|file):/.test(val);
+      // Allow http, https, mailto, tel, file — plus the exact hardcoded OS
+      // deep links in BROWSER_PROTOCOLS.EXTERNAL_EXACT (e.g. the macOS Input
+      // Monitoring System Settings pane). Full-string match only: the
+      // x-apple.systempreferences: scheme is never allowlisted wholesale.
+      return (
+        /^(https?|mailto|tel|file):/.test(val) || BROWSER_PROTOCOLS.EXTERNAL_EXACT.includes(val)
+      );
     },
-    { message: 'Invalid URL format - must start with http, https, mailto, tel, or file' },
+    {
+      message:
+        'Invalid URL format - must start with http, https, mailto, tel, or file, or be an allowlisted OS settings deep link',
+    },
   ),
 });
 
 export const ShellShowItemInFolderSchema = z.object({
   path: z.string().min(1, 'Path is required'),
 });
-
-// VSCODE_CHANNELS schemas
-export const VscodeOpenSchema = z.union([
-  z.string().min(1, 'Path is required'),
-  z.object({
-    folder: z.string().min(1, 'Folder path is required'),
-    file: z.string().min(1, 'File path is required'),
-  }),
-]);
 
 export const VscodeOpenGitDiffSchema = z.object({
   filePath: z.string().min(1, 'File path is required'),
@@ -1209,26 +810,14 @@ export const XcodeOpenSchema = z.union([
   }),
 ]);
 
-// SETTINGS_CHANNELS schemas
-export const SettingsGetSchema = z.object({
-  key: z.string().min(1, 'Settings key is required'),
-});
-
-export const SettingsSetSchema = z.object({
-  key: z.string().min(1, 'Settings key is required'),
-  value: z.any(),
-});
-
-export const SettingsUpdateSchema = z.object({
-  settings: z.record(z.any()),
-});
-
-// WEBSOCKET_API_CHANNELS schemas
-export const WebSocketApiSetEnabledSchema = z.object({
-  enabled: z.boolean(),
-});
-
 // USER_MCP_CHANNELS schemas
+export const UserMcpAuthenticateSchema = z.object({
+  serverId: z.string().min(1, 'Server ID is required'),
+  // Advisory only: the handler resolves the OAuth URL from the daemon record
+  // by `serverId` and rejects a renderer URL that disagrees with it.
+  url: z.string().url('A valid MCP server URL is required').optional(),
+});
+
 export const UserMcpCheckAuthSchema = z.object({
   url: z.string().min(1, 'URL is required'),
   name: z.string().optional(), // Server name for OAuth token lookup
@@ -1316,15 +905,6 @@ export const WorkspaceSearchInFilesSchema = z.object({
   workspaceId: z.string().min(1, 'Workspace ID is required'),
   query: z.string().min(1, 'Search query is required'),
   limit: z.number().optional(),
-});
-
-export const WorkspaceTriggerCheckSchema = z.object({
-  workspaceId: z.string().min(1, 'Workspace ID is required'),
-  reason: z.string().optional(),
-});
-
-export const DeepLinkValidateWorkspaceSchema = z.object({
-  id: z.string().min(1, 'Workspace ID is required'),
 });
 
 // ============================================================================
@@ -1430,22 +1010,6 @@ export const UserRulesGetCombinedPromptSchema = z.object({
 });
 
 // ============================================================================
-// Workspace Info Schema
-// ============================================================================
-
-export const WorkspaceGetInfoSchema = z.object({
-  workspaceId: WorkspaceIdSchema,
-});
-
-// ============================================================================
-// File Open Schema
-// ============================================================================
-
-export const FileOpenSchema = z.object({
-  path: z.string().min(1, 'Path is required'),
-});
-
-// ============================================================================
 // Specialists Schemas
 // ============================================================================
 
@@ -1471,6 +1035,10 @@ export const SpecialistWriteSchema = z
     modelOptions: z
       .array(
         z.object({
+          provider: z
+            .string()
+            .refine((value) => value.trim() !== '', 'Provider must be non-empty when present')
+            .optional(),
           model: z.string().min(1, 'Model is required'),
           hint: z.string(),
           reasoningEffort: z.string().optional(),
@@ -1478,6 +1046,9 @@ export const SpecialistWriteSchema = z
       )
       .optional(),
     reasoningEffort: z.string().optional(),
+    role: z.enum(['orchestrator', 'internal']).optional(),
+    teamAgents: z.array(z.string().min(1, 'Team agent id must be non-empty')).optional(),
+    icon: z.string().optional(),
     behaviorPrompt: z.string().min(1, 'Behavior prompt is required'),
     scope: z.enum(['user', 'project']).optional(),
     workspacePath: z.string().optional(),
@@ -1490,30 +1061,6 @@ export const SpecialistWriteSchema = z
 export const SpecialistExportBuiltinSchema = z.object({
   id: z.string().min(1, 'Built-in specialist ID is required'),
 });
-
-// ============================================================================
-// Auggie MCP Setup Schemas
-// ============================================================================
-
-export const AuggieMcpSetupClaudeCodeSchema = z.object({}).strict();
-
-export const AuggieMcpSetupCodexSchema = z.object({}).strict();
-
-export const AuggieMcpSetupOpenCodeSchema = z.object({}).strict();
-
-export const AuggieMcpSetupDroidSchema = z.object({}).strict();
-
-// ============================================================================
-// Auggie MCP Check Schemas
-// ============================================================================
-
-export const AuggieMcpCheckClaudeCodeSchema = z.object({}).strict();
-
-export const AuggieMcpCheckCodexSchema = z.object({}).strict();
-
-export const AuggieMcpCheckOpenCodeSchema = z.object({}).strict();
-
-export const AuggieMcpCheckDroidSchema = z.object({}).strict();
 
 // ============================================================================
 // Voice (local OS transcription) Schemas
@@ -1554,20 +1101,97 @@ export const ConnectionsCaptureFingerprintSchema = z.object({
   token: z.string().min(1, 'Token is required'),
 });
 
+const DeviceIconKindSchema: z.ZodType<DeviceKind> = z.enum(DEVICE_KINDS);
+
 export const ConnectionsAddSchema = z.object({
   label: z.string().min(1, 'Label is required'),
+  accent: z.enum(CONNECTION_ACCENTS).nullable().optional(),
+  detectedDeviceKind: z.enum(DETECTED_DEVICE_KINDS).nullable().optional(),
+  deviceIcon: z.union([z.literal('auto'), DeviceIconKindSchema]).optional(),
   host: z.string().min(1, 'Host is required'),
   port: z.number().int().positive('Port must be a positive integer'),
   fingerprint: z.string().min(1, 'Fingerprint is required'),
   token: z.string().min(1, 'Token is required'),
+  /** tc address from the pairing URI's `tc=` (PROTOCOL §12.3); absent = none. */
+  tcAddress: z.string().trim().min(1).optional(),
   /** "Detect all backend IPs" option (#1746); absent = enabled. */
   detectHosts: z.boolean().optional(),
+  /** Per-backend keychain-sync opt-out (spec Phase 2); absent = synced. */
+  syncExcluded: z.boolean().optional(),
+});
+
+export const ConnectionsUpdateSchema = z
+  .object({
+    id: z.string().min(1, 'Connection ID is required'),
+    label: z.string().trim().min(1, 'Label is required'),
+    accent: z.enum(CONNECTION_ACCENTS).nullable(),
+    detectedDeviceKind: z.enum(DETECTED_DEVICE_KINDS).nullable().optional(),
+    deviceIcon: z.union([z.literal('auto'), DeviceIconKindSchema]).optional(),
+    host: z.string().trim().min(1, 'Host is required').optional(),
+    port: z.number().int().min(1).max(65_535).optional(),
+    confirmedFingerprint: z.string().trim().min(1).optional(),
+    detectHosts: z.boolean().optional(),
+    syncExcluded: z.boolean().optional(),
+  })
+  .refine((value) => (value.host === undefined) === (value.port === undefined), {
+    message: 'Host and port must be supplied together',
+  });
+
+export const ConnectionsTestSchema = z.object({
+  id: z.string().min(1, 'Connection ID is required'),
+  host: z.string().trim().min(1, 'Host is required'),
+  port: z.number().int().min(1).max(65_535),
+  token: z.string().min(1, 'Token is required').optional(),
+});
+
+export const ConnectionsRotateSecretSchema = z.object({
+  id: z.string().min(1, 'Connection ID is required'),
+  token: z.string().min(1, 'Token is required'),
+  confirmedFingerprint: z.string().trim().min(1).optional(),
 });
 
 export const ConnectionsForgetSchema = z.object({
   id: z.string().min(1, 'Connection ID is required'),
 });
 
-export const ConnectionsSwitchSchema = z.object({
+export const ConnectionsOpenSchema = z.object({
   id: z.string().min(1, 'Connection ID is required'),
+});
+
+export const ConnectionsUpdateBackendSchema = z.object({
+  id: z.string().min(1, 'Connection ID is required'),
+});
+
+export const ConnectionsSyncGetStateSchema = EmptySchema;
+
+export const ConnectionsSyncSetEnabledSchema = z.object({
+  enabled: z.boolean(),
+});
+
+// Self-publish: no renderer-supplied params on either channel — main gathers
+// everything (token, fingerprint, IPs, port) from `server.pairingInfo` over
+// the local client, so the bearer token never crosses the IPC boundary.
+export const ConnectionsPublishSelfSchema = EmptySchema;
+
+export const ConnectionsSelfPublishedStateSchema = EmptySchema;
+
+export const ConnectionsRefreshSelfSchema = EmptySchema;
+
+export const ConnectionsUnpublishSelfSchema = EmptySchema;
+
+// ============================================================================
+// Quit Confirmation Schemas
+//
+// Renderer → main payloads for the renderer-rendered quit prompt. The payload
+// contract (all four channels) is documented in
+// `src/shared/ipc/quit-confirmation.ts`.
+// ============================================================================
+
+export const QuitConfirmationAckSchema = z.object({
+  requestId: z.string().min(1, 'Request ID is required'),
+});
+
+export const QuitConfirmationResponseSchema = z.object({
+  requestId: z.string().min(1, 'Request ID is required'),
+  proceed: z.boolean(),
 });

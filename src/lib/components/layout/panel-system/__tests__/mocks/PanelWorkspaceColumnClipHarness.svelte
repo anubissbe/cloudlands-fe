@@ -9,7 +9,10 @@
     openTabInNewRootColumn,
     setRestoreStatus,
   } from '$store/renderer/slices/panel-layout/panel-layout-slice';
-  import { selectPanelCanvasWidth } from '$store/renderer/slices/panel-layout/panel-layout-selectors';
+  import {
+    selectPanelCanvasWidth,
+    selectPanelCanvasWidthSource,
+  } from '$store/renderer/slices/panel-layout/panel-layout-selectors';
   import type { PanelTabType } from '$store/renderer/slices/panel-layout/panel-layout-types';
 
   appStore.init();
@@ -51,6 +54,7 @@
   let layoutMountKey = $state(0);
   const LAYOUT_ID = `column-clip-check-${scenario}-${panelTypes?.join('-') ?? 'default'}`;
   const layoutCanvasWidth$ = selectPanelCanvasWidth(LAYOUT_ID);
+  const layoutCanvasWidthSource$ = selectPanelCanvasWidthSource(LAYOUT_ID);
   const agentTab = {
     type: 'agent' as const,
     title: 'Ada',
@@ -150,11 +154,12 @@
 {/if}
 
 {#if mode === 'contained'}
-  <!-- Mirrors WorkspaceColumnsView: column div (stackWidth) > section (overflow-hidden)
-       > WorkspaceLayout row (fixed sidebar + flex-1 content) > PanelLayout. -->
+  <!-- Mirrors the contained workspace shell: fixed sidebar + flex-1 PanelLayout. -->
   <div
-    data-testid="workspace-column"
+    data-testid="panel-column"
     data-scenario={scenario}
+    data-persisted-canvas-width={$layoutCanvasWidth$ ?? 'null'}
+    data-canvas-width-source={$layoutCanvasWidthSource$ ?? 'null'}
     style:width={`${stackWidth}px`}
     style:zoom={zoomFactor}
     class="h-96 shrink-0 overflow-hidden rounded-md bg-sidebar"
@@ -182,8 +187,10 @@
   <!-- Mirrors tab view: app frame row (pl-2) > fixed sidebar > flex-1 content
        > uncontained PanelLayout (viewport sizing, overflow-x-auto inset). -->
   <div
-    data-testid="workspace-column"
+    data-testid="panel-column"
     data-scenario={scenario}
+    data-persisted-canvas-width={$layoutCanvasWidth$ ?? 'null'}
+    data-canvas-width-source={$layoutCanvasWidthSource$ ?? 'null'}
     style:width={`${stackWidth}px`}
     style:zoom={zoomFactor}
     class="flex h-96 min-h-0 shrink-0 overflow-hidden pl-2"

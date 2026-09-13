@@ -28,6 +28,7 @@
   import { createTranscriptQuery } from '$lib/utils/palette-transcript-search';
   import { createLogger } from '$lib/utils/client-logger';
   import { m } from '$shared/paraglide/messages.js';
+  import { isCmdClickModifier } from '$shared/utils/link-helpers';
 
   import { selectBrowserRecentUrls } from '$store/renderer/slices/browser/browser-selectors';
   import { initBrowserWorkspace } from '$store/renderer/slices/browser/browser-slice';
@@ -38,7 +39,6 @@
   import { dispatchWindowEvent } from '$lib/utils/window-events';
   import { invoke } from '$lib/electron-bridge';
   import { IPC_CHANNELS } from '$shared/ipc-registry';
-  import { togglePanelOpenMode } from '$store/renderer/slices/user-preferences/user-preferences-slice';
   import {
     openWorkspaceBrowser,
     openWorkspaceNote,
@@ -46,8 +46,8 @@
   import {
     commandPaletteNewFileRequested,
     openAgentTabRequested,
-    openTerminalTabRequested,
   } from '$store/renderer/slices/app-layout/app-layout-slice';
+  import { openTab } from '$store/renderer/slices/panel-layout/panel-layout-slice';
   import {
     resetOnboarding,
     setOnboardingFullFlowRequested,
@@ -91,8 +91,6 @@
     getWorkspaceActivityDisplayTime,
   } from '$shared/utils/workspace-activity-time';
   import { store as appStore } from '$store/renderer/store';
-  import { selectWorkspaceViewMode } from '$store/renderer/slices/tab-state/tab-state-selectors';
-  import { toggleWorkspaceViewModeWithTransition } from '$features/workspace/workspace-view-mode-action';
 
   const logger = createLogger('CommandPalette');
 
@@ -120,8 +118,7 @@
 
   let searchQuery = $state('');
   const workspaceItems = selectWorkspaceItems();
-  const workspaceViewMode$ = selectWorkspaceViewMode();
-  let commands = $derived(COMMAND_PALETTE_COMMANDS($workspaceViewMode$));
+  const commands = COMMAND_PALETTE_COMMANDS;
   const currentChanges$ = selectCurrentChanges(workspaceIdStore);
   const workspaceAgents$ = selectAllWorkspaceAgents(workspaceIdStore);
   const allNotes$ = selectAllNotes(workspaceIdStore);
@@ -162,7 +159,7 @@
     if (!workspaceId) return [];
 
     return $workspaceAgents$
-      .filter((s) => !s.id?.startsWith('terminal-'))
+      .filter((s) => !s.id?.startsWith('terminal-') && !s.retiredAt)
       .map((s) => {
         // Get the latest message content
         const messages = s.messages || [];
@@ -481,6 +478,7 @@
             : undefined,
           _workspace: true as const,
           _time: activityTime > 0 ? formatRelativeTime(new Date(activityTime)) : '',
+          _activityTime: activityTime,
         };
       });
 
@@ -646,7 +644,7 @@
         return;
       }
       // Cmd+Enter opens in adjacent panel
-      const openInAdjacentPanel = e.metaKey || e.ctrlKey;
+      const openInAdjacentPanel = isCmdClickModifier({ event: e });
       const selectedItem = searchResults[selectedIndex];
       if (isSelectableResult(selectedItem)) {
         selectItem(selectedItem, { openInAdjacentPanel });
@@ -719,7 +717,14 @@
           break;
         case 'terminal':
           if (workspaceId) {
-            appStore.dispatch(openTerminalTabRequested(workspaceId, { terminalId: item.id }));
+            appStore.dispatch(
+              openTab(workspaceId, {
+                type: 'terminal',
+                title: m.layout_tabTypes_terminal_title(),
+                terminalId: item.id,
+                closable: true,
+              }),
+            );
           }
           break;
         case 'browser':
@@ -802,12 +807,6 @@
         return true;
       case 'open-usage-stats':
         appStore.dispatch(setStatsOverlayOpen(true));
-        return true;
-      case 'workspace-view-mode':
-        void toggleWorkspaceViewModeWithTransition();
-        return true;
-      case 'toggle-panel-open-mode':
-        appStore.dispatch(togglePanelOpenMode());
         return true;
       default:
         return true;

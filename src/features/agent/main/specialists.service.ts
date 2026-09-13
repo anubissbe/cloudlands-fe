@@ -1,7 +1,8 @@
 /**
  * Specialists Service (BACKEND ONLY)
  *
- * Provides access to specialist configurations for the InstructionService.
+ * Provides access to specialist configurations, formatted for the daemon and
+ * the renderer IPC surface.
  * Reads specialists from (in priority order):
  * 1. User file-based specialists (~/.intent/specialists/*.md) - highest priority
  * 2. Bundled specialists (resources/specialists/*.md)
@@ -29,6 +30,7 @@ import {
 import {
   mergeSpecialistsByPriority,
   type SpecialistFile,
+  type SpecialistRole,
 } from '../../../shared/specialist-file-types';
 import { isGitHubConfigured } from '../../../main/utils/github-auth-status';
 import { createCache } from '../../../main/utils/cache';
@@ -37,22 +39,6 @@ const logger = new Logger('SpecialistsService');
 
 // Cached GitHub auth status for synchronous filtering
 let isGitHubAuthenticated = false;
-
-// Wave 2: CustomSpecialist type retained for migration compatibility only.
-// All active specialist resolution now goes through file-based system.
-export interface CustomSpecialist {
-  id: string;
-  name: string;
-  description: string;
-  codingAgent?: string;
-  model: string;
-  behaviorPrompt: string;
-  /**
-   * Optional short reminder of critical constraints.
-   * If not provided, will be auto-generated from behaviorPrompt.
-   */
-  roleReminder?: string;
-}
 
 export interface EffectiveSpecialist {
   id: string;
@@ -73,6 +59,12 @@ export interface EffectiveSpecialist {
    * May be explicit (from config) or auto-generated from behaviorPrompt.
    */
   roleReminder?: string;
+  /** Orchestration role (PROTOCOL §5.11 `role`); undefined = standard. */
+  role?: SpecialistRole;
+  /** Specialist ids the orchestrator delegates to (advisory/render-only). */
+  teamAgents?: string[];
+  /** Built-in avatar design id; unknown/absent degrades to the fallback. */
+  icon?: string;
 }
 
 let initPromise: Promise<void> | null = null;
@@ -299,25 +291,36 @@ export function getEffectiveSpecialist(
       behaviorPrompt: fileSpecialist.behaviorPrompt,
       isCustomized: fileSpecialist.source !== 'bundled',
       roleReminder: fileSpecialist.frontmatter.roleReminder,
+      role: fileSpecialist.frontmatter.role,
+      teamAgents: fileSpecialist.frontmatter.teamAgents,
+      icon: fileSpecialist.frontmatter.icon,
     };
   }
 
-  // Last resort fallback: hardcoded SPECIALISTS array from constants
-  const hardcoded = getSpecialistById(specialistId);
-  if (hardcoded) {
-    logger.warn(
-      `Using hardcoded fallback for specialist "${specialistId}" — file-based loading may have failed`,
-    );
-    return {
-      id: hardcoded.id,
-      name: hardcoded.name,
-      description: hardcoded.description,
-      codingAgent: resolveSpecialistCodingAgent(hardcoded.codingAgent, providerId),
-      model: hardcoded.defaultModel || '',
-      behaviorPrompt: hardcoded.defaultBehaviorPrompt,
-      isCustomized: false,
-      roleReminder: hardcoded.roleReminder,
-    };
+  // Last resort fallback: hardcoded SPECIALISTS array from constants.
+  // Only consulted when file-based loading yielded nothing — once file
+  // specialists loaded, the loaded set is authoritative and shipped
+  // specialists absent from it must not resurrect (daemon replacement mode).
+  if (getCachedFileSpecialists(workspacePath).length === 0) {
+    const hardcoded = getSpecialistById(specialistId);
+    if (hardcoded) {
+      logger.warn(
+        `Using hardcoded fallback for specialist "${specialistId}" — file-based loading may have failed`,
+      );
+      return {
+        id: hardcoded.id,
+        name: hardcoded.name,
+        description: hardcoded.description,
+        codingAgent: resolveSpecialistCodingAgent(hardcoded.codingAgent, providerId),
+        model: hardcoded.defaultModel || '',
+        behaviorPrompt: hardcoded.defaultBehaviorPrompt,
+        isCustomized: false,
+        roleReminder: hardcoded.roleReminder,
+        role: hardcoded.role,
+        teamAgents: hardcoded.teamAgents,
+        icon: hardcoded.icon,
+      };
+    }
   }
 
   return null;
@@ -333,39 +336,43 @@ export function getAllEffectiveSpecialists(
   providerId?: string,
   workspacePath?: string,
 ): EffectiveSpecialist[] {
-  const seenIds = new Set<string>();
-
   // File-based specialists (project > user > bundled, already merged in cache)
   const fileEffective: EffectiveSpecialist[] = getCachedFileSpecialists(workspacePath).map(
-    (file) => {
-      seenIds.add(file.id);
-
-      return {
-        id: file.id,
-        name: file.frontmatter.name,
-        description: file.frontmatter.description,
-        codingAgent: resolveSpecialistCodingAgent(file.frontmatter.codingAgent, providerId),
-        model: file.frontmatter.model || '',
-        behaviorPrompt: file.behaviorPrompt,
-        isCustomized: file.source !== 'bundled',
-        roleReminder: file.frontmatter.roleReminder,
-      };
-    },
+    (file) => ({
+      id: file.id,
+      name: file.frontmatter.name,
+      description: file.frontmatter.description,
+      codingAgent: resolveSpecialistCodingAgent(file.frontmatter.codingAgent, providerId),
+      model: file.frontmatter.model || '',
+      behaviorPrompt: file.behaviorPrompt,
+      isCustomized: file.source !== 'bundled',
+      roleReminder: file.frontmatter.roleReminder,
+      role: file.frontmatter.role,
+      teamAgents: file.frontmatter.teamAgents,
+      icon: file.frontmatter.icon,
+    }),
   );
 
-  // Last resort fallback: include any hardcoded SPECIALISTS not already covered
-  const hardcodedFallback: EffectiveSpecialist[] = SPECIALISTS.filter(
-    (s) => !seenIds.has(s.id),
-  ).map((s) => ({
-    id: s.id,
-    name: s.name,
-    description: s.description,
-    codingAgent: resolveSpecialistCodingAgent(s.codingAgent, providerId),
-    model: s.defaultModel || '',
-    behaviorPrompt: s.defaultBehaviorPrompt,
-    isCustomized: false,
-    roleReminder: s.roleReminder,
-  }));
+  // Last resort fallback: hardcoded SPECIALISTS, only when file-based loading
+  // yielded nothing. Once file specialists loaded, the loaded set is
+  // authoritative — shipped specialists absent from it must not resurrect
+  // (daemon replacement mode).
+  const hardcodedFallback: EffectiveSpecialist[] =
+    fileEffective.length > 0
+      ? []
+      : SPECIALISTS.map((s) => ({
+          id: s.id,
+          name: s.name,
+          description: s.description,
+          codingAgent: resolveSpecialistCodingAgent(s.codingAgent, providerId),
+          model: s.defaultModel || '',
+          behaviorPrompt: s.defaultBehaviorPrompt,
+          isCustomized: false,
+          roleReminder: s.roleReminder,
+          role: s.role,
+          teamAgents: s.teamAgents,
+          icon: s.icon,
+        }));
 
   if (hardcodedFallback.length > 0) {
     logger.warn(
@@ -387,62 +394,6 @@ export function getAllEffectiveSpecialists(
 }
 
 /**
- * Auto-generate a role reminder from a behavior prompt.
- * Extracts the first meaningful line and optionally the first "Hard Rule" if present.
- */
-function autoGenerateRoleReminder(behaviorPrompt: string): string {
-  if (!behaviorPrompt) return '';
-
-  // Try to extract the first non-header, non-empty line as the core role description
-  const lines = behaviorPrompt.split('\n');
-  let firstMeaningfulLine = '';
-
-  for (const line of lines) {
-    const trimmed = line.trim();
-    // Skip empty lines and markdown headers
-    if (!trimmed || trimmed.startsWith('#')) continue;
-    // Skip lines that are just bold markers
-    if (trimmed.startsWith('**') && trimmed.endsWith('**')) continue;
-    // Found a meaningful line
-    firstMeaningfulLine = trimmed.replace(/^\*\*|\*\*$/g, '').trim();
-    break;
-  }
-
-  // Try to extract the first "Hard Rule" if present
-  const hardRulesMatch = behaviorPrompt.match(/##\s*Hard Rules[\s\S]*?(?=\n##|$)/i);
-  if (hardRulesMatch) {
-    // Extract first numbered rule: "1. **Rule text** — description"
-    const firstRuleMatch = hardRulesMatch[0].match(/\d+\.\s*\*\*([^*]+)\*\*/);
-    if (firstRuleMatch) {
-      const firstRule = firstRuleMatch[1].trim();
-      if (firstMeaningfulLine) {
-        return `${firstMeaningfulLine} ${firstRule}.`;
-      }
-      return firstRule;
-    }
-  }
-
-  return firstMeaningfulLine;
-}
-
-/**
- * Get the role reminder for a specialist.
- * Returns the explicit roleReminder if defined, otherwise auto-generates from behaviorPrompt.
- *
- * @param specialist - The effective specialist configuration
- * @returns The role reminder string (may be empty if no meaningful content found)
- */
-export function getRoleReminder(specialist: EffectiveSpecialist): string {
-  // Use explicit reminder if provided
-  if (specialist.roleReminder) {
-    return specialist.roleReminder;
-  }
-
-  // Auto-generate from behavior prompt
-  return autoGenerateRoleReminder(specialist.behaviorPrompt);
-}
-
-/**
  * Format specialists for inclusion in agent prompts.
  * Omits concrete model IDs so the prompt is provider-agnostic.
  */
@@ -454,23 +405,36 @@ export async function formatSpecialistsForPrompt(workspacePath?: string): Promis
     .map((s) => `| **${s.name}** | \`${s.id}\` | ${s.description} |`)
     .join('\n');
 
+  // Example ids come from the resolved list so a replacement set never sees
+  // shipped ids it does not contain; implementor/verifier are preferred only
+  // when actually present.
+  const ids = specialists.map((s) => s.id);
+  const delegateExampleId = ids.includes('implementor') ? 'implementor' : ids[0];
+  const createExampleId = ids.includes('verifier')
+    ? 'verifier'
+    : (ids.find((id) => id !== delegateExampleId) ?? delegateExampleId);
+
+  const examples = delegateExampleId
+    ? `
+
+**Examples** (call via the \`workspace_api\` tool):
+
+\`\`\`
+// Delegate an existing task note to a specialist
+ws.agent.delegate({ taskNoteId: "abc-123", specialist: "${delegateExampleId}" })
+
+// Create a new agent with a specialist
+ws.agent.create("Review changes", "Check the implementation...", { specialist: "${createExampleId}" })
+\`\`\`
+`
+    : '\n';
+
   return `## Agent Specialists
 
 You have access to the following agent specialists. When delegating work, you can either create a blank agent or use \`specialist\` to create an agent with specific, pre-configured behavior:
 
 | Specialist | ID | Purpose |
 |------------|-------|---------|
-${rows}
-
-**Examples** (call via the \`workspace_api\` tool):
-
-\`\`\`
-// To implement work
-ws.agent.delegate({ taskNoteId: "abc-123", specialist: "implementor" })
-
-// To review work
-ws.agent.create("Review changes", "Check the implementation...", { specialist: "verifier" })
-\`\`\`
-
+${rows}${examples}
 The specialist parameter sets the model and adds role-specific instructions. Override with \`model\` or \`behaviorPrompt\` if needed.`;
 }

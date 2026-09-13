@@ -1,8 +1,9 @@
 /**
  * @vitest-environment jsdom
  */
-import { cleanup, render, waitFor } from '@testing-library/svelte';
+import { cleanup, render, screen, waitFor } from '@testing-library/svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { CHIEF_WORKSPACE_ID } from '$shared/types/branded-ids';
 
 const testState = vi.hoisted(() => {
   const readable = <T>(value: T) => ({
@@ -34,11 +35,21 @@ const testState = vi.hoisted(() => {
       vi.fn(() => readable(value)),
       { select: vi.fn(() => value) },
     );
+  const selectorFrom = <T>(get: () => T) =>
+    Object.assign(
+      vi.fn(() => ({
+        subscribe: (run: (value: T) => void) => (run(get()), () => {}),
+      })),
+      { select: vi.fn(get) },
+    );
   return {
     dispatch: vi.fn(),
+    agentSessionIsStreaming: false,
+    chatAuroraEnabled: true,
     panelTabs,
     panel,
     selector,
+    selectorFrom,
     readable,
     panelManager: {
       getPanelIds: vi.fn(() => ['panel-1']),
@@ -57,7 +68,10 @@ const testState = vi.hoisted(() => {
 vi.mock('$store/renderer/store', async () => {
   const { createAppStoreMockModule } =
     await import('$store/renderer/utils/test-helpers/store-mock');
-  return createAppStoreMockModule({ state: () => ({}), dispatch: testState.dispatch });
+  return createAppStoreMockModule({
+    state: () => ({ browser: { byWorkspaceId: {} } }),
+    dispatch: testState.dispatch,
+  });
 });
 
 vi.mock('$features/layout/panel-layout-adapter', () => ({
@@ -87,7 +101,7 @@ vi.mock('$store/renderer/slices/agent-session/agent-session-selectors', () => ({
   selectAgentSession: testState.selector(null),
   selectAgentIsResponding: testState.selector(false),
   selectAgentIsRunning: testState.selector(false),
-  selectAgentSessionIsStreaming: testState.selector(false),
+  selectAgentSessionIsStreaming: testState.selectorFrom(() => testState.agentSessionIsStreaming),
   selectAgentSessionStreamingContent: testState.selector(''),
   selectAgentMessages: testState.selector([]),
   selectAgentHistoryMessages: testState.selector([]),
@@ -97,14 +111,16 @@ vi.mock('$store/renderer/slices/agent-session/agent-session-selectors', () => ({
     historyCount: 0,
     tailCount: 0,
   }),
+  selectAgentTailCapPruned: testState.selector(false),
 }));
 vi.mock('$store/renderer/slices/chat-state/chat-state-selectors', () => ({
   selectAwaitingSwitchBackSnapshot: testState.selector(false),
-  selectAwaitingUtilityFooter: testState.selector(false),
   selectChatError: testState.selector(null),
+  selectChatFailureCorrelation: testState.selector(undefined),
   selectChatLastChunkTime: testState.selector(null),
   selectChatLiveStreamPhase: testState.selector(null),
   selectChatModelUnavailable: testState.selector(null),
+  selectChatQuotaExceeded: testState.selector(null),
   selectChatReceivedFirstChunk: testState.selector(false),
   selectChatStatusEvents: testState.selector([]),
   selectChatStreamingStartTime: testState.selector(null),
@@ -113,6 +129,8 @@ vi.mock('$store/renderer/slices/chat-state/chat-state-selectors', () => ({
   selectFetchingOlderHistory: testState.selector(false),
   selectHistoryExhausted: testState.selector(false),
   selectHistorySeekUnsupported: testState.selector(false),
+  selectPendingProposalRecovery: testState.selector(undefined),
+  selectPendingQuestionRecovery: testState.selector(undefined),
   selectTranscriptHydration: testState.selector({ isHydrating: false }),
   selectTranscriptHydratedOnce: testState.selector(false),
   selectTranscriptSnapshotMeta: testState.selector(undefined),
@@ -144,6 +162,7 @@ vi.mock('$store/renderer/slices/permission/permission-selectors', () => ({
   selectPermissionRequests: testState.selector([]),
 }));
 vi.mock('$store/renderer/slices/user-preferences/user-preferences-selectors', () => ({
+  selectChatAuroraEnabled: testState.selectorFrom(() => testState.chatAuroraEnabled),
   selectIsAgentMonospace: testState.selector(false),
 }));
 vi.mock('$store/renderer/slices/specialists/specialists-selectors', () => ({
@@ -153,6 +172,11 @@ vi.mock('$store/renderer/slices/specialists/specialists-selectors', () => ({
 }));
 vi.mock('$store/renderer/slices/provider-catalog/provider-catalog-selectors', () => ({
   selectEffectiveDefaultProviderId: testState.selector(''),
+  selectProviderCatalogLoaded: testState.selector(false),
+  selectProviderCatalogEntries: testState.selector([] as unknown[]),
+  selectProviderAuthFailureGuidance: { select: () => null },
+  selectProviderDisplayName: { select: (_state: unknown, id: string) => id },
+  selectNormalizedProviderId: { select: (_state: unknown, id: string) => id },
 }));
 
 vi.mock('../input/SimpleRichInput.svelte', async () => ({
@@ -228,11 +252,12 @@ vi.mock('$features/onboarding/messages/WorkspaceSetupCard.svelte', async () => (
   default: (await import('./mocks/SlotOnly.svelte')).default,
 }));
 
+import ChatPanel from '../ChatPanel.svelte';
+
 const workspace = { id: 'ws-1', title: 'Workspace' };
 
-async function renderChatPanel(isActive: boolean) {
-  const ChatPanel = (await import('../ChatPanel.svelte')).default;
-  render(ChatPanel, { props: { workspace, agentId: 'agent-1', isActive } });
+async function renderChatPanel(isActive: boolean, targetWorkspace = workspace) {
+  render(ChatPanel, { props: { workspace: targetWorkspace, agentId: 'agent-1', isActive } });
   await Promise.resolve();
 }
 
@@ -249,6 +274,8 @@ function updatePanelActions() {
 describe('ChatPanel multi-panel context ownership', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    testState.agentSessionIsStreaming = false;
+    testState.chatAuroraEnabled = true;
     testState.panel.title = 'app.ts';
     testState.panelTabs.emit([]);
     vi.stubGlobal(
@@ -280,6 +307,21 @@ describe('ChatPanel multi-panel context ownership', () => {
     expect(dispatchedTypes()).toContain('multiPanelContext/updatePanels');
   });
 
+  it.each([
+    ['regular', workspace],
+    ['Chief', { ...workspace, id: CHIEF_WORKSPACE_ID }],
+  ])(
+    'does not mount the %s Aurora host while streaming when the preference is disabled',
+    async (_kind, targetWorkspace) => {
+      testState.agentSessionIsStreaming = true;
+      testState.chatAuroraEnabled = false;
+
+      await renderChatPanel(true, targetWorkspace);
+
+      expect(screen.queryByTestId('composer-aurora-host')).toBeNull();
+    },
+  );
+
   it('does not produce a fresh availablePanelContexts reference for unchanged panel data', async () => {
     await renderChatPanel(true);
 
@@ -305,5 +347,41 @@ describe('ChatPanel multi-panel context ownership', () => {
     const nextPanels = updatePanelActions()[1].payload[0];
     expect(nextPanels).not.toBe(firstPanels);
     expect(nextPanels[0].label).toBe('renamed.ts');
+  });
+
+  it('coalesces dense editor selection events and keeps the latest selection', async () => {
+    await renderChatPanel(true);
+    await waitFor(() => expect(dispatchedTypes()).toContain('multiPanelContext/setWorkspace'));
+    testState.dispatch.mockClear();
+    const pendingFrames: FrameRequestCallback[] = [];
+    vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
+      pendingFrames.push(callback);
+      return pendingFrames.length;
+    });
+    vi.stubGlobal('cancelAnimationFrame', () => {});
+
+    const emitSelection = (text: string) => {
+      window.dispatchEvent(
+        new CustomEvent('editor:selection-change', {
+          detail: { text, file: 'src/app.ts', language: 'typescript', source: 'editor' },
+        }),
+      );
+    };
+    emitSelection('first');
+    emitSelection('second');
+    emitSelection('latest');
+
+    expect(dispatchedTypes()).not.toContain('multiPanelContext/setSelection');
+    pendingFrames.splice(0).forEach((callback) => callback(0));
+
+    const selectionActions = testState.dispatch.mock.calls.filter(
+      ([action]) => action?.type === 'multiPanelContext/setSelection',
+    );
+    expect(selectionActions).toHaveLength(1);
+    expect(selectionActions[0][0].payload[0]).toMatchObject({
+      panelId: 'src/app.ts',
+      tabId: 'src/app.ts',
+      text: 'latest',
+    });
   });
 });

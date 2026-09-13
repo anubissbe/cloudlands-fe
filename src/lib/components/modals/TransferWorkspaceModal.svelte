@@ -11,7 +11,7 @@
    *      counts, size estimate, git summary, and pre-flight warnings.
    *   3. `transferring` — live progress (build stage, bytes down/up vs the
    *      plan estimate) + the "restart in-flight agents" toggle.
-   *   4. `result` — success (archive-source checkbox and Switch button for
+   *   4. `result` — success (archive-source checkbox and Open button for
    *      server transfers, Done) or failure (reason + Retry; the source
    *      stays usable).
    *
@@ -34,6 +34,7 @@
   import { m } from '$shared/paraglide/messages.js';
   import { formatBytesBinary, formatInteger } from '$lib/i18n/format';
   import { formatConnectionLabel } from '$lib/components/layout/DaemonStatusIndicator.svelte';
+  import type { TransferFailurePhase } from '$shared/types/workspace-transfer';
   import type { ConnectionRecord } from '$store/renderer/slices/connections/connections-types';
   import type {
     TransferDestination,
@@ -58,6 +59,7 @@
     runStatus?: TransferRunStatus;
     progress?: TransferProgress | null;
     runError?: string | null;
+    failurePhase?: TransferFailurePhase | null;
     restartAgents?: boolean;
     downloadFilePath?: string | null;
     interruptedAgents?: string[];
@@ -72,7 +74,7 @@
     onRetry?: () => void;
     onSetRestartAgents?: (value: boolean) => void;
     onSetArchiveSource?: (value: boolean) => void;
-    onFinalize?: (switchToTarget: boolean) => void;
+    onFinalize?: (openTarget: boolean) => void;
   }
 
   let {
@@ -87,6 +89,7 @@
     runStatus = 'idle',
     progress = null,
     runError = null,
+    failurePhase = null,
     restartAgents = false,
     downloadFilePath = null,
     interruptedAgents = [],
@@ -312,7 +315,7 @@
               {m.workspace_transfer_planLoading_message()}
             </p>
           {:else if planStatus === 'error'}
-            <p class="text-xs text-error-foreground" data-testid="transfer-plan-error">
+            <p class="text-xs text-danger" data-testid="transfer-plan-error">
               {m.workspace_transfer_planFailed_error({ error: planError ?? '' })}
             </p>
           {:else if plan}
@@ -531,13 +534,13 @@
                 {m.workspace_transfer_finalizing_message()}
               </p>
             {:else if finalizeStatus === 'error'}
-              <p class="text-xs text-error-foreground" data-testid="transfer-finalize-error">
+              <p class="text-xs text-danger" data-testid="transfer-finalize-error">
                 {m.workspace_transfer_finalizeFailed_error({ error: finalizeError ?? '' })}
               </p>
             {/if}
           {:else}
             <p class="flex items-center gap-2 text-sm" data-testid="transfer-result-failed">
-              <Fa icon={faCircleXmark} class="text-error-foreground shrink-0" />
+              <Fa icon={faCircleXmark} class="text-danger shrink-0" />
               <span class="font-semibold">
                 {isDownload
                   ? m.workspace_transfer_result_downloadFailed_title()
@@ -547,7 +550,9 @@
             <p class="text-xs text-subtle" data-testid="transfer-failed-reason">
               {isDownload
                 ? m.workspace_transfer_result_downloadFailed_message({ error: runError ?? '' })
-                : m.workspace_transfer_result_failed_message({ error: runError ?? '' })}
+                : failurePhase === 'preflight'
+                  ? m.workspace_transfer_result_preflightFailed_message({ error: runError ?? '' })
+                  : m.workspace_transfer_result_failed_message({ error: runError ?? '' })}
             </p>
           {/if}
         {/if}
@@ -589,9 +594,9 @@
               variant="ghost"
               onclick={() => onFinalize?.(true)}
               disabled={finalizeStatus === 'running'}
-              data-testid="transfer-switch-button"
+              data-testid="transfer-open-button"
             >
-              {m.workspace_transfer_switchToTarget_label({ label: targetLabel })}
+              {m.workspace_transfer_openTarget_label({ label: targetLabel })}
             </Button>
           {/if}
           <Button

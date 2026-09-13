@@ -1,11 +1,12 @@
-import { createCollection } from '@augmentcode/themis/utils/collections/collection-utils';
+import { createCollection, getItem } from '@augmentcode/themis/utils/collections/collection-utils';
 import { runSaga, stdChannel } from 'redux-saga';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
   workspaces: { list: vi.fn(), recentViews: vi.fn(), getTokenUsage: vi.fn(), getContext: vi.fn() },
+  workspaceServiceList: vi.fn(),
   tasks: { list: vi.fn(), listAgentLinks: vi.fn() },
-  events: { list: vi.fn() },
+  events: { queryPage: vi.fn() },
   skills: { list: vi.fn() },
   scripts: { list: vi.fn() },
   git: {
@@ -14,7 +15,7 @@ const mocks = vi.hoisted(() => ({
     trackedChanges: vi.fn(),
     commitsWithBoundary: vi.fn(),
   },
-  agents: { list: vi.fn() },
+  agents: { list: vi.fn(), listWithMeta: vi.fn() },
   terminals: { list: vi.fn() },
   getAgentLineStats: vi.fn(),
   isAgentDeletionPending: vi.fn(),
@@ -31,6 +32,9 @@ vi.mock('$lib/client', () => ({
     agents: mocks.agents,
     terminals: mocks.terminals,
   },
+}));
+vi.mock('../../workspace/utils/workspace.client', () => ({
+  workspaceClient: { list: mocks.workspaceServiceList },
 }));
 vi.mock('$features/line-changes/line-changes.client', () => ({
   getAgentLineStats: mocks.getAgentLineStats,
@@ -58,15 +62,27 @@ import { hydrateTaskAgentAssociationsRequested } from '../../task-agent-associat
 import { hydrateTerminalsRequested } from '../../terminals/terminals-slice';
 import { fetchWorkspaceTokenUsage } from '../../token-usage/token-usage-slice';
 import {
+  fetchRetiredAgentsRequested,
   hydrateAgentsRequested,
   setAgentsLoaded,
 } from '../../workspace-agents/workspace-agents-slice';
-import { loadEventsRequested } from '../../workspace-events/workspace-events-slice';
+import {
+  loadEventsRequested,
+  loadOlderEventsRequested,
+} from '../../workspace-events/workspace-events-slice';
 import {
   ensureWorkspaceTasksLoaded,
   loadWorkspaceTasksRequested,
 } from '../../workspace-tasks/workspace-tasks-slice';
-import { loadWorkspacesRequested } from '../../workspace/workspace-slice';
+import {
+  loadWorkspacesRequested,
+  replaceWorkspaceList,
+  workspaceReducer,
+} from '../../workspace/workspace-slice';
+import { consoleOwnerChanged } from '../../hardware-console/hardware-console-slice';
+import { bulkUpsertSessions } from '../../agent-session/agent-session-slice';
+import { selectAgentSessionsById } from '../../agent-session/agent-session-selectors';
+import { store as appStore } from '../../../store';
 import { workspaceDeleted, workspaceUnmounted } from '../workspace-lifecycle-slice';
 import { gitReadSaga } from '../../git/sagas/git-read-saga';
 import { lifecycleReadSaga } from './lifecycle-read-saga';
@@ -82,7 +98,7 @@ const settle = async () => {
   await Promise.resolve();
 };
 
-function state(currentTabId: string | null = null) {
+function state(currentTabId: string | null = null, eventsNextToken: string | null = null) {
   return {
     tabState: { currentTabId },
     workspaceTasks: { byWorkspaceId: {} },
@@ -90,6 +106,9 @@ function state(currentTabId: string | null = null) {
     workspace: { workspaces: createCollection('id', []) },
     agentSessions: { byAgentId: {} },
     workspaceAgents: { byWorkspaceId: {} },
+    workspaceEvents: {
+      byWorkspaceId: eventsNextToken ? { [WS]: { nextToken: eventsNextToken } } : {},
+    },
     prStatus: { byWorkspaceId: {} },
   };
 }
@@ -100,7 +119,6 @@ function start(current = state()) {
   const task = runSaga(
     { channel, dispatch: (action) => actions.push(action), getState: () => current },
     lifecycleReadSaga,
-    { activeWorkspaceId: current.tabState.currentTabId },
   );
   return { channel, actions, task };
 }
@@ -128,13 +146,13 @@ describe('lifecycleReadSaga', () => {
   beforeEach(() => {
     vi.useFakeTimers();
     vi.setSystemTime(NOW);
-    mocks.workspaces.list.mockResolvedValue([]);
+    mocks.workspaceServiceList.mockResolvedValue({ ok: true, data: [] });
     mocks.workspaces.recentViews.mockResolvedValue({});
     mocks.workspaces.getTokenUsage.mockResolvedValue(null);
     mocks.workspaces.getContext.mockResolvedValue([]);
     mocks.tasks.list.mockResolvedValue({ tasks: [], stats: { total: 0 } });
     mocks.tasks.listAgentLinks.mockResolvedValue({});
-    mocks.events.list.mockResolvedValue([]);
+    mocks.events.queryPage.mockResolvedValue({ items: [], nextToken: null });
     mocks.skills.list.mockResolvedValue([]);
     mocks.scripts.list.mockResolvedValue([]);
     mocks.git.prRefresh.mockResolvedValue({ outcome: 'unchanged', pullRequests: [] });
@@ -154,6 +172,7 @@ describe('lifecycleReadSaga', () => {
       nextToken: null,
     });
     mocks.agents.list.mockResolvedValue([]);
+    mocks.agents.listWithMeta.mockResolvedValue({ agents: [], retiredCount: 0 });
     mocks.terminals.list.mockResolvedValue([]);
     mocks.getAgentLineStats.mockResolvedValue(null);
     mocks.isAgentDeletionPending.mockReturnValue(false);
@@ -166,20 +185,165 @@ describe('lifecycleReadSaga', () => {
 
   it('loads the workspace list and recency in middleware order', async () => {
     const workspace = { id: WS, branch: 'main', wire_only: 'drop' };
-    mocks.workspaces.list.mockResolvedValue([workspace]);
+    mocks.workspaceServiceList.mockResolvedValue({ ok: true, data: [workspace] });
     mocks.workspaces.recentViews.mockResolvedValue({ [WS]: 42 });
     const run = start();
     run.channel.put(loadWorkspacesRequested());
     await settle();
 
-    expect(mocks.workspaces.list.mock.calls).toEqual([[{ includeArchived: true }]]);
+    expect(mocks.workspaceServiceList.mock.calls).toEqual([[{ lite: true }]]);
     expect(mocks.workspaces.recentViews.mock.calls).toEqual([[]]);
     expect(run.actions).toEqual([
       { type: 'workspace/replaceWorkspaceList', payload: [[workspace]] },
-      { type: 'workspace/setWorkspaceHasLoaded', payload: [true] },
+      { type: 'workspace/setWorkspaceHasLoaded', payload: [true, 'local'] },
       { type: 'workspace/loadRecencyData', payload: [{ lastViewedAt: { [WS]: 42 } }] },
     ]);
     await stop(run.task);
+  });
+
+  it('publishes a workspace-scoped skills failure when loading rejects', async () => {
+    mocks.skills.list.mockRejectedValue(new Error('skill load failed'));
+    const run = start();
+
+    run.channel.put(loadSkillsRequested(WS));
+    await settle();
+
+    expect(run.actions).toContainEqual({
+      type: 'skills/loadSkillsFailed',
+      payload: [WS, 'skill load failed'],
+    });
+    await stop(run.task);
+  });
+
+  it('coalesces workspace-list loads arriving mid-fetch into one trailing refetch', async () => {
+    const resolvers: ((value: { ok: true; data: unknown[] }) => void)[] = [];
+    mocks.workspaceServiceList.mockImplementation(
+      () =>
+        new Promise<{ ok: true; data: unknown[] }>((done) => {
+          resolvers.push(done);
+        }),
+    );
+    const run = start();
+    run.channel.put(loadWorkspacesRequested());
+    await settle();
+    expect(mocks.workspaceServiceList.mock.calls).toEqual([[{ lite: true }]]);
+
+    // A burst of triggers while the first fetch is in flight (e.g. remote
+    // workspace:created events) must collapse into exactly one trailing
+    // refetch — takeLeading would drop them and the first snapshot could
+    // predate the creates (PR #1740 review).
+    run.channel.put(loadWorkspacesRequested());
+    run.channel.put(loadWorkspacesRequested());
+    await settle();
+    expect(mocks.workspaceServiceList.mock.calls).toHaveLength(1);
+
+    resolvers[0]!({ ok: true, data: [] });
+    await settle();
+    expect(mocks.workspaceServiceList.mock.calls).toHaveLength(2);
+
+    resolvers[1]!({ ok: true, data: [] });
+    await settle();
+    expect(mocks.workspaceServiceList.mock.calls).toHaveLength(2);
+    await stop(run.task);
+  });
+
+  describe('attention reconciliation on focus / console-owner acquisition', () => {
+    const wireWorkspace = (attention: 'none' | 'unread') =>
+      ({ id: WS, branch: 'main', attention }) as unknown as import('$shared/types').Workspace;
+
+    // These triggers dispatch loadWorkspacesRequested from inside the saga, so
+    // the harness must loop dispatched actions back into the channel (the
+    // default start() only records them) and apply the real workspaceReducer
+    // to observe store convergence.
+    function startWithLoopback() {
+      const channel = stdChannel();
+      const actions: { type: string }[] = [];
+      let workspaceState = workspaceReducer(undefined, { type: '@@INIT' });
+      const dispatch = (action: { type: string }) => {
+        actions.push(action);
+        workspaceState = workspaceReducer(workspaceState, action);
+        channel.put(action);
+        return action;
+      };
+      const current = state();
+      const task = runSaga(
+        {
+          channel,
+          dispatch,
+          getState: () => ({ ...current, workspace: workspaceState }),
+        },
+        lifecycleReadSaga,
+      );
+      return { channel, actions, task, dispatch, getWorkspaceState: () => workspaceState };
+    }
+
+    it('refetches the workspace list when the window regains focus and converges stale attention', async () => {
+      const run = startWithLoopback();
+      // Seed a stale snapshot: attention raised before the window lost focus,
+      // then cleared daemon-side while this window missed the deltas.
+      run.dispatch(replaceWorkspaceList([wireWorkspace('unread')]));
+      expect(getItem(run.getWorkspaceState().workspaces, WS)?.attention).toBe('unread');
+
+      mocks.workspaceServiceList.mockResolvedValue({ ok: true, data: [wireWorkspace('none')] });
+      window.dispatchEvent(new Event('focus'));
+      await settle();
+      await settle();
+
+      expect(mocks.workspaceServiceList.mock.calls).toEqual([[{ lite: true }]]);
+      expect(getItem(run.getWorkspaceState().workspaces, WS)?.attention).toBe('none');
+      await stop(run.task);
+    });
+
+    it('coalesces a focus burst into one in-flight fetch plus one trailing refetch', async () => {
+      const resolvers: ((value: { ok: true; data: unknown[] }) => void)[] = [];
+      mocks.workspaceServiceList.mockImplementation(
+        () =>
+          new Promise<{ ok: true; data: unknown[] }>((done) => {
+            resolvers.push(done);
+          }),
+      );
+      const run = startWithLoopback();
+      window.dispatchEvent(new Event('focus'));
+      await settle();
+      expect(mocks.workspaceServiceList.mock.calls).toHaveLength(1);
+
+      window.dispatchEvent(new Event('focus'));
+      window.dispatchEvent(new Event('focus'));
+      await settle();
+      expect(mocks.workspaceServiceList.mock.calls).toHaveLength(1);
+
+      resolvers[0]!({ ok: true, data: [] });
+      await settle();
+      expect(mocks.workspaceServiceList.mock.calls).toHaveLength(2);
+
+      resolvers[1]!({ ok: true, data: [] });
+      await settle();
+      expect(mocks.workspaceServiceList.mock.calls).toHaveLength(2);
+      await stop(run.task);
+    });
+
+    it('refetches on console-owner acquisition and converges stale attention', async () => {
+      const run = startWithLoopback();
+      run.dispatch(replaceWorkspaceList([wireWorkspace('none')]));
+
+      mocks.workspaceServiceList.mockResolvedValue({ ok: true, data: [wireWorkspace('unread')] });
+      run.channel.put(consoleOwnerChanged(true));
+      await settle();
+      await settle();
+
+      expect(mocks.workspaceServiceList.mock.calls).toEqual([[{ lite: true }]]);
+      expect(getItem(run.getWorkspaceState().workspaces, WS)?.attention).toBe('unread');
+      await stop(run.task);
+    });
+
+    it('does not refetch when console ownership is lost', async () => {
+      const run = startWithLoopback();
+      run.channel.put(consoleOwnerChanged(false));
+      await settle();
+      await settle();
+      expect(mocks.workspaceServiceList.mock.calls).toEqual([]);
+      await stop(run.task);
+    });
   });
 
   it('guards ensure-tasks and coalesces explicit loads per workspace', async () => {
@@ -453,13 +617,17 @@ describe('lifecycleReadSaga', () => {
   });
 
   it('routes event, context, task-link, skill, script, and terminal reads exactly', async () => {
-    const event = { id: 'event-1', type: 'agent:created', wire_only: true };
+    const newestEvent = { id: 'event-2', type: 'agent:created', wire_only: true };
+    const oldestEvent = { id: 'event-1', type: 'agent:created', wire_only: true };
     const item = { id: 'context-1', type: 'note', title: 'Context', provider: 'internal' };
     const links = { 'note-1': { 'agent:a': { agentId: 'a', taskKey: 'agent:a' } } };
     const skill = { name: 'review', description: 'Review code', wire_only: 'keep' };
     const script = { id: 'script-1', name: 'test', command: 'pnpm test', wire_only: 1 };
     const terminal = { id: 'terminal-1', workspaceId: WS, title: 'Shell', wire_only: 'keep' };
-    mocks.events.list.mockResolvedValue([event]);
+    mocks.events.queryPage.mockResolvedValue({
+      items: [newestEvent, oldestEvent],
+      nextToken: 'older-events',
+    });
     mocks.workspaces.getContext.mockResolvedValue([item]);
     mocks.tasks.listAgentLinks.mockResolvedValue(links);
     mocks.skills.list.mockResolvedValue([skill]);
@@ -480,14 +648,144 @@ describe('lifecycleReadSaga', () => {
     run.channel.put(hydrateTerminalsRequested(WS));
     await settle();
 
+    expect(mocks.events.queryPage.mock.calls).toEqual([[WS, { limit: 100 }]]);
     expect(run.actions).toEqual([
-      { type: 'workspaceEvents/eventsLoaded', payload: [WS, [event]] },
+      { type: 'workspaceEvents/eventsLoadStarted', payload: [WS] },
+      {
+        type: 'workspaceEvents/eventsLoaded',
+        payload: [WS, [oldestEvent, newestEvent], 'older-events'],
+      },
       { type: 'context/hydrateContextItems', payload: [WS, [item]] },
       { type: 'taskAgentAssociations/hydrateTaskAgentAssociations', payload: [WS, links] },
       { type: 'skills/setSkills', payload: [WS, [skill]] },
       { type: 'scripts/setScriptsData', payload: { wsId: WS, scripts: [script] } },
       { type: 'scripts/setInitialized', payload: [WS, true] },
       { type: 'terminals/loadWorkspaceTerminals', payload: [WS, [terminal]] },
+    ]);
+    await stop(run.task);
+  });
+
+  it('loads the next older events page from the stored cursor', async () => {
+    const newest = { id: 'event-2' };
+    const oldest = { id: 'event-1' };
+    mocks.events.queryPage.mockResolvedValue({ items: [newest, oldest], nextToken: null });
+    const run = start(state(null, 'older-cursor'));
+
+    run.channel.put(loadOlderEventsRequested(WS));
+    await settle();
+
+    expect(mocks.events.queryPage.mock.calls).toEqual([
+      [WS, { limit: 100, nextToken: 'older-cursor' }],
+    ]);
+    expect(run.actions).toEqual([
+      {
+        type: 'workspaceEvents/olderEventsLoaded',
+        payload: [WS, [oldest, newest], null],
+      },
+    ]);
+    await stop(run.task);
+  });
+
+  it('marks older event history complete without querying when no cursor remains', async () => {
+    const run = start();
+
+    run.channel.put(loadOlderEventsRequested(WS));
+    await settle();
+
+    expect(mocks.events.queryPage).not.toHaveBeenCalled();
+    expect(run.actions).toEqual([
+      { type: 'workspaceEvents/olderEventsLoaded', payload: [WS, [], null] },
+    ]);
+    await stop(run.task);
+  });
+
+  it('serializes a fresh events load behind an in-flight older-page load', async () => {
+    let resolveOlder!: (value: { items: unknown[]; nextToken: string | null }) => void;
+    const olderPage = { items: [{ id: 'older' }], nextToken: null };
+    const freshPage = { items: [{ id: 'fresh' }], nextToken: 'fresh-cursor' };
+    mocks.events.queryPage
+      .mockReturnValueOnce(new Promise((done) => (resolveOlder = done)))
+      .mockResolvedValueOnce(freshPage);
+    const run = start(state(null, 'older-cursor'));
+
+    run.channel.put(loadOlderEventsRequested(WS));
+    await settle();
+    run.channel.put(loadEventsRequested(WS));
+    await settle();
+    expect(mocks.events.queryPage.mock.calls).toEqual([
+      [WS, { limit: 100, nextToken: 'older-cursor' }],
+    ]);
+
+    resolveOlder(olderPage);
+    await settle();
+
+    expect(mocks.events.queryPage.mock.calls).toEqual([
+      [WS, { limit: 100, nextToken: 'older-cursor' }],
+      [WS, { limit: 100 }],
+    ]);
+    expect(run.actions).toEqual([
+      { type: 'workspaceEvents/olderEventsLoaded', payload: [WS, [{ id: 'older' }], null] },
+      { type: 'workspaceEvents/eventsLoadStarted', payload: [WS] },
+      {
+        type: 'workspaceEvents/eventsLoaded',
+        payload: [WS, [{ id: 'fresh' }], 'fresh-cursor'],
+      },
+    ]);
+    await stop(run.task);
+  });
+
+  it('runs a replaced initial load before the trailing older-page request', async () => {
+    let resolveOlder!: (value: { items: unknown[]; nextToken: string | null }) => void;
+    let resolveFresh!: (value: { items: unknown[]; nextToken: string | null }) => void;
+    mocks.events.queryPage
+      .mockReturnValueOnce(new Promise((done) => (resolveOlder = done)))
+      .mockReturnValueOnce(new Promise((done) => (resolveFresh = done)))
+      .mockResolvedValueOnce({ items: [{ id: 'fresh-older' }], nextToken: null });
+    const current = state(null, 'older-cursor');
+    const run = start(current);
+
+    run.channel.put(loadOlderEventsRequested(WS));
+    await settle();
+    run.channel.put(loadEventsRequested(WS));
+    run.channel.put(loadOlderEventsRequested(WS));
+    await settle();
+    expect(mocks.events.queryPage.mock.calls).toEqual([
+      [WS, { limit: 100, nextToken: 'older-cursor' }],
+    ]);
+
+    resolveOlder({ items: [{ id: 'leading-older' }], nextToken: 'stale-cursor' });
+    await settle();
+    expect(mocks.events.queryPage.mock.calls).toEqual([
+      [WS, { limit: 100, nextToken: 'older-cursor' }],
+      [WS, { limit: 100 }],
+    ]);
+
+    const eventState = current.workspaceEvents.byWorkspaceId[WS];
+    expect(eventState).toBeDefined();
+    if (!eventState) throw new Error('Expected seeded workspace event state');
+    eventState.nextToken = 'fresh-cursor';
+    resolveFresh({ items: [{ id: 'fresh' }], nextToken: 'fresh-cursor' });
+    await settle();
+
+    expect(mocks.events.queryPage.mock.calls).toEqual([
+      [WS, { limit: 100, nextToken: 'older-cursor' }],
+      [WS, { limit: 100 }],
+      [WS, { limit: 100, nextToken: 'fresh-cursor' }],
+    ]);
+    expect(run.actions).toEqual([
+      {
+        type: 'workspaceEvents/olderEventsLoaded',
+        payload: [WS, [{ id: 'leading-older' }], 'stale-cursor'],
+      },
+      { type: 'workspaceEvents/eventsLoadStarted', payload: [WS] },
+      {
+        type: 'workspaceEvents/eventsLoaded',
+        payload: [WS, [{ id: 'fresh' }], 'fresh-cursor'],
+      },
+      {
+        type: 'workspaceEvents/olderEventsLoaded',
+        payload: [WS, [{ id: 'fresh-older' }], null],
+      },
     ]);
     await stop(run.task);
   });
@@ -685,6 +983,71 @@ describe('lifecycleReadSaga', () => {
       { type: 'context/hydrateContextItems', payload: [WS, []] },
       { type: 'context/hydrateContextItems', payload: [WS, []] },
     ]);
+    await stop(run.task);
+  });
+
+  it('forces context hydration after the workspace was initialized', async () => {
+    const run = start();
+    run.channel.put(initContextForWorkspace(WS));
+    await settle();
+    run.channel.put(initContextForWorkspace(WS, true));
+    await settle();
+
+    expect(mocks.workspaces.getContext.mock.calls).toEqual([[WS], [WS]]);
+    expect(run.actions).toEqual([
+      { type: 'context/hydrateContextItems', payload: [WS, []] },
+      { type: 'context/hydrateContextItems', payload: [WS, []] },
+    ]);
+    await stop(run.task);
+  });
+
+  it('replaces an in-flight context read with a fresh hydration generation', async () => {
+    const stale = [{ id: 'stale', type: 'note', title: 'Stale', provider: 'internal' }];
+    const fresh = [{ id: 'fresh', type: 'note', title: 'Fresh', provider: 'internal' }];
+    let resolveStale!: (items: typeof stale) => void;
+    let resolveFresh!: (items: typeof fresh) => void;
+    mocks.workspaces.getContext
+      .mockReturnValueOnce(new Promise((resolve) => (resolveStale = resolve)))
+      .mockReturnValueOnce(new Promise((resolve) => (resolveFresh = resolve)));
+    const run = start();
+
+    run.channel.put(initContextForWorkspace(WS, false, 1));
+    await settle();
+    run.channel.put(initContextForWorkspace(WS, true, 2));
+    await settle();
+
+    expect(mocks.workspaces.getContext.mock.calls).toEqual([[WS], [WS]]);
+    resolveFresh(fresh);
+    await settle();
+    resolveStale(stale);
+    await settle();
+
+    expect(run.actions).toEqual([{ type: 'context/hydrateContextItems', payload: [WS, fresh] }]);
+    await stop(run.task);
+  });
+
+  it('replaces an in-flight context read when forced without a generation', async () => {
+    const stale = [{ id: 'stale', type: 'note', title: 'Stale', provider: 'internal' }];
+    const fresh = [{ id: 'fresh', type: 'note', title: 'Fresh', provider: 'internal' }];
+    let resolveStale!: (items: typeof stale) => void;
+    let resolveFresh!: (items: typeof fresh) => void;
+    mocks.workspaces.getContext
+      .mockReturnValueOnce(new Promise((resolve) => (resolveStale = resolve)))
+      .mockReturnValueOnce(new Promise((resolve) => (resolveFresh = resolve)));
+    const run = start();
+
+    run.channel.put(initContextForWorkspace(WS));
+    await settle();
+    run.channel.put(initContextForWorkspace(WS, true));
+    await settle();
+
+    expect(mocks.workspaces.getContext.mock.calls).toEqual([[WS], [WS]]);
+    resolveFresh(fresh);
+    await settle();
+    resolveStale(stale);
+    await settle();
+
+    expect(run.actions).toEqual([{ type: 'context/hydrateContextItems', payload: [WS, fresh] }]);
     await stop(run.task);
   });
 
@@ -890,9 +1253,9 @@ describe('lifecycleReadSaga', () => {
     await settle();
 
     expect(run.actions.filter((action: any) => action.type === 'git/setStatus')).toHaveLength(1);
-    expect(run.actions.filter((action: any) => action.type === 'changes/setChangesData')).toHaveLength(
-      1,
-    );
+    expect(
+      run.actions.filter((action: any) => action.type === 'changes/setChangesData'),
+    ).toHaveLength(1);
     await stop(gitTask);
     await stop(run.task);
   });
@@ -1177,12 +1540,15 @@ describe('lifecycleReadSaga', () => {
     const current = state();
     current.agentSessions.byAgentId['agent-keep'] = existing;
     mocks.isAgentDeletionPending.mockImplementation((id: string) => id === 'agent-drop');
-    mocks.agents.list.mockResolvedValue([
-      agent('agent-drop'),
-      agent('agent-daemon-pending', { pendingDeleteAt: '2026-08-11T00:00:15.000Z' }),
-      agent('agent-bg', { isBackground: true }),
-      agent('agent-keep'),
-    ]);
+    mocks.agents.listWithMeta.mockResolvedValue({
+      agents: [
+        agent('agent-drop'),
+        agent('agent-daemon-pending', { pendingDeleteAt: '2026-08-11T00:00:15.000Z' }),
+        agent('agent-bg', { isBackground: true }),
+        agent('agent-keep'),
+      ],
+      retiredCount: 0,
+    });
     const run = start(current);
     run.channel.put(hydrateAgentsRequested(WS));
     await settle();
@@ -1191,17 +1557,200 @@ describe('lifecycleReadSaga', () => {
     const background = agent('agent-bg', { isBackground: true });
     expect(run.actions).toEqual([
       { type: 'workspaceAgents/setAgentsLoaded', payload: [WS, true] },
+      { type: 'workspaceAgents/setRetiredCount', payload: [WS, 0] },
       { type: 'workspaceAgents/setAgents', payload: [WS, [background, kept]] },
       { type: 'agentSessions/bulkUpsertSessions', payload: [[background, kept]] },
-      { type: 'agentSessions/upsertSession', payload: [background] },
-      { type: 'agentSessions/upsertSession', payload: [kept] },
       { type: 'workspaceAgents/setActiveAgentId', payload: [WS, 'agent-keep'] },
     ]);
     await stop(run.task);
   });
 
+  it('clears a crash-leftover in-flight pair when the list snapshot reports the agent idle (monorepo#4135)', async () => {
+    const current = state();
+    current.agentSessions.byAgentId['agent-stale'] = agent('agent-stale', {
+      isStreaming: true,
+      isProcessing: true,
+    });
+    // The fresh daemon rows: agent-stale is idle (crash leftover — no event
+    // will ever clear the stored pair), agent-normal has no stored session.
+    const staleRow = agent('agent-stale');
+    const normalRow = agent('agent-normal');
+    mocks.agents.listWithMeta.mockResolvedValue({
+      agents: [staleRow, normalRow],
+      retiredCount: 0,
+    });
+    const run = start(current);
+
+    run.channel.put(hydrateAgentsRequested(WS));
+    await settle();
+
+    // One batch carries per-agent stale-clear IDs so the snapshot's idle flags
+    // win for the crash leftover while normal rows retain pair-guard semantics.
+    const bulkUpserts = run.actions.filter(
+      (action) => action.type === 'agentSessions/bulkUpsertSessions',
+    );
+    expect(bulkUpserts).toEqual([
+      {
+        type: 'agentSessions/bulkUpsertSessions',
+        payload: [[staleRow, normalRow], { staleRuntimeFlagClearAgentIds: ['agent-stale'] }],
+      },
+    ]);
+    await stop(run.task);
+  });
+
+  it('notifies the real agent-session selector once for a mixed N-agent hydration', async () => {
+    const dispose = appStore.init();
+    const stopSaga = appStore.runSaga(lifecycleReadSaga);
+    appStore.dispatch(
+      bulkUpsertSessions([
+        agent('agent-stale', { isStreaming: true, isProcessing: true }),
+        agent('agent-existing', { messages: [{ id: 'local' }] as never }),
+      ]),
+    );
+    const emissions: Array<Readonly<Record<string, AgentSession>>> = [];
+    let lastSelected: Readonly<Record<string, AgentSession>> | undefined;
+    const unsubscribe = appStore.getReadableState().subscribe((state) => {
+      const selected = selectAgentSessionsById.select(state);
+      if (selected !== lastSelected) {
+        emissions.push(selected);
+        lastSelected = selected;
+      }
+    });
+    mocks.agents.listWithMeta.mockResolvedValue({
+      agents: [
+        agent('agent-stale', { isStreaming: false, isProcessing: false }),
+        agent('agent-existing'),
+        agent('agent-new'),
+      ],
+      retiredCount: 0,
+    });
+
+    try {
+      appStore.dispatch(hydrateAgentsRequested(WS));
+      await settle();
+
+      expect(Object.keys(appStore.state.agentSessions.byAgentId)).toEqual([
+        'agent-stale',
+        'agent-existing',
+        'agent-new',
+      ]);
+      expect(appStore.state.agentSessions.byAgentId['agent-existing'].messages).toEqual([
+        { id: 'local' },
+      ]);
+      expect(appStore.state.agentSessions.byAgentId['agent-stale']).toMatchObject({
+        isStreaming: false,
+        isProcessing: false,
+      });
+      expect(emissions).toHaveLength(2);
+    } finally {
+      unsubscribe();
+      stopSaga();
+      dispose();
+    }
+  });
+
+  it('does not clear a pair set while the list fetch was in flight, even if the row reports idle', async () => {
+    // Race regression (PR #2028 review): chatSendStarted lands the both-true
+    // pair AFTER hydration starts but BEFORE the daemon list resolves. The
+    // daemon snapshot was cut before the turn started, so the row reports
+    // idle — but the pair does not predate the fetch, so it must keep the
+    // default #1250 preservation semantics, not be treated as a crash
+    // leftover.
+    const current = state();
+    const raceRow = agent('agent-race');
+    mocks.agents.listWithMeta.mockImplementation(async () => {
+      current.agentSessions.byAgentId['agent-race'] = agent('agent-race', {
+        isStreaming: true,
+        isProcessing: true,
+      });
+      return { agents: [raceRow], retiredCount: 0 };
+    });
+    const run = start(current);
+
+    run.channel.put(hydrateAgentsRequested(WS));
+    await settle();
+
+    const bulkUpserts = run.actions.filter(
+      (action) => action.type === 'agentSessions/bulkUpsertSessions',
+    );
+    expect(bulkUpserts).toEqual([
+      { type: 'agentSessions/bulkUpsertSessions', payload: [[raceRow]] },
+    ]);
+    await stop(run.task);
+  });
+
+  it('keeps the pair-guard for a live in-flight pair the fresh snapshot still reports busy', async () => {
+    const current = state();
+    current.agentSessions.byAgentId['agent-live'] = agent('agent-live', {
+      isStreaming: true,
+      isProcessing: true,
+    });
+    const liveRow = agent('agent-live', { isStreaming: true });
+    mocks.agents.listWithMeta.mockResolvedValue({ agents: [liveRow], retiredCount: 0 });
+    const run = start(current);
+
+    run.channel.put(hydrateAgentsRequested(WS));
+    await settle();
+
+    // The daemon reports the turn in flight, so the single optionless bulk
+    // upsert keeps the default preservation semantics (monorepo#1250).
+    const bulkUpserts = run.actions.filter(
+      (action) => action.type === 'agentSessions/bulkUpsertSessions',
+    );
+    expect(bulkUpserts).toEqual([
+      { type: 'agentSessions/bulkUpsertSessions', payload: [[liveRow]] },
+    ]);
+    await stop(run.task);
+  });
+
+  // The two tests below stub the seam (appClient.agents.listWithMeta), not the
+  // wire. On an 8.2+ daemon the default read excludes retired rows, but the saga
+  // must stay agnostic to row provenance: retired rows re-enter state via the
+  // retiredOnly read (lazy retired bin), and the auto-select guard has to hold
+  // no matter how a retired row reached the snapshot.
+  it('keeps retired agents in state but never auto-selects them (§5.5 soft retire)', async () => {
+    const retired = agent('agent-retired', { retiredAt: '2026-08-10T00:00:00.000Z' });
+    const active = agent('agent-live');
+    mocks.agents.listWithMeta.mockResolvedValue({ agents: [retired, active], retiredCount: 1 });
+    const run = start();
+
+    run.channel.put(hydrateAgentsRequested(WS));
+    await settle();
+
+    expect(mocks.agents.listWithMeta).toHaveBeenCalledWith(WS);
+    expect(run.actions).toContainEqual({
+      type: 'workspaceAgents/setRetiredCount',
+      payload: [WS, 1],
+    });
+    expect(run.actions).toContainEqual({
+      type: 'workspaceAgents/setAgents',
+      payload: [WS, [retired, active]],
+    });
+    expect(run.actions).toContainEqual({
+      type: 'workspaceAgents/setActiveAgentId',
+      payload: [WS, 'agent-live'],
+    });
+    await stop(run.task);
+  });
+
+  it('does not auto-select any agent when every candidate is retired', async () => {
+    mocks.agents.listWithMeta.mockResolvedValue({
+      agents: [agent('agent-retired', { retiredAt: '2026-08-10T00:00:00.000Z' })],
+      retiredCount: 1,
+    });
+    const run = start();
+
+    run.channel.put(hydrateAgentsRequested(WS));
+    await settle();
+
+    expect(
+      run.actions.find((action) => action.type === 'workspaceAgents/setActiveAgentId'),
+    ).toBeUndefined();
+    await stop(run.task);
+  });
+
   it('converges to an authoritative empty daemon agent snapshot', async () => {
-    mocks.agents.list.mockResolvedValue([]);
+    mocks.agents.listWithMeta.mockResolvedValue({ agents: [], retiredCount: 0 });
     const run = start();
 
     run.channel.put(hydrateAgentsRequested(WS));
@@ -1209,17 +1758,228 @@ describe('lifecycleReadSaga', () => {
 
     expect(run.actions).toEqual([
       { type: 'workspaceAgents/setAgentsLoaded', payload: [WS, true] },
+      { type: 'workspaceAgents/setRetiredCount', payload: [WS, 0] },
       { type: 'workspaceAgents/setAgents', payload: [WS, []] },
     ]);
     await stop(run.task);
   });
 
+  it('rehydrates retired rows alongside the default read once they were lazily loaded', async () => {
+    const retired = agent('agent-retired', { retiredAt: '2026-08-10T00:00:00.000Z' });
+    const active = agent('agent-live');
+    const current = state();
+    current.workspaceAgents.byWorkspaceId = {
+      [WS]: { retiredAgentsLoaded: true, isLoadingRetiredAgents: false },
+    } as never;
+    mocks.agents.listWithMeta.mockResolvedValue({ agents: [active], retiredCount: 1 });
+    mocks.agents.list.mockResolvedValue([retired]);
+    const run = start(current);
+
+    run.channel.put(hydrateAgentsRequested(WS));
+    await settle();
+
+    expect(mocks.agents.list).toHaveBeenCalledWith(WS, { retiredOnly: true });
+    expect(run.actions).toContainEqual({
+      type: 'workspaceAgents/setAgents',
+      payload: [WS, [active, retired]],
+    });
+    await stop(run.task);
+  });
+
+  it('lazy-loads retired rows on demand and re-baselines the count (§5.5 v8.2)', async () => {
+    const retired = agent('agent-retired', { retiredAt: '2026-08-10T00:00:00.000Z' });
+    mocks.agents.list.mockResolvedValue([retired]);
+    const run = start();
+
+    run.channel.put(fetchRetiredAgentsRequested(WS));
+    await settle();
+
+    expect(mocks.agents.list.mock.calls).toEqual([[WS, { retiredOnly: true }]]);
+    expect(run.actions).toEqual([
+      { type: 'workspaceAgents/setIsLoadingRetiredAgents', payload: [WS, true] },
+      { type: 'agentSessions/bulkUpsertSessions', payload: [[retired]] },
+      { type: 'workspaceAgents/addAgent', payload: [WS, retired] },
+      { type: 'workspaceAgents/setRetiredCount', payload: [WS, 1] },
+      { type: 'workspaceAgents/setRetiredAgentsLoaded', payload: [WS, true] },
+      { type: 'workspaceAgents/setIsLoadingRetiredAgents', payload: [WS, false] },
+    ]);
+    await stop(run.task);
+  });
+
+  it('skips the retired load when the rows are already hydrated', async () => {
+    const current = state();
+    current.workspaceAgents.byWorkspaceId = {
+      [WS]: { retiredAgentsLoaded: true, isLoadingRetiredAgents: false },
+    } as never;
+    const run = start(current);
+
+    run.channel.put(fetchRetiredAgentsRequested(WS));
+    await settle();
+
+    expect(mocks.agents.list).not.toHaveBeenCalled();
+    expect(run.actions).toEqual([]);
+    await stop(run.task);
+  });
+
+  it('clears the retired loading flag and stays retryable after a failed load', async () => {
+    mocks.agents.list.mockRejectedValueOnce(new Error('offline')).mockResolvedValueOnce([]);
+    const run = start();
+
+    run.channel.put(fetchRetiredAgentsRequested(WS));
+    await settle();
+
+    expect(run.actions).toEqual([
+      { type: 'workspaceAgents/setIsLoadingRetiredAgents', payload: [WS, true] },
+      { type: 'workspaceAgents/setIsLoadingRetiredAgents', payload: [WS, false] },
+    ]);
+
+    run.channel.put(fetchRetiredAgentsRequested(WS));
+    await settle();
+    expect(mocks.agents.list.mock.calls).toEqual([
+      [WS, { retiredOnly: true }],
+      [WS, { retiredOnly: true }],
+    ]);
+    expect(run.actions).toContainEqual({
+      type: 'workspaceAgents/setRetiredAgentsLoaded',
+      payload: [WS, true],
+    });
+    await stop(run.task);
+  });
+
+  it('dedupes an agent retired between the default and retired-only reads (prefers the fresher retired row)', async () => {
+    const active = agent('agent-live');
+    // Retired between the two round trips: the default read still returns the
+    // stale non-retired row, the retired-only read returns the fresh one.
+    const staleBoth = agent('agent-both');
+    const freshBoth = agent('agent-both', { retiredAt: '2026-08-10T00:00:00.000Z' });
+    const current = state();
+    current.workspaceAgents.byWorkspaceId = {
+      [WS]: { retiredAgentsLoaded: true, isLoadingRetiredAgents: false },
+    } as never;
+    mocks.agents.listWithMeta.mockResolvedValue({ agents: [active, staleBoth], retiredCount: 1 });
+    mocks.agents.list.mockResolvedValue([freshBoth]);
+    const run = start(current);
+
+    run.channel.put(hydrateAgentsRequested(WS));
+    await settle();
+
+    expect(run.actions).toContainEqual({
+      type: 'workspaceAgents/setAgents',
+      payload: [WS, [active, freshBoth]],
+    });
+    await stop(run.task);
+  });
+
+  it('re-arms the lazy retired load when it completes mid-hydration (snapshot eviction guard)', async () => {
+    // Force a real await inside the loaded-check → setAgents span so the
+    // lazy-load completion can interleave (defense for the no-await invariant).
+    let resolvePending!: (value: boolean) => void;
+    mocks.isAgentDeletionPending.mockReturnValueOnce(
+      new Promise<boolean>((resolve) => {
+        resolvePending = resolve;
+      }) as never,
+    );
+    const active = agent('agent-live');
+    const current = state();
+    mocks.agents.listWithMeta.mockResolvedValue({ agents: [active], retiredCount: 1 });
+    const run = start(current);
+
+    run.channel.put(hydrateAgentsRequested(WS));
+    await settle();
+
+    // The lazy retired worker finishes while hydration is parked: rows added,
+    // loaded flag now true — the hydration snapshot below would evict them.
+    current.workspaceAgents.byWorkspaceId = {
+      [WS]: { retiredAgentsLoaded: true, isLoadingRetiredAgents: false },
+    } as never;
+    resolvePending(false);
+    await settle();
+
+    const types = run.actions.map((action) => action.type);
+    const setAgentsIndex = types.indexOf('workspaceAgents/setAgents');
+    expect(setAgentsIndex).toBeGreaterThanOrEqual(0);
+    // The mismatch resets the loaded flag and re-requests the retired rows so
+    // the worker re-adds what the snapshot evicted.
+    expect(run.actions.slice(setAgentsIndex)).toContainEqual({
+      type: 'workspaceAgents/setRetiredAgentsLoaded',
+      payload: [WS, false],
+    });
+    expect(run.actions).toContainEqual({
+      type: 'workspaceAgents/fetchRetiredAgentsRequested',
+      payload: [WS],
+    });
+    await stop(run.task);
+  });
+
+  it('preserves in-store transcripts on the lazy retired load (empty list rows never clobber)', async () => {
+    const existing = agent('agent-retired', {
+      retiredAt: '2026-08-10T00:00:00.000Z',
+      messages: [{ id: 'm1', role: 'user', timestamp: NOW.toISOString() }] as never,
+    });
+    const current = state();
+    current.agentSessions.byAgentId['agent-retired'] = existing;
+    // List rows carry message counts, not transcripts — the wire row is empty.
+    mocks.agents.list.mockResolvedValue([
+      agent('agent-retired', { retiredAt: '2026-08-10T00:00:00.000Z' }),
+    ]);
+    const run = start(current);
+
+    run.channel.put(fetchRetiredAgentsRequested(WS));
+    await settle();
+
+    const preserved = agent('agent-retired', {
+      retiredAt: '2026-08-10T00:00:00.000Z',
+      messages: existing.messages,
+    });
+    expect(run.actions).toContainEqual({
+      type: 'workspaceAgents/addAgent',
+      payload: [WS, preserved],
+    });
+    expect(run.actions).toContainEqual({
+      type: 'agentSessions/bulkUpsertSessions',
+      payload: [[preserved]],
+    });
+    await stop(run.task);
+  });
+
+  it('single-flights concurrent lazy retired loads (one daemon read per workspace)', async () => {
+    let resolveList!: (value: AgentSession[]) => void;
+    mocks.agents.list.mockReturnValueOnce(
+      new Promise<AgentSession[]>((resolve) => {
+        resolveList = resolve;
+      }),
+    );
+    const run = start();
+
+    run.channel.put(fetchRetiredAgentsRequested(WS));
+    await settle();
+    run.channel.put(fetchRetiredAgentsRequested(WS));
+    run.channel.put(fetchRetiredAgentsRequested(WS));
+    await settle();
+
+    // takeLeading: re-triggers while the first read is parked are dropped.
+    expect(mocks.agents.list.mock.calls).toEqual([[WS, { retiredOnly: true }]]);
+    resolveList([]);
+    await settle();
+
+    expect(mocks.agents.list.mock.calls).toEqual([[WS, { retiredOnly: true }]]);
+    expect(
+      run.actions.filter(
+        (action) =>
+          action.type === 'workspaceAgents/setIsLoadingRetiredAgents' &&
+          (action as { payload: [string, boolean] }).payload[1] === true,
+      ),
+    ).toHaveLength(1);
+    await stop(run.task);
+  });
+
   it('does not cancel concurrent agent hydrates across workspaces (#1934)', async () => {
     const otherWorkspaceId = 'ws-other';
-    const resolvers: Record<string, (value: AgentSession[]) => void> = {};
-    mocks.agents.list.mockImplementation(
+    type ListWithMeta = { agents: AgentSession[]; retiredCount: number };
+    const resolvers: Record<string, (value: ListWithMeta) => void> = {};
+    mocks.agents.listWithMeta.mockImplementation(
       (workspaceId: string) =>
-        new Promise<AgentSession[]>((resolve) => {
+        new Promise<ListWithMeta>((resolve) => {
           resolvers[workspaceId] = resolve;
         }),
     );
@@ -1230,10 +1990,10 @@ describe('lifecycleReadSaga', () => {
     run.channel.put(hydrateAgentsRequested(otherWorkspaceId));
     await settle();
 
-    expect(mocks.agents.list.mock.calls).toEqual([[WS], [otherWorkspaceId]]);
+    expect(mocks.agents.listWithMeta.mock.calls).toEqual([[WS], [otherWorkspaceId]]);
 
-    resolvers[WS]!([]);
-    resolvers[otherWorkspaceId]!([]);
+    resolvers[WS]!({ agents: [], retiredCount: 0 });
+    resolvers[otherWorkspaceId]!({ agents: [], retiredCount: 0 });
     await settle();
 
     expect(run.actions).toContainEqual(setAgentsLoaded(WS, true));
@@ -1242,14 +2002,15 @@ describe('lifecycleReadSaga', () => {
   });
 
   it('coalesces a newer same-workspace agent hydrate into one trailing rerun', async () => {
-    let resolveFirst!: (value: AgentSession[]) => void;
-    mocks.agents.list
+    type ListWithMeta = { agents: AgentSession[]; retiredCount: number };
+    let resolveFirst!: (value: ListWithMeta) => void;
+    mocks.agents.listWithMeta
       .mockReturnValueOnce(
-        new Promise<AgentSession[]>((resolve) => {
+        new Promise<ListWithMeta>((resolve) => {
           resolveFirst = resolve;
         }),
       )
-      .mockResolvedValueOnce([]);
+      .mockResolvedValueOnce({ agents: [], retiredCount: 0 });
     const run = start();
 
     run.channel.put(hydrateAgentsRequested(WS));
@@ -1257,24 +2018,24 @@ describe('lifecycleReadSaga', () => {
     run.channel.put(hydrateAgentsRequested(WS));
     await settle();
 
-    expect(mocks.agents.list.mock.calls).toEqual([[WS]]);
-    resolveFirst([]);
+    expect(mocks.agents.listWithMeta.mock.calls).toEqual([[WS]]);
+    resolveFirst({ agents: [], retiredCount: 0 });
     await settle();
 
-    expect(mocks.agents.list.mock.calls).toEqual([[WS], [WS]]);
+    expect(mocks.agents.listWithMeta.mock.calls).toEqual([[WS], [WS]]);
     expect(run.actions.filter((action) => action.type === setAgentsLoaded.type)).toHaveLength(2);
     await stop(run.task);
   });
 
   it('runs one trailing agent hydrate after an in-flight failure', async () => {
     let rejectFirst!: (reason?: unknown) => void;
-    mocks.agents.list
+    mocks.agents.listWithMeta
       .mockReturnValueOnce(
         new Promise((_, reject) => {
           rejectFirst = reject;
         }),
       )
-      .mockResolvedValueOnce([]);
+      .mockResolvedValueOnce({ agents: [], retiredCount: 0 });
     const run = start();
 
     run.channel.put(hydrateAgentsRequested(WS));
@@ -1282,28 +2043,30 @@ describe('lifecycleReadSaga', () => {
     run.channel.put(hydrateAgentsRequested(WS));
     run.channel.put(hydrateAgentsRequested(WS));
     await settle();
-    expect(mocks.agents.list.mock.calls).toEqual([[WS]]);
+    expect(mocks.agents.listWithMeta.mock.calls).toEqual([[WS]]);
 
     rejectFirst(new Error('offline'));
     await settle();
 
-    expect(mocks.agents.list.mock.calls).toEqual([[WS], [WS]]);
+    expect(mocks.agents.listWithMeta.mock.calls).toEqual([[WS], [WS]]);
     expect(run.actions).toEqual([
       setAgentsLoaded(WS, true),
+      { type: 'workspaceAgents/setRetiredCount', payload: [WS, 0] },
       { type: 'workspaceAgents/setAgents', payload: [WS, []] },
     ]);
     await stop(run.task);
   });
 
   it('workspace cleanup cancels an agent hydrate and discards its trailing rerun', async () => {
-    let resolveFirst!: (value: AgentSession[]) => void;
-    mocks.agents.list
+    type ListWithMeta = { agents: AgentSession[]; retiredCount: number };
+    let resolveFirst!: (value: ListWithMeta) => void;
+    mocks.agents.listWithMeta
       .mockReturnValueOnce(
-        new Promise((resolve) => {
+        new Promise<ListWithMeta>((resolve) => {
           resolveFirst = resolve;
         }),
       )
-      .mockResolvedValueOnce([]);
+      .mockResolvedValueOnce({ agents: [], retiredCount: 0 });
     const run = start();
 
     run.channel.put(hydrateAgentsRequested(WS));
@@ -1312,25 +2075,26 @@ describe('lifecycleReadSaga', () => {
     run.channel.put(hydrateAgentsRequested(WS));
     run.channel.put(workspaceUnmounted(WS));
     await settle();
-    resolveFirst([agent('agent-late')]);
+    resolveFirst({ agents: [agent('agent-late')], retiredCount: 0 });
     await settle();
 
-    expect(mocks.agents.list.mock.calls).toEqual([[WS]]);
+    expect(mocks.agents.listWithMeta.mock.calls).toEqual([[WS]]);
     expect(run.actions).toEqual([]);
 
     run.channel.put(hydrateAgentsRequested(WS));
     await settle();
-    expect(mocks.agents.list.mock.calls).toEqual([[WS], [WS]]);
+    expect(mocks.agents.listWithMeta.mock.calls).toEqual([[WS], [WS]]);
     expect(run.actions).toEqual([
       setAgentsLoaded(WS, true),
+      { type: 'workspaceAgents/setRetiredCount', payload: [WS, 0] },
       { type: 'workspaceAgents/setAgents', payload: [WS, []] },
     ]);
     await stop(run.task);
   });
 
   it('does not cancel workspace reads on deletion before tab removal', async () => {
-    let resolve!: (value: unknown[]) => void;
-    mocks.events.list.mockReturnValue(
+    let resolve!: (value: { items: unknown[]; nextToken: string | null }) => void;
+    mocks.events.queryPage.mockReturnValue(
       new Promise((done) => {
         resolve = done;
       }),
@@ -1340,13 +2104,37 @@ describe('lifecycleReadSaga', () => {
     await settle();
     run.channel.put(workspaceDeleted(WS, []));
     await settle();
-    resolve([{ id: 'late' }]);
+    resolve({ items: [{ id: 'late' }], nextToken: null });
     await settle();
 
-    expect(mocks.events.list.mock.calls).toEqual([[WS]]);
+    expect(mocks.events.queryPage.mock.calls).toEqual([[WS, { limit: 100 }]]);
     expect(run.actions).toEqual([
-      { type: 'workspaceEvents/eventsLoaded', payload: [WS, [{ id: 'late' }]] },
+      { type: 'workspaceEvents/eventsLoadStarted', payload: [WS] },
+      { type: 'workspaceEvents/eventsLoaded', payload: [WS, [{ id: 'late' }], null] },
     ]);
+    await stop(run.task);
+  });
+
+  it('drops a late older-events page after workspace unmount', async () => {
+    let resolve!: (value: { items: unknown[]; nextToken: string | null }) => void;
+    mocks.events.queryPage.mockReturnValue(
+      new Promise((done) => {
+        resolve = done;
+      }),
+    );
+    const run = start(state(null, 'older-cursor'));
+
+    run.channel.put(loadOlderEventsRequested(WS));
+    await settle();
+    run.channel.put(workspaceUnmounted(WS));
+    await settle();
+    resolve({ items: [{ id: 'too-late' }], nextToken: null });
+    await settle();
+
+    expect(mocks.events.queryPage.mock.calls).toEqual([
+      [WS, { limit: 100, nextToken: 'older-cursor' }],
+    ]);
+    expect(run.actions).toEqual([]);
     await stop(run.task);
   });
 
@@ -1437,6 +2225,41 @@ describe('lifecycleReadSaga', () => {
       await stop(run.task);
     });
 
+    // Regression: the active workspace used to be captured once at saga start
+    // (and prod passed none at all), so a workspace focused later — e.g. an
+    // archived workspace opened via cmd+k — hydrated as a background read and
+    // starved behind the backlog, leaving the chat area stuck loading.
+    it('hydrates agents ahead of the backlog for a workspace focused after boot', async () => {
+      const HOT = 'ws-archived';
+      const pendingTasks = parkTaskReads();
+      const agentReads: string[] = [];
+      mocks.agents.listWithMeta.mockImplementation((workspaceId: string) => {
+        agentReads.push(workspaceId);
+        return Promise.resolve({ agents: [], retiredCount: 0 });
+      });
+      const current = state();
+      const run = start(current);
+
+      for (let i = 0; i < FAN_OUT; i += 1) run.channel.put(loadWorkspaceTasksRequested(`ws-${i}`));
+      await settle();
+
+      // Focus moves to this workspace only now, long after the saga started.
+      current.tabState.currentTabId = HOT;
+      run.channel.put(hydrateAgentsRequested(HOT));
+      await settle();
+      expect(agentReads).toEqual([]);
+
+      pendingTasks[0].resolve();
+      await settle();
+      // The focused workspace's agents read runs next, ahead of the queued
+      // background task reads.
+      expect(agentReads).toEqual([HOT]);
+
+      for (const entry of pendingTasks) entry.resolve();
+      await settle();
+      await stop(run.task);
+    });
+
     // Cleanup ownership is split: coalesced domains (tasks) are cancelled by
     // their context watcher, non-coalesced ones (events) by the cleanup race in
     // runWorkspaceRead. Both must hand the slot back.
@@ -1466,10 +2289,10 @@ describe('lifecycleReadSaga', () => {
 
     it('frees the slot held by a raced read cancelled by workspace unmount', async () => {
       const pending: Array<{ workspaceId: string; resolve: () => void }> = [];
-      mocks.events.list.mockImplementation(
+      mocks.events.queryPage.mockImplementation(
         (workspaceId: string) =>
-          new Promise<unknown[]>((done) => {
-            pending.push({ workspaceId, resolve: () => done([]) });
+          new Promise<{ items: unknown[]; nextToken: null }>((done) => {
+            pending.push({ workspaceId, resolve: () => done({ items: [], nextToken: null }) });
           }),
       );
       const run = start();
@@ -1495,7 +2318,7 @@ describe('lifecycleReadSaga', () => {
     const run = start();
     run.channel.put({ type: loadEventsRequested.type, payload: [] });
     await settle();
-    expect(mocks.events.list.mock.calls).toEqual([]);
+    expect(mocks.events.queryPage.mock.calls).toEqual([]);
     expect(run.actions).toEqual([]);
     await stop(run.task);
   });

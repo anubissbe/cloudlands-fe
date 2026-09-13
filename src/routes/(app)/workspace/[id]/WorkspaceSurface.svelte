@@ -13,12 +13,7 @@
   import { toast } from 'svelte-sonner';
 
   import { createWorkspacePageState } from './composables/workspace-page-state.svelte';
-  import {
-    useCloseHandlers,
-    usePanelShortcuts,
-    useTabManagement,
-    useWorkspaceLoader,
-  } from './composables';
+  import { useCloseHandlers, usePanelShortcuts, useTabManagement } from './composables';
   import {
     dispatchCreateFileRequest,
     handleCommandPaletteCreateFile,
@@ -35,27 +30,25 @@
   import { isBootRouteLoad } from '$lib/utils/boot-route-gate';
   import { clearMainPanelView as ftClearMainPanelView } from '$store/renderer/slices/changes/changes-slice';
   import {
-    selectWorkspaceById,
     selectWorkspaceIsEmpty,
     selectIsNewWorkspaceSession,
   } from '$store/renderer/slices/workspace/workspace-selectors';
   import {
+    selectWorkspaceLoadResult,
+    selectWorkspaceLoadState,
+  } from '$store/renderer/slices/workspace-lifecycle/workspace-lifecycle-selectors';
+  import { workspaceLoadRequested } from '$store/renderer/slices/workspace-lifecycle/workspace-lifecycle-slice';
+  import {
     selectPanelVisibilityFlag,
     selectSidebarSide,
   } from '$store/renderer/slices/ui-layout/ui-layout-selectors';
-  import {
-    loadWorkspacesRequested,
-    setWorkspaceEntity,
-  } from '$store/renderer/slices/workspace/workspace-slice';
+  import { loadWorkspacesRequested } from '$store/renderer/slices/workspace/workspace-slice';
   import {
     setPanelVisibility,
     type PanelVisibilityState,
   } from '$store/renderer/slices/ui-layout/ui-layout-slice';
 
   import { createNoteRequested } from '$store/renderer/slices/note-read-tracking/note-read-tracking-slice';
-  import { markWorkspaceSeen } from '$features/workspace/mark-workspace-seen';
-  import { workspaceUnmounted } from '$store/renderer/slices/workspace-lifecycle/workspace-lifecycle-slice';
-
   import { setOnboardingActive } from '$store/renderer/slices/sidebar-nav/sidebar-nav-slice';
 
   // Components
@@ -71,10 +64,7 @@
   import { PanelLayout } from '$lib/components/layout/panel-system';
   import { getPanelLayoutManager } from '$features/layout/panel-layout-adapter';
 
-  import {
-    selectPanelColumnCountsByWorkspaceId,
-    selectPanelLayoutRoot,
-  } from '$store/renderer/slices/panel-layout/panel-layout-selectors';
+  import { selectPanelLayoutRoot } from '$store/renderer/slices/panel-layout/panel-layout-selectors';
 
   // Onboarding
   import OnboardingPage from '$features/onboarding/OnboardingPage.svelte';
@@ -87,15 +77,9 @@
   import {
     createAgentRequested,
     createAgentWithSpecialistRequested,
-    setAgents,
-    setAgentsLoaded,
   } from '$store/renderer/slices/workspace-agents/workspace-agents-slice';
   import MultiSelectTabbedSidebar from '$lib/components/workspace/MultiSelectTabbedSidebar.svelte';
   import { m } from '$shared/paraglide/messages.js';
-  import type {
-    PanelCycleBoundaryTarget,
-    PanelCycleDirection,
-  } from '$features/layout/panel-cycle-navigation';
   import { store as appStore } from '$store/renderer/store';
 
   // eslint-disable-next-line intent/no-component-async-data-fetch -- Constructs a logger; no domain data is fetched.
@@ -104,70 +88,16 @@
   interface Props {
     workspaceId: string;
     active?: boolean;
-    manageTab?: boolean;
-    columnMode?: boolean;
-    retainWorkspaceSessionOnUnmount?: boolean;
-    onCloseWorkspace?: (event: MouseEvent) => void;
-    onSidebarWidthChange?: (width: number) => void;
-    onPanelMovePreviewWidthRatioChange?: (ratio: number) => void;
-    onPanelCanvasWidthChange?: (width: number) => void;
-    onCyclePanelBoundary?: (direction: PanelCycleDirection) => PanelCycleBoundaryTarget | null;
   }
 
-  let {
-    workspaceId,
-    active = true,
-    manageTab = true,
-    columnMode = false,
-    retainWorkspaceSessionOnUnmount = false,
-    onCloseWorkspace,
-    onSidebarWidthChange,
-    onPanelMovePreviewWidthRatioChange,
-    onPanelCanvasWidthChange,
-    onCyclePanelBoundary,
-  }: Props = $props();
+  let { workspaceId, active = true }: Props = $props();
   const surfaceWorkspaceId = $derived(
     workspaceId && workspaceId !== 'new' ? WorkspaceId(workspaceId) : null,
   );
   const panelLayoutId = $derived(workspaceId);
-  const panelLayoutIdStore = writable(workspaceId);
+  const panelLayoutIdStore = writable(untrack(() => workspaceId));
   $effect(() => panelLayoutIdStore.set(workspaceId));
   const panelLayoutRoot$ = selectPanelLayoutRoot(panelLayoutIdStore);
-  const panelColumnCountsByWorkspaceId$ = selectPanelColumnCountsByWorkspaceId();
-  const columnPanelCount = $derived($panelColumnCountsByWorkspaceId$[panelLayoutId] ?? 0);
-  let sidebarFillsAvailableWidth = $state(false);
-  let availablePanelCanvasWidth = $state(0);
-  let previousColumnPanelCount: number | null = null;
-  let sidebarFillTimer: ReturnType<typeof setTimeout> | null = null;
-
-  $effect(() => {
-    const nextPanelCount = columnPanelCount;
-    if (sidebarFillTimer) clearTimeout(sidebarFillTimer);
-
-    if (!columnMode) {
-      sidebarFillsAvailableWidth = false;
-      previousColumnPanelCount = nextPanelCount;
-      return;
-    }
-
-    const delayCompactFill =
-      previousColumnPanelCount !== null && previousColumnPanelCount > 0 && nextPanelCount === 0;
-    previousColumnPanelCount = nextPanelCount;
-    if (!delayCompactFill) {
-      sidebarFillsAvailableWidth = nextPanelCount === 0;
-      return;
-    }
-
-    sidebarFillsAvailableWidth = false;
-    sidebarFillTimer = setTimeout(() => {
-      sidebarFillsAvailableWidth = true;
-      sidebarFillTimer = null;
-    }, 300);
-
-    return () => {
-      if (sidebarFillTimer) clearTimeout(sidebarFillTimer);
-    };
-  });
 
   // ============================================================================
   // Core State
@@ -196,10 +126,8 @@
    * Initialize a new workspace state for the given ID, pre-populating data from the store
    * to avoid a flash of empty/skeleton UI. Used by both the initial load and transition paths.
    *
-   * Sets workspaceData on the state AND hydrates Redux so the selector-backed
-   * $workspace has data on the first render frame. The workspace loader's
-   * effect will still call workspaceClient.open() because its condition does not gate on
-   * hasWorkspaceData — open() must always be called to start backend change detection.
+   * Sets presentation data from the canonical Redux entity on the first frame.
+   * Backend admission and publication are owned by workspaceLoadSaga.
    */
   function initializeWorkspaceState(wsId: string): ReturnType<typeof createWorkspacePageState> {
     const newState = createWorkspacePageState(wsId);
@@ -207,18 +135,11 @@
     // Pre-populate workspace data from the store to avoid blank state.
     // This is a synchronous Map lookup — cheap and eliminates the skeleton flash
     // when the workspace is already cached (the common case during workspace navigation).
-    const cachedWorkspace = selectWorkspaceById.select(appStore.state, wsId);
+    const cachedWorkspace = selectWorkspaceLoadResult.select(appStore.state, wsId);
     if (cachedWorkspace) {
       newState.updateState({
         workspaceData: cachedWorkspace,
-        workspace: { id: wsId, status: 'ready' },
       });
-    }
-
-    // Hydrate Redux immediately so the selector-backed $workspace has
-    // data on the very first render frame (before the workspace loader runs).
-    if (cachedWorkspace) {
-      appStore.dispatch(setWorkspaceEntity(cachedWorkspace));
     }
 
     // Batch state updates with untrack to prevent effect cascades
@@ -252,10 +173,24 @@
     workspaceIdStore.set(workspaceId);
   });
 
-  // Redux-backed workspace entity selector.  Called at component init time
+  // Redux-backed workspace result selector. Called at component init time
   // (top-level script) with a Readable<string> so it stays reactive to both
   // workspaceId changes AND Redux state updates.
-  const workspace = selectWorkspaceById(workspaceIdStore);
+  const workspace = selectWorkspaceLoadResult(workspaceIdStore);
+  const workspaceLoadState = selectWorkspaceLoadState(workspaceIdStore);
+
+  $effect(() => {
+    const currentWorkspaceId = workspaceId;
+    if (
+      !active ||
+      !currentWorkspaceId ||
+      currentWorkspaceId === 'undefined' ||
+      currentWorkspaceId === 'new'
+    ) {
+      return;
+    }
+    appStore.dispatch(workspaceLoadRequested(currentWorkspaceId));
+  });
 
   // Transient signal: command palette → create-file dialog
   const pendingCommandPaletteAction$ = selectPendingCommandPaletteAction();
@@ -275,6 +210,7 @@
 
   // When workspaceId changes from 'new' to a real ID, start crossfade transition
   $effect(() => {
+    if (!active) return;
     if (workspaceId !== 'new' && onboardingHoldActive) {
       // Start fade-out animation on the onboarding content
       onboardingFadingOut = true;
@@ -297,6 +233,7 @@
   // ResizablePanel only reads initiallyCollapsed at init time, so we dispatch
   // the toggle event to animate it open after workspace creation.
   $effect(() => {
+    if (!active) return;
     // While the boot-route gate is holding, showOnboarding is suppressed but
     // onboarding has not "ended" — skip so the hold is not misread as an
     // onboarding→workspace transition (which would expand an empty sidebar
@@ -319,13 +256,11 @@
     return () => appStore.dispatch(setOnboardingActive(false));
   });
 
-  $effect(() => {
-    if (!active || !workspaceId || workspaceId === 'new') return;
-    // Viewing a workspace clears its unread attention on the daemon
-    // (fire-and-forget `workspace.markSeen`, PROTOCOL §5.1); the
-    // `workspace:attention-changed` event drives the UI clear.
-    markWorkspaceSeen(workspaceId);
-  });
+  // Viewing a workspace does NOT clear its unread attention: the flag is
+  // daemon-derived from per-agent seen markers (PROTOCOL §5.1) and clears only
+  // as each unread agent conversation is read (`agent.markSeen`, driven by the
+  // per-agent unread-tracking triggers). Explicit "mark as read" gestures call
+  // `workspace.markSeen` (mark every agent seen) from the sidebar cards.
 
   // Load workspace store on mount
   onMount(() => {
@@ -335,22 +270,10 @@
       appStore.dispatch(loadWorkspacesRequested());
     }
 
-    // Re-focusing the window while a workspace is on screen counts as viewing
-    // it — mark it seen so unread raised while the window was backgrounded
-    // clears the moment the user comes back.
-    const handleWindowFocus = () => {
-      if (workspaceId) markWorkspaceSeen(workspaceId);
-    };
-    window.addEventListener('focus', handleWindowFocus);
-
     // The `initial-agent-pending` sessionStorage marker is no longer stashed
     // by the daemon-owned create flow, so the fresh-creation fade-in transition
     // no longer keys off it. Any equivalent signal should come from workspace
     // creation events / navigation state going forward.
-
-    return () => {
-      window.removeEventListener('focus', handleWindowFocus);
-    };
   });
 
   // Create cleanup manager for this component
@@ -358,6 +281,7 @@
 
   // Properly manage state lifecycle with improved error handling
   $effect(() => {
+    if (!active) return;
     // Only track these specific values to avoid unnecessary re-runs
     const currentWorkspaceId = workspaceId;
 
@@ -398,19 +322,10 @@
         to: currentWorkspaceId,
       });
 
-      // Update the workspace ID in the existing state
-      // Don't set status to "loading" to avoid showing loading states
-      workspaceState.updateState({
-        workspace: { id: currentWorkspaceId, status: 'ready' },
-      });
-
       // Use untrack to prevent this state mutation from triggering effect re-runs
       untrack(() => {
         previousWorkspaceId = currentWorkspaceId;
       });
-
-      // Clear loading state to trigger fresh load
-      workspaceLoader.clearLoadingState();
 
       // The workspace state still has the old workspace ID internally,
       // but we need to recreate it to get the correct isOptimistic value.
@@ -430,15 +345,6 @@
 
         // Immediately restore the preserved data to avoid UI flash
         workspaceState.updateState(preservedData);
-
-        // Hydrate Redux so the selector-backed $workspace picks up the
-        // workspace entity immediately during the optimistic→real transition.
-        {
-          const cachedWorkspace = selectWorkspaceById.select(appStore.state, currentWorkspaceId);
-          if (cachedWorkspace) {
-            appStore.dispatch(setWorkspaceEntity(cachedWorkspace));
-          }
-        }
 
         logger.info('Transitioned to real workspace state', {
           workspaceId: currentWorkspaceId,
@@ -461,11 +367,6 @@
     // Key insight: Create new state BEFORE disposing old one to avoid blank state during transition
     const previousState = workspaceState;
     if (previousState && !stateDisposing) {
-      // Clear any in-flight load from the previous workspace so the loader's
-      // deduplication guards don't block the new workspace from loading.
-      // (The optimistic transition path already does this at line 238.)
-      workspaceLoader.clearLoadingState();
-
       // Create the new workspace state immediately to avoid UI gaps
       if (currentWorkspaceId) {
         try {
@@ -521,17 +422,18 @@
 
   // Restore scroll position after workspace state is created
   $effect(() => {
-    if (workspaceState) {
+    if (active && workspaceState) {
       // Restore scroll position after initial load
       // Use a delay to ensure content is rendered
       // Capture reference to avoid stale closure if workspaceState becomes null
       const currentState = workspaceState;
-      setTimeout(() => {
+      const timeout = setTimeout(() => {
         // Check if the state is still valid before calling
         if (currentState) {
           currentState.restoreInitialScrollPosition();
         }
       }, 200);
+      return () => clearTimeout(timeout);
     }
   });
 
@@ -564,28 +466,6 @@
     get previousWorkspaceId() {
       return previousWorkspaceId;
     },
-    get manageTab() {
-      return manageTab;
-    },
-  });
-
-  // ============================================================================
-  // Workspace Loading (composable)
-  // ============================================================================
-
-  const workspaceLoader = useWorkspaceLoader({
-    get workspaceId() {
-      return workspaceId;
-    },
-    get workspaceState() {
-      return workspaceState;
-    },
-    get state() {
-      return pageState;
-    },
-    get previousWorkspaceId() {
-      return previousWorkspaceId;
-    },
   });
 
   // ============================================================================
@@ -601,6 +481,7 @@
   // onboarding path), so the FE no longer performs any pending-agent
   // activation, session-storage sniffing, or drawer heuristics here.
   $effect(() => {
+    if (!active) return;
     const capturedWorkspaceId = $workspace?.id;
     if (!capturedWorkspaceId) return;
     const errorKey = `workspace:${capturedWorkspaceId}:creation-error`;
@@ -689,6 +570,7 @@
   }
 
   $effect(() => {
+    if (!active) return;
     const pending = $pendingCommandPaletteAction$;
     if (!pending) return;
     if (pending.workspaceId !== workspaceId) return;
@@ -722,10 +604,6 @@
    */
   async function handleCreateAgent(agentType?: string, panelId?: string) {
     if (!$workspace) return;
-    if (columnMode) {
-      appStore.dispatch(createAgentRequested($workspace.id, agentType, { panelLayoutId, panelId }));
-      return;
-    }
     appStore.dispatch(createAgentRequested($workspace.id, agentType, { panelId }));
   }
 
@@ -735,12 +613,6 @@
    */
   async function handleCreateAgentWithSpecialist(specialistId: string | null, panelId?: string) {
     if (!$workspace) return;
-    if (columnMode) {
-      appStore.dispatch(
-        createAgentWithSpecialistRequested($workspace.id, specialistId, { panelLayoutId, panelId }),
-      );
-      return;
-    }
     appStore.dispatch(createAgentWithSpecialistRequested($workspace.id, specialistId, { panelId }));
   }
 
@@ -851,23 +723,8 @@
   onDestroy(() => {
     logger.debug('Starting workspace page cleanup', { workspaceId });
 
-    // Dispatch workspaceUnmounted so sagas can clean up (cancel agent loading,
-    // terminal loading, spec panel, window event watchers for this workspace).
-    if (workspaceId && !retainWorkspaceSessionOnUnmount) {
-      appStore.dispatch(workspaceUnmounted(workspaceId));
-    }
-
-    // Cancel any pending loads
-    workspaceLoader.clearLoadingState();
-
     // Clear workspace state reference
     workspaceState = null;
-
-    // Clear all local state
-    if (!retainWorkspaceSessionOnUnmount) {
-      appStore.dispatch(setAgents(workspaceId, []));
-      appStore.dispatch(setAgentsLoaded(workspaceId, false));
-    }
 
     // Dispose all managed resources (timers, intervals, etc.)
     cleanupManager.dispose();
@@ -882,23 +739,18 @@
      Template - Using WorkspaceLayout with snippets
      ============================================================================ -->
 
-<svelte:head>
-  <title
-    >{isOnboarding || showOnboarding
-      ? m.workspace_page_newSpace_title()
-      : $workspace?.title || m.workspace_page_space_title()}</title
-  >
-</svelte:head>
 <!-- Sidebar Snippet -->
 {#snippet sidebarContent()}
-  {#if showOnboarding || isCreatingWorkspace}
+  {#if !active}
+    <div class="h-full w-full"></div>
+  {:else if showOnboarding || isCreatingWorkspace}
     <!-- Empty sidebar during onboarding and workspace creation -->
     <div class="flex items-center flex-none w-full"></div>
   {:else if !$workspace || isCreatingWorkspace}
     {#if isCreatingWorkspace || isInTransition}
       <!-- Blank panel while creating new workspace or during transition -->
       <div class="w-full h-full"></div>
-    {:else if workspaceLoader.loadError}
+    {:else if $workspaceLoadState.error}
       <!-- Terminal load failure — blank panel; main content shows the not-found state -->
       <div class="w-full h-full"></div>
     {:else}
@@ -915,9 +767,6 @@
       <MultiSelectTabbedSidebar
         workspaceId={$workspace?.id || workspaceId}
         {panelLayoutId}
-        {availablePanelCanvasWidth}
-        {onCloseWorkspace}
-        draggableTitleRegion={columnMode}
         onCreateNote={handleCreateNote}
         onCreateFile={handleCreateFile}
         onFileRenamed={handleFileRenamed}
@@ -942,21 +791,18 @@
     {/if}
     {#if !showOnboarding || onboardingFadingOut}
       {#if !$workspace || isCreatingWorkspace}
-        {#if workspaceLoader.loadError && !isCreatingWorkspace}
+        {#if $workspaceLoadState.error && !isCreatingWorkspace}
           <ResourceNotFound
-            kind={workspaceLoader.loadError.kind}
+            kind={$workspaceLoadState.error.kind}
             resourceLabel={m.workspace_page_workspaceResource_label()}
             resourceId={workspaceId}
-            detail={workspaceLoader.loadError.kind === 'error'
-              ? workspaceLoader.loadError.message
+            detail={$workspaceLoadState.error.kind === 'error'
+              ? $workspaceLoadState.error.message
               : undefined}
             onNavigateAway={() => void navigateToFirstWorkspace()}
           />
         {:else}
-          <ContentSkeleton
-            panelCount={columnMode ? columnPanelCount : 1}
-            layoutRoot={$panelLayoutRoot$}
-          />
+          <ContentSkeleton panelCount={1} layoutRoot={$panelLayoutRoot$} />
         {/if}
       {:else}
         <div
@@ -970,17 +816,9 @@
             workspaceId={$workspace?.id || workspaceId}
             layoutId={panelLayoutId}
             {active}
-            contained={columnMode}
-            canvasSizing={columnMode ? 'content' : 'viewport'}
-            hideEmptyLayout={columnMode}
-            allowCloseLastPanel={columnMode}
             onCreateAgent={(panelId) => handleCreateAgent(undefined, panelId)}
             onCreateAgentWithSpecialist={handleCreateAgentWithSpecialist}
             onCreateNote={handleCreateNote}
-            {onPanelMovePreviewWidthRatioChange}
-            {onPanelCanvasWidthChange}
-            onAvailableCanvasWidthChange={(width) => (availablePanelCanvasWidth = width)}
-            {onCyclePanelBoundary}
           />
         </div>
       {/if}
@@ -990,23 +828,27 @@
 
 <!-- Terminal Overlay Snippet -->
 {#snippet terminalOverlayContent()}
-  <QuakeTerminalOverlay
-    workspaceId={WorkspaceId($workspace?.id || workspaceId)}
-    showDockWhenClosed={false}
-  />
+  {#if active}
+    <QuakeTerminalOverlay
+      workspaceId={WorkspaceId($workspace?.id || workspaceId)}
+      showDockWhenClosed={false}
+    />
+  {/if}
 {/snippet}
 
 <!-- Modals Snippet -->
 {#snippet modalsContent()}
-  <WorkspaceModals workspace={$workspace ?? null} showPRCreator={false} />
-  <InputDialog
-    bind:open={createFileDialogOpen}
-    title={m.workspace_page_createFile_title()}
-    description={m.workspace_page_createFile_description()}
-    placeholder={m.workspace_page_createFile_placeholder()}
-    confirmLabel={m.workspace_page_create_label()}
-    onConfirm={handleCreateFileConfirm}
-  />
+  {#if active}
+    <WorkspaceModals workspace={$workspace ?? null} showPRCreator={false} />
+    <InputDialog
+      bind:open={createFileDialogOpen}
+      title={m.workspace_page_createFile_title()}
+      description={m.workspace_page_createFile_description()}
+      placeholder={m.workspace_page_createFile_placeholder()}
+      confirmLabel={m.workspace_page_create_label()}
+      onConfirm={handleCreateFileConfirm}
+    />
+  {/if}
 {/snippet}
 
 <!-- Always render WorkspaceLayout — sidebar starts collapsed during onboarding -->
@@ -1016,17 +858,17 @@
       bind:this={surfaceElement}
       class="h-full min-h-0 w-full overflow-hidden"
       data-workspace-surface={workspaceId}
-      data-active={active}
       data-loading={!$workspace}
     >
       <WorkspaceSurfaceLoadBoundary
-        loadError={isCreatingWorkspace ? null : workspaceLoader.loadError}
+        loadError={isCreatingWorkspace ? null : $workspaceLoadState.error}
         resourceLabel={m.workspace_page_workspaceResource_label()}
         resourceId={workspaceId}
         onNavigateAway={() => void navigateToFirstWorkspace()}
       >
         {#snippet children()}
           <WorkspaceLayout
+            {active}
             sidebar={sidebarContent}
             content={mainContent}
             terminalOverlay={terminalOverlayContent}
@@ -1034,10 +876,6 @@
             sidebarSide={$sidebarSide$}
             sidebarStorageKey={`workspace-left-panel-width:${workspaceId}`}
             sidebarExpandedStorageKey={`workspace-left-panel-expanded-width:${workspaceId}`}
-            {columnMode}
-            {sidebarFillsAvailableWidth}
-            disableSidebarWidthTransition={columnMode}
-            {onSidebarWidthChange}
             startCollapsed={isOnboarding}
           />
         {/snippet}

@@ -2,7 +2,7 @@
  * Connections Slice
  *
  * Actions + reducer for the multi-backend connect feature. Tracks the
- * connections list, the active backend, the in-flight add/switch operation
+ * connections list, the active backend, the in-flight add/open operation
  * status, and the last pinned-cert mismatch.
  *
  * The list + active selection are authoritative from main: they are set from
@@ -24,8 +24,20 @@ import type {
   ConnectionRecord,
   ConnectionsState,
   ConnectionsListResult,
+  KeychainSyncStateResult,
+  KeychainSyncUiStatus,
+  OpenConnectionResult,
+  RotateConnectionSecretParams,
+  RotateConnectionSecretResult,
+  TestConnectionParams,
+  TestConnectionResult,
+  UpdateConnectionParams,
+  UpdateConnectionResult,
+  UpdateBackendResult,
   ConnectionAuthRejectedEvent,
   ConnectionCertMismatchEvent,
+  ConnectionCertWarningsEvent,
+  ConnectionHostCertWarning,
   ConnectionProtocolMismatchEvent,
 } from './connections-types';
 
@@ -36,12 +48,19 @@ import type {
 export const initialState: ConnectionsState = {
   connections: createCollection<ConnectionRecord, 'id'>('id'),
   activeId: LOCAL_CONNECTION_ID,
+  windowBackendId: LOCAL_CONNECTION_ID,
+  hasReceivedList: false,
+  pinnedVersion: null,
+  connectedIds: [],
   status: 'idle',
   error: null,
+  openingIds: [],
   certMismatch: null,
+  certWarnings: {},
   authRejected: null,
   protocolMismatch: null,
   protocolMismatchModalDismissed: false,
+  keychainSync: null,
 };
 
 // ---------------------------------------------------------------------------
@@ -58,22 +77,43 @@ export const connectionsListReceived = createAction<[result: ConnectionsListResu
 );
 
 /**
- * An add/switch operation started (thunk invoked its IPC channel). Moves
+ * An add/open operation started (its saga invoked the IPC channel). Moves
  * status to 'connecting' and clears any prior error.
  */
 export const connectOperationStarted = createAction('connections/operationStarted');
 
 /**
- * The in-flight add/switch operation succeeded. Status returns to 'idle'; the
+ * The in-flight add/open operation succeeded. Status returns to 'idle'; the
  * list/active refresh arrives separately via the `connections:changed` push.
  */
 export const connectOperationSettled = createAction('connections/operationSettled');
 
 /**
- * The in-flight add/switch operation failed. Status moves to 'error' and the
+ * The in-flight add/open operation failed. Status moves to 'error' and the
  * message is stored for the UI.
  */
 export const connectOperationFailed = createAction<[error: string]>('connections/operationFailed');
+
+/**
+ * An open operation for one backend started. Records the id in `openingIds`
+ * and moves status to 'connecting' — opens run concurrently, so each is
+ * tracked per id.
+ */
+export const openOperationStarted = createAction<[id: string]>('connections/openStarted');
+
+/**
+ * The open operation for one backend succeeded. Drops the id from
+ * `openingIds`; status returns to 'idle' only once no other open remains in
+ * flight.
+ */
+export const openOperationSettled = createAction<[id: string]>('connections/openSettled');
+
+/**
+ * The open operation for one backend failed. Drops the id from `openingIds`,
+ * moves status to 'error' and stores the message for the UI.
+ */
+export const openOperationFailed =
+  createAction<[id: string, error: string]>('connections/openFailed');
 
 /**
  * A `connections:cert-mismatch` push arrived — a pinned cert changed on
@@ -87,10 +127,21 @@ export const certMismatchReceived = createAction<[event: ConnectionCertMismatchE
 export const certMismatchCleared = createAction('connections/certMismatchCleared');
 
 /**
+ * A `connections:cert-warnings` push arrived — the set of NON-FATAL per-host
+ * cert mismatches observed for a connection changed (the multi-host connection
+ * race can connect through one candidate while another presents a foreign
+ * pinned cert). Informative only — never blocks the connection or retries. An
+ * empty `warnings` array clears the connection's entry (fresh client).
+ */
+export const certWarningsReceived = createAction<[event: ConnectionCertWarningsEvent]>(
+  'connections/certWarningsReceived',
+);
+
+/**
  * A `connections:auth-rejected` push arrived — the remote backend rejected the
  * WebSocket upgrade with HTTP 401/403 (bad/rotated token, or the WS API is
- * disabled). Latched so the UI can surface a "re-pair or switch" state instead
- * of the generic cannot-connect overlay.
+ * disabled). Latched so the UI can surface a "re-pair or open local" state
+ * instead of the generic cannot-connect overlay.
  */
 export const authRejectedReceived = createAction<[event: ConnectionAuthRejectedEvent]>(
   'connections/authRejectedReceived',
@@ -103,7 +154,7 @@ export const authRejectedReceived = createAction<[event: ConnectionAuthRejectedE
  * the modal-dismissed flag so the advisory shows for this fresh mismatch —
  * except for boot-origin events (`origin: 'boot'`), which latch the flag so
  * only the persistent menu warning shows (the user did not just initiate a
- * switch, so no modal).
+ * connect, so no modal).
  */
 export const protocolMismatchReceived = createAction<[event: ConnectionProtocolMismatchEvent]>(
   'connections/protocolMismatchReceived',
@@ -131,13 +182,36 @@ export const captureFingerprintRequested = createAsyncAction<
 
 /**
  * Saga-owned connection add request. Resolves with the token-free record plus
- * whether main already switched to it (active re-pair rebuilds the live client
- * in the add handler — the caller must then skip its own follow-up switch).
+ * whether main rebuilt an active connection's client in place.
  */
 export const addConnectionRequested = createAsyncAction<
   [params: AddConnectionParams],
   AddConnectionResult
 >('connections/add', 'connections/addRequested');
+
+/** Saga-owned remote metadata update request. */
+export const updateConnectionRequested = createAsyncAction<
+  [params: UpdateConnectionParams],
+  UpdateConnectionResult
+>('connections/update', 'connections/updateRequested');
+
+/** Saga-owned probe of unsaved address values with the saved secret. */
+export const testConnectionRequested = createAsyncAction<
+  [params: TestConnectionParams],
+  TestConnectionResult
+>('connections/test', 'connections/testRequested');
+
+/** Saga-owned write-only secret rotation request. */
+export const rotateConnectionSecretRequested = createAsyncAction<
+  [params: RotateConnectionSecretParams],
+  RotateConnectionSecretResult
+>('connections/rotateSecret', 'connections/rotateSecretRequested');
+
+/** Saga-owned non-destructive open/focus request for one backend. */
+export const openConnectionRequested = createAsyncAction<[id: string], OpenConnectionResult>(
+  'connections/open',
+  'connections/openRequested',
+);
 
 /** Saga-owned stored-connection removal request. */
 export const forgetConnectionRequested = createAsyncAction<[id: string], void>(
@@ -145,11 +219,45 @@ export const forgetConnectionRequested = createAsyncAction<[id: string], void>(
   'connections/forgetRequested',
 );
 
-/** Saga-owned active-backend switch request. */
-export const switchConnectionRequested = createAsyncAction<[id: string], void>(
-  'connections/switch',
-  'connections/switchRequested',
+/**
+ * Saga-owned remote-backend update request (the connections-menu Update
+ * action). Resolves with the structured `connections:update-backend` result;
+ * the saga owns the success/failure toasts, so no op-status state is tracked.
+ */
+export const updateBackendRequested = createAsyncAction<[id: string], UpdateBackendResult>(
+  'connections/updateBackend',
+  'connections/updateBackendRequested',
 );
+
+/**
+ * iCloud-keychain sync state received — from the `connections:sync-get-state`
+ * invoke or the `connections:sync-set-enabled` result (both carry the full
+ * `KeychainSyncStateResult`).
+ */
+export const keychainSyncStateReceived = createAction<[result: KeychainSyncStateResult]>(
+  'connections/keychainSyncStateReceived',
+);
+
+/**
+ * A `connections:sync-status-changed` push arrived — a reconcile's
+ * availability verdict changed. Ignored until the full state has been loaded
+ * (`keychainSync` is null before that, and status alone cannot seed it).
+ */
+export const keychainSyncStatusReceived = createAction<[status: KeychainSyncUiStatus]>(
+  'connections/keychainSyncStatusReceived',
+);
+
+/** Saga-owned keychain-sync state hydration (settings UI mount). */
+export const loadKeychainSyncStateRequested = createAsyncAction<[], KeychainSyncStateResult>(
+  'connections/loadKeychainSyncState',
+  'connections/loadKeychainSyncStateRequested',
+);
+
+/** Saga-owned keychain-sync opt-in toggle request. */
+export const setKeychainSyncEnabledRequested = createAsyncAction<
+  [enabled: boolean],
+  KeychainSyncStateResult
+>('connections/setKeychainSyncEnabled', 'connections/setKeychainSyncEnabledRequested');
 
 // ---------------------------------------------------------------------------
 // Reducer
@@ -157,16 +265,65 @@ export const switchConnectionRequested = createAsyncAction<[id: string], void>(
 
 export const connectionsReducer = createReducer<ConnectionsState>(initialState);
 connectionsReducer.with(connectionsListReceived, (state, { payload: [result] }) => {
-  return {
+  const next: ConnectionsState = {
     ...state,
     connections: createCollection<ConnectionRecord, 'id'>('id', result.connections),
     activeId: result.activeId,
+    windowBackendId: result.windowBackendId,
+    hasReceivedList: true,
+    // Absent on payloads from an older main process — keep the prior value
+    // rather than clearing a pin the renderer already learned.
+    pinnedVersion: result.pinnedVersion !== undefined ? result.pinnedVersion : state.pinnedVersion,
+    // Same older-main tolerance for live connectivity.
+    connectedIds: result.connectedIds !== undefined ? result.connectedIds : state.connectedIds,
   };
+  // Sync the per-window sticky latches when the payload carries them: `null`
+  // clears (e.g. main disconnected/rebuilt the window's backend client, so the
+  // old rejection no longer applies), an event replays the latch. Absent fields
+  // (older payload shape) leave the latched state untouched.
+  if (result.authRejected !== undefined) {
+    next.authRejected = result.authRejected;
+  }
+  if (result.certWarnings !== undefined) {
+    // Replay of the window backend's sticky NON-FATAL per-host warnings —
+    // same shape as the one-shot push, so an empty/`null` replay clears the
+    // entry and a non-empty one seeds a renderer created after the push.
+    if (result.certWarnings === null || result.certWarnings.warnings.length === 0) {
+      // A `null` replay carries no id — it means the window backend has no
+      // sticky warnings, so the entry to drop is the window backend's.
+      const clearedId =
+        result.certWarnings === null ? result.windowBackendId : result.certWarnings.id;
+      if (state.certWarnings[clearedId]) {
+        const { [clearedId]: _cleared, ...rest } = state.certWarnings;
+        next.certWarnings = rest;
+      }
+    } else {
+      next.certWarnings = {
+        ...state.certWarnings,
+        [result.certWarnings.id]: createCollection<ConnectionHostCertWarning, 'host'>(
+          'host',
+          result.certWarnings.warnings,
+        ),
+      };
+    }
+  }
+  if (result.protocolMismatch !== undefined) {
+    next.protocolMismatch = result.protocolMismatch;
+    if (result.protocolMismatch === null) {
+      next.protocolMismatchModalDismissed = false;
+    } else if (result.protocolMismatch.id !== state.protocolMismatch?.id) {
+      // A fresh mismatch replayed via the list gets the same modal semantics
+      // as the one-shot push; re-replays of the already-stored mismatch keep
+      // the user's dismissal.
+      next.protocolMismatchModalDismissed = result.protocolMismatch.origin === 'boot';
+    }
+  }
+  return next;
 });
 connectionsReducer.with(connectOperationStarted, (state) => {
-  // A fresh add/switch clears the auth-rejected latch: a re-add refreshes the
-  // stored token for the same target, and a switch changes the target — either
-  // way the latched rejection no longer describes the operation under way.
+  // A fresh add/open clears the auth-rejected latch: a re-add refreshes the
+  // stored token for the same target, and a fresh open rebuilds the client —
+  // either way the latched rejection no longer describes the operation under way.
   return { ...state, status: 'connecting', error: null, authRejected: null };
 });
 connectionsReducer.with(connectOperationSettled, (state) => {
@@ -175,18 +332,76 @@ connectionsReducer.with(connectOperationSettled, (state) => {
 connectionsReducer.with(connectOperationFailed, (state, { payload: [error] }) => {
   return { ...state, status: 'error', error };
 });
+/**
+ * Drop exactly one occurrence of `id` from the in-flight multiset so a repeat
+ * open of the same backend keeps the id tracked until its own settle.
+ */
+function removeOneOpening(openingIds: string[], id: string): string[] {
+  const index = openingIds.indexOf(id);
+  if (index === -1) return openingIds;
+  return [...openingIds.slice(0, index), ...openingIds.slice(index + 1)];
+}
+
+connectionsReducer.with(openOperationStarted, (state, { payload: [id] }) => {
+  // Mirrors connectOperationStarted's legacy latch-clearing semantics: any new
+  // open clears the auth-rejected latch, regardless of whether `id` matches
+  // the window's own backend (the clearing is not scoped to the opened id).
+  // Opening does not itself replace the client (main's connectBackendClient
+  // reuses the pooled instance; replacement happens on re-pair/config
+  // changes). One entry per operation (not per id): takeEvery admits repeat
+  // opens of the same backend and each must settle on its own.
+  const openingIds = [...state.openingIds, id];
+  return { ...state, openingIds, status: 'connecting', error: null, authRejected: null };
+});
+connectionsReducer.with(openOperationSettled, (state, { payload: [id] }) => {
+  const openingIds = removeOneOpening(state.openingIds, id);
+  // Another open still in flight keeps the global status busy.
+  if (openingIds.length > 0) return { ...state, openingIds };
+  return { ...state, openingIds, status: 'idle', error: null };
+});
+connectionsReducer.with(openOperationFailed, (state, { payload: [id, error] }) => {
+  const openingIds = removeOneOpening(state.openingIds, id);
+  return { ...state, openingIds, status: 'error', error };
+});
 connectionsReducer.with(certMismatchReceived, (state, { payload: [event] }) => {
-  return { ...state, certMismatch: event };
+  // The fatal mismatch also carries every per-host mismatch the failing
+  // multi-host race observed — seed the passive list from it so the
+  // reconnect UI can show which hosts failed even when no separate
+  // `connections:cert-warnings` push preceded the failure.
+  const certWarnings =
+    event.mismatches && event.mismatches.length > 0
+      ? {
+          ...state.certWarnings,
+          [event.id]: createCollection<ConnectionHostCertWarning, 'host'>('host', event.mismatches),
+        }
+      : state.certWarnings;
+  return { ...state, certMismatch: event, certWarnings };
 });
 connectionsReducer.with(certMismatchCleared, (state) => {
   return { ...state, certMismatch: null };
+});
+connectionsReducer.with(certWarningsReceived, (state, { payload: [event] }) => {
+  // Empty warnings ⇒ the set was cleared for this id (fresh client) — drop
+  // the entry entirely so selectors return the shared empty list.
+  if (event.warnings.length === 0) {
+    if (!state.certWarnings[event.id]) return state;
+    const { [event.id]: _cleared, ...rest } = state.certWarnings;
+    return { ...state, certWarnings: rest };
+  }
+  return {
+    ...state,
+    certWarnings: {
+      ...state.certWarnings,
+      [event.id]: createCollection<ConnectionHostCertWarning, 'host'>('host', event.warnings),
+    },
+  };
 });
 connectionsReducer.with(authRejectedReceived, (state, { payload: [event] }) => {
   return { ...state, authRejected: event };
 });
 connectionsReducer.with(protocolMismatchReceived, (state, { payload: [event] }) => {
   // Boot-origin mismatches (persisted remote restored at launch) suppress the
-  // advisory modal but keep the persistent menu warning; switch-origin (or
+  // advisory modal but keep the persistent menu warning; user-initiated (or
   // origin-less, older payloads) mismatches show the modal.
   return {
     ...state,
@@ -196,4 +411,13 @@ connectionsReducer.with(protocolMismatchReceived, (state, { payload: [event] }) 
 });
 connectionsReducer.with(protocolMismatchModalDismissed, (state) => {
   return { ...state, protocolMismatchModalDismissed: true };
+});
+connectionsReducer.with(keychainSyncStateReceived, (state, { payload: [result] }) => {
+  return { ...state, keychainSync: result };
+});
+connectionsReducer.with(keychainSyncStatusReceived, (state, { payload: [status] }) => {
+  // Status alone cannot seed the state — `supported`/`enabled` are unknown
+  // until the first full load, so a push arriving before it is dropped.
+  if (!state.keychainSync) return state;
+  return { ...state, keychainSync: { ...state.keychainSync, status } };
 });

@@ -18,7 +18,7 @@
     getAvatarStateForSession,
   } from '$features/agent/components/agent-avatar/avatar-state';
   import { Spinner } from '$lib/components/ui/indicators';
-  import { classifyTool } from '$lib/components/chat/tool-classifier';
+  import { classifyTool } from '$lib/utils/tool-classifier';
   import {
     selectAgentAttentionRequest,
     selectAgentSession,
@@ -119,7 +119,7 @@
     >
       <AgentAvatarWithState
         agentId={agent.agentId}
-        size={24}
+        variant="emphasized"
         state={avatarState}
         specialist={agent.specialist as 'spec-writer' | 'implementor' | 'verifier' | null}
       />

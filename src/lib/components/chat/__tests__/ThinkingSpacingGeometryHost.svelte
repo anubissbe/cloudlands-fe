@@ -21,11 +21,19 @@
 
   let { theme = 'light', width = 720, zoom = 1, showStreamingThinking = true }: Props = $props();
 
-  const thinking = (id: string): ContentBlock => ({ type: 'thinking', id, text: 'Thinking' });
+  const thinking = (id: string): ContentBlock => ({
+    type: 'thinking',
+    id,
+    text: `Thinking ${id}\n\nGeometry detail.`,
+  });
   const firstChild = [thinking('first-child')] as ContentBlock[];
   const proseThenThinking = [
     { type: 'text', text: 'Ordinary prose before reasoning' },
     thinking('after-prose'),
+  ] as ContentBlock[];
+  const thinkingThenProse = [
+    thinking('before-prose'),
+    { type: 'text', text: 'Response after completed reasoning' },
   ] as ContentBlock[];
   const toolThenThinking = [
     { type: 'tool_use', id: 'read-first', name: 'view', input: { path: 'src/example.ts' } },
@@ -43,6 +51,10 @@
         ] as ContentBlock[])
       : ([{ type: 'text', text: 'Streaming prose before reasoning' }] as ContentBlock[]),
   );
+  const streamingResponseContent = [
+    thinking('streaming-before-prose'),
+    { type: 'text', text: 'Streaming response after reasoning' },
+  ] as ContentBlock[];
 
   const thinkingBoundaryClass = (type: string) =>
     getOperationalClusterSpacingClass([{ type }, { type: 'thinking' }], 1);
@@ -69,6 +81,9 @@
     </div>
 
     <div data-testid="prose-boundary"><MessageContent content={proseThenThinking} /></div>
+    <div data-testid="reasoning-response-boundary">
+      <MessageContent content={thinkingThenProse} />
+    </div>
     <div class="flex flex-col gap-1" data-testid="message-content-boundary">
       <div class="type-body" data-testid="message-content">Ordinary message content</div>
       <div class={thinkingBoundaryClass('message')} data-thinking-boundary>
@@ -82,6 +97,9 @@
     </div>
     <div data-testid="streaming-boundary">
       <StreamingMessageContent content={streamingContent} isStreaming />
+    </div>
+    <div data-testid="streaming-response-boundary">
+      <StreamingMessageContent content={streamingResponseContent} isStreaming />
     </div>
   </div>
 </section>

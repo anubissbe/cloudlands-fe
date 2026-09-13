@@ -10,7 +10,23 @@ import {
   selectAllScrollPositions,
   selectPersistedWorkspaceTabsState,
 } from '../tab-state-selectors';
-import { closeWorkspaceTab, loadScrollPositions, loadWorkspaceTabsState, moveWorkspace, openWorkspaceTab, type PersistedWorkspaceTabsState, reopenLastClosedWorkspaceTab, restoreWorkspaceTab, saveScrollPosition, setWorkspaceViewMode, switchToNextWorkspaceTab, switchToPreviousWorkspaceTab, switchToWorkspaceTabByIndex, TAB_SCROLL_POSITIONS_STORAGE_KEY, WORKSPACE_TABS_STORAGE_KEY, workspaceTabsHydrated } from '../tab-state-slice';
+import {
+  closeWorkspaceTab,
+  loadScrollPositions,
+  loadWorkspaceTabsState,
+  moveWorkspace,
+  openWorkspaceTab,
+  type PersistedWorkspaceTabsState,
+  reopenLastClosedWorkspaceTab,
+  restoreWorkspaceTab,
+  saveScrollPosition,
+  switchToNextWorkspaceTab,
+  switchToPreviousWorkspaceTab,
+  switchToWorkspaceTabByIndex,
+  TAB_SCROLL_POSITIONS_STORAGE_KEY,
+  WORKSPACE_TABS_STORAGE_KEY,
+  workspaceTabsHydrated,
+} from '../tab-state-slice';
 
 const TAB_PERSIST_ACTIONS = [
   openWorkspaceTab,
@@ -21,7 +37,6 @@ const TAB_PERSIST_ACTIONS = [
   switchToNextWorkspaceTab,
   switchToPreviousWorkspaceTab,
   switchToWorkspaceTabByIndex,
-  setWorkspaceViewMode,
 ];
 
 const SCROLL_PERSIST_ACTIONS = [saveScrollPosition];
@@ -65,8 +80,7 @@ function isPersistedWorkspaceTabsState(value: unknown): value is PersistedWorksp
     isStringArray(stored.unsavedTabs) &&
     isStringArray(stored.optimisticTabs) &&
     isStringArray(stored.tabOrder) &&
-    isOptionalStringArrayArray(stored.workspaceStacks) &&
-    (stored.viewMode === undefined || stored.viewMode === 'single' || stored.viewMode === 'columns')
+    isOptionalStringArrayArray(stored.workspaceStacks)
   );
 }
 
@@ -77,7 +91,7 @@ function isScrollPositionsMap(value: unknown): value is Record<string, number> {
   );
 }
 
-export function* hydrateTabState(): SagaGenerator<void> {
+function* hydrateTabState(): SagaGenerator<void> {
   const backendId = yield* selectActiveBackendId();
   try {
     const scrollPositions = yield* call(getLocalStorageJSON<unknown>, scrollKey(backendId));
@@ -130,7 +144,7 @@ function* persistScrollPositions(): SagaGenerator<void> {
  * tabs don't linger. Also clears backend-local recently-closed workspace-tab
  * state to prevent cross-namespace reopens.
  */
-export function* watchBackendSwitch(): SagaGenerator<void> {
+function* watchBackendSwitch(): SagaGenerator<void> {
   let lastBackendId = yield* selectActiveBackendId();
   while (true) {
     yield* take(connectionsListReceived);

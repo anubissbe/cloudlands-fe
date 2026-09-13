@@ -22,11 +22,14 @@ import {
   selectHudAttentionItems,
   selectHudAttnCount,
   selectHudFeedItems,
+  selectHudSystem,
   selectHudTakeoverView,
   selectHudWorkspaceCards,
   selectHudWorkspaceStateBars,
   selectWorkspaceTabStatuses,
 } from './hud-selectors';
+import type { DaemonHealthState } from '../daemon-health/daemon-health-types';
+import { initialState as daemonHealthInitialState } from '../daemon-health/daemon-health-slice';
 import { createCollection } from '@augmentcode/themis/utils/collections/collection-utils';
 import type { WorkspaceTask } from '$shared/types';
 import {
@@ -343,6 +346,8 @@ describe('selectHudWorkspaceStateBars', () => {
       // BE-sent idle and absent displayStatus both bucket as IDLE.
       withStatus('ws-8', 'idle'),
       withStatus('ws-9'),
+      // pr_queued (in the merge queue) buckets with the PR-stage counter.
+      withStatus('ws-10', 'pr_queued'),
     ]);
     expect(selectHudWorkspaceStateBars.select(state)).toEqual({
       idle: 3,
@@ -350,11 +355,11 @@ describe('selectHudWorkspaceStateBars', () => {
       progress: 2,
       attention: 0,
       waiting: 0,
-      prOpen: 2,
+      prOpen: 3,
       prMerged: 1,
       failed: 0,
       completed: 1,
-      total: 9,
+      total: 10,
     });
   });
 
@@ -697,6 +702,38 @@ describe('selectHudAttnCount', () => {
     expect(selectHudAttnCount.select(state)).toBe(1);
   });
 
+  it('counts a pending request while the agent runs a live turn (attention trumps running)', () => {
+    // An automatic delivery restarts a top-level foreground agent without
+    // clearing the request, so it is still pending while the agent streams and
+    // must blink, bucket needs-attention, and still count on the running axis.
+    const state = attnState({
+      root: {
+        status: 'active',
+        workspaceId: 'ws-1',
+        attentionRequestKind: 'discussion',
+        isResponding: true,
+        messages: [],
+      },
+    });
+    expect(selectHudAttnCount.select(state)).toBe(1);
+    const [card] = selectHudWorkspaceCards.select(state);
+    expect(card.agents.find((agent) => agent.id === 'root')).toMatchObject({
+      bucket: 'needs-attention',
+      attentionKind: 'discussion',
+    });
+    const tabCategories = selectWorkspaceTabStatuses.select(state)['ws-1'].categories;
+    expect(tabCategories).toContainEqual({
+      category: 'discussion',
+      count: 1,
+      agentNames: ['Coordinator'],
+    });
+    expect(tabCategories).toContainEqual({
+      category: 'running',
+      count: 1,
+      agentNames: ['Coordinator'],
+    });
+  });
+
   it('counts a wire needs_attention rollup once when no per-agent signal covers it', () => {
     // The daemon's step-0 rollup (intentd#825) can raise needs_attention from
     // a question hold the FE never captured — the counter must still blink.
@@ -734,16 +771,20 @@ describe('selectHudAttnCount', () => {
     expect(selectHudAttnCount.select(cleared)).toBe(0);
   });
 
-  it('counts a top-level blocker and a failed agent (failed is ungated)', () => {
+  it('counts a top-level blocker and a top-level failed agent, not a failed child (gated)', () => {
     const blocker = attnState({
       root: { status: 'active', attentionRequestKind: 'blocker', messages: [] },
     });
     expect(selectHudAttnCount.select(blocker)).toBe(1);
-    // A failed CHILD agent still counts on the per-agent axis — but the card
-    // state stays whatever the BE rolled up (no local `failed` synthesis).
+    const failedRoot = attnState({ root: { status: 'error', messages: [] } });
+    expect(selectHudAttnCount.select(failedRoot)).toBe(1);
+    // A failed CHILD agent no longer counts (spec decision: failed is gated
+    // to top-level non-background too) — and the card state stays whatever
+    // the BE rolled up (no local `failed` synthesis), so nothing blinks.
     const failedChild = attnState({ child: { status: 'error', messages: [] } });
     expect(selectHudWorkspaceCards.select(failedChild)[0].stateKey).toBe('in_progress');
-    expect(selectHudAttnCount.select(failedChild)).toBe(1);
+    expect(selectHudAttnCount.select(failedChild)).toBe(0);
+    expect(selectHudAttentionItems.select(failedChild)).toEqual([]);
   });
 
   it.each(['failed', 'blocked'] as const)(
@@ -942,6 +983,123 @@ describe('selectHudAttentionItems', () => {
     const blocker = items.find((item) => item.agentName === 'Implementor');
     expect(blocker?.signal).toBe('blocker');
     expect(blocker?.message).toBe('Sandbox network is down');
+  });
+
+  /** ws-1 (in_progress by default) with a top-level root + delegated child, plus session overlays. */
+  function gatedItemsState(
+    sessions: Record<string, Record<string, unknown>>,
+    displayStatus: WorkspaceDisplayStatus = 'in_progress',
+  ): StoreState {
+    const base = mockState([
+      makeWorkspace('ws-1', {
+        displayStatus,
+        agentSummary: {
+          count: 2,
+          agentIds: ['root', 'child'],
+          agents: [
+            { id: 'root', name: 'Coordinator', status: 'active' },
+            { id: 'child', name: 'Implementor', status: 'active', parentAgentId: 'root' },
+          ],
+        } as Workspace['agentSummary'],
+      }),
+    ]);
+    return {
+      ...base,
+      agentSessions: { byAgentId: sessions, agentIdsByWorkspace: {} },
+    } as unknown as StoreState;
+  }
+
+  it('a delegated sub-agent pending discussion raises no row (regression: gated to top-level)', () => {
+    const state = gatedItemsState({
+      child: {
+        status: 'active',
+        attentionRequestKind: 'discussion',
+        attentionRequestReason: 'Need a call on the rollout order',
+        messages: [],
+      },
+    });
+    expect(selectHudAttentionItems.select(state)).toEqual([]);
+    expect(selectHudAttnCount.select(state)).toBe(0);
+  });
+
+  it('a background agent attention request or failure raises no row', () => {
+    const attention = gatedItemsState({
+      root: {
+        status: 'active',
+        isBackground: true,
+        attentionRequestKind: 'blocker',
+        messages: [],
+      },
+    });
+    expect(selectHudAttentionItems.select(attention)).toEqual([]);
+    expect(selectHudAttnCount.select(attention)).toBe(0);
+    const failed = gatedItemsState({
+      root: { status: 'error', isBackground: true, messages: [] },
+    });
+    expect(selectHudAttentionItems.select(failed)).toEqual([]);
+    expect(selectHudAttnCount.select(failed)).toBe(0);
+  });
+
+  it('a failed delegated sub-agent raises no row; a failed top-level agent still does', () => {
+    const failedChild = gatedItemsState({ child: { status: 'error', messages: [] } });
+    expect(selectHudAttentionItems.select(failedChild)).toEqual([]);
+    expect(selectHudAttnCount.select(failedChild)).toBe(0);
+    const failedRoot = gatedItemsState({ root: { status: 'error', messages: [] } });
+    expect(selectHudAttentionItems.select(failedRoot).map((item) => item.kind)).toEqual([
+      'agent_failed',
+    ]);
+    expect(selectHudAttnCount.select(failedRoot)).toBe(1);
+  });
+
+  it('a summary-only failed background agent raises no row before session hydration (§5.1 isBackground)', () => {
+    // intent-hq/intent#3789: the §5.1 summary row carries the additive
+    // `isBackground` flag, so the gate holds with NO tracked session — the
+    // previous session-only read let the failed row through until
+    // hydration. A summary-only failed FOREGROUND root (no flag) still
+    // raises the row, proving the gate keys on the summary field alone.
+    const summaryOnly = (root: Record<string, unknown>): StoreState => {
+      const base = mockState([
+        makeWorkspace('ws-1', {
+          displayStatus: 'in_progress',
+          agentSummary: {
+            count: 1,
+            agentIds: ['root'],
+            agents: [{ id: 'root', name: 'Watcher', status: 'error', ...root }],
+          } as Workspace['agentSummary'],
+        }),
+      ]);
+      return {
+        ...base,
+        agentSessions: { byAgentId: {}, agentIdsByWorkspace: {} },
+      } as unknown as StoreState;
+    };
+    const background = summaryOnly({ isBackground: true });
+    expect(selectHudAttentionItems.select(background)).toEqual([]);
+    expect(selectHudAttnCount.select(background)).toBe(0);
+    const foreground = summaryOnly({});
+    expect(selectHudAttentionItems.select(foreground).map((item) => item.kind)).toEqual([
+      'agent_failed',
+    ]);
+    expect(selectHudAttnCount.select(foreground)).toBe(1);
+  });
+
+  it('an attention card state whose only per-agent signal is gated out falls back to a generic row', () => {
+    // Card state `failed` (BE rollup) while the only failed agent is a
+    // delegated sub-agent: the gated-out agent covers nothing, so the
+    // authoritative-rollup fallback raises ONE generic workspace_attention
+    // row (no agent fields) — not the old named agent_failed row — and the
+    // ATTN counter counts the same 1 via the card-state fallback.
+    const state = gatedItemsState({ child: { status: 'error', messages: [] } }, 'failed');
+    expect(selectHudAttentionItems.select(state)).toEqual([
+      {
+        workspaceId: 'ws-1',
+        workspaceTitle: 'Workspace ws-1',
+        kind: 'workspace_attention',
+        message: null,
+        sinceTs: null,
+      },
+    ]);
+    expect(selectHudAttnCount.select(state)).toBe(1);
   });
 
   it('surfaces raised workspace attention flags with their raise time', () => {
@@ -1374,6 +1532,37 @@ describe('selectHudWorkspaceCards', () => {
     expect(card.agents.find((agent) => agent.id === 'a2')?.line).toBe('Verifying panel focus fix');
   });
 
+  it('reduces multi-line preview text (report kind) to a single line for the swap line', () => {
+    const state = cardState(
+      [
+        makeWorkspace('ws-1', {
+          displayStatus: 'in_progress',
+          agentSummary: {
+            count: 1,
+            agentIds: ['a1'],
+            agents: [{ id: 'a1', name: 'Developer', status: 'active' }],
+          } as Workspace['agentSummary'],
+        }),
+      ],
+      [],
+      {
+        agentSessions: {
+          byAgentId: {
+            // The report kind carries raw digest text, which can be
+            // multi-line — the HUD line must reduce it to one line.
+            a1: {
+              lastMessageRole: 'assistant',
+              digest: 'Reviewing the selector\nAll 12 tests pass\n```\n',
+            },
+          },
+          agentIdsByWorkspace: {},
+        },
+      },
+    );
+    const [card] = selectHudWorkspaceCards.select(state);
+    expect(card.agents.find((agent) => agent.id === 'a1')?.line).toBe('All 12 tests pass');
+  });
+
   it('card agent line falls back to the wire lastToolUse preview (agent:last-message apply)', () => {
     const state = cardState(
       [
@@ -1404,7 +1593,9 @@ describe('selectHudWorkspaceCards', () => {
       },
     );
     const [card] = selectHudWorkspaceCards.select(state);
-    expect(card.agents.find((agent) => agent.id === 'a1')?.line).toBe('str-replace-editor');
+    // The canonical chain classifies the tool block into its display label
+    // (verb + subject + path), not the raw tool name.
+    expect(card.agents.find((agent) => agent.id === 'a1')?.line).toBe('Edit x.ts src');
   });
 
   it('a merely-waiting agent (no attention) buckets idle and drops off the card rows', () => {
@@ -1469,10 +1660,12 @@ describe('selectHudWorkspaceCards', () => {
       },
     );
     const [card] = selectHudWorkspaceCards.select(state);
+    // The idle-but-waiting coordinator still heads its subtree; among its
+    // children the running reviewer sorts before the idle implementor.
     expect(card.agents.map((a) => [a.id, a.bucket, a.isWaitingForAgents])).toEqual([
       ['coord', 'idle', true],
-      ['impl', 'idle', false],
       ['reviewer', 'running', false],
+      ['impl', 'idle', false],
     ]);
     expect(card.agents.find((a) => a.id === 'coord')?.waitingForAgentIds).toEqual([
       'impl',
@@ -1739,11 +1932,11 @@ describe('selectHudWorkspaceCards', () => {
     ]);
   });
 
-  it('the STAB-9 mid-turn agent.list re-hydration (waiting + turnInFlight) keeps the bucket running (live bug, 2nd repro)', () => {
+  it('the STAB-9 mid-turn agent re-hydration (waiting + turnInFlight) keeps the bucket running (live bug, 2nd repro)', () => {
     // Second live repro AFTER the event-fold fix: the card square STILL
     // stayed grey all turn. The event fold DID clear the frozen waiting flag
-    // — but the daemon-events-bridge refires `hydrateAgentsRequested` on the
-    // SAME `agent:status-changed` (STAB-9), and the fresh `agent.list`
+    // — but the daemon-events-bridge refires a per-agent `agent.get` on the
+    // SAME `agent:status-changed` (STAB-9), and the fresh
     // AgentLite legitimately carries `isWaitingForOtherAgents: true` for the
     // WHOLE turn (the completion watch on the probe child pends through it,
     // §5.5 agent_activity_flags_for). lifecycle-read-service folds it via
@@ -2150,7 +2343,10 @@ describe('selectHudWorkspaceCards', () => {
   it('joins hydrated lastAgentResponse lines onto needs-attention and idle-summary agents too', () => {
     // Sessions carry ONLY the AgentLite hydration snapshot (agent.list §5.5
     // via bulkUpsertSessions) — no live status event ever fired in this
-    // window. The line must still surface on non-running rows.
+    // window. The line must still surface on non-running rows. Canonical
+    // precedence: a pending attention request's reason outranks the
+    // hydrated lastAgentResponse on a1; a2 has no attention and falls
+    // through to the persisted response.
     const state = cardState(
       [
         makeWorkspace('ws-1', {
@@ -2172,6 +2368,7 @@ describe('selectHudWorkspaceCards', () => {
             a1: {
               status: 'waiting',
               attentionRequestKind: 'discussion',
+              attentionRequestReason: 'Need a decision on the rollout order',
               lastAgentResponse: 'Waiting on the reviewer',
               messages: [],
             },
@@ -2183,9 +2380,42 @@ describe('selectHudWorkspaceCards', () => {
     );
     const [card] = selectHudWorkspaceCards.select(state);
     expect(card.agents.map((a) => [a.id, a.bucket, a.line])).toEqual([
-      ['a1', 'needs-attention', 'Waiting on the reviewer'],
+      ['a1', 'needs-attention', 'Need a decision on the rollout order'],
       ['a2', 'running', 'Porting the fetch loop'],
     ]);
+  });
+
+  it('a reasonless attention request yields a null line without falling back (canonical chain)', () => {
+    const state = cardState(
+      [
+        makeWorkspace('ws-1', {
+          displayStatus: 'in_progress',
+          agentSummary: {
+            count: 1,
+            agentIds: ['a1'],
+            agents: [{ id: 'a1', name: 'Coordinator', status: 'waiting' }],
+          } as Workspace['agentSummary'],
+        }),
+      ],
+      [],
+      {
+        agentSessions: {
+          byAgentId: {
+            a1: {
+              status: 'waiting',
+              attentionRequestKind: 'blocker',
+              lastAgentResponse: 'Old response text',
+              messages: [],
+            },
+          },
+          agentIdsByWorkspace: {},
+        },
+      },
+    );
+    const [card] = selectHudWorkspaceCards.select(state);
+    const row = card.agents.find((a) => a.id === 'a1');
+    expect(row?.bucket).toBe('needs-attention');
+    expect(row?.line).toBeNull();
   });
 
   it('orders agents depth-first from parentAgentId with connector prefixes', () => {
@@ -2205,13 +2435,221 @@ describe('selectHudWorkspaceCards', () => {
       }),
     ]);
     const [card] = selectHudWorkspaceCards.select(state);
+    // All siblings are running with no lastActivity, so the stable id
+    // tiebreak orders child-a before child-b (wire order is NOT preserved).
     expect(card.agents.map((a) => [a.id, a.depth, a.treePrefix])).toEqual([
       ['root', 0, ''],
-      ['child-b', 1, '├─'],
-      // grandchild is child-b's LAST (only) child — closing connector, even
-      // though it is not the last row overall.
+      ['child-a', 1, '├─'],
+      ['child-b', 1, '└─'],
+      // grandchild is child-b's LAST (only) child — closing connector.
       ['grandchild', 2, '│ └─'],
-      ['child-a', 1, '└─'],
+    ]);
+  });
+
+  it('orders siblings non-idle-first by lastActivity desc, idle last (missing timestamps last in partition)', () => {
+    // The coordinator awaits the idle children so keepLiveWithAncestors
+    // keeps their rows visible — the ordering under test stays observable.
+    const state = cardState(
+      [
+        makeWorkspace('ws-1', {
+          displayStatus: 'in_progress',
+          agentSummary: {
+            count: 6,
+            agentIds: ['root', 'idle-old', 'run-old', 'run-new', 'run-nots', 'idle-new'],
+            agents: [
+              { id: 'root', name: 'Coordinator', status: 'idle' },
+              {
+                id: 'idle-old',
+                name: 'Idle Old',
+                status: 'idle',
+                parentAgentId: 'root',
+                lastActivity: '2026-07-30T09:00:00Z',
+              },
+              {
+                id: 'run-old',
+                name: 'Runner Old',
+                status: 'active',
+                parentAgentId: 'root',
+                lastActivity: '2026-07-30T10:00:00Z',
+              },
+              {
+                id: 'run-new',
+                name: 'Runner New',
+                status: 'active',
+                parentAgentId: 'root',
+                lastActivity: '2026-07-30T11:00:00Z',
+              },
+              // No lastActivity — sorts after the timestamped runners but
+              // still before every idle sibling.
+              { id: 'run-nots', name: 'Runner Untimed', status: 'active', parentAgentId: 'root' },
+              {
+                id: 'idle-new',
+                name: 'Idle New',
+                status: 'idle',
+                parentAgentId: 'root',
+                lastActivity: '2026-07-30T12:00:00Z',
+              },
+            ],
+          } as Workspace['agentSummary'],
+        }),
+      ],
+      [],
+      {
+        agentSessions: {
+          byAgentId: {
+            root: {
+              status: 'idle',
+              isWaitingForOtherAgents: true,
+              waitingForAgentIds: ['idle-old', 'idle-new'],
+              messages: [],
+            },
+          },
+          agentIdsByWorkspace: {},
+        },
+      },
+    );
+    const [card] = selectHudWorkspaceCards.select(state);
+    // Non-idle partition first by recency desc (untimed runner last of it),
+    // then the idle partition by the same recency-desc rule.
+    expect(card.agents.map((a) => [a.id, a.bucket])).toEqual([
+      ['root', 'idle'],
+      ['run-new', 'running'],
+      ['run-old', 'running'],
+      ['run-nots', 'running'],
+      ['idle-new', 'idle'],
+      ['idle-old', 'idle'],
+    ]);
+  });
+
+  it('tiebreaks equal-recency siblings by agent id so rows stay stable', () => {
+    const state = cardState([
+      makeWorkspace('ws-1', {
+        displayStatus: 'in_progress',
+        agentSummary: {
+          count: 3,
+          agentIds: ['root', 'b-agent', 'a-agent'],
+          agents: [
+            { id: 'root', name: 'Coordinator', status: 'active' },
+            {
+              id: 'b-agent',
+              name: 'B',
+              status: 'active',
+              parentAgentId: 'root',
+              lastActivity: '2026-07-30T11:00:00Z',
+            },
+            {
+              id: 'a-agent',
+              name: 'A',
+              status: 'active',
+              parentAgentId: 'root',
+              lastActivity: '2026-07-30T11:00:00Z',
+            },
+          ],
+        } as Workspace['agentSummary'],
+      }),
+    ]);
+    const [card] = selectHudWorkspaceCards.select(state);
+    expect(card.agents.map((a) => a.id)).toEqual(['root', 'a-agent', 'b-agent']);
+  });
+
+  it('orders roots by the same non-idle-first recency rule', () => {
+    // The idle root awaits a hook-parked agent elsewhere so it stays visible
+    // (isWaitingForAgents) — despite being more recent, it sorts after the
+    // running root.
+    const state = cardState(
+      [
+        makeWorkspace('ws-1', {
+          displayStatus: 'in_progress',
+          agentSummary: {
+            count: 2,
+            agentIds: ['idle-root', 'run-root'],
+            agents: [
+              {
+                id: 'idle-root',
+                name: 'Waiting Root',
+                status: 'idle',
+                lastActivity: '2026-07-30T12:00:00Z',
+              },
+              {
+                id: 'run-root',
+                name: 'Running Root',
+                status: 'active',
+                lastActivity: '2026-07-30T10:00:00Z',
+              },
+            ],
+          } as Workspace['agentSummary'],
+        }),
+      ],
+      [],
+      {
+        agentSessions: {
+          byAgentId: {
+            'idle-root': {
+              status: 'idle',
+              isWaitingForOtherAgents: true,
+              waitingForAgentIds: [],
+              messages: [],
+            },
+          },
+          agentIdsByWorkspace: {},
+        },
+      },
+    );
+    const [card] = selectHudWorkspaceCards.select(state);
+    expect(card.agents.map((a) => [a.id, a.bucket, a.treePrefix])).toEqual([
+      ['run-root', 'running', ''],
+      ['idle-root', 'idle', ''],
+    ]);
+  });
+
+  it('pins an idle coordinator root above active peer roots (agents-list parity)', () => {
+    // Spec ordering rule 1: the coordinator keeps the top row on both
+    // surfaces even when idle — an active, more recent top-level peer must
+    // not displace it.
+    const state = cardState(
+      [
+        makeWorkspace('ws-1', {
+          displayStatus: 'in_progress',
+          agentSummary: {
+            count: 2,
+            agentIds: ['coord', 'peer'],
+            agents: [
+              {
+                id: 'coord',
+                name: 'Coordinator',
+                status: 'idle',
+                specialist: 'spec-writer',
+                lastActivity: '2026-07-30T10:00:00Z',
+              },
+              {
+                id: 'peer',
+                name: 'Peer Root',
+                status: 'active',
+                lastActivity: '2026-07-30T12:00:00Z',
+              },
+            ],
+          } as Workspace['agentSummary'],
+        }),
+      ],
+      [],
+      {
+        agentSessions: {
+          byAgentId: {
+            coord: {
+              status: 'idle',
+              isWaitingForOtherAgents: true,
+              waitingForAgentIds: [],
+              messages: [],
+            },
+          },
+          agentIdsByWorkspace: {},
+        },
+      },
+    );
+    const [card] = selectHudWorkspaceCards.select(state);
+    expect(card.agents.map((a) => [a.id, a.bucket])).toEqual([
+      ['coord', 'idle'],
+      ['peer', 'running'],
     ]);
   });
 
@@ -2328,6 +2766,7 @@ describe('selectHudWorkspaceCards', () => {
     ['in_progress', 'in_progress'],
     ['complete', 'complete'],
     ['pr_ready', 'pr_ready'],
+    ['pr_queued', 'pr_queued'],
     ['pr_open', 'pr_open'],
     ['pr_merged', 'pr_merged'],
     ['idle', 'idle'],
@@ -2754,6 +3193,64 @@ describe('selectHudWorkspaceCards', () => {
     expect(card.attentionSnippet).toEqual({ kind: 'pending', text: '' });
   });
 
+  it('with multiple raisers the snippet follows the recency-first row order', () => {
+    // cardAttentionSnippet scans the tree-ordered rows for the first gated
+    // raiser — since rows sort non-idle-first by recency, the most-recently
+    // active raiser's reason wins over an older one listed first on the wire.
+    const state = mockState(
+      [
+        makeWorkspace('ws-1', {
+          displayStatus: 'needs_attention',
+          agentSummary: {
+            count: 2,
+            agentIds: ['older', 'newer'],
+            agents: [
+              {
+                id: 'older',
+                name: 'Older',
+                status: 'active',
+                lastActivity: '2026-07-30T10:00:00Z',
+              },
+              {
+                id: 'newer',
+                name: 'Newer',
+                status: 'active',
+                lastActivity: '2026-07-30T12:00:00Z',
+              },
+            ],
+          } as Workspace['agentSummary'],
+        }),
+      ],
+      [],
+      [],
+      [],
+    );
+    const withSessions = {
+      ...state,
+      agentSessions: {
+        byAgentId: {
+          older: {
+            status: 'active',
+            attentionRequestKind: 'blocker',
+            attentionRequestReason: 'Older reason',
+            messages: [],
+          },
+          newer: {
+            status: 'active',
+            attentionRequestKind: 'blocker',
+            attentionRequestReason: 'Newer reason',
+            messages: [],
+          },
+        },
+        agentIdsByWorkspace: {},
+      },
+    } as StoreState;
+    const [card] = selectHudWorkspaceCards.select(withSessions);
+    expect(card.stateKey).toBe('wait');
+    expect(card.agents.map((a) => a.id)).toEqual(['newer', 'older']);
+    expect(card.attentionSnippet).toEqual({ kind: 'blocker', text: 'Newer reason' });
+  });
+
   it('failed card snippet carries the failing agent stopReason', () => {
     const state = gatedState(
       {
@@ -2958,6 +3455,26 @@ describe('selectHudWorkspaceCards', () => {
     const [card] = selectHudWorkspaceCards.select(state);
     expect(card.tasks).toEqual({ total: 6, completed: 2, inProgress: 1 });
     expect(card.tokens).toBe(175);
+  });
+
+  it('includes thoughtTokens in the card token sum when reported (§5.23)', () => {
+    const state = cardState([makeWorkspace('ws-1', { displayStatus: 'in_progress' })], [], {
+      tokenUsage: {
+        byWorkspaceId: {
+          'ws-1': {
+            totals: {
+              inputTokens: 100,
+              outputTokens: 40,
+              cacheReadTokens: 30,
+              cacheCreationTokens: 5,
+              thoughtTokens: 25,
+            },
+          },
+        },
+      },
+    });
+    const [card] = selectHudWorkspaceCards.select(state);
+    expect(card.tokens).toBe(200);
   });
 });
 
@@ -3246,5 +3763,76 @@ describe('selectHudTakeoverView task relation projection', () => {
     expect(view?.tasks.find((task) => task.id === 'task-b')?.specLinked).toBe(false);
     const legacy = view?.tasks.find((task) => task.id === 'task-c');
     expect(legacy && 'specLinked' in legacy).toBe(false);
+  });
+});
+
+describe('selectHudSystem remote hostname', () => {
+  function healthState(overrides: Partial<DaemonHealthState>): StoreState {
+    return {
+      daemonHealth: { ...daemonHealthInitialState, ...overrides },
+    } as unknown as StoreState;
+  }
+
+  function statsWith(hostname?: string): NonNullable<DaemonHealthState['stats']> {
+    return {
+      clients: 1,
+      agents: 0,
+      listenMode: 'tcp',
+      port: 5181,
+      os: 'linux',
+      arch: 'x86_64',
+      ...(hostname !== undefined ? { hostname } : {}),
+    };
+  }
+
+  it('exposes the short hostname when the daemon reports remote locality', () => {
+    const state = healthState({
+      health: 'healthy',
+      hostLocality: 'remote',
+      stats: statsWith('intent1'),
+    });
+    expect(selectHudSystem.select(state).remoteHostname).toBe('intent1');
+  });
+
+  it('strips everything from the first dot (intent1.local → intent1)', () => {
+    const state = healthState({
+      health: 'healthy',
+      hostLocality: 'remote',
+      stats: statsWith('intent1.local'),
+    });
+    expect(selectHudSystem.select(state).remoteHostname).toBe('intent1');
+  });
+
+  it('is null for a local daemon even when a hostname is known', () => {
+    const state = healthState({
+      health: 'healthy',
+      hostLocality: 'local',
+      stats: statsWith('studio.local'),
+    });
+    expect(selectHudSystem.select(state).remoteHostname).toBeNull();
+  });
+
+  it('is null when the poll carried no hostname (older daemon)', () => {
+    const state = healthState({
+      health: 'healthy',
+      hostLocality: 'remote',
+      stats: statsWith(),
+    });
+    expect(selectHudSystem.select(state).remoteHostname).toBeNull();
+  });
+
+  it('is null before the first poll (unknown locality, no stats)', () => {
+    expect(selectHudSystem.select(healthState({})).remoteHostname).toBeNull();
+  });
+
+  it('survives the ONLINE→OFFLINE flip (stats are kept on disconnect)', () => {
+    const state = healthState({
+      health: 'down',
+      hostLocality: 'remote',
+      stats: statsWith('intent1.local'),
+    });
+    const view = selectHudSystem.select(state);
+    expect(view.online).toBe(false);
+    expect(view.remoteHostname).toBe('intent1');
   });
 });

@@ -1,92 +1,18 @@
-/**
- * MCP OAuth Flow
- *
- * Handles OAuth authentication for MCP servers by:
- * 1. Discovering OAuth metadata from the server
- * 2. Starting a local callback server
- * 3. Opening the browser for authentication
- * 4. Handling the callback and storing tokens
- */
-
-import express from 'express';
-import type { Server } from 'http';
+/** Standards-based OAuth flow for hosted MCP servers. */
+import { createHash, randomBytes } from 'node:crypto';
+import { createServer, type Server } from 'node:http';
 import { shell } from 'electron';
 import { Logger } from '$shared/logger';
 import { m } from '$shared/paraglide/messages.js';
 
 const logger = new Logger('McpOAuth');
+const CALLBACK_TIMEOUT_MS = 5 * 60 * 1_000;
+const REQUEST_TIMEOUT_MS = 10_000;
 
-/** Escape HTML meta-characters so text can be safely interpolated into markup. */
-function escapeHtml(text: string): string {
-  return text
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;');
-}
-
-// Store pending OAuth states (for PKCE verification)
-const pendingAuthStates = new Map<
-  string,
-  {
-    codeVerifier: string;
-    state: string;
-    redirectUri: string;
-    serverMetadata: OAuthServerMetadata;
-    client: OAuthClient;
-    resolve: (tokens: OAuthTokens) => void;
-    reject: (error: Error) => void;
-  }
->();
-
-// Store OAuth tokens per MCP server (in-memory cache). Raw bags are held in
-// memory only for the current process lifetime so `getMcpAuthHeaderAsync`
-// can build Authorization headers; persistence is delegated to the daemon
-// (PROTOCOL.md §5.22, `mcp.oauth.*`). Per §5.22.1 the daemon never echoes the
-// raw bag back over the wire, so a restart drops the cache and the user must
-// re-run the OAuth flow — matching the P3 canonical-persistence posture where
-// electron-store is retired.
-const tokenStore = new Map<string, OAuthTokens>();
-
-/**
- * Persist a token bag on the daemon via `mcp.oauth.set`. Best-effort: a
- * failure is logged but does not abort the OAuth flow because the in-memory
- * cache still lets the current process build auth headers.
- */
-async function persistTokensOnDaemon(mcpName: string, tokens: OAuthTokens): Promise<void> {
-  try {
-    const { getBackendClient } = await import('../../backend/main/backend.ipc');
-    await getBackendClient().request('mcp.oauth.set', {
-      serverId: mcpName,
-      tokenBag: tokens,
-    });
-  } catch (error) {
-    logger.error('Failed to persist OAuth tokens on daemon:', error);
-  }
-}
-
-/**
- * Drop a persisted bag on the daemon via `mcp.oauth.delete`. Idempotent on
- * the daemon side, so unknown servers succeed silently.
- */
-async function deleteTokensOnDaemon(mcpName: string): Promise<void> {
-  try {
-    const { getBackendClient } = await import('../../backend/main/backend.ipc');
-    await getBackendClient().request('mcp.oauth.delete', { serverId: mcpName });
-  } catch (error) {
-    logger.error('Failed to delete OAuth tokens on daemon:', error);
-  }
-}
-
-/**
- * Clear OAuth tokens for an MCP server (in-memory cache + daemon store).
- * Used when the user disconnects an integration.
- */
-export async function clearMcpOAuthTokens(mcpName: string): Promise<void> {
-  logger.info('Clearing OAuth tokens for:', mcpName);
-  tokenStore.delete(mcpName);
-  await deleteTokensOnDaemon(mcpName);
+interface ProtectedResourceMetadata {
+  resource: string;
+  authorization_servers: string[];
+  scopes_supported?: string[];
 }
 
 interface OAuthServerMetadata {
@@ -94,6 +20,9 @@ interface OAuthServerMetadata {
   authorization_endpoint: string;
   token_endpoint: string;
   registration_endpoint?: string;
+  scopes_supported?: string[];
+  code_challenge_methods_supported?: string[];
+  authorization_response_iss_parameter_supported?: boolean;
 }
 
 interface OAuthClient {
@@ -106,252 +35,17 @@ interface OAuthTokens {
   refresh_token?: string;
   expires_at?: number;
   token_type: string;
+  token_endpoint: string;
+  client_id: string;
+  client_secret?: string;
+  scope?: string;
 }
 
-/**
- * Generate a random string for PKCE code verifier
- */
-function generateCodeVerifier(): string {
-  const array = new Uint8Array(32);
-  crypto.getRandomValues(array);
-  return Array.from(array, (byte) => byte.toString(16).padStart(2, '0')).join('');
-}
-
-/**
- * Generate code challenge from verifier (S256)
- */
-async function generateCodeChallenge(verifier: string): Promise<string> {
-  const encoder = new TextEncoder();
-  const data = encoder.encode(verifier);
-  const hash = await crypto.subtle.digest('SHA-256', data);
-  return btoa(String.fromCharCode(...new Uint8Array(hash)))
-    .replace(/\+/g, '-')
-    .replace(/\//g, '_')
-    .replace(/=+$/, '');
-}
-
-/**
- * Generate random state parameter
- */
-function generateState(): string {
-  const array = new Uint8Array(16);
-  crypto.getRandomValues(array);
-  return Array.from(array, (byte) => byte.toString(16).padStart(2, '0')).join('');
-}
-
-/**
- * Discover OAuth metadata from MCP server URL
- */
-async function discoverOAuthMetadata(serverUrl: string): Promise<OAuthServerMetadata | null> {
-  logger.info('Discovering OAuth metadata for:', serverUrl);
-  const url = new URL(serverUrl);
-
-  // Try well-known OAuth endpoints
-  const wellKnownPaths = [
-    '/.well-known/oauth-authorization-server',
-    '/.well-known/openid-configuration',
-  ];
-
-  for (const path of wellKnownPaths) {
-    try {
-      const metadataUrl = new URL(path, url.origin);
-      logger.debug('Trying OAuth metadata URL:', metadataUrl.toString());
-      const response = await fetch(metadataUrl.toString(), {
-        headers: { Accept: 'application/json' },
-      });
-
-      logger.debug('OAuth metadata response:', { status: response.status, ok: response.ok });
-
-      if (response.ok) {
-        const metadata = await response.json();
-        if (metadata.authorization_endpoint && metadata.token_endpoint) {
-          logger.info('Discovered OAuth metadata:', { issuer: metadata.issuer });
-          return metadata as OAuthServerMetadata;
-        }
-      }
-    } catch {
-      // Continue trying other paths
-    }
-  }
-
-  logger.warn('No OAuth metadata found for:', serverUrl);
-  return null;
-}
-
-/**
- * Dynamically register a client with the OAuth server.
- *
- * Aligned with the sidecar implementation (clients/sidecar/libs/src/mcp/auth/mcp-oauth.ts)
- * to handle non-conformant OAuth servers (Figma, Stripe, Linear, Ramp, etc.).
- */
-async function registerClient(
-  metadata: OAuthServerMetadata,
-  redirectUri: string,
-): Promise<OAuthClient | null> {
-  if (!metadata.registration_endpoint) {
-    logger.warn('No registration endpoint available');
-    return null;
-  }
-
-  try {
-    const response = await fetch(metadata.registration_endpoint, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        client_name: 'Intent',
-        client_uri: 'https://intentapp.dev',
-        redirect_uris: [redirectUri],
-        grant_types: ['authorization_code', 'refresh_token'],
-        response_types: ['code'],
-      }),
-    });
-
-    // Some servers (e.g. Stripe, Ramp) return 200 instead of 201 on success
-    const effectiveStatus = response.status === 200 ? 201 : response.status;
-
-    if (effectiveStatus !== 201) {
-      const errorBody = await response.text().catch(() => '');
-      logger.error('Client registration failed:', {
-        status: response.status,
-        body: errorBody,
-      });
-      return null;
-    }
-
-    const client = await response.json();
-
-    // Some servers (e.g. Linear) omit client_secret_expires_at — not fatal, just log
-    if (!client.client_secret_expires_at) {
-      logger.debug('Registration response missing client_secret_expires_at, defaulting to 0');
-    }
-
-    const clientSecret = client.client_secret || undefined;
-
-    logger.info('Registered OAuth client:', { client_id: client.client_id });
-    return {
-      client_id: client.client_id,
-      client_secret: clientSecret,
-    };
-  } catch (error) {
-    logger.error('Client registration error:', error);
-    return null;
-  }
-}
-
-/**
- * Create a local callback server for OAuth redirect
- */
-function createCallbackServer(
-  mcpName: string,
-  onCallback: (params: URLSearchParams) => Promise<void>,
-): Promise<{ server: Server; port: number }> {
-  return new Promise((resolve, reject) => {
-    const app = express();
-
-    app.get('/callback', (req, res) => {
-      void (async () => {
-        logger.info('OAuth callback received for:', mcpName);
-        const params = new URLSearchParams(req.query as Record<string, string>);
-
-        try {
-          await onCallback(params);
-          res.send(`
-            <html>
-              <body style="font-family: system-ui; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0;">
-                <div style="text-align: center;">
-                  <h1>✓ Authentication Successful</h1>
-                  <p>You can close this window and return to Workspaces.</p>
-                </div>
-              </body>
-            </html>
-          `);
-        } catch (error) {
-          res.status(500).send(`
-            <html>
-              <body style="font-family: system-ui; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0;">
-                <div style="text-align: center;">
-                  <h1>✗ Authentication Failed</h1>
-                  <p>${escapeHtml(error instanceof Error ? error.message : 'Unknown error')}</p>
-                </div>
-              </body>
-            </html>
-          `);
-        }
-
-        // Close server after response
-        setTimeout(() => server.close(), 2000);
-      })();
-    });
-
-    const server = app.listen(0, 'localhost', () => {
-      const addr = server.address();
-      if (!addr || typeof addr === 'string') {
-        reject(new Error('Failed to get server address'));
-        return;
-      }
-      const port = addr.port;
-      logger.info('OAuth callback server started on port:', port);
-
-      // Timeout after 5 minutes
-      setTimeout(
-        () => {
-          logger.warn('OAuth callback timeout for:', mcpName);
-          server.close();
-        },
-        5 * 60 * 1000,
-      );
-
-      resolve({ server, port });
-    });
-
-    server.on('error', reject);
-  });
-}
-
-/**
- * Exchange authorization code for tokens
- */
-async function exchangeCodeForTokens(
-  metadata: OAuthServerMetadata,
-  client: OAuthClient,
-  code: string,
-  redirectUri: string,
-  codeVerifier: string,
-): Promise<OAuthTokens> {
-  const body = new URLSearchParams({
-    grant_type: 'authorization_code',
-    code,
-    redirect_uri: redirectUri,
-    client_id: client.client_id,
-    code_verifier: codeVerifier,
-  });
-
-  if (client.client_secret) {
-    body.set('client_secret', client.client_secret);
-  }
-
-  const response = await fetch(metadata.token_endpoint, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/x-www-form-urlencoded',
-    },
-    body: body.toString(),
-  });
-
-  if (!response.ok) {
-    const error = await response.text();
-    throw new Error(`Token exchange failed: ${error}`);
-  }
-
-  const tokens = await response.json();
-  return {
-    access_token: tokens.access_token,
-    refresh_token: tokens.refresh_token,
-    expires_at: tokens.expires_in ? Date.now() + tokens.expires_in * 1000 : undefined,
-    token_type: tokens.token_type || 'Bearer',
-  };
+interface CallbackServer {
+  server: Server;
+  port: number;
+  completion: Promise<void>;
+  close(): void;
 }
 
 export interface InitiateOAuthResult {
@@ -359,216 +53,382 @@ export interface InitiateOAuthResult {
   error?: string;
 }
 
-/**
- * Initiate OAuth flow for an MCP server
- * Opens browser for authentication and returns when complete
- */
+const tokenStore = new Map<string, OAuthTokens>();
+
+function requestSignal(): AbortSignal {
+  return AbortSignal.timeout(REQUEST_TIMEOUT_MS);
+}
+
+function randomBase64Url(bytes: number): string {
+  return randomBytes(bytes).toString('base64url');
+}
+
+function codeChallenge(verifier: string): string {
+  return createHash('sha256').update(verifier).digest('base64url');
+}
+
+function resourceMetadataFromChallenge(header: string | null): string | null {
+  const match = header?.match(/\bresource_metadata\s*=\s*"([^"]+)"/i);
+  return match?.[1] ?? null;
+}
+
+function protectedResourceWellKnown(serverUrl: string): string {
+  const resource = new URL(serverUrl);
+  const suffix = resource.pathname === '/' ? '' : resource.pathname;
+  return new URL(`/.well-known/oauth-protected-resource${suffix}`, resource.origin).toString();
+}
+
+function authorizationServerWellKnown(issuer: string): string {
+  const url = new URL(issuer);
+  const suffix = url.pathname === '/' ? '' : url.pathname.replace(/\/$/, '');
+  return new URL(`/.well-known/oauth-authorization-server${suffix}`, url.origin).toString();
+}
+
+function openIdConfiguration(issuer: string): string {
+  const url = new URL(issuer);
+  const prefix = url.pathname === '/' ? '' : url.pathname.replace(/\/$/, '');
+  url.pathname = `${prefix}/.well-known/openid-configuration`;
+  url.search = '';
+  url.hash = '';
+  return url.toString();
+}
+
+function requireHttpsUrl(value: string, field: string): URL {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error(`The OAuth ${field} is not a valid URL.`);
+  }
+  if (url.protocol !== 'https:' || url.username || url.password) {
+    throw new Error(`The OAuth ${field} must use a secure HTTPS URL.`);
+  }
+  return url;
+}
+
+function validateIssuer(issuer: string): void {
+  const url = requireHttpsUrl(issuer, 'issuer');
+  if (url.search || url.hash) {
+    throw new Error('The OAuth issuer must not contain a query or fragment.');
+  }
+}
+
+async function fetchJson<T>(url: string): Promise<{ response: Response; value?: T }> {
+  const response = await fetch(url, {
+    headers: { Accept: 'application/json' },
+    redirect: 'error',
+    signal: requestSignal(),
+  });
+  if (!response.ok) return { response };
+  return { response, value: (await response.json()) as T };
+}
+
+async function discoverProtectedResource(serverUrl: string): Promise<ProtectedResourceMetadata> {
+  const resourceUrl = requireHttpsUrl(serverUrl, 'protected resource').toString();
+  const challenge = await fetch(resourceUrl, {
+    method: 'POST',
+    headers: { Accept: 'application/json, text/event-stream' },
+    redirect: 'error',
+    signal: requestSignal(),
+  });
+  const challengedUrl = resourceMetadataFromChallenge(challenge.headers.get('www-authenticate'));
+  const metadataUrl = challengedUrl ?? protectedResourceWellKnown(resourceUrl);
+  requireHttpsUrl(metadataUrl, 'protected-resource metadata endpoint');
+  const { response, value } = await fetchJson<ProtectedResourceMetadata>(metadataUrl);
+  if (
+    !response.ok ||
+    typeof value?.resource !== 'string' ||
+    !Array.isArray(value.authorization_servers) ||
+    !value.authorization_servers.length ||
+    value.authorization_servers.some((issuer) => typeof issuer !== 'string')
+  ) {
+    throw new Error('The MCP server did not provide valid OAuth protected-resource metadata.');
+  }
+  if (value.resource !== resourceUrl) {
+    throw new Error('The OAuth protected-resource metadata did not match the MCP server URL.');
+  }
+  return value;
+}
+
+async function discoverAuthorizationServer(issuer: string): Promise<OAuthServerMetadata> {
+  validateIssuer(issuer);
+  const candidates = [authorizationServerWellKnown(issuer), openIdConfiguration(issuer)];
+  for (const candidate of candidates) {
+    const { response, value } = await fetchJson<OAuthServerMetadata>(candidate);
+    if (
+      response.ok &&
+      typeof value?.issuer === 'string' &&
+      typeof value.authorization_endpoint === 'string' &&
+      typeof value.token_endpoint === 'string'
+    ) {
+      if (value.issuer !== issuer) {
+        throw new Error('The OAuth authorization metadata issuer did not match discovery.');
+      }
+      validateIssuer(value.issuer);
+      requireHttpsUrl(value.authorization_endpoint, 'authorization endpoint');
+      requireHttpsUrl(value.token_endpoint, 'token endpoint');
+      if (value.registration_endpoint !== undefined) {
+        requireHttpsUrl(value.registration_endpoint, 'registration endpoint');
+      }
+      if (
+        value.code_challenge_methods_supported &&
+        !value.code_challenge_methods_supported.includes('S256')
+      ) {
+        throw new Error('The OAuth provider does not support PKCE S256.');
+      }
+      return value;
+    }
+  }
+  throw new Error('The MCP server OAuth provider did not publish valid authorization metadata.');
+}
+
+async function registerClient(
+  metadata: OAuthServerMetadata,
+  redirectUri: string,
+): Promise<OAuthClient> {
+  if (!metadata.registration_endpoint) {
+    throw new Error('The OAuth provider does not support automatic client registration.');
+  }
+  const response = await fetch(metadata.registration_endpoint, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      client_name: 'Intent',
+      client_uri: 'https://intentapp.dev',
+      redirect_uris: [redirectUri],
+      grant_types: ['authorization_code', 'refresh_token'],
+      response_types: ['code'],
+      token_endpoint_auth_method: 'none',
+    }),
+    redirect: 'error',
+    signal: requestSignal(),
+  });
+  if (response.status === 403) {
+    throw new Error(m.mcp_oauth_registrationRestricted_error());
+  }
+  if (!response.ok) throw new Error(`OAuth client registration failed (HTTP ${response.status}).`);
+  const value = (await response.json()) as Partial<OAuthClient>;
+  if (!value.client_id)
+    throw new Error('The OAuth provider returned an invalid client registration.');
+  return { client_id: value.client_id, client_secret: value.client_secret };
+}
+
+async function exchangeCode(
+  metadata: OAuthServerMetadata,
+  client: OAuthClient,
+  code: string,
+  redirectUri: string,
+  verifier: string,
+  resource: string,
+  requestedScope?: string,
+): Promise<OAuthTokens> {
+  const body = new URLSearchParams({
+    grant_type: 'authorization_code',
+    code,
+    redirect_uri: redirectUri,
+    client_id: client.client_id,
+    code_verifier: verifier,
+    resource,
+  });
+  if (client.client_secret) body.set('client_secret', client.client_secret);
+  const response = await fetch(metadata.token_endpoint, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: body.toString(),
+    redirect: 'error',
+    signal: requestSignal(),
+  });
+  if (!response.ok) throw new Error(`OAuth token exchange failed (HTTP ${response.status}).`);
+  const value = (await response.json()) as Record<string, unknown>;
+  if (typeof value.access_token !== 'string' || !value.access_token) {
+    throw new Error('The OAuth provider returned an invalid token response.');
+  }
+  const expiresIn = typeof value.expires_in === 'number' ? value.expires_in : undefined;
+  const scope = typeof value.scope === 'string' ? value.scope : requestedScope;
+  return {
+    access_token: value.access_token,
+    refresh_token: typeof value.refresh_token === 'string' ? value.refresh_token : undefined,
+    expires_at: expiresIn === undefined ? undefined : Date.now() + expiresIn * 1_000,
+    token_type: typeof value.token_type === 'string' ? value.token_type : 'Bearer',
+    token_endpoint: metadata.token_endpoint,
+    client_id: client.client_id,
+    client_secret: client.client_secret,
+    scope,
+  };
+}
+
+async function persistTokensOnDaemon(serverId: string, tokens: OAuthTokens): Promise<void> {
+  const { getBackendClient } = await import('../../backend/main/backend.ipc');
+  await getBackendClient().request('mcp.oauth.set', { serverId, tokenBag: tokens });
+}
+
+async function deleteTokensOnDaemon(serverId: string): Promise<void> {
+  const { getBackendClient } = await import('../../backend/main/backend.ipc');
+  await getBackendClient().request('mcp.oauth.delete', { serverId });
+}
+
+export async function clearMcpOAuthTokens(serverId: string): Promise<void> {
+  tokenStore.delete(serverId);
+  try {
+    await deleteTokensOnDaemon(serverId);
+  } catch (error) {
+    logger.error('Failed to delete MCP OAuth tokens from the daemon', error);
+  }
+}
+
+function startCallbackServer(
+  handleCallback: (params: URLSearchParams) => Promise<void>,
+): Promise<CallbackServer> {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let resolveCompletion!: () => void;
+    let rejectCompletion!: (error: Error) => void;
+    const completion = new Promise<void>((done, failed) => {
+      resolveCompletion = done;
+      rejectCompletion = failed;
+    });
+    const server = createServer((request, response) => {
+      void (async () => {
+        try {
+          const url = new URL(request.url ?? '/', 'http://127.0.0.1');
+          if (url.pathname !== '/callback') {
+            response.statusCode = 404;
+            response.end();
+            return;
+          }
+          await handleCallback(url.searchParams);
+          response.statusCode = 200;
+          response.setHeader('Content-Type', 'text/plain; charset=utf-8');
+          response.end(m.mcp_oauth_callbackComplete_message());
+          settled = true;
+          resolveCompletion();
+        } catch (error) {
+          response.statusCode = 400;
+          response.setHeader('Content-Type', 'text/plain; charset=utf-8');
+          response.end(m.mcp_oauth_callbackFailed_message());
+          settled = true;
+          rejectCompletion(error instanceof Error ? error : new Error('OAuth callback failed.'));
+        } finally {
+          if (settled) server.close();
+        }
+      })();
+    });
+    const timeout = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      server.close();
+      rejectCompletion(new Error('OAuth sign-in timed out.'));
+    }, CALLBACK_TIMEOUT_MS);
+    timeout.unref?.();
+    server.once('error', (error) => {
+      clearTimeout(timeout);
+      reject(error);
+    });
+    server.listen(0, '127.0.0.1', () => {
+      const address = server.address();
+      if (!address || typeof address === 'string') {
+        clearTimeout(timeout);
+        server.close();
+        reject(new Error('Could not start the OAuth callback server.'));
+        return;
+      }
+      resolve({
+        server,
+        port: address.port,
+        completion: completion.finally(() => clearTimeout(timeout)),
+        close: () => {
+          clearTimeout(timeout);
+          server.close();
+        },
+      });
+    });
+  });
+}
+
 export async function initiateMcpOAuth(
-  mcpName: string,
+  serverId: string,
   serverUrl: string,
 ): Promise<InitiateOAuthResult> {
-  logger.info('Initiating OAuth for MCP server:', { mcpName, serverUrl });
-
+  let callbackServer: CallbackServer | undefined;
   try {
-    // 1. Discover OAuth metadata
-    const metadata = await discoverOAuthMetadata(serverUrl);
-    if (!metadata) {
-      return {
-        success: false,
-        error: m.mcp_oauth_notSupported_error(),
+    const resourceMetadata = await discoverProtectedResource(serverUrl);
+    const metadata = await discoverAuthorizationServer(resourceMetadata.authorization_servers[0]);
+    const callbackContext: {
+      current?: {
+        client: OAuthClient;
+        verifier: string;
+        state: string;
+        redirectUri: string;
+        scope?: string;
       };
-    }
-
-    // 2. Create callback server
-    let callbackServer!: { server: Server; port: number };
-
-    const tokenPromise = new Promise<OAuthTokens>((resolve, reject) => {
-      createCallbackServer(mcpName, async (params) => {
-        const code = params.get('code');
-        const state = params.get('state');
-        const error = params.get('error');
-
-        if (error) {
-          reject(new Error(params.get('error_description') || error));
-          return;
-        }
-
-        if (!code) {
-          reject(new Error('No authorization code received'));
-          return;
-        }
-
-        // Get pending auth state
-        const authState = pendingAuthStates.get(mcpName);
-        if (!authState) {
-          reject(new Error('No pending auth state found'));
-          return;
-        }
-
-        // Verify state
-        if (state !== authState.state) {
-          reject(new Error('State mismatch - possible CSRF attack'));
-          return;
-        }
-
-        // Exchange code for tokens
-        const newTokens = await exchangeCodeForTokens(
-          authState.serverMetadata,
-          authState.client,
-          code,
-          authState.redirectUri,
-          authState.codeVerifier,
-        );
-
-        pendingAuthStates.delete(mcpName);
-        resolve(newTokens);
-      })
-        .then((result) => {
-          callbackServer = result;
-        })
-        .catch(reject);
+    } = {};
+    let tokens: OAuthTokens | undefined;
+    callbackServer = await startCallbackServer(async (params) => {
+      const context = callbackContext.current;
+      if (!context) throw new Error('The OAuth callback was incomplete.');
+      if (params.get('state') !== context.state) {
+        throw new Error('OAuth state verification failed.');
+      }
+      const responseIssuer = params.get('iss');
+      if (
+        responseIssuer !== null
+          ? responseIssuer !== metadata.issuer
+          : metadata.authorization_response_iss_parameter_supported === true
+      ) {
+        throw new Error('OAuth authorization response issuer verification failed.');
+      }
+      const error = params.get('error');
+      if (error) throw new Error(params.get('error_description') || 'OAuth authorization failed.');
+      const code = params.get('code');
+      if (!code) throw new Error('The OAuth callback was incomplete.');
+      tokens = await exchangeCode(
+        metadata,
+        context.client,
+        code,
+        context.redirectUri,
+        context.verifier,
+        resourceMetadata.resource,
+        context.scope,
+      );
     });
-
-    // Wait for callback server to start
-    await new Promise((resolve) => setTimeout(resolve, 100));
-
-    // 3. Register client (or use existing)
-    const redirectUri = `http://localhost:${callbackServer.port}/callback`;
+    const redirectUri = `http://127.0.0.1:${callbackServer.port}/callback`;
     const client = await registerClient(metadata, redirectUri);
-    if (!client) {
-      callbackServer.server.close();
-      return {
-        success: false,
-        error: m.mcp_oauth_registerFailed_error(),
-      };
-    }
-
-    // 4. Build authorization URL with PKCE
-    const codeVerifier = generateCodeVerifier();
-    const codeChallenge = await generateCodeChallenge(codeVerifier);
-    const state = generateState();
-
-    // Store auth state for callback verification
-    pendingAuthStates.set(mcpName, {
-      codeVerifier,
-      state,
-      redirectUri,
-      serverMetadata: metadata,
-      client,
-      resolve: () => {},
-      reject: () => {},
-    });
-
-    const authUrl = new URL(metadata.authorization_endpoint);
-    authUrl.searchParams.set('response_type', 'code');
-    authUrl.searchParams.set('client_id', client.client_id);
-    authUrl.searchParams.set('redirect_uri', redirectUri);
-    authUrl.searchParams.set('state', state);
-    authUrl.searchParams.set('code_challenge', codeChallenge);
-    authUrl.searchParams.set('code_challenge_method', 'S256');
-
-    // 5. Open browser
-    logger.info('Opening browser for OAuth:', authUrl.toString());
-    await shell.openExternal(authUrl.toString());
-
-    // 6. Wait for callback
-    const tokens = await tokenPromise;
-
-    // 7. Store tokens (in memory and persistent storage)
-    tokenStore.set(mcpName, tokens);
-    await persistTokensOnDaemon(mcpName, tokens);
-    logger.info('OAuth completed successfully for:', mcpName);
-
+    const verifier = randomBase64Url(32);
+    const state = randomBase64Url(16);
+    const scope = (resourceMetadata.scopes_supported ?? metadata.scopes_supported)?.join(' ');
+    callbackContext.current = { client, verifier, state, redirectUri, scope };
+    const authorizationUrl = new URL(metadata.authorization_endpoint);
+    authorizationUrl.searchParams.set('response_type', 'code');
+    authorizationUrl.searchParams.set('client_id', client.client_id);
+    authorizationUrl.searchParams.set('redirect_uri', redirectUri);
+    authorizationUrl.searchParams.set('state', state);
+    authorizationUrl.searchParams.set('code_challenge', codeChallenge(verifier));
+    authorizationUrl.searchParams.set('code_challenge_method', 'S256');
+    authorizationUrl.searchParams.set('resource', resourceMetadata.resource);
+    if (scope) authorizationUrl.searchParams.set('scope', scope);
+    await Promise.all([shell.openExternal(authorizationUrl.toString()), callbackServer.completion]);
+    if (!tokens) throw new Error('OAuth sign-in did not return tokens.');
+    await persistTokensOnDaemon(serverId, tokens);
+    tokenStore.set(serverId, tokens);
     return { success: true };
   } catch (error) {
-    logger.error('OAuth failed for:', mcpName, error);
-    pendingAuthStates.delete(mcpName);
+    logger.error('MCP OAuth sign-in failed', error);
     return {
       success: false,
-      error: error instanceof Error ? error.message : 'OAuth failed',
+      error: error instanceof Error ? error.message : m.mcp_oauth_signInFailed_error(),
     };
+  } finally {
+    callbackServer?.close();
   }
 }
 
-/**
- * Get stored OAuth tokens for an MCP server. The daemon persists bags via
- * `mcp.oauth.*` but never echoes raw contents back (PROTOCOL.md §5.22.1), so
- * this only inspects the in-process memory cache populated by
- * `initiateMcpOAuth`. After a main-process restart callers must re-run the
- * OAuth flow. Kept `async` for call-site compat.
- */
-export async function getMcpOAuthTokensAsync(mcpName: string): Promise<OAuthTokens | null> {
-  return tokenStore.get(mcpName) ?? null;
+export async function getMcpOAuthTokensAsync(serverId: string): Promise<OAuthTokens | null> {
+  return tokenStore.get(serverId) ?? null;
 }
 
-/**
- * Get stored OAuth tokens for an MCP server (sync version, only checks memory)
- */
-export function getMcpOAuthTokens(mcpName: string): OAuthTokens | null {
-  return tokenStore.get(mcpName) || null;
-}
-
-/**
- * Check if we have valid OAuth tokens for an MCP server (async version)
- */
-export async function hasMcpOAuthTokensAsync(mcpName: string): Promise<boolean> {
-  const tokens = await getMcpOAuthTokensAsync(mcpName);
-  if (!tokens) return false;
-
-  // Check if expired
-  if (tokens.expires_at && Date.now() > tokens.expires_at) {
-    return false;
-  }
-
-  return true;
-}
-
-/**
- * Check if we have valid OAuth tokens for an MCP server (sync version)
- */
-export function hasMcpOAuthTokens(mcpName: string): boolean {
-  const tokens = tokenStore.get(mcpName);
-  if (!tokens) return false;
-
-  // Check if expired
-  if (tokens.expires_at && Date.now() > tokens.expires_at) {
-    return false;
-  }
-
-  return true;
-}
-
-/**
- * Get authorization header for an MCP server (async version that checks persistent storage)
- */
-export async function getMcpAuthHeaderAsync(mcpName: string): Promise<string | null> {
-  logger.info('getMcpAuthHeaderAsync called for:', mcpName);
-  const tokens = await getMcpOAuthTokensAsync(mcpName);
-  logger.info('getMcpAuthHeaderAsync tokens result:', {
-    mcpName,
-    hasTokens: !!tokens,
-    tokenType: tokens?.token_type,
-  });
+export async function getMcpAuthHeaderAsync(serverId: string): Promise<string | null> {
+  const tokens = tokenStore.get(serverId);
   if (!tokens) return null;
-
-  // Capitalize token type for Authorization header (OAuth servers may return "bearer" lowercase)
-  const tokenType = tokens.token_type.toLowerCase() === 'bearer' ? 'Bearer' : tokens.token_type;
-  const header = `${tokenType} ${tokens.access_token}`;
-  logger.info('getMcpAuthHeaderAsync returning header:', {
-    mcpName,
-    headerPrefix: header.substring(0, 20),
-  });
-  return header;
-}
-
-/**
- * Get authorization header for an MCP server (sync version, only checks memory)
- */
-export function getMcpAuthHeader(mcpName: string): string | null {
-  const tokens = tokenStore.get(mcpName);
-  if (!tokens) return null;
-
-  // Capitalize token type for Authorization header (OAuth servers may return "bearer" lowercase)
   const tokenType = tokens.token_type.toLowerCase() === 'bearer' ? 'Bearer' : tokens.token_type;
   return `${tokenType} ${tokens.access_token}`;
 }

@@ -5,11 +5,7 @@
 import { store } from '../../store';
 import type { StoreState } from '../../types';
 import { extractAllContent, type AgentMessage, type AgentSession } from '$shared/types';
-import {
-  CHIEF_WORKSPACE_ID,
-  type ChiefThreadPreview,
-  type SidebarNavItem,
-} from './sidebar-nav-types';
+import { CHIEF_WORKSPACE_ID, type ChiefThreadPreview } from './sidebar-nav-types';
 import { getChiefThreadTitle } from './chief-thread-title';
 import { m } from '$shared/paraglide/messages.js';
 import {
@@ -72,6 +68,10 @@ function hasCurrentChiefIdentity(session: AgentSession): boolean {
   );
 }
 
+function getChiefSessionMessageCount(session: AgentSession): number {
+  return Math.max(session.messages.length, session.messageCount ?? 0);
+}
+
 function toChiefThreadPreview(session: AgentSession): ChiefThreadPreview {
   const latestMessage = session.messages.at(-1);
   return {
@@ -87,13 +87,11 @@ function toChiefThreadPreview(session: AgentSession): ChiefThreadPreview {
       session.isStreaming === true ||
       session.isProcessing === true ||
       session.isResponding === true,
-    messageCount: session.messages.length,
+    messageCount: getChiefSessionMessageCount(session),
   };
 }
 
 // ── Direct state selectors ──
-export const selectExpandedItem = store.createSelector((state) => state.sidebarNav.expandedItem);
-
 export const selectIsCardPinned = store.createSelector((state) => state.sidebarNav.isCardPinned);
 
 export const selectPanelItem = store.createSelector((state) => state.sidebarNav.panelItem);
@@ -122,12 +120,16 @@ export const selectShowArchivedWorkspaces = store.createSelector(
   (state) => state.sidebarNav.showArchivedWorkspaces,
 );
 
-export const selectPinnedWorkspaceIds = store.createSelector(
-  (state) => state.sidebarNav.pinnedWorkspaceIds,
+export const selectCollapsedStatusGroupIds = store.createSelector(
+  (state) => state.sidebarNav.collapsedStatusGroupIds,
 );
 
-export const selectMultiSelectSidebarTabOrder = store.createSelector(
-  (state): string[] => state.sidebarNav.multiSelectTabOrder,
+export const selectIsChiefCollapsed = store.createSelector(
+  (state) => state.sidebarNav.isChiefCollapsed,
+);
+
+export const selectPinnedWorkspaceIds = store.createSelector(
+  (state) => state.sidebarNav.pinnedWorkspaceIds,
 );
 
 export const selectMultiSelectSidebarSelectedTabIds = store.createSelector(
@@ -154,17 +156,6 @@ export const selectStatsOverlayOpen = store.createSelector(
 );
 
 // ── Derived selectors ──
-
-/** The active visible card (either hovered or expanded) */
-export const selectActiveCard = store.createSelector((state): SidebarNavItem | null => {
-  const { expandedItem, hoveredItem } = state.sidebarNav;
-  return expandedItem ?? hoveredItem;
-});
-
-/** Whether any context menu is open (prevents hover card auto-close) */
-export const selectContextMenuOpen = store.createSelector(
-  (state) => state.sidebarNav.contextMenuOpenCount > 0,
-);
 
 /** Latest Chief thread preview for the sidebar hover card. */
 export const selectChiefThreadPreview = store.createSelector((state): ChiefThreadPreview | null => {
@@ -196,7 +187,12 @@ export const selectCurrentChiefThread = store.createSelector((state): ChiefThrea
 export const selectReusableChiefThread = store.createSelector(
   (state): ChiefThreadPreview | null => {
     const reusable = getChiefSessions(state)
-      .filter((session) => session.messages.length === 0 && hasCurrentChiefIdentity(session))
+      .filter(
+        (session) =>
+          getChiefSessionMessageCount(session) === 0 &&
+          !session.lastMessageId &&
+          hasCurrentChiefIdentity(session),
+      )
       .sort((a, b) => getSessionTimestamp(b) - getSessionTimestamp(a))[0];
 
     return reusable ? toChiefThreadPreview(reusable) : null;

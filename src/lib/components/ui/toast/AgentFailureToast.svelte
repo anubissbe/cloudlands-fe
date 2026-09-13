@@ -2,7 +2,9 @@
   import Fa from 'svelte-fa';
   import { faExclamationCircle } from '@fortawesome/free-solid-svg-icons';
   import Button from '$lib/components/ui/button/button.svelte';
+  import CopyButton from '$lib/components/ui/CopyButton.svelte';
   import MicroKeySlotSquare from '$features/hardware-console/components/MicroKeySlotSquare.svelte';
+  import ToastCloseButton from './ToastCloseButton.svelte';
   import { m } from '$shared/paraglide/messages.js';
 
   interface Props {
@@ -20,6 +22,10 @@
     retryNote?: string;
     /** Resolved 0-based micro key slot of the workspace (badge hidden when null). */
     keySlot?: number | null;
+    /** Provider auth failure: login command to run (copyable guidance). */
+    loginCommandHint?: string;
+    /** claude-code auth failure: desktop-app sign-in doesn't carry over to the CLI. */
+    showClaudeDesktopNote?: boolean;
     onRetry: () => void;
     /** Navigate to the agent WITHOUT retrying. */
     onSwitchTo: () => void;
@@ -34,6 +40,8 @@
     retrying,
     retryNote,
     keySlot = null,
+    loginCommandHint,
+    showClaudeDesktopNote = false,
     onRetry,
     onSwitchTo,
     onClose,
@@ -42,9 +50,9 @@
 
 <!-- Content-only: the Sonner wrapper owns the card chrome (bg, border, padding);
      the destructive border tint is passed as a wrapper class by the service. -->
-<div class="flex w-full min-w-0 items-start gap-3">
+<div class="relative flex w-full min-w-0 items-start gap-3">
   <!-- Icon -->
-  <div class="flex-shrink-0 mt-0.5 text-destructive">
+  <div class="flex-shrink-0 mt-0.5 text-danger">
     <Fa icon={faExclamationCircle} class="w-5 h-5" />
   </div>
 
@@ -58,12 +66,33 @@
     </div>
     <p class="text-sm text-muted-foreground line-clamp-2 mt-0.5 break-words">{errorSummary}</p>
 
+    {#if loginCommandHint}
+      <div class="mt-1.5 flex min-w-0 flex-col gap-1" data-testid="toast-auth-guidance">
+        <p class="text-xs text-muted-foreground">{m.settings_providers_runToLogIn_label()}</p>
+        <div class="flex items-center gap-1">
+          <code
+            class="rounded bg-muted px-1.5 py-0.5 text-xs"
+            data-testid="toast-auth-login-command">{loginCommandHint}</code
+          >
+          <CopyButton text={loginCommandHint} size="xs" />
+        </div>
+        {#if showClaudeDesktopNote}
+          <p
+            class="text-xs text-muted-foreground break-words"
+            data-testid="toast-auth-claude-desktop-note"
+          >
+            {m.settings_providers_claudeDesktopNote_label()}
+          </p>
+        {/if}
+      </div>
+    {/if}
+
     {#if contextLine}
       <p class="text-xs text-muted-foreground truncate mt-1.5 min-w-0">{contextLine}</p>
     {/if}
 
     {#if retryNote}
-      <p class="text-xs text-destructive mt-1.5 break-words">{retryNote}</p>
+      <p class="text-xs text-danger mt-1.5 break-words">{retryNote}</p>
     {/if}
 
     <!-- Action buttons -->
@@ -78,17 +107,7 @@
   </div>
 
   <!-- Close button -->
-  <button
-    type="button"
-    class="-mr-1 -mt-1 flex-shrink-0 p-1 text-muted-foreground hover:text-foreground transition-colors cursor-pointer focus-visible:outline-2 focus-visible:outline-ring focus-visible:outline-offset-2"
-    onclick={onClose}
-    aria-label={m.ui_agentFailureToast_close_ariaLabel()}
-  >
-    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"
-      ></path>
-    </svg>
-  </button>
+  <ToastCloseButton onclick={onClose} ariaLabel={m.ui_agentFailureToast_close_ariaLabel()} />
 </div>
 
 <style>

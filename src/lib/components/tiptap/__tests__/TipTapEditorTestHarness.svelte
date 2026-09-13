@@ -1,8 +1,5 @@
 <script lang="ts">
-  import {
-  onMount,
-  onDestroy,
-} from 'svelte';
+  import { onMount, onDestroy } from 'svelte';
   import { Editor } from '@tiptap/core';
   import StarterKit from '@tiptap/starter-kit';
   import TaskList from '@tiptap/extension-task-list';
@@ -28,18 +25,20 @@
           taskListTypeName: 'taskList',
         }),
       ],
+      // CustomTaskItem's parse rule expects task item content inside a <div>
+      // wrapper (contentElement: 'div').
       content:
         content ||
         `
         <ul data-type="taskList">
           <li data-type="taskItem" data-checked="false" data-status="todo">
-            <p>Todo task</p>
+            <div><p>Todo task</p></div>
           </li>
           <li data-type="taskItem" data-checked="false" data-status="in-progress">
-            <p>In-progress task</p>
+            <div><p>In-progress task</p></div>
           </li>
           <li data-type="taskItem" data-checked="true" data-status="done">
-            <p>Done task</p>
+            <div><p>Done task</p></div>
           </li>
         </ul>
       `,

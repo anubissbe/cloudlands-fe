@@ -5,8 +5,19 @@ import {
   type AppSettingDefinition,
 } from '../app-settings-schema';
 import { THEME_PRESET_IDS, THEME_PRESET_MANIFEST } from '../theme-presets-manifest';
+import { UPDATE_CHANNELS } from '../../features/auto-update/types';
 
 describe('app settings schema', () => {
+  it('defines the persisted Open In editor order setting', () => {
+    expect(findAppSettingDefinition('openIn.editorOrder')).toMatchObject({
+      type: 'array',
+      source: 'local-storage',
+      storageKey: 'settings:openInEditorsOrder',
+      defaultValue: [],
+      apply: { kind: 'local-storage-set', key: 'settings:openInEditorsOrder' },
+    });
+  });
+
   it('defines the persisted GitHub link default action choices', () => {
     expect(findAppSettingDefinition('githubLinks.defaultAction')).toMatchObject({
       type: 'enum',
@@ -21,6 +32,39 @@ describe('app settings schema', () => {
         'start-workspace',
       ],
       apply: { kind: 'redux-action', action: 'userPreferences/setGithubLinkDefaultAction' },
+    });
+  });
+
+  it('derives the update channel choices from UPDATE_CHANNELS (including disabled)', () => {
+    const definition = findAppSettingDefinition('preferences.updateChannel');
+
+    expect(definition?.type).toBe('enum');
+    // Derived, not a parallel hardcoded list: every channel the service
+    // accepts — including 'disabled' — is offered and carries a label.
+    expect(definition?.enumValues).toEqual(UPDATE_CHANNELS);
+    for (const channel of UPDATE_CHANNELS) {
+      expect(definition?.enumLabels?.[channel]).toBeTruthy();
+    }
+    expect(definition?.enumLabels?.disabled).toBe('Disabled');
+    expect(definition?.description).toContain('disabled');
+  });
+
+  it('defines persisted appearance preferences that default to enabled', () => {
+    expect(findAppSettingDefinition('appearance.chatAurora')).toMatchObject({
+      category: 'theme',
+      type: 'boolean',
+      source: 'local-storage',
+      storageKey: 'chat:auroraEnabled',
+      defaultValue: true,
+      apply: { kind: 'redux-action', action: 'userPreferences/setChatAuroraEnabled' },
+    });
+    expect(findAppSettingDefinition('appearance.shellTransparency')).toMatchObject({
+      category: 'theme',
+      type: 'boolean',
+      source: 'local-storage',
+      storageKey: 'appearance:shellTransparencyEnabled',
+      defaultValue: true,
+      apply: { kind: 'redux-action', action: 'userPreferences/setShellTransparencyEnabled' },
     });
   });
 

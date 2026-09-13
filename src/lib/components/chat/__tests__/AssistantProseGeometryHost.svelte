@@ -35,8 +35,20 @@
     { type: 'tool_use', id: 'nested-tool', name: 'view', input: { path: 'src/example.ts' } },
     { type: 'text', text: '</group:Recovery>' },
   ];
+  const headerlessInlineResponseGroup: ContentBlock[] = [
+    { type: 'thinking', id: 'inline-history', text: 'Earlier reasoning history' },
+    { type: 'text', text: '<group:Prepping>Inline assistant prose' },
+    { type: 'tool_use', id: 'inline-tool', name: 'view', input: { path: 'src/inline.ts' } },
+    { type: 'text', text: '</group>' },
+  ];
   const tool = [
     { type: 'tool_use', id: 'tool-1', name: 'read_file', input: { path: 'src/example.ts' } },
+  ] as ContentBlock[];
+  const richBlock = [
+    {
+      type: 'text',
+      text: 'Prose beside a rich block\n\n```ts\nconst inset = true;\n```',
+    },
   ] as ContentBlock[];
 
   const operationalRows = [
@@ -103,20 +115,32 @@
       id: 'tool-reasoning',
       content: [
         { type: 'tool_use', id: 'pair-tool-c', name: 'view', input: { path: 'src/c.ts' } },
-        { type: 'thinking', id: 'pair-reasoning-a', text: 'Inspect the tool result' },
+        {
+          type: 'thinking',
+          id: 'pair-reasoning-a',
+          text: 'Inspect the tool result\n\nOperational geometry detail.',
+        },
       ],
     },
     {
       id: 'reasoning-tool',
       content: [
-        { type: 'thinking', id: 'pair-reasoning-b', text: 'Choose the next tool' },
+        {
+          type: 'thinking',
+          id: 'pair-reasoning-b',
+          text: 'Choose the next tool\n\nOperational geometry detail.',
+        },
         { type: 'tool_use', id: 'pair-tool-d', name: 'view', input: { path: 'src/d.ts' } },
       ],
     },
     {
       id: 'reasoning-context',
       content: [
-        { type: 'thinking', id: 'pair-reasoning-c', text: 'Search for the owning primitive' },
+        {
+          type: 'thinking',
+          id: 'pair-reasoning-c',
+          text: 'Search for the owning primitive\n\nOperational geometry detail.',
+        },
         {
           type: 'tool_use',
           id: 'pair-context-a',
@@ -188,6 +212,19 @@
     </div>
     <div data-testid="expanded-group-operational-rows">
       <MessageContent content={expandedGroupOperationalRows} />
+    </div>
+    <div data-testid="streaming-expanded-group-operational-rows">
+      <StreamingMessageContent content={expandedGroupOperationalRows} isStreaming />
+    </div>
+    <div data-testid="headerless-inline-static">
+      <MessageContent content={headerlessInlineResponseGroup} />
+    </div>
+    <div data-testid="headerless-inline-streaming">
+      <StreamingMessageContent content={headerlessInlineResponseGroup} isStreaming />
+    </div>
+    <div data-testid="static-rich-block"><MessageContent content={richBlock} /></div>
+    <div data-testid="streaming-rich-block">
+      <StreamingMessageContent content={richBlock} isStreaming />
     </div>
     <div data-testid="single-operational-cluster">
       <MessageContent content={tool} />

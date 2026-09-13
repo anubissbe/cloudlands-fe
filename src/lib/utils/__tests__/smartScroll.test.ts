@@ -5,10 +5,13 @@ import {
   captureScrollAnchor,
   followBottom,
   followToBottom,
+  hasActiveFollowBottomMutation,
   isFollowingBottom,
   isNativeScrollAnchoringActive,
   restoreScrollAnchor,
+  type FollowBottomState,
 } from '../smartScroll';
+import { safeDisclosureTransition } from '../../components/chat/disclosure-motion';
 
 describe('animateScrollTo', () => {
   let rafCallbacks: FrameRequestCallback[];
@@ -111,10 +114,23 @@ describe('captureScrollAnchor / restoreScrollAnchor', () => {
         scrollTop = value;
       },
     });
-    Object.defineProperty(container, 'scrollHeight', { configurable: true, value: opts.scrollHeight });
-    Object.defineProperty(container, 'clientHeight', { configurable: true, value: opts.clientHeight });
+    Object.defineProperty(container, 'scrollHeight', {
+      configurable: true,
+      value: opts.scrollHeight,
+    });
+    Object.defineProperty(container, 'clientHeight', {
+      configurable: true,
+      value: opts.clientHeight,
+    });
     container.getBoundingClientRect = () =>
-      ({ top: 0, bottom: opts.clientHeight, left: 0, right: 0, width: 0, height: opts.clientHeight }) as DOMRect;
+      ({
+        top: 0,
+        bottom: opts.clientHeight,
+        left: 0,
+        right: 0,
+        width: 0,
+        height: opts.clientHeight,
+      }) as DOMRect;
     document.body.appendChild(container);
     return container;
   }
@@ -134,7 +150,11 @@ describe('captureScrollAnchor / restoreScrollAnchor', () => {
 
   it('skips anchoring near the bottom and restore leaves scrollTop untouched', () => {
     // distance from bottom = 1000 - 550 - 400 = 50 <= 100 threshold
-    const container = makeScrollContainer({ scrollTop: 550, scrollHeight: 1000, clientHeight: 400 });
+    const container = makeScrollContainer({
+      scrollTop: 550,
+      scrollHeight: 1000,
+      clientHeight: 400,
+    });
     addMessage(container, 'm1', 20);
 
     const anchor = captureScrollAnchor(container);
@@ -147,7 +167,11 @@ describe('captureScrollAnchor / restoreScrollAnchor', () => {
 
   it('anchors the first visible element and compensates scrollTop by its movement', () => {
     // distance from bottom = 2000 - 500 - 400 = 1100 > 100 threshold
-    const container = makeScrollContainer({ scrollTop: 500, scrollHeight: 2000, clientHeight: 400 });
+    const container = makeScrollContainer({
+      scrollTop: 500,
+      scrollHeight: 2000,
+      clientHeight: 400,
+    });
     addMessage(container, 'above-viewport', -60); // above viewport, not eligible
     const anchorEl = addMessage(container, 'first-visible', 20);
     addMessage(container, 'second-visible', 80);
@@ -171,7 +195,11 @@ describe('captureScrollAnchor / restoreScrollAnchor', () => {
   });
 
   it('restores gracefully when the anchor element was removed from the DOM', () => {
-    const container = makeScrollContainer({ scrollTop: 500, scrollHeight: 2000, clientHeight: 400 });
+    const container = makeScrollContainer({
+      scrollTop: 500,
+      scrollHeight: 2000,
+      clientHeight: 400,
+    });
     const anchorEl = addMessage(container, 'doomed', 20);
 
     const anchor = captureScrollAnchor(container);
@@ -221,6 +249,7 @@ describe('followBottom policy', () => {
   let resizeUnobserved: Element[];
   let resizeActive: Set<Element>;
   let mutationCallbacks: MutationCallback[];
+  let mutationDisconnects: number;
   let scrollHeight: number;
   let clientHeight: number;
   let scrollTop: number;
@@ -233,6 +262,7 @@ describe('followBottom policy', () => {
     resizeUnobserved = [];
     resizeActive = new Set();
     mutationCallbacks = [];
+    mutationDisconnects = 0;
     scrollHeight = 900;
     clientHeight = 300;
     scrollTop = 600;
@@ -267,7 +297,9 @@ describe('followBottom policy', () => {
           mutationCallbacks.push(callback);
         }
         observe() {}
-        disconnect() {}
+        disconnect() {
+          mutationDisconnects += 1;
+        }
       },
     );
     container = document.createElement('div');
@@ -347,6 +379,28 @@ describe('followBottom policy', () => {
     );
   }
 
+  it('detaches and restores every listener and observer when disabled', () => {
+    const removeContainerListener = vi.spyOn(container, 'removeEventListener');
+    const removeWindowListener = vi.spyOn(window, 'removeEventListener');
+    const action = followBottom(container, { enabled: true, follow: true });
+
+    expect(isFollowingBottom(container)).toBe(true);
+    expect(resizeActive.size).toBeGreaterThan(0);
+
+    action.update({ enabled: false, follow: true });
+    expect(isFollowingBottom(container)).toBe(false);
+    expect(resizeActive.size).toBe(0);
+    expect(mutationDisconnects).toBe(1);
+    expect(removeContainerListener).toHaveBeenCalledWith('scroll', expect.any(Function));
+    expect(removeWindowListener).toHaveBeenCalledWith('pointerup', expect.any(Function));
+
+    action.update({ enabled: true, follow: true });
+    expect(isFollowingBottom(container)).toBe(true);
+    expect(resizeActive.size).toBeGreaterThan(0);
+
+    action.destroy();
+  });
+
   function fireRemovedMutation(node: Node) {
     mutationCallbacks[0]?.(
       [
@@ -384,11 +438,72 @@ describe('followBottom policy', () => {
     expect(child.style.overflowAnchor).toBe('auto');
   });
 
-  it('starts followed and idle with no pending animation frame', () => {
+  it('keeps the layout-neutral anchor a viable non-zero-sized anchor candidate', () => {
+    const action = followBottom(container, { follow: true, layoutNeutralBottomAnchor: true });
+    const anchor = container.querySelector<HTMLElement>('[data-follow-bottom-anchor]')!;
+
+    // Zero-sized boxes are rejected as scroll-anchor candidates by Chromium
+    // and Gecko (w3c/csswg-drafts#3483): the declared box must be non-zero
+    // and its margin must cancel that height exactly so the net scrollable
+    // extent is unchanged. jsdom has no layout, so assert the numeric
+    // invariant here; real-browser eligibility + neutrality is covered by
+    // bottom-anchoring.ct.spec.ts ("layout-neutral bottom anchor is a real
+    // anchor candidate with zero net scroll height").
+    const declaredHeight = Number.parseFloat(anchor.style.height);
+    const cancellingMargin = Number.parseFloat(anchor.style.marginTop);
+    expect(declaredHeight).toBeGreaterThan(0);
+    expect(declaredHeight + cancellingMargin).toBe(0);
+    action.destroy();
+  });
+
+  it('defers the initial mount snap and layout reads to an animation frame', () => {
+    // Start the viewport away from the bottom so the deferred path must
+    // actually snap it there — a no-op attach would leave it at 100.
+    scrollTop = 100;
+    let layoutReads = 0;
+    Object.defineProperty(container, 'scrollHeight', {
+      configurable: true,
+      get: () => {
+        layoutReads += 1;
+        return scrollHeight;
+      },
+    });
+    Object.defineProperty(container, 'clientHeight', {
+      configurable: true,
+      get: () => {
+        layoutReads += 1;
+        return clientHeight;
+      },
+    });
     const action = followBottom(container, { follow: true });
 
+    // Initial mount runs inside the component mount flush on a dirty tree:
+    // no synchronous layout read, snap deferred to the frame (pre-paint).
+    expect(layoutReads).toBe(0);
+    expect(scrollTop).toBe(100);
+    expect(animationFrames).toHaveLength(1);
+
+    runSettleTail();
+    expect(layoutReads).toBeGreaterThan(0);
     expect(scrollTop).toBe(600);
     expect(animationFrames).toHaveLength(0);
+    action.destroy();
+  });
+
+  it('deduplicates unchanged geometry reports during repeated scroll events', () => {
+    const states: FollowBottomState[] = [];
+    const action = followBottom(container, {
+      follow: true,
+      onScrollStateChange: (state) => states.push(state),
+    });
+    runSettleTail();
+    const initialReports = states.length;
+
+    container.dispatchEvent(new Event('scroll'));
+    container.dispatchEvent(new Event('scroll'));
+    container.dispatchEvent(new Event('scroll'));
+
+    expect(states).toHaveLength(initialReports);
     action.destroy();
   });
 
@@ -449,14 +564,18 @@ describe('followBottom policy', () => {
       follow: true,
       onScrollStateChange: (state) => distances.push(state.distanceFromBottom),
     });
+    runSettleTail();
 
     scrollHeight += 120;
     fireMutation();
+    expect(animationFrames).toHaveLength(1);
+    runFrame();
     expect(scrollTop).toBe(720);
     expect(distances.at(-1)).toBe(0);
 
     scrollHeight += 30;
     fireResize();
+    runFrame();
     expect(scrollTop).toBe(750);
     runFrame();
     expect(scrollTop).toBe(750);
@@ -484,19 +603,231 @@ describe('followBottom policy', () => {
     const child = document.createElement('div');
     container.append(child);
     const action = followBottom(container, { follow: true });
+    runSettleTail();
     const mutation = beforeFollowBottomMutation(child);
 
+    // While leased, the pin arrives with the leased element's post-layout
+    // resize delivery; the settle frame and the lease calls stay read-free.
     scrollHeight += 12;
     runFrame();
+    expect(scrollTop).toBe(600);
+    fireResizeFor(child);
     expect(scrollTop).toBe(612);
 
     scrollHeight += 18;
     mutation.request();
+    expect(scrollTop).toBe(612);
+    fireResizeFor(child);
     expect(scrollTop).toBe(630);
 
     scrollHeight += 24;
     mutation.settle();
+    expect(scrollTop).toBe(630);
+    runFrame();
     expect(scrollTop).toBe(654);
+    runSettleTail();
+    expect(scrollTop).toBe(654);
+    expect(animationFrames).toHaveLength(0);
+    action.destroy();
+  });
+
+  it('reports an active lease from acquisition until the last lease settles', () => {
+    const child = document.createElement('div');
+    container.append(child);
+    const action = followBottom(container, { follow: true });
+    runSettleTail();
+    expect(hasActiveFollowBottomMutation(container)).toBe(false);
+
+    const first = beforeFollowBottomMutation(child);
+    const second = beforeFollowBottomMutation(child);
+    expect(hasActiveFollowBottomMutation(container)).toBe(true);
+    first.settle();
+    expect(hasActiveFollowBottomMutation(container)).toBe(true);
+    second.settle();
+    expect(hasActiveFollowBottomMutation(container)).toBe(false);
+
+    action.destroy();
+    expect(hasActiveFollowBottomMutation(container)).toBe(false);
+  });
+
+  it('reports no active lease on an unfollowed container', () => {
+    const child = document.createElement('div');
+    container.append(child);
+    const action = followBottom(container, { follow: false });
+    const mutation = beforeFollowBottomMutation(child);
+    expect(hasActiveFollowBottomMutation(container)).toBe(false);
+    mutation.settle();
+    action.destroy();
+  });
+
+  it('stops reporting an active lease once user input leaves the bottom', () => {
+    const child = document.createElement('div');
+    container.append(child);
+    const action = followBottom(container, { follow: true });
+    runSettleTail();
+    const mutation = beforeFollowBottomMutation(child);
+    expect(hasActiveFollowBottomMutation(container)).toBe(true);
+
+    container.dispatchEvent(new WheelEvent('wheel', { deltaY: -1 }));
+    expect(isFollowingBottom(container)).toBe(false);
+    expect(hasActiveFollowBottomMutation(container)).toBe(false);
+
+    // The lease stays owned: re-following restores the hold until it settles.
+    followToBottom(container);
+    expect(hasActiveFollowBottomMutation(container)).toBe(true);
+    mutation.settle();
+    expect(hasActiveFollowBottomMutation(container)).toBe(false);
+    followToBottom(container);
+    expect(hasActiveFollowBottomMutation(container)).toBe(false);
+    action.destroy();
+  });
+
+  it('stops reporting an active lease when the consumer drops follow mode', () => {
+    const child = document.createElement('div');
+    container.append(child);
+    const action = followBottom(container, { follow: true });
+    runSettleTail();
+    const mutation = beforeFollowBottomMutation(child);
+    expect(hasActiveFollowBottomMutation(container)).toBe(true);
+
+    action.update({ follow: false });
+    expect(hasActiveFollowBottomMutation(container)).toBe(false);
+
+    action.update({ follow: true });
+    expect(hasActiveFollowBottomMutation(container)).toBe(true);
+    mutation.settle();
+    expect(hasActiveFollowBottomMutation(container)).toBe(false);
+    action.destroy();
+  });
+
+  it('drops active leases when disabled and re-enables without a hold', () => {
+    const child = document.createElement('div');
+    container.append(child);
+    const action = followBottom(container, { follow: true });
+    runSettleTail();
+    const mutation = beforeFollowBottomMutation(child);
+    expect(hasActiveFollowBottomMutation(container)).toBe(true);
+
+    action.update({ enabled: false, follow: true });
+    expect(hasActiveFollowBottomMutation(container)).toBe(false);
+    expect(resizeActive.size).toBe(0);
+
+    action.update({ enabled: true, follow: true });
+    expect(isFollowingBottom(container)).toBe(true);
+    expect(hasActiveFollowBottomMutation(container)).toBe(false);
+    // The pre-disable lease is inert: neither its ticks nor its settle re-arm a hold.
+    mutation.request();
+    expect(hasActiveFollowBottomMutation(container)).toBe(false);
+    mutation.settle();
+    expect(hasActiveFollowBottomMutation(container)).toBe(false);
+    action.destroy();
+  });
+
+  it('keeps a lease scoped to its own root across a root swap', () => {
+    const child = document.createElement('div');
+    container.append(child);
+    const replacement = document.createElement('div');
+    Object.defineProperties(replacement, {
+      scrollHeight: { configurable: true, get: () => scrollHeight },
+      clientHeight: { configurable: true, value: 300 },
+      scrollTop: { configurable: true, writable: true, value: 600 },
+    });
+    document.body.append(replacement);
+    const action = followBottom(container, { follow: true });
+    runSettleTail();
+    const mutation = beforeFollowBottomMutation(child);
+    expect(hasActiveFollowBottomMutation(container)).toBe(true);
+
+    // The consumer swaps roots: the new root never inherits the old hold, and
+    // destroying the old follower retires it.
+    const swapped = followBottom(replacement, { follow: true });
+    expect(hasActiveFollowBottomMutation(replacement)).toBe(false);
+    action.destroy();
+    expect(hasActiveFollowBottomMutation(container)).toBe(false);
+    expect(hasActiveFollowBottomMutation(replacement)).toBe(false);
+    mutation.settle();
+    swapped.destroy();
+    replacement.remove();
+  });
+
+  it('releases a lease whose element leaves the container before its motion ends', () => {
+    const wrapper = document.createElement('div');
+    const row = document.createElement('div');
+    wrapper.append(row);
+    container.append(wrapper);
+    const action = followBottom(container, { follow: true });
+    runSettleTail();
+    const mutation = beforeFollowBottomMutation(row);
+    mutation.request();
+    expect(hasActiveFollowBottomMutation(container)).toBe(true);
+    expect(resizeActive.has(row)).toBe(true);
+
+    row.remove();
+    fireRemovedMutation(row);
+
+    expect(hasActiveFollowBottomMutation(container)).toBe(false);
+    expect(resizeActive.has(row)).toBe(false);
+    runSettleTail();
+    expect(animationFrames).toHaveLength(0);
+    // The late terminal release is idempotent.
+    mutation.settle();
+    expect(animationFrames).toHaveLength(0);
+    action.destroy();
+  });
+
+  it('releases a detached lease from the settle frame when no removal record is delivered', () => {
+    const child = document.createElement('div');
+    container.append(child);
+    const action = followBottom(container, { follow: true });
+    runSettleTail();
+    beforeFollowBottomMutation(child);
+    expect(hasActiveFollowBottomMutation(container)).toBe(true);
+
+    child.remove();
+    runFrame();
+
+    expect(hasActiveFollowBottomMutation(container)).toBe(false);
+    runSettleTail();
+    expect(animationFrames).toHaveLength(0);
+    action.destroy();
+  });
+
+  it('expires a lease a bounded time after its declared motion', () => {
+    let now = 1000;
+    vi.spyOn(performance, 'now').mockImplementation(() => now);
+    const child = document.createElement('div');
+    container.append(child);
+    const action = followBottom(container, { follow: true });
+    runSettleTail();
+    beforeFollowBottomMutation(child, { maxHoldMs: 500 });
+    expect(hasActiveFollowBottomMutation(container)).toBe(true);
+
+    now = 1499;
+    runFrame();
+    expect(hasActiveFollowBottomMutation(container)).toBe(true);
+    expect(animationFrames).toHaveLength(1);
+
+    now = 1500;
+    expect(hasActiveFollowBottomMutation(container)).toBe(false);
+    runSettleTail();
+    expect(animationFrames).toHaveLength(0);
+    action.destroy();
+  });
+
+  it('expires a lease from the settle frame without a hold query', () => {
+    let now = 1000;
+    vi.spyOn(performance, 'now').mockImplementation(() => now);
+    const child = document.createElement('div');
+    container.append(child);
+    const action = followBottom(container, { follow: true });
+    runSettleTail();
+    beforeFollowBottomMutation(child, { maxHoldMs: 500 });
+
+    now = 1600;
+    runSettleTail();
+
+    expect(animationFrames).toHaveLength(0);
+    expect(hasActiveFollowBottomMutation(container)).toBe(false);
     action.destroy();
   });
 
@@ -521,6 +852,7 @@ describe('followBottom policy', () => {
 
     scrollHeight += 21;
     fireResizeFor(child);
+    runFrame();
     expect(scrollTop).toBe(621);
     action.destroy();
   });
@@ -538,6 +870,7 @@ describe('followBottom policy', () => {
     expect(resizeUnobserved).not.toContain(child);
     scrollHeight += 17;
     fireResizeFor(child);
+    runFrame();
     expect(scrollTop).toBe(617);
     action.destroy();
   });
@@ -569,6 +902,7 @@ describe('followBottom policy', () => {
     wrapper.append(row);
     container.append(wrapper);
     const action = followBottom(container, { follow: true });
+    runSettleTail();
     const trace: Array<{
       phase: string;
       maximum: number;
@@ -594,6 +928,8 @@ describe('followBottom policy', () => {
     fireResizeFor(row);
     runFrame();
 
+    // Resize delivery snaps synchronously (post-layout, pre-paint), so the
+    // trace callback already sees the corrected position in the same frame.
     expect(trace).toEqual([
       {
         phase: 'edit-grow-first-frame',
@@ -603,6 +939,7 @@ describe('followBottom policy', () => {
         settleFrames: 0,
       },
     ]);
+    expect(scrollTop).toBe(613);
     mutation.settle();
     expect(resizeUnobserved).toContain(row);
     action.destroy();
@@ -626,6 +963,296 @@ describe('followBottom policy', () => {
     runFrame();
     expect(scrollTop).toBe(600);
     expect(animationFrames).toHaveLength(0);
+  });
+
+  it('releases a single-tick disclosure outro lease so the settle loop drains', () => {
+    const child = document.createElement('div');
+    container.append(child);
+    vi.spyOn(window, 'getComputedStyle').mockReturnValue({
+      height: '40px',
+      opacity: '1',
+      paddingTop: '0px',
+      paddingBottom: '0px',
+      marginTop: '0px',
+      marginBottom: '0px',
+    } as CSSStyleDeclaration);
+    vi.stubGlobal(
+      'matchMedia',
+      vi.fn(() => ({ matches: false })),
+    );
+    const action = followBottom(container, { follow: true });
+    // Fresh outro config: Svelte discards the cached options after introend,
+    // so a `transition:` outro re-enters safeDisclosureTransition here.
+    const outro = safeDisclosureTransition(child, {}, { direction: 'both' });
+    expect(outro.tick).toBeDefined();
+
+    // Throttled rAF delivers the whole outro as one tick at its end.
+    outro.tick?.(0, 1);
+    runSettleTail();
+
+    expect(animationFrames).toHaveLength(0);
+    action.destroy();
+  });
+
+  it('recovers a fresh outro whose first tick lands exactly on its start time', () => {
+    const child = document.createElement('div');
+    container.append(child);
+    vi.spyOn(window, 'getComputedStyle').mockReturnValue({
+      height: '40px',
+      opacity: '1',
+      paddingTop: '0px',
+      paddingBottom: '0px',
+      marginTop: '0px',
+      marginBottom: '0px',
+    } as CSSStyleDeclaration);
+    vi.stubGlobal(
+      'matchMedia',
+      vi.fn(() => ({ matches: false })),
+    );
+    const action = followBottom(container, { follow: true });
+    const outro = safeDisclosureTransition(child, {}, { direction: 'both' });
+    expect(outro.tick).toBeDefined();
+
+    // rAF timestamp exactly on the start time: easing(0) = 0 ⇒ t = 1, which
+    // the t < 1 first-tick guard excludes — the early settle fires and the
+    // falling ticks re-acquire through the reversal path.
+    outro.tick?.(1, 0);
+    scrollHeight -= 20;
+    outro.tick?.(0.5, 0.5);
+    fireResizeFor(child);
+    expect(scrollTop).toBe(580);
+    scrollHeight -= 20;
+    outro.tick?.(0, 1);
+    fireResizeFor(child);
+    expect(scrollTop).toBe(560);
+    runSettleTail();
+
+    expect(animationFrames).toHaveLength(0);
+    action.destroy();
+  });
+
+  it('keeps a both-direction intro pinned from its first tick and drains at rest', () => {
+    const child = document.createElement('div');
+    container.append(child);
+    vi.spyOn(window, 'getComputedStyle').mockReturnValue({
+      height: '40px',
+      opacity: '1',
+      paddingTop: '0px',
+      paddingBottom: '0px',
+      marginTop: '0px',
+      marginBottom: '0px',
+    } as CSSStyleDeclaration);
+    vi.stubGlobal(
+      'matchMedia',
+      vi.fn(() => ({ matches: false })),
+    );
+    const action = followBottom(container, { follow: true });
+    const intro = safeDisclosureTransition(child, {}, { direction: 'both' });
+    expect(intro.tick).toBeDefined();
+
+    intro.tick?.(0, 1);
+    scrollHeight += 20;
+    intro.tick?.(0.5, 0.5);
+    fireResizeFor(child);
+    expect(scrollTop).toBe(620);
+    scrollHeight += 20;
+    intro.tick?.(1, 0);
+    fireResizeFor(child);
+    expect(scrollTop).toBe(640);
+    runSettleTail();
+
+    expect(animationFrames).toHaveLength(0);
+    action.destroy();
+  });
+
+  it('reads container geometry at most once per frame during a leased disclosure motion', () => {
+    const child = document.createElement('div');
+    container.append(child);
+    vi.spyOn(window, 'getComputedStyle').mockReturnValue({
+      height: '40px',
+      opacity: '1',
+      paddingTop: '0px',
+      paddingBottom: '0px',
+      marginTop: '0px',
+      marginBottom: '0px',
+    } as CSSStyleDeclaration);
+    vi.stubGlobal(
+      'matchMedia',
+      vi.fn(() => ({ matches: false })),
+    );
+    const action = followBottom(container, { follow: true });
+    runSettleTail();
+    const heightReads = vi.spyOn(container, 'scrollHeight', 'get');
+    const clientReads = vi.spyOn(container, 'clientHeight', 'get');
+    const topReads = vi.spyOn(container, 'scrollTop', 'get');
+    const readCount = () =>
+      Math.max(
+        heightReads.mock.calls.length,
+        clientReads.mock.calls.length,
+        topReads.mock.calls.length,
+      );
+    const intro = safeDisclosureTransition(child, {}, { direction: 'in' });
+    expect(intro.tick).toBeDefined();
+
+    // One browser frame while the lease is held: the previous frame's snap
+    // echoes as a scroll event, rAF callbacks run (settle loop, then the
+    // Svelte tick that dirties style), layout happens, then ResizeObserver
+    // delivers on the clean tree.
+    const frameReads: number[] = [];
+    const frame = (t: number, u: number, growth: number) => {
+      const atFrameStart = readCount();
+      container.dispatchEvent(new Event('scroll'));
+      runFrame();
+      const beforeTick = readCount();
+      intro.tick?.(t, u);
+      expect(readCount()).toBe(beforeTick);
+      scrollHeight += growth;
+      fireResizeFor(child);
+      frameReads.push(readCount() - atFrameStart);
+      expect(scrollTop).toBe(scrollHeight - clientHeight);
+    };
+
+    frame(0, 1, 0);
+    frame(0.25, 0.75, 10);
+    frame(0.5, 0.5, 10);
+    frame(0.75, 0.25, 10);
+    frame(1, 0, 10);
+    expect(frameReads.every((reads) => reads <= 1)).toBe(true);
+
+    runSettleTail();
+    expect(animationFrames).toHaveLength(0);
+    expect(scrollTop).toBe(640);
+    action.destroy();
+  });
+
+  it('pins from the lease request when the container opts out of native anchoring', () => {
+    const child = document.createElement('div');
+    container.append(child);
+    container.style.overflowAnchor = 'none';
+    const action = followBottom(container, { follow: true });
+    runSettleTail();
+    const mutation = beforeFollowBottomMutation(child);
+
+    // No native anchor carries the viewport between the tick's write and the
+    // post-layout resize delivery, so the request itself snaps to the new
+    // maximum instead of only arming the settle loop.
+    scrollHeight += 18;
+    mutation.request();
+    expect(scrollTop).toBe(618);
+    fireResizeFor(child);
+    expect(scrollTop).toBe(618);
+
+    scrollHeight += 24;
+    mutation.settle();
+    runSettleTail();
+    expect(scrollTop).toBe(642);
+    expect(animationFrames).toHaveLength(0);
+    action.destroy();
+  });
+
+  it('re-acquires a reversed disclosure lease without reading geometry inside the tick', () => {
+    const child = document.createElement('div');
+    container.append(child);
+    vi.spyOn(window, 'getComputedStyle').mockReturnValue({
+      height: '40px',
+      opacity: '1',
+      paddingTop: '0px',
+      paddingBottom: '0px',
+      marginTop: '0px',
+      marginBottom: '0px',
+    } as CSSStyleDeclaration);
+    vi.stubGlobal(
+      'matchMedia',
+      vi.fn(() => ({ matches: false })),
+    );
+    const action = followBottom(container, { follow: true });
+    runSettleTail();
+    const outro = safeDisclosureTransition(child, {}, { direction: 'both' });
+    outro.tick?.(1, 0);
+    outro.tick?.(0.5, 0.5);
+    const heightReads = vi.spyOn(container, 'scrollHeight', 'get');
+    const clientReads = vi.spyOn(container, 'clientHeight', 'get');
+    const topReads = vi.spyOn(container, 'scrollTop', 'get');
+
+    // Reversal back toward shown re-enters the lease from inside the tick.
+    outro.tick?.(0.75, 0.25);
+    expect(heightReads).not.toHaveBeenCalled();
+    expect(clientReads).not.toHaveBeenCalled();
+    expect(topReads).not.toHaveBeenCalled();
+
+    scrollHeight += 10;
+    fireResizeFor(child);
+    expect(scrollTop).toBe(610);
+    outro.tick?.(1, 0);
+    runSettleTail();
+    expect(animationFrames).toHaveLength(0);
+    action.destroy();
+  });
+
+  it('releases an aborted outro lease once its element leaves the container', () => {
+    const child = document.createElement('div');
+    container.append(child);
+    vi.spyOn(window, 'getComputedStyle').mockReturnValue({
+      height: '40px',
+      opacity: '1',
+      paddingTop: '0px',
+      paddingBottom: '0px',
+      marginTop: '0px',
+      marginBottom: '0px',
+    } as CSSStyleDeclaration);
+    vi.stubGlobal(
+      'matchMedia',
+      vi.fn(() => ({ matches: false })),
+    );
+    const action = followBottom(container, { follow: true });
+    runSettleTail();
+    const outro = safeDisclosureTransition(child, {}, { direction: 'out' });
+    outro.tick?.(0.6, 0.4);
+    expect(hasActiveFollowBottomMutation(container)).toBe(true);
+
+    // Svelte's transition.stop() cancels the animation without a terminal
+    // tick, then the destroyed effect removes the node.
+    child.remove();
+    fireRemovedMutation(child);
+
+    expect(hasActiveFollowBottomMutation(container)).toBe(false);
+    runSettleTail();
+    expect(animationFrames).toHaveLength(0);
+    action.destroy();
+  });
+
+  it('bounds a disclosure lease whose terminal tick never arrives', () => {
+    let now = 5000;
+    vi.spyOn(performance, 'now').mockImplementation(() => now);
+    const child = document.createElement('div');
+    container.append(child);
+    vi.spyOn(window, 'getComputedStyle').mockReturnValue({
+      height: '40px',
+      opacity: '1',
+      paddingTop: '0px',
+      paddingBottom: '0px',
+      marginTop: '0px',
+      marginBottom: '0px',
+    } as CSSStyleDeclaration);
+    vi.stubGlobal(
+      'matchMedia',
+      vi.fn(() => ({ matches: false })),
+    );
+    const action = followBottom(container, { follow: true });
+    runSettleTail();
+    const intro = safeDisclosureTransition(child, { duration: 200 }, { direction: 'in' });
+    intro.tick?.(0.5, 0.5);
+    expect(hasActiveFollowBottomMutation(container)).toBe(true);
+
+    now += 200;
+    runFrame();
+    expect(hasActiveFollowBottomMutation(container)).toBe(true);
+
+    now += 2000;
+    runSettleTail();
+    expect(hasActiveFollowBottomMutation(container)).toBe(false);
+    expect(animationFrames).toHaveLength(0);
+    action.destroy();
   });
 
   it('leaves an unlocked viewport unchanged through descendant mutation requests', () => {
@@ -782,8 +1409,9 @@ describe('followBottom policy', () => {
     });
     const mutation = beforeFollowBottomMutation(child);
     for (let frame = 0; frame < 81; frame += 1) {
-      scrollHeight += 1;
       runFrame();
+      scrollHeight += 1;
+      fireResizeFor(child);
       expect(scrollTop).toBe(scrollHeight - clientHeight);
       expect(isFollowingBottom(container)).toBe(true);
     }
@@ -795,9 +1423,11 @@ describe('followBottom policy', () => {
 
     scrollHeight += 17;
     fireMutation();
-    expect(scrollTop).toBe(scrollHeight - clientHeight);
     expect(animationFrames).toHaveLength(1);
+    runFrame();
+    expect(scrollTop).toBe(scrollHeight - clientHeight);
     runSettleTail();
+    expect(scrollTop).toBe(scrollHeight - clientHeight);
     expect(animationFrames).toHaveLength(0);
     expect(followChanges).toEqual([]);
     action.destroy();
@@ -805,21 +1435,280 @@ describe('followBottom policy', () => {
 
   it('restarts an idle settle tail for attribute and resize observations', () => {
     const action = followBottom(container, { follow: true });
+    runSettleTail();
     expect(animationFrames).toHaveLength(0);
 
     scrollHeight += 11;
     fireAttributeMutation();
-    expect(scrollTop).toBe(611);
     expect(animationFrames).toHaveLength(1);
+    runFrame();
+    expect(scrollTop).toBe(611);
     runSettleTail();
+    expect(scrollTop).toBe(611);
     expect(animationFrames).toHaveLength(0);
 
     scrollHeight += 13;
     fireResize();
-    expect(scrollTop).toBe(624);
     expect(animationFrames).toHaveLength(1);
+    runFrame();
+    expect(scrollTop).toBe(624);
+    runSettleTail();
+    expect(scrollTop).toBe(624);
+    expect(animationFrames).toHaveLength(0);
+    action.destroy();
+  });
+
+  it('coalesces same-frame mutation bursts into one geometry read and scroll write', () => {
+    const action = followBottom(container, { follow: true });
+    runSettleTail();
+    const heightReads = vi.spyOn(container, 'scrollHeight', 'get');
+    const clientReads = vi.spyOn(container, 'clientHeight', 'get');
+    const topReads = vi.spyOn(container, 'scrollTop', 'get');
+    const topWrites = vi.spyOn(container, 'scrollTop', 'set');
+    scrollHeight += 40;
+
+    fireMutation();
+    fireMutation();
+    fireMutation();
+
+    expect(animationFrames).toHaveLength(1);
+    expect(heightReads).not.toHaveBeenCalled();
+    expect(clientReads).not.toHaveBeenCalled();
+    expect(topReads).not.toHaveBeenCalled();
+    runFrame();
+    expect(heightReads).toHaveBeenCalledOnce();
+    expect(clientReads).toHaveBeenCalledOnce();
+    expect(topReads).toHaveBeenCalledOnce();
+    expect(topWrites).toHaveBeenCalledOnce();
+    expect(scrollTop).toBe(640);
+    action.destroy();
+  });
+
+  it('does not restart settling or write scrollTop for unchanged mutation geometry', () => {
+    const action = followBottom(container, { follow: true });
+    runSettleTail();
+    const topWrites = vi.spyOn(container, 'scrollTop', 'set');
+
+    fireMutation();
+    fireMutation();
+    runFrame();
+
+    expect(topWrites).not.toHaveBeenCalled();
+    expect(animationFrames).toHaveLength(0);
+    action.destroy();
+  });
+
+  it('defers the reactivation snap and layout reads to an animation frame', () => {
+    const distances: number[] = [];
+    const options = {
+      enabled: true,
+      follow: true,
+      onScrollStateChange: (state: { distanceFromBottom: number }) =>
+        distances.push(state.distanceFromBottom),
+    };
+    const action = followBottom(container, options);
+    runSettleTail();
+    action.update({ ...options, enabled: false });
+
+    // Content grew while the surface was retained/disabled.
+    scrollHeight += 100;
+    let layoutReads = 0;
+    Object.defineProperty(container, 'scrollHeight', {
+      configurable: true,
+      get: () => {
+        layoutReads += 1;
+        return scrollHeight;
+      },
+    });
+    Object.defineProperty(container, 'clientHeight', {
+      configurable: true,
+      get: () => {
+        layoutReads += 1;
+        return clientHeight;
+      },
+    });
+    distances.length = 0;
+
+    action.update({ ...options, enabled: true });
+    expect(layoutReads).toBe(0);
+    expect(scrollTop).toBe(600);
+    expect(distances).toEqual([]);
+    expect(isFollowingBottom(container)).toBe(true);
+    expect(animationFrames).toHaveLength(1);
+
+    runFrame();
+    expect(layoutReads).toBeGreaterThan(0);
+    expect(scrollTop).toBe(700);
+    expect(distances).toEqual([0]);
+    action.destroy();
+  });
+
+  it('applies an unfollowed reactivation without snapping to the bottom', () => {
+    const options = { enabled: true, follow: true };
+    const action = followBottom(container, options);
+    action.update({ ...options, enabled: false });
+    scrollTop = 300;
+
+    action.update({ ...options, enabled: true, follow: false });
+    expect(isFollowingBottom(container)).toBe(false);
+    runFrame();
+
+    expect(scrollTop).toBe(300);
+    action.destroy();
+  });
+
+  it('abandons a pending reactivation snap when disabled before the frame', () => {
+    const options = { enabled: true, follow: true };
+    const action = followBottom(container, options);
+    runSettleTail();
+    action.update({ ...options, enabled: false });
+    scrollTop = 300;
+
+    action.update({ ...options, enabled: true });
+    expect(animationFrames).toHaveLength(1);
+    action.update({ ...options, enabled: false });
+    expect(cancelAnimationFrame).toHaveBeenCalledWith(1);
+    runFrame();
+
+    expect(scrollTop).toBe(300);
+    action.destroy();
+  });
+
+  it('defers mutation-driven layout work out of the reveal frame', () => {
+    const options = { enabled: true, follow: true };
+    const action = followBottom(container, options);
+    action.update({ ...options, enabled: false });
+
+    // Content grew while the surface was retained/disabled.
+    scrollHeight += 100;
+    let layoutReads = 0;
+    Object.defineProperty(container, 'scrollHeight', {
+      configurable: true,
+      get: () => {
+        layoutReads += 1;
+        return scrollHeight;
+      },
+    });
+    Object.defineProperty(container, 'clientHeight', {
+      configurable: true,
+      get: () => {
+        layoutReads += 1;
+        return clientHeight;
+      },
+    });
+
+    action.update({ ...options, enabled: true });
+    // Mutation observers fire as microtasks during the reveal on the
+    // still-dirty tree — their layout work stays deferred to the frame.
+    fireMutation();
+    fireMutation();
+    expect(layoutReads).toBe(0);
+    expect(scrollTop).toBe(600);
+
+    runSettleTail();
+    expect(layoutReads).toBeGreaterThan(0);
+    expect(scrollTop).toBe(700);
+    action.destroy();
+  });
+
+  it('snaps synchronously on resize delivery while following', () => {
+    const action = followBottom(container, { follow: true });
     runSettleTail();
     expect(animationFrames).toHaveLength(0);
+
+    // ResizeObserver delivers after layout, pre-paint, on a clean tree. The
+    // snap must land in the same frame: deferring it to a rAF (which runs in
+    // the NEXT frame from an RO callback) paints one stale-scrollTop frame
+    // per resize burst — the footer utility bar flicker under rapid streaming.
+    scrollHeight += 40;
+    fireResize();
+    expect(scrollTop).toBe(640);
+
+    scrollHeight += 25;
+    fireResize();
+    expect(scrollTop).toBe(665);
+
+    runSettleTail();
+    expect(scrollTop).toBe(665);
+    expect(animationFrames).toHaveLength(0);
+    action.destroy();
+  });
+
+  it('coalesces a burst of mutation callbacks into one deferred settle', () => {
+    const action = followBottom(container, { follow: true });
+    runSettleTail();
+    expect(animationFrames).toHaveLength(0);
+
+    scrollHeight += 40;
+    fireMutation();
+    fireAttributeMutation();
+    expect(animationFrames).toHaveLength(1);
+    expect(scrollTop).toBe(600);
+
+    fireResize();
+    expect(animationFrames).toHaveLength(1);
+    expect(scrollTop).toBe(640);
+
+    runFrame();
+    expect(scrollTop).toBe(640);
+    runSettleTail();
+    expect(animationFrames).toHaveLength(0);
+    action.destroy();
+  });
+
+  it('coalesces unfollowed observer reports into one deferred frame without snapping', () => {
+    const distances: number[] = [];
+    const action = followBottom(container, {
+      follow: false,
+      onScrollStateChange: (state) => distances.push(state.distanceFromBottom),
+    });
+    runSettleTail();
+    distances.length = 0;
+    scrollTop = 300;
+    scrollHeight += 100;
+    fireMutation();
+    fireResize();
+    expect(animationFrames).toHaveLength(1);
+    expect(distances).toEqual([]);
+
+    runFrame();
+    expect(scrollTop).toBe(300);
+    expect(distances).toEqual([400]);
+    expect(animationFrames).toHaveLength(0);
+    action.destroy();
+  });
+
+  it('cancels a deferred observer settle on destroy', () => {
+    const action = followBottom(container, { follow: true });
+    runSettleTail();
+    scrollHeight += 50;
+    fireMutation();
+    expect(animationFrames).toHaveLength(1);
+
+    action.destroy();
+    expect(cancelAnimationFrame).toHaveBeenCalledWith(1);
+    runFrame();
+    expect(scrollTop).toBe(600);
+  });
+
+  it('cancels a pending unfollowed report frame when disabled', () => {
+    const distances: number[] = [];
+    const options = {
+      enabled: true,
+      follow: false,
+      onScrollStateChange: (state: { distanceFromBottom: number }) =>
+        distances.push(state.distanceFromBottom),
+    };
+    const action = followBottom(container, options);
+    runSettleTail();
+    distances.length = 0;
+    fireResize();
+    expect(animationFrames).toHaveLength(1);
+
+    action.update({ ...options, enabled: false });
+    expect(cancelAnimationFrame).toHaveBeenCalledWith(1);
+    runFrame();
+    expect(distances).toEqual([]);
     action.destroy();
   });
 

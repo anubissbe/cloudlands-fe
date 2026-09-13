@@ -2,14 +2,27 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { runSaga, stdChannel } from 'redux-saga';
 import { createCollection } from '@augmentcode/themis/utils/collections/collection-utils';
 
-const mocks = vi.hoisted(() => ({ update: vi.fn() }));
-vi.mock('$lib/client', () => ({ appClient: { settings: { update: mocks.update } } }));
+const mocks = vi.hoisted(() => ({ update: vi.fn(), updateSnapshot: undefined as any }));
+vi.mock('$lib/client', () => ({
+  appClient: {
+    settings: {
+      update: mocks.update,
+      get updateSnapshot() {
+        return mocks.updateSnapshot;
+      },
+    },
+  },
+}));
 
 import { BackendError } from '$lib/client/live/backend-transport-types';
+import { initialState as providerSettingsInitialState } from '../../provider-settings/provider-settings-slice';
 
 import {
+  hydrateDefaultProvider,
+  initialState as modelInitialState,
   loadDefaultReasoningEffortFromStorage,
   loadProviderModelsFromStorage,
+  modelReducer,
   selectModel,
   setDefaultReasoningEffort,
   setSelectedModel,
@@ -30,7 +43,7 @@ const settle = async () => {
 
 function state() {
   return {
-    providerSettings: { activeProviderId: 'auggie' },
+    providerSettings: { ...providerSettingsInitialState },
     providerCatalog: {
       providers: createCollection('id', [{ id: 'codex', canBeDisabled: true }]),
       loaded: true,
@@ -44,9 +57,12 @@ function state() {
 }
 
 describe('modelSelectionSaga', () => {
-  beforeEach(() => vi.clearAllMocks());
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.updateSnapshot = undefined;
+  });
 
-  it('switches a known compound provider before reload and selection', async () => {
+  it('lands a known compound provider switch before requesting its reload', async () => {
     const dispatch = vi.fn();
     await runSaga(
       { dispatch, getState: state },
@@ -55,13 +71,37 @@ describe('modelSelectionSaga', () => {
     ).toPromise();
 
     expect(dispatch.mock.calls.map(([action]) => action)).toEqual([
-      { type: 'providerSettings/setActiveProvider', payload: ['codex'] },
-      { type: 'model/reloadModelsForProvider', payload: [] },
       {
-        type: 'model/setSelectedModel',
-        payload: [{ providerId: 'codex', model: 'codex:gpt-5' }],
+        type: 'providerSettings/setAtomicDefaultModel',
+        payload: [{ providerId: 'codex', model: 'gpt-5' }],
       },
+      { type: 'model/reloadModelsForProvider', payload: [] },
     ]);
+  });
+
+  it('keeps a compound Claude model pick authoritative over stale provider hydration', async () => {
+    const current = {
+      ...state(),
+      model: { ...modelInitialState },
+      providerCatalog: {
+        providers: createCollection('id', [{ id: 'claude-code', canBeDisabled: true }]),
+        loaded: true,
+      },
+    };
+    const dispatch = vi.fn((action) => {
+      current.model = modelReducer(current.model, action);
+      return action;
+    });
+
+    await runSaga(
+      { dispatch, getState: () => current },
+      handleSelectModel,
+      selectModel('claude-code:opus-4-1'),
+    ).toPromise();
+    current.model = modelReducer(current.model, hydrateDefaultProvider('auggie'));
+
+    expect(current.model.defaultProviderId).toBe('claude-code');
+    expect(current.model.pendingDefaultProviderId).toBe('claude-code');
   });
 
   it('does not switch for an unknown compound provider once the catalog is loaded', async () => {
@@ -72,12 +112,7 @@ describe('modelSelectionSaga', () => {
       selectModel('unknown:model'),
     ).toPromise();
 
-    expect(dispatch.mock.calls.map(([action]) => action)).toEqual([
-      {
-        type: 'model/setSelectedModel',
-        payload: [{ providerId: 'unknown', model: 'unknown:model' }],
-      },
-    ]);
+    expect(dispatch).not.toHaveBeenCalled();
   });
 
   it('adopts the picked compound provider before catalog hydration (onboarding race)', async () => {
@@ -93,12 +128,11 @@ describe('modelSelectionSaga', () => {
     ).toPromise();
 
     expect(dispatch.mock.calls.map(([action]) => action)).toEqual([
-      { type: 'providerSettings/setActiveProvider', payload: ['claude-code'] },
-      { type: 'model/reloadModelsForProvider', payload: [] },
       {
-        type: 'model/setSelectedModel',
-        payload: [{ providerId: 'claude-code', model: 'claude-code:fable5' }],
+        type: 'providerSettings/setAtomicDefaultModel',
+        payload: [{ providerId: 'claude-code', model: 'fable5' }],
       },
+      { type: 'model/reloadModelsForProvider', payload: [] },
     ]);
   });
 
@@ -110,17 +144,88 @@ describe('modelSelectionSaga', () => {
       { codex: 'codex:gpt-5' },
     ).toPromise();
 
-    expect(landed).toBe(true);
+    expect(landed).toBe('persisted');
     expect(mocks.update.mock.calls).toEqual([
       [
         [
           {
             path: 'model.providerDefaults',
-            value: { auggie: 'sonnet4.5', codex: 'codex:gpt-5' },
+            value: { auggie: 'sonnet4.5', codex: 'gpt-5' },
           },
         ],
       ],
     ]);
+  });
+
+  it('persists a cross-provider default as one revision-bearing atomic batch', async () => {
+    mocks.updateSnapshot = vi.fn().mockResolvedValue({
+      applied: [
+        { path: 'model.defaultProvider', value: 'codex' },
+        { path: 'model.providerDefaults', value: { auggie: 'sonnet4.5', codex: 'gpt-5' } },
+      ],
+      revision: 7,
+    });
+    const dispatch = vi.fn();
+
+    const landed = await runSaga(
+      { dispatch, getState: state },
+      persistSelectedModelsWorker,
+      { codex: 'codex:gpt-5' },
+      'codex',
+    ).toPromise();
+
+    expect(landed).toBe('persisted');
+    expect(mocks.updateSnapshot).toHaveBeenCalledWith([
+      { path: 'model.defaultProvider', value: 'codex' },
+      {
+        path: 'model.providerDefaults',
+        value: { auggie: 'sonnet4.5', codex: 'gpt-5' },
+      },
+    ]);
+    expect(dispatch).toHaveBeenCalledWith({
+      type: 'settings/changesReceived',
+      payload: [
+        [
+          { path: 'model.defaultProvider', value: 'codex' },
+          {
+            path: 'model.providerDefaults',
+            value: { auggie: 'sonnet4.5', codex: 'gpt-5' },
+          },
+        ],
+        7,
+      ],
+    });
+  });
+
+  it.each([0, 1, 3])('accepts a successful atomic save with %i changed paths', async (count) => {
+    const applied = [
+      { path: 'model.providerDefaults', value: { auggie: 'sonnet4.5', codex: 'gpt-5' } },
+      { path: 'model.defaultProvider', value: 'codex' },
+      { path: 'model.default', value: '' },
+    ].slice(0, count);
+    mocks.updateSnapshot = vi.fn().mockResolvedValue({ applied, revision: 8 });
+    const dispatch = vi.fn();
+    const result = await runSaga(
+      { dispatch, getState: state },
+      persistSelectedModelsWorker,
+      { codex: 'gpt-5' },
+      'codex',
+    ).toPromise();
+    expect(result).toBe('persisted');
+    expect(dispatch).toHaveBeenCalledExactlyOnceWith({
+      type: 'settings/changesReceived',
+      payload: [
+        expect.arrayContaining([
+          { path: 'model.defaultProvider', value: 'codex' },
+          {
+            path: 'model.providerDefaults',
+            value: { auggie: 'sonnet4.5', codex: 'gpt-5' },
+          },
+          ...applied,
+        ]),
+        8,
+      ],
+    });
   });
 
   it('serializes writes and retains only the latest queued snapshot', async () => {
@@ -215,16 +320,16 @@ describe('modelSelectionSaga', () => {
     await settle();
 
     // Provider A's pick starts a held-in-flight write.
-    current.model.providerModels = { auggie: 'sonnet4.5', codex: 'codex:gpt-5' };
-    channel.put(setSelectedModel({ providerId: 'codex', model: 'codex:gpt-5' }));
+    current.model.providerModels = { auggie: 'sonnet4.5', codex: 'gpt-5' };
+    channel.put(setSelectedModel({ providerId: 'codex', model: 'gpt-5' }));
     await settle();
     // Provider B's pick queues behind it...
     current.model.providerModels = {
       auggie: 'sonnet4.5',
-      codex: 'codex:gpt-5',
-      'claude-code': 'claude-code:fable5',
+      codex: 'gpt-5',
+      'claude-code': 'fable5',
     };
-    channel.put(setSelectedModel({ providerId: 'claude-code', model: 'claude-code:fable5' }));
+    channel.put(setSelectedModel({ providerId: 'claude-code', model: 'fable5' }));
     // ...then a stale boot snapshot resets the SHARED map, wiping A's pick
     // from state before B's write runs.
     current.model.providerModels = { auggie: 'sonnet4.5' };
@@ -239,7 +344,7 @@ describe('modelSelectionSaga', () => {
         [
           {
             path: 'model.providerDefaults',
-            value: { auggie: 'sonnet4.5', codex: 'codex:gpt-5' },
+            value: { auggie: 'sonnet4.5', codex: 'gpt-5' },
           },
         ],
       ],
@@ -249,8 +354,8 @@ describe('modelSelectionSaga', () => {
             path: 'model.providerDefaults',
             value: {
               auggie: 'sonnet4.5',
-              codex: 'codex:gpt-5',
-              'claude-code': 'claude-code:fable5',
+              codex: 'gpt-5',
+              'claude-code': 'fable5',
             },
           },
         ],
@@ -279,12 +384,46 @@ describe('modelSelectionSaga', () => {
     await task.toPromise();
   });
 
+  it('does not resend a rejected session pick with the next valid write', async () => {
+    mocks.update
+      .mockRejectedValueOnce(
+        new BackendError({ code: 'INVALID_PARAMS', message: 'invalid', rpcCode: -32602 }),
+      )
+      .mockResolvedValue([]);
+    const current = state();
+    const channel = stdChannel();
+    const task = runSaga(
+      { channel, dispatch: vi.fn(), getState: () => current },
+      modelSelectionSaga,
+    );
+
+    current.model.providerModels = { auggie: 'invalid' };
+    channel.put(setSelectedModel({ providerId: 'auggie', model: 'invalid' }));
+    await settle();
+
+    current.model.providerModels = { auggie: 'sonnet4.5', codex: 'gpt-5' };
+    channel.put(setSelectedModel({ providerId: 'codex', model: 'gpt-5' }));
+    await settle();
+
+    expect(mocks.update.mock.calls).toEqual([
+      [[{ path: 'model.providerDefaults', value: { auggie: 'invalid' } }]],
+      [
+        [
+          {
+            path: 'model.providerDefaults',
+            value: { auggie: 'sonnet4.5', codex: 'gpt-5' },
+          },
+        ],
+      ],
+    ]);
+    task.cancel();
+    await task.toPromise();
+  });
+
   it('retries a failed providerDefaults write until it lands (daemon not ready at pick time)', async () => {
     vi.useFakeTimers();
     try {
-      mocks.update
-        .mockRejectedValueOnce(new Error('backend unavailable'))
-        .mockResolvedValue([]);
+      mocks.update.mockRejectedValueOnce(new Error('backend unavailable')).mockResolvedValue([]);
       const current = state();
       const channel = stdChannel();
       const task = runSaga(
@@ -313,9 +452,7 @@ describe('modelSelectionSaga', () => {
   it('lets a newer pick supersede a failed write instead of waiting out the backoff', async () => {
     vi.useFakeTimers();
     try {
-      mocks.update
-        .mockRejectedValueOnce(new Error('backend unavailable'))
-        .mockResolvedValue([]);
+      mocks.update.mockRejectedValueOnce(new Error('backend unavailable')).mockResolvedValue([]);
       const current = state();
       const channel = stdChannel();
       const task = runSaga(

@@ -8,6 +8,7 @@
     faBars,
     faEllipsisV,
     faKeyboard,
+    faRightLeft,
     faTableColumns,
   } from '@fortawesome/free-solid-svg-icons';
   import Fa from 'svelte-fa';
@@ -27,6 +28,7 @@
   } from '$store/renderer/slices/ui-layout/ui-layout-slice';
 
   import { requestDeleteWorkspace } from '$store/renderer/slices/workspace-operations/workspace-operations-slice';
+  import { openTransferModal } from '$store/renderer/slices/workspace-transfer/workspace-transfer-slice';
   import { setWorkspaceEntity } from '$store/renderer/slices/workspace/workspace-slice';
   import {
     markKeySlotUnassigned,
@@ -404,6 +406,27 @@
     };
   });
 
+  const transferAction: MenuAction | null = $derived(
+    workspace
+      ? {
+          label: m.workspace_card_transfer_label(),
+          icon: faRightLeft,
+          onClick: () => {
+            appStore.dispatch(
+              openTransferModal({ workspaceId: workspace.id, workspaceTitle: workspace.title }),
+            );
+          },
+        }
+      : null,
+  );
+
+  const additionalActions: MenuAction[] = $derived([
+    sidebarToggleAction,
+    ...(microKeyAction ? [microKeyAction] : []),
+    ...(transferAction ? [transferAction] : []),
+    sidebarSideAction,
+  ]);
+
   function handleClose() {
     dropdownOpen = false;
   }
@@ -434,37 +457,45 @@
 
 <div class="group flex h-full items-start justify-between gap-2">
   <div class="flex min-w-0 flex-1 flex-col gap-1">
-    {#if isEditingTitle}
-      <input
-        bind:this={titleInputRef}
-        type="text"
-        bind:value={editedTitle}
-        onblur={saveTitle}
-        onkeydown={handleTitleKeydown}
-        class="type-title w-full rounded bg-none py-0.5 text-foreground
-               outline-none leading-normal
-               focus:ring-none! focus:outline-none!
-               transition-all duration-150"
-        placeholder={m.ui_editableName_placeholder()}
-      />
-    {:else}
-      <button
-        class="type-title cursor-pointer rounded border-none bg-transparent py-0.5 pr-1 text-left text-foreground
-               max-w-full overflow-hidden text-ellipsis whitespace-nowrap
-               transition-all duration-150 leading-normal line-clamp-3
-              focus-visible:outline focus-visible:outline-1
-               focus-visible:outline-ring focus-visible:outline-offset-[-1px]
-               disabled:cursor-default disabled:opacity-50"
-        class:opacity-50={!workspace?.title}
-        onclick={startEditingTitle}
-        title={m.workspace_sidebarHeader_editTitle_tooltip()}
-        disabled={!workspace}
-      >
-        {#if workspace}
-          {workspace.title || m.workspace_links_untitled_label()}
-        {/if}
-      </button>
-    {/if}
+    <div class="relative flex w-full min-w-0 items-center">
+      {#if isEditingTitle}
+        <input
+          bind:this={titleInputRef}
+          type="text"
+          bind:value={editedTitle}
+          onblur={saveTitle}
+          onkeydown={handleTitleKeydown}
+          class="edit-input type-title relative z-10 w-full rounded border-none bg-transparent py-0.5 text-foreground
+                 outline-none leading-normal
+                 focus:ring-none! focus:outline-none!
+                 transition-all duration-150"
+          placeholder={m.ui_editableName_placeholder()}
+        />
+      {:else}
+        <button
+          class="type-title relative z-10 cursor-text rounded border-none bg-transparent py-0.5 pr-1 text-left text-foreground
+                 max-w-full overflow-hidden text-ellipsis whitespace-nowrap
+                 transition-all duration-150 leading-normal line-clamp-3
+                focus-visible:outline focus-visible:outline-1
+                 focus-visible:outline-ring focus-visible:outline-offset-[-1px]
+                 disabled:cursor-default disabled:opacity-50"
+          class:opacity-50={!workspace?.title}
+          onclick={startEditingTitle}
+          title={m.workspace_sidebarHeader_editTitle_tooltip()}
+          disabled={!workspace}
+        >
+          {#if workspace}
+            {workspace.title || m.workspace_links_untitled_label()}
+          {/if}
+        </button>
+      {/if}
+      <span
+        aria-hidden="true"
+        class="pointer-events-none absolute z-0 rounded-(--radius-small) border transition-[inset,border-color,background-color] duration-(--motion-standard) ease-(--ease-standard) motion-reduce:transition-none {isEditingTitle
+          ? '-inset-x-2 -inset-y-1.5 border-ring/60 bg-sidebar'
+          : '-inset-x-1 -inset-y-0.5 border-transparent bg-transparent'}"
+      ></span>
+    </div>
 
     <!-- status message -->
     {#if isEditingStatusMessage}
@@ -485,7 +516,7 @@
         placeholder={m.workspace_sidebarHeader_addStatus_placeholder()}></textarea>
     {:else if workspace}
       <button
-        class="type-body cursor-pointer rounded border-none bg-transparent py-0.5 text-left text-muted-foreground
+        class="type-body cursor-text rounded border-none bg-transparent py-0.5 text-left text-muted-foreground
                max-w-full overflow-hidden line-clamp-2 break-words whitespace-normal
                transition-all duration-150 leading-snug
                hover:text-foreground hover:opacity-80
@@ -547,7 +578,7 @@
               contentClass="border-0!"
               contentContainerClass="p-0! space-y-0!"
               showArrow={false}
-              class="type-caption flex h-5 w-0 min-w-0 flex-1 cursor-pointer items-center overflow-hidden text-ellipsis whitespace-nowrap rounded-sm border-none bg-transparent p-0 text-left leading-5 text-muted-foreground
+              class="type-caption flex h-5 w-0 min-w-0 flex-1 cursor-text items-center overflow-hidden text-ellipsis whitespace-nowrap rounded-sm border-none bg-transparent p-0 text-left leading-5 text-muted-foreground
                      transition-all duration-150 hover:text-foreground
                      focus-visible:outline focus-visible:outline-1
                      focus-visible:outline-ring focus-visible:outline-offset-[-1px]
@@ -582,42 +613,52 @@
     </div>
   </div>
 
-  <DropdownMenu bind:open={dropdownOpen} align="end">
-    {#snippet trigger({ props })}
-      <Button
-        {...props}
-        variant="ghost-light"
-        size="icon-sm"
-        aria-label={m.workspace_sidebarHeader_actions_ariaLabel()}
-        class="opacity-50 group-hover:opacity-70 hover:!opacity-100 transition-opacity duration-150"
-        disabled={isDeleting}
-      >
-        {#if isDeleting}
-          <div
-            class="animate-spin h-3.5 w-3.5 border-2 border-current border-t-transparent rounded-full"
-          ></div>
-        {:else}
-          <Fa icon={faEllipsisV} size="sm" />
-        {/if}
-      </Button>
-    {/snippet}
+  <div class="flex shrink-0 items-start gap-1" data-sidebar-header-controls>
+    <DropdownMenu bind:open={dropdownOpen} align="end">
+      {#snippet trigger({ props })}
+        <Button
+          {...props}
+          variant="ghost-light"
+          size="icon-sm"
+          aria-label={m.workspace_sidebarHeader_actions_ariaLabel()}
+          class="opacity-50 group-hover:opacity-70 hover:!opacity-100 transition-opacity duration-150"
+          disabled={isDeleting}
+          data-workspace-actions-trigger
+        >
+          {#if isDeleting}
+            <div
+              class="animate-spin h-3.5 w-3.5 border-2 border-current border-t-transparent rounded-full"
+            ></div>
+          {:else}
+            <Fa icon={faEllipsisV} size="sm" />
+          {/if}
+        </Button>
+      {/snippet}
 
-    {#snippet content()}
-      <div class="w-48">
-        <WorkspaceActionsMenu
-          filePath={workspace?.worktreePath || workspace?.repositoryPath || workspace?.path || ''}
-          workspaceId={workspace?.id || workspaceId}
-          isDirectory={true}
-          isWorkspaceRoot={true}
-          onDelete={handleDelete}
-          onClose={handleClose}
-          showDeleteOption={true}
-          showFileNameCopy={false}
-          additionalActions={microKeyAction
-            ? [sidebarToggleAction, microKeyAction, sidebarSideAction]
-            : [sidebarToggleAction, sidebarSideAction]}
-        />
-      </div>
-    {/snippet}
-  </DropdownMenu>
+      {#snippet content()}
+        <div
+          class="min-w-48 w-max"
+          style="max-width: min(20rem, calc(var(--bits-dropdown-menu-content-available-width, 100vw) - 0.625rem))"
+        >
+          <WorkspaceActionsMenu
+            filePath={workspace?.worktreePath || workspace?.repositoryPath || workspace?.path || ''}
+            workspaceId={workspace?.id || workspaceId}
+            isDirectory={true}
+            isWorkspaceRoot={true}
+            onDelete={handleDelete}
+            onClose={handleClose}
+            showDeleteOption={true}
+            showFileNameCopy={false}
+            {additionalActions}
+          />
+        </div>
+      {/snippet}
+    </DropdownMenu>
+  </div>
 </div>
+
+<style>
+  input.edit-input::selection {
+    background: hsl(var(--ring) / 0.3);
+  }
+</style>

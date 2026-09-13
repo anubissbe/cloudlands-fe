@@ -1,13 +1,13 @@
-import { call, put, race, take, takeLeading } from 'typed-redux-saga';
+import { call, put, race, take } from 'typed-redux-saga';
 
 import { appClient } from '$lib/client';
 import { createLogger } from '$lib/utils/client-logger';
 import { SPEC_NOTE_ID } from '$shared/constants/notes';
+import { workspaceUnmounted } from '../../workspace-lifecycle/workspace-lifecycle-slice';
 import {
-  workspaceMounted,
-  workspaceUnmounted,
-} from '../../workspace-lifecycle/workspace-lifecycle-slice';
-import { takeLeadingByWorkspace } from '../../../utils/context-saga-effects';
+  takeLatestByContext,
+  takeSingleFlightInContext,
+} from '../../../utils/context-saga-effects';
 import { selectNoteById, selectWorkspaceNotesState } from '../workspace-notes-selectors';
 import {
   applyNoteCreated,
@@ -17,6 +17,7 @@ import {
   loadWorkspaceNotesSucceeded,
   noteEventReceived,
   selectNote,
+  workspaceNotesHydrationRequested,
   type NoteEventType,
 } from '../workspace-notes-slice';
 import { toRuntimeNote } from './note-payload-mappers';
@@ -33,15 +34,28 @@ function isWorkspaceCleanup(action: ObservedAction, workspaceId: string): boolea
   );
 }
 
-function* hydrateWorkspaceNotes(workspaceId: string) {
+function* hydrateWorkspaceNotes(workspaceId: string, force = false) {
   const current = yield* selectWorkspaceNotesState.effect(workspaceId);
-  if (current.loading || current.initialized) return;
+  if (current.loading || (!force && current.initialized)) return;
   try {
-    const response: Awaited<ReturnType<typeof appClient.notes.list>> = yield* call(
-      [appClient.notes, appClient.notes.list],
+    // Slim projection (§5.2): the initial hydrate does not need full bodies —
+    // sidebar surfaces read titles/tags/metadata, and slim rows carry
+    // contentPreview/contentLength. The spec is the one structural exception
+    // (task links, ordering), so fetch it full alongside the slim list.
+    // The spec fetch is fail-soft: a workspace without a spec note must not
+    // fail the hydrate (its slim row, if any, is kept as-is).
+    const fetchSlimListAndSpec = (id: string) =>
+      Promise.all([
+        appClient.notes.list(id, { projection: 'slim' }),
+        appClient.notes.get(SPEC_NOTE_ID, id).catch(() => null),
+      ]);
+    const [response, specNote]: Awaited<ReturnType<typeof fetchSlimListAndSpec>> = yield* call(
+      fetchSlimListAndSpec,
       workspaceId,
     );
-    const notes = response.map(toRuntimeNote);
+    const notes = response.map((note) =>
+      specNote && String(note.id) === SPEC_NOTE_ID ? toRuntimeNote(specNote) : toRuntimeNote(note),
+    );
     yield* put(loadWorkspaceNotesSucceeded([workspaceId], { [workspaceId]: notes }));
     const spec = notes.find((note) => String(note.id) === SPEC_NOTE_ID);
     if (spec) yield* put(selectNote(workspaceId, String(spec.id)));
@@ -62,11 +76,13 @@ function* applyNoteEvent(workspaceId: string, noteId: string, eventType: NoteEve
     return;
   }
   try {
-    const response: Awaited<ReturnType<typeof appClient.notes.list>> = yield* call(
-      [appClient.notes, appClient.notes.list],
+    // Targeted refetch (§5.2): one note changed, so fetch that note instead of
+    // re-listing the whole workspace with full bodies.
+    const found: Awaited<ReturnType<typeof appClient.notes.get>> = yield* call(
+      [appClient.notes, appClient.notes.get],
+      noteId,
       workspaceId,
     );
-    const found = response.find((note) => String(note.id) === noteId);
     if (!found || String(found.workspaceId) !== workspaceId) return;
     const note = toRuntimeNote(found);
     const existing = yield* selectNoteById.effect(workspaceId, noteId);
@@ -80,11 +96,11 @@ function* applyNoteEvent(workspaceId: string, noteId: string, eventType: NoteEve
   }
 }
 
-function* hydrateWorkspaceNotesWorker(action: ReturnType<typeof workspaceMounted>) {
-  const [workspaceId] = action.payload;
+function* hydrateWorkspaceNotesWorker(action: ReturnType<typeof workspaceNotesHydrationRequested>) {
+  const [workspaceId, , force] = action.payload;
   if (!workspaceId) return;
   yield* race({
-    hydrate: call(hydrateWorkspaceNotes, workspaceId),
+    hydrate: call(hydrateWorkspaceNotes, workspaceId, force),
     cleanup: take((cleanup: ObservedAction) => isWorkspaceCleanup(cleanup, workspaceId)),
   });
 }
@@ -99,6 +115,18 @@ function* applyNoteEventWorker(action: ReturnType<typeof noteEventReceived>) {
 }
 
 export function* notesReadSaga() {
-  yield* takeLeadingByWorkspace(workspaceMounted, hydrateWorkspaceNotesWorker);
-  yield* takeLeading(noteEventReceived, applyNoteEventWorker);
+  yield* takeLatestByContext(
+    workspaceNotesHydrationRequested,
+    (action) => ({ context: action.payload[0], generation: action.payload[1] }),
+    hydrateWorkspaceNotesWorker,
+  );
+  // Per-note single-flight with trailing coalesce: events for different notes
+  // run concurrently (a global takeLeading would drop a second note's event
+  // while the first is fetching), while a burst of events for one note
+  // collapses to the in-flight fetch plus at most one trailing refetch.
+  yield* takeSingleFlightInContext(
+    noteEventReceived,
+    (action) => `${action.payload[0]}:${action.payload[1]}`,
+    applyNoteEventWorker,
+  );
 }

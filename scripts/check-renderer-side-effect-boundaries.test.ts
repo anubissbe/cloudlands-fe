@@ -6,12 +6,12 @@ const registry = {
   content: [
     "import { createStoreGuardMiddleware } from '../../store/utils/store-guard-middleware';",
     "import { createBatchingMiddleware } from './middlewares/batch';",
-    "import { createLoggerMiddleware } from './middlewares/logger';",
+    "import { createActionRingBufferMiddleware } from './middlewares/action-ring-buffer';",
     "import { createReferenceChangeDetectorMiddleware } from './middlewares/state-reference-checks';",
     "import { createStructuredCloneCheckerMiddleware } from './middlewares/structured-clone-checker';",
     'createStoreGuardMiddleware()',
     'createBatchingMiddleware()',
-    'createLoggerMiddleware()',
+    'createActionRingBufferMiddleware()',
     'createReferenceChangeDetectorMiddleware()',
     'createStructuredCloneCheckerMiddleware()',
   ].join('\n'),
@@ -24,7 +24,7 @@ const configuredStore = {
     "import { middleware } from './middleware';",
     "import { reducers } from './reducer';",
     'class RendererStore extends Store {}',
-    'export const store = new RendererStore(reducers, middleware);',
+    'export const store = new RendererStore(reducers, middleware, { logReduxActions: false });',
   ].join('\n'),
 };
 
@@ -32,11 +32,6 @@ describe('renderer side-effect boundary guard', () => {
   it('allows the five approved middleware and reusable non-middleware utilities', () => {
     const files = [
       registry,
-      {
-        path: 'src/store/renderer/middlewares/logger.ts',
-        content:
-          'import type { StoreMiddleware } from "x"; export function createLoggerMiddleware() {}',
-      },
       {
         path: 'src/features/agent/read-helper.ts',
         content: [
@@ -303,6 +298,51 @@ describe('renderer side-effect boundary guard', () => {
     ).toEqual([]);
   });
 
+  it('pins the Antigravity setup bridge seeder to its two reviewed registrations', () => {
+    const seeder = (channels: string[]) => ({
+      path: 'src/store/renderer/seeders/antigravity-setup-bridge-seeder.ts',
+      content: [
+        "import { registerMockIpcHandler } from '$shared/ipc-mock-router';",
+        ...channels.map(
+          (channel) => `registerMockIpcHandler('${channel}', async () => undefined);`,
+        ),
+      ].join('\n'),
+    });
+    expect(
+      findRendererSideEffectBoundaryViolations([
+        registry,
+        seeder(['antigravity:setup', 'antigravity:close-setup']),
+      ]),
+    ).toEqual([]);
+    expect(
+      findRendererSideEffectBoundaryViolations([
+        registry,
+        seeder(['antigravity:setup', 'antigravity:close-setup', 'antigravity:unreviewed']),
+      ]),
+    ).toEqual([expect.stringContaining('reviewed renderer IPC bridge registrations changed')]);
+  });
+
+  it('pins the user MCP bridge seeder to its reviewed registration', () => {
+    const seeder = (channels: string[]) => ({
+      path: 'src/store/renderer/seeders/user-mcp-bridge-seeder.ts',
+      content: [
+        "import { registerMockIpcHandler } from '$shared/ipc-mock-router';",
+        ...channels.map(
+          (channel) => `registerMockIpcHandler('${channel}', async () => undefined);`,
+        ),
+      ].join('\n'),
+    });
+    expect(
+      findRendererSideEffectBoundaryViolations([registry, seeder(['user-mcp:authenticate'])]),
+    ).toEqual([]);
+    expect(
+      findRendererSideEffectBoundaryViolations([
+        registry,
+        seeder(['user-mcp:authenticate', 'user-mcp:unreviewed']),
+      ]),
+    ).toEqual([expect.stringContaining('reviewed renderer IPC bridge registrations changed')]);
+  });
+
   it('rejects expansion of an approved bridge path', () => {
     const violations = findRendererSideEffectBoundaryViolations([
       registry,
@@ -325,23 +365,21 @@ describe('renderer side-effect boundary guard', () => {
       { ...registry, content: `${registry.content}\ninstallTaskEffects()` },
     ]);
     expect(violations).toEqual([
-      expect.stringContaining(
-        'registry must contain exactly the five approved middleware factories',
-      ),
+      expect.stringContaining('registry must contain exactly the 5 approved middleware factories'),
     ]);
   });
 
   it.each([
-    ['removed', registry.content.replace('createLoggerMiddleware()\n', '')],
+    ['removed', registry.content.replace('createBatchingMiddleware()\n', '')],
     [
       'replaced',
-      registry.content.replace('createLoggerMiddleware()', 'createUnapprovedMiddleware()'),
+      registry.content.replace('createBatchingMiddleware()', 'createUnapprovedMiddleware()'),
     ],
-    ['duplicated', `${registry.content}\ncreateLoggerMiddleware()`],
+    ['duplicated', `${registry.content}\ncreateBatchingMiddleware()`],
   ])('rejects an approved factory that is %s in the registry', (_change, content) => {
     expect(findRendererSideEffectBoundaryViolations([{ ...registry, content }])).toEqual([
       expect.stringContaining(
-        'src/store/renderer/middleware.ts: registry must contain exactly the five approved middleware factories',
+        'src/store/renderer/middleware.ts: registry must contain exactly the 5 approved middleware factories',
       ),
     ]);
   });

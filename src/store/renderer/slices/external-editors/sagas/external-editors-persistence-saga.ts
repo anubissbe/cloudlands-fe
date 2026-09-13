@@ -1,9 +1,12 @@
 import { call, fork, put, takeEvery, type SagaGenerator } from 'typed-redux-saga';
 
 import { getLocalStorageItem, setLocalStorageItem } from '../../../utils/safe-local-storage-saga';
-import { selectHiddenEditorIds } from '../external-editors-selectors';
+import { selectEditorOrder, selectHiddenEditorIds } from '../external-editors-selectors';
 import {
   normalizeHiddenEditorIds,
+  normalizeEditorOrder,
+  fetchEditorsSuccess,
+  setEditorOrder,
   setHiddenEditorIds,
   setOpenAction,
   toggleHiddenEditor,
@@ -11,8 +14,9 @@ import {
 
 const OPEN_ACTION_STORAGE_KEY = 'open-combo-button-last-action';
 const HIDDEN_EDITORS_STORAGE_KEY = 'legacy-settings:hiddenOpenInEditors';
+export const EDITOR_ORDER_STORAGE_KEY = 'settings:openInEditorsOrder';
 
-export function* hydrateHiddenEditorIdsWorker(): SagaGenerator<void> {
+function* hydrateHiddenEditorIdsWorker(): SagaGenerator<void> {
   const stored = yield* call(getLocalStorageItem, HIDDEN_EDITORS_STORAGE_KEY);
   if (!stored) return;
 
@@ -23,26 +27,43 @@ export function* hydrateHiddenEditorIdsWorker(): SagaGenerator<void> {
   }
 }
 
-export function* persistOpenActionWorker(
-  action: ReturnType<typeof setOpenAction>,
-): SagaGenerator<void> {
+function* hydrateEditorOrderWorker(): SagaGenerator<void> {
+  const stored = yield* call(getLocalStorageItem, EDITOR_ORDER_STORAGE_KEY);
+  if (!stored) return;
+  try {
+    const order = normalizeEditorOrder(JSON.parse(stored));
+    if (order.length) yield* put(setEditorOrder(order));
+  } catch {
+    // Invalid editor order storage is ignored.
+  }
+}
+
+function* persistOpenActionWorker(action: ReturnType<typeof setOpenAction>): SagaGenerator<void> {
   const [openAction] = action.payload;
   if (typeof openAction !== 'string') return;
   yield* call(setLocalStorageItem, OPEN_ACTION_STORAGE_KEY, openAction);
 }
 
-export function* persistHiddenEditorIdsWorker(): SagaGenerator<void> {
+function* persistHiddenEditorIdsWorker(): SagaGenerator<void> {
   const hiddenEditorIds = yield* selectHiddenEditorIds.effect();
   yield* call(setLocalStorageItem, HIDDEN_EDITORS_STORAGE_KEY, JSON.stringify(hiddenEditorIds));
+}
+
+function* persistEditorOrderWorker(): SagaGenerator<void> {
+  const editorOrder = yield* selectEditorOrder.effect();
+  yield* call(setLocalStorageItem, EDITOR_ORDER_STORAGE_KEY, JSON.stringify(editorOrder));
 }
 
 function* watchExternalEditorPersistence(): SagaGenerator<void> {
   yield* takeEvery(setOpenAction, persistOpenActionWorker);
   yield* takeEvery(toggleHiddenEditor, persistHiddenEditorIdsWorker);
+  yield* takeEvery(setEditorOrder, persistEditorOrderWorker);
+  yield* takeEvery(fetchEditorsSuccess, persistEditorOrderWorker);
 }
 
 /** Unregistered until the S20 middleware cutover. */
 export function* externalEditorsPersistenceSaga(): SagaGenerator<void> {
   yield* call(hydrateHiddenEditorIdsWorker);
+  yield* call(hydrateEditorOrderWorker);
   yield* fork(watchExternalEditorPersistence);
 }

@@ -9,7 +9,10 @@
   background-color: hsl(var(--warning) / 0.2);
   border-bottom: 2px solid hsl(var(--warning) / 0.5);
   cursor: pointer;
-  transition: all 0.2s ease;
+  transition:
+    background-color 0.2s ease,
+    border-bottom-color 0.2s ease,
+    transform 0.2s ease;
   position: relative;
 }
 
@@ -44,8 +47,8 @@
 }
 
 .comment-rejected {
-  background-color: hsl(var(--destructive) / 0.1);
-  border-bottom-color: hsl(var(--destructive) / 0.3);
+  background-color: hsl(var(--danger-background) / 0.1);
+  border-bottom-color: hsl(var(--danger) / 0.3);
   text-decoration: line-through;
   opacity: 0.7;
 }
@@ -63,8 +66,8 @@
 }
 
 .comment-type-change-request {
-  background-color: hsl(var(--destructive) / 0.15);
-  border-bottom-color: hsl(var(--destructive) / 0.4);
+  background-color: hsl(var(--danger-background) / 0.15);
+  border-bottom-color: hsl(var(--danger) / 0.4);
   border-bottom-width: 3px;
 }
 
@@ -122,11 +125,13 @@
 
 /* Overlapping comments - striped pattern */
 .comment-highlight.comment-overlap {
-  background: repeating-linear-gradient(45deg,
-      hsl(var(--warning) / 0.2),
-      hsl(var(--warning) / 0.2) 5px,
-      hsl(var(--primary) / 0.2) 5px,
-      hsl(var(--primary) / 0.2) 10px);
+  background: repeating-linear-gradient(
+    45deg,
+    hsl(var(--warning) / 0.2),
+    hsl(var(--warning) / 0.2) 5px,
+    hsl(var(--primary) / 0.2) 5px,
+    hsl(var(--primary) / 0.2) 10px
+  );
   border-bottom: 2px solid hsl(var(--accent) / 0.5);
 }
 
@@ -222,7 +227,9 @@
   border: 1px solid hsl(var(--border));
   border-radius: 8px;
   box-shadow: var(--elevation-raised);
-  transition: all 0.2s ease;
+  transition:
+    box-shadow 0.2s ease,
+    transform 0.2s ease;
 }
 
 .comment-bubble:hover {
@@ -272,7 +279,7 @@
   border-radius: 4px;
   background: transparent;
   cursor: pointer;
-  transition: all 0.2s ease;
+  transition: background-color 0.2s ease;
 }
 
 .comment-bubble-action:hover {
@@ -301,8 +308,8 @@
 }
 
 .comment-type-icon.change-request {
-  background: hsl(var(--destructive) / 0.2);
-  color: hsl(var(--destructive));
+  background: hsl(var(--danger-background) / 0.2);
+  color: hsl(var(--danger));
 }
 
 .comment-type-icon.question {

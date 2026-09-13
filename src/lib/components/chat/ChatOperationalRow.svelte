@@ -12,12 +12,15 @@
     CHAT_OPERATIONAL_TRAILING_CLASS,
     safeOperationalDetailsTransition,
   } from './operational-disclosure-row';
+  import { searchDisclosureEvents } from './chat-search-disclosure';
+  import { streamingPulse } from './streaming-pulse';
 
   interface Props {
     leading: Snippet;
     summary: Snippet;
     trailing?: Snippet;
     showChevron?: boolean;
+    preview?: Snippet;
     details?: Snippet;
     interactive?: boolean;
     expanded?: boolean;
@@ -28,7 +31,13 @@
     onclick?: (event: MouseEvent) => void;
     onkeydown?: (event: KeyboardEvent) => void;
     detailsId?: string;
+    previewClass?: string;
     detailsClass?: string;
+    previewTransition?: (
+      node: Element,
+      params?: { duration?: number; y?: number },
+      options?: { direction?: 'in' | 'out' | 'both' },
+    ) => TransitionConfig;
     detailsTransition?: (node: Element) => TransitionConfig;
     detailsMotion?: string;
     detailsInert?: boolean;
@@ -44,6 +53,10 @@
     toolUseId?: string;
     toolCallId?: string;
     conversationLayer?: string;
+    searchDisclosureId?: string;
+    summarySearchPath?: string;
+    onSearchExpand?: () => void;
+    onSearchRestore?: () => void;
     class?: string;
   }
 
@@ -52,6 +65,7 @@
     summary,
     trailing,
     showChevron = true,
+    preview,
     details,
     interactive = false,
     expanded = false,
@@ -62,7 +76,9 @@
     onclick,
     onkeydown,
     detailsId,
+    previewClass = '',
     detailsClass = '',
+    previewTransition,
     detailsTransition = safeOperationalDetailsTransition,
     detailsMotion,
     detailsInert = false,
@@ -78,8 +94,23 @@
     toolUseId,
     toolCallId,
     conversationLayer,
+    searchDisclosureId,
+    summarySearchPath,
+    onSearchExpand,
+    onSearchRestore,
     class: className = '',
   }: Props = $props();
+
+  // Delegates to the consumer transition when provided; the zero-duration
+  // fallback keeps removal synchronous for rows without preview motion.
+  function previewContentTransition(
+    node: Element,
+    params?: { duration?: number; y?: number },
+    options?: { direction?: 'in' | 'out' | 'both' },
+  ): TransitionConfig {
+    if (!previewTransition) return { duration: 0 };
+    return previewTransition(node, params, options);
+  }
 </script>
 
 <div
@@ -91,6 +122,9 @@
   data-tool-use-id={toolUseId}
   data-tool-call-id={toolCallId}
   data-conversation-layer={conversationLayer}
+  data-chat-search-disclosure-id={searchDisclosureId}
+  data-chat-search-expanded={searchDisclosureId ? expanded : undefined}
+  use:searchDisclosureEvents={{ onExpand: onSearchExpand, onRestore: onSearchRestore }}
 >
   <div class={CHAT_OPERATIONAL_ROW_CLASS} data-operational-disclosure-row data-compact-tool-row>
     {#if interactive}
@@ -107,7 +141,8 @@
         {onkeydown}
       >
         <span
-          class="{CHAT_OPERATIONAL_LEADING_CLASS} {streaming ? 'animate-pulse' : ''}"
+          class={CHAT_OPERATIONAL_LEADING_CLASS}
+          use:streamingPulse={streaming}
           data-operational-leading
           data-operational-icon-box
           data-tool-icon={toolIcon || undefined}>{@render leading()}</span
@@ -117,12 +152,14 @@
           data-operational-summary
           data-tool-sentence={toolIcon || undefined}
           data-testid={summaryTestId}
+          data-chat-search-block-path={summarySearchPath}
           title={summaryTitle}>{@render summary()}</span
         >
       </button>
     {:else}
       <div
-        class="{CHAT_OPERATIONAL_LEADING_CLASS} {streaming ? 'animate-pulse' : ''}"
+        class={CHAT_OPERATIONAL_LEADING_CLASS}
+        use:streamingPulse={streaming}
         data-operational-leading
         data-operational-icon-box
         data-tool-icon={toolIcon || undefined}
@@ -134,6 +171,7 @@
         data-operational-summary
         data-tool-sentence={toolIcon || undefined}
         data-testid={summaryTestId}
+        data-chat-search-block-path={summarySearchPath}
         aria-label={ariaLabel}
         title={summaryTitle ?? ariaLabel}>{@render summary()}</span
       >
@@ -153,6 +191,12 @@
       </span>
     {/if}
   </div>
+
+  {#if preview}
+    <div class={previewClass} data-operational-preview-content out:previewContentTransition>
+      {@render preview()}
+    </div>
+  {/if}
 
   {#if details}
     <div

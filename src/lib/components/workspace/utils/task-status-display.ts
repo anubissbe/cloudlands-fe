@@ -11,7 +11,7 @@ import { formatInteger } from '$lib/i18n/format';
 // Named exports keep the status presentation on one shared visual contract.
 
 /** Accessible detail order for included task statuses (complete first, not started last). */
-export const TASK_STATUS_ORDER: readonly TaskStatus[] = [
+const TASK_STATUS_ORDER: readonly TaskStatus[] = [
   'complete',
   'in_progress',
   'review_required',
@@ -148,7 +148,7 @@ export const TASK_STATUS_INDICATOR_CLASSES: Record<TaskStatus, string> = {
   not_started: 'border border-border bg-background',
   waiting: 'border border-muted-foreground/50 bg-background',
   discussion_needed: 'bg-warning',
-  blocked: 'bg-destructive',
+  blocked: 'bg-danger',
   in_progress: 'bg-info',
   review_required: 'bg-primary/70',
   complete: 'bg-success',

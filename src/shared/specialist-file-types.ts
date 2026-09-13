@@ -34,17 +34,33 @@ export type SpecialistFileScope = Extract<SpecialistSource, 'project' | 'user'>;
 
 /**
  * One entry of a specialist's ordered delegation model-option list
- * (PROTOCOL §5.11 `modelOptions`): `model` is the internal compound model id
- * (e.g. "opencode:kimi-k3") and `hint` the author's free-text guidance for
- * choosing that option (`""` when none was given). `reasoningEffort` is the
- * optional per-option effort level (one of the model's catalog
- * `effortLevels`); omitted when the option inherits the model default.
+ * (PROTOCOL §5.11 `modelOptions`): `model` is a BARE model id (e.g.
+ * "kimi-k3"); an omitted `provider` means the specialist's own provider
+ * (`codingAgent`, else the settings-derived default). `hint` is the author's
+ * free-text guidance for choosing that option (`""` when none was given).
+ * `reasoningEffort` is the optional per-option effort level (one of the
+ * model's catalog `effortLevels`); omitted when the option inherits the
+ * model default. Legacy compound `model` ids ("provider:model") split on
+ * read (the prefix wins over an entry-level `provider`); writes emit the
+ * triple shape only.
  */
 export interface SpecialistModelOption {
+  provider?: string;
   model: string;
   hint: string;
   reasoningEffort?: string;
 }
+
+/**
+ * Orchestration role of a specialist (PROTOCOL §5.11 `role`):
+ * - 'orchestrator': powers the New Workspace modal's team-mode card.
+ * - 'internal': excluded from the modal's single-agent dropdown ONLY; still
+ *   visible in-workspace (SpecialistDropdown) and in Settings, unlike
+ *   `hidden` which hides from all pickers.
+ * Absent (undefined) means a standard specialist. Unknown values read as
+ * absent (lenient parse).
+ */
+export type SpecialistRole = 'orchestrator' | 'internal';
 
 /**
  * YAML frontmatter fields for specialist markdown files
@@ -93,6 +109,24 @@ export interface SpecialistFileFrontmatter {
    * specialist then inherits the model default.
    */
   reasoningEffort?: string;
+  /**
+   * Orchestration role (PROTOCOL §5.11). Omitted (undefined) means standard;
+   * unknown values in files read as omitted.
+   */
+  role?: SpecialistRole;
+  /**
+   * Specialist ids the orchestrator delegates to (advisory/render-only, used
+   * for the team-card avatar row). Stored in frontmatter as a single-line
+   * JSON-array scalar like `modelOptions`. Omitted (undefined) when the file
+   * has no `teamAgents:` key.
+   */
+  teamAgents?: string[];
+  /**
+   * Built-in avatar design id for this specialist (PROTOCOL §5.11). Carried
+   * verbatim; unknown/absent values degrade to the id-map + seeded fallback
+   * at render time.
+   */
+  icon?: string;
 }
 
 /**
@@ -111,31 +145,6 @@ export interface SpecialistFile {
   rawContent: string;
   /** Where this specialist was loaded from */
   source: SpecialistSource;
-}
-
-/**
- * Unified specialist type that combines all sources
- * This is what the frontend and agent system work with
- */
-export interface UnifiedSpecialist {
-  /** Unique identifier */
-  id: string;
-  /** Display name */
-  name: string;
-  /** Short description */
-  description: string;
-  /** ACP provider / runtime backend, if explicitly configured */
-  codingAgent?: string;
-  /** Default model ID */
-  defaultModel: string;
-  /** Behavior prompt / system instructions */
-  defaultBehaviorPrompt: string;
-  /** Optional role reminder for long conversations */
-  roleReminder?: string;
-  /** Source of this specialist definition */
-  source: SpecialistSource;
-  /** File path if source is 'file' */
-  filePath?: string;
 }
 
 /**
@@ -160,12 +169,6 @@ export const SPECIALISTS_FOLDER = 'specialists';
  * Valid file extensions for specialist files
  */
 export const SPECIALIST_FILE_EXTENSIONS = ['.md'];
-
-/**
- * Legacy default model constant. Runtime specialist resolution should prefer
- * the user's selected default model when a specialist does not specify model.
- */
-export const DEFAULT_SPECIALIST_MODEL = 'sonnet4.5';
 
 /**
  * Sanitize a string to be used as a specialist ID.

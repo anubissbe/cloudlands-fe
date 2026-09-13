@@ -15,6 +15,12 @@
   import { m } from '$shared/paraglide/messages.js';
   import { formatInteger, formatNumber } from '$lib/i18n/format';
 
+  interface Props {
+    class?: string;
+  }
+
+  let { class: className = '' }: Props = $props();
+
   const logger = new Logger({ category: 'AgentRulesEditor' });
 
   const RULE_TYPE = 'base-system-prompt';
@@ -31,6 +37,14 @@
   let hasChanges = $state(false);
   let originalContent = '';
   let saveStatus = $state<'idle' | 'saving' | 'saved'>('idle');
+
+  // Single-flight save with trailing coalesce: never run two rules.update
+  // requests concurrently (they could resolve out of order and leave the
+  // backend with a stale payload), and re-save after completion if the text
+  // changed while the request was in flight.
+  let saveInFlight = false;
+  let trailingSaveNeeded = false;
+  let lastSavedContent = '';
 
   // Derived character limit state
   let charCount = $derived(rulesContent.length);
@@ -79,6 +93,10 @@
       }
       rulesContent = rule.content;
       originalContent = rulesContent;
+      // Trimmed, like every payload saveRules persists: all drift
+      // comparisons are trimmed-vs-trimmed, so padding whitespace in a rule
+      // set outside this editor cannot register as unsaved drift.
+      lastSavedContent = rulesContent.trim();
       hasChanges = false;
     } catch (error) {
       logger.error('Failed to load rules', error instanceof Error ? error : undefined);
@@ -89,10 +107,23 @@
   }
 
   async function saveRules() {
-    if (!hasChanges) return;
+    if (saveInFlight) {
+      trailingSaveNeeded = true;
+      return;
+    }
 
-    // Block saving if over limit
+    const trimmedContent = rulesContent.trim();
+
+    // Gate on drift from the persisted value (lastSavedContent), not on
+    // hasChanges (which tracks the loaded original for "Undo changes"): a
+    // revert back to the original must still reconcile a persisted draft
+    // (intent-hq/intent#4094).
+    if (!hasChanges && trimmedContent === lastSavedContent) return;
+
+    // Block saving if over limit; never leave saveStatus stuck at 'saving'
+    // when a trailing save bails out here.
     if (isOverLimit) {
+      saveStatus = 'idle';
       showError(
         m.settings_agentRules_overLimitError({
           max: formatInteger(MAX_RULES_LENGTH),
@@ -102,25 +133,47 @@
       return;
     }
 
+    // The backend already holds this exact value: skip the redundant wire
+    // call and mark the clean/saved state directly.
+    if (trimmedContent === lastSavedContent) {
+      hasChanges = trimmedContent !== originalContent;
+      saveStatus = 'saved';
+      if (savedStatusTimeout) clearTimeout(savedStatusTimeout);
+      savedStatusTimeout = setTimeout(() => {
+        saveStatus = 'idle';
+      }, 2000);
+      return;
+    }
+
+    saveInFlight = true;
+    let saveSucceeded = false;
     try {
       saveStatus = 'saving';
       errorMessage = null;
 
-      const trimmedContent = rulesContent.trim();
       const result = await appClient.settings.updateUserRule(RULE_TYPE, trimmedContent);
 
       if (result.success) {
-        rulesContent = trimmedContent;
+        saveSucceeded = true;
+        lastSavedContent = trimmedContent;
+        // Don't rewrite rulesContent with the trimmed value - reassigning it
+        // mid-edit clobbers the textarea and swallows leading/trailing
+        // newlines the user just typed
         // Don't update originalContent - we want to keep track of what was loaded
         // so "Undo changes" can revert to the initial state
-        hasChanges = rulesContent !== originalContent;
-        saveStatus = 'saved';
+        hasChanges = rulesContent.trim() !== originalContent;
 
-        // Clear saved status after 2 seconds
-        if (savedStatusTimeout) clearTimeout(savedStatusTimeout);
-        savedStatusTimeout = setTimeout(() => {
-          saveStatus = 'idle';
-        }, 2000);
+        // Only show "saved" when the persisted value matches the live text;
+        // otherwise the trailing save below re-runs and reports instead.
+        if (rulesContent.trim() === lastSavedContent) {
+          saveStatus = 'saved';
+
+          // Clear saved status after 2 seconds
+          if (savedStatusTimeout) clearTimeout(savedStatusTimeout);
+          savedStatusTimeout = setTimeout(() => {
+            saveStatus = 'idle';
+          }, 2000);
+        }
       } else {
         saveStatus = 'idle';
         showError(result.error || m.settings_agentRules_saveErrorShort());
@@ -129,15 +182,28 @@
       logger.error('Failed to save rules', error instanceof Error ? error : undefined);
       saveStatus = 'idle';
       showError(m.settings_agentRules_saveError());
+    } finally {
+      saveInFlight = false;
+    }
+
+    // Trailing coalesce: if the text changed while the request was in flight
+    // (or another save was requested), save again immediately so the backend
+    // converges to the latest text.
+    const trailing = trailingSaveNeeded;
+    trailingSaveNeeded = false;
+    if (trailing || (saveSucceeded && rulesContent.trim() !== lastSavedContent)) {
+      void saveRules();
     }
   }
 
   function handleContentChange() {
     hasChanges = rulesContent !== originalContent;
 
-    // Debounced auto-save
+    // Debounced auto-save: schedule on drift from the persisted value too,
+    // so retyping the exact original after an auto-save still reconciles
+    // the backend.
     if (debounceTimeout) clearTimeout(debounceTimeout);
-    if (hasChanges) {
+    if (hasChanges || rulesContent.trim() !== lastSavedContent) {
       debounceTimeout = setTimeout(() => {
         saveRules();
       }, DEBOUNCE_MS);
@@ -149,6 +215,13 @@
     hasChanges = false;
     saveStatus = 'idle';
     if (debounceTimeout) clearTimeout(debounceTimeout);
+    // Undo persists the revert: when an auto-save already stored a draft,
+    // run the normal save flow so the backend converges to the original
+    // (intent-hq/intent#4094). A revert during an in-flight save is covered
+    // by the trailing coalesce in saveRules.
+    if (rulesContent.trim() !== lastSavedContent) {
+      void saveRules();
+    }
   }
 
   function handleKeyDown(e: KeyboardEvent) {
@@ -163,26 +236,22 @@
 
 <svelte:window onkeydown={handleKeyDown} />
 
-<div class="h-full flex flex-col gap-4">
-  <div class="flex items-start justify-between gap-4 shrink-0">
-    <div>
-      <h2 class="text-sm font-medium text-foreground">{m.settings_agentRules_title()}</h2>
-      <p class="text-sm text-muted-foreground mt-1">
-        {m.settings_agentRules_description()}
-      </p>
-    </div>
-
-    {#if hasChanges}
+<div class="h-full flex flex-col gap-2 {className}">
+  {#if hasChanges}
+    <div
+      data-testid="agent-rules-header"
+      class="flex min-w-0 shrink-0 flex-wrap items-center gap-2"
+    >
       <Button variant="ghost-light" size="xs" onclick={undoChanges} class="">
         <Fa icon={faRotateLeft} class="w-3 h-3" />
         {m.settings_agentRules_undoChanges()}
       </Button>
-    {/if}
-  </div>
+    </div>
+  {/if}
 
   {#if errorMessage}
     <div
-      class="bg-destructive/10 border border-destructive/20 text-error-foreground px-4 py-2 rounded-md text-sm shrink-0"
+      class="bg-danger-background/10 border border-danger/20 text-danger px-4 py-2 rounded-md text-sm shrink-0"
     >
       {errorMessage}
     </div>
@@ -191,7 +260,7 @@
   <!-- Character limit warning/error callout -->
   {#if isOverLimit}
     <div
-      class="flex items-center gap-2 p-3 bg-destructive/10 border border-destructive/30 rounded-md text-error-foreground shrink-0"
+      class="flex items-center gap-2 p-3 bg-danger-background/10 border border-danger/30 rounded-md text-danger shrink-0"
     >
       <Fa icon={faCircleExclamation} class="w-4 h-4 flex-shrink-0" />
       <span class="text-sm">
@@ -231,10 +300,11 @@
         oninput={handleContentChange}
         noFocusStyle
         placeholder={m.settings_agentRules_placeholder()}
-        class="text-sm leading-relaxed grow {isOverLimit ? 'border-destructive' : ''}"
+        class="text-sm leading-relaxed grow {isOverLimit ? 'border-danger' : ''}"
       />
       <!-- Saved indicator -->
       <div
+        data-testid="agent-rules-saved-indicator"
         class="absolute top-2 right-2 transition-opacity duration-200 {saveStatus === 'saved'
           ? 'opacity-100'
           : 'opacity-0'}"
@@ -247,7 +317,7 @@
     {#if isApproachingLimit || isOverLimit}
       <div
         class="flex items-center justify-end shrink-0 {isOverLimit
-          ? 'text-destructive'
+          ? 'text-danger'
           : 'text-warning'}"
       >
         <span>

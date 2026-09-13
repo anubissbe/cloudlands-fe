@@ -37,6 +37,7 @@
     sanitizeToolPayload,
     sanitizeToolText,
   } from './tool-display-model';
+  import { resolveBrowserScreenshotSource } from './browser-screenshot-source';
 
   interface Props {
     input: Record<string, any>;
@@ -76,6 +77,9 @@
   let copied = $state(false);
   const sanitizedInput = $derived(sanitizeToolPayload(input) as Record<string, any>);
   const sanitizedResult = $derived(sanitizeToolPayload(result));
+  const browserScreenshotSource = $derived(
+    parsedResult?.type === 'browser' ? resolveBrowserScreenshotSource(parsedResult) : null,
+  );
 
   // Disposition summary for batch delegate results ("2 started · 1 held · 1 skipped").
   // The started count always shows; held/skipped/failed only when non-zero.
@@ -252,21 +256,13 @@
     <div class="flex min-w-0 flex-col gap-2" data-tool-detail-error>
       {#if errorText}
         <div class="flex min-w-0 items-start gap-2">
-          <Fa
-            icon={faExclamationTriangle}
-            size="xs"
-            class="text-error-foreground mt-0.5 shrink-0"
-          />
+          <Fa icon={faExclamationTriangle} size="xs" class="text-danger mt-0.5 shrink-0" />
           <pre
-            class="m-0 min-w-0 whitespace-pre-wrap break-words font-mono text-xs text-error-foreground">{errorText}</pre>
+            class="m-0 min-w-0 whitespace-pre-wrap break-words font-mono text-xs text-danger">{errorText}</pre>
         </div>
       {:else}
         <div class="flex min-w-0 items-start gap-2">
-          <Fa
-            icon={faExclamationTriangle}
-            size="xs"
-            class="text-error-foreground mt-0.5 shrink-0"
-          />
+          <Fa icon={faExclamationTriangle} size="xs" class="text-danger mt-0.5 shrink-0" />
           <span class="text-xs text-subtle">{m.chat_toolDetails_noErrorDetails_label()}</span>
         </div>
       {/if}
@@ -482,12 +478,21 @@
                   )}
                 </div>
               {/if}
+              {#if parsedResult.content}
+                <!-- Tool-reported truncation note (e.g. rtk "+N more in <file>") -->
+                <div class="text-xs text-subtle py-1 whitespace-pre-wrap">
+                  {parsedResult.content}
+                </div>
+              {/if}
             </div>
           {:else if parsedResult.type === 'code-search'}
-            <!-- Search results with no snippets - show "No results" message -->
-            <div class="text-center py-2 text-subtle text-sm">
-              {m.chat_toolDetails_noResults_label()}
-            </div>
+            <!-- No parsed snippets - only claim "No results" when the search was
+                 genuinely empty; unparsed fallback content still holds real matches -->
+            {#if parsedResult.noMatches || !parsedResult.content}
+              <div class="text-center py-2 text-subtle text-sm">
+                {m.chat_toolDetails_noResults_label()}
+              </div>
+            {/if}
             {#if parsedResult.content}
               <CodeBlock
                 code={parsedResult.content}
@@ -945,12 +950,11 @@
           {:else if parsedResult.type === 'browser' && (parsedResult.screenshotBase64 || parsedResult.screenshotUrl || parsedResult.browserTabs?.length || parsedResult.evaluateResult !== undefined || evaluateExpressions || parsedResult.accessibilityTree || parsedResult.error || parsedResult.content)}
             <!-- Browser tool results -->
             <div class="flex flex-col gap-2">
-              {#if parsedResult.screenshotBase64 || parsedResult.screenshotUrl}
+              {#if browserScreenshotSource}
                 <!-- Inline screenshot -->
                 <div class="overflow-hidden rounded border border-border">
                   <img
-                    src={parsedResult.screenshotUrl ||
-                      `data:image/png;base64,${parsedResult.screenshotBase64}`}
+                    src={browserScreenshotSource}
                     alt={m.chat_toolDetails_browserScreenshot_alt()}
                     class="w-full h-auto max-h-96 object-contain bg-white"
                     style={parsedResult.screenshotWidth
@@ -1036,13 +1040,9 @@
               {#if parsedResult.error}
                 <!-- Error -->
                 <div class="flex items-start gap-2 p-2">
-                  <Fa
-                    icon={faExclamationTriangle}
-                    size="xs"
-                    class="text-error-foreground mt-0.5 shrink-0"
-                  />
+                  <Fa icon={faExclamationTriangle} size="xs" class="text-danger mt-0.5 shrink-0" />
                   <pre
-                    class="m-0 whitespace-pre-wrap font-mono text-xs text-error-foreground">{parsedResult.error}</pre>
+                    class="m-0 whitespace-pre-wrap font-mono text-xs text-danger">{parsedResult.error}</pre>
                 </div>
               {/if}
               {#if parsedResult.content && !parsedResult.screenshotBase64 && !parsedResult.screenshotUrl && !parsedResult.browserTabs?.length && !parsedResult.evaluateResult && !parsedResult.accessibilityTree && !parsedResult.error}
