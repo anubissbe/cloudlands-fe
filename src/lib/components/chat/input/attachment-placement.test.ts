@@ -109,6 +109,7 @@ describe('supportsIdempotentPlacementProtocol', () => {
     expect(supportsIdempotentPlacementProtocol('9.13')).toBe(true);
     expect(supportsIdempotentPlacementProtocol('9.14')).toBe(true);
     expect(supportsIdempotentPlacementProtocol('10.0')).toBe(true);
+    expect(supportsIdempotentPlacementProtocol('10.2')).toBe(true);
     expect(supportsIdempotentPlacementProtocol('9.12')).toBe(false);
     expect(supportsIdempotentPlacementProtocol('9')).toBe(false);
     expect(supportsIdempotentPlacementProtocol('8.20')).toBe(false);
