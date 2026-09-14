@@ -48,6 +48,7 @@ export const inputMetadata = parseUiComponentMetadata({
     'src/lib/components/layout/sidebar-nav/cards/AllWorkspacesCard.svelte',
     'src/lib/components/modals/FeatureCodeDialog.svelte',
     'src/lib/components/modals/InputDialog.svelte',
+    'src/lib/components/modals/ShareWorkspaceDialog.svelte',
     'src/lib/components/patterns/confirm/ConfirmRequestView.svelte',
     'src/lib/components/patterns/settings/SettingsControl.svelte',
     'src/lib/components/patterns/settings/custom-controls.ts',
