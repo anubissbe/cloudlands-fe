@@ -209,17 +209,92 @@ describe('onboarding local repository discovery', () => {
     ]);
   });
 
-  it.each(['', '/', '\\', 'C:\\', 'C:/', 'C:'])(
-    'never scans an unavailable or filesystem-root home: %s',
-    async (homePath) => {
-      mockBackend({ 'host.listDirectory': { ...home, home: homePath } });
-      const run = harness();
-      run.send(onboardingPickerOpened(true));
-      await settle();
-      expect(run.state().status).toBe('error');
-      expect(mocks.request).toHaveBeenCalledTimes(3);
-    },
-  );
+  it.each([
+    '',
+    '/',
+    '\\',
+    '///',
+    'C:\\',
+    'C:/',
+    'C:',
+    '.',
+    '..',
+    'home/dev',
+    './home/dev',
+    '../home/dev',
+    '~',
+    '~/dev',
+    'C:Users\\dev',
+    '\\Users\\dev',
+    '/.',
+    '/..',
+    '/tmp/..',
+    '/tmp/../..',
+    '/home/./dev',
+    '/home/dev/../dev',
+    'C:\\.',
+    'C:\\Users\\..',
+    'C:/Users/../..',
+    'C:\\Users/../dev',
+    '\\\\server',
+    '\\\\server\\share',
+    '\\\\server\\share\\',
+    '//server/share',
+    '//server/share/dev/..',
+    '\\\\server\\share\\dev\\..',
+    '\\\\?\\C:\\Users\\dev',
+    '\\\\?\\UNC\\server\\share\\dev',
+    '\\\\.\\C:\\Users\\dev',
+    '//?/C:/Users/dev',
+  ])('never scans an unsafe home or retries it in the same session: %s', async (homePath) => {
+    mockBackend({ 'host.listDirectory': { ...home, home: homePath } });
+    const run = harness();
+    run.send(onboardingPickerOpened(true));
+    await settle();
+    expect(run.state().status).toBe('error');
+    expect(getItems(run.state().repos)).toEqual([]);
+    run.send(discoverLocalReposRequested());
+    run.switchBackend('local');
+    await settle();
+    expect(run.state().status).toBe('error');
+    expect(mocks.request.mock.calls).toEqual([
+      ['repo.list', {}],
+      ['workspace.list', { includeArchived: true }],
+      ['host.listDirectory', {}],
+    ]);
+  });
+
+  it.each([
+    '/home/dev',
+    '/Users/Dev Name/',
+    '/root',
+    '/home/.dev',
+    '/home//dev/',
+    'C:\\Users\\dev',
+    'd:/Users/Dev Name/',
+    'C:\\Users/dev',
+    '\\\\server\\share\\dev',
+    '//server/share/dev/',
+  ])('scans an absolute home unchanged exactly once: %s', async (homePath) => {
+    const repositoryPath = `${homePath}/repo`;
+    mockBackend({
+      'host.listDirectory': { ...home, home: homePath },
+      'workspace.findRepositories': { repositories: [repositoryPath] },
+    });
+    const run = harness();
+    run.send(onboardingPickerOpened(true));
+    await settle();
+    run.send(discoverLocalReposRequested());
+    await settle();
+    expect(mocks.request.mock.calls).toEqual([
+      ['repo.list', {}],
+      ['workspace.list', { includeArchived: true }],
+      ['host.listDirectory', {}],
+      ['workspace.findRepositories', { directory: homePath }],
+    ]);
+    expect(run.state().status).toBe('complete');
+    expect(getItems(run.state().repos)).toEqual([{ path: repositoryPath, name: 'repo' }]);
+  });
 
   it('does not begin scanning if the picker closes during preflight', async () => {
     const registry = deferred<{ repos: [] }>();

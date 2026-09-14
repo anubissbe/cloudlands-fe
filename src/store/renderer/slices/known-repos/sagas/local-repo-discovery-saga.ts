@@ -2,6 +2,7 @@ import type { Task } from 'redux-saga';
 import { all, call, cancel, fork, put, takeEvery, type SagaGenerator } from 'typed-redux-saga';
 import { backendRequest } from '$lib/client/live/backend-transport';
 import { getRepoFolderName } from '$lib/components/workspace/initializer/recent-repo-display';
+import { isAbsolutePath } from '$lib/utils/path-utils';
 import { localRepoOptions } from '$features/onboarding/utils/local-repo-options';
 import type { KnownRepo } from '$shared/types/known-repo';
 import type { Workspace } from '$shared/types';
@@ -40,7 +41,17 @@ function* discover(backendId: string): SagaGenerator<void> {
     const { home } = yield* call(backendRequest<DirectoryPickerListing>, 'host.listDirectory', {});
     // host.listDirectory falls back to filesystem root if HOME cannot be
     // resolved. That is not permission to turn a home scan into a disk crawl.
-    if (!home || /^[/\\]+$/.test(home) || /^[a-z]:[/\\]*$/i.test(home)) {
+    // Reject ambiguous paths rather than resolving against the renderer's host
+    // or normalizing away dot segments, drive prefixes, or UNC share boundaries.
+    const segments = home.split(/[/\\]/).filter(Boolean);
+    const networkPath = /^[/\\]{2}/.test(home);
+    if (
+      !isAbsolutePath(home) ||
+      segments.length === 0 ||
+      /^[a-z]:[/\\]*$/i.test(home) ||
+      segments.some((segment) => segment === '.' || segment === '..') ||
+      (networkPath && (segments.length < 3 || segments[0] === '?'))
+    ) {
       throw new Error('Home directory unavailable');
     }
     const { repositories } = yield* call(
