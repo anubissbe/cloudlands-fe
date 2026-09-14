@@ -62,6 +62,104 @@ function routesShareSegment(left: Point[], right: Point[]) {
 }
 
 describe('custom route obstacle avoidance', () => {
+  for (const width of [224, 420, 960]) {
+    it(`separates mixed backward left ports and lanes at ${width}px`, () => {
+      const diagram = CUSTOM_WORKBENCH_CASES['custom-topology-stress'].diagram;
+      const layout = computeLayout(
+        diagram.model,
+        diagram.baseView,
+        diagram.grammar,
+        undefined,
+        width,
+      );
+      const repair = layout.edges.find(({ id }) => id === 'z3')!;
+      const feedback = layout.edges.find(({ id }) => id === 'z11')!;
+      const gate = layout.nodes.find(({ id }) => id === 'gate')!;
+      expect(repair.points![0].x).toBe(gate.x);
+      expect(feedback.points!.at(-1)!.x).toBe(gate.x);
+      expect(feedback.points!.at(-1)!.y - repair.points![0].y).toBeGreaterThanOrEqual(12);
+      for (const point of [repair.points![0], feedback.points!.at(-1)!]) {
+        expect(point.y).toBeGreaterThan(gate.y);
+        expect(point.y).toBeLessThan(gate.y + gate.height);
+      }
+      expect(
+        Math.abs(
+          Math.min(...repair.points!.map((p) => p.x)) -
+            Math.min(...feedback.points!.map((p) => p.x)),
+        ),
+      ).toBeGreaterThanOrEqual(16);
+      expect(routesShareSegment(repair.points!, feedback.points!)).toBe(false);
+      for (const edge of [repair, feedback]) {
+        for (const node of layout.nodes.filter(
+          (node) => node.id !== edge.from && node.id !== edge.to,
+        ))
+          expectRouteToClear(edge.points!, node, 0);
+      }
+      expect(
+        computeLayout(diagram.model, diagram.baseView, diagram.grammar, undefined, width),
+      ).toEqual(layout);
+    });
+  }
+
+  it('packs disjoint compact return lanes inside the original exterior envelope', () => {
+    const diagram = CUSTOM_WORKBENCH_CASES['custom-topology-stress'].diagram;
+    const layout = computeLayout(diagram.model, diagram.baseView, diagram.grammar, undefined, 224);
+    const returns = layout.edges.filter(({ id }) => ['z3', 'z11'].includes(id));
+    // The saved pre-fix compact routes share x=-40. Separation must not grow that envelope.
+    expect(
+      Math.min(...returns.flatMap((edge) => edge.points!.map((point) => point.x))),
+    ).toBeGreaterThanOrEqual(-40);
+  });
+
+  it('keeps the outer return lane when the inner label corridor is occupied', () => {
+    const diagram = structuredClone(CUSTOM_WORKBENCH_CASES['custom-topology-stress'].diagram);
+    diagram.model.nodes.forEach((node) => {
+      node.size = { width: 150, height: 60 };
+    });
+    const layout = computeLayout(diagram.model, diagram.baseView, diagram.grammar, undefined, 224);
+    const repair = layout.edges.find(({ id }) => id === 'z3')!;
+    const feedback = layout.edges.find(({ id }) => id === 'z11')!;
+    expect(Math.min(...feedback.points!.map((point) => point.x))).toBeLessThanOrEqual(
+      Math.min(...repair.points!.map((point) => point.x)) - 16,
+    );
+    for (const node of layout.nodes.filter((node) => !['gate', 'audit'].includes(node.id)))
+      expectRouteToClear(feedback.points!, node, 8);
+    expect(routesShareSegment(repair.points!, feedback.points!)).toBe(false);
+  });
+
+  for (const width of [224, 864]) {
+    it(`keeps the authored state-machine branches and return distinct at ${width}px`, () => {
+      const diagram = CUSTOM_WORKBENCH_CASES['custom-state-machine'].diagram;
+      const layout = computeLayout(
+        diagram.model,
+        diagram.baseView,
+        diagram.grammar,
+        undefined,
+        width,
+      );
+      for (const [index, edge] of layout.edges.entries()) {
+        for (const other of layout.edges.slice(index + 1)) {
+          expect(routesShareSegment(edge.points!, other.points!), `${edge.id}/${other.id}`).toBe(
+            false,
+          );
+        }
+        for (const node of layout.nodes.filter(
+          (node) => node.id !== edge.from && node.id !== edge.to,
+        )) {
+          expectRouteToClear(edge.points!, node, 0);
+        }
+      }
+    });
+  }
+
+  it('separates overlapping compact return shafts and their final approaches', () => {
+    const diagram = CUSTOM_WORKBENCH_CASES['custom-walkthrough'].diagram;
+    const layout = computeLayout(diagram.model, diagram.baseView, diagram.grammar, undefined, 224);
+    const left = layout.edges.find((edge) => edge.id === 'w3')!;
+    const right = layout.edges.find((edge) => edge.id === 'w5')!;
+    expect(routesShareSegment(left.points!, right.points!)).toBe(false);
+  });
+
   it('routes around an unrelated node with visible clearance', () => {
     const diagram = createArchitectureDiagram(
       [

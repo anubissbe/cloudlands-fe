@@ -1,6 +1,6 @@
 /** @vitest-environment jsdom */
 import { cleanup, render, waitFor } from '@testing-library/svelte';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import DiagramEmbeddingPreview, { preview } from './diagram-embedding.preview.svelte';
 
 vi.mock('$lib/components/markdown/MarkdownViewer.svelte', async () => ({
@@ -17,7 +17,21 @@ vi.mock('$store/renderer/store', async () => {
   return createAppStoreMockModule({ state: () => ({}), dispatch: vi.fn() });
 });
 
-afterEach(cleanup);
+beforeEach(() => {
+  vi.stubGlobal(
+    'ResizeObserver',
+    class {
+      observe = vi.fn();
+      unobserve = vi.fn();
+      disconnect = vi.fn();
+    },
+  );
+});
+
+afterEach(() => {
+  cleanup();
+  vi.unstubAllGlobals();
+});
 
 describe('diagram embedding preview', () => {
   it('registers stable note and chat states with one deterministic fixture', () => {

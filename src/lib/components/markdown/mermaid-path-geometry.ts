@@ -28,6 +28,15 @@ export function chooseFlowchartFeedbackTargetX(target: Bounds, sameSidePorts: nu
   return center - (gap * (slotCount - 1)) / 2;
 }
 
+export function chooseFlowchartFeedbackInsideX(target: FlowchartRectBounds, ports: number[]) {
+  const center = target.x + target.width / 2;
+  if (!ports.some((x) => x < center) || !ports.some((x) => x > center)) return;
+  if (ports.every((x) => Math.abs(x - center) >= FLOWCHART_PORT_SLOT_GAP)) return;
+  const x = Math.min(...ports) - FLOWCHART_PORT_SLOT_GAP;
+  const inset = Math.min(target.width / 2, target.corner?.x ?? 0);
+  return x >= target.x + inset && x <= target.x + target.width - inset ? x : undefined;
+}
+
 function segmentCssScale(path: SVGGraphicsElement, start: Point, end: Point) {
   const matrix = path.getScreenCTM();
   const localLength = Math.hypot(end.x - start.x, end.y - start.y);
@@ -538,6 +547,30 @@ export function diamondRayIntersection(origin: Point, direction: Point, bounds: 
 }
 
 function distanceToShape(point: Point, bounds: Bounds, shape: SVGGraphicsElement) {
+  if (
+    shape.tagName.toLowerCase() === 'rect' &&
+    shape.closest('svg')?.classList.contains('statediagram')
+  ) {
+    const matrix = shape.getScreenCTM();
+    const style = getComputedStyle(shape);
+    const local = shape.getBBox();
+    const radius = (value: string) =>
+      /^\d+(?:\.\d+)?(?:px)?$/.test(value) ? Number.parseFloat(value) : NaN;
+    const rx = radius(style.rx === 'auto' ? style.ry : style.rx);
+    const ry = radius(style.ry === 'auto' ? style.rx : style.ry);
+    if (matrix && Math.abs(matrix.b) < 1e-8 && Math.abs(matrix.c) < 1e-8) {
+      const screenRx = Math.min(local.width / 2, rx) * Math.abs(matrix.a);
+      const screenRy = Math.min(local.height / 2, ry) * Math.abs(matrix.d);
+      if (screenRx > 0 && Math.abs(screenRx - screenRy) < 1e-6) {
+        // Only circular, axis-aligned state corners are supported here. Other
+        // shapes and elliptical/skewed corners retain their existing behavior.
+        const dx = Math.abs(point.x - bounds.x - bounds.width / 2) - (bounds.width / 2 - screenRx);
+        const dy =
+          Math.abs(point.y - bounds.y - bounds.height / 2) - (bounds.height / 2 - screenRx);
+        return Math.max(0, Math.hypot(Math.max(0, dx), Math.max(0, dy)) - screenRx);
+      }
+    }
+  }
   const boundary = isDiamondShape(shape)
     ? diamondBoundary(bounds)
     : shape.dataset.diagramCylinder === 'true'
@@ -1079,7 +1112,7 @@ export function routeFlowchartClientRequestLane(svg: SVGSVGElement) {
   const sourcePort = pointAt(client, 0.5, 1);
   const targetPort = pointAt(gateway, 0, 0.35);
   const laneY = (sourcePort.y + boundary.y) / 2;
-  const laneX = boundary.x - 8;
+  const laneX = boundary.x - Math.max(20, labelBounds.height / 2 + 4);
   const points = [
     sourcePort,
     { x: sourcePort.x, y: laneY },
@@ -1387,7 +1420,7 @@ export function snapFlowchartFeedbackPorts(svg: SVGSVGElement) {
   const targetRight = new DOMPoint(targetBounds.right, targetBounds.bottom).matrixTransform(
     inverse,
   ).x;
-  const targetX = chooseFlowchartFeedbackTargetX(
+  let targetX = chooseFlowchartFeedbackTargetX(
     {
       x: Math.min(targetLeft, targetRight),
       y: 0,
@@ -1401,7 +1434,82 @@ export function snapFlowchartFeedbackPorts(svg: SVGSVGElement) {
     sourceBounds.right,
     sourceBounds.top + sourceBounds.height / 2,
   ).matrixTransform(inverse);
-  if (Math.abs(targetX - targetCenterX) > 1 && points.length >= 7) {
+  const targetShape = shapeForNode(target);
+  const targetLocal = targetShape && boundsInPathSpace(targetShape, path);
+  const radius = targetShape ? getComputedStyle(targetShape).rx : '0';
+  const localWidth = targetShape?.getBBox().width ?? 0;
+  const insideX =
+    targetLocal && localWidth && points.at(-2)!.y > targetLocal.y + targetLocal.height
+      ? chooseFlowchartFeedbackInsideX(
+          {
+            ...targetLocal,
+            corner: {
+              x:
+                (Number.parseFloat(radius) || 0) *
+                (radius.endsWith('%') ? targetLocal.width / 100 : targetLocal.width / localWidth),
+              y: 0,
+            },
+          },
+          sameSidePorts,
+        )
+      : undefined;
+  const insideTail =
+    insideX === undefined
+      ? []
+      : [
+          { ...points[points.length - 3] },
+          { x: insideX, y: points[points.length - 2].y },
+          {
+            x: insideX,
+            y: new DOMPoint(targetBounds.left, targetBounds.bottom).matrixTransform(inverse).y,
+          },
+        ];
+  const insideObstacles = [...svg.querySelectorAll<SVGGElement>('g.node')]
+    .filter((node) => node !== target)
+    .flatMap((node) => {
+      const bounds = boundsInPathSpace(node, path);
+      return bounds ? [bounds] : [];
+    });
+  const ownLabel = flowchartLabelForPath(svg, path);
+  const insideLabels = [...svg.querySelectorAll<SVGGElement>('.edgeLabels > .edgeLabel')]
+    .filter((label) => label !== ownLabel && label.textContent?.trim())
+    .flatMap((label) => {
+      const bounds = clientBoundsInPathSpace(label, path);
+      return bounds ? [bounds] : [];
+    });
+  const insideOccupied = measuredFlowchartRoutes(svg)
+    .filter((route) => route.path !== path)
+    .flatMap((route) => {
+      const routeMatrix = route.path.getScreenCTM();
+      return routeMatrix
+        ? segments(
+            route.points.map(({ x, y }) =>
+              new DOMPoint(x, y).matrixTransform(routeMatrix).matrixTransform(inverse),
+            ),
+          )
+        : [];
+    });
+  const clearInside =
+    insideTail.length > 0 &&
+    segments(insideTail).every(
+      (segment) =>
+        !insideObstacles.some((bounds) => segmentCrossesBounds(segment, bounds, 8)) &&
+        !insideLabels.some((bounds) => segmentCrossesBounds(segment, bounds, 4)) &&
+        !insideOccupied.some(({ start, end }) =>
+          segmentCrossesBounds(
+            segment,
+            {
+              x: Math.min(start.x, end.x),
+              y: Math.min(start.y, end.y),
+              width: Math.abs(end.x - start.x),
+              height: Math.abs(end.y - start.y),
+            },
+            6,
+          ),
+        ),
+    );
+  if (clearInside) targetX = insideX!;
+  if (!clearInside && Math.abs(targetX - targetCenterX) > 1 && points.length >= 7) {
     const targetPort = new DOMPoint(
       targetBounds.left + targetBounds.width / 2,
       targetBounds.top - 0.25,
@@ -1444,7 +1552,7 @@ export function snapFlowchartFeedbackPorts(svg: SVGSVGElement) {
 
 export function snapFlowchartFanoutPorts(svg: SVGSVGElement) {
   const edges = [...svg.querySelectorAll<SVGPathElement>('.edgePaths path')].flatMap((path) => {
-    if (path.dataset.clusterHeaderClearance) return [];
+    if (path.dataset.clusterHeaderClearance || path.dataset.nestedDecisionRoute) return [];
     const identity = flowchartEdgeIdentity(path);
     const points = (path.dataset.manhattanPoints ?? '')
       .trim()
@@ -1834,6 +1942,540 @@ export function snapFlowchartPorts(svg: SVGSVGElement) {
 type CardinalAttachment = { point: Point; side: CardinalSide; lead?: Point };
 
 type StraightRoutePort = CardinalAttachment & { range?: [number, number] };
+type FlowchartRectBounds = Bounds & { corner?: Point };
+
+/** Choose a label position without changing or remeasuring any SVG geometry. */
+export function chooseClearFlowchartLabel(
+  points: Point[],
+  current: Bounds,
+  obstacles: Bounds[],
+  occupied: Segment[],
+) {
+  const center = pointAt(current, 0.5, 0.5);
+  const clear = (bounds: Bounds) =>
+    !obstacles.some((other) => boundsOverlap(bounds, other, 4)) &&
+    !occupied.some((segment) => segmentCrossesBounds(segment, bounds, 4));
+  const candidates = segments(points).flatMap(({ start, end }) => {
+    const horizontal = Math.abs(start.y - end.y) < 0.001;
+    const axis = horizontal ? 'x' : 'y';
+    const across = horizontal ? 'y' : 'x';
+    const half = (horizontal ? current.width : current.height) / 2;
+    const low = Math.min(start[axis], end[axis]) + half + 6;
+    const high = Math.max(start[axis], end[axis]) - half - 6;
+    if (low > high) return [];
+    return [
+      center[axis],
+      (low + high) / 2,
+      low,
+      high,
+      low * 0.75 + high * 0.25,
+      low * 0.25 + high * 0.75,
+    ].flatMap((value) => {
+      const next = {
+        [axis]: Math.max(low, Math.min(high, value)),
+        [across]: start[across],
+      } as Point;
+      const bounds = { ...current, x: next.x - current.width / 2, y: next.y - current.height / 2 };
+      return clear(bounds)
+        ? [
+            {
+              center: next,
+              bounds,
+              start,
+              end,
+              distance: Math.hypot(next.x - center.x, next.y - center.y),
+            },
+          ]
+        : [];
+    });
+  });
+  return candidates.toSorted((a, b) => a.distance - b.distance)[0];
+}
+
+/** A bounded local repair, not a layout: clear routes keep their assigned ports. */
+export function chooseClearFlowchartRoute(
+  points: Point[],
+  source: FlowchartRectBounds,
+  target: FlowchartRectBounds,
+  obstacles: Bounds[],
+  occupied: Segment[],
+  sourcePorts: Point[] = [],
+  targetPorts: Point[] = [],
+  label?: { bounds: Bounds; obstacles: Bounds[]; occupied: Segment[] },
+  fixedSource = false,
+  shorterOnly = false,
+) {
+  if (points.length < 2) return points;
+  const blocked = (route: Point[]) =>
+    segments(route).some((segment) =>
+      obstacles.some((bounds) => segmentCrossesBounds(segment, bounds, 8)),
+    );
+  const shared = (route: Point[]) =>
+    segments(route).some((segment) =>
+      occupied.some((other) => overlappingSegments(segment, other)),
+    );
+  const labelFits = (route: Point[]) =>
+    !label ||
+    chooseClearFlowchartLabel(
+      route,
+      label.bounds,
+      [source, target, ...obstacles, ...label.obstacles],
+      label.occupied,
+    );
+  if (!shorterOnly && !blocked(points) && !shared(points) && labelFits(points)) return points;
+  const attachments = (
+    bounds: FlowchartRectBounds,
+    point: Point,
+    adjacent: Point,
+    ports: Point[],
+    fixed = false,
+  ) => {
+    const side = cardinalSideFromDirection(point, adjacent);
+    const candidates: CardinalAttachment[] = [{ point, side }];
+    for (const side of fixed ? [] : (['top', 'right', 'bottom', 'left'] as const)) {
+      for (const fraction of shorterOnly ? [0.5, 0.25, 0.75, 0, 1] : [0.5, 0.25, 0.75]) {
+        const point =
+          side === 'top' || side === 'bottom'
+            ? pointAt(bounds, fraction, side === 'top' ? 0 : 1)
+            : pointAt(bounds, side === 'left' ? 0 : 1, fraction);
+        if (side === 'top' || side === 'bottom') {
+          const inset = Math.min(bounds.width / 2, bounds.corner?.x ?? 0);
+          point.x = Math.max(bounds.x + inset, Math.min(bounds.x + bounds.width - inset, point.x));
+        } else {
+          const inset = Math.min(bounds.height / 2, bounds.corner?.y ?? 0);
+          point.y = Math.max(bounds.y + inset, Math.min(bounds.y + bounds.height - inset, point.y));
+        }
+        if (
+          ports.every(
+            (port) =>
+              Math.hypot(port.x - point.x, port.y - point.y) >=
+              (shorterOnly ? 8 : FLOWCHART_PORT_SLOT_GAP),
+          )
+        )
+          candidates.push({ point, side });
+      }
+    }
+    return candidates.map((attachment) => {
+      const lead = { ...attachment.point };
+      const verticalLead = Math.max(16, (label?.bounds.height ?? 0) / 2 + (shorterOnly ? 4 : 8));
+      const horizontalLead = Math.max(16, (label?.bounds.width ?? 0) / 2 + (shorterOnly ? 4 : 8));
+      if (attachment.side === 'top') lead.y -= verticalLead;
+      if (attachment.side === 'bottom') lead.y += verticalLead;
+      if (attachment.side === 'left') lead.x -= horizontalLead;
+      if (attachment.side === 'right') lead.x += horizontalLead;
+      return { ...attachment, lead };
+    });
+  };
+  const starts = attachments(source, points[0], points[1], sourcePorts, fixedSource);
+  const ends = attachments(target, points.at(-1)!, points.at(-2)!, targetPorts);
+  const extent = [
+    source,
+    target,
+    ...obstacles,
+    ...occupied.map(({ start, end }) => ({
+      x: Math.min(start.x, end.x),
+      y: Math.min(start.y, end.y),
+      width: Math.abs(start.x - end.x),
+      height: Math.abs(start.y - end.y),
+    })),
+  ];
+  const xGap = Math.max(16, (label?.bounds.width ?? 0) / 2 + 8);
+  const yGap = Math.max(16, (label?.bounds.height ?? 0) / 2 + 8);
+  const outerX = [
+    Math.min(...extent.map((b) => b.x)) - xGap,
+    Math.max(...extent.map((b) => b.x + b.width)) + xGap,
+  ];
+  const outerY = [
+    Math.min(...extent.map((b) => b.y)) - yGap,
+    Math.max(...extent.map((b) => b.y + b.height)) + yGap,
+  ];
+  if (shorterOnly) {
+    // Local obstacle faces expose corridors hidden by the global envelope. Bound
+    // the candidates and retain the original whenever no shorter clear route fits.
+    const faces = (axis: 'x' | 'y', size: 'width' | 'height') =>
+      [...new Set(obstacles.flatMap((box) => [box[axis] - 16, box[axis] + box[size] + 16]))]
+        .toSorted((a, b) => Math.abs(a - source[axis]) - Math.abs(b - source[axis]))
+        .slice(0, 12);
+    outerX.push(...faces('x', 'width'));
+    outerY.push(...faces('y', 'height'));
+  }
+  // Four envelope lanes bound the fallback; no visibility grid or iterative rerouting.
+  const candidates = starts.flatMap((start) =>
+    ends.flatMap((end) =>
+      [
+        [start.point, start.lead, { x: start.lead.x, y: end.lead.y }, end.lead, end.point],
+        [start.point, start.lead, { x: end.lead.x, y: start.lead.y }, end.lead, end.point],
+        ...outerX.map((x) => [
+          start.point,
+          start.lead,
+          { x, y: start.lead.y },
+          { x, y: end.lead.y },
+          end.lead,
+          end.point,
+        ]),
+        ...outerY.map((y) => [
+          start.point,
+          start.lead,
+          { x: start.lead.x, y },
+          { x: end.lead.x, y },
+          end.lead,
+          end.point,
+        ]),
+      ].map(simplifyOrthogonalPoints),
+    ),
+  );
+  const length = (route: Point[]) =>
+    segments(route).reduce(
+      (sum, segment) =>
+        sum + Math.hypot(segment.end.x - segment.start.x, segment.end.y - segment.start.y),
+      0,
+    );
+  let best: Point[] | undefined;
+  let score = Infinity;
+  for (const { candidate, length: candidateLength } of candidates
+    .map((candidate) => ({ candidate, length: length(candidate) }))
+    .toSorted((a, b) => a.length - b.length)) {
+    if (
+      (shorterOnly &&
+        (candidateLength >= length(points) - 1 ||
+          candidate.some((point) => point.y < Math.min(source.y, target.y) - yGap))) ||
+      blocked(candidate) ||
+      !labelFits(candidate) ||
+      segments(candidate).some(
+        (segment) => segmentCrossesBounds(segment, source) || segmentCrossesBounds(segment, target),
+      )
+    )
+      continue;
+    const conflicts = segments(candidate).reduce(
+      (sum, segment) =>
+        sum +
+        occupied.reduce((count, other) => {
+          const bounds = {
+            x: Math.min(other.start.x, other.end.x),
+            y: Math.min(other.start.y, other.end.y),
+            width: Math.abs(other.end.x - other.start.x),
+            height: Math.abs(other.end.y - other.start.y),
+          };
+          return (
+            count +
+            (overlappingSegments(segment, other)
+              ? 100
+              : segmentCrossesBounds(segment, bounds, 6)
+                ? 1
+                : 0)
+          );
+        }, 0),
+      0,
+    );
+    if (conflicts < score && (!shorterOnly || conflicts === 0)) {
+      best = candidate;
+      score = conflicts;
+    }
+    if (score === 0) break;
+  }
+  return best ?? points;
+}
+
+function measuredFlowchartRoutes(svg: SVGSVGElement) {
+  return [...svg.querySelectorAll<SVGPathElement>('.edgePaths path')].flatMap((path) => {
+    const identity = flowchartEdgeIdentity(path);
+    const points = (path.dataset.manhattanPoints ?? '')
+      .trim()
+      .split(/\s+/)
+      .map((value) => {
+        const [x, y] = value.split(',').map(Number);
+        return { x, y };
+      });
+    return identity &&
+      points.length >= 2 &&
+      points.every((p) => Number.isFinite(p.x) && Number.isFinite(p.y))
+      ? [{ path, ...identity, points, label: flowchartLabelForPath(svg, path) }]
+      : [];
+  });
+}
+
+export function repairFlowchartRouteClearance(svg: SVGSVGElement) {
+  if (svg.getAttribute('aria-roledescription') !== 'flowchart-v2') return;
+  const routes = measuredFlowchartRoutes(svg);
+  const reference = routes[0]?.path;
+  if (!reference) return;
+  const nodes = new Map(
+    [...svg.querySelectorAll<SVGGElement>('g.node')].flatMap((node) => {
+      const shape = shapeForNode(node);
+      const bounds = shape && boundsInPathSpace(shape, reference);
+      if (!shape || !bounds) return [];
+      const style = getComputedStyle(shape);
+      const local = shape.getBBox();
+      const radius = (value: string, extent: number) =>
+        (Number.parseFloat(value) || 0) * (value.endsWith('%') ? extent / 100 : 1);
+      const corner = {
+        x: (radius(style.rx, local.width) * bounds.width) / local.width,
+        y: (radius(style.ry, local.height) * bounds.height) / local.height,
+      };
+      return [[flowchartNodeId(node), { bounds: { ...bounds, corner }, shape }] as const];
+    }),
+  );
+  const labels = new Map(
+    routes.flatMap((route) => {
+      const bounds =
+        route.label?.textContent?.trim() && clientBoundsInPathSpace(route.label, reference);
+      return bounds ? [[route, bounds] as const] : [];
+    }),
+  );
+  const headers = [...svg.querySelectorAll<SVGGElement>('g.cluster > .cluster-label')].flatMap(
+    (node) => {
+      const bounds = clientBoundsInPathSpace(node, reference);
+      return bounds ? [bounds] : [];
+    },
+  );
+  const plannedLabels = new Map<string, Point>();
+  const routingOrder = routes
+    .map((route) => {
+      const source = nodes.get(route.source);
+      const target = nodes.get(route.target);
+      // Dedicated passes own shared trunks, return lanes, and nonrectangular attachment.
+      const fixed = Boolean(
+        route.source === route.target ||
+        route.path.dataset.fanoutSource ||
+        route.path.dataset.feedbackLane ||
+        route.path.dataset.groupedReturnLane ||
+        route.path.dataset.nestedDecisionRoute ||
+        source?.shape.tagName.toLowerCase() !== 'rect' ||
+        target?.shape.tagName.toLowerCase() !== 'rect',
+      );
+      return { route, source, target, fixed };
+    })
+    // Reserve labels on fixed routes before choosing corridors around them.
+    .sort((a, b) => Number(b.fixed) - Number(a.fixed));
+  for (const { route, source, target, fixed } of routingOrder) {
+    const others = routes.filter((other) => other !== route);
+    const ports = (id: string) =>
+      others.flatMap((other) => [
+        ...(other.source === id ? [other.points[0]] : []),
+        ...(other.target === id ? [other.points.at(-1)!] : []),
+      ]);
+    const occupied = others
+      .filter((other) => other.source !== route.source || other.target === route.target)
+      .flatMap((other) => segments(other.points));
+    const obstacles = [...nodes]
+      .filter(([id]) => id !== route.source && id !== route.target)
+      .map<Bounds>(([, node]) => node.bounds)
+      .concat(
+        headers,
+        [...labels].filter(([other]) => other !== route).map(([, bounds]) => bounds),
+      );
+    const labelBounds = labels.get(route);
+    const chooseRoute = (points: Point[], shorterOnly = false) =>
+      !fixed && source && target
+        ? chooseClearFlowchartRoute(
+            points,
+            source.bounds,
+            target.bounds,
+            obstacles,
+            occupied,
+            ports(route.source),
+            ports(route.target),
+            labelBounds
+              ? {
+                  bounds: labelBounds,
+                  obstacles: [...labels]
+                    .filter(([other]) => other !== route)
+                    .map(([, bounds]) => bounds),
+                  occupied: others.flatMap((other) => segments(other.points)),
+                }
+              : undefined,
+            Boolean(route.path.dataset.fanoutPort) &&
+              others.some(
+                (other) => other.source === route.source && other.target !== route.target,
+              ),
+            shorterOnly,
+          )
+        : points;
+    const ingress = nestedClusterIngress(svg, route.path, source?.bounds, target?.bounds);
+    const initialPoints = ingress
+      ? [
+          pointAt(source!.bounds, 1, 0.5),
+          { x: ingress.x, y: source!.bounds.y + source!.bounds.height / 2 },
+          { x: ingress.x, y: target!.bounds.y + target!.bounds.height / 2 },
+          pointAt(target!.bounds, 1, 0.5),
+        ]
+      : route.points;
+    let points = chooseRoute(initialPoints);
+    if (!fixed && !ingress && !svg.querySelector('g.cluster'))
+      points = separateFlowchartVerticalLane(
+        points,
+        others
+          .filter((other) => other.path.dataset.feedbackLane)
+          .flatMap((other) => segments(other.points)),
+        obstacles,
+      );
+    // Ordinary label clearance may introduce a feedback crossing. Retry that
+    // candidate once, before reserving labels or writing any route geometry.
+    if (
+      !fixed &&
+      source &&
+      target &&
+      target.bounds.y > source.bounds.y &&
+      others.some(
+        (other) =>
+          other.path.dataset.feedbackLane &&
+          other.target === route.source &&
+          segments(points).some((segment) =>
+            segments(other.points).some(({ start, end }) =>
+              segmentCrossesBounds(segment, {
+                x: Math.min(start.x, end.x),
+                y: Math.min(start.y, end.y),
+                width: Math.abs(end.x - start.x),
+                height: Math.abs(end.y - start.y),
+              }),
+            ),
+          ),
+      )
+    )
+      points = chooseRoute(points, true);
+    if (labelBounds) {
+      const placement = chooseClearFlowchartLabel(
+        points,
+        labelBounds,
+        [...[source, target].flatMap((node) => (node ? [node.bounds] : [])), ...obstacles],
+        others.flatMap((other) => segments(other.points)),
+      );
+      // Reserve the planned label before later routes choose their corridors.
+      if (placement) {
+        labels.set(route, placement.bounds);
+        plannedLabels.set(route.path.id, placement.center);
+      }
+    }
+    if (points === route.points) continue;
+    route.points = points;
+    route.path.dataset.manhattanPoints = points.map(({ x, y }) => `${x},${y}`).join(' ');
+    route.path.setAttribute('d', points.map(({ x, y }, i) => `${i ? 'L' : 'M'}${x},${y}`).join(''));
+  }
+  return plannedLabels;
+}
+
+export function separateFlowchartVerticalLane(
+  points: Point[],
+  occupied: Segment[],
+  obstacles: Bounds[],
+): Point[] {
+  for (let index = 1; index < points.length - 2; index++) {
+    const start = points[index],
+      end = points[index + 1];
+    if (Math.abs(start.x - end.x) > 0.001 || Math.abs(start.y - end.y) < 32) continue;
+    const neighbors = occupied.filter(
+      (other) =>
+        Math.abs(other.start.x - other.end.x) < 0.001 &&
+        Math.abs(other.start.x - start.x) < 20 &&
+        Math.abs(other.start.x - start.x) > 0.001 &&
+        Math.min(Math.max(start.y, end.y), Math.max(other.start.y, other.end.y)) -
+          Math.max(Math.min(start.y, end.y), Math.min(other.start.y, other.end.y)) >
+          20,
+    );
+    if (!neighbors.length) continue;
+    const candidates = neighbors
+      .flatMap((other) => [other.start.x - 20, other.start.x + 20])
+      .filter((x) => Math.abs(x - start.x) <= 20)
+      .toSorted((a, b) => Math.abs(a - start.x) - Math.abs(b - start.x));
+    for (const x of candidates) {
+      const candidate = points.map((point, i) =>
+        i === index || i === index + 1 ? { ...point, x } : point,
+      );
+      const changed = segments(candidate).slice(index - 1, index + 2);
+      if (
+        neighbors.some((other) => Math.abs(other.start.x - x) < 19.99) ||
+        changed.some((segment) => obstacles.some((box) => segmentCrossesBounds(segment, box, 4)))
+      )
+        continue;
+      return candidate;
+    }
+  }
+  return points;
+}
+
+function nestedClusterIngress(
+  svg: SVGSVGElement,
+  path: SVGPathElement,
+  source?: Bounds,
+  target?: Bounds,
+) {
+  if (!source || !target || path.dataset.nestedDecisionRoute) return null;
+  const contains = (frame: Bounds, node: Bounds) =>
+    node.x >= frame.x - 0.5 &&
+    node.x + node.width <= frame.x + frame.width + 0.5 &&
+    node.y >= frame.y - 0.5 &&
+    node.y + node.height <= frame.y + frame.height + 0.5;
+  const frames = [...svg.querySelectorAll<SVGRectElement>('g.cluster > rect')].flatMap((rect) => {
+    const bounds = boundsInPathSpace(rect, path);
+    return bounds ? [bounds] : [];
+  });
+  const child = frames
+    .filter((frame) => contains(frame, target) && !contains(frame, source))
+    .toSorted((a, b) => a.width * a.height - b.width * b.height)[0];
+  const parent =
+    child &&
+    frames
+      .filter((frame) => frame !== child && contains(frame, child) && contains(frame, source))
+      .toSorted((a, b) => a.width * a.height - b.width * b.height)[0];
+  if (!child || !parent || source.y + source.height > child.y) return null;
+  return { x: (child.x + child.width + parent.x + parent.width) / 2 };
+}
+
+export function repairFlowchartLabelClearance(
+  svg: SVGSVGElement,
+  plannedLabels?: Map<string, Point>,
+) {
+  if (svg.getAttribute('aria-roledescription') !== 'flowchart-v2') return;
+  const routes = measuredFlowchartRoutes(svg);
+  const reference = routes[0]?.path;
+  if (!reference) return;
+  const nodes = [
+    ...svg.querySelectorAll<SVGGElement>('g.node, g.cluster > .cluster-label'),
+  ].flatMap((node) => {
+    const bounds = clientBoundsInPathSpace(node, reference);
+    return bounds ? [bounds] : [];
+  });
+  // Snapshot every measurement before writing: placement is purely local arithmetic.
+  const labels = routes.flatMap((route) => {
+    const label = route.label;
+    if (!label?.textContent?.trim()) return [];
+    const current = clientBoundsInPathSpace(label, reference);
+    const planned = plannedLabels?.get(route.path.id);
+    if (current && planned) {
+      current.x = planned.x - current.width / 2;
+      current.y = planned.y - current.height / 2;
+    }
+    const matrix = reference.getScreenCTM();
+    const parentMatrix = (label.parentElement as SVGGraphicsElement | null)?.getScreenCTM();
+    const local = label.getBBox();
+    return current && matrix && parentMatrix
+      ? [{ route, label, current, matrix, inverse: parentMatrix.inverse(), local }]
+      : [];
+  });
+  for (const item of labels) {
+    const { route, label, current, matrix, inverse, local } = item;
+    const occupied = routes
+      .filter((other) => other !== route)
+      .flatMap((other) => segments(other.points));
+    const placement = chooseClearFlowchartLabel(
+      route.points,
+      current,
+      [...nodes, ...labels.filter((other) => other !== item).map((other) => other.current)],
+      occupied,
+    );
+    if (!placement) continue;
+    const center = new DOMPoint(placement.center.x, placement.center.y)
+      .matrixTransform(matrix)
+      .matrixTransform(inverse);
+    label.setAttribute(
+      'transform',
+      `translate(${center.x - local.x - local.width / 2},${center.y - local.y - local.height / 2})`,
+    );
+    label.dataset.labelSegmentStart = `${placement.start.x},${placement.start.y}`;
+    label.dataset.labelSegmentEnd = `${placement.end.x},${placement.end.y}`;
+    item.current = placement.bounds;
+  }
+}
 
 /** Keep assigned shape ports fixed; slide only ports with an explicit free boundary range. */
 export function preferClearStraightRoute(
@@ -1929,6 +2571,57 @@ function cardinalSideFromDirection(origin: Point, adjacent: Point): CardinalSide
   return dy >= 0 ? 'bottom' : 'top';
 }
 
+/** A local return is optional: never trade a shorter path for occupied paint or a lost label. */
+export function chooseClearLocalReturn(
+  points: Point[],
+  candidates: Point[][],
+  obstacles: Bounds[],
+  occupied: Segment[],
+  label?: { bounds: Bounds; obstacles: Bounds[] },
+) {
+  const length = (route: Point[]) =>
+    segments(route).reduce(
+      (sum, { start, end }) => sum + Math.hypot(end.x - start.x, end.y - start.y),
+      0,
+    );
+  return (
+    candidates
+      .map(simplifyOrthogonalPoints)
+      .filter(
+        (candidate) => candidate.length <= points.length && length(candidate) < length(points) - 1,
+      )
+      .filter((candidate) =>
+        segments(candidate).every(
+          (segment) =>
+            !obstacles.some((bounds) => segmentCrossesBounds(segment, bounds, 8)) &&
+            !occupied.some(({ start, end }) =>
+              segmentCrossesBounds(
+                segment,
+                {
+                  x: Math.min(start.x, end.x),
+                  y: Math.min(start.y, end.y),
+                  width: Math.abs(end.x - start.x),
+                  height: Math.abs(end.y - start.y),
+                },
+                8,
+              ),
+            ),
+        ),
+      )
+      .filter(
+        (candidate) =>
+          !label ||
+          chooseClearFlowchartLabel(
+            candidate,
+            label.bounds,
+            [...obstacles, ...label.obstacles],
+            occupied,
+          ),
+      )
+      .sort((left, right) => length(left) - length(right))[0] ?? points
+  );
+}
+
 function straightenClearFlowchartRoutes(svg: SVGSVGElement, edges: FlowchartRoute[]) {
   const routes = edges
     .map((edge) => ({
@@ -1994,7 +2687,7 @@ function straightenClearFlowchartRoutes(svg: SVGSVGElement, edges: FlowchartRout
         obstacles.push(bounds);
     }
     const occupied = otherRoutes.flatMap((other) => segments(other.points));
-    const straight = preferClearStraightRoute(
+    let straight = preferClearStraightRoute(
       points,
       source,
       target,
@@ -2003,6 +2696,61 @@ function straightenClearFlowchartRoutes(svg: SVGSVGElement, edges: FlowchartRout
       occupiedPorts(route.source),
       occupiedPorts(route.target),
     );
+    if (straight === points && path.dataset.nestedDecisionRoute === 'secondary-retry') {
+      const sourceNode = flowchartNode(svg, route.source);
+      const targetNode = flowchartNode(svg, route.target);
+      const sourceShape = sourceNode && shapeForNode(sourceNode);
+      const targetShape = targetNode && shapeForNode(targetNode);
+      const sourceBounds = sourceShape && boundsInPathSpace(sourceShape, path);
+      const targetBounds = targetShape && boundsInPathSpace(targetShape, path);
+      if (
+        sourceShape?.tagName.toLowerCase() === 'rect' &&
+        targetShape &&
+        isDiamondShape(targetShape) &&
+        sourceBounds &&
+        targetBounds
+      ) {
+        const start = pointAt(sourceBounds, 0.5, 0);
+        const candidates: Point[][] = [];
+        // Keep the existing lower diamond port when returning from below/right.
+        if (
+          target.side === 'bottom' &&
+          start.y > targetBounds.y + targetBounds.height + 8 &&
+          start.x > target.point.x
+        ) {
+          const y = (start.y + targetBounds.y + targetBounds.height) / 2;
+          candidates.push([start, { x: start.x, y }, { x: target.point.x, y }, target.point]);
+        }
+        // A below/left reciprocal can approach the lower-left face without crossing the add lane.
+        const left = diamondBoundaryPort(targetBounds, 'left', 24);
+        if (start.x < left.x && start.y > left.y)
+          candidates.push([start, { x: start.x, y: left.y }, left]);
+        const right = diamondBoundaryPort(targetBounds, 'right', targetBounds.height * 0.32);
+        if (start.x > right.x && start.y > right.y)
+          candidates.push([start, { x: start.x, y: right.y }, right]);
+        const available = candidates.filter(
+          (candidate) =>
+            !occupiedPorts(route.source).some(
+              (port) => Math.hypot(port.x - start.x, port.y - start.y) < FLOWCHART_PORT_SLOT_GAP,
+            ) &&
+            !occupiedPorts(route.target).some(
+              (port) =>
+                Math.hypot(port.x - candidate.at(-1)!.x, port.y - candidate.at(-1)!.y) <
+                FLOWCHART_PORT_SLOT_GAP,
+            ),
+        );
+        const labelBounds = route.label && clientBoundsInPathSpace(route.label, path);
+        straight = chooseClearLocalReturn(
+          points,
+          available,
+          obstacles,
+          occupied,
+          labelBounds
+            ? { bounds: labelBounds, obstacles: [sourceBounds, targetBounds] }
+            : undefined,
+        );
+      }
+    }
     if (straight === points) continue;
     if (
       !placeFlowchartLabelOnRoute(route.label, path, straight, undefined, { obstacles, occupied })
@@ -2010,8 +2758,13 @@ function straightenClearFlowchartRoutes(svg: SVGSVGElement, edges: FlowchartRout
       continue;
     route.points = straight;
     path.dataset.manhattanPoints = straight.map(({ x, y }) => `${x},${y}`).join(' ');
-    path.dataset.manhattanSegments = '1';
-    path.dataset.terminalDirection = `${straight[1].x - straight[0].x},${straight[1].y - straight[0].y}`;
+    path.dataset.manhattanSegments = String(straight.length - 1);
+    const terminal = straight.at(-1)!;
+    const adjacent = straight.at(-2)!;
+    path.dataset.terminalDirection = `${terminal.x - adjacent.x},${terminal.y - adjacent.y}`;
+    if (path.dataset.nestedDecisionRoute === 'secondary-retry') {
+      path.dataset.diamondTargetSide = cardinalSideFromDirection(terminal, adjacent);
+    }
     path.setAttribute(
       'd',
       straight.map(({ x, y }, index) => `${index ? 'L' : 'M'}${x},${y}`).join(''),
@@ -3939,6 +4692,97 @@ function routeCompactGroupedEdges(svg: SVGSVGElement) {
   }
 }
 
+export function spaceNestedFlowchartClusters(svg: SVGSVGElement) {
+  if (svg.dataset.nestedDecisionLayout) return;
+  const nodes = [...svg.querySelectorAll<SVGGElement>('g.node')];
+  const records = [...svg.querySelectorAll<SVGGElement>('g.cluster')].flatMap((cluster) => {
+    const rect = cluster.querySelector<SVGRectElement>(':scope > rect');
+    return rect
+      ? [
+          {
+            cluster,
+            rect,
+            frame: {
+              x: Number(rect.getAttribute('x')),
+              y: Number(rect.getAttribute('y')),
+              width: Number(rect.getAttribute('width')),
+              height: Number(rect.getAttribute('height')),
+            },
+          },
+        ]
+      : [];
+  });
+  const contains = (frame: Bounds, node: Bounds) =>
+    node.x >= frame.x &&
+    node.x + node.width <= frame.x + frame.width &&
+    node.y >= frame.y &&
+    node.y + node.height <= frame.y + frame.height;
+  for (const child of records) {
+    const parent = records
+      .filter((record) => record !== child && contains(record.frame, child.frame))
+      .toSorted((a, b) => a.frame.width * a.frame.height - b.frame.width * b.frame.height)[0];
+    if (!parent) continue;
+    const entries = [...svg.querySelectorAll<SVGPathElement>('.edgePaths path')].flatMap((path) => {
+      const identity = flowchartEdgeIdentity(path);
+      const sourceNode = identity && flowchartNode(svg, identity.source);
+      const targetNode = identity && flowchartNode(svg, identity.target);
+      const source = sourceNode && flowchartNodeBounds(sourceNode);
+      const target = targetNode && flowchartNodeBounds(targetNode);
+      const label = flowchartLabelForPath(svg, path);
+      if (
+        !source ||
+        !target ||
+        !contains(child.frame, target) ||
+        contains(child.frame, source) ||
+        !contains(parent.frame, source) ||
+        source.y + source.height > child.frame.y
+      )
+        return [];
+      return [{ source, labelWidth: label?.getBBox().width ?? 0 }];
+    });
+    if (!entries.length) continue;
+    const clearance = 24;
+    const needed = Math.max(
+      0,
+      ...entries.map(({ source }) => source.y + source.height + clearance - child.frame.y),
+    );
+    const members = nodes.filter((node) => {
+      const bounds = flowchartNodeBounds(node);
+      return bounds && contains(child.frame, bounds);
+    });
+    const below = nodes
+      .filter((node) => !members.includes(node))
+      .flatMap((node) => {
+        const bounds = flowchartNodeBounds(node);
+        return bounds && bounds.y >= child.frame.y + child.frame.height ? [bounds.y] : [];
+      });
+    const available =
+      Math.min(parent.frame.y + parent.frame.height, ...below) -
+      child.frame.y -
+      child.frame.height -
+      clearance;
+    const shift = Math.min(needed, Math.max(0, available));
+    if (shift > 0) {
+      for (const node of members) {
+        const matrix = node.transform.baseVal.consolidate()?.matrix;
+        if (matrix) node.setAttribute('transform', `translate(${matrix.e}, ${matrix.f + shift})`);
+      }
+      for (const record of records.filter((record) => contains(child.frame, record.frame))) {
+        record.rect.setAttribute('y', String(record.frame.y + shift));
+        const label = record.cluster.querySelector<SVGGElement>(':scope > .cluster-label');
+        const matrix = label?.transform.baseVal.consolidate()?.matrix;
+        if (matrix) label!.setAttribute('transform', `translate(${matrix.e}, ${matrix.f + shift})`);
+      }
+    }
+    const corridor = Math.max(...entries.map(({ labelWidth }) => labelWidth + 12));
+    const right = Math.max(
+      parent.frame.x + parent.frame.width,
+      child.frame.x + child.frame.width + corridor,
+    );
+    parent.rect.setAttribute('width', String(right - parent.frame.x));
+  }
+}
+
 export function routeFlowchartAroundClusterHeaders(svg: SVGSVGElement) {
   if (svg.getAttribute('aria-roledescription') !== 'flowchart-v2') return;
   const clusters = [...svg.querySelectorAll<SVGGElement>('g.cluster')];
@@ -4736,6 +5580,254 @@ export function rewriteStateRoutes(svg: SVGSVGElement, compact = false) {
   return { x: minX, y: minY, width: maxX - minX, height: maxY - minY };
 }
 
+/** Keep an entry's departure fixed; try only the four local target-side midpoints. */
+export function chooseClearStateEntryRoute(
+  points: Point[],
+  target: Bounds,
+  obstacles: Bounds[],
+  occupied: Segment[],
+  clearance = 8,
+) {
+  if (points.length < 2) return points;
+  const occupiedBounds = occupied.map(({ start, end }) => ({
+    x: Math.min(start.x, end.x),
+    y: Math.min(start.y, end.y),
+    width: Math.abs(end.x - start.x),
+    height: Math.abs(end.y - start.y),
+  }));
+  const clear = (route: Point[]) =>
+    segments(route).every(
+      (segment) =>
+        !segmentCrossesBounds(segment, target) &&
+        [...obstacles, ...occupiedBounds].every(
+          (bounds) => !segmentCrossesBounds(segment, bounds, clearance),
+        ),
+    );
+  if (clear(points)) return points;
+  const start = points[0];
+  const side = cardinalSideFromDirection(start, points[1]);
+  const lead = { ...start };
+  const distance = clearance * 2;
+  if (side === 'top') lead.y -= distance;
+  if (side === 'bottom') lead.y += distance;
+  if (side === 'left') lead.x -= distance;
+  if (side === 'right') lead.x += distance;
+  const candidates = [
+    { point: pointAt(target, 0.5, 0), dx: 0, dy: -distance },
+    { point: pointAt(target, 1, 0.5), dx: distance, dy: 0 },
+    { point: pointAt(target, 0.5, 1), dx: 0, dy: distance },
+    { point: pointAt(target, 0, 0.5), dx: -distance, dy: 0 },
+  ].flatMap(({ point, dx, dy }) => {
+    const endLead = { x: point.x + dx, y: point.y + dy };
+    return [
+      [start, lead, { x: lead.x, y: endLead.y }, endLead, point],
+      [start, lead, { x: endLead.x, y: lead.y }, endLead, point],
+    ]
+      .map(simplifyOrthogonalPoints)
+      .filter((route) => {
+        const first = route[1],
+          last = route.at(-2)!;
+        return (
+          (first.x - start.x) * (lead.x - start.x) + (first.y - start.y) * (lead.y - start.y) > 0 &&
+          (last.x - point.x) * dx + (last.y - point.y) * dy > 0 &&
+          clear(route)
+        );
+      });
+  });
+  const length = (route: Point[]) =>
+    segments(route).reduce(
+      (sum, { start, end }) => sum + Math.hypot(end.x - start.x, end.y - start.y),
+      0,
+    );
+  return candidates.toSorted((a, b) => length(a) - length(b))[0] ?? points;
+}
+
+export function repairStateEntryRoutes(svg: SVGSVGElement) {
+  if (!svg.classList.contains('statediagram')) return;
+  const paths = [
+    ...svg.querySelectorAll<SVGPathElement>('.edgePaths path, path.transition[data-edge="true"]'),
+  ];
+  const reference = paths[0];
+  if (!reference) return;
+  const nodes = [...svg.querySelectorAll<SVGGElement>('g.node')].flatMap((node) => {
+    const shape = shapeForNode(node);
+    const bounds = shape && boundsInPathSpace(shape, reference);
+    return shape && bounds ? [{ node, shape, bounds }] : [];
+  });
+  const routes = paths.flatMap((path) => {
+    let points: Point[];
+    try {
+      points = path.dataset.manhattanPoints
+        ? path.dataset.manhattanPoints.split(' ').map((value) => {
+            const [x, y] = value.split(',').map(Number);
+            return { x, y };
+          })
+        : JSON.parse(atob(path.dataset.points ?? ''));
+    } catch {
+      return [];
+    }
+    if (
+      !Array.isArray(points) ||
+      points.length < 2 ||
+      points.some((p) => !p || !Number.isFinite(p.x) || !Number.isFinite(p.y))
+    )
+      return [];
+    const nearest = (point: Point) =>
+      nodes.toSorted(
+        (a, b) => distanceToBounds(point, a.bounds) - distanceToBounds(point, b.bounds),
+      )[0];
+    return [{ path, points, source: nearest(points[0]), target: nearest(points.at(-1)!) }];
+  });
+  for (const route of routes) {
+    const { path, points, source, target } = route;
+    if (
+      !source ||
+      !target ||
+      source === target ||
+      source.shape.tagName !== 'circle' ||
+      target.shape.tagName !== 'rect' ||
+      routes.some((other) => other.target === source)
+    )
+      continue;
+    const labels = [...svg.querySelectorAll<SVGGElement>('.edgeLabels > .edgeLabel')].flatMap(
+      (label) => {
+        if (!label.textContent?.trim()) return [];
+        const bounds = clientBoundsInPathSpace(label, path);
+        return bounds ? [bounds] : [];
+      },
+    );
+    const next = chooseClearStateEntryRoute(
+      points,
+      target.bounds,
+      [
+        ...nodes.filter((node) => node !== source && node !== target).map((node) => node.bounds),
+        ...labels,
+      ],
+      routes.filter((other) => other !== route).flatMap((other) => segments(other.points)),
+    );
+    if (next === points) continue;
+    const d = buildRoundedOrthogonalPath(next, 2);
+    path.setAttribute('d', d);
+    path.dataset.terminalGapBasePath = d;
+    path.dataset.manhattanPoints = next.map(({ x, y }) => `${x},${y}`).join(' ');
+    path.dataset.manhattanSegments = String(next.length - 1);
+    path.dataset.terminalTarget = target.node.id;
+    const end = next.at(-1)!,
+      previous = next.at(-2)!;
+    path.dataset.terminalDirection = `${end.x - previous.x},${end.y - previous.y}`;
+    route.points = next;
+  }
+}
+
+function shortenStateRouteDetours(svg: SVGSVGElement) {
+  const paths = [
+    ...svg.querySelectorAll<SVGPathElement>('.edgePaths path, path.transition[data-edge="true"]'),
+  ];
+  const labels = [...svg.querySelectorAll<SVGGElement>('.edgeLabels > .edgeLabel')];
+  const reference = paths[0];
+  if (!reference) return;
+  const allNodes = [...svg.querySelectorAll<SVGGElement>('g.node')].flatMap((node) => {
+    const shape = shapeForNode(node);
+    const bounds = shape && boundsInPathSpace(shape, reference);
+    if (!shape || !bounds) return [];
+    const style = getComputedStyle(shape);
+    return [
+      {
+        ...bounds,
+        corner: {
+          x: Math.min(bounds.width / 2, Number.parseFloat(style.rx) || 0),
+          y: Math.min(bounds.height / 2, Number.parseFloat(style.ry) || 0),
+        },
+      },
+    ];
+  });
+  const routes = paths.flatMap((path) => {
+    const points = (path.dataset.manhattanPoints ?? '').split(' ').map((value) => {
+      const [x, y] = value.split(',').map(Number);
+      return { x, y };
+    });
+    if (points.length < 2 || points.some(({ x, y }) => !Number.isFinite(x) || !Number.isFinite(y)))
+      return [];
+    const nearest = (point: Point) =>
+      allNodes.toSorted((a, b) => distanceToBounds(point, a) - distanceToBounds(point, b))[0];
+    return [{ path, points, source: nearest(points[0]), target: nearest(points.at(-1)!) }];
+  });
+  for (const route of routes) {
+    const { path, points, source, target } = route;
+    // Only reconsider an upward departure that overshoots both endpoints of a
+    // downward transition. Ordinary state lanes retain their assigned geometry.
+    if (
+      !source ||
+      !target ||
+      target.y <= source.y ||
+      points[1].y >= Math.min(source.y, target.y) - Math.max(source.height, target.height)
+    )
+      continue;
+    const label = labels.find((label) => label.dataset.routePathId === path.id);
+    const labelBounds = label && clientBoundsInPathSpace(label, path);
+    if (!label || !labelBounds) continue;
+    const others = routes.filter((other) => other !== route);
+    const occupied = others.flatMap((other) => segments(other.points));
+    const obstacles = allNodes.filter((node) => node !== source && node !== target);
+    const labelObstacles = labels
+      .filter((other) => other !== label)
+      .flatMap((other) => {
+        const bounds = clientBoundsInPathSpace(other, path);
+        return bounds ? [bounds] : [];
+      });
+    const ports = (node: Bounds) =>
+      others.flatMap((other) => [
+        ...(other.source === node ? [other.points[0]] : []),
+        ...(other.target === node ? [other.points.at(-1)!] : []),
+      ]);
+    const local = chooseClearFlowchartRoute(
+      points,
+      source,
+      target,
+      [...obstacles, ...labelObstacles],
+      occupied,
+      ports(source),
+      ports(target),
+      { bounds: labelBounds, obstacles: labelObstacles, occupied },
+      false,
+      true,
+    );
+    if (local === points) continue;
+    const placement = chooseClearFlowchartLabel(
+      local,
+      labelBounds,
+      [...allNodes, ...labelObstacles],
+      occupied,
+    );
+    if (!placement) continue;
+    route.points = local;
+    path.setAttribute(
+      'd',
+      local.map(({ x, y }, index) => `${index ? 'L' : 'M'}${x},${y}`).join(''),
+    );
+    path.dataset.manhattanPoints = local.map(({ x, y }) => `${x},${y}`).join(' ');
+    path.dataset.manhattanSegments = String(local.length - 1);
+    path.dataset.labelSegment = `${placement.start.x},${placement.start.y} ${placement.end.x},${placement.end.y}`;
+    const end = local.at(-1)!;
+    const previous = local.at(-2)!;
+    path.dataset.terminalDirection = `${end.x - previous.x},${end.y - previous.y}`;
+    delete path.dataset.terminalGapBasePath;
+    const labelLocal = label.getBBox();
+    const parentMatrix = (label.parentElement as SVGGraphicsElement | null)?.getCTM();
+    const pathMatrix = path.getCTM();
+    if (parentMatrix && pathMatrix) {
+      const center = new DOMPoint(placement.center.x, placement.center.y)
+        .matrixTransform(pathMatrix)
+        .matrixTransform(parentMatrix.inverse());
+      label.setAttribute(
+        'transform',
+        `translate(${center.x - labelLocal.x - labelLocal.width / 2},${center.y - labelLocal.y - labelLocal.height / 2})`,
+      );
+      label.dataset.finalPathCenter = `${placement.center.x},${placement.center.y}`;
+    }
+  }
+}
+
 type StateLabelPathCandidate = {
   id: string;
   nativeId?: string;
@@ -4800,7 +5892,7 @@ export function repairUpwardStateFailureRoutes(svg: SVGSVGElement) {
     const nodes = [...svg.querySelectorAll<SVGGElement>('g.node')].flatMap((node) => {
       const shape = shapeForNode(node);
       const bounds = shape && boundsInPathSpace(shape, path);
-      return shape && bounds ? [{ node, bounds }] : [];
+      return shape && bounds ? [{ node, shape, bounds }] : [];
     });
     const source = nodes.toSorted(
       (left, right) => distanceToBounds(start, left.bounds) - distanceToBounds(start, right.bounds),
@@ -4816,8 +5908,17 @@ export function repairUpwardStateFailureRoutes(svg: SVGSVGElement) {
     );
     if (overlapRight <= overlapLeft) return;
     const x = overlapLeft + (overlapRight - overlapLeft) * 0.75;
+    const style = getComputedStyle(source.shape);
+    const rx = Math.min(source.bounds.width / 2, Number.parseFloat(style.rx) || 0);
+    const ry = Math.min(source.bounds.height / 2, Number.parseFloat(style.ry) || 0);
+    const cornerX = Math.max(
+      source.bounds.x + rx - x,
+      x - (source.bounds.x + source.bounds.width - rx),
+      0,
+    );
+    const cornerInset = rx > 0 ? ry * (1 - Math.sqrt(Math.max(0, 1 - (cornerX / rx) ** 2))) : 0;
     const points = [
-      { x, y: source.bounds.y },
+      { x, y: source.bounds.y + cornerInset },
       { x, y: target.bounds.y + target.bounds.height },
     ];
     const pathData = `M${points[0].x},${points[0].y}L${points[1].x},${points[1].y}`;
@@ -5085,6 +6186,7 @@ export function placeStateLabelsOnFinalRoutes(svg: SVGSVGElement, compact = fals
     label.dataset.finalPathCenter = `${midpoint.x},${midpoint.y}`;
     placed.push(bounds);
   }
+  shortenStateRouteDetours(svg);
   if (!placed.length) return null;
   const left = Math.min(...placed.map((bounds) => bounds.x));
   const top = Math.min(...placed.map((bounds) => bounds.y));

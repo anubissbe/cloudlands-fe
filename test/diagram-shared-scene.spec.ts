@@ -141,6 +141,7 @@ for (const motion of ['full', 'reduced']) {
           phase: element.getAttribute('data-diagram-motion-phase'),
           settled: element.getAttribute('data-diagram-settled') === 'true',
           height: viewport.height,
+          drawingHeight: element.querySelector('.diagram-content')!.getBoundingClientRect().height,
           animations: animations.length,
           nodes: ['user', 'renderer'].map((id) => {
             const node = element.querySelector(`[data-node-id="${id}"]`)!;
@@ -196,11 +197,13 @@ for (const motion of ['full', 'reduced']) {
     });
     const original = transitions[0].clicks[0].before;
     const grown = transitions[0].frames.at(-1)!;
-    expect(grown.height).toBeGreaterThan(original.height);
+    expect(grown.drawingHeight).toBeGreaterThan(original.drawingHeight);
+    expect(grown.height).toBeCloseTo(original.height, 0);
     for (const change of transitions) {
       const final = change.frames.at(-1)!;
       expect(final).toMatchObject({ settled: true, animations: 0 });
       for (const frame of change.frames) {
+        expect(frame.height).toBeCloseTo(original.height, 0);
         for (const node of frame.nodes) {
           expect([node.x, node.y, node.width, node.height].every(Number.isFinite)).toBe(true);
           expect(node.width).toBeGreaterThan(0);

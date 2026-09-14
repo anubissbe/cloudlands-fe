@@ -18,19 +18,39 @@
 </script>
 
 <script lang="ts">
-  import DiagramPresentation from './DiagramPresentation.svelte';
-  import DiagramRenderer from './DiagramRenderer.svelte';
-  import NoteDiagramControlsBand from './NoteDiagramControlsBand.svelte';
-  import MermaidRenderer from '$lib/components/markdown/MermaidRenderer.svelte';
+  import { WorkspaceStatus, type Workspace } from '$shared/types';
+  import { WorkspaceId } from '$shared/types/branded-ids';
+  import NoteWithComments from '$lib/components/workspace/NoteWithComments.svelte';
 
-  let ports = $state<HTMLElement[]>([]);
   let enabled = $state(true);
   let mounted = $state(true);
   let note = $state(0);
+  // Synthetic identities have no backing store note or persistence callback.
+  const workspace: Workspace = {
+    id: WorkspaceId('diagram-controls-preview'),
+    title: 'Local diagram controls',
+    branch: 'preview',
+    changesets: [],
+    timeline: [],
+    conversationInfo: [],
+    status: WorkspaceStatus.Active,
+    createdAt: '2026-09-12T00:00:00.000Z',
+    updatedAt: '2026-09-12T00:00:00.000Z',
+  };
   const diagrams = [
     CUSTOM_WORKBENCH_CASES['custom-architecture'],
     CUSTOM_WORKBENCH_CASES['custom-delivery-walkthrough'],
   ];
+  const walkthroughs = diagrams
+    .map((fixture) => `\`\`\`diagram\n${JSON.stringify(fixture.diagram)}\n\`\`\``)
+    .join('\n\n');
+  const lead = 'Before the diagrams.\n\n'.repeat(12);
+  const tail = '\n\nAfter the diagrams.'.repeat(24);
+  const mermaid = DIAGRAM_WORKBENCH_CASES['mermaid-flow'];
+  const stateless = `\`\`\`diagram\n${JSON.stringify(CUSTOM_WORKBENCH_CASES['custom-flowchart'].diagram)}\n\`\`\`\n\n\`\`\`mermaid\n${mermaid.kind === 'mermaid' ? mermaid.source : ''}\n\`\`\``;
+  const content = $derived(
+    lead + (note % 3 === 0 ? walkthroughs : note % 3 === 1 ? 'Prose note.' : stateless) + tail,
+  );
 </script>
 
 <!-- i18n-ignore (deterministic preview-only lifecycle controls) -->
@@ -44,34 +64,14 @@
   {#each [0, 1] as index}
     {#if mounted || index === 1}
       <article class="note-host" data-testid={`note-host-${index}`}>
-        <section class="note-content-container" bind:this={ports[index]}>
-          <div class="lead" data-testid="lead"></div>
-          {#key index === 0 ? note : 0}
-            <div class="tiptap-editor ProseMirror" contenteditable="false">
-              {#each diagrams as fixture, diagramIndex}
-                {#if fixture.kind === 'custom' && (index === 1 || note % 3 === 0)}
-                  <div class="node-diagram_block" data-testid={`walkthrough-${diagramIndex}`}>
-                    <DiagramPresentation kind="custom">
-                      <DiagramRenderer diagram={fixture.diagram} editable={false} />
-                    </DiagramPresentation>
-                  </div>
-                {/if}
-              {/each}
-              {#if index === 0 && note % 3 === 2}
-                <DiagramRenderer diagram={CUSTOM_WORKBENCH_CASES['custom-flowchart'].diagram} />
-                {@const mermaid = DIAGRAM_WORKBENCH_CASES['mermaid-flow']}
-                {#if mermaid.kind === 'mermaid'}
-                  <MermaidRenderer code={mermaid.source} />
-                {/if}
-              {/if}
-            </div>
-          {/key}
-          <div class="tail" data-testid="tail"></div>
-        </section>
-        <NoteDiagramControlsBand
-          scrollport={ports[index]}
-          scopeKey={String(index === 0 ? note : 0)}
-          enabled={index === 1 || enabled}
+        <NoteWithComments
+          {workspace}
+          noteId={`diagram-controls-${index}-${index === 0 ? note : 0}`}
+          content={index === 0 ? content : lead + walkthroughs + tail}
+          editable={false}
+          showComments={false}
+          showSuggestions={false}
+          showVersionHistory={index === 0 && !enabled}
         />
       </article>
     {/if}
@@ -90,22 +90,5 @@
     min-width: 0;
     overflow: hidden;
     background: hsl(var(--background));
-  }
-  .note-content-container {
-    flex: 1;
-    min-height: 0;
-    overflow-y: auto;
-    position: relative;
-    container-type: inline-size;
-  }
-  .tiptap-editor {
-    height: auto;
-    min-height: 0;
-  }
-  .lead {
-    height: 700px;
-  }
-  .tail {
-    height: 900px;
   }
 </style>

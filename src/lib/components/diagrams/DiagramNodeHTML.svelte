@@ -401,7 +401,7 @@
     text-align: left;
     width: 100%;
     white-space: pre-line;
-    overflow-wrap: normal;
+    overflow-wrap: anywhere;
     font-family: var(--font-editorial);
     font-size: var(--label-font-size);
     font-weight: 600;
@@ -411,10 +411,15 @@
   }
 
   .semantic-filename-unit {
-    white-space: nowrap;
+    display: inline-block;
+    max-width: 100%;
+    vertical-align: top;
+    white-space: pre-line;
   }
 
   .node-kind-label {
+    max-width: 100%;
+    overflow-wrap: anywhere;
     color: var(--diagram-metadata);
     opacity: 0.86;
     font-family: var(--font-ui);

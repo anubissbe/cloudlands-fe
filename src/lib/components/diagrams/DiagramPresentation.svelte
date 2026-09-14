@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { Snippet } from 'svelte';
+  import { onMount, type Snippet } from 'svelte';
   import DiagramActionsMenu from './DiagramActionsMenu.svelte';
 
   interface Props {
@@ -22,6 +22,46 @@
     fileName,
   }: Props = $props();
   let contentElement: HTMLDivElement | undefined = $state();
+  let noteWidth = $state<number>();
+  let controlsWidth = $state<number>();
+
+  onMount(() => {
+    const lane = contentElement?.closest<HTMLElement>('.node-mermaidBlock, .node-diagram_block');
+    const prose = lane?.parentElement;
+    if (!lane || !prose?.matches('.tiptap-editor.ProseMirror') || !contentElement) return;
+    const content = contentElement;
+    let intrinsic = 0;
+    const updateWidth = () => {
+      const custom = content.querySelector<HTMLElement>('[data-diagram-intrinsic-width]');
+      const svg = content.querySelector<SVGSVGElement>('.mermaid-svg > svg');
+      // Read authored/layout dimensions, never the fitted screen rectangle: fitting
+      // into this presentation must not feed back into its preferred width.
+      if (custom?.dataset.diagramSettled === 'true') {
+        intrinsic = Number(custom.dataset.diagramIntrinsicWidth);
+      } else if (svg?.dataset.layoutSettled === 'true') {
+        intrinsic = svg.viewBox.baseVal.width + 16;
+      } else if (!custom && !svg) {
+        intrinsic = 0;
+      }
+      noteWidth = Math.min(lane.clientWidth, Math.max(prose.clientWidth, intrinsic));
+      controlsWidth = Math.min(lane.clientWidth, prose.clientWidth);
+    };
+    const resize = new ResizeObserver(updateWidth);
+    resize.observe(lane);
+    resize.observe(prose);
+    const mutation = new MutationObserver(updateWidth);
+    mutation.observe(content, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ['data-diagram-settled', 'data-layout-settled'],
+    });
+    updateWidth();
+    return () => {
+      resize.disconnect();
+      mutation.disconnect();
+    };
+  });
 </script>
 
 <section
@@ -29,6 +69,9 @@
   class:selected
   data-diagram-presentation
   data-diagram-kind={kind}
+  style:width={noteWidth === undefined ? undefined : `${noteWidth}px`}
+  style:min-width={noteWidth === undefined ? undefined : '0'}
+  style={controlsWidth === undefined ? undefined : `--diagram-controls-width: ${controlsWidth}px`}
 >
   {#if header}
     <header class="diagram-presentation-header" data-diagram-presentation-header>
@@ -78,6 +121,14 @@
     min-width: 0;
     padding: var(--space-2) var(--space-3);
     font-family: var(--font-ui);
+  }
+
+  .diagram-presentation[data-diagram-kind='custom']:has(:global(.stateful-diagram))
+    > .diagram-presentation-header {
+    /* A scene's wider canvas must not unwrap the header and move its local footer. */
+    width: min(100%, var(--diagram-controls-width, 100%));
+    margin-inline: auto;
+    box-sizing: border-box;
   }
 
   .diagram-presentation-content {

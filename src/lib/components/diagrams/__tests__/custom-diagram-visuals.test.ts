@@ -126,6 +126,27 @@ describe('custom diagram visual contract', () => {
     }
   });
 
+  it('expands group frames for long headings without enlarging their nodes', () => {
+    const layoutFor = (label: string) =>
+      computeLayout(
+        {
+          nodes: [{ id: 'member', label: 'Stable node', kind: 'service', group: 'boundary' }],
+          edges: [],
+          groups: [{ id: 'boundary', label, nodeIds: ['member'] }],
+        },
+        { layout: { type: 'manual' } },
+        'architecture',
+      );
+    const short = layoutFor('Boundary');
+    const long = layoutFor('A deliberately long responsibility boundary heading');
+
+    expect(long.nodes[0]).toMatchObject({
+      width: short.nodes[0].width,
+      height: short.nodes[0].height,
+    });
+    expect(long.groups![0].width).toBeGreaterThan(short.groups![0].width);
+  });
+
   it('renders every state-machine label with matching semantic markers', async () => {
     const { container } = render(DiagramRenderer, {
       props: { diagram: customDiagram('custom-state-machine') },
@@ -162,7 +183,8 @@ describe('custom diagram visual contract', () => {
     const label = [...container.querySelectorAll('.edge-label-container')].find((node) =>
       node.textContent?.includes('asks for'),
     );
-    expect(Number(label?.getAttribute('height'))).toBeGreaterThan(36);
+    // Two 11px lines at 1.26 leading, plus the existing 4px top/bottom padding.
+    expect(Number(label?.getAttribute('height'))).toBeCloseTo(35.72, 2);
 
     const svg = container.querySelector('.diagram-svg-layer');
     const transform = label?.parentElement?.getAttribute('transform') ?? '';
@@ -177,9 +199,9 @@ describe('custom diagram visual contract', () => {
   });
 
   it('limits edge-label geometry to three lines without misclassifying exact fits', () => {
-    expect(measureEdgeLabel('short')).toMatchObject({ lines: 1, height: 28 });
-    expect(measureEdgeLabel('one\ntwo\nthree')).toMatchObject({ lines: 3, height: 64 });
-    expect(measureEdgeLabel('one\ntwo\nthree\nfour')).toMatchObject({ lines: 4, height: 64 });
+    expect(measureEdgeLabel('short')).toMatchObject({ lines: 1, height: 21.86 });
+    expect(measureEdgeLabel('one\ntwo\nthree')).toMatchObject({ lines: 3, height: 49.58 });
+    expect(measureEdgeLabel('one\ntwo\nthree\nfour')).toMatchObject({ lines: 4, height: 49.58 });
   });
 
   it('anchors grouped labels to their route without crossing group headings', async () => {

@@ -150,8 +150,18 @@ export function createMermaidConfig(styles: TokenStyle, htmlLabels = true): Merm
 
 let renderQueue = Promise.resolve();
 
-export function runSerializedMermaidRender<T>(task: () => Promise<T>): Promise<T> {
-  const result = renderQueue.then(task, task);
+export function runSerializedMermaidRender<T>(
+  task: () => Promise<T>,
+  isCurrent: () => boolean = () => true,
+): Promise<T | undefined> {
+  const run = async () => {
+    if (!isCurrent()) return;
+    // A task boundary lets pending input run; a resolved Promise only yields a microtask.
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    if (!isCurrent()) return;
+    return task();
+  };
+  const result = renderQueue.then(run, run);
   renderQueue = result.then(
     () => undefined,
     () => undefined,

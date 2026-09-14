@@ -109,11 +109,16 @@ describe('Mermaid design-system theme', () => {
 
   it('serializes Mermaid global initialization and rendering', async () => {
     const events: string[] = [];
+    let firstStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      firstStarted = resolve;
+    });
     let finishFirst!: () => void;
     const first = runSerializedMermaidRender(
       () =>
         new Promise<void>((resolve) => {
           events.push('first:start');
+          firstStarted();
           finishFirst = () => {
             events.push('first:end');
             resolve();
@@ -124,10 +129,71 @@ describe('Mermaid design-system theme', () => {
       events.push('second:start');
     });
 
-    await Promise.resolve();
+    await started;
     expect(events).toEqual(['first:start']);
     finishFirst();
     await Promise.all([first, second]);
     expect(events).toEqual(['first:start', 'first:end', 'second:start']);
+  });
+
+  it('allows a pending browser task to run before the next diagram job', async () => {
+    const events: string[] = [];
+    const first = runSerializedMermaidRender(async () => {
+      events.push('first');
+      setTimeout(() => events.push('input'), 0);
+    });
+    const second = runSerializedMermaidRender(async () => {
+      events.push('second');
+    });
+    await Promise.all([first, second]);
+    expect(events).toEqual(['first', 'input', 'second']);
+  });
+
+  it('skips cancelled queued work without preventing the following job', async () => {
+    let current = true;
+    const events: string[] = [];
+    const first = runSerializedMermaidRender(async () => {
+      current = false;
+    });
+    const stale = runSerializedMermaidRender(
+      async () => {
+        events.push('stale');
+      },
+      () => current,
+    );
+    const last = runSerializedMermaidRender(async () => {
+      events.push('last');
+      return 42;
+    });
+    await first;
+    expect(await stale).toBeUndefined();
+    expect(await last).toBe(42);
+    expect(events).toEqual(['last']);
+  });
+
+  it('rechecks cancellation after yielding to pending input', async () => {
+    let current = true;
+    const events: string[] = [];
+    const pending = runSerializedMermaidRender(
+      async () => {
+        events.push('stale');
+      },
+      () => current,
+    );
+    setTimeout(() => {
+      current = false;
+    }, 0);
+    await pending;
+    expect(events).toEqual([]);
+  });
+
+  it('does not poison the queue when a render or fitting job rejects', async () => {
+    const failure = runSerializedMermaidRender(async () => {
+      throw new Error('render failure');
+    });
+    const assertion = expect(failure).rejects.toThrow('render failure');
+    const next = runSerializedMermaidRender(async () => 'ready');
+    await assertion;
+    expect(await next).toBe('ready');
   });
 });

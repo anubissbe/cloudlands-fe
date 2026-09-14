@@ -5,7 +5,6 @@
   import CommentsSidebar from '$lib/components/tiptap/CommentsSidebar.svelte';
   import LineAttributionGutter from '$lib/components/tiptap/LineAttributionGutter.svelte';
   import NoteVersionHistory from '$lib/components/workspace/NoteVersionHistory.svelte';
-  import NoteDiagramControlsBand from '$lib/components/diagrams/NoteDiagramControlsBand.svelte';
   import RawNoteCodeEditor from '$lib/components/workspace/RawNoteCodeEditor.svelte';
   import SuggestionTooltip from '$lib/components/tiptap/SuggestionTooltip.svelte';
   import { Skeleton } from '$lib/components/ui/skeleton';
@@ -2160,14 +2159,6 @@
 
       <!-- Task Menu (moved outside clipping containers) -->
     </section>
-    <NoteDiagramControlsBand
-      scrollport={scrollContainer}
-      scopeKey={`${workspace?.id}:${noteId}`}
-      enabled={!showVersionHistory &&
-        !shouldShowRawNoteView &&
-        !isInitializing &&
-        !isTooLargeForRichEditor}
-    />
   </div>
 </div>
 

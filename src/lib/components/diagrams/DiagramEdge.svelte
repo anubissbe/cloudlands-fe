@@ -246,7 +246,7 @@
       );
       previousPoints = points;
       motionProgress = elapsed;
-      displayedPath = `M ${points.map((point) => `${point.x} ${point.y}`).join(' L ')}`;
+      displayedPath = buildRoundedOrthogonalPath(points);
       if (elapsed < 1) frame = requestAnimationFrame(tick);
       else {
         displayedPath = targetPath;

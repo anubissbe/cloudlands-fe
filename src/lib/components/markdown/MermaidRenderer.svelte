@@ -26,6 +26,8 @@
   } from './mermaid-theme';
   import { splitSemanticLabel } from '$lib/components/diagrams/diagram-label-wrap';
   import type { SvgBounds } from './mermaid-state-layout';
+  import { addMermaidLabelKnockouts, insertLabelKnockout } from './mermaid-label-knockouts';
+  import { loadMermaidTextFont } from './mermaid-font-loading';
   import {
     alignMermaidOpenArrowheads,
     applyMermaidTerminalGaps,
@@ -38,7 +40,10 @@
     repairEntityDividers,
     refineMermaidCylinderNodes,
     repairFlowchartNodeOutlines,
+    repairFlowchartRouteClearance,
+    repairFlowchartLabelClearance,
     reserveFlowchartClusterHeaderBands,
+    spaceNestedFlowchartClusters,
     routeFlowchartClientRequestLane,
     rewriteStateRoutes,
     roundOrthogonalBends,
@@ -48,6 +53,7 @@
     routeFlowchartFeedbackLane,
     routeGroupedReturnEdges,
     repairUpwardStateFailureRoutes,
+    repairStateEntryRoutes,
     snapFlowchartDiamondPorts,
     snapFlowchartFanoutPorts,
     snapFlowchartPorts,
@@ -362,43 +368,6 @@ ${verticalSource}`;
       background.dataset.labelPaddingX = '6';
       background.dataset.labelPaddingY = '5';
       background.dataset.labelPadded = 'true';
-    }
-  }
-
-  function insertLabelKnockout(
-    parent: Element,
-    before: Element,
-    bounds: { x: number; y: number; width: number; height: number },
-  ) {
-    const knockout = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
-    knockout.classList.add('edge-label-knockout');
-    knockout.setAttribute('x', String(bounds.x - 6));
-    knockout.setAttribute('y', String(bounds.y - 4));
-    knockout.setAttribute('width', String(bounds.width + 12));
-    knockout.setAttribute('height', String(bounds.height + 8));
-    knockout.setAttribute('rx', '2');
-    knockout.dataset.labelPaddingX = '6';
-    knockout.dataset.labelPaddingY = '4';
-    parent.insertBefore(knockout, before);
-  }
-
-  function addMermaidLabelKnockouts(svg: SVGSVGElement) {
-    for (const label of svg.querySelectorAll<SVGGElement>('g.edgeLabel')) {
-      if (label.querySelector('.edge-label-knockout, rect.background, foreignObject')) continue;
-      const content = label.querySelector<SVGGraphicsElement>('text');
-      if (content) {
-        insertLabelKnockout(label, label.firstElementChild!, content.getBBox());
-      }
-    }
-
-    for (const text of svg.querySelectorAll<SVGGraphicsElement>(
-      'text.messageText, text.loopText',
-    )) {
-      if (text.dataset.labelKnockout === 'true' || !text.textContent?.trim()) continue;
-      const parent = text.parentElement;
-      if (!parent) continue;
-      insertLabelKnockout(parent, text, text.getBBox());
-      text.dataset.labelKnockout = 'true';
     }
   }
 
@@ -912,13 +881,7 @@ ${verticalSource}`;
       }
     }
     if (notes.length) {
-      await Promise.all(
-        notes.flatMap(({ texts }) =>
-          texts.map((text) =>
-            document.fonts?.load(getComputedStyle(text).font, text.textContent ?? ''),
-          ),
-        ),
-      );
+      await Promise.all(notes.flatMap(({ texts }) => texts.map(loadMermaidTextFont)));
     }
     for (const { note, texts } of notes) {
       const textBounds = texts.map((text) => text.getBBox());
@@ -1325,6 +1288,8 @@ ${verticalSource}`;
     );
     if (generation !== renderGeneration) return false;
     svg.getBoundingClientRect();
+    if (compactFlowchartLayout) alignCompactClusterTitles(svg);
+    if (flowchart) spaceNestedFlowchartClusters(svg);
     routeFlowchartFeedbackLane(svg);
     routeFlowchartCenteredFanouts(svg);
     routeFlowchartDecisionBranches(svg);
@@ -1348,6 +1313,7 @@ ${verticalSource}`;
       !normalizedState || svg.dataset.stateRouteLayout !== stateRouteLayout;
     if (shouldRewriteStateRoutes) rewriteStateRoutes(svg, narrowLayout);
     repairUpwardStateFailureRoutes(svg);
+    repairStateEntryRoutes(svg);
     if (normalizedState && shouldRewriteStateRoutes) {
       svg.dataset.stateRouteLayout = stateRouteLayout;
     }
@@ -1459,8 +1425,10 @@ ${verticalSource}`;
       snapFlowchartFeedbackPorts(svg);
       routeFlowchartClientRequestLane(svg);
       snapFlowchartDiamondPorts(svg);
+      const plannedLabels = repairFlowchartRouteClearance(svg);
       roundOrthogonalBends(svg);
       if (groupedFlowchart) positionCompactGroupedEdgeLabels(svg);
+      repairFlowchartLabelClearance(svg, plannedLabels);
       alignMermaidOpenArrowheads(svg);
       if (compactFlowchartLayout && svg.querySelector('path[data-grouped-return-lane="right"]')) {
         padding = Math.max(padding, 23);
@@ -1549,16 +1517,20 @@ ${verticalSource}`;
         }
       }
       await document.fonts?.load(`400 ${config.fontSize}px "${MERMAID_PRIMARY_FONT}"`);
-      const { svg } = await runSerializedMermaidRender(async () => {
-        mermaid.initialize(config);
-        const id = `mermaid-${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
-        return mermaid.render(id, renderCode);
-      });
-      if (generation !== renderGeneration) return;
-      renderedSvg = svg;
-      error = null;
-      const fitCompleted = await fitRenderedSvg(generation, renderCode);
-      if (fitCompleted && generation === renderGeneration) settledGeneration = generation;
+      await runSerializedMermaidRender(
+        async () => {
+          mermaid.initialize(config);
+          const id = `mermaid-${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
+          const { svg } = await mermaid.render(id, renderCode);
+          if (generation !== renderGeneration) return;
+          renderedSvg = svg;
+          error = null;
+          // Finish geometry before another diagram dirties the document for measurement.
+          const fitCompleted = await fitRenderedSvg(generation, renderCode);
+          if (fitCompleted && generation === renderGeneration) settledGeneration = generation;
+        },
+        () => generation === renderGeneration,
+      );
     } catch (err) {
       if (generation !== renderGeneration) return;
       logger.error('Failed to render mermaid diagram:', err);
@@ -2115,6 +2087,12 @@ ${verticalSource}`;
   .mermaid-presentation :global(.group-label) {
     font-family: var(--font-ui) !important;
     font-weight: 500 !important;
+    color: var(--diagram-metadata) !important;
+    fill: var(--diagram-metadata) !important;
+  }
+
+  .mermaid-presentation :global(.cluster-label :is(text, tspan)),
+  .mermaid-presentation :global(.cluster-label foreignObject *) {
     color: var(--diagram-metadata) !important;
     fill: var(--diagram-metadata) !important;
   }

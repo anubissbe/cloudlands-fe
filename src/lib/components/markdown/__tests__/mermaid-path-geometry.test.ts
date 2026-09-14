@@ -8,14 +8,20 @@ import {
   buildFlowchartFeedbackLanePoints,
   buildGroupedReturnLanePoints,
   chooseFlowchartFeedbackTargetX,
+  chooseFlowchartFeedbackInsideX,
+  chooseClearFlowchartRoute,
+  chooseClearFlowchartLabel,
+  chooseClearLocalReturn,
   chooseLabelSegment,
   chooseStateLabelPathIndex,
+  chooseClearStateEntryRoute,
   diamondBoundaryPort,
   diamondRayIntersection,
   measuredClusterHeaderHeight,
   preferClearStraightRoute,
   replacePathTerminal,
   routeOrthogonalAroundObstacles,
+  separateFlowchartVerticalLane,
   simplifyOrthogonalPoints,
   snapOrthogonalTerminals,
 } from '../mermaid-path-geometry';
@@ -59,6 +65,286 @@ function expectRouteAvoids(points: TestPoint[], bounds: TestBounds) {
 }
 
 describe('Mermaid path terminal geometry', () => {
+  describe('adjacent feedback lane clearance', () => {
+    const points = [
+      { x: 20, y: 40 },
+      { x: 100, y: 40 },
+      { x: 100, y: 160 },
+      { x: 20, y: 160 },
+    ];
+    const feedback = [{ start: { x: 108, y: 20 }, end: { x: 108, y: 180 } }];
+
+    it('moves only the adjacent run, retaining endpoints and repeat-fit stability', () => {
+      const result = separateFlowchartVerticalLane(points, feedback, []);
+      expectOrthogonalRoute(result);
+      expect(result[0]).toEqual(points[0]);
+      expect(result.at(-1)).toEqual(points.at(-1));
+      expect(result[1].x).toBe(88);
+      expect(result[2].x).toBe(88);
+      expect(separateFlowchartVerticalLane(result, feedback, [])).toBe(result);
+    });
+
+    it('retains the safe route when occupied paint blocks the separated lane', () => {
+      const obstacle = { x: 82, y: 70, width: 12, height: 30 };
+      expect(separateFlowchartVerticalLane(points, feedback, [obstacle])).toBe(points);
+    });
+
+    it('does not move sufficiently separated or vertically disjoint runs', () => {
+      for (const occupied of [
+        [{ start: { x: 130, y: 20 }, end: { x: 130, y: 180 } }],
+        [{ start: { x: 108, y: 200 }, end: { x: 108, y: 300 } }],
+      ])
+        expect(separateFlowchartVerticalLane(points, occupied, [])).toBe(points);
+    });
+
+    it('does not split coincident shared trunks', () => {
+      const shared = [{ start: { x: 100, y: 20 }, end: { x: 100, y: 180 } }];
+      expect(separateFlowchartVerticalLane(points, shared, [])).toBe(points);
+    });
+  });
+
+  describe('local reciprocal return', () => {
+    const exterior = [
+      { x: 160, y: 140 },
+      { x: 160, y: 240 },
+      { x: 20, y: 240 },
+      { x: 20, y: 40 },
+    ];
+    const local = [
+      { x: 160, y: 100 },
+      { x: 160, y: 60 },
+      { x: 20, y: 60 },
+      { x: 20, y: 40 },
+    ];
+    const label = { bounds: { x: 70, y: 224, width: 40, height: 32 }, obstacles: [] };
+    it('chooses a shorter clear return with room for its own label', () => {
+      const result = chooseClearLocalReturn(exterior, [local], [], [], label);
+      expectOrthogonalRoute(result);
+      expect(result).toEqual(local);
+      expect(chooseClearFlowchartLabel(result, label.bounds, [], [])).toBeDefined();
+      expect(chooseClearLocalReturn(result, [local], [], [], label)).toBe(result);
+    });
+    it.each(['node', 'heading'])(
+      'retains the exterior lane when a %s blocks the local corridor',
+      () => {
+        const obstacle = { x: 65, y: 45, width: 40, height: 30 };
+        expect(chooseClearLocalReturn(exterior, [local], [obstacle], [], label)).toBe(exterior);
+      },
+    );
+    it('rejects both crossing and nearby parallel occupied routes', () => {
+      for (const occupied of [
+        { start: { x: 90, y: 20 }, end: { x: 90, y: 90 } },
+        { start: { x: 40, y: 65 }, end: { x: 140, y: 65 } },
+      ])
+        expect(chooseClearLocalReturn(exterior, [local], [], [occupied], label)).toBe(exterior);
+    });
+    it('retains the return if the label cannot fit even though the centerline clears', () => {
+      expect(
+        chooseClearLocalReturn(exterior, [local], [], [], {
+          ...label,
+          obstacles: [{ x: 0, y: 20, width: 200, height: 100 }],
+        }),
+      ).toBe(exterior);
+    });
+    it('does not replace the original with a longer or more-bent route', () => {
+      expect(chooseClearLocalReturn(local, [exterior], [], [], label)).toBe(local);
+      expect(
+        chooseClearLocalReturn(
+          exterior,
+          [[...local.slice(0, 2), { x: 90, y: 60 }, { x: 90, y: 50 }, { x: 20, y: 50 }, local[3]]],
+          [],
+          [],
+          label,
+        ),
+      ).toBe(exterior);
+    });
+  });
+
+  describe('measured route-label clearance', () => {
+    it('moves a label along its own route away from an unrelated crossing', () => {
+      const route = [
+        { x: 0, y: 0 },
+        { x: 0, y: 160 },
+      ];
+      const current = { x: -30, y: 70, width: 60, height: 20 };
+      const crossing = { start: { x: -50, y: 80 }, end: { x: 50, y: 80 } };
+      const result = chooseClearFlowchartLabel(route, current, [], [crossing]);
+      expect(result).toBeDefined();
+      expect(result!.center.x).toBe(0);
+      expect(segmentEntersBounds(crossing.start, crossing.end, result!.bounds)).toBe(false);
+      expect(result!.bounds.width).toBe(60);
+      expect(result!.bounds.height).toBe(20);
+      expect(chooseClearFlowchartLabel(route, result!.bounds, [], [crossing])!.bounds).toEqual(
+        result!.bounds,
+      );
+    });
+    it('does not hide a crossing or a node when no readable label corridor exists', () => {
+      const route = [
+        { x: 0, y: 0 },
+        { x: 0, y: 30 },
+      ];
+      const label = { x: -30, y: 5, width: 60, height: 20 };
+      expect(chooseClearFlowchartLabel(route, label, [], [])).toBeUndefined();
+      expect(
+        chooseClearFlowchartLabel(
+          [
+            { x: 0, y: 0 },
+            { x: 0, y: 160 },
+          ],
+          label,
+          [{ x: -100, y: -100, width: 200, height: 400 }],
+          [],
+        ),
+      ).toBeUndefined();
+    });
+  });
+
+  describe('local obstacle repair', () => {
+    const source = { x: 0, y: 0, width: 80, height: 40 };
+    const target = { x: 200, y: 180, width: 100, height: 40 };
+    const blocked = [
+      { x: 40, y: 40 },
+      { x: 40, y: 100 },
+      { x: 250, y: 100 },
+      { x: 250, y: 180 },
+    ];
+    it('keeps repaired attachments on straight sides of rounded nodes', () => {
+      const roundedSource = { ...source, corner: { x: 18, y: 18 } };
+      const roundedTarget = { ...target, corner: { x: 18, y: 18 } };
+      const result = chooseClearFlowchartRoute(
+        blocked,
+        roundedSource,
+        roundedTarget,
+        [{ x: 0, y: 80, width: 100, height: 40 }],
+        [],
+      );
+      expect(result).not.toBe(blocked);
+      for (const [point, bounds] of [
+        [result[0], roundedSource],
+        [result.at(-1)!, roundedTarget],
+      ] as const) {
+        if (point.x === bounds.x || point.x === bounds.x + bounds.width) {
+          expect(point.y - bounds.y).toBeGreaterThanOrEqual(18);
+          expect(bounds.y + bounds.height - point.y).toBeGreaterThanOrEqual(18);
+        } else {
+          expect(point.x - bounds.x).toBeGreaterThanOrEqual(18);
+          expect(bounds.x + bounds.width - point.x).toBeGreaterThanOrEqual(18);
+        }
+      }
+    });
+    it('avoids an intervening node and a competing target approach without moving nodes', () => {
+      const obstacle = { x: 0, y: 80, width: 100, height: 40 };
+      const occupied = [
+        { start: { x: 50, y: 160 }, end: { x: 258, y: 160 } },
+        { start: { x: 258, y: 160 }, end: { x: 258, y: 180 } },
+      ];
+      const result = chooseClearFlowchartRoute(
+        blocked,
+        source,
+        target,
+        [obstacle],
+        occupied,
+        [],
+        [{ x: 258, y: 180 }],
+      );
+      expect(result).not.toBe(blocked);
+      expectOrthogonalRoute(result);
+      [source, target, obstacle].forEach((bounds) => expectRouteAvoids(result, bounds));
+      for (const segment of occupied)
+        expectRouteAvoids(result, {
+          x: Math.min(segment.start.x, segment.end.x) - 1,
+          y: Math.min(segment.start.y, segment.end.y) - 1,
+          width: Math.abs(segment.end.x - segment.start.x) + 2,
+          height: Math.abs(segment.end.y - segment.start.y) + 2,
+        });
+      const again = chooseClearFlowchartRoute(result, source, target, [obstacle], occupied);
+      expect(again).toBe(result);
+    });
+    it('keeps a clear straight corridor and its exact ports unchanged', () => {
+      const route = [
+        { x: 80, y: 20 },
+        { x: 200, y: 20 },
+      ];
+      expect(chooseClearFlowchartRoute(route, source, { ...target, y: 0 }, [], [])).toBe(route);
+    });
+    it('repairs a blocked branch without changing its assigned fan-out source port', () => {
+      const obstacle = { x: 0, y: 80, width: 100, height: 40 };
+      const result = chooseClearFlowchartRoute(
+        blocked,
+        source,
+        target,
+        [obstacle],
+        [],
+        [],
+        [],
+        undefined,
+        true,
+      );
+      expect(result).not.toBe(blocked);
+      expect(result[0]).toEqual(blocked[0]);
+      expect(result[1].x).toBe(blocked[0].x);
+      expect(result[1].y).toBeGreaterThan(blocked[0].y);
+      expectOrthogonalRoute(result);
+      [source, target, obstacle].forEach((bounds) => expectRouteAvoids(result, bounds));
+    });
+    it('leaves an impossible corridor intact instead of accepting a node collision', () => {
+      expect(
+        chooseClearFlowchartRoute(
+          blocked,
+          source,
+          target,
+          [{ x: -20, y: -20, width: 400, height: 300 }],
+          [],
+        ),
+      ).toBe(blocked);
+      expect(chooseClearFlowchartRoute([], source, target, [], [])).toEqual([]);
+    });
+  });
+
+  describe('shorter local detours', () => {
+    const source = { x: 100, y: 100, width: 80, height: 40 };
+    const target = { x: 100, y: 300, width: 80, height: 40 };
+    const outer = [
+      { x: 140, y: 100 },
+      { x: 140, y: 0 },
+      { x: 0, y: 0 },
+      { x: 0, y: 320 },
+      { x: 100, y: 320 },
+    ];
+    it('shortens without an above-source excursion or occupied-route crossing', () => {
+      const occupied = [{ start: { x: 60, y: 160 }, end: { x: 60, y: 290 } }];
+      const result = chooseClearFlowchartRoute(
+        outer,
+        source,
+        target,
+        [],
+        occupied,
+        [],
+        [],
+        undefined,
+        false,
+        true,
+      );
+      expect(result).not.toBe(outer);
+      expectOrthogonalRoute(result);
+      expect(result.every((p) => p.y >= source.y)).toBe(true);
+      expectRouteAvoids(result, { x: 59, y: 160, width: 2, height: 130 });
+      expectRouteAvoids(result, source);
+      expectRouteAvoids(result, target);
+    });
+    it('keeps the exterior fallback when every local corridor is obstructed', () => {
+      const walls = [
+        { x: 20, y: 80, width: 60, height: 220 },
+        { x: 190, y: 80, width: 60, height: 220 },
+        { x: 20, y: 150, width: 230, height: 100 },
+      ];
+      walls.forEach((wall) => expectRouteAvoids(outer, wall));
+      expect(
+        chooseClearFlowchartRoute(outer, source, target, walls, [], [], [], undefined, false, true),
+      ).toBe(outer);
+    });
+  });
+
   describe('downstream fanout corridors', () => {
     const source = { x: 110, y: 70, width: 100, height: 50 };
     const targets = [
@@ -450,6 +736,71 @@ describe('Mermaid path terminal geometry', () => {
     ]);
   });
 
+  it('separates a crossing entry with a fixed departure and a clear target side', () => {
+    const points = [
+      { x: 150, y: 110 },
+      { x: 150, y: 150 },
+      { x: 75, y: 150 },
+      { x: 75, y: 170 },
+    ];
+    const target = { x: 20, y: 170, width: 80, height: 40 };
+    const occupied = [{ start: { x: 85, y: 170 }, end: { x: 85, y: 50 } }];
+    const result = chooseClearStateEntryRoute(points, target, [], occupied);
+    expect(result).toEqual([
+      { x: 150, y: 110 },
+      { x: 150, y: 190 },
+      { x: 100, y: 190 },
+    ]);
+    expect(chooseClearStateEntryRoute(result, target, [], occupied)).toBe(result);
+  });
+
+  it('leaves already separate entry geometry unchanged', () => {
+    const points = [
+      { x: 50, y: 20 },
+      { x: 50, y: 100 },
+    ];
+    expect(
+      chooseClearStateEntryRoute(points, { x: 20, y: 100, width: 80, height: 40 }, [], []),
+    ).toBe(points);
+  });
+
+  it('keeps the original when every local entry corridor is obstructed', () => {
+    const points = [
+      { x: 150, y: 110 },
+      { x: 150, y: 150 },
+      { x: 75, y: 150 },
+      { x: 75, y: 170 },
+    ];
+    expect(
+      chooseClearStateEntryRoute(
+        points,
+        { x: 20, y: 170, width: 80, height: 40 },
+        [{ x: 0, y: 120, width: 180, height: 30 }],
+        [{ start: { x: 85, y: 170 }, end: { x: 85, y: 50 } }],
+      ),
+    ).toBe(points);
+  });
+
+  it('uses the same bounded entry repair when the geometry is mirrored', () => {
+    const points = [
+      { x: -150, y: 110 },
+      { x: -150, y: 150 },
+      { x: -75, y: 150 },
+      { x: -75, y: 170 },
+    ];
+    const result = chooseClearStateEntryRoute(
+      points,
+      { x: -100, y: 170, width: 80, height: 40 },
+      [],
+      [{ start: { x: -85, y: 170 }, end: { x: -85, y: 50 } }],
+    );
+    expect(result).toEqual([
+      { x: -150, y: 110 },
+      { x: -150, y: 190 },
+      { x: -100, y: 190 },
+    ]);
+  });
+
   it('selects the unoccupied side when obstacle detours have equal length', () => {
     const routed = routeOrthogonalAroundObstacles(
       [
@@ -764,6 +1115,18 @@ describe('Mermaid path terminal geometry', () => {
     expect(chooseFlowchartFeedbackTargetX(target, [34, 50, 66])).toBe(26);
     expect(chooseFlowchartFeedbackTargetX(target, [26, 42, 58, 74])).toBe(50);
     expect(chooseFlowchartFeedbackTargetX(target, [])).toBe(50);
+  });
+
+  it('allocates an inside feedback slot only on an unoccupied straight boundary', () => {
+    const target = { x: 0, y: 0, width: 100, height: 40, corner: { x: 16, y: 16 } };
+    const ports = [42, 58];
+    const slot = chooseFlowchartFeedbackInsideX(target, ports)!;
+    expect(slot).toBeGreaterThanOrEqual(16);
+    expect(slot).toBeLessThan(Math.min(...ports));
+    expect(ports.every((p) => Math.abs(p - slot) >= 16)).toBe(true);
+    expect(chooseFlowchartFeedbackInsideX(target, [20, 42, 58])).toBeUndefined();
+    expect(chooseFlowchartFeedbackInsideX(target, [])).toBeUndefined();
+    expect(chooseFlowchartFeedbackInsideX(target, [20, 80])).toBeUndefined();
   });
 
   it('builds grouped return routes on an external lane with side-center ports', () => {

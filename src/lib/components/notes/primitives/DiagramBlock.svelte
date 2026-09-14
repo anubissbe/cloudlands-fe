@@ -29,6 +29,9 @@
 
   // Expanded state
   let expanded = $state(true);
+  const instanceId = $props.id();
+  const disclosureId = `diagram-disclosure-${instanceId}`;
+  const regionId = `diagram-region-${instanceId}`;
 
   function toggleExpanded() {
     expanded = !expanded;
@@ -104,6 +107,9 @@
             type="button"
             class="flex items-center gap-1.5 text-subtle transition-colors flex-1 min-w-0 cursor-pointer"
             onclick={toggleExpanded}
+            id={disclosureId}
+            aria-expanded={expanded}
+            aria-controls={regionId}
           >
             <Fa
               icon={faChevronDown}
@@ -121,16 +127,18 @@
       {/snippet}
 
       <!-- Expanded content -->
-      {#if expanded}
-        <div transition:slide={{ duration: 150 }}>
-          <DiagramRenderer
-            diagram={primitive}
-            onUpdate={handleDiagramUpdate}
-            editable={false}
-            onBindingClick={handleBindingClick}
-          />
-        </div>
-      {/if}
+      <div id={regionId} role="region" aria-labelledby={disclosureId} aria-hidden={!expanded}>
+        {#if expanded}
+          <div transition:slide={{ duration: 150 }}>
+            <DiagramRenderer
+              diagram={primitive}
+              onUpdate={handleDiagramUpdate}
+              editable={false}
+              onBindingClick={handleBindingClick}
+            />
+          </div>
+        {/if}
+      </div>
     </DiagramPresentation>
   {:else}
     <DiagramPresentation kind="custom" selected={Boolean(selected)} exportable={false}>

@@ -14,7 +14,7 @@
     ComputedNode,
     NodeStyleConfig,
   } from './types';
-  import { DEFAULT_NODE_STYLE } from './types';
+  import { DEFAULT_NODE_STYLE, EDGE_LABEL_STYLE } from './types';
   import DiagramNodeHTML from './DiagramNodeHTML.svelte';
   import DiagramEdge from './DiagramEdge.svelte';
   import DiagramGroup from './DiagramGroup.svelte';
@@ -30,7 +30,7 @@
   import { m } from '$shared/paraglide/messages.js';
   import { shouldReduceMotion } from '$lib/utils/motion-preference';
   import { cameraMotionKeyframes, partitionSceneIds } from './diagram-motion';
-  import { walkthroughFooter } from './note-diagram-controls';
+  import { freeLabelFractions } from './diagram-label-placement';
 
   interface Props {
     diagram: DiagramPrimitive;
@@ -69,6 +69,7 @@
   let resizing = $state(false);
   let layoutResizeRevision = $state(0);
   let resizeFrame: number | undefined;
+  let fitFrame: number | undefined;
   function motionDuration(duration: number): number {
     return resizing || shouldReduceMotion() ? 0 : duration;
   }
@@ -81,6 +82,12 @@
   let layoutWidthLimit = $state(900);
   let scrollContainerEl = $state<HTMLDivElement | null>(null);
   let scrollContainerWidth = $state<number | null>(null);
+  let noteLaneWidth = $state<number | null>(null);
+  let windowHeight = $state<number | undefined>();
+  let stepViewportActive = $state(false);
+  let stepViewportStartHeight = $state<number | null>(null);
+  let restoreStepScroll: (() => void) | undefined;
+  let keepStepInView: (() => void) | undefined;
   let fontMeasurementRevision = $state(0);
 
   onMount(() => {
@@ -94,7 +101,7 @@
   });
 
   // Current state - default to first state if not set
-  // svelte-ignore state_referenced_locally - intentional: prop seeds the initial step; changeState() owns it afterwards and persists via onUpdate
+  // svelte-ignore state_referenced_locally - intentional: prop seeds the step; valid local selections survive parent echoes
   let currentStateId = $state(
     diagram.currentStateId ??
       (diagram.states && diagram.states.length > 0 ? diagram.states[0].id : undefined),
@@ -102,6 +109,7 @@
   let currentState = $derived(diagram.states?.find((s) => s.id === currentStateId) ?? null);
   // svelte-ignore state_referenced_locally - intentional: the presented state begins at the selected initial step
   let presentedStateId = $state(currentStateId);
+  let previousDiagramId: string | undefined;
   let presentedState = $derived(
     diagram.states?.find((state) => state.id === presentedStateId) ?? currentState,
   );
@@ -115,9 +123,8 @@
   let usesCompactPresentation = $derived(
     layoutWidthLimit < 500 ||
       (automaticallyFitState &&
-        presentationWidth !== null &&
-        presentationWidth > 0 &&
-        presentationWidth < 500),
+        (noteLaneWidth ?? presentationWidth ?? 0) > 0 &&
+        (noteLaneWidth ?? presentationWidth ?? 0) < 500),
   );
   let canvasPadding = $derived(usesCompactPresentation ? 4 : PADDING);
   let renderStyleConfig = $derived(
@@ -334,6 +341,7 @@
   function monitorDiagramSettlement(revision: number, previousSnapshot?: string) {
     settlementFrame = requestAnimationFrame(() => {
       if (revision !== settlementRevision) return;
+      keepStepInView?.();
       const snapshot = motionSnapshot();
       const active =
         motionPhase === 'camera' ||
@@ -351,6 +359,7 @@
         }
         diagramSettled = true;
         motionPhase = 'settled';
+        stopStepViewportTracking();
         settlementFrame = undefined;
         return;
       }
@@ -373,10 +382,12 @@
   }
 
   onDestroy(() => {
+    stopStepViewportTracking();
     transitionRevision += 1;
     settlementRevision += 1;
     if (settlementFrame !== undefined) cancelAnimationFrame(settlementFrame);
     if (resizeFrame !== undefined) cancelAnimationFrame(resizeFrame);
+    cancelFitFrame();
     for (const animation of cameraAnimations) animation.cancel();
     cameraAnimations = [];
     movingEdgeIds.clear();
@@ -606,9 +617,16 @@
         );
         const x = points[0].x + (points[1].x - points[0].x) * fraction - labelWidth / 2;
         const y = points[0].y + (points[1].y - points[0].y) * fraction - labelHeight / 2;
-        positions.set(edge.id, { x, y, width: labelWidth, height: labelHeight, truncated });
-        placedLabels.push({ x, y, width: labelWidth, height: labelHeight });
-        continue;
+        if (
+          !overlapsNode(x, y, labelWidth, labelHeight, 8) &&
+          !overlapsGroupHeader(x, y, labelWidth, labelHeight) &&
+          !overlapsRoute(x, y, labelWidth, labelHeight, edge.id) &&
+          !overlapsLabel(x, y, labelWidth, labelHeight, 1)
+        ) {
+          positions.set(edge.id, { x, y, width: labelWidth, height: labelHeight, truncated });
+          placedLabels.push({ x, y, width: labelWidth, height: labelHeight });
+          continue;
+        }
       }
 
       const candidates: Array<{ x: number; y: number; score: number }> = [];
@@ -659,6 +677,49 @@
             segmentLength + horizontalBonus - Math.abs(fraction - 0.5) * 16,
             nearestTurn >= labelExtent / 2 + labelTurnClearance ? candidates : oneSidedCandidates,
           );
+        }
+      }
+
+      // Fixed fractions can miss a small clear interval. Only on exhaustion, inspect
+      // obstacle boundaries along the same edge, then revalidate the usual predicates.
+      if (!candidates.length && !closeCandidates.length && !oneSidedCandidates.length) {
+        const obstacles = [
+          ...visibleNodes.map((node) => ({ ...node, padding: 8 })),
+          ...(layout?.groups ?? []).map((group) => ({ ...group, height: 34, padding: 0 })),
+          ...placedLabels.map((label) => ({ ...label, padding: 1 })),
+          ...visibleEdges
+            .filter((other) => other.id !== edge.id)
+            .flatMap((other) =>
+              (other.points ?? []).slice(1).map((end, index) => {
+                const start = other.points![index];
+                return {
+                  x: Math.min(start.x, end.x),
+                  y: Math.min(start.y, end.y),
+                  width: Math.abs(end.x - start.x),
+                  height: Math.abs(end.y - start.y),
+                  padding: 2,
+                };
+              }),
+            ),
+        ];
+        for (let index = 1; index < points.length; index += 1) {
+          const start = points[index - 1];
+          const end = points[index];
+          const length = Math.hypot(end.x - start.x, end.y - start.y);
+          const horizontalBonus = Math.abs(end.x - start.x) >= Math.abs(end.y - start.y) ? 1000 : 0;
+          for (const fraction of freeLabelFractions(
+            start,
+            end,
+            { width: labelWidth, height: labelHeight },
+            obstacles,
+            labelTurnClearance,
+          )) {
+            addCandidate(
+              start.x + (end.x - start.x) * fraction,
+              start.y + (end.y - start.y) * fraction,
+              length + horizontalBonus - Math.abs(fraction - 0.5) * 16,
+            );
+          }
         }
       }
 
@@ -873,45 +934,85 @@
     presentedStateId = currentStateId;
   }
 
-  // Track scroll container width for sticky footer sizing
+  // Reconcile only replacement identity or removed local steps. Parent onUpdate echoes
+  // must not rewind a valid selection or interrupt its in-flight presentation.
+  $effect.pre(() => {
+    const id = diagram.id;
+    const stateIds = diagram.states?.map((state) => state.id) ?? [];
+    const incomingStateId = diagram.currentStateId;
+    untrack(() => {
+      // Initial selection retains the existing prop-seeding contract; only updates reconcile.
+      if (previousDiagramId === undefined) {
+        previousDiagramId = id;
+        return;
+      }
+      const valid = (stateId: string | undefined) =>
+        stateId === undefined ? stateIds.length === 0 : stateIds.includes(stateId);
+      if (id === previousDiagramId && valid(currentStateId) && valid(presentedStateId)) return;
+      const keepSelection = id === previousDiagramId && valid(currentStateId);
+      previousDiagramId = id;
+      transitionRevision += 1;
+      for (const animation of cameraAnimations) animation.cancel();
+      cameraAnimations = [];
+      cancelFitFrame();
+      stopStepViewportTracking();
+      movingEdgeIds.clear();
+      if (!keepSelection) {
+        currentStateId = stateIds.find((stateId) => stateId === incomingStateId) ?? stateIds[0];
+      }
+      clearTransitionScene();
+      // Dispose the old keyed paint (including child-owned animations), not the renderer
+      // or its controls. Ordinary navigation retains the shared-scene/camera path.
+      layoutResizeRevision += 1;
+    });
+  });
+
+  // Keep the available note lane separate from the content-sized presentation.
+  // Only a lane resize interrupts motion; a step's own width change does not.
   $effect(() => {
     if (!scrollContainerEl) return;
+    const noteLane = scrollContainerEl.closest<HTMLElement>('.node-diagram_block');
+    const resizeLane = noteLane ?? rendererEl ?? scrollContainerEl;
+    let resizeLaneWidth = resizeLane.clientWidth;
     untrack(() => {
+      noteLaneWidth = noteLane?.clientWidth ?? null;
       scrollContainerWidth = scrollContainerEl!.clientWidth;
       updateFitScale();
     });
-    const observer = new ResizeObserver((entries) => {
-      for (const entry of entries) {
-        if (
-          automaticallyFitState &&
-          scrollContainerWidth !== null &&
-          Math.abs(entry.contentRect.width - scrollContainerWidth) > 0.5
-        ) {
-          // Old scene coordinates no longer fit after a lane resize. Settle that interruption
-          // immediately; ordinary step changes keep their existing motion schedule.
-          resizing = true;
-          transitionRevision += 1;
-          for (const animation of cameraAnimations) animation.cancel();
-          cameraAnimations = [];
-          movingEdgeIds.clear();
-          clearTransitionScene();
-        }
-        scrollContainerWidth = entry.contentRect.width;
-        updateFitScale();
+    const observer = new ResizeObserver(() => {
+      if (
+        automaticallyFitState &&
+        scrollContainerWidth !== null &&
+        Math.abs(resizeLane.clientWidth - resizeLaneWidth) > 0.5
+      ) {
+        // Old scene coordinates no longer fit after a lane resize. Settle that interruption
+        // immediately; ordinary step changes keep their existing motion schedule.
+        resizing = true;
+        stopStepViewportTracking();
+        transitionRevision += 1;
+        for (const animation of cameraAnimations) animation.cancel();
+        cameraAnimations = [];
+        movingEdgeIds.clear();
+        clearTransitionScene();
+      }
+      resizeLaneWidth = resizeLane.clientWidth;
+      noteLaneWidth = noteLane?.clientWidth ?? null;
+      scrollContainerWidth = scrollContainerEl!.clientWidth;
+      updateFitScale();
+      flushSync();
+      if (resizing) {
+        layoutResizeRevision += 1;
         flushSync();
-        if (resizing) {
-          layoutResizeRevision += 1;
-          flushSync();
-          for (const animation of activeFiniteAnimations()) animation.finish();
-          if (resizeFrame !== undefined) cancelAnimationFrame(resizeFrame);
-          resizeFrame = requestAnimationFrame(() => {
-            resizing = false;
-            resizeFrame = undefined;
-          });
-        }
+        for (const animation of activeFiniteAnimations()) animation.finish();
+        if (resizeFrame !== undefined) cancelAnimationFrame(resizeFrame);
+        resizeFrame = requestAnimationFrame(() => {
+          resizing = false;
+          resizeFrame = undefined;
+        });
       }
     });
     observer.observe(scrollContainerEl);
+    if (resizeLane !== scrollContainerEl) observer.observe(resizeLane);
     return () => observer.disconnect();
   });
 
@@ -963,7 +1064,7 @@
   });
 
   // Compute visible bounds when state filtering is active
-  let visibleBounds = $derived.by(() => {
+  function measureSceneBounds(includeDeparting = true) {
     if (!layout) return null;
     if (!currentState) {
       let { minX, minY, maxX, maxY } = layout.bounds;
@@ -978,9 +1079,15 @@
 
     // Compute bounds from only visible elements
     // Keep outgoing paint in the camera bounds until its existing exit finishes.
-    const nodes = [...visibleNodes, ...departingNodes, ...heldNodes];
-    const edges = [...visibleEdges, ...departingEdges, ...heldEdges];
-    const groups = [...visibleGroups, ...departingGroups, ...heldGroups];
+    const nodes = includeDeparting
+      ? [...visibleNodes, ...departingNodes, ...heldNodes]
+      : visibleNodes;
+    const edges = includeDeparting
+      ? [...visibleEdges, ...departingEdges, ...heldEdges]
+      : visibleEdges;
+    const groups = includeDeparting
+      ? [...visibleGroups, ...departingGroups, ...heldGroups]
+      : visibleGroups;
 
     if (nodes.length === 0) return { minX: 0, minY: 0, maxX: 0, maxY: 0, width: 0, height: 0 };
 
@@ -1013,8 +1120,8 @@
     // Keep edge labels inside the SVG, including multiline labels offset from their path.
     for (const label of [
       ...edgeLabelPositions.values(),
-      ...departingLabelPositions.values(),
-      ...heldLabelPositions.values(),
+      ...(includeDeparting ? departingLabelPositions.values() : []),
+      ...(includeDeparting ? heldLabelPositions.values() : []),
     ]) {
       minX = Math.min(minX, label.x);
       minY = Math.min(minY, label.y);
@@ -1023,7 +1130,11 @@
     }
 
     return { minX, minY, maxX, maxY, width: maxX - minX, height: maxY - minY };
-  });
+  }
+
+  // Frame the complete destination from the first transition frame. Departing paint
+  // remains mounted for its exit, but cannot move the incoming scene's fit or origin.
+  let visibleBounds = $derived(measureSceneBounds(false));
 
   let svgWidth = $derived.by(() => {
     if (!visibleBounds) return 800;
@@ -1036,9 +1147,12 @@
   });
 
   let contentWidth = $derived(svgWidth * renderedScale);
+  let intrinsicWidth = $derived(
+    (layout ? svgWidth * cameraZoom * Math.max(1, readableScale) : 0) + 16,
+  );
   let contentHeight = $derived((svgHeight + 6) * renderedScale);
-  // Exit geometry contributes only until its animation completes; returning to a small
-  // scene then restores that scene's height rather than retaining the largest step.
+  let destinationFrameHeight = $derived(Math.ceil((svgHeight + 6) * renderedScale + 20));
+  // Include departing paint until its exit finishes, then hug the incoming scene.
   let stateFrameHeight = $derived(
     Math.ceil(
       (svgHeight + 6) *
@@ -1046,6 +1160,124 @@
         20,
     ),
   );
+  // Target only the incoming step: held/departing paint may enlarge the drawing,
+  // but must not make the viewport detour beyond its two settled heights.
+  let stepFrameHeight = $derived.by(() => {
+    if (!stepViewportActive || !automaticallyFitState || presentationWidth === null)
+      return stateFrameHeight;
+    const incoming = measureSceneBounds(false);
+    if (!incoming) return stateFrameHeight;
+    // Predict the existing width-only fit without changing the camera or its scale.
+    const incomingScale =
+      cameraZoom *
+      Math.min(
+        noteLaneWidth === null ? 1.25 : Math.max(1, readableScale),
+        Math.max(
+          readableScale,
+          Math.max(1, presentationWidth - 16) /
+            Math.max(1, (incoming.width + canvasPadding * 2) * cameraZoom),
+        ),
+      );
+    const targetHeight = Math.ceil((incoming.height + canvasPadding * 2 + 6) * incomingScale + 20);
+    // Keep held source nodes visible until the existing camera stage releases them.
+    // A rapid reversal starts here from the currently painted height, not an old endpoint.
+    if (
+      motionPhase === 'camera' &&
+      stepViewportStartHeight !== null &&
+      targetHeight < stepViewportStartHeight
+    )
+      return stepViewportStartHeight;
+    return targetHeight;
+  });
+  let stepContentHeight = $derived.by(() => {
+    if (!stepViewportActive || stepViewportStartHeight === null) return stateFrameHeight;
+    const endpointHeight = Math.max(stepViewportStartHeight, stepFrameHeight);
+    // Capped steps retain the natural frame so native scrolling can expose all paint.
+    if (endpointHeight >= (windowHeight ?? Infinity) * 0.9 - 1) {
+      const retained = measureSceneBounds(true);
+      const retainedBottomOverflow =
+        retained && visibleBounds
+          ? Math.max(
+              0,
+              retained.height - visibleBounds.height,
+              retained.maxY - visibleBounds.maxY,
+            ) * renderedScale
+          : 0;
+      return stateFrameHeight + retainedBottomOverflow;
+    }
+    // A temporary scene union must not center departing paint below both endpoints.
+    return Math.min(stateFrameHeight, endpointHeight);
+  });
+  let drawingOverflows = $derived(
+    automaticallyFitState &&
+      ((windowHeight !== undefined && stateFrameHeight > windowHeight * 0.9 + 1) ||
+        (presentationWidth !== null && contentWidth + 16 > presentationWidth + 1)),
+  );
+
+  function stopStepViewportTracking() {
+    stepViewportActive = false;
+    stepViewportStartHeight = null;
+    keepStepInView = undefined;
+    restoreStepScroll?.();
+    restoreStepScroll = undefined;
+  }
+
+  function startStepViewportTracking() {
+    stopStepViewportTracking();
+    if (!rendererEl) return;
+    stepViewportStartHeight = scrollContainerEl?.getBoundingClientRect().height ?? null;
+    stepViewportActive = true;
+    const renderer = rendererEl;
+    const ancestors: HTMLElement[] = [];
+    for (let parent = renderer.parentElement; parent; parent = parent.parentElement) {
+      if (/(auto|scroll)/.test(getComputedStyle(parent).overflowY)) ancestors.push(parent);
+    }
+    const page = document.scrollingElement as HTMLElement | null;
+    if (page && !ancestors.includes(page)) ancestors.push(page);
+    // Browser anchoring must not compete with the bounded, step-owned adjustment.
+    const anchoring = ancestors.map((element) => ({
+      element,
+      value: element.style.getPropertyValue('overflow-anchor'),
+      priority: element.style.getPropertyPriority('overflow-anchor'),
+    }));
+    for (const { element } of anchoring) element.style.setProperty('overflow-anchor', 'none');
+    const stopFollowing = () => {
+      keepStepInView = undefined;
+    };
+    // A wheel/touch/key gesture belongs to the user, even during an unfinished step.
+    for (const type of ['wheel', 'touchstart', 'keydown'])
+      window.addEventListener(type, stopFollowing, { capture: true, passive: true });
+    restoreStepScroll = () => {
+      for (const { element, value, priority } of anchoring) {
+        if (value) element.style.setProperty('overflow-anchor', value, priority);
+        else element.style.removeProperty('overflow-anchor');
+      }
+      for (const type of ['wheel', 'touchstart', 'keydown'])
+        window.removeEventListener(type, stopFollowing, true);
+    };
+    keepStepInView = () => {
+      const footer = renderer.querySelector<HTMLElement>('.diagram-footer');
+      if (!footer) return;
+      for (const ancestor of ancestors) {
+        const bounds = ancestor.getBoundingClientRect();
+        const top = ancestor === page ? 0 : Math.max(0, bounds.top + ancestor.clientTop);
+        const bottom =
+          ancestor === page
+            ? window.innerHeight
+            : Math.min(window.innerHeight, bounds.top + ancestor.clientTop + ancestor.clientHeight);
+        if (bottom <= top) continue;
+        const footerBounds = footer.getBoundingClientRect();
+        // Only reveal clipped controls. Do not recenter unrelated note/page content.
+        const target =
+          footerBounds.height <= bottom - top
+            ? footerBounds
+            : footer.querySelector('.state-navigation')!.getBoundingClientRect();
+        const delta =
+          target.bottom > bottom ? target.bottom - bottom : target.top < top ? target.top - top : 0;
+        if (Math.abs(delta) > 0.5) ancestor.scrollBy({ top: delta, behavior: 'instant' });
+      }
+    };
+  }
 
   let svgTransform = $derived.by(() => {
     if (!visibleBounds) return 'translate(0, 0)';
@@ -1063,6 +1295,7 @@
       return;
     }
     const availableWidth = Math.max(1, scrollContainerEl.clientWidth - 16);
+    const layoutAvailableWidth = Math.max(1, (noteLaneWidth ?? scrollContainerEl.clientWidth) - 16);
     // A stateful canvas follows its content. Its own height must not feed back into fitting.
     const availableHeight = automaticallyFitState
       ? Number.POSITIVE_INFINITY
@@ -1071,16 +1304,16 @@
     const renderedHeight = Math.max(1, svgHeight * cameraZoom);
     const verticalStateWidthFloor =
       automaticallyFitState &&
-      availableWidth >= 500 &&
+      layoutAvailableWidth >= 500 &&
       ['TB', 'BT'].includes(diagram.baseView.layout.direction ?? '')
         ? 500
         : 160;
     layoutWidthLimit = Math.max(
       verticalStateWidthFloor,
-      availableWidth / readableScale - canvasPadding * 2,
+      layoutAvailableWidth / readableScale - canvasPadding * 2,
     );
     fitScale = Math.min(
-      1.25,
+      noteLaneWidth === null ? 1.25 : Math.max(1, readableScale),
       Math.max(
         readableScale,
         Math.min(availableWidth / renderedWidth, availableHeight / renderedHeight),
@@ -1088,10 +1321,17 @@
     );
   }
 
+  function cancelFitFrame() {
+    if (fitFrame !== undefined) cancelAnimationFrame(fitFrame);
+    fitFrame = undefined;
+  }
+
   function toggleFitToWidth() {
+    cancelFitFrame();
     fitToWidth = !fitToWidth;
     updateFitScale();
-    requestAnimationFrame(() => {
+    fitFrame = requestAnimationFrame(() => {
+      fitFrame = undefined;
       updateFitScale();
       scrollContainerEl?.scrollTo({
         left: 0,
@@ -1130,6 +1370,8 @@
     }
     if (nextViewResetKey === previousViewResetKey) return;
     previousViewResetKey = nextViewResetKey;
+    cancelFitFrame();
+    stopStepViewportTracking();
     fitToWidth = false;
     fitScale = 1;
     scrollContainerEl?.scrollTo({ left: 0, top: 0, behavior: 'auto' });
@@ -1138,6 +1380,7 @@
   // Handle state change
   function changeState(stateId: string) {
     if (stateId === currentStateId) return;
+    startStepViewportTracking();
     const previousCameraStage = captureCameraStage();
     cameraSourceScale = previousCameraStage.scale;
     transitionRevision += 1;
@@ -1214,6 +1457,7 @@
 
     // Notify parent so consumers (e.g. TipTap DiagramBlock) can persist the selected step
     onUpdate?.({ currentStateId: stateId });
+    keepStepInView?.();
   }
 
   function handleEdgeMotion(edgeId: string, moving: boolean) {
@@ -1241,6 +1485,13 @@
   }
 </script>
 
+<svelte:window
+  bind:innerHeight={windowHeight}
+  onresize={() => {
+    stepViewportStartHeight = null;
+  }}
+/>
+
 <div
   bind:this={rendererEl}
   class="diagram-renderer"
@@ -1250,6 +1501,11 @@
   class:stateful-diagram={Boolean(diagram.states?.length)}
   class:camera-stage={motionPhase === 'camera'}
   class:resizing
+  data-diagram-intrinsic-width={intrinsicWidth}
+  style={`--diagram-edge-label-font-size: ${EDGE_LABEL_STYLE.fontSize}px;
+    --diagram-edge-label-line-height: ${EDGE_LABEL_STYLE.lineHeight};
+    --diagram-edge-label-padding-x: ${EDGE_LABEL_STYLE.paddingX}px;
+    --diagram-edge-label-padding-y: ${EDGE_LABEL_STYLE.paddingY}px;`}
   style:--diagram-camera-duration={`${motionDuration(CAMERA_MOTION_MS)}ms`}
   style:--diagram-camera-easing={CAMERA_MOTION_EASING}
   style:--diagram-move-exit-duration={`${motionDuration(MOVE_EXIT_MS)}ms`}
@@ -1280,10 +1536,17 @@
     </div>
   {/if}
   <!-- Scrollable diagram content -->
+  <!-- svelte-ignore a11y_no_noninteractive_tabindex (The named drawing region needs keyboard access only when it scrolls.) -->
   <div
     class="diagram-scroll-container"
+    class:stepping-viewport={stepViewportActive}
     bind:this={scrollContainerEl}
-    style:height={automaticallyFitState ? `${stateFrameHeight}px` : undefined}
+    role={automaticallyFitState ? 'region' : undefined}
+    aria-label={automaticallyFitState ? m.diagram_controls_walkthrough_ariaLabel() : undefined}
+    tabindex={drawingOverflows ? 0 : undefined}
+    style:height={automaticallyFitState
+      ? `${Math.min(stepFrameHeight, (windowHeight ?? Infinity) * 0.9)}px`
+      : undefined}
   >
     {#if layoutError}
       <div class="diagram-feedback" role="alert">
@@ -1298,14 +1561,19 @@
     {:else}
       <div
         class="diagram-content"
-        style:width={automaticallyFitState ? '100%' : `${contentWidth}px`}
-        style:height={automaticallyFitState ? '100%' : `${contentHeight}px`}
+        style:width={automaticallyFitState
+          ? `max(100%, ${contentWidth + 16}px)`
+          : `${contentWidth}px`}
+        style:height={automaticallyFitState
+          ? `max(100%, ${stepContentHeight}px)`
+          : `${contentHeight}px`}
       >
         <!-- SVG Layer (edges, groups, and HTML overlay) -->
         <svg
           class="diagram-svg-layer"
           width={svgWidth}
           height={svgHeight + 6}
+          style:top={automaticallyFitState ? `${destinationFrameHeight / 2}px` : undefined}
           style:transform={cameraTransformStyle}
         >
           <!-- Shared marker definitions scoped by diagram ID to avoid cross-diagram conflicts -->
@@ -1601,16 +1869,10 @@
     {/if}
   </div>
 
-  <!-- Footer with controls and narrative (only show if states exist) - sticky at bottom -->
+  <!-- Reserve the final row for this diagram's controls, outside its drawing viewport. -->
   {#if !layoutError && diagram.model.nodes.length > 0 && diagram.states && diagram.states.length > 0}
-    <div class="diagram-controls-slot">
-      <div
-        class="diagram-footer"
-        use:walkthroughFooter
-        style:width={scrollContainerWidth != null ? `${scrollContainerWidth}px` : '100%'}
-      >
-        <DiagramControls states={diagram.states} {currentStateId} onStateChange={changeState} />
-      </div>
+    <div class="diagram-footer">
+      <DiagramControls states={diagram.states} {currentStateId} onStateChange={changeState} />
     </div>
   {/if}
 </div>
@@ -1693,20 +1955,17 @@
   }
 
   .stateful-diagram .diagram-scroll-container {
-    display: grid;
-    place-items: center;
-    overflow: hidden;
+    overflow: auto;
+    max-height: 90vh;
+  }
+
+  .stepping-viewport {
+    transition: height var(--diagram-move-exit-duration) var(--diagram-camera-easing);
   }
 
   .stateful-diagram .diagram-content {
     min-width: 100%;
     min-height: 100%;
-  }
-
-  .stateful-diagram .diagram-footer :global(.controls-inner) {
-    display: grid;
-    grid-template-columns: minmax(0, 1fr) auto;
-    align-items: start;
   }
 
   .resizing :global(*) {
@@ -1754,21 +2013,11 @@
       var(--diagram-camera-easing, cubic-bezier(0.65, 0, 0.35, 1));
   }
 
-  .diagram-controls-slot {
-    display: contents;
-    grid-column: 1;
-    grid-row: 3;
-    min-width: 0;
-  }
-
   .diagram-footer {
     grid-column: 1;
     grid-row: 3;
-    position: sticky;
-    bottom: 0;
-    align-self: end;
+    min-width: 0;
     flex-shrink: 0;
-    z-index: 1;
     box-sizing: border-box;
     overflow: hidden;
   }
@@ -1862,13 +2111,13 @@
     border: 0;
     border-radius: 2px;
     font-family: var(--font-ui);
-    font-size: var(--text-caption-size);
+    font-size: var(--diagram-edge-label-font-size);
     font-weight: var(--text-body-weight);
-    line-height: var(--text-caption-line-height);
+    line-height: var(--diagram-edge-label-line-height);
     letter-spacing: var(--text-caption-tracking);
     color: hsl(var(--muted-foreground));
     background: transparent;
-    padding: 4px 6px;
+    padding: var(--diagram-edge-label-padding-y) var(--diagram-edge-label-padding-x);
     overflow: hidden;
     overflow-wrap: normal;
     word-break: normal;
@@ -1904,10 +2153,6 @@
     white-space: pre-line;
     -webkit-box-orient: vertical;
     -webkit-line-clamp: 3;
-  }
-
-  :global(.edge-label-container[data-semantic-style='danger'] .edge-label-html) {
-    color: hsl(var(--danger));
   }
 
   :global(.catalog-reduced-motion .edge-label-container),

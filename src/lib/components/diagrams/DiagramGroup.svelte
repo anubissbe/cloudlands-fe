@@ -104,8 +104,8 @@
   :global(.group-label) {
     fill: var(--diagram-metadata);
     font-family: var(--font-ui);
-    font-size: var(--text-body-size);
-    font-weight: 500;
+    font-size: var(--diagram-edge-label-font-size, 11px);
+    font-weight: var(--text-caption-weight);
     letter-spacing: var(--text-caption-tracking);
     pointer-events: none;
     transition:

@@ -13,6 +13,7 @@
   import { cubicOut } from 'svelte/easing';
   import { m } from '$shared/paraglide/messages.js';
   import { shouldReduceMotion } from '$lib/utils/motion-preference';
+  import { onDestroy } from 'svelte';
 
   interface Props {
     states: DiagramState[];
@@ -44,6 +45,7 @@
   // Hover state for each segment
   let hoveredIndex = $state<number | null>(null);
   let navigationElement = $state<HTMLDivElement | null>(null);
+  let focusFrame: number | undefined;
 
   function motionDuration(duration: number): number {
     return shouldReduceMotion() ? 0 : duration;
@@ -66,14 +68,22 @@
 
   function goToState(index: number) {
     previousIndex = currentIndex;
+    hoveredIndex = null;
     onStateChange(states[index].id);
   }
 
   function focusStep(index: number) {
-    requestAnimationFrame(() => {
+    if (focusFrame !== undefined) cancelAnimationFrame(focusFrame);
+    const stateId = states[index]?.id;
+    const stateList = states;
+    const navigation = navigationElement;
+    focusFrame = requestAnimationFrame(() => {
+      focusFrame = undefined;
+      if (navigation !== navigationElement || stateId !== currentStateId || stateList !== states)
+        return;
       navigationElement
         ?.querySelector<HTMLButtonElement>(`[data-diagram-step-index="${index}"]`)
-        ?.focus();
+        ?.focus({ preventScroll: true });
     });
   }
 
@@ -94,6 +104,10 @@
     goToState(nextIndex);
     focusStep(nextIndex);
   }
+
+  onDestroy(() => {
+    if (focusFrame !== undefined) cancelAnimationFrame(focusFrame);
+  });
 </script>
 
 <div class="diagram-controls">
@@ -160,7 +174,11 @@
 
           <!-- Hover card -->
           {#if hoveredIndex === index && stateNarrative}
-            <HoverCard anchor="--segment-{index}" position="top" class="rounded-md">
+            <HoverCard
+              anchor="--segment-{index}"
+              position="top"
+              class="rounded-md !pointer-events-none"
+            >
               <div class="p-2.5">
                 {#if stateNarrative.title}
                   <div class="text-xs font-medium mb-0.5">{stateNarrative.title}</div>
@@ -218,6 +236,7 @@
 
 <style>
   .diagram-controls {
+    container-type: inline-size;
     pointer-events: auto;
     border-top: 1px solid hsl(var(--border));
     background: hsl(var(--card));
@@ -226,24 +245,30 @@
   }
 
   .controls-inner {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    flex-wrap: wrap;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    width: min(100%, var(--diagram-controls-width, 100%));
+    box-sizing: border-box;
+    margin-inline: auto;
     gap: var(--space-2) var(--space-3);
     padding: var(--space-2) var(--space-3);
   }
 
   .narrative-region {
     display: grid;
-    flex: 1 1 13rem;
+    grid-row: 2;
     min-width: 0;
+  }
+
+  .narrative-region:empty {
+    display: none;
   }
 
   .narrative {
     grid-column: 1;
     grid-row: 1;
     overflow: hidden;
+    overflow-wrap: anywhere;
     text-align: left;
   }
 
@@ -269,17 +294,37 @@
   }
 
   .state-navigation {
-    flex: none;
+    grid-row: 1;
+    min-width: 0;
+    max-width: 100%;
     gap: var(--space-1);
-    margin-left: auto;
+    justify-content: flex-end;
+    align-self: start;
+  }
+
+  @container (min-width: 28rem) {
+    .controls-inner {
+      grid-template-columns: minmax(0, 1fr) auto;
+    }
+
+    .narrative-region {
+      grid-row: 1;
+    }
+
+    .state-navigation {
+      grid-column: 2;
+    }
   }
 
   .stepper {
     gap: 2px;
+    min-width: 0;
+    flex-wrap: wrap;
   }
 
   .navigation-buttons {
     gap: 2px;
+    flex-shrink: 0;
   }
 
   .step-counter {

@@ -296,8 +296,8 @@ describe('Layout Engine', () => {
 
   it('expands route-label height for every measured line', () => {
     expect(measureEdgeLabel('send message').lines).toBe(1);
-    expect(measureEdgeLabel('send message')).toMatchObject({ lines: 1, height: 28 });
-    expect(measureEdgeLabel('asks for\ninput')).toMatchObject({ lines: 2, height: 46 });
+    expect(measureEdgeLabel('send message')).toMatchObject({ lines: 1, height: 21.86 });
+    expect(measureEdgeLabel('asks for\ninput')).toMatchObject({ lines: 2, height: 35.72 });
     expect(measureEdgeLabel('one two three four five six seven eight').lines).toBeGreaterThan(1);
     expect(measureEdgeLabel('stream state events')).toMatchObject({ width: 112, lines: 2 });
     expect(measureEdgeLabel('x'.repeat(40))).toMatchObject({ lines: 1 });

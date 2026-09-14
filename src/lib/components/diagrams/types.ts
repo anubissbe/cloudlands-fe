@@ -59,6 +59,14 @@ export const DEFAULT_NODE_STYLE: NodeStyleConfig = {
   maxWidth: 250,
 };
 
+/** Shared by connector measurement and paint; secondary size, compact multiline rhythm. */
+export const EDGE_LABEL_STYLE = Object.freeze({
+  fontSize: DEFAULT_NODE_STYLE.kindFontSize,
+  lineHeight: DEFAULT_NODE_STYLE.labelLineHeight,
+  paddingX: 6,
+  paddingY: 4,
+});
+
 /**
  * Computed node position and size for rendering
  */

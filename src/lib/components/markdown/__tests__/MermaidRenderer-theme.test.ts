@@ -102,6 +102,45 @@ describe('MermaidRenderer theme updates', () => {
     });
   });
 
+  it('does not initialize or render an unmounted diagram waiting in the queue', async () => {
+    let finish!: (value: { svg: string }) => void;
+    mermaidMocks.render.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finish = resolve;
+        }),
+    );
+    render(MermaidRenderer, { code: 'sequenceDiagram\nA->>B: First' });
+    await waitFor(() => expect(mermaidMocks.render).toHaveBeenCalledOnce());
+    const stale = render(MermaidRenderer, { code: 'sequenceDiagram\nA->>B: Cancelled' });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    stale.unmount();
+    const current = render(MermaidRenderer, { code: 'sequenceDiagram\nA->>B: Current' });
+    finish({ svg: '<svg aria-roledescription="sequence"></svg>' });
+    await waitFor(() => expect(mermaidMocks.render).toHaveBeenCalledTimes(2));
+    expect(mermaidMocks.initialize).toHaveBeenCalledTimes(2);
+    expect(mermaidMocks.render.mock.calls[1]?.[1]).toContain('Current');
+    expect(current.container.querySelector('svg')).toBeTruthy();
+  });
+
+  it('discards obsolete output and skips superseded queued code', async () => {
+    let finish!: (value: { svg: string }) => void;
+    mermaidMocks.render.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finish = resolve;
+        }),
+    );
+    const view = render(MermaidRenderer, { code: 'sequenceDiagram\nA->>B: First' });
+    await waitFor(() => expect(mermaidMocks.render).toHaveBeenCalledOnce());
+    await view.rerender({ code: 'sequenceDiagram\nA->>B: Superseded' });
+    await view.rerender({ code: 'sequenceDiagram\nA->>B: Current' });
+    finish({ svg: '<svg data-obsolete="true" aria-roledescription="sequence"></svg>' });
+    await waitFor(() => expect(mermaidMocks.render).toHaveBeenCalledTimes(2));
+    expect(mermaidMocks.render.mock.calls[1]?.[1]).toContain('Current');
+    expect(view.container.querySelector('[data-obsolete]')).toBeNull();
+  });
+
   it('joins automatic note wraps without removing authored line breaks or tspan text', async () => {
     const getBBox = Object.getOwnPropertyDescriptor(SVGElement.prototype, 'getBBox');
     const viewBox = Object.getOwnPropertyDescriptor(SVGSVGElement.prototype, 'viewBox');

@@ -1,4 +1,5 @@
 import { expect, test, type Locator } from '@playwright/test';
+import { expectDrawingReachable } from './diagram-scroll-reachability';
 
 const baseUrl = process.env.UI_PREVIEW_BASE_URL ?? 'http://127.0.0.1:5173';
 const fixtures = [
@@ -18,7 +19,9 @@ const fixtures = [
 
 function sceneGeometry(element: Element) {
   const viewport = element.querySelector('.diagram-scroll-container')!.getBoundingClientRect();
+  const drawing = element.querySelector('.diagram-content')!.getBoundingClientRect();
   const svg = element.querySelector<SVGSVGElement>('svg.diagram-svg-layer')!;
+  const svgBox = svg.getBoundingClientRect();
   const scale = Math.hypot(svg.getScreenCTM()!.a, svg.getScreenCTM()!.b);
   const painted = [
     ...element.querySelectorAll<SVGGraphicsElement>(
@@ -55,15 +58,16 @@ function sceneGeometry(element: Element) {
     settled: element.getAttribute('data-diagram-settled') === 'true',
     width: viewport.width,
     height: viewport.height,
+    drawingHeight: drawing.height,
     topGap: Math.min(...boxes.map((box) => box.top)) - viewport.top,
     bottomGap: viewport.bottom - Math.max(...boxes.map((box) => box.bottom)),
     overflow: Math.max(
       0,
       ...boxes.flatMap((box) => [
-        viewport.left - box.left,
-        box.right - viewport.right,
-        viewport.top - box.top,
-        box.bottom - viewport.bottom,
+        Math.max(drawing.left, svgBox.left) - box.left,
+        box.right - Math.min(drawing.right, svgBox.right),
+        Math.max(drawing.top, svgBox.top) - box.top,
+        box.bottom - Math.min(drawing.bottom, svgBox.bottom),
       ]),
     ),
     nodes: [...element.querySelectorAll('[data-node-id]')]
@@ -138,6 +142,7 @@ for (const fixture of fixtures) {
           const samples = await sampleStep(root, index);
           transitions.push(samples);
           scenes.push(samples.at(-1)!);
+          await expectDrawingReachable(root);
           await root.screenshot({
             path: testInfo.outputPath(`step-${scenes.length}-${index}.png`),
           });
@@ -171,9 +176,12 @@ for (const fixture of fixtures) {
           expect(scene.topGap, JSON.stringify(scene)).toBeLessThanOrEqual(64);
           expect(scene.bottomGap, JSON.stringify(scene)).toBeLessThanOrEqual(64);
         }
-        expect(Math.max(...scenes.map((scene) => scene.height))).toBeGreaterThan(
+        expect(Math.max(...scenes.map((scene) => scene.drawingHeight))).toBeGreaterThan(
           scenes[0].height + 40,
         );
+        expect(
+          Math.max(...scenes.map((scene) => Math.abs(scene.height - scenes[0].height))),
+        ).toBeLessThanOrEqual(1);
       });
     }
   }

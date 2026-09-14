@@ -1206,6 +1206,99 @@ test('animates delivery nodes and painted connections between Observe and Publis
   }
 });
 
+test('targets complete delivery scene geometry before incoming content appears', async ({
+  page,
+}) => {
+  await openMotionFixture(page, 'custom-delivery-walkthrough');
+  const root = page.locator('#custom-delivery-walkthrough');
+  const renderer = root.locator('.diagram-renderer');
+  for (const state of ['verify', 'publish', 'observe']) {
+    await root.getByRole('button', { name: 'Next step' }).click();
+    await expect(renderer).toHaveAttribute('data-diagram-state', state);
+    await expect(renderer).toHaveAttribute('data-diagram-settled', 'true');
+  }
+
+  for (const [stepIndex, enteringNodeId] of [
+    [2, 'artifact'],
+    [3, 'updater'],
+  ] as const) {
+    const samples = await root.evaluate(
+      async (element, target) => {
+        const diagram = element.querySelector<HTMLElement>('.diagram-renderer')!;
+        const nextFrame = () =>
+          new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+        const read = () => {
+          const node = element.querySelector<SVGForeignObjectElement>('[data-node-id="registry"]')!;
+          const nodeStyle = getComputedStyle(node);
+          const bounds = node.getBoundingClientRect();
+          const enteringNode = element.querySelector<SVGForeignObjectElement>(
+            `[data-node-id="${target.enteringNodeId}"]`,
+          );
+          const svg = element.querySelector<SVGSVGElement>('.diagram-svg-layer')!;
+          return {
+            phase: diagram.dataset.diagramMotionPhase,
+            settled: diagram.dataset.diagramSettled === 'true',
+            local: { x: Number.parseFloat(nodeStyle.x), y: Number.parseFloat(nodeStyle.y) },
+            screen: { x: bounds.x, y: bounds.y },
+            enteringOpacity: enteringNode ? Number(getComputedStyle(enteringNode).opacity) : 0,
+            frame: { width: svg.width.baseVal.value, height: svg.height.baseVal.value },
+          };
+        };
+        const frames = [read()];
+        element
+          .querySelector<HTMLButtonElement>(`[data-diagram-step-index="${target.stepIndex}"]`)!
+          .click();
+        let settledFrames = 0;
+        for (let frame = 0; frame < 120 && settledFrames < 4; frame += 1) {
+          await nextFrame();
+          const sample = read();
+          frames.push(sample);
+          settledFrames = sample.settled ? settledFrames + 1 : 0;
+        }
+        return frames;
+      },
+      { stepIndex, enteringNodeId },
+    );
+    const destination = samples.at(-1)!;
+    const afterSelection = samples.slice(1);
+    const distance = (left: { x: number; y: number }, right: { x: number; y: number }) =>
+      Math.hypot(left.x - right.x, left.y - right.y);
+    const destinationLocal = afterSelection.findIndex(
+      ({ local }) => distance(local, destination.local) <= 0.25,
+    );
+    const entryStart = afterSelection.findIndex(({ enteringOpacity }) => enteringOpacity > 0.01);
+
+    expect(destinationLocal).toBeGreaterThanOrEqual(0);
+    expect(entryStart).toBeGreaterThan(destinationLocal);
+    expect(
+      afterSelection.every(
+        ({ frame }) =>
+          Math.abs(frame.width - destination.frame.width) <= 0.1 &&
+          Math.abs(frame.height - destination.frame.height) <= 0.1,
+      ),
+      JSON.stringify(afterSelection.map(({ phase, frame }) => ({ phase, frame }))),
+    ).toBe(true);
+    expect(
+      afterSelection
+        .slice(destinationLocal)
+        .every(({ local }) => distance(local, destination.local) <= 0.25),
+    ).toBe(true);
+    expect(
+      afterSelection
+        .slice(entryStart)
+        .every(({ screen }) => distance(screen, destination.screen) <= 1),
+      JSON.stringify(
+        afterSelection.slice(entryStart).map(({ phase, local, screen, enteringOpacity }) => ({
+          phase,
+          local,
+          screen,
+          enteringOpacity,
+        })),
+      ),
+    ).toBe(true);
+  }
+});
+
 test('animates the untouched initial ownership step before the following step', async ({
   page,
 }) => {
@@ -1328,6 +1421,186 @@ test('animates the untouched initial ownership step before the following step', 
       ),
     ).toBe(true);
   }
+});
+
+for (const width of [960, 320]) {
+  test(`keeps the short ownership kind label on one line at ${width}px`, async ({ page }) => {
+    await page.emulateMedia({ reducedMotion: 'no-preference' });
+    await page.goto(
+      `${baseUrl}/sandbox/diagram-workbench?state=custom-walkthrough&theme=light&width=${width}&motion=full`,
+      { waitUntil: 'domcontentloaded' },
+    );
+    await expect(page.getByTestId('catalog-scene')).toHaveAttribute('data-preview-ready', 'true', {
+      timeout: 30_000,
+    });
+
+    const lineTops = await page
+      .locator('#custom-walkthrough [data-node-id="chat"] .node-kind-label')
+      .evaluate((label) => {
+        const range = document.createRange();
+        range.selectNodeContents(label);
+        return [...range.getClientRects()].map(({ top }) => Math.round(top * 10) / 10);
+      });
+    expect(new Set(lineTops).size).toBe(1);
+  });
+}
+
+test('keeps transient retained-route corners rounded', async ({ page }) => {
+  await openMotionFixture(page, 'custom-walkthrough');
+  const root = page.locator('#custom-walkthrough');
+  await root.getByRole('button', { name: 'State 2: 2. Follow execution' }).click();
+  await expect(root.locator('.diagram-renderer')).toHaveAttribute('data-diagram-settled', 'true');
+
+  const paths = await root.evaluate(async (element) => {
+    const renderer = element.querySelector<HTMLElement>('.diagram-renderer')!;
+    const readPath = () => {
+      const path = element.querySelector<SVGPathElement>(
+        '.diagram-edge[data-edge-id="w5"] path.edge-path',
+      )!;
+      const length = path.getTotalLength();
+      const start = path.getPointAtLength(0);
+      const end = path.getPointAtLength(length);
+      return {
+        d: path.getAttribute('d') ?? '',
+        excessLength: length - Math.hypot(end.x - start.x, end.y - start.y),
+      };
+    };
+    const samples = [readPath()];
+    element.querySelector<HTMLButtonElement>('[data-diagram-step-index="2"]')!.click();
+    for (let frame = 0; frame < 120; frame += 1) {
+      await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+      samples.push(readPath());
+      if (renderer.dataset.diagramSettled === 'true' && frame > 1) break;
+    }
+    return samples;
+  });
+  const bentPaths = paths.filter(({ excessLength }) => excessLength > 0.5);
+  expect(bentPaths.length).toBeGreaterThan(0);
+  expect(bentPaths.every(({ d }) => d.includes(' Q '))).toBe(true);
+});
+
+test('keeps ownership motion when a scrollbar gutter changes only the viewport width', async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 941, height: 700 });
+  await openMotionFixture(page, 'custom-walkthrough');
+  await page.addStyleTag({
+    content:
+      '#custom-walkthrough .diagram-scroll-container.stepping-viewport { scrollbar-gutter: stable; }',
+  });
+
+  const transitions = await page.locator('#custom-walkthrough').evaluate(async (root) => {
+    const renderer = root.querySelector<HTMLElement>('.diagram-renderer')!;
+    const viewport = root.querySelector<HTMLElement>('.diagram-scroll-container')!;
+    const nextFrame = () => new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+    const edgeReveal = (edgeId: string) => {
+      const edge = root.querySelector<SVGGElement>(
+        `.diagram-edge[data-edge-id="${edgeId}"]`,
+      )?.parentElement;
+      if (!edge) return null;
+      const value = getComputedStyle(edge).getPropertyValue('--edge-reveal-progress').trim();
+      return value === '' ? 1 : Number(value);
+    };
+    const record = async (
+      stepIndex: number,
+      sharedSelectors: string[],
+      enteringNodeId: string,
+      enteringEdgeId: string,
+      exitingEdgeId: string,
+    ) => {
+      const shared = sharedSelectors.map((selector) => root.querySelector(selector));
+      const samples = [];
+      const read = () => {
+        const enteringNode = root.querySelector<SVGForeignObjectElement>(
+          `[data-node-id="${enteringNodeId}"]`,
+        );
+        samples.push({
+          phase: renderer.dataset.diagramMotionPhase,
+          settled: renderer.dataset.diagramSettled === 'true',
+          rendererWidth: renderer.getBoundingClientRect().width,
+          viewportWidth: viewport.clientWidth,
+          sharedIdentity: sharedSelectors.every(
+            (selector, index) => root.querySelector(selector) === shared[index],
+          ),
+          enteringOpacity: enteringNode ? Number(getComputedStyle(enteringNode).opacity) : null,
+          enteringReveal: edgeReveal(enteringEdgeId),
+          exitingReveal: edgeReveal(exitingEdgeId),
+        });
+      };
+      read();
+      root.querySelector<HTMLButtonElement>(`[data-diagram-step-index="${stepIndex}"]`)!.click();
+      for (let frame = 0; frame < 120; frame += 1) {
+        await nextFrame();
+        read();
+        if (samples.at(-1)!.settled && frame > 1) break;
+      }
+      return samples;
+    };
+
+    return [
+      await record(
+        1,
+        ['[data-node-id="chat"]', '[data-node-id="redux"]', '.diagram-edge[data-edge-id="w3"]'],
+        'daemon',
+        'w4',
+        'w1',
+      ),
+      await record(
+        2,
+        [
+          '[data-node-id="chat"]',
+          '[data-node-id="redux"]',
+          '[data-node-id="daemon"]',
+          '.diagram-edge[data-edge-id="w5"]',
+        ],
+        'user',
+        'w2',
+        'w3',
+      ),
+    ];
+  });
+
+  const fractional = (value: number | null) => value !== null && value > 0 && value < 1;
+  for (const samples of transitions) {
+    expect(Math.max(...samples.map(({ rendererWidth }) => rendererWidth))).toBe(
+      Math.min(...samples.map(({ rendererWidth }) => rendererWidth)),
+    );
+    expect(Math.max(...samples.map(({ viewportWidth }) => viewportWidth))).toBeGreaterThan(
+      Math.min(...samples.map(({ viewportWidth }) => viewportWidth)),
+    );
+    expect(samples.every(({ sharedIdentity }) => sharedIdentity)).toBe(true);
+    expect(samples.some(({ phase }) => phase === 'exit')).toBe(true);
+    expect(samples.some(({ phase }) => phase === 'scene')).toBe(true);
+    expect(samples.some(({ enteringReveal }) => fractional(enteringReveal))).toBe(true);
+    expect(samples.some(({ exitingReveal }) => fractional(exitingReveal))).toBe(true);
+  }
+  expect(transitions[0].some(({ enteringOpacity }) => fractional(enteringOpacity))).toBe(true);
+});
+
+test('settles an ownership step interrupted by a genuine outer lane resize', async ({ page }) => {
+  await page.setViewportSize({ width: 941, height: 700 });
+  await openMotionFixture(page, 'custom-walkthrough');
+  const root = page.locator('#custom-walkthrough');
+  const renderer = root.locator('.diagram-renderer');
+  const sharedChat = await root.locator('[data-node-id="chat"]').elementHandle();
+  const beforeWidth = await renderer.evaluate((element) => element.getBoundingClientRect().width);
+
+  await root.getByRole('button', { name: 'State 2: 2. Follow execution' }).click();
+  await expect(renderer).toHaveAttribute('data-diagram-motion-phase', 'camera');
+  await page.setViewportSize({ width: 861, height: 700 });
+
+  await expect(renderer).toHaveAttribute('data-diagram-settled', 'true');
+  await expect(renderer).toHaveAttribute('data-diagram-state', 'execute');
+  await expect(root.locator('[data-node-id="daemon"]')).toHaveCSS('opacity', '1');
+  await expect(root.locator('.diagram-edge[data-edge-id="w4"]')).toHaveAttribute(
+    'data-edge-motion-progress',
+    '1',
+  );
+  expect(await renderer.evaluate((element) => element.getBoundingClientRect().width)).toBeLessThan(
+    beforeWidth,
+  );
+  expect(await sharedChat!.evaluate((element) => element.isConnected)).toBe(false);
+  expect(await allRoutesComplete(page, 'custom-walkthrough')).toBe(true);
 });
 
 test('interpolates a retained route with its moving endpoints in diagram coordinates', async ({
@@ -1747,9 +2020,10 @@ test('coordinates architecture and ownership state motion through settled frames
         frame.exitingReveal < 1,
     ),
   ).toBe(true);
-  // Observe already fits the union camera: this reverse jump needs only exit
-  // and scene motion, not a fabricated camera animation.
-  expectUnchangedCameraBeforeScene(architecture31);
+  // The destination scene owns the reverse fit even though the old outgoing union
+  // happened to match the previous camera.
+  expectCameraBeforeScene(architecture31);
+  expectCameraInterpolation(architecture31);
   expectFixedFooter(architecture31);
 
   await openMotionFixture(page, 'custom-walkthrough');
@@ -1798,8 +2072,10 @@ test('coordinates architecture and ownership state motion through settled frames
     ),
   ).toBe(true);
   expect(ownership23.settled.exitingReveal).toBeNull();
-  // Execute and Render share the union camera; retain explicit no-camera checks.
-  expectUnchangedCameraBeforeScene(ownership23);
+  // Execute and Render retain local positions, but the destination-only origin still
+  // moves their screen geometry continuously to the final frame.
+  expectCameraBeforeScene(ownership23);
+  expectCameraInterpolation(ownership23);
   expectFrameGeometry(ownership23.settled);
   expectFixedFooter(ownership23);
   const ownershipStable = await readStableSignature(page, 'custom-walkthrough');
@@ -1839,10 +2115,10 @@ test('coordinates architecture and ownership state motion through settled frames
     return interrupted;
   });
   expect(interruptedExit).toEqual({
-    phase: 'exit',
+    phase: 'camera',
     settled: 'false',
-    unchangedCamera: true,
-    cameraAnimations: 0,
+    unchangedCamera: false,
+    cameraAnimations: 1,
   });
   await expect(root.locator('.diagram-renderer')).toHaveAttribute('data-diagram-settled', 'true');
   await expect(root.locator('.diagram-renderer')).toHaveAttribute('data-diagram-state', 'orient');

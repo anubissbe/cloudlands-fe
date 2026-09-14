@@ -54,3 +54,50 @@ export function semanticLabelUnits(label: string): string[] {
     .flatMap((word) => word.match(/[^./\\]+[./\\]?/g) ?? [])
     .filter(Boolean);
 }
+
+const graphemeSegmenter = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
+
+/** Node-only emergency breaks must never separate a combining or emoji sequence. */
+export function nodeLabelGraphemes(text: string): string[] {
+  return Array.from(graphemeSegmenter.segment(text), ({ segment }) => segment);
+}
+
+/**
+ * Count pre-line text at the existing semantic/wbr boundaries, breaking an oversized
+ * unit only at grapheme boundaries (overflow-wrap:anywhere). Units retain their
+ * real whitespace; delimiters and camel-case boundaries do not add spaces.
+ */
+export function countEmergencyWrappedLines(
+  units: readonly string[],
+  width: number,
+  measure: (text: string) => number,
+  atomicUnits = false,
+): number {
+  const limit = Math.max(1, width);
+  let lines = 1;
+  let current = '';
+  for (const [index, raw] of units.entries()) {
+    const unit = raw.replace(/[\t\r\f ]+/g, ' ');
+    const candidate = `${current}${unit}`.trimStart();
+    if (measure(candidate.trimEnd()) <= limit) {
+      current = candidate;
+      continue;
+    }
+    if (current.trim()) lines += 1;
+    current = '';
+    for (const grapheme of nodeLabelGraphemes(unit.trimStart())) {
+      if (current && measure(`${current}${grapheme}`.trimEnd()) > limit) {
+        lines += 1;
+        current = '';
+      }
+      current += grapheme;
+    }
+    // An oversized inline-block filename occupies the entire available width,
+    // even when its final internal line has room left over.
+    if (atomicUnits && measure(unit.trim()) > limit && index < units.length - 1) {
+      lines += 1;
+      current = '';
+    }
+  }
+  return lines;
+}

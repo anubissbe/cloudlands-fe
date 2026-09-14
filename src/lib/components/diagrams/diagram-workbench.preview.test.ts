@@ -235,7 +235,7 @@ describe('diagram workbench fixtures', () => {
     ]);
   });
 
-  it('keeps exact distinct bottom and side ports for the topology fan-out', () => {
+  it('keeps ordered, separated bottom ports and exact attachments for the topology fan-out', () => {
     const fixture = CUSTOM_WORKBENCH_CASES['custom-topology-stress'];
     expect(fixture.kind).toBe('custom');
     if (fixture.kind !== 'custom') return;
@@ -248,8 +248,27 @@ describe('diagram workbench fixtures', () => {
     const start = (id: string) => layout.edges.find((edge) => edge.id === id)!.points![0];
     const centerX = hub.x + hub.width / 2;
 
-    expect(start('z6')).toEqual({ x: centerX - 16, y: hub.y + hub.height });
-    expect(start('z7')).toEqual({ x: centerX + 16, y: hub.y + hub.height });
+    expect(start('z6').x).toBeLessThan(centerX);
+    expect(start('z7').x).toBeGreaterThan(centerX);
+    expect(start('z7').x - start('z6').x).toBeGreaterThanOrEqual(32);
+    for (const [edgeId, targetId] of [
+      ['z6', 'success'],
+      ['z7', 'failure'],
+    ]) {
+      const edge = layout.edges.find(({ id }) => id === edgeId)!;
+      const points = edge.points!;
+      const target = layout.nodes.find(({ id }) => id === targetId)!;
+      expect(edge.from).toBe('hub');
+      expect(edge.to).toBe(targetId);
+      expect(points[0].x).toBeGreaterThan(hub.x);
+      expect(points[0].x).toBeLessThan(hub.x + hub.width);
+      expect(points[0].y).toBe(hub.y + hub.height);
+      expect(points[1].x).toBe(points[0].x);
+      expect(points[1].y - points[0].y).toBeGreaterThanOrEqual(24);
+      expect(points.at(-1)).toEqual({ x: target.x + target.width / 2, y: target.y });
+      expect(points.at(-2)!.x).toBe(points.at(-1)!.x);
+      expect(points.at(-1)!.y - points.at(-2)!.y).toBeGreaterThanOrEqual(24);
+    }
     expect(start('z8')).toEqual({ x: hub.x + hub.width, y: hub.y + hub.height / 2 });
   });
 });

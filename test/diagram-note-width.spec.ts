@@ -26,7 +26,7 @@ async function mountNote(
   const block =
     kind === 'mermaid'
       ? `~~~mermaid\n${source}\n~~~`
-      : `\`\`\`diagram\n${JSON.stringify(fixture.diagram)}\n\`\`\``;
+      : `\`\`\`diagram\n${source === validSource ? JSON.stringify(fixture.diagram) : source}\n\`\`\``;
   await page.evaluate(
     async ({ width, block, comments }) => {
       const [{ mount }, { default: NoteWithComments }] = await Promise.all([
@@ -151,6 +151,12 @@ async function geometry(page: Page, kind: Kind) {
       prose: bounds(lane.previousElementSibling!),
       lane: bounds(lane),
       presentation: bounds(lane.querySelector('[data-diagram-presentation]')!),
+      header: lane.querySelector('[data-diagram-presentation-header]')
+        ? bounds(lane.querySelector('[data-diagram-presentation-header]')!)
+        : null,
+      footer: lane.querySelector('.diagram-footer')
+        ? bounds(lane.querySelector('.diagram-footer')!)
+        : null,
       content: bounds(lane.querySelector('[data-diagram-presentation-content]')!),
       viewport: bounds(viewport),
       paint,
@@ -161,6 +167,20 @@ async function geometry(page: Page, kind: Kind) {
       scrollWidth: viewport.scrollWidth,
       pageOverflow: document.documentElement.scrollWidth - innerWidth,
       generation: lane.querySelector('.mermaid-renderer')?.getAttribute('data-render-generation'),
+      svgScale: viewport.querySelector<SVGSVGElement>('svg')?.getScreenCTM()?.a,
+      labels: [...viewport.querySelectorAll<SVGGraphicsElement>('[data-node-id]')].map((node) => {
+        const label = node.querySelector('.node-label')!;
+        const range = document.createRange();
+        range.selectNodeContents(label);
+        const r = range.getBoundingClientRect();
+        return {
+          id: node.getAttribute('data-node-id'),
+          text: label.textContent,
+          width: r.width,
+          height: r.height,
+          fontSize: Number.parseFloat(getComputedStyle(label).fontSize) * node.getScreenCTM()!.a,
+        };
+      }),
       ancestors,
     };
   });
@@ -352,7 +372,10 @@ test('small diagrams retain intrinsic paint size and fullscreen uses the window,
   expect(medium.paint[0].width).toBeCloseTo(wide.paint[0].width, 0);
   expect(medium.paint[0].height).toBeCloseTo(wide.paint[0].height, 0);
   for (const result of [narrow, medium, wide]) {
-    expect(result.paint[0].width).toBeLessThan(result.viewport.width / 2);
+    expect.soft(result.presentation.width).toBeCloseTo(result.prose.width, 0);
+    // A prose-sized viewport need not be twice the node width. Assert actual
+    // intrinsic rendering, rather than the superseded full-lane size ratio.
+    expect(result.svgScale).toBeLessThanOrEqual(1);
     expect((result.paint[0].left + result.paint[0].right) / 2).toBeCloseTo(
       (result.viewport.left + result.viewport.right) / 2,
       0,
@@ -371,6 +394,96 @@ test('small diagrams retain intrinsic paint size and fullscreen uses the window,
   await expect(opener).toBeFocused();
   expectLane(await geometry(page, 'mermaid'));
 });
+
+test('Architecture presentation follows prose and the current scene without enlarging paint', async ({
+  page,
+}, info) => {
+  test.setTimeout(60_000);
+  await mountNote(page, 960, 'stateful');
+  const lane = laneFor(page, 'stateful');
+  const small = await capture(page, 'stateful', info, 'architecture-small');
+  expect.soft(small.presentation.width).toBeCloseTo(small.prose.width, 0);
+  expectPaint(small, paintCounts.stateful);
+  for (const outer of [small.header!, small.footer!]) {
+    expect.soft(outer.left).toBeCloseTo(small.presentation.left, 0);
+    expect.soft(outer.right).toBeCloseTo(small.presentation.right, 0);
+  }
+  const dots = lane.locator('[data-diagram-step-index]');
+  await dots.last().click();
+  await expect(lane.locator('.diagram-renderer')).toHaveAttribute('data-diagram-state', 'observe');
+  await settled(page, 'stateful');
+  const large = await capture(page, 'stateful', info, 'architecture-large');
+  expectLane(large);
+  expect(large.presentation.width).toBeGreaterThanOrEqual(large.prose.width - 1);
+  expect(large.presentation.width).toBeLessThanOrEqual(large.lane.width + 1);
+  await dots.first().click();
+  await expect(lane.locator('.diagram-renderer')).toHaveAttribute('data-diagram-state', 'orient');
+  await settled(page, 'stateful');
+  const returned = await capture(page, 'stateful', info, 'architecture-returned');
+  expect.soft(returned.presentation.width).toBeCloseTo(returned.prose.width, 0);
+  expectPaint(returned, paintCounts.stateful);
+  expect(returned.labels).toEqual(small.labels);
+  await resizeNote(page, 800, 'stateful');
+  const medium = await capture(page, 'stateful', info, 'architecture-medium');
+  expect.soft(medium.presentation.width).toBeCloseTo(medium.prose.width, 0);
+  for (const [index, label] of medium.labels.entries()) {
+    expect(label.text).toBe(small.labels[index].text);
+    expect(label.width).toBeCloseTo(small.labels[index].width, 0);
+    expect(label.height).toBeCloseTo(small.labels[index].height, 0);
+    expect.soft(label.fontSize).toBeLessThanOrEqual(13.01);
+  }
+  await resizeNote(page, 320, 'stateful');
+  const narrow = await capture(page, 'stateful', info, 'architecture-narrow');
+  expectLane(narrow);
+  expectPaint(narrow, paintCounts.stateful);
+  expect(narrow.presentation.width).toBeGreaterThanOrEqual(narrow.prose.width - 1);
+  for (const label of narrow.labels) expect(label.fontSize).toBeGreaterThanOrEqual(11.99);
+  await resizeNote(page, 960, 'stateful');
+  const recovered = await capture(page, 'stateful', info, 'architecture-recovered');
+  expect.soft(recovered.presentation.width).toBeCloseTo(recovered.prose.width, 0);
+  expect(recovered.labels).toEqual(small.labels);
+});
+
+test('wide current content grows the presentation beyond prose without filling unused lane', async ({
+  page,
+}, info) => {
+  const fixture = CUSTOM_WORKBENCH_CASES['custom-disconnected-extremes'].diagram;
+  await mountNote(page, 960, 'custom', JSON.stringify(fixture));
+  const result = await capture(page, 'custom', info, 'wide-current-content');
+  expectLane(result);
+  expectPaint(result, 8);
+  const span =
+    Math.max(...result.paint.map((p) => p.right)) - Math.min(...result.paint.map((p) => p.left));
+  expect(result.presentation.width).toBeGreaterThan(result.prose.width);
+  expect(result.presentation.width).toBeLessThan(result.lane.width);
+  expect(result.presentation.width - span / result.svgScale!).toBeLessThanOrEqual(100);
+  expect(result.labels.every((label) => label.fontSize >= 11.99)).toBe(true);
+});
+
+for (const width of [320, 960]) {
+  test(`Architecture width follows actual prose and comments reserve at ${width}px`, async ({
+    page,
+  }, info) => {
+    await mountNote(page, width, 'stateful', validSource, true);
+    const before = await capture(page, 'stateful', info, 'architecture-before-comments');
+    await loadComment(page);
+    const sidebar = page.locator('[data-comment-id="width-comment"]');
+    await expect(sidebar).toBeVisible();
+    await expect
+      .poll(async () => (await geometry(page, 'stateful')).lane.width)
+      .toBeLessThan(before.lane.width);
+    await settled(page, 'stateful');
+    const active = await capture(page, 'stateful', info, 'architecture-active-comments');
+    expectPaint(active, paintCounts.stateful);
+    expect(active.noteOverflow).toBeLessThanOrEqual(1);
+    expect(active.pageOverflow).toBeLessThanOrEqual(1);
+    expect(active.presentation.width).toBeGreaterThanOrEqual(active.prose.width - 1);
+    expect(active.presentation.width).toBeLessThanOrEqual(active.lane.width + 1);
+    expect(active.presentation.right).toBeLessThanOrEqual((await sidebar.boundingBox())!.x);
+    if (width === 960) expect(active.presentation.width).toBeCloseTo(active.prose.width, 0);
+    expect(active.footer!.width).toBeCloseTo(active.presentation.width, 0);
+  });
+}
 
 test('valid to error to valid keeps expanded source aligned at the minimum note width', async ({
   page,

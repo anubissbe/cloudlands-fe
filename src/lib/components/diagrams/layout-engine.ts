@@ -18,11 +18,14 @@ import type {
   ComputedGroup,
   NodeStyleConfig,
 } from './types';
-import { GRAMMAR_CONFIGS, DEFAULT_NODE_STYLE } from './types';
+import { GRAMMAR_CONFIGS, DEFAULT_NODE_STYLE, EDGE_LABEL_STYLE } from './types';
 import {
+  countEmergencyWrappedLines,
+  nodeLabelGraphemes,
   semanticFilenameUnits,
   semanticLabelTokens,
   semanticLabelUnits,
+  splitSemanticLabel,
 } from './diagram-label-wrap';
 
 /**
@@ -38,11 +41,11 @@ const MAX_SPACING = 300;
 const ORTHOGONAL_CORNER_RADIUS = 6;
 const EDGE_LABEL_MAX_WIDTH = 112;
 const EDGE_LABEL_MIN_WIDTH = 32;
-const EDGE_LABEL_CHAR_WIDTH = 7.2;
-const EDGE_LABEL_PADDING_X = 12;
-const EDGE_LABEL_PADDING_Y = 10;
+const EDGE_LABEL_CHAR_WIDTH = EDGE_LABEL_STYLE.fontSize * DEFAULT_NODE_STYLE.labelCharWidthRatio;
+const EDGE_LABEL_PADDING_X = EDGE_LABEL_STYLE.paddingX * 2;
+const EDGE_LABEL_PADDING_Y = EDGE_LABEL_STYLE.paddingY * 2;
 const EDGE_LABEL_FRAME_WIDTH = 0;
-const EDGE_LABEL_LINE_HEIGHT = 18;
+const EDGE_LABEL_LINE_HEIGHT = EDGE_LABEL_STYLE.fontSize * EDGE_LABEL_STYLE.lineHeight;
 const NODE_ICON_WIDTH = 14;
 const NODE_ICON_GAP = 8;
 const MIN_NODE_HEIGHT = 32;
@@ -65,21 +68,11 @@ export function compactEdgeLabelMaxWidth(
 }
 
 let measurementContext: CanvasRenderingContext2D | null | undefined;
+let edgeMeasurementContext: CanvasRenderingContext2D | null | undefined;
 
 function rootToken(name: string, fallback: string): string {
   if (typeof document === 'undefined') return fallback;
   return getComputedStyle(document.documentElement).getPropertyValue(name).trim() || fallback;
-}
-
-function rootPixelSize(name: string, fallback: number): number {
-  const value = rootToken(name, `${fallback}px`);
-  const amount = Number.parseFloat(value);
-  if (!Number.isFinite(amount)) return fallback;
-  if (value.endsWith('rem')) {
-    const rootSize = Number.parseFloat(getComputedStyle(document.documentElement).fontSize) || 16;
-    return amount * rootSize;
-  }
-  return amount;
 }
 
 export function measureDiagramTextWidth(
@@ -103,30 +96,66 @@ export function measureDiagramTextWidth(
 }
 
 function minimumGroupTitleWidth(label: string): number {
-  const fontSize = rootPixelSize('--text-body-size', 15);
-  const tracking = rootToken('--text-caption-tracking', '0.01em');
+  const fontSize = EDGE_LABEL_STYLE.fontSize;
+  const weight = rootToken('--text-caption-weight', '500');
+  const tracking = rootToken('--text-caption-tracking', '-0.01em');
   const trackingAmount = Number.parseFloat(tracking);
   const letterSpacing = Number.isFinite(trackingAmount)
     ? tracking.endsWith('em')
       ? trackingAmount * fontSize
       : trackingAmount
-    : fontSize * 0.01;
+    : fontSize * -0.01;
   const titleWidth = Math.max(
     ...label
       .split('\n')
-      .map((line) => measureDiagramTextWidth(line, fontSize, '500', 7.5, letterSpacing)),
+      .map((line) =>
+        measureDiagramTextWidth(line, fontSize, weight, fontSize * 0.5, letterSpacing),
+      ),
   );
   return Math.ceil(titleWidth) + CUSTOM_GROUP_TITLE_GEOMETRY.horizontalPadding * 2;
+}
+
+function groupTitleObstacle(group: ComputedGroup) {
+  const width =
+    minimumGroupTitleWidth(group.label) - CUSTOM_GROUP_TITLE_GEOMETRY.horizontalPadding * 2;
+  const halfHeight = EDGE_LABEL_STYLE.fontSize;
+  return {
+    left: group.x + (group.width - width) / 2 - ORTHOGONAL_CORNER_RADIUS,
+    right: group.x + (group.width + width) / 2 + ORTHOGONAL_CORNER_RADIUS,
+    top: group.y + CUSTOM_GROUP_TITLE_GEOMETRY.centerY - halfHeight,
+    bottom: group.y + CUSTOM_GROUP_TITLE_GEOMETRY.centerY + halfHeight,
+  };
 }
 
 export function measureEdgeLabel(
   label: string,
   maxWidth = EDGE_LABEL_MAX_WIDTH,
 ): { width: number; height: number; lines: number } {
-  const fontSize = rootPixelSize('--text-caption-size', 13);
+  const fontSize = EDGE_LABEL_STYLE.fontSize;
   const weight = rootToken('--text-body-weight', '400');
+  const tracking = rootToken('--text-caption-tracking', '-0.01em');
+  const trackingAmount = Number.parseFloat(tracking);
+  const letterSpacing = Number.isFinite(trackingAmount)
+    ? tracking.endsWith('em')
+      ? trackingAmount * fontSize
+      : trackingAmount
+    : -0.01 * fontSize;
+  if (edgeMeasurementContext === undefined) {
+    edgeMeasurementContext =
+      typeof document !== 'undefined' && typeof CanvasRenderingContext2D !== 'undefined'
+        ? document.createElement('canvas').getContext('2d')
+        : null;
+  }
+  const context = edgeMeasurementContext;
+  // Native tracking respects grapheme clusters and joining scripts. Keep this
+  // context separate so connector tracking cannot affect node-title measurement.
+  if (context) {
+    context.font = `${weight} ${fontSize}px ${rootToken('--font-ui', 'Inter, system-ui, sans-serif')}`;
+    context.letterSpacing = `${letterSpacing}px`;
+  }
   const measure = (text: string) =>
-    measureDiagramTextWidth(text, fontSize, weight, EDGE_LABEL_CHAR_WIDTH);
+    context?.measureText(text).width ??
+    measureDiagramTextWidth(text, fontSize, weight, EDGE_LABEL_CHAR_WIDTH, letterSpacing);
   const explicitLines = label.split('\n');
   const naturalWidth =
     Math.max(...explicitLines.map(measure)) + EDGE_LABEL_PADDING_X + EDGE_LABEL_FRAME_WIDTH;
@@ -135,7 +164,7 @@ export function measureEdgeLabel(
     EDGE_LABEL_PADDING_X +
     EDGE_LABEL_FRAME_WIDTH;
   const wrappingLimit = Math.max(maxWidth, minimumWordWidth);
-  const width = Math.max(EDGE_LABEL_MIN_WIDTH, Math.min(naturalWidth, wrappingLimit));
+  const width = Math.ceil(Math.max(EDGE_LABEL_MIN_WIDTH, Math.min(naturalWidth, wrappingLimit)));
   const contentWidth = width - EDGE_LABEL_PADDING_X - EDGE_LABEL_FRAME_WIDTH;
   const lines = explicitLines.reduce((total, line) => {
     const words = line.trim().split(/\s+/).filter(Boolean);
@@ -144,14 +173,14 @@ export function measureEdgeLabel(
     let current = '';
     for (const word of words) {
       const wordWidth = measure(word);
-      if (wordWidth > contentWidth + 0.5) {
+      if (wordWidth > contentWidth) {
         if (current) count += 1;
-        count += Math.max(1, Math.ceil((wordWidth - 0.5) / contentWidth)) - 1;
+        count += Math.max(1, Math.ceil(wordWidth / contentWidth)) - 1;
         current = '';
         continue;
       }
       const candidate = current ? `${current} ${word}` : word;
-      if (current && measure(candidate) > contentWidth + 0.5) {
+      if (current && measure(candidate) > contentWidth) {
         count += 1;
         current = word;
       } else {
@@ -455,7 +484,7 @@ function applyWrapping(
     const narrowGroups = layout.groups
       ? computeGroupBoundsFromNodes(layout.groups, narrowNodes)
       : undefined;
-    const narrowEdges = computeCompactColumnEdgePaths(layout.edges, narrowNodes);
+    const narrowEdges = computeCompactColumnEdgePaths(layout.edges, narrowNodes, narrowGroups);
     return {
       nodes: narrowNodes,
       groups: narrowGroups,
@@ -712,30 +741,52 @@ function computeNodeSize(
       LABEL_CHAR_WIDTH,
       -0.01 * style.labelFontSize,
       labelFontFamily,
-    );
+    ) +
+    (measurementContext
+      ? (text.length - nodeLabelGraphemes(text).length) * 0.01 * style.labelFontSize
+      : 0);
   const measureKind = (text: string) =>
-    measureDiagramTextWidth(text, kindFontSize, '500', KIND_CHAR_WIDTH, 0.015 * kindFontSize);
+    measureDiagramTextWidth(text, kindFontSize, '500', KIND_CHAR_WIDTH, 0.015 * kindFontSize) -
+    (measurementContext
+      ? (text.length - nodeLabelGraphemes(text).length) * 0.015 * kindFontSize
+      : 0);
   const estimatedLineWidths = hardLines.map(measureLabel);
   const longestLineWidth = Math.max(...estimatedLineWidths);
   const longestWordWidth = Math.max(...semanticLabelUnits(node.label).map(measureLabel), 0);
+  const hasOversizedUnit = longestWordWidth > maxWidth;
+  const contentLimit = Math.max(
+    1,
+    maxWidth - paddingX * 2 - iconColumnWidth - frameBorderWidth - labelWrapSafety,
+    // Preserve ordinary short units even when the frame's chrome exceeds the
+    // preferred width. Emergency wrapping is for text wider than that width.
+    hasOversizedUnit ? 0 : longestWordWidth,
+  );
 
   let labelWidth: number;
   let labelLines = 1;
 
-  if (isShortLabel) {
+  if (isShortLabel && !hasOversizedUnit) {
     labelWidth = longestLineWidth;
     labelLines = hardLines.length;
   } else {
     // For longer labels, estimate wrapping at a reasonable width
     // Allow wider nodes for long labels, but cap at maxWidth
-    const maxLineWidth = Math.min(
-      longestLineWidth,
-      maxWidth - paddingX * 2 - iconColumnWidth - frameBorderWidth - labelWrapSafety,
-    );
-    const wrappedLineWidth = Math.max(maxLineWidth, longestWordWidth);
+    const maxLineWidth = Math.min(longestLineWidth, contentLimit);
+    const wrappedLineWidth = Math.min(contentLimit, Math.max(maxLineWidth, longestWordWidth));
     labelWidth = wrappedLineWidth;
     const visibleLineCount = hardLines.reduce((total, line) => {
       const filenameUnits = semanticFilenameUnits(line);
+      if (longestWordWidth > contentLimit || /[^\x00-\x7f]/.test(line)) {
+        return (
+          total +
+          countEmergencyWrappedLines(
+            filenameUnits ?? splitSemanticLabel(line).map(({ text }) => text),
+            wrappedLineWidth,
+            measureLabel,
+            filenameUnits !== null,
+          )
+        );
+      }
       const lineWords = filenameUnits ?? semanticLabelTokens(line);
       if (!lineWords.length) return total + 1;
       let count = 1;
@@ -768,12 +819,28 @@ function computeNodeSize(
   let kindHeight = 0;
   if (node.kind) {
     const kindLines = node.kind.split('\n');
-    kindWidth = Math.max(...kindLines.map(measureKind));
-    kindHeight = kindFontSize * style.kindLineHeight * kindLines.length;
+    kindWidth = Math.min(contentLimit, Math.max(...kindLines.map(measureKind)));
+    kindHeight =
+      kindFontSize *
+      style.kindLineHeight *
+      kindLines.reduce(
+        (total, line) =>
+          total +
+          countEmergencyWrappedLines(
+            line.match(/\S+[\t ]*|[\t ]+/g) ?? [],
+            contentLimit,
+            measureKind,
+          ),
+        0,
+      );
   }
 
   // Calculate total size
-  const contentWidth = Math.max(labelWidth + labelWrapSafety, kindWidth) + iconColumnWidth;
+  // Canvas and browser text shaping can straddle a fractional-pixel boundary.
+  // Keep one CSS pixel so a kind that measures as fitting does not emergency-wrap.
+  const kindWrapSafety = node.kind ? 1 : 0;
+  const contentWidth =
+    Math.max(labelWidth + labelWrapSafety, kindWidth + kindWrapSafety) + iconColumnWidth;
   const contentHeight = labelHeight + (node.kind ? contentGap + kindHeight : 0);
 
   // Ensure minimum size but allow nodes to be smaller for short labels
@@ -781,7 +848,7 @@ function computeNodeSize(
   const chromeWidth = iconColumnWidth + paddingX * 2 + frameBorderWidth;
   const width = Math.max(
     Math.min(Math.max(contentWidth + paddingX * 2 + frameBorderWidth, minWidth), maxWidth),
-    longestWordWidth + chromeWidth + labelWrapSafety,
+    Math.min(longestWordWidth, contentLimit) + chromeWidth + labelWrapSafety,
   );
   const height = Math.max(
     contentHeight + paddingY * 2 + frameBorderWidth,
@@ -2831,6 +2898,38 @@ function computeOrthogonalEdgePaths(
     backwardTrackMap.set(info.edge.id, i);
   });
 
+  // Vertical returns use the left side, not the provisional top/bottom sides.
+  // Allocate their mixed incoming/outgoing ports without disturbing forward ports.
+  const backwardLeftPorts = assignOrderedPortPositions(
+    isVerticalLayout
+      ? backwardEdges.map((info) => ({ ...info, fromSide: 'left', toSide: 'left' }))
+      : [],
+  );
+  const backwardLeftTracks = new Map<string, number>();
+  if (isVerticalLayout) {
+    for (const info of backwardEdges) {
+      const labelClearance = Math.max(
+        groups?.length ? 0 : 32,
+        info.edge.label ? estimateEdgeLabelWidth(info.edge.label) / 2 + 4 : 0,
+      );
+      let x =
+        minX -
+        NODE_CLEARANCE -
+        labelClearance -
+        ((backwardTrackMap.get(info.edge.id) ?? 0) + 1) * TRACK_SPACING;
+      const adjacentTracks = backwardEdges
+        .filter((other) => other.edge.from === info.edge.to || other.edge.to === info.edge.from)
+        .flatMap((other) =>
+          backwardLeftTracks.has(other.edge.id) ? [backwardLeftTracks.get(other.edge.id)!] : [],
+        )
+        .sort((a, b) => b - a);
+      for (const occupied of adjacentTracks) {
+        if (Math.abs(x - occupied) < TRACK_SPACING) x = occupied - TRACK_SPACING;
+      }
+      backwardLeftTracks.set(info.edge.id, x);
+    }
+  }
+
   const directedParallelMap = new Map<string, { index: number; count: number }>();
   const directedParallelGroups = new Map<string, EdgeInfo[]>();
   for (const info of edgeInfos) {
@@ -2943,12 +3042,14 @@ function computeOrthogonalEdgePaths(
         top: group.y - ROUTE_GROUP_CLEARANCE,
         bottom: group.y + group.height + ROUTE_GROUP_CLEARANCE,
       }));
-    const obstacles = [...nodeObstacles, ...groupObstacles];
+    const titleObstacles = (groups ?? []).map(groupTitleObstacle);
+    const obstacles = [...nodeObstacles, ...groupObstacles, ...titleObstacles];
     const original = simplifyOrthogonalPoints(routePoints);
     if (!routeEntersObstacles(original, obstacles)) return original;
 
     const label = info.edge.label ? measureEdgeLabel(info.edge.label) : undefined;
     const labelObstacles = [
+      ...titleObstacles,
       ...nodes.map((node) => ({
         left: node.x,
         right: node.x + node.width,
@@ -3084,7 +3185,14 @@ function computeOrthogonalEdgePaths(
     const isFromVertical = fromSide === 'top' || fromSide === 'bottom';
     const isToVertical = toSide === 'top' || toSide === 'bottom';
     const sharedHorizontalPorts = (() => {
-      if (isFromVertical || isToVertical || biOffset) return null;
+      if (
+        isFromVertical ||
+        isToVertical ||
+        biOffset ||
+        portPositions.has(`${index}:from`) ||
+        portPositions.has(`${index}:to`)
+      )
+        return null;
       const paintedSideInset = (node: ComputedNode) =>
         Math.min(node.height / 4, ['db', 'store', 'data_store'].includes(node.kind ?? '') ? 10 : 6);
       const overlapTop = Math.max(
@@ -3161,13 +3269,15 @@ function computeOrthogonalEdgePaths(
       const trackNum = backwardTrackMap.get(edge.id) ?? 0;
 
       if (isVerticalLayout) {
-        const labelClearance = Math.max(
-          groups?.length ? 0 : 32,
-          edge.label ? estimateEdgeLabelWidth(edge.label) / 2 + 4 : 0,
-        );
-        const trackX = minX - NODE_CLEARANCE - labelClearance - (trackNum + 1) * TRACK_SPACING;
-        const source = { x: fromNode.x, y: fromNode.y + fromNode.height / 2 };
-        const target = { x: toNode.x, y: toNode.y + toNode.height / 2 };
+        const trackX = backwardLeftTracks.get(edge.id)!;
+        const source = backwardLeftPorts.get(`${index}:from`) ?? {
+          x: fromNode.x,
+          y: fromNode.y + fromNode.height / 2,
+        };
+        const target = backwardLeftPorts.get(`${index}:to`) ?? {
+          x: toNode.x,
+          y: toNode.y + toNode.height / 2,
+        };
         points[0] = source;
         points.push({ x: trackX, y: source.y }, { x: trackX, y: target.y });
         toPos = target;
@@ -3474,7 +3584,7 @@ function computeOrthogonalEdgePaths(
           return use.role === 'from' ? info?.toNode.id : info?.fromNode.id;
         }),
       );
-      const needsDistinctPorts = uses.length >= 3 || (roles.size > 1 && oppositeNodes.size === 1);
+      const needsDistinctPorts = uses.length >= 2 && (roles.size > 1 || oppositeNodes.size > 1);
       if (!needsDistinctPorts) continue;
       const sorted = uses.toSorted(
         (left, right) =>
@@ -3488,7 +3598,21 @@ function computeOrthogonalEdgePaths(
       const size = verticalSide ? node.width : node.height;
       const center = verticalSide ? node.x + node.width / 2 : node.y + node.height / 2;
       const available = Math.max(0, size - Math.min(32, size * 0.4));
-      const gap = sorted.length > 1 ? Math.min(PORT_SLOT_GAP, available / (sorted.length - 1)) : 0;
+      const labelExtents = sorted.map((use) => {
+        const edge = infos.find((info) => info.edge.id === use.edgeId)?.edge;
+        const label = edge?.label ? measureEdgeLabel(edge.label) : undefined;
+        return label ? (verticalSide ? label.width : label.height) : 0;
+      });
+      const labelGap =
+        roles.size === 1
+          ? Math.max(
+              PORT_SLOT_GAP,
+              ...labelExtents
+                .slice(1)
+                .map((extent, index) => (extent + labelExtents[index]) / 2 + ROUTE_LABEL_CLEARANCE),
+            )
+          : PORT_SLOT_GAP;
+      const gap = sorted.length > 1 ? Math.min(labelGap, available / (sorted.length - 1)) : 0;
       const start = center - (gap * (sorted.length - 1)) / 2;
       sorted.forEach((use, slot) => {
         const axis = start + slot * gap;
@@ -3507,12 +3631,71 @@ function computeOrthogonalEdgePaths(
 function computeCompactColumnEdgePaths(
   edges: DiagramEdge[],
   nodes: ComputedNode[],
+  groups?: ComputedGroup[],
 ): ComputedEdge[] {
   const nodeMap = new Map(nodes.map((node, index) => [node.id, { node, index }]));
   const sourceRows = new Map<string, number>();
-  const exteriorRows = new Map<string, number>();
+  const lanes: Array<{
+    x: number;
+    top: number;
+    bottom: number;
+    halfWidth: number;
+    downward: boolean;
+    from: string;
+    to: string;
+    start: RoutePoint;
+    end: RoutePoint;
+    halfHeight: number;
+  }> = [];
+  const titles = (groups ?? []).map(groupTitleObstacle);
   const columnWidth = Math.max(...nodes.map((node) => node.x + node.width));
   const terminalLead = (edges.length >= nodes.length * 1.5 ? 24 : 32) + ORTHOGONAL_CORNER_RADIUS;
+
+  const needsExteriorLane = (edge: DiagramEdge) => {
+    const source = nodeMap.get(edge.from);
+    const target = nodeMap.get(edge.to);
+    if (!source || !target || source.index === target.index) return false;
+    if (target.index !== source.index + 1) return true;
+    const label = edge.label
+      ? measureEdgeLabel(edge.label, compactEdgeLabelMaxWidth(edge.label))
+      : null;
+    const x = source.node.x + source.node.width / 2;
+    return (
+      Boolean(label && label.height + 16 > target.node.y - (source.node.y + source.node.height)) ||
+      titles.some(
+        (title) =>
+          x > title.left &&
+          x < title.right &&
+          source.node.y + source.node.height < title.bottom &&
+          target.node.y > title.top,
+      )
+    );
+  };
+  const exteriorEdges = edges.filter(needsExteriorLane);
+  const sidePortY = (node: ComputedNode, edge: DiagramEdge, downward: boolean) => {
+    const uses = exteriorEdges
+      .flatMap((candidate) => {
+        const source = nodeMap.get(candidate.from);
+        const target = nodeMap.get(candidate.to);
+        if (!source || !target) return [];
+        if (target.index > source.index !== downward) return [];
+        if (candidate.from === node.id)
+          return [{ edge: candidate, opposite: target.index, role: 'from' }];
+        if (candidate.to === node.id)
+          return [{ edge: candidate, opposite: source.index, role: 'to' }];
+        return [];
+      })
+      .sort(
+        (a, b) =>
+          a.opposite - b.opposite ||
+          a.role.localeCompare(b.role) ||
+          a.edge.id.localeCompare(b.edge.id),
+      );
+    const index = uses.findIndex((use) => use.edge.id === edge.id);
+    const gap =
+      uses.length > 1 ? Math.min(PORT_SLOT_GAP, (node.height * 0.6) / (uses.length - 1)) : 0;
+    return node.y + node.height / 2 + (index - (uses.length - 1) / 2) * gap;
+  };
 
   return edges.flatMap((edge) => {
     const sourceEntry = nodeMap.get(edge.from);
@@ -3525,9 +3708,7 @@ function computeCompactColumnEdgePaths(
     const compactLabel = edge.label
       ? measureEdgeLabel(edge.label, compactEdgeLabelMaxWidth(edge.label))
       : null;
-    const needsAdjacentLabelLane =
-      targetIndex === sourceIndex + 1 &&
-      Boolean(compactLabel && compactLabel.height + 16 > target.y - (source.y + source.height));
+    const needsAdjacentLabelLane = needsExteriorLane(edge);
     let points: Array<{ x: number; y: number }>;
 
     if (edge.from === edge.to) {
@@ -3550,15 +3731,13 @@ function computeCompactColumnEdgePaths(
       ];
     } else {
       const downward = targetIndex > sourceIndex;
-      const exteriorRow = exteriorRows.get(edge.from) ?? 0;
-      exteriorRows.set(edge.from, exteriorRow + 1);
       const start = {
         x: downward ? source.x + source.width : source.x,
-        y: source.y + source.height / 2,
+        y: sidePortY(source, edge, downward),
       };
       const end = {
         x: downward ? target.x + target.width : target.x,
-        y: target.y + target.height / 2,
+        y: sidePortY(target, edge, downward),
       };
       const laneClearance = Math.max(terminalLead, (compactLabel?.width ?? 0) / 2 + 10);
       const routeTop = Math.min(start.y, end.y);
@@ -3576,8 +3755,137 @@ function computeCompactColumnEdgePaths(
         ...interveningNodes.map(
           (node) => node.x + node.width + (compactLabel?.width ?? 0) / 2 + 10,
         ),
+        ...titles
+          .filter((title) => title.top < routeBottom && title.bottom > routeTop)
+          .map((title) => title.right + laneClearance),
       );
-      const laneX = downward ? localRight + exteriorRow * 8 : -laneClearance - exteriorRow * 8;
+      const localLeft =
+        Math.min(
+          source.x,
+          target.x,
+          ...interveningNodes.map((node) => node.x),
+          ...titles
+            .filter((title) => title.top < routeBottom && title.bottom > routeTop)
+            .map((title) => title.left),
+        ) - laneClearance;
+      const halfWidth = (compactLabel?.width ?? 0) / 2;
+      const overlapping = lanes.filter(
+        (lane) => lane.downward === downward && lane.top < routeBottom && lane.bottom > routeTop,
+      );
+      let laneX = downward
+        ? Math.max(
+            localRight,
+            ...overlapping.map(
+              (lane) => lane.x + lane.halfWidth + halfWidth + ORTHOGONAL_CORNER_RADIUS,
+            ),
+          )
+        : Math.min(
+            localLeft,
+            ...overlapping.map(
+              (lane) => lane.x - lane.halfWidth - halfWidth - ORTHOGONAL_CORNER_RADIUS,
+            ),
+          );
+      // Separated ports can make consecutive return spans disjoint. Their shafts
+      // still need distinct lanes instead of appearing to join just off the node.
+      if (!downward) {
+        const adjacent = lanes
+          .filter((lane) => !lane.downward && (lane.from === edge.to || lane.to === edge.from))
+          .toSorted((a, b) => b.x - a.x);
+        const inwardLaneIsClear = (x: number) => {
+          // Only pack disjoint spans. Keep room for the corner and terminal marker,
+          // and require a clear midpoint label anchor rather than a whole label-wide shaft.
+          if (
+            overlapping.length ||
+            Math.min(start.x, end.x) - x < PORT_SLOT_GAP + ORTHOGONAL_CORNER_RADIUS ||
+            routeBottom - routeTop < (compactLabel?.height ?? 0) + PORT_SLOT_GAP
+          )
+            return false;
+          const box = (a: RoutePoint, b: RoutePoint) => ({
+            left: Math.min(a.x, b.x),
+            right: Math.max(a.x, b.x),
+            top: Math.min(a.y, b.y),
+            bottom: Math.max(a.y, b.y),
+          });
+          const overlaps = (a: ReturnType<typeof box>, b: ReturnType<typeof box>, gap: number) =>
+            a.left < b.right + gap &&
+            a.right > b.left - gap &&
+            a.top < b.bottom + gap &&
+            a.bottom > b.top - gap;
+          const segments = (x: number, from: RoutePoint, to: RoutePoint) => [
+            box(from, { x, y: from.y }),
+            box({ x, y: from.y }, { x, y: to.y }),
+            box({ x, y: to.y }, to),
+          ];
+          const nodeBoxes = nodes.map((node) => ({
+            ...box(node, { x: node.x + node.width, y: node.y + node.height }),
+            id: node.id,
+          }));
+          const groupBoxes = (groups ?? []).map((group) =>
+            box(group, { x: group.x + group.width, y: group.y + group.height }),
+          );
+          const candidate = segments(x, start, end);
+          const obstacles = [
+            ...nodeBoxes.filter((node) => node.id !== source.id && node.id !== target.id),
+            ...groupBoxes,
+            ...titles,
+          ];
+          if (
+            candidate.some((segment) =>
+              obstacles.some((obstacle) => overlaps(segment, obstacle, 10)),
+            )
+          )
+            return false;
+          const label = {
+            left: x - halfWidth,
+            right: x + halfWidth,
+            top: (routeTop + routeBottom - (compactLabel?.height ?? 0)) / 2,
+            bottom: (routeTop + routeBottom + (compactLabel?.height ?? 0)) / 2,
+          };
+          if (
+            [...nodeBoxes, ...groupBoxes, ...titles].some((obstacle) =>
+              overlaps(label, obstacle, 8),
+            ) ||
+            label.right + 10 > Math.min(...nodes.map((node) => node.x + node.width / 2))
+          )
+            return false;
+          return lanes.every((lane) => {
+            const occupied = segments(lane.x, lane.start, lane.end);
+            const otherLabel = {
+              left: lane.x - lane.halfWidth,
+              right: lane.x + lane.halfWidth,
+              top: (lane.top + lane.bottom) / 2 - lane.halfHeight,
+              bottom: (lane.top + lane.bottom) / 2 + lane.halfHeight,
+            };
+            return (
+              candidate.every((segment) =>
+                occupied.every((other) => !overlaps(segment, other, 10)),
+              ) &&
+              (!compactLabel || occupied.every((segment) => !overlaps(label, segment, 10))) &&
+              (!lane.halfWidth ||
+                candidate.every((segment) => !overlaps(otherLabel, segment, 10))) &&
+              (!compactLabel || !lane.halfWidth || !overlaps(label, otherLabel, 6))
+            );
+          });
+        };
+        for (const lane of adjacent) {
+          if (Math.abs(laneX - lane.x) < PORT_SLOT_GAP) {
+            const inward = lane.x + PORT_SLOT_GAP;
+            laneX = inwardLaneIsClear(inward) ? inward : lane.x - PORT_SLOT_GAP;
+          }
+        }
+      }
+      lanes.push({
+        x: laneX,
+        top: routeTop,
+        bottom: routeBottom,
+        halfWidth,
+        downward,
+        from: edge.from,
+        to: edge.to,
+        start,
+        end,
+        halfHeight: (compactLabel?.height ?? 0) / 2,
+      });
       points = [
         start,
         { x: start.x + (downward ? terminalLead : -terminalLead), y: start.y },

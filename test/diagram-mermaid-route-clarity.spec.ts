@@ -10,7 +10,6 @@ const appearances: Appearance[] = [
 const widths = [1400, 960, 420, 320] as const;
 
 test.skip(!baseUrl, 'Set UI_PREVIEW_BASE_URL to the running diagram preview server.');
-test.describe.configure({ mode: 'serial' });
 
 async function openDiagram(page: Page, state: string, width: number, appearance: Appearance) {
   const params = new URLSearchParams({
@@ -739,7 +738,10 @@ for (const appearance of appearances) {
 
       const topology = await page
         .locator('#mermaid-topology-stress svg[aria-roledescription="flowchart-v2"]')
-        .evaluate((svg) => {
+        .evaluate(async (svg) => {
+          const viewport = svg.closest<HTMLElement>('.mermaid-svg-viewport')!;
+          viewport.scrollLeft = 0;
+          await new Promise(requestAnimationFrame);
           const paths = [...svg.querySelectorAll<SVGPathElement>('.edgePaths path')];
           const nodes = [...svg.querySelectorAll<SVGGElement>('g.node')].map((node) => ({
             id: node.id.match(/flowchart-(.+?)-\d+$/)?.[1],
@@ -782,8 +784,11 @@ for (const appearance of appearances) {
           const labels = [...svg.querySelectorAll<SVGGElement>('g.edgeLabel')].filter((label) =>
             label.textContent?.trim(),
           );
-          const frame = svg.closest<HTMLElement>('.mermaid-presentation')!.getBoundingClientRect();
+          // The readable SVG can exceed its native scroll viewport. Its canvas,
+          // not the viewport-width presentation wrapper, owns the 16px inset.
+          const frame = svg.getBoundingClientRect();
           const canvasMargin = 16;
+          const paintBounds = [...nodes.map(({ bounds }) => bounds)];
           if (
             nodes.some(
               ({ bounds }) =>
@@ -796,6 +801,7 @@ for (const appearance of appearances) {
             violations.push('node leaves painted canvas');
           for (let left = 0; left < labels.length; left += 1) {
             const a = labels[left].getBoundingClientRect();
+            paintBounds.push(a);
             if (
               a.left < frame.left + canvasMargin ||
               a.right > frame.right - canvasMargin ||
@@ -815,35 +821,120 @@ for (const appearance of appearances) {
             .filter((path) => /-L_(?:A_B|B_A)_/.test(path.id))
             .map((path) => path.dataset.parallelLane)
             .filter(Boolean);
+          for (const path of paths) {
+            const matrix = path.getScreenCTM()!;
+            const scale = Math.hypot(matrix.a, matrix.b);
+            const style = getComputedStyle(path);
+            const strokeScale = style.vectorEffect === 'non-scaling-stroke' ? 1 : scale;
+            const bleed = (Number.parseFloat(style.strokeWidth) * strokeScale) / 2;
+            const bounds = path.getBoundingClientRect();
+            paintBounds.push(
+              new DOMRect(
+                bounds.x - bleed,
+                bounds.y - bleed,
+                bounds.width + bleed * 2,
+                bounds.height + bleed * 2,
+              ),
+            );
+            const markerId = path.getAttribute('marker-end')?.match(/#([^)]*)/)?.[1];
+            if (!markerId) continue;
+            const marker = svg.querySelector<SVGMarkerElement>(`marker[id="${markerId}"]`);
+            const shape = marker?.querySelector<SVGPathElement>('path');
+            if (!marker || !shape) {
+              violations.push(`${path.id} missing marker geometry`);
+              continue;
+            }
+            const box = shape.getBBox();
+            const view = marker.viewBox.baseVal;
+            const units =
+              marker.markerUnits.baseVal === SVGMarkerElement.SVG_MARKERUNITS_STROKEWIDTH
+                ? Number.parseFloat(style.strokeWidth)
+                : 1;
+            const zoom = view.width
+              ? Math.max(
+                  marker.markerWidth.baseVal.value / view.width,
+                  marker.markerHeight.baseVal.value / view.height,
+                )
+              : 1;
+            const markerScale = units * zoom * scale;
+            const markerStyle = getComputedStyle(shape);
+            const markerStrokeScale =
+              markerStyle.vectorEffect === 'non-scaling-stroke' ? 1 : markerScale;
+            // A conservative orientation-independent disk encloses the actual
+            // marker, only at the terminal — never along the entire shaft.
+            const radius =
+              Math.max(
+                ...[box.x, box.x + box.width].flatMap((x) =>
+                  [box.y, box.y + box.height].map((y) =>
+                    Math.hypot(x - marker.refX.baseVal.value, y - marker.refY.baseVal.value),
+                  ),
+                ),
+              ) *
+                markerScale +
+              (Number.parseFloat(markerStyle.strokeWidth) * markerStrokeScale) / 2;
+            const end = path.getPointAtLength(path.getTotalLength()).matrixTransform(matrix);
+            paintBounds.push(new DOMRect(end.x - radius, end.y - radius, radius * 2, radius * 2));
+          }
           if (
-            paths.some((path) => {
-              const matrix = path.getScreenCTM()!;
-              const markerBleed = path.hasAttribute('marker-end') ? 4 : 0;
-              const paintBleed = Math.max(
-                Number.parseFloat(getComputedStyle(path).strokeWidth) / 2,
-                markerBleed,
-              );
-              return Array.from({ length: 121 }, (_, index) => {
-                const point = path.getPointAtLength((path.getTotalLength() * index) / 120);
-                return new DOMPoint(point.x, point.y).matrixTransform(matrix);
-              }).some(
-                (point) =>
-                  point.x < frame.left + canvasMargin + paintBleed ||
-                  point.x > frame.right - canvasMargin - paintBleed ||
-                  point.y < frame.top + canvasMargin + paintBleed ||
-                  point.y > frame.bottom - canvasMargin - paintBleed,
-              );
-            })
+            paintBounds.some(
+              (bounds) =>
+                bounds.left < frame.left + canvasMargin ||
+                bounds.right > frame.right - canvasMargin ||
+                bounds.top < frame.top + canvasMargin ||
+                bounds.bottom > frame.bottom - canvasMargin,
+            )
           )
-            violations.push('route leaves frame');
+            violations.push('paint leaves inset canvas');
+          const scrollExtremes = [];
+          for (const requested of [0, viewport.scrollWidth]) {
+            viewport.scrollLeft = requested;
+            await new Promise(requestAnimationFrame);
+            const clip = viewport.getBoundingClientRect();
+            const displacement = svg.getBoundingClientRect().left - frame.left;
+            scrollExtremes.push({
+              scrollLeft: viewport.scrollLeft,
+              leftInset: Math.min(
+                ...paintBounds.map((bounds) => bounds.left + displacement - clip.left),
+              ),
+              rightInset: Math.min(
+                ...paintBounds.map((bounds) => clip.right - bounds.right - displacement),
+              ),
+            });
+          }
+          viewport.scrollLeft = 0;
+          const fonts = [
+            ...svg.querySelectorAll<SVGElement>('.nodeLabel, .edgeLabel text, span.edgeLabel'),
+          ]
+            .filter((element) => element.textContent?.trim())
+            .map(
+              (element) =>
+                Number.parseFloat(getComputedStyle(element).fontSize) *
+                Math.hypot(svg.getScreenCTM()!.a, svg.getScreenCTM()!.b),
+            );
           return {
             violations,
+            scrollExtremes,
+            scrollExtent: viewport.scrollWidth - viewport.clientWidth,
+            minimumFont: Math.min(...fonts),
+            pageOverflow:
+              document.documentElement.scrollWidth - document.documentElement.clientWidth,
             feedback: [feedback?.dataset.feedbackSource, feedback?.dataset.feedbackTarget],
             parallel,
             selfLoop: svg.querySelector('path[data-self-loop="right"]') !== null,
           };
         });
+      await testInfo.attach('topology-canvas-geometry', {
+        body: JSON.stringify(topology, null, 2),
+        contentType: 'application/json',
+      });
       expect(topology.violations).toEqual([]);
+      expect(topology.scrollExtremes[0].scrollLeft).toBe(0);
+      expect(topology.scrollExtremes[1].scrollLeft).toBe(topology.scrollExtent);
+      expect(topology.scrollExtremes[0].leftInset).toBeGreaterThanOrEqual(16);
+      expect(topology.scrollExtremes[1].rightInset).toBeGreaterThanOrEqual(16);
+      // CSS layout quantizes the SVG width; allow only one 1/64px layout unit.
+      expect(topology.minimumFont).toBeGreaterThanOrEqual(12 - 1 / 64);
+      expect(topology.pageOverflow).toBe(0);
       expect(topology.feedback).toEqual(['E', 'B']);
       if (width === 960) {
         expect(topology.parallel).toEqual(['before', 'center', 'after']);
@@ -857,47 +948,264 @@ for (const appearance of appearances) {
         .waitFor();
       const feedback = await page
         .locator('#mermaid-cycle-fanout svg[aria-roledescription="flowchart-v2"]')
-        .evaluate((svg) => {
-          const outer = svg.querySelector<SVGPathElement>('path[data-feedback-lane="outer"]')!;
-          const inner = [...svg.querySelectorAll<SVGPathElement>('.edgePaths path')].find((path) =>
-            path.id.includes('-L_ER_Review_'),
-          )!;
-          const target = [...svg.querySelectorAll<SVGGElement>('g.node')].find((node) =>
-            node.id.includes('-flowchart-Hub-'),
-          )!;
-          const shape = target.querySelector<SVGGraphicsElement>(':scope > .label-container')!;
-          const end = outer.getPointAtLength(outer.getTotalLength());
-          const screenEnd = new DOMPoint(end.x, end.y).matrixTransform(outer.getScreenCTM()!);
-          const targetBox = shape.getBoundingClientRect();
-          const sample = (path: SVGPathElement) => {
-            const count = Math.ceil(path.getTotalLength() / 2) + 1;
-            return Array.from({ length: count }, (_, index) =>
-              path.getPointAtLength((path.getTotalLength() * index) / (count - 1)),
+        .evaluate(
+          (svg, runNegativeControls) => {
+            const outer = svg.querySelector<SVGPathElement>('path[data-feedback-lane="outer"]')!;
+            const inner = [...svg.querySelectorAll<SVGPathElement>('.edgePaths path')].find(
+              (path) => path.id.includes('-L_ER_Review_'),
+            )!;
+            const target = [...svg.querySelectorAll<SVGGElement>('g.node')].find((node) =>
+              node.id.includes('-flowchart-Hub-'),
+            )!;
+            const shape = target.querySelector<SVGGeometryElement>(':scope > .label-container')!;
+            const end = outer.getPointAtLength(outer.getTotalLength());
+            const screenEnd = new DOMPoint(end.x, end.y).matrixTransform(outer.getScreenCTM()!);
+            const targetBox = shape.getBoundingClientRect();
+            const shapeMatrix = shape.getScreenCTM()!;
+            const inverseShapeMatrix = shapeMatrix.inverse();
+            type Point = { x: number; y: number };
+            const distance = (a: Point, b: Point) => Math.hypot(a.x - b.x, a.y - b.y);
+            const inside = (point: Point) =>
+              shape.isPointInFill(
+                new DOMPoint(point.x, point.y).matrixTransform(inverseShapeMatrix),
+              );
+            const perimeterCount = Math.ceil(
+              shape.getTotalLength() * Math.hypot(shapeMatrix.a, shapeMatrix.b) * 10,
             );
-          };
-          const left = sample(outer).slice(1, -1);
-          const right = sample(inner).slice(1, -1);
-          const minimumDistance = Math.min(
-            ...left.flatMap((a) => right.map((b) => Math.hypot(a.x - b.x, a.y - b.y))),
-          );
-          const outerBox = outer.getBBox();
-          const innerBox = inner.getBBox();
-          return {
-            source: outer.dataset.feedbackSource,
-            target: outer.dataset.feedbackTarget,
-            segments: Number(outer.dataset.manhattanSegments),
-            outside:
-              outerBox.x + outerBox.width > innerBox.x + innerBox.width + 20 &&
-              outerBox.y + outerBox.height > innerBox.y + innerBox.height + 20,
-            minimumDistance,
-            marker: outer.getAttribute('marker-end'),
-            targetCenterError: Math.abs(screenEnd.x - (targetBox.left + targetBox.right) / 2),
-            targetGap:
-              outer.dataset.feedbackTargetSide === 'top'
-                ? targetBox.top - screenEnd.y
-                : screenEnd.y - targetBox.bottom,
-          };
-        });
+            const perimeter = Array.from({ length: perimeterCount }, (_, index) =>
+              shape
+                .getPointAtLength((shape.getTotalLength() * index) / perimeterCount)
+                .matrixTransform(shapeMatrix),
+            );
+            const nearest = (point: Point) =>
+              perimeter.reduce((best, p) =>
+                distance(point, p) < distance(point, best) ? p : best,
+              );
+            const terminal = (path: SVGPathElement, atEnd: boolean) => {
+              const matrix = path.getScreenCTM()!;
+              const scale = Math.hypot(matrix.a, matrix.b);
+              const length = path.getTotalLength();
+              const point = path.getPointAtLength(atEnd ? length : 0).matrixTransform(matrix);
+              const adjacent = path
+                .getPointAtLength(atEnd ? length - 0.25 / scale : 0.25 / scale)
+                .matrixTransform(matrix);
+              const magnitude = distance(point, adjacent);
+              const sign = atEnd ? 1 : -1;
+              const direction = {
+                x: (sign * (point.x - adjacent.x)) / magnitude,
+                y: (sign * (point.y - adjacent.y)) / magnitude,
+              };
+              const stroke = getComputedStyle(path);
+              const shaftRadius =
+                (parseFloat(stroke.strokeWidth) / 2) *
+                (stroke.vectorEffect === 'non-scaling-stroke' ? 1 : scale);
+              const markerId = path
+                .getAttribute(atEnd ? 'marker-end' : 'marker-start')
+                ?.match(/#([^)]*)/)?.[1];
+              let forward = shaftRadius,
+                lateral = shaftRadius,
+                markerValid = !atEnd;
+              if (markerId) {
+                const marker = svg.querySelector<SVGMarkerElement>(`marker[id="${markerId}"]`);
+                const markerShape = marker?.querySelector<SVGGeometryElement>('path');
+                if (marker && markerShape) {
+                  const box = markerShape.getBBox(),
+                    view = marker.viewBox.baseVal;
+                  const sx = marker.markerWidth.baseVal.value / view.width;
+                  const sy = marker.markerHeight.baseVal.value / view.height;
+                  const units =
+                    marker.markerUnits.baseVal === 2 ? parseFloat(stroke.strokeWidth) : 1;
+                  const markerStyle = getComputedStyle(markerShape);
+                  const bleed =
+                    (parseFloat(markerStyle.strokeWidth) / 2) *
+                    (markerStyle.vectorEffect === 'non-scaling-stroke' ? 1 : scale * units * sx);
+                  markerValid =
+                    marker.getAttribute('orient') === 'auto' && Math.abs(sx - sy) < 0.001;
+                  forward =
+                    (box.x + box.width - marker.refX.baseVal.value) * sx * units * scale + bleed;
+                  lateral =
+                    Math.max(
+                      Math.abs(box.y - marker.refY.baseVal.value),
+                      Math.abs(box.y + box.height - marker.refY.baseVal.value),
+                    ) *
+                      sy *
+                      units *
+                      scale +
+                    bleed;
+                }
+              }
+              return {
+                id: path.id,
+                atEnd,
+                point,
+                direction,
+                boundary: nearest(point),
+                forward,
+                lateral,
+                markerValid,
+              };
+            };
+            const original = terminal(outer, true);
+            const inwardAt = (point: Point, direction: Point) =>
+              inside({ x: point.x + direction.x * 0.75, y: point.y + direction.y * 0.75 }) &&
+              !inside({ x: point.x - direction.x * 0.75, y: point.y - direction.y * 0.75 });
+            // Discover adjacent incoming AND outgoing paint from endpoints, not port datasets.
+            const neighbors = [...svg.querySelectorAll<SVGPathElement>('.edgePaths path')]
+              .filter((path) => path !== outer)
+              .flatMap((path) => [terminal(path, false), terminal(path, true)])
+              .filter(
+                (item) =>
+                  distance(item.point, item.boundary) <= 8 &&
+                  inwardAt(item.boundary, original.direction) &&
+                  Math.abs(
+                    (item.boundary.x - original.boundary.x) * original.direction.x +
+                      (item.boundary.y - original.boundary.y) * original.direction.y,
+                  ) < 0.2,
+              );
+            const inspectAttachment = () => {
+              const item = terminal(outer, true);
+              const { point, direction, boundary } = item;
+              const tangent = { x: -direction.y, y: direction.x };
+              const rawGap =
+                (boundary.x - point.x) * direction.x + (boundary.y - point.y) * direction.y;
+              const perpendicularError = Math.abs(
+                (boundary.x - point.x) * tangent.x + (boundary.y - point.y) * tangent.y,
+              );
+              const cardinal = Math.min(Math.abs(direction.x), Math.abs(direction.y)) < 0.001;
+              const straightBoundary = [-1, 0, 1].every((sign) =>
+                inwardAt(
+                  {
+                    x: boundary.x + tangent.x * sign * (item.lateral + 1),
+                    y: boundary.y + tangent.y * sign * (item.lateral + 1),
+                  },
+                  direction,
+                ),
+              );
+              const clearance = neighbors.map((neighbor) => ({
+                id: neighbor.id,
+                atEnd: neighbor.atEnd,
+                separation:
+                  Math.abs(
+                    (neighbor.boundary.x - boundary.x) * tangent.x +
+                      (neighbor.boundary.y - boundary.y) * tangent.y,
+                  ) -
+                  neighbor.lateral -
+                  item.lateral,
+              }));
+              return {
+                cardinal,
+                inward: inwardAt(boundary, direction),
+                straightBoundary,
+                perpendicularError,
+                markerValid: item.markerValid,
+                paintedGap: rawGap - item.forward,
+                nonconflicting: clearance.every((neighbor) => neighbor.separation > 1),
+                clearance,
+                endpoint: { x: point.x, y: point.y },
+                boundary: { x: boundary.x, y: boundary.y },
+              };
+            };
+            const attachment = inspectAttachment();
+            const negativeControls: Record<string, ReturnType<typeof inspectAttachment>> = {};
+            if (runNegativeControls) {
+              // Mutate only this browser's rendered path, then restore it. The same
+              // observer must reject real detached, tangential and colliding paint.
+              const originalD = outer.getAttribute('d')!;
+              const originalStyle = outer.getAttribute('style');
+              // Do not measure the first frame of a CSS d transition as the mutation.
+              outer.style.setProperty('transition', 'none', 'important');
+              getComputedStyle(outer).transition;
+              const move = (dx: number, dy: number) => {
+                const m = outer.getScreenCTM()!;
+                const a = new DOMPoint(0, 0).matrixTransform(m.inverse());
+                const b = new DOMPoint(dx, dy).matrixTransform(m.inverse());
+                outer.setAttribute(
+                  'd',
+                  originalD.replace(/[MLQ][^MLQ]*/g, (command) => {
+                    const coordinates = command.slice(1).trim().split(/[ ,]+/).map(Number);
+                    return (
+                      command[0] +
+                      coordinates
+                        .map((value, index) => value + (index % 2 ? b.y - a.y : b.x - a.x))
+                        .join(' ') +
+                      ' '
+                    );
+                  }),
+                );
+              };
+              const restore = () => {
+                outer.setAttribute('d', originalD);
+              };
+              try {
+                move(-original.direction.x * 20, -original.direction.y * 20);
+                negativeControls.detached = inspectAttachment();
+                restore();
+                outer.setAttribute('d', `${originalD} L ${end.x + 2} ${end.y}`);
+                negativeControls.tangential = inspectAttachment();
+                restore();
+                outer.setAttribute('d', `${originalD} L ${end.x} ${end.y + 2}`);
+                negativeControls.outward = inspectAttachment();
+                restore();
+                move(targetBox.left - original.point.x, 0);
+                negativeControls.corner = inspectAttachment();
+                restore();
+                if (neighbors[0]) {
+                  move(
+                    neighbors[0].boundary.x - original.boundary.x,
+                    neighbors[0].boundary.y - original.boundary.y,
+                  );
+                  negativeControls.colliding = inspectAttachment();
+                }
+              } finally {
+                restore();
+                getComputedStyle(outer).d;
+                if (originalStyle === null) outer.removeAttribute('style');
+                else outer.setAttribute('style', originalStyle);
+              }
+            }
+            const sample = (path: SVGPathElement) => {
+              const count = Math.ceil(path.getTotalLength() / 2) + 1;
+              return Array.from({ length: count }, (_, index) =>
+                path.getPointAtLength((path.getTotalLength() * index) / (count - 1)),
+              );
+            };
+            const left = sample(outer).slice(1, -1);
+            const right = sample(inner).slice(1, -1);
+            const minimumDistance = Math.min(
+              ...left.flatMap((a) => right.map((b) => Math.hypot(a.x - b.x, a.y - b.y))),
+            );
+            const outerBox = outer.getBBox();
+            const innerBox = inner.getBBox();
+            return {
+              source: outer.dataset.feedbackSource,
+              target: outer.dataset.feedbackTarget,
+              segments: Number(outer.dataset.manhattanSegments),
+              outside:
+                outerBox.x + outerBox.width > innerBox.x + innerBox.width + 20 &&
+                outerBox.y + outerBox.height > innerBox.y + innerBox.height + 20,
+              minimumDistance,
+              marker: outer.getAttribute('marker-end'),
+              attachment,
+              neighbors: neighbors.map(({ id, atEnd, point, boundary }) => ({
+                id,
+                atEnd,
+                point: { x: point.x, y: point.y },
+                boundary: { x: boundary.x, y: boundary.y },
+              })),
+              negativeControls,
+              targetCenterError: Math.abs(screenEnd.x - (targetBox.left + targetBox.right) / 2),
+              targetGap:
+                outer.dataset.feedbackTargetSide === 'top'
+                  ? targetBox.top - screenEnd.y
+                  : screenEnd.y - targetBox.bottom,
+            };
+          },
+          width === 420 && appearance.name === 'light',
+        );
+      await testInfo.attach('feedback-attachment-geometry', {
+        body: JSON.stringify(feedback, null, 2),
+        contentType: 'application/json',
+      });
       expect(feedback).toMatchObject({
         source: 'Review',
         target: 'Hub',
@@ -906,7 +1214,26 @@ for (const appearance of appearances) {
       expect(feedback.segments).toBeLessThanOrEqual(6);
       expect(feedback.minimumDistance).toBeGreaterThan(6);
       expect(feedback.marker).toContain('pointEnd');
-      expect(feedback.targetCenterError).toBeLessThanOrEqual(1);
+      expect(feedback.attachment).toMatchObject({
+        cardinal: true,
+        inward: true,
+        straightBoundary: true,
+        markerValid: true,
+        nonconflicting: true,
+      });
+      expect(feedback.attachment.perpendicularError).toBeLessThanOrEqual(0.2);
+      expect(feedback.attachment.paintedGap).toBeGreaterThanOrEqual(4.65);
+      expect(feedback.attachment.paintedGap).toBeLessThanOrEqual(5.35);
+      if (feedback.neighbors.length === 0)
+        expect(feedback.targetCenterError).toBeLessThanOrEqual(1);
+      if (width === 420 && appearance.name === 'light') {
+        expect(feedback.neighbors.length).toBeGreaterThan(0);
+        expect(feedback.negativeControls.detached.paintedGap).toBeGreaterThan(5.35);
+        expect(feedback.negativeControls.tangential.inward).toBe(false);
+        expect(feedback.negativeControls.outward.inward).toBe(false);
+        expect(feedback.negativeControls.corner.straightBoundary).toBe(false);
+        expect(feedback.negativeControls.colliding.nonconflicting).toBe(false);
+      }
       expect(feedback.targetGap).toBeGreaterThanOrEqual(0);
       expect(feedback.targetGap).toBeLessThanOrEqual(6);
 
@@ -974,6 +1301,200 @@ for (const appearance of appearances) {
             }
           }
         const placements = paths.map((path) => {
+          const points = path.dataset.manhattanPoints!.split(' ').map((value) => {
+            const [x, y] = value.split(',').map(Number);
+            return { x, y };
+          });
+          const directions = points.slice(1).map((point, index) => {
+            const dx = point.x - points[index].x;
+            const dy = point.y - points[index].y;
+            return Math.abs(dx) < 0.01 && Math.abs(dy) >= 0.01
+              ? { x: 0, y: Math.sign(dy) }
+              : Math.abs(dy) < 0.01 && Math.abs(dx) >= 0.01
+                ? { x: Math.sign(dx), y: 0 }
+                : null;
+          });
+          const cleanLegs = directions.every(
+            (direction, index) =>
+              direction &&
+              (!index ||
+                (directions[index - 1] &&
+                  direction.x * directions[index - 1]!.x +
+                    direction.y * directions[index - 1]!.y ===
+                    0)),
+          );
+          let necessaryFive = false;
+          let fiveLegEvidence;
+          if (directions.length === 5 && cleanLegs) {
+            // Read the rendered path independently of its Manhattan metadata.
+            // Q controls recover rounded corners; consecutive collinear Ls
+            // (including terminal trimming) are one geometric leg, not a turn.
+            const actualPoints: { x: number; y: number }[] = [];
+            const commands = path.getAttribute('d')!.match(/[A-Za-z][^A-Za-z]*/g) ?? [];
+            const supportedCommands = commands.every((command) => {
+              const values = command.slice(1).trim().split(/[ ,]+/).map(Number);
+              if (
+                !['M', 'L', 'Q'].includes(command[0]) ||
+                values.some((value) => !Number.isFinite(value))
+              )
+                return false;
+              for (let index = 0; index < values.length; index += 2) {
+                const point = { x: values[index], y: values[index + 1] };
+                const a = actualPoints.at(-2),
+                  b = actualPoints.at(-1);
+                if (
+                  a &&
+                  b &&
+                  ((Math.abs(a.x - b.x) < 0.01 &&
+                    Math.abs(b.x - point.x) < 0.01 &&
+                    (b.y - a.y) * (point.y - b.y) > 0) ||
+                    (Math.abs(a.y - b.y) < 0.01 &&
+                      Math.abs(b.y - point.y) < 0.01 &&
+                      (b.x - a.x) * (point.x - b.x) > 0))
+                )
+                  actualPoints.pop();
+                actualPoints.push(point);
+              }
+              return true;
+            });
+            const actualLegsMatch =
+              supportedCommands &&
+              actualPoints.length === 6 &&
+              actualPoints.slice(1).every((point, index) => {
+                const dx = point.x - actualPoints[index].x,
+                  dy = point.y - actualPoints[index].y;
+                const direction = directions[index]!;
+                return direction.x
+                  ? Math.abs(dy) < 0.01 && Math.sign(dx) === direction.x
+                  : Math.abs(dx) < 0.01 && Math.sign(dy) === direction.y;
+              });
+            const matrix = path.getScreenCTM()!;
+            const length = path.getTotalLength();
+            const scale = Math.hypot(matrix.a, matrix.b);
+            const count = Math.ceil(length * scale * 4);
+            const samples = Array.from({ length: count + 1 }, (_, index) =>
+              path.getPointAtLength((length * index) / count).matrixTransform(matrix),
+            );
+            const start = samples[0],
+              end = samples.at(-1)!;
+            const first = { x: samples[1].x - start.x, y: samples[1].y - start.y };
+            const last = { x: end.x - samples.at(-2)!.x, y: end.y - samples.at(-2)!.y };
+            const firstLength = Math.hypot(first.x, first.y),
+              lastLength = Math.hypot(last.x, last.y);
+            const sameDirection =
+              Math.abs(first.x / firstLength - last.x / lastLength) < 0.01 &&
+              Math.abs(first.y / firstLength - last.y / lastLength) < 0.01;
+            // Same-direction terminal legs with opposite net displacement cannot
+            // use 1 or 3 legs; 2/4 legs have perpendicular terminals. Five is the
+            // geometric minimum, independent of route IDs or router metadata.
+            const oppositeDisplacement =
+              (end.x - start.x) * first.x + (end.y - start.y) * first.y < 0;
+            const nodes = [...svg.querySelectorAll<SVGGElement>('g.node')].map((node) => ({
+              id: node.id,
+              shape: node.querySelector<SVGGeometryElement>(
+                ':scope > .label-container, :scope > rect, :scope > circle',
+              )!,
+            }));
+            const perimeterDistance = (shape: SVGGeometryElement, point: DOMPoint) => {
+              const transform = shape.getScreenCTM()!;
+              const perimeter = shape.getTotalLength();
+              const steps = Math.ceil(perimeter * Math.hypot(transform.a, transform.b) * 8);
+              let closest = Infinity;
+              for (let index = 0; index <= steps; index++) {
+                const edge = shape
+                  .getPointAtLength((perimeter * index) / steps)
+                  .matrixTransform(transform);
+                closest = Math.min(closest, Math.hypot(edge.x - point.x, edge.y - point.y));
+              }
+              return closest;
+            };
+            const source = nodes.toSorted(
+              (a, b) => perimeterDistance(a.shape, start) - perimeterDistance(b.shape, start),
+            )[0];
+            const target = nodes.find((node) => node.id === path.dataset.terminalTarget);
+            const markerId = path.getAttribute('marker-end')?.match(/#([^)]*)/)?.[1];
+            const marker = markerId
+              ? svg.querySelector<SVGMarkerElement>(`marker[id="${markerId}"]`)
+              : null;
+            const markerShape = marker?.querySelector<SVGPathElement>('path');
+            // Measure the chevron's forward-most painted point from its actual
+            // shape/reference point, not the router's stored terminal gap.
+            let markerTip = NaN;
+            if (
+              marker &&
+              markerShape &&
+              marker.orientType.baseVal === SVGMarkerElement.SVG_MARKER_ORIENT_AUTO
+            ) {
+              const units =
+                marker.markerUnits.baseVal === SVGMarkerElement.SVG_MARKERUNITS_STROKEWIDTH
+                  ? Number.parseFloat(getComputedStyle(path).strokeWidth)
+                  : 1;
+              const zoom = marker.viewBox.baseVal.width
+                ? marker.markerWidth.baseVal.value / marker.viewBox.baseVal.width
+                : 1;
+              const box = markerShape.getBBox();
+              const stroke = getComputedStyle(markerShape);
+              const strokeScale =
+                stroke.vectorEffect === 'non-scaling-stroke' ? 1 : scale * units * zoom;
+              markerTip =
+                (box.x + box.width - marker.refX.baseVal.value) * units * zoom * scale +
+                (Number.parseFloat(stroke.strokeWidth) * strokeScale) / 2;
+            }
+            const targetGap = target ? perimeterDistance(target.shape, end) - markerTip : NaN;
+            const inside = (node: typeof source, point: DOMPoint) =>
+              node.shape.isPointInFill(point.matrixTransform(node.shape.getScreenCTM()!.inverse()));
+            const entersTarget =
+              target &&
+              inside(
+                target,
+                new DOMPoint(end.x + (last.x / lastLength) * 8, end.y + (last.y / lastLength) * 8),
+              );
+            const clearsNodes = samples
+              .slice(1, -1)
+              .every((point) => nodes.every((node) => !inside(node, point)));
+            const otherLabels = [
+              ...svg.querySelectorAll<SVGGElement>('.edgeLabels > .edgeLabel'),
+            ].filter((label) => label.textContent?.trim() && label.dataset.routePathId !== path.id);
+            const clearsLabels = otherLabels.every((label) => {
+              const b = label.getBoundingClientRect();
+              return samples.every(
+                (p) => p.x <= b.left || p.x >= b.right || p.y <= b.top || p.y >= b.bottom,
+              );
+            });
+            const ownLabel = svg
+              .querySelector<SVGGElement>(`.edgeLabel[data-route-path-id="${path.id}"]`)!
+              .getBoundingClientRect();
+            const labelClearsNodes = nodes.every(({ shape }) => {
+              const b = shape.getBoundingClientRect();
+              return (
+                ownLabel.right <= b.left ||
+                ownLabel.left >= b.right ||
+                ownLabel.bottom <= b.top ||
+                ownLabel.top >= b.bottom
+              );
+            });
+            fiveLegEvidence = {
+              actualLegsMatch,
+              terminalDirections: [first, last],
+              displacement: { x: end.x - start.x, y: end.y - start.y },
+              sourceGap: perimeterDistance(source.shape, start),
+              targetGap,
+              clearsNodes,
+              clearsLabels,
+              labelClearsNodes,
+            };
+            necessaryFive =
+              actualLegsMatch &&
+              sameDirection &&
+              oppositeDisplacement &&
+              perimeterDistance(source.shape, start) <= 0.5 &&
+              Boolean(entersTarget) &&
+              Number.isFinite(targetGap) &&
+              Math.abs(targetGap - 5) <= 0.35 &&
+              clearsNodes &&
+              clearsLabels &&
+              labelClearsNodes;
+          }
           const label = svg.querySelector<SVGGElement>(
             `.edgeLabel[data-route-path-id="${path.id}"]`,
           )!;
@@ -993,12 +1514,19 @@ for (const appearance of appearances) {
             distance: Math.hypot(center.x - expected.x, center.y - expected.y),
             capacity: Number(path.dataset.labelCapacity),
             required: horizontal ? box.width : box.height,
-            segments: Number(path.dataset.manhattanSegments),
+            segments: directions.length,
+            cleanLegs,
+            necessaryFive,
+            fiveLegEvidence,
             terminal: path.dataset.terminalTarget,
             marker: path.getAttribute('marker-end'),
           };
         });
         return { count: paths.length, violations, placements };
+      });
+      await testInfo.attach('state-route-geometry', {
+        body: JSON.stringify(state, null, 2),
+        contentType: 'application/json',
       });
       expect(state.count).toBe(10);
       expect(state.violations).toEqual([]);
@@ -1007,7 +1535,8 @@ for (const appearance of appearances) {
           (item) =>
             item.distance > 1 ||
             item.capacity < item.required ||
-            item.segments > 4 ||
+            !item.cleanLegs ||
+            (item.segments > 4 && !item.necessaryFive) ||
             !item.terminal ||
             !item.marker?.includes('barbEnd'),
         ),
@@ -1147,48 +1676,130 @@ for (const appearance of appearances) {
         contained: true,
       });
       expect(highlight.borderWidth).toBe(0);
-      const defaults = await root.locator('.diagram-renderer').evaluate((renderer) => {
-        const node = renderer.querySelector<HTMLElement>(
-          '.diagram-node-html:not(.node-state-highlighted)',
-        )!;
-        const label = renderer.querySelector<HTMLElement>('.edge-label-html')!;
-        const labelRange = document.createRange();
-        labelRange.selectNodeContents(label);
-        const labelBounds = label.getBoundingClientRect();
-        const textBounds = labelRange.getBoundingClientRect();
-        const edge = renderer.querySelector<SVGPathElement>('.edge-path')!;
-        const markerId = edge.getAttribute('marker-end')?.match(/#([^)]*)/)?.[1];
-        const marker = markerId
-          ? renderer.querySelector<SVGPathElement>(`marker[id="${markerId}"] path`)
-          : null;
-        const nodeStyle = getComputedStyle(node);
-        const labelStyle = getComputedStyle(label);
-        const labelFeatherStyle = getComputedStyle(label, '::before');
-        const svg = renderer.querySelector<SVGSVGElement>('.diagram-svg-layer')!;
-        const matrix = svg.getScreenCTM()!;
-        const scale = Math.hypot(matrix.a, matrix.b);
-        return {
-          nodeBorder: Number.parseFloat(nodeStyle.borderWidth),
-          nodeBackground: nodeStyle.backgroundColor,
-          nodeColor: nodeStyle.color,
-          labelBackground: labelStyle.backgroundColor,
-          labelFeatherBackground: labelFeatherStyle.backgroundColor,
-          labelMask: labelFeatherStyle.webkitMaskImage || labelFeatherStyle.maskImage,
-          horizontal:
-            Math.min(textBounds.left - labelBounds.left, labelBounds.right - textBounds.right) /
-            scale,
-          vertical:
-            Math.min(textBounds.top - labelBounds.top, labelBounds.bottom - textBounds.bottom) /
-            scale,
-          paintOrder: !!(
-            edge.compareDocumentPosition(label.closest('foreignObject')!) &
-            Node.DOCUMENT_POSITION_FOLLOWING
-          ),
-          edgeStroke: getComputedStyle(edge).stroke,
-          markerFill: marker?.getAttribute('fill'),
-          markerStroke: marker?.getAttribute('stroke'),
-        };
-      });
+      await page.evaluate(() => document.fonts.ready);
+      const defaults = await root.locator('.diagram-renderer').evaluate(
+        (renderer, runNegatives) => {
+          const node = renderer.querySelector<HTMLElement>(
+            '.diagram-node-html:not(.node-state-highlighted)',
+          )!;
+          const label = renderer.querySelector<HTMLElement>('.edge-label-html')!;
+          const labelRange = document.createRange();
+          labelRange.selectNodeContents(label);
+          const labelBounds = label.getBoundingClientRect();
+          const textBounds = labelRange.getBoundingClientRect();
+          const edge = renderer.querySelector<SVGPathElement>('.edge-path')!;
+          const markerId = edge.getAttribute('marker-end')?.match(/#([^)]*)/)?.[1];
+          const marker = markerId
+            ? renderer.querySelector<SVGPathElement>(`marker[id="${markerId}"] path`)
+            : null;
+          const nodeStyle = getComputedStyle(node);
+          const labelStyle = getComputedStyle(label);
+          const labelFeatherStyle = getComputedStyle(label, '::before');
+          const svg = renderer.querySelector<SVGSVGElement>('.diagram-svg-layer')!;
+          const matrix = svg.getScreenCTM()!;
+          const scale = Math.hypot(matrix.a, matrix.b);
+          const text = label.querySelector<HTMLElement>('.edge-label-text')!;
+          const foreignObject = label.closest('foreignObject')!;
+          const measurePadding = () => {
+            const bounds = label.getBoundingClientRect();
+            const lineBox = text.getBoundingClientRect();
+            const frame = foreignObject.getBoundingClientRect();
+            const style = getComputedStyle(label);
+            const characters: DOMRect[] = [];
+            const walker = document.createTreeWalker(text, NodeFilter.SHOW_TEXT);
+            while (walker.nextNode()) {
+              const node = walker.currentNode;
+              for (let index = 0; index < (node.textContent?.length ?? 0); index++) {
+                if (!node.textContent![index].trim()) continue;
+                const range = document.createRange();
+                range.setStart(node, index);
+                range.setEnd(node, index + 1);
+                characters.push(...range.getClientRects());
+              }
+            }
+            const contains = (outer: DOMRect, inner: DOMRect) =>
+              inner.left >= outer.left &&
+              inner.right <= outer.right &&
+              inner.top >= outer.top &&
+              inner.bottom <= outer.bottom;
+            const lines = [...new Set(characters.map((rect) => rect.top))].map((top) => {
+              const rects = characters.filter((rect) => rect.top === top);
+              return {
+                top,
+                bottom: Math.max(...rects.map((r) => r.bottom)),
+                left: Math.min(...rects.map((r) => r.left)),
+                right: Math.max(...rects.map((r) => r.right)),
+              };
+            });
+            return {
+              top: (lineBox.top - bounds.top) / scale,
+              bottom: (bounds.bottom - lineBox.bottom) / scale,
+              cssTop: parseFloat(style.paddingTop),
+              cssBottom: parseFloat(style.paddingBottom),
+              textContained:
+                characters.length > 0 &&
+                characters.every((rect) => contains(bounds, rect) && contains(frame, rect)),
+              textFits:
+                text.scrollWidth <= text.clientWidth && text.scrollHeight <= text.clientHeight,
+              unmasked: [label, text, foreignObject].every((element) => {
+                const s = getComputedStyle(element);
+                return s.clipPath === 'none' && s.maskImage === 'none';
+              }),
+              lines,
+            };
+          };
+          const padding = measurePadding();
+          const negativePadding: Record<string, ReturnType<typeof measurePadding>> = {};
+          if (runNegatives) {
+            const labelStyle = label.getAttribute('style'),
+              textStyle = text.getAttribute('style');
+            const restore = () => {
+              for (const [element, style] of [
+                [label, labelStyle],
+                [text, textStyle],
+              ] as const) {
+                if (style === null) element.removeAttribute('style');
+                else element.setAttribute('style', style);
+              }
+            };
+            try {
+              label.style.paddingTop = '2px';
+              label.style.paddingBottom = '2px';
+              label.style.height = `${labelBounds.height / scale - 4}px`;
+              negativePadding.insufficient = measurePadding();
+              restore();
+              text.style.height = '2px';
+              negativePadding.clipped = measurePadding();
+              restore();
+              text.style.transform = 'translateY(20px)';
+              negativePadding.displaced = measurePadding();
+            } finally {
+              restore();
+            }
+          }
+          return {
+            nodeBorder: Number.parseFloat(nodeStyle.borderWidth),
+            nodeBackground: nodeStyle.backgroundColor,
+            nodeColor: nodeStyle.color,
+            labelBackground: labelStyle.backgroundColor,
+            labelFeatherBackground: labelFeatherStyle.backgroundColor,
+            labelMask: labelFeatherStyle.webkitMaskImage || labelFeatherStyle.maskImage,
+            horizontal:
+              Math.min(textBounds.left - labelBounds.left, labelBounds.right - textBounds.right) /
+              scale,
+            padding,
+            negativePadding,
+            paintOrder: !!(
+              edge.compareDocumentPosition(label.closest('foreignObject')!) &
+              Node.DOCUMENT_POSITION_FOLLOWING
+            ),
+            edgeStroke: getComputedStyle(edge).stroke,
+            markerFill: marker?.getAttribute('fill'),
+            markerStroke: marker?.getAttribute('stroke'),
+          };
+        },
+        width === 320 && appearance.name === 'light',
+      );
       expect(defaults).toMatchObject({
         nodeBorder: 0,
         paintOrder: true,
@@ -1201,7 +1812,55 @@ for (const appearance of appearances) {
       expect(defaults.labelFeatherBackground).not.toMatch(/rgba\(0, 0, 0, 0\)|transparent/);
       expect(defaults.labelMask).not.toBe('none');
       expect(defaults.horizontal).toBeGreaterThanOrEqual(5.9);
-      expect(defaults.vertical).toBeGreaterThanOrEqual(3.9);
+      const assertPadding = (padding: typeof defaults.padding) => {
+        // CSS padding belongs to the line box, not font ascent/descent rectangles.
+        expect(padding.top).toBeGreaterThanOrEqual(3.9);
+        expect(padding.bottom).toBeGreaterThanOrEqual(3.9);
+        expect(padding.cssTop).toBe(4);
+        expect(padding.cssBottom).toBe(4);
+        expect(padding.textContained).toBe(true);
+        expect(padding.textFits).toBe(true);
+        expect(padding.unmasked).toBe(true);
+        expect(padding.lines.length).toBeGreaterThan(0);
+      };
+      await testInfo.attach('custom-padding-geometry', {
+        body: JSON.stringify(
+          { padding: defaults.padding, negative: defaults.negativePadding },
+          null,
+          2,
+        ),
+        contentType: 'application/json',
+      });
+      assertPadding(defaults.padding);
+      for (const [name, corrupted] of Object.entries(defaults.negativePadding)) {
+        expect(() => assertPadding(corrupted), `Reject ${name} text geometry`).toThrow();
+      }
+      // Range rectangles contain font leading, not just ink. Compare actual pixels
+      // with text overflow unclipped as an independent check that no glyphs are lost.
+      const label = root.locator('.edge-label-html').first();
+      const text = label.locator('.edge-label-text');
+      const clipped = await label.screenshot();
+      const originalStyle = await text.evaluate((element) => {
+        const style = element.getAttribute('style');
+        element.style.overflow = 'visible';
+        return style;
+      });
+      try {
+        const unclipped = await label.screenshot();
+        await testInfo.attach('custom-label-clipped', { body: clipped, contentType: 'image/png' });
+        await testInfo.attach('custom-label-unclipped', {
+          body: unclipped,
+          contentType: 'image/png',
+        });
+        expect(clipped.equals(unclipped), 'Text overflow must not hide visible glyph pixels').toBe(
+          true,
+        );
+      } finally {
+        await text.evaluate((element, style) => {
+          if (style === null) element.removeAttribute('style');
+          else element.setAttribute('style', style);
+        }, originalStyle);
+      }
       await page.locator('.catalog-topbar').evaluate((toolbar) => {
         toolbar.style.visibility = 'hidden';
       });
