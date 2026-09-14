@@ -600,12 +600,17 @@ function canonicalSessionUpdates(
     updates.liveTurnOpenedAt = undefined;
   }
 
-  // Defensively clear processQueueHint when agent transitions to normal running state
-  // or terminal state. This handles reconnect cases where agent:process:resumed may
-  // not arrive, and prevents stale hints after failed/idle transitions.
+  // Clear processQueueHint only on genuine evidence the turn got past admission
+  // (streaming started), on a terminal status, or when the session goes idle
+  // (`isResponding`/`isActive` false — the reconnect safety net for a missed
+  // `agent:process:resumed`). `isResponding === true` / `isActive === true` are
+  // NOT clearing signals: an agent parked waiting for a slot (§6.5) IS
+  // responding — its turn is open — so an ordinary status tick landing while it
+  // is still queued would wipe the hint and flicker the chat warning off.
   if (
-    fields.isResponding === true ||
-    fields.isActive === true ||
+    fields.isStreaming === true ||
+    fields.isResponding === false ||
+    fields.isActive === false ||
     (typeof fields.status === 'string' && TERMINAL_STATUSES.has(fields.status))
   ) {
     updates.processQueueHint = undefined;
@@ -849,6 +854,7 @@ type SessionComparisonSnapshot = Pick<
   liveTurnOpen: boolean | undefined;
   liveTurnOpenedAt: string | undefined;
   tailCapPruned: boolean | undefined;
+  processQueueHintWaiting: boolean | undefined;
   harnessVersion: string | undefined;
   harnessFeaturesKey: string | undefined;
 };
@@ -916,6 +922,7 @@ function toSessionComparisonSnapshot(session: StoredAgentSession): SessionCompar
     liveTurnOpenedAt:
       typeof session.liveTurnOpenedAt === 'string' ? session.liveTurnOpenedAt : undefined,
     tailCapPruned: session.tailCapPruned === true ? true : undefined,
+    processQueueHintWaiting: session.processQueueHint?.waiting === true ? true : undefined,
     // Harness stamp (§5.5, additive): normally immutable, but a daemon
     // upgrade backfills harnessVersion on legacy rows and first activation
     // materializes harnessFeatures — those upserts must not be swallowed
@@ -1050,6 +1057,24 @@ function applySessionUpsert(
       if (!incomingClosed) {
         finalSession.liveTurnOpen = true;
         finalSession.liveTurnOpenedAt = existing.liveTurnOpenedAt;
+      }
+    }
+    // processQueueHint is FE-owned (set from agent:process:queued, never on
+    // the wire), so a snapshot refresh triggered by an unrelated agent event
+    // must not drop it while the agent is still parked — otherwise the chat
+    // slot-wait warning flickers off. Carry it forward unless the snapshot
+    // itself shows the wait is over (same signals as canonicalSessionUpdates).
+    if (
+      existing.processQueueHint?.waiting === true &&
+      !Object.prototype.hasOwnProperty.call(session, 'processQueueHint')
+    ) {
+      const waitOver =
+        session.isStreaming === true ||
+        session.isResponding === false ||
+        session.isActive === false ||
+        (typeof session.status === 'string' && TERMINAL_STATUSES.has(session.status));
+      if (!waitOver) {
+        finalSession.processQueueHint = existing.processQueueHint;
       }
     }
 
@@ -1600,10 +1625,24 @@ agentSessionReducer.with(clearAllSessions, () => initialState);
 // -----------------------------------------------------------------------
 // Cross-slice: handle workspace-agents actions directly (replaces bridge saga)
 // -----------------------------------------------------------------------
+// Streaming means the process was admitted, so every reducer path that sets
+// isStreaming=true also drops the FE-owned processQueueHint. These paths
+// (setAgentStreaming, chatSendStarted via agent:stream:start,
+// chatStreamingReconciled) bypass canonicalSessionUpdates, so a missed
+// agent:process:resumed would otherwise leave the slot-wait warning up while
+// the agent streams.
+function streamingStartedFields(
+  existing: StoredAgentSession | undefined,
+): Pick<StoredAgentSession, 'processQueueHint'> | Record<string, never> {
+  return existing?.processQueueHint ? { processQueueHint: undefined } : {};
+}
 agentSessionReducer.with(setAgentStreaming, (state, { payload: [agentId, isStreaming] }) => {
   const session = getSession(state, agentId);
-  if (!session || session.isStreaming === isStreaming) return state;
-  return updateSessionFields(state, agentId, { isStreaming });
+  if (!session) return state;
+  return updateSessionFields(state, agentId, {
+    isStreaming,
+    ...(isStreaming ? streamingStartedFields(session) : {}),
+  });
 });
 agentSessionReducer.with(updateAgentDigest, (state, { payload: [, agentId, digest] }) => {
   const session = getSession(state, agentId);
@@ -1623,7 +1662,11 @@ agentSessionReducer.with(renameAgent, (state, { payload: [, agentId, name] }) =>
 agentSessionReducer.with(chatSendStarted, (state, { payload: { agentId, wsId, timestampIso } }) => {
   const existing = getSession(state, agentId);
   if (existing) {
-    return updateSessionFields(state, agentId, { isStreaming: true, isProcessing: true });
+    return updateSessionFields(state, agentId, {
+      isStreaming: true,
+      isProcessing: true,
+      ...streamingStartedFields(existing),
+    });
   }
   if (!wsId) return state;
   // Session not yet loaded (e.g. restored workspace where disk load is still in flight).
@@ -1680,7 +1723,11 @@ agentSessionReducer.with(chatReset, (state, { payload: [agentId] }) =>
   ),
 );
 agentSessionReducer.with(chatStreamingReconciled, (state, { payload: { agentId } }) =>
-  updateSessionFields(state, agentId, { isStreaming: true, isProcessing: true }),
+  updateSessionFields(state, agentId, {
+    isStreaming: true,
+    isProcessing: true,
+    ...streamingStartedFields(getSession(state, agentId)),
+  }),
 );
 agentSessionReducer.with(chatInitialized, (state, { payload: [agentId, data] }) => {
   const session = getSession(state, agentId);
