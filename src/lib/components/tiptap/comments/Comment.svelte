@@ -285,8 +285,10 @@
               size="icon-xs"
               aria-label={m.tiptap_comment_collapse_label()}
               tooltip={m.tiptap_comment_collapse_label()}
-              onclick={(event) => {
-                event.stopPropagation();
+              onclick={(e: MouseEvent) => {
+                // The sidebar container re-focuses a comment on any bubbled
+                // click, which would immediately undo the collapse.
+                e.stopPropagation();
                 onClose?.();
               }}
             >

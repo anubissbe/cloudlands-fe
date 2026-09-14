@@ -34,23 +34,27 @@ src/
 FE docs live in the monorepo's `docs/fe/` — the `../../docs/fe/` paths below resolve
 in a monorepo checkout, where this repo mounts at `packages/cloudlands-fe/`.
 
-| Working on…         | Open                                                                                 |
-| ------------------- | ------------------------------------------------------------------------------------ |
-| agents              | ../../docs/fe/agent-message-dedup-and-stream-sagas.md, ../../docs/fe/RULES_SYSTEM.md |
-| state/store         | ../../docs/fe/STATE_MANAGEMENT.md, src/store/renderer/docs/                          |
-| component design    | ../../docs/fe/COMPONENTS_DESIGN.md                                                   |
-| UI invariant gates  | `pnpm run test:ui-invariants` — ratchets + catalog `*.meta.ts` ledgers, see below    |
-| deps freshness      | `pnpm run deps:check` — gates refuse to run on a stale node_modules install          |
-| panels/layout       | ../../docs/fe/panel-system-refactoring.md, ../../docs/fe/PANEL_TAB_UX_SPEC.md        |
-| PR descriptions     | ../../docs/fe/PR_DESCRIPTION_GUIDE.md                                                |
-| browser/CDP         | ../../docs/fe/BROWSER_PANEL_SPEC.md, ../../docs/fe/CDP_MCP_TOOLS.md                  |
-| module boundaries   | ../../docs/fe/MODULE_BOUNDARY_GUIDE.md                                               |
-| debugging           | ../../docs/fe/TROUBLESHOOTING_GUIDE.md, ../../docs/fe/IPC_DEBUG_GUIDE.md             |
-| error handling      | ../../docs/fe/ERROR_HANDLING_SYSTEM.md                                               |
-| TypeScript/types    | ../../docs/fe/TYPE_SYSTEM_GUIDE.md                                                   |
-| events/IPC          | ../../docs/fe/EVENT_SYSTEM.md                                                        |
-| keybindings         | ../../docs/fe/KEYBINDINGS.md                                                         |
-| deploying/releasing | ../../docs/fe/DEPLOYING.md                                                           |
+| Working on…                                                             | Open                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| ----------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| agents                                                                  | ../../docs/fe/agent-message-dedup-and-stream-sagas.md, ../../docs/fe/RULES_SYSTEM.md                                                                                                                                                                                                                                                                                                                                                                                               |
+| state/store                                                             | ../../docs/fe/STATE_MANAGEMENT.md, src/store/renderer/docs/                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| component design                                                        | ../../docs/fe/COMPONENTS_DESIGN.md                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| UI invariant gates                                                      | `pnpm run test:ui-invariants` — ratchets + catalog `*.meta.ts` ledgers, see below                                                                                                                                                                                                                                                                                                                                                                                                  |
+| deps freshness                                                          | `pnpm run deps:check` — gates refuse to run on a stale node_modules install                                                                                                                                                                                                                                                                                                                                                                                                        |
+| Node version                                                            | `pnpm install` and gates refuse to run on a Node outside `engines.node` (the one range)                                                                                                                                                                                                                                                                                                                                                                                            |
+| panels/layout                                                           | ../../docs/fe/panel-system-refactoring.md, ../../docs/fe/PANEL_TAB_UX_SPEC.md                                                                                                                                                                                                                                                                                                                                                                                                      |
+| PR descriptions                                                         | ../../docs/fe/PR_DESCRIPTION_GUIDE.md                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| browser/CDP                                                             | ../../docs/fe/BROWSER_PANEL_SPEC.md, ../../docs/fe/CDP_MCP_TOOLS.md                                                                                                                                                                                                                                                                                                                                                                                                                |
+| browser tab contract (`ws.browser.*` actions, `errorCode`, `displayed`) | `src/features/browser/main/browser-action-executor.ts`, `embedded-browser-cdp-service.ts`, the browser-tab-registry saga, `src/shared/types/browser-clients.ts` (`BrowserTabInput` / `BrowserTab` own the `displayed` wire field) — change together with intentd `crates/intent-acp/src/mcp_server/bindings/browser_docs/*.md` (the `ws.browser.docs` text) and `../../docs/protocol/methods/files-terminal-browser.md`; monorepo `make docs-check` cross-checks the shared tokens |
+| module boundaries                                                       | ../../docs/fe/MODULE_BOUNDARY_GUIDE.md                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| motion perf traces                                                      | `pnpm perf:chat-motion` — ../../docs/fe/DEVELOPER_GUIDE.md#chat-motion-performance-traces                                                                                                                                                                                                                                                                                                                                                                                          |
+| debugging                                                               | ../../docs/fe/TROUBLESHOOTING_GUIDE.md, ../../docs/fe/IPC_DEBUG_GUIDE.md                                                                                                                                                                                                                                                                                                                                                                                                           |
+| prod stack traces                                                       | `pnpm resolve-stack <tag> < stack.txt` — rebuilds the tag with sourcemaps, maps frames                                                                                                                                                                                                                                                                                                                                                                                             |
+| error handling                                                          | ../../docs/fe/ERROR_HANDLING_SYSTEM.md                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| TypeScript/types                                                        | ../../docs/fe/TYPE_SYSTEM_GUIDE.md                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| events/IPC                                                              | ../../docs/fe/EVENT_SYSTEM.md                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| keybindings                                                             | ../../docs/fe/KEYBINDINGS.md                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| deploying/releasing                                                     | ../../docs/fe/DEPLOYING.md                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 
 ## Key conventions
 
@@ -88,7 +92,7 @@ corepack pnpm run dev           # Standard Electron launcher
 corepack pnpm run dev:cdp       # Electron launcher with CDP support
 corepack pnpm run build         # Production build
 corepack pnpm run check         # Svelte + TypeScript checks
-corepack pnpm run lint          # ESLint
+corepack pnpm run lint          # ESLint + i18n string/completeness + package-script pnpm nesting + knip dead code
 corepack pnpm run format        # Prettier write pass
 corepack pnpm run format:check  # Prettier check (enforced in PR CI)
 corepack pnpm run test:unit     # Vitest suite
@@ -236,8 +240,10 @@ For focused browser validation, run:
 corepack pnpm run test:ct -- src/features/agent/components/agent-avatar/__tests__/agent-avatar-waiting.ct.spec.ts
 ```
 
-The CT harness defaults to port 3100 (the `CT_PORT` env var overrides it). Stop the
-process on that port before retrying if it is occupied. The run exits with Playwright's
+The CT harness defaults to port 3100 (the `CT_PORT` env var overrides it). A run holds
+the host-wide `ct-<CT_PORT>` lock, so a second run on an occupied port waits for the
+first instead of reusing its server; set a free `CT_PORT` to run concurrently (see
+[Verification](#verification)). The run exits with Playwright's
 status as soon as the tests finish — the HTML report is written to `playwright-report/`
 but never served automatically. To browse it after the run, opt in from an interactive
 terminal with `CT_HTML_REPORT=open` (or `-- --open-report`); `node
@@ -316,7 +322,13 @@ empty change set exits 2 instead of passing silently. Add `--dry-run` to inspect
 selected commands without running them. The command runs scoped Prettier and ESLint,
 related Vitest tests, directly imported colocated component tests, and only the
 renderer/main/preload TypeScript boundaries that changed. Ambiguous or high-risk files
-select a conservative suite instead of silently skipping coverage.
+select a conservative suite instead of silently skipping coverage. Any code change (or a
+`knip.jsonc` / `package.json` / `tsconfig*.json` change) also runs knip repo-wide (~3 s,
+also chained into `pnpm run lint`): dead-code detection is a whole-program check, so it
+cannot be scoped to changed files — dropping an import in one file can make an export in
+another unused. knip resolves `m.*()` imports against the gitignored i18n bundle, so
+`lint:dead-code` first runs `generate:i18n --if-stale`, which compiles only while the
+bundle is missing or its recorded input hash no longer matches `messages/*.json`.
 
 Any renderer source change also runs `pnpm run test:ui-invariants` (chained into
 `validate:architecture` too): the repo-wide UI ratchets and the component-catalog
@@ -338,8 +350,17 @@ in `package.json`, never into a separate workflow step, so local and CI cannot d
 step in `intent-pr.yml`, and an edit to that workflow runs it locally) —
 because those scans are cross-file graph checks that per-file linting cannot see:
 cloudlands-fe#2315 passed `verify:changed` locally and failed CI in
-`lint:saga-watcher-ownership`. A change to `scripts/type-check.ts` additionally runs
-`pnpm run type-check:validate`, since `lint:architecture` omits that wrapper and the
+`lint:saga-watcher-ownership`. One of those gates, `lint:protocol-version-literals`, fails
+any `src/` line carrying a `v`-prefixed version literal (`v10.1`), and a bare one (`10.1`)
+when the same line mentions protocol/intentd/daemon(s): reference the method/field name,
+the `§` section, or the capability, not protocol version numbers — they are provisional
+until merge and went stale in cloudlands-fe#2447. A deliberate exception appends a
+`// protocol-version-ok: <reason>` comment to the line, or puts
+`// protocol-version-ok-file: <reason>` in the first 10 lines of a fixture-heavy file —
+only a comment with a non-empty reason exempts; a bare token or one inside a string does
+not. A
+change to `scripts/type-check.ts` additionally runs `pnpm run type-check:validate`, since
+`lint:architecture` omits that wrapper and the
 per-boundary checks invoke `tsc` directly.
 
 `vitest related` follows the import graph, so a suite that reads the tree from disk is
@@ -360,7 +381,13 @@ Playwright CT uses `ct-<CT_PORT>` (default `ct-3100`) and the full Vitest fallba
 `vitest-full`. CT runs on different ports can proceed concurrently; Svelte and TypeScript
 checks do not lock. The default waits are 240 seconds for CT and 120 seconds for full
 Vitest. `VERIFY_CHANGED_LOCK_TIMEOUT_MS` overrides either wait but remains capped at
-300000 ms, and the command never stops the process that owns a lock.
+300000 ms, and the command never stops the process that owns a lock. Direct
+`pnpm run test:ct` runs hold the same `ct-<CT_PORT>` lock (`scripts/verification-lock.mjs`),
+because the CT runtime reuses any server already listening on its port — an unlocked
+second run from another worktree would test that tree's component registry and then fail
+with ECONNREFUSED when the first run exits (intent-hq/intent#4964). A second run on an
+occupied port waits, then fails naming the owner's pid and worktree; pick a free `CT_PORT`
+to run concurrently.
 
 After any structural change (moving files, changing imports, extracting modules):
 
@@ -448,8 +475,8 @@ reducer runs, calls the `AppClient` seam and dispatches the per-dispatch
 dependency-light (no selector imports — they evaluate `store.createSelector` at chain
 construction); read state directly off `appStore.state` and import the toast lib lazily.
 
-Agent **deletion** uses the **daemon-owned delete grace window** (PROTOCOL §5.5, v6.7+;
-the handlers live in the agent mutation saga):
+Agent **deletion** uses the **daemon-owned delete grace window** (PROTOCOL §5.5,
+`agent.delete { undoDelayMs }`; the handlers live in the agent mutation saga):
 
 - `deleteAgentWithUndoRequested` **soft-hides** the session locally (drops it from the
   visible list) and sends `agent.delete { undoDelayMs: 15000 }` **immediately**, so the
@@ -546,5 +573,8 @@ single tracker for all components; never track issues in markdown files. Label w
 `component:fe` + `agent-filed`. See the root [`AGENTS.md`](../../AGENTS.md) → Filing
 Issues for the full conventions (dedup, cross-referencing, `Fixes intent-hq/intent#N` —
 the release notifier `scripts/notify-fixed-issues.sh` comments on the issue once a
-release fully delivers the fix, i.e. every linked fix PR across cloudlands-fe and
-intentd is merged and contained in the released versions).
+release fully delivers the fix, i.e. the issue is closed, at least one linked fix PR
+across cloudlands-fe and intentd is merged and contained in the released versions, no
+linked fix PR is still open, and every merged one is contained (PRs closed without
+merging are ignored); a plain `intent-hq/intent#N` mention never earns a release
+comment, only a closing-keyword reference on the actual fix PR does).
