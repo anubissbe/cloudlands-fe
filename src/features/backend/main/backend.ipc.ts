@@ -74,6 +74,8 @@ import { daemonHelloBuildKey, extractDaemonHelloBuildInfo } from './daemon-hello
 import { detectOrphanedSidecar } from './intentd-orphan';
 import { defaultKill, restartOrphanedSidecar } from './orphan-recovery';
 import * as connectionsStore from './connections-store';
+import * as guestSessionsStore from './guest-sessions-store';
+import type { GuestSessionsListResult } from '../../../shared/types/guest-sessions';
 import {
   initKeychainSyncLifecycle,
   isKeychainSyncEnabled,
@@ -125,6 +127,7 @@ import {
   ConnectionsCaptureFingerprintSchema,
   ConnectionsForgetSchema,
   ConnectionsListSchema,
+  GuestSessionsListSchema,
   ConnectionsOpenSchema,
   ConnectionsRotateSecretSchema,
   ConnectionsPublishSelfSchema,
@@ -143,6 +146,7 @@ import { getBackendIdForWebContents, getFocusedWindowBackendId } from '../../../
 const logger = new Logger('Backend-IPC');
 const BACKEND = IPC_CHANNELS.BACKEND;
 const CONNECTIONS = IPC_CHANNELS.CONNECTIONS;
+const GUEST_SESSIONS = IPC_CHANNELS.GUEST_SESSIONS;
 
 // Last daemon build identity logged per connection from a `client.hello`
 // result (#3649): the handshake re-runs on every (re)connect, so dedupe on
@@ -1318,6 +1322,12 @@ async function captureRemoteHostname(id: string): Promise<void> {
     // Drop the result when this backend's client changed mid-flight — the
     // snapshot client may have answered just before its disposal.
     if (backendClients.get(id) === client) {
+      if ((await guestSessionsStore.findById(id)) !== null) {
+        if (hostname && (await guestSessionsStore.setHostname(id, hostname))) {
+          await broadcastGuestSessionsChanged();
+        }
+        return;
+      }
       const kindChanged = await connectionsStore.setDetectedDeviceKind(id, deviceKind);
       if (hostname) await connectionsStore.setHostname(id, hostname);
       if (hostname || kindChanged) await broadcastConnectionsChanged();
@@ -1827,6 +1837,42 @@ function refreshConnectionsForStatusChange(): void {
 }
 
 /**
+ * Push the token-free guest sessions list to every renderer after a local
+ * mutation (invite redeemed, forgotten, hostname captured) or a keychain
+ * pull. Fail-soft per window, like {@link broadcastConnectionsChanged}.
+ */
+async function broadcastGuestSessionsChanged(): Promise<void> {
+  const payload: GuestSessionsListResult = { sessions: await guestSessionsStore.list() };
+  for (const win of BrowserWindow.getAllWindows()) {
+    if (win.isDestroyed()) continue;
+    try {
+      win.webContents.send(GUEST_SESSIONS.CHANGED, payload);
+    } catch (error) {
+      logger.warn('Failed to broadcast guest sessions change', {
+        windowId: win.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+}
+
+/** Register the guest sessions IPC (token-free list) + the change push. */
+function registerGuestSessionsHandlers(): void {
+  ipcMain.handle(
+    GUEST_SESSIONS.LIST,
+    createValidatedHandler(
+      GuestSessionsListSchema,
+      async (): Promise<GuestSessionsListResult> => ({ sessions: await guestSessionsStore.list() }),
+      GUEST_SESSIONS.LIST,
+    ),
+  );
+  guestSessionsStore.onGuestSessionsMutated(() => {
+    void broadcastGuestSessionsChanged();
+    keychainSyncLifecycle?.requestReconcile();
+  });
+}
+
+/**
  * Resolve the transport config + cert-mismatch identity for a connection id.
  * `local` maps to the env/UDS default (no pinned cert); a remote id builds the
  * pinned `wss` config from its stored host/port/fingerprint + decrypted token.
@@ -1845,6 +1891,51 @@ class ConnectionSecretUnavailableError extends Error {
   }
 }
 
+/**
+ * The dial envelope of a remote backend id, whichever registry holds it: a
+ * paired (owner) backend from the connections store or a guest session from
+ * the guest-sessions store. Both share one id space (random UUIDs), so the
+ * window/backend layer stays keyed by id alone and never needs to know which
+ * registry a window belongs to. `null` for the local id or an unknown id.
+ */
+export async function resolveBackendRecord(id: string): Promise<{
+  kind: 'owner' | 'guest';
+  id: string;
+  host: string;
+  hosts: string[];
+  port: number;
+  fingerprint: string;
+  tcAddress: string | null;
+  getToken: () => Promise<string | null>;
+} | null> {
+  if (id === LOCAL_CONNECTION_ID) return null;
+  const owner = (await connectionsStore.list()).find((c) => c.id === id && !c.isLocal);
+  if (owner && owner.host != null && owner.port != null && owner.fingerprint != null) {
+    return {
+      kind: 'owner',
+      id,
+      host: owner.host,
+      hosts: owner.hosts?.length ? owner.hosts : [owner.host],
+      port: owner.port,
+      fingerprint: owner.fingerprint,
+      tcAddress: owner.tcAddress ?? null,
+      getToken: () => connectionsStore.getDecryptedToken(id),
+    };
+  }
+  const guest = await guestSessionsStore.findById(id);
+  if (!guest) return null;
+  return {
+    kind: 'guest',
+    id,
+    host: guest.host,
+    hosts: guest.hosts.length ? guest.hosts : [guest.host],
+    port: guest.port,
+    fingerprint: guest.fingerprint,
+    tcAddress: guest.tcAddress,
+    getToken: () => guestSessionsStore.getDecryptedToken(id),
+  };
+}
+
 export async function buildConfigForConnection(
   id: string,
   tokenOverride?: string,
@@ -1855,14 +1946,14 @@ export async function buildConfigForConnection(
   if (id === LOCAL_CONNECTION_ID) {
     return { config: resolveBackendConfig(process.env, { isDev: !app.isPackaged }), meta: null };
   }
-  const record = (await connectionsStore.list()).find((c) => c.id === id && !c.isLocal);
-  if (!record || record.host == null || record.port == null || record.fingerprint == null) {
+  const record = await resolveBackendRecord(id);
+  if (!record) {
     throw new Error(`Unknown or incomplete connection: ${id}`);
   }
   let token: string | null | undefined = tokenOverride;
   if (token === undefined) {
     try {
-      token = await connectionsStore.getDecryptedToken(id);
+      token = await record.getToken();
     } catch {
       throw new ConnectionSecretUnavailableError();
     }
@@ -1874,7 +1965,7 @@ export async function buildConfigForConnection(
   // is excluded whenever a routable candidate exists), so the race dials
   // hosts[0] first — not the raw stored primary, which can be loopback on
   // records synced from before self-publish filtered it out.
-  const dialHosts = record.hosts?.length ? record.hosts : [record.host];
+  const dialHosts = record.hosts;
   return {
     config: {
       transport: 'wss',
@@ -2407,14 +2498,23 @@ export function registerBackendHandlers(): void {
   });
 
   registerConnectionsHandlers();
+  registerGuestSessionsHandlers();
 
   // Keychain sync (T3): pref-gated (opt-out — absent reads as enabled on
   // macOS), fail-soft, fully async. When a reconcile pulls remote changes into
   // the store, refresh every renderer via the existing connections:changed
   // broadcast. Availability changes push connections:sync-status-changed so
-  // the settings UI stays live (T4).
+  // the settings UI stays live (T4). Guest sessions ride the same lifecycle as
+  // a secondary pass against their own keychain service.
   keychainSyncLifecycle = initKeychainSyncLifecycle({
     onRemoteApplied: () => broadcastConnectionsChanged(),
+    guestAdapter: {
+      list: () => guestSessionsStore.listSyncRecords(),
+      async applyRemote(_account, record) {
+        await guestSessionsStore.applyRemoteSyncRecord(record);
+      },
+    },
+    onGuestRemoteApplied: () => broadcastGuestSessionsChanged(),
     onStatusChanged: (status) => {
       for (const win of BrowserWindow.getAllWindows()) {
         if (win.isDestroyed()) continue;
