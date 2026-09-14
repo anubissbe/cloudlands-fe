@@ -4,10 +4,31 @@
  * free-form text destined for a log line. The deep-link entry points log the
  * URLs they receive, and both link kinds carry a credential-grade value —
  * every such log site must pass the text through this first.
+ *
+ * Keys are matched AFTER percent-decoding and case-folding, because the URI
+ * parsers go through `URLSearchParams`, which accepts `%73ecret=` or
+ * `SECRET=` as `secret` — so any spelling the parser redeems, this redacts.
  */
+
+/** One `key=value` pair as it appears in a query string or free-form text. */
+const QUERY_PAIR = /([^&=?#\s"'<>]+)=([^&#\s"'<>]*)/g;
+
+/** Decoded, case-folded key suffixes that carry a credential. */
+const CREDENTIAL_KEY = /(token|secret)$/i;
+
+function isCredentialKey(rawKey: string): boolean {
+  let decoded = rawKey;
+  try {
+    decoded = decodeURIComponent(rawKey.replace(/\+/g, ' '));
+  } catch {
+    // Malformed escape — fall back to the raw spelling.
+  }
+  return CREDENTIAL_KEY.test(decoded.trim());
+}
+
 export function scrubToken(text: string): string {
-  // i18n-ignore (log scrubbing constant, never user-facing)
-  return text
-    .replace(/token=[^&\s"']*/gi, 'token=REDACTED')
-    .replace(/secret=[^&\s"']*/gi, 'secret=REDACTED');
+  return text.replace(QUERY_PAIR, (pair, rawKey: string) =>
+    // i18n-ignore (log scrubbing constant, never user-facing)
+    isCredentialKey(rawKey) ? `${rawKey}=REDACTED` : pair,
+  );
 }
