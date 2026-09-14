@@ -267,6 +267,186 @@ async function recordControlMotion(page: Page, rootId: string, direction: 'forwa
   };
 }
 
+type ContentMotionFrame = {
+  state: string;
+  phase: string;
+  settled: boolean;
+  nodes: Record<
+    string,
+    {
+      x: number;
+      y: number;
+      width: number;
+      height: number;
+      opacity: number;
+      sameAsBaseline: boolean;
+    } | null
+  >;
+  edges: Record<
+    string,
+    {
+      path: string;
+      progress: number;
+      reveal: number;
+      maskDashOffset: number;
+      maskApplied: boolean;
+      sameAsBaseline: boolean;
+      sourcePoint: { x: number; y: number };
+      targetPoint: { x: number; y: number };
+      sourceDistance: number;
+      targetDistance: number;
+    } | null
+  >;
+};
+
+async function recordContentMotion(
+  page: Page,
+  rootId: string,
+  direction: 'forward' | 'backward',
+  nodeIds: string[],
+  edgeIds: string[],
+) {
+  const root = page.locator(`#${rootId}`);
+  const recorder = await root.evaluateHandle(
+    (element, { direction, nodeIds, edgeIds }) => {
+      const initialNodes = new Map(
+        nodeIds.map((id) => [id, element.querySelector(`[data-node-id="${id}"]`)]),
+      );
+      const initialEdges = new Map(
+        edgeIds.map((id) => [id, element.querySelector(`.diagram-edge[data-edge-id="${id}"]`)]),
+      );
+      const number = (value: string, fallback: number) => {
+        const parsed = Number.parseFloat(value);
+        return Number.isFinite(parsed) ? parsed : fallback;
+      };
+      const nodeBounds = (node: SVGForeignObjectElement) => {
+        const style = getComputedStyle(node);
+        const x = number(style.getPropertyValue('x'), node.x.baseVal.value);
+        const y = number(style.getPropertyValue('y'), node.y.baseVal.value);
+        const width = number(style.width, node.width.baseVal.value);
+        const height = number(style.height, node.height.baseVal.value);
+        return { left: x, right: x + width, top: y, bottom: y + height };
+      };
+      const boundaryDistance = (
+        point: DOMPoint,
+        bounds: { left: number; right: number; top: number; bottom: number },
+      ) => {
+        const outsideX = Math.max(bounds.left - point.x, 0, point.x - bounds.right);
+        const outsideY = Math.max(bounds.top - point.y, 0, point.y - bounds.bottom);
+        if (outsideX > 0 || outsideY > 0) return Math.hypot(outsideX, outsideY);
+        return -Math.min(
+          point.x - bounds.left,
+          bounds.right - point.x,
+          point.y - bounds.top,
+          bounds.bottom - point.y,
+        );
+      };
+      const revealProgress = (element: Element) => {
+        const value = getComputedStyle(element).getPropertyValue('--edge-reveal-progress').trim();
+        return value === '' ? 1 : Number(value);
+      };
+      const read = (): ContentMotionFrame => {
+        const renderer = element.querySelector<HTMLElement>('.diagram-renderer')!;
+        return {
+          state: renderer.dataset.diagramState ?? '',
+          phase: renderer.dataset.diagramMotionPhase ?? '',
+          settled: renderer.dataset.diagramSettled === 'true',
+          nodes: Object.fromEntries(
+            nodeIds.map((id) => {
+              const node = element.querySelector<SVGForeignObjectElement>(`[data-node-id="${id}"]`);
+              if (!node) return [id, null];
+              const bounds = nodeBounds(node);
+              return [
+                id,
+                {
+                  x: bounds.left,
+                  y: bounds.top,
+                  width: bounds.right - bounds.left,
+                  height: bounds.bottom - bounds.top,
+                  opacity: Number(getComputedStyle(node).opacity),
+                  sameAsBaseline: node === initialNodes.get(id),
+                },
+              ];
+            }),
+          ),
+          edges: Object.fromEntries(
+            edgeIds.map((id) => {
+              const edge = element.querySelector<SVGGElement>(
+                `.diagram-edge[data-edge-id="${id}"]`,
+              );
+              const path = edge?.querySelector<SVGPathElement>('path.edge-path');
+              const source = edge?.dataset.edgeFrom
+                ? element.querySelector<SVGForeignObjectElement>(
+                    `[data-node-id="${edge.dataset.edgeFrom}"]`,
+                  )
+                : null;
+              const target = edge?.dataset.edgeTo
+                ? element.querySelector<SVGForeignObjectElement>(
+                    `[data-node-id="${edge.dataset.edgeTo}"]`,
+                  )
+                : null;
+              const maskPath = edge?.querySelector<SVGPathElement>('.edge-reveal-mask-path');
+              if (!edge || !path || !source || !target || !maskPath) return [id, null];
+              const length = path.getTotalLength();
+              const sourcePoint = path.getPointAtLength(0);
+              const targetPoint = path.getPointAtLength(length);
+              return [
+                id,
+                {
+                  path: path.getAttribute('d') ?? '',
+                  progress: Number(edge.dataset.edgeMotionProgress),
+                  reveal: revealProgress(edge.parentElement!),
+                  maskDashOffset: number(getComputedStyle(maskPath).strokeDashoffset, NaN),
+                  maskApplied: edge.querySelector(':scope > g')?.hasAttribute('mask') ?? false,
+                  sameAsBaseline: edge === initialEdges.get(id),
+                  sourcePoint: { x: sourcePoint.x, y: sourcePoint.y },
+                  targetPoint: { x: targetPoint.x, y: targetPoint.y },
+                  sourceDistance: boundaryDistance(sourcePoint, nodeBounds(source)),
+                  targetDistance: boundaryDistance(targetPoint, nodeBounds(target)),
+                },
+              ];
+            }),
+          ),
+        };
+      };
+      const baseline = read();
+      const button =
+        element.querySelectorAll<HTMLButtonElement>('.diagram-nav-button')[
+          direction === 'forward' ? 1 : 0
+        ];
+      const finished = new Promise<ContentMotionFrame[]>((resolve) => {
+        window.addEventListener(
+          'click',
+          async (event) => {
+            if (!(event.target instanceof Node) || !button.contains(event.target))
+              throw new Error('Unexpected control click while recording diagram content motion');
+            await Promise.resolve();
+            const frames = [read()];
+            const deadline = performance.now() + 2_500;
+            do {
+              await new Promise<void>((next) => requestAnimationFrame(() => next()));
+              frames.push(read());
+            } while (!frames.at(-1)!.settled && performance.now() < deadline);
+            resolve(frames);
+          },
+          { once: true },
+        );
+      });
+      return { baseline, finished };
+    },
+    { direction, nodeIds, edgeIds },
+  );
+  await root
+    .getByRole('button', { name: direction === 'forward' ? 'Next step' : 'Previous step' })
+    .click();
+  const result = await recorder.evaluate(async ({ baseline, finished }) => ({
+    baseline,
+    frames: await finished,
+  }));
+  await recorder.dispose();
+  return result;
+}
+
 async function recordReducedControlMotion(
   page: Page,
   rootId: string,
@@ -897,6 +1077,208 @@ test('persists accessible full and reduced motion choices across stepped fixture
     'aria-checked',
     'true',
   );
+});
+
+test('animates delivery nodes and painted connections between Observe and Publish', async ({
+  page,
+}) => {
+  test.setTimeout(60_000);
+  await openMotionFixture(page, 'custom-delivery-walkthrough');
+  const root = page.locator('#custom-delivery-walkthrough');
+  const renderer = root.locator('.diagram-renderer');
+  for (const state of ['verify', 'publish', 'observe']) {
+    await root.getByRole('button', { name: 'Next step' }).click();
+    await expect(renderer).toHaveAttribute('data-diagram-state', state);
+    await expect(renderer).toHaveAttribute('data-diagram-settled', 'true');
+  }
+
+  const cases = [
+    {
+      direction: 'backward' as const,
+      from: 'observe',
+      to: 'publish',
+      departingNodes: ['updater', 'audit'],
+      enteringNodes: ['checks', 'artifact'],
+      departingEdges: ['dw6', 'dw7'],
+      enteringEdges: ['dw4', 'dw5'],
+    },
+    {
+      direction: 'forward' as const,
+      from: 'publish',
+      to: 'observe',
+      departingNodes: ['checks', 'artifact'],
+      enteringNodes: ['updater', 'audit'],
+      departingEdges: ['dw4', 'dw5'],
+      enteringEdges: ['dw6', 'dw7'],
+    },
+  ];
+
+  for (const transitionCase of cases) {
+    const transition = await recordContentMotion(
+      page,
+      'custom-delivery-walkthrough',
+      transitionCase.direction,
+      ['registry', ...transitionCase.departingNodes, ...transitionCase.enteringNodes],
+      [...transitionCase.departingEdges, ...transitionCase.enteringEdges],
+    );
+    const settled = transition.frames.at(-1)!;
+    expect(transition.baseline.state).toBe(transitionCase.from);
+    expect(settled).toMatchObject({ state: transitionCase.to, phase: 'settled', settled: true });
+
+    const registryStart = transition.baseline.nodes.registry!;
+    const registryEnd = settled.nodes.registry!;
+    expect(
+      Math.hypot(registryEnd.x - registryStart.x, registryEnd.y - registryStart.y),
+    ).toBeGreaterThan(2);
+    expect(
+      transition.frames.some((frame) => {
+        const registry = frame.nodes.registry;
+        return (
+          registry !== null &&
+          (isBetween(registry.x, registryStart.x, registryEnd.x) ||
+            isBetween(registry.y, registryStart.y, registryEnd.y))
+        );
+      }),
+    ).toBe(true);
+    expect(
+      transition.frames.every(
+        (frame) => frame.nodes.registry === null || frame.nodes.registry.sameAsBaseline,
+      ),
+    ).toBe(true);
+
+    for (const id of [...transitionCase.departingNodes, ...transitionCase.enteringNodes]) {
+      expect(
+        transition.frames.some((frame) => {
+          const opacity = frame.nodes[id]?.opacity;
+          return opacity !== undefined && opacity > 0.01 && opacity < 0.99;
+        }),
+        `${transitionCase.from}→${transitionCase.to} ${id} opacity`,
+      ).toBe(true);
+    }
+    for (const id of [...transitionCase.departingEdges, ...transitionCase.enteringEdges]) {
+      const observations = transition.frames.flatMap((frame) => {
+        const edge = frame.edges[id];
+        return edge
+          ? [
+              {
+                phase: frame.phase,
+                reveal: edge.reveal,
+                dash: edge.maskDashOffset,
+                mask: edge.maskApplied,
+              },
+            ]
+          : [];
+      });
+      expect(
+        observations.every(({ mask }) => mask),
+        `${id} mask application`,
+      ).toBe(true);
+      expect(
+        observations.some(({ reveal }) => reveal > 0.01 && reveal < 0.99),
+        `${transitionCase.from}→${transitionCase.to} ${id} reveal variable`,
+      ).toBe(true);
+      expect(
+        observations.some(({ dash }) => dash > 0.01 && dash < 0.99),
+        `${transitionCase.from}→${transitionCase.to} ${id} mask dash ${JSON.stringify(observations)}`,
+      ).toBe(true);
+    }
+
+    const firstEnteringNode = transition.frames.find((frame) =>
+      transitionCase.enteringNodes.some((id) => (frame.nodes[id]?.opacity ?? 0) > 0.01),
+    )!;
+    expect(
+      transitionCase.departingNodes.every(
+        (id) => (firstEnteringNode.nodes[id]?.opacity ?? 0) <= 0.01,
+      ),
+    ).toBe(true);
+    const firstEnteringEdge = transition.frames.find((frame) =>
+      transitionCase.enteringEdges.some((id) => (frame.edges[id]?.reveal ?? 0) > 0.01),
+    )!;
+    expect(
+      transitionCase.departingEdges.every(
+        (id) => (firstEnteringEdge.edges[id]?.reveal ?? 0) <= 0.01,
+      ),
+    ).toBe(true);
+  }
+});
+
+test('interpolates a retained route with its moving endpoints in diagram coordinates', async ({
+  page,
+}) => {
+  test.setTimeout(60_000);
+  await openMotionFixture(page, 'custom-architecture');
+  const root = page.locator('#custom-architecture');
+  const renderer = root.locator('.diagram-renderer');
+  await root.getByRole('button', { name: 'Next step' }).click();
+  await expect(renderer).toHaveAttribute('data-diagram-state', 'connect');
+  await expect(renderer).toHaveAttribute('data-diagram-settled', 'true');
+
+  const transition = await recordContentMotion(
+    page,
+    'custom-architecture',
+    'forward',
+    ['renderer', 'daemon'],
+    ['a2'],
+  );
+  const settled = transition.frames.at(-1)!;
+  const nodeStart = transition.baseline.nodes.daemon!;
+  const nodeEnd = settled.nodes.daemon!;
+  const edgeStart = transition.baseline.edges.a2!;
+  const edgeEnd = settled.edges.a2!;
+  expect(Math.hypot(nodeEnd.x - nodeStart.x, nodeEnd.y - nodeStart.y)).toBeGreaterThan(2);
+  expect(
+    transition.frames.some((frame) => {
+      const node = frame.nodes.daemon;
+      return (
+        node !== null &&
+        (isBetween(node.x, nodeStart.x, nodeEnd.x) || isBetween(node.y, nodeStart.y, nodeEnd.y))
+      );
+    }),
+  ).toBe(true);
+  expect(
+    transition.frames.every(
+      (frame) => frame.nodes.daemon === null || frame.nodes.daemon.sameAsBaseline,
+    ),
+  ).toBe(true);
+
+  expect(edgeEnd.path).not.toBe(edgeStart.path);
+  expect(
+    transition.frames.some(
+      (frame) =>
+        frame.edges.a2 !== null &&
+        frame.edges.a2.path !== edgeStart.path &&
+        frame.edges.a2.path !== edgeEnd.path &&
+        frame.edges.a2.progress > 0 &&
+        frame.edges.a2.progress < 1,
+    ),
+  ).toBe(true);
+  const routeFrames = transition.frames.flatMap((frame) =>
+    frame.edges.a2 ? [{ phase: frame.phase, ...frame.edges.a2 }] : [],
+  );
+  expect(routeFrames.every(({ sameAsBaseline }) => sameAsBaseline)).toBe(true);
+  expect(
+    routeFrames.every(({ sourceDistance }) => Math.abs(sourceDistance) <= 2),
+    JSON.stringify(
+      transition.frames
+        .filter((frame) => Math.abs(frame.edges.a2?.sourceDistance ?? 0) > 2)
+        .map((frame) => ({
+          phase: frame.phase,
+          edgeProgress: frame.edges.a2?.progress,
+          sourceDistance: frame.edges.a2?.sourceDistance,
+          sourcePoint: frame.edges.a2?.sourcePoint,
+          sourceNode: frame.nodes.renderer,
+        })),
+    ),
+  ).toBe(true);
+  const minimumTargetGap = Math.min(edgeStart.targetDistance, edgeEnd.targetDistance);
+  const maximumTargetGap = Math.max(edgeStart.targetDistance, edgeEnd.targetDistance);
+  expect(
+    routeFrames.every(
+      ({ targetDistance }) =>
+        targetDistance >= minimumTargetGap - 0.1 && targetDistance <= maximumTargetGap + 2,
+    ),
+    JSON.stringify(routeFrames.map(({ phase, targetDistance }) => ({ phase, targetDistance }))),
+  ).toBe(true);
 });
 
 test('keeps explicit full motion active for every stepped sandbox control', async ({ page }) => {

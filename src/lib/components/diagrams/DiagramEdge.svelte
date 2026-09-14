@@ -35,6 +35,7 @@
   let previousTargetPath = '';
   let previousEdgeReference: ComputedEdge | undefined;
   let previousEdgeId = '';
+  let rootElement: SVGGElement | undefined;
   let revealMaskId = $derived(`edge-reveal-${markerScope}-${edge.id}`);
   let revealMaskBounds = $derived.by(() => {
     displayedPath;
@@ -68,6 +69,77 @@
 
   function reportMotion(moving: boolean) {
     untrack(() => onmotionchange?.(edge.id, moving));
+  }
+
+  type NodeBounds = { x: number; y: number; width: number; height: number };
+
+  function captureNodeMotion(nodeId: string) {
+    const node = rootElement?.ownerSVGElement?.querySelector<SVGForeignObjectElement>(
+      `[data-node-id="${CSS.escape(nodeId)}"]`,
+    );
+    if (!node) return null;
+    const style = getComputedStyle(node);
+    const value = (property: string, fallback: number) => {
+      const parsed = Number.parseFloat(style.getPropertyValue(property));
+      return Number.isFinite(parsed) ? parsed : fallback;
+    };
+    return {
+      node,
+      from: {
+        x: value('x', node.x.baseVal.value),
+        y: value('y', node.y.baseVal.value),
+        width: value('width', node.width.baseVal.value),
+        height: value('height', node.height.baseVal.value),
+      },
+      to: {
+        x: node.x.baseVal.value,
+        y: node.y.baseVal.value,
+        width: node.width.baseVal.value,
+        height: node.height.baseVal.value,
+      },
+    };
+  }
+
+  function interpolateNodeMotion(
+    motion: { node: SVGForeignObjectElement; from: NodeBounds; to: NodeBounds } | null,
+    fallbackProgress: number,
+  ) {
+    if (!motion) return null;
+    const transition = motion.node
+      .getAnimations()
+      .find((animation) => (animation as CSSTransition).transitionProperty === 'x');
+    const sampledProgress = transition?.effect?.getComputedTiming().progress;
+    const progress = typeof sampledProgress === 'number' ? sampledProgress : fallbackProgress;
+    return Object.fromEntries(
+      (['x', 'y', 'width', 'height'] as const).map((property) => [
+        property,
+        motion.from[property] + (motion.to[property] - motion.from[property]) * progress,
+      ]),
+    ) as NodeBounds;
+  }
+
+  function attachToNode(point: { x: number; y: number }, bounds: NodeBounds | null, gap = 0) {
+    if (!bounds) return point;
+    const centerX = bounds.x + bounds.width / 2;
+    const centerY = bounds.y + bounds.height / 2;
+    const halfWidth = bounds.width / 2;
+    const halfHeight = bounds.height / 2;
+    const dx = point.x - centerX;
+    const dy = point.y - centerY;
+    const length = Math.hypot(dx, dy);
+    if (length < 0.001) return point;
+    const horizontalScale = Math.abs(dx) < 0.001 ? Infinity : halfWidth / Math.abs(dx);
+    const verticalScale = Math.abs(dy) < 0.001 ? Infinity : halfHeight / Math.abs(dy);
+    if (horizontalScale <= verticalScale) {
+      return {
+        x: centerX + Math.sign(dx) * (halfWidth + gap),
+        y: centerY + dy * horizontalScale,
+      };
+    }
+    return {
+      x: centerX + dx * verticalScale,
+      y: centerY + Math.sign(dy) * (halfHeight + gap),
+    };
   }
 
   function sampleCurve(a1: number, a2: number, progress: number) {
@@ -141,6 +213,8 @@
     const previousEnd = previousPoints[previousPoints.length - 1];
     const targetStart = targetPoints[0];
     const targetEnd = targetPoints[targetPoints.length - 1];
+    const sourceNodeMotion = captureNodeMotion(edge.from);
+    const targetNodeMotion = captureNodeMotion(edge.to);
     const shiftsLaneWithoutMovingNodes =
       retainsIdentity &&
       Math.abs(targetStart.x - previousStart.x - (targetEnd.x - previousEnd.x)) < 1 &&
@@ -164,6 +238,12 @@
         points[0] = targetPoints[0];
         points[points.length - 1] = targetPoints[targetPoints.length - 1];
       }
+      points[0] = attachToNode(points[0], interpolateNodeMotion(sourceNodeMotion, progress));
+      points[points.length - 1] = attachToNode(
+        points[points.length - 1],
+        interpolateNodeMotion(targetNodeMotion, progress),
+        terminalGap,
+      );
       previousPoints = points;
       motionProgress = elapsed;
       displayedPath = `M ${points.map((point) => `${point.x} ${point.y}`).join(' L ')}`;
@@ -229,6 +309,7 @@
 </script>
 
 <g
+  bind:this={rootElement}
   class={edgeClass}
   data-edge-id={edge.id}
   data-edge-from={edge.from}
@@ -292,7 +373,7 @@
 
   :global(.edge-reveal-mask-path) {
     stroke-dasharray: 1 1;
-    stroke-dashoffset: calc(1 - var(--edge-reveal-progress, 1));
+    stroke-dashoffset: calc((1 - var(--edge-reveal-progress, 1)) * 1px);
   }
 
   :global(.diagram-edge:hover .edge-path) {
