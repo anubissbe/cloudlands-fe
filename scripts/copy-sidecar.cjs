@@ -10,6 +10,11 @@
  * macOS signing: the bundled binary is signed/notarized by electron-builder's afterSign
  * hook (scripts/notarize.js) along with the rest of the app bundle. No separate signing
  * step is required here.
+ *
+ * On darwin-arm64 a locally built `intentd-microvm-helper` next to the source intentd
+ * binary is also staged, at resources/microvm/intentd-microvm-helper (the same location
+ * fetch-sidecar.cjs uses for the released helper); it is optional — without it the
+ * package ships without microVM support.
  */
 const fs = require('fs');
 const path = require('path');
@@ -60,16 +65,38 @@ const isSameFile = (a, b) => {
 };
 if (isSameFile(sourceBin, destBin)) {
   console.log(`intentd binary already staged at ${destBin} — nothing to copy`);
-  process.exit(0);
+} else {
+  fs.mkdirSync(destDir, { recursive: true });
+  fs.copyFileSync(sourceBin, destBin);
+
+  // Make executable on Unix
+  if (process.platform !== 'win32') {
+    fs.chmodSync(destBin, 0o755);
+  }
+
+  console.log(`Copied intentd binary to ${destBin}`);
+  console.log(`Source: ${sourceBin}`);
 }
 
-fs.mkdirSync(destDir, { recursive: true });
-fs.copyFileSync(sourceBin, destBin);
-
-// Make executable on Unix
-if (process.platform !== 'win32') {
-  fs.chmodSync(destBin, 0o755);
+// microVM helper (macOS arm64 only): stage a locally built helper found next to the
+// source intentd binary. A pre-staged helper (fetch-sidecar.cjs / CI from-source
+// staging) is left alone when no local build is present.
+if (process.platform === 'darwin' && process.arch === 'arm64') {
+  const helperName = 'intentd-microvm-helper';
+  const sourceHelper = path.join(path.dirname(sourceBin), helperName);
+  const destHelper = path.join(FE_DIR, 'resources/microvm', helperName);
+  if (!fs.existsSync(sourceHelper)) {
+    console.log(
+      fs.existsSync(destHelper)
+        ? `${helperName} not found next to ${sourceBin}; keeping the helper already staged at ${destHelper}`
+        : `${helperName} not found next to ${sourceBin} — package will ship without microVM support (build it with: cargo build --release -p intentd-microvm-helper)`,
+    );
+  } else if (isSameFile(sourceHelper, destHelper)) {
+    console.log(`${helperName} already staged at ${destHelper} — nothing to copy`);
+  } else {
+    fs.mkdirSync(path.dirname(destHelper), { recursive: true });
+    fs.copyFileSync(sourceHelper, destHelper);
+    fs.chmodSync(destHelper, 0o755);
+    console.log(`Copied ${helperName} to ${destHelper}`);
+  }
 }
-
-console.log(`Copied intentd binary to ${destBin}`);
-console.log(`Source: ${sourceBin}`);

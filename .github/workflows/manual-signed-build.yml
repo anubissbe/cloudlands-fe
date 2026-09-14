@@ -190,13 +190,25 @@ jobs:
           key: aarch64-apple-darwin
           cache-on-failure: true
 
-      # Native build on the arm64 host (no --target), so the binary lands at
-      # target/release/intentd.
+      # Native build on the arm64 host (no --target), so the binaries land at
+      # target/release/. Also builds the microVM helper (crates/
+      # intentd-microvm-helper) when the ref carries it, so a from-source
+      # build ships the helper matching its daemon; older refs without the
+      # crate build intentd alone and the package ships without microVM.
       - name: Build intentd from source
         if: ${{ inputs.intentd_ref != '' }}
         working-directory: intentd-src
-        run: cargo build --release -p intentd
+        run: |
+          if [ -d crates/intentd-microvm-helper ]; then
+            cargo build --release -p intentd -p intentd-microvm-helper
+          else
+            echo "::notice::intentd ref has no crates/intentd-microvm-helper — building intentd only (no microVM support)"
+            cargo build --release -p intentd
+          fi
 
+      # The helper lands at resources/microvm/intentd-microvm-helper — the path
+      # fetch-sidecar.cjs stages the released helper to; electron-builder merges
+      # resources/microvm into the intentd/ resource dir next to the sidecar.
       - name: Stage from-source intentd sidecar
         if: ${{ inputs.intentd_ref != '' }}
         run: |
@@ -204,6 +216,12 @@ jobs:
           cp intentd-src/target/release/intentd resources/sidecar/intentd
           chmod +x resources/sidecar/intentd
           ls -l resources/sidecar/intentd
+          if [ -f intentd-src/target/release/intentd-microvm-helper ]; then
+            mkdir -p resources/microvm
+            cp intentd-src/target/release/intentd-microvm-helper resources/microvm/intentd-microvm-helper
+            chmod +x resources/microvm/intentd-microvm-helper
+            ls -l resources/microvm/intentd-microvm-helper
+          fi
 
       # Written for the non-ephemeral m1mac runner (and equally valid on an
       # ephemeral hosted one): signing must never touch the login
@@ -280,6 +298,12 @@ jobs:
       - name: Generate i18n catalog
         run: pnpm run generate:i18n
 
+      # dist:mac also runs scripts/fetch-libkrun-bundle.mjs, which downloads the
+      # libkrun bundle pinned by libkrun-bundle.version (a `libkrun-bundle-v*`
+      # release on intent-hq/intentd), verifies its sha256 and stages the dylibs
+      # at resources/microvm next to the microVM helper. GH_TOKEN on the build
+      # step keeps that read authenticated (rate limits; the repo is public).
+      #
       # dist:mac runs scripts/fetch-tailcat.cjs --targets=darwin-arm64, which
       # builds the tailcat tunnel client from source (tailcat publishes no
       # prebuilt macOS assets) and needs a Go toolchain — the hosted
@@ -330,6 +354,8 @@ jobs:
           # Points at the sidecar staged by fetch-sidecar.cjs; copy-sidecar.cjs
           # detects the pre-staged binary and leaves it in place.
           INTENTD_BIN: ${{ github.workspace }}/resources/sidecar/intentd
+          # scripts/fetch-libkrun-bundle.mjs release read (see above).
+          GH_TOKEN: ${{ github.token }}
           # Signing env is removed by the command when sign=false, and
           # auto-discovery is disabled so no stray keychain identity is used.
           CSC_IDENTITY_AUTO_DISCOVERY: ${{ inputs.sign && 'true' || 'false' }}

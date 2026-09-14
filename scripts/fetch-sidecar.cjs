@@ -7,6 +7,14 @@
  *
  * Pin: intentd.version at the repo root (see README "intentd sidecar pin").
  *
+ * On aarch64-apple-darwin the same release also carries `intentd-microvm-helper`
+ * (cargo-dist asset `intentd-microvm-helper-<target>.tar.xz` + `.sha256`), staged at
+ * resources/microvm/intentd-microvm-helper — packaged next to intentd under
+ * Contents/Resources/intentd/ together with the libkrun bundle
+ * (scripts/fetch-libkrun-bundle.mjs). A pinned release without the helper asset is
+ * tolerated with a warning (the package then ships without microVM support) unless
+ * INTENTD_REQUIRE_MICROVM_HELPER=1 makes it fatal.
+ *
  * Env:
  *   INTENTD_READ_PAT / GH_TOKEN / GITHUB_TOKEN  auth token (required while the
  *                                               intentd repo is private)
@@ -16,11 +24,13 @@
  *                     TARGET_BY_PLATFORM_ARCH values in fetch-sidecar-lib.mjs
  *   INTENTD_REPO      override the source repo (default intent-hq/intentd)
  *   INTENTD_APP_NAME  override the cargo-dist app/binary name (testing only)
+ *   INTENTD_REQUIRE_MICROVM_HELPER=1  fail when the release has no helper asset
  *
  * Flags: --force re-fetches even when the staged sidecar already matches the pin.
  *
- * Idempotent: a stamp file (resources/sidecar/.intentd-fetch-stamp.json) records what
- * was staged; matching version+target+staged-binary-hash skips the download.
+ * Idempotent: stamp files (resources/sidecar/.intentd-fetch-stamp.json and
+ * resources/microvm/.microvm-helper-fetch-stamp.json) record what was staged;
+ * matching version+target+staged-binary-hash skips the download.
  */
 const fs = require('node:fs');
 const os = require('node:os');
@@ -32,6 +42,8 @@ const FE_DIR = path.resolve(__dirname, '..');
 const PIN_FILE = path.join(FE_DIR, 'intentd.version');
 const DEST_DIR = path.join(FE_DIR, 'resources/sidecar');
 const STAMP_FILE = path.join(DEST_DIR, '.intentd-fetch-stamp.json');
+const MICROVM_DIR = path.join(FE_DIR, 'resources/microvm');
+const HELPER_STAMP_FILE = path.join(MICROVM_DIR, '.microvm-helper-fetch-stamp.json');
 const REPO = process.env.INTENTD_REPO?.trim() || 'intent-hq/intentd';
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 
@@ -161,28 +173,43 @@ async function main() {
   const destBin = path.join(DEST_DIR, binaryName);
   const tag = lib.releaseTag(version);
 
-  if (!force && fs.existsSync(destBin)) {
-    let stamp = null;
-    try {
-      stamp = JSON.parse(fs.readFileSync(STAMP_FILE, 'utf8'));
-    } catch {
-      // Missing or corrupted stamp (e.g. prior run killed mid-write): fall through and re-fetch.
-    }
-    if (
-      stamp?.version === version &&
-      stamp?.target === target &&
-      // Guard against a corrupted/partial staged binary: only skip when it still
-      // hashes to what was staged. Old stamps without binSha256 re-fetch once.
-      stamp?.binSha256 === lib.sha256Hex(fs.readFileSync(destBin))
-    ) {
-      console.log(
-        `intentd ${version} (${target}) already staged at ${destBin} — skipping (use --force to re-fetch)`,
+  // Lazily fetched once and shared by the sidecar and helper stages.
+  let release = null;
+  const getRelease = async () => {
+    release ??= await fetchRelease(tag);
+    return release;
+  };
+
+  if (!force && isStaged(lib, STAMP_FILE, destBin, version, target)) {
+    console.log(
+      `intentd ${version} (${target}) already staged at ${destBin} — skipping (use --force to re-fetch)`,
+    );
+  } else {
+    console.log(`Fetching intentd ${tag} (${target}) from ${REPO}...`);
+    const rel = await getRelease();
+    const candidates = lib.assetCandidates(target, appName);
+    const assetName = candidates.find((name) => rel.assetsByName.has(name));
+    if (!assetName) {
+      throw new Error(
+        `No asset for ${target} in release ${tag} (tried: ${candidates.join(', ')}). Available assets: ${rel.assetNames.join(', ') || '(none)'}`,
       );
-      return;
     }
+    await stageBinary(lib, rel, {
+      assetName,
+      binaryName,
+      destBin,
+      stampFile: STAMP_FILE,
+      version,
+      target,
+      tmpPrefix: 'intentd-sidecar-',
+    });
+    console.log(`Staged intentd ${version} (${target}) at ${destBin}`);
   }
 
-  console.log(`Fetching intentd ${tag} (${target}) from ${REPO}...`);
+  await stageMicrovmHelper(lib, { version, target, tag, force, getRelease });
+}
+
+async function fetchRelease(tag) {
   const releaseRes = await githubGet(
     `https://api.github.com/repos/${REPO}/releases/tags/${tag}`,
     'application/vnd.github+json',
@@ -196,15 +223,39 @@ async function main() {
     throw new Error(`GitHub API error fetching release ${tag}: HTTP ${releaseRes.status}`);
   }
   const release = await releaseRes.json();
-  const assetsByName = new Map(release.assets.map((a) => [a.name, a]));
+  return {
+    tag,
+    assetsByName: new Map(release.assets.map((a) => [a.name, a])),
+    assetNames: release.assets.map((a) => a.name),
+  };
+}
 
-  const candidates = lib.assetCandidates(target, appName);
-  const assetName = candidates.find((name) => assetsByName.has(name));
-  if (!assetName) {
-    throw new Error(
-      `No asset for ${target} in release ${tag} (tried: ${candidates.join(', ')}). Available assets: ${release.assets.map((a) => a.name).join(', ') || '(none)'}`,
-    );
+/** True when the stamp matches version+target and the staged binary still hashes to it. */
+function isStaged(lib, stampFile, destBin, version, target) {
+  if (!fs.existsSync(destBin)) return false;
+  let stamp = null;
+  try {
+    stamp = JSON.parse(fs.readFileSync(stampFile, 'utf8'));
+  } catch {
+    // Missing or corrupted stamp (e.g. prior run killed mid-write): re-fetch.
+    return false;
   }
+  return (
+    stamp?.version === version &&
+    stamp?.target === target &&
+    // Guard against a corrupted/partial staged binary: only skip when it still
+    // hashes to what was staged. Old stamps without binSha256 re-fetch once.
+    stamp?.binSha256 === lib.sha256Hex(fs.readFileSync(destBin))
+  );
+}
+
+/** Download `assetName` + its `.sha256`, verify, extract `binaryName` to `destBin`, stamp it. */
+async function stageBinary(
+  lib,
+  release,
+  { assetName, binaryName, destBin, stampFile, version, target, tmpPrefix },
+) {
+  const { tag, assetsByName } = release;
   const checksumName = lib.checksumAssetName(assetName);
   const checksumAsset = assetsByName.get(checksumName);
   if (!checksumAsset) {
@@ -227,7 +278,7 @@ async function main() {
   }
   console.log(`sha256 verified: ${actual}`);
 
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'intentd-sidecar-'));
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), tmpPrefix));
   try {
     const archivePath = path.join(tmpDir, assetName);
     fs.writeFileSync(archivePath, archive);
@@ -238,11 +289,11 @@ async function main() {
     if (!extractedBin) {
       throw new Error(`Binary ${binaryName} not found inside ${assetName}`);
     }
-    fs.mkdirSync(DEST_DIR, { recursive: true });
+    fs.mkdirSync(path.dirname(destBin), { recursive: true });
     fs.copyFileSync(extractedBin, destBin);
     if (process.platform !== 'win32') fs.chmodSync(destBin, 0o755);
     fs.writeFileSync(
-      STAMP_FILE,
+      stampFile,
       `${JSON.stringify(
         {
           version,
@@ -259,8 +310,52 @@ async function main() {
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
+}
 
-  console.log(`Staged intentd ${version} (${target}) at ${destBin}`);
+/**
+ * Stage `intentd-microvm-helper` from the same release into resources/microvm/ on
+ * targets the pipeline publishes it for. A release without the helper asset (pins
+ * older than the helper's first release) is tolerated with a warning — the package
+ * then ships without microVM support — unless INTENTD_REQUIRE_MICROVM_HELPER=1.
+ */
+async function stageMicrovmHelper(lib, { version, target, tag, force, getRelease }) {
+  if (!lib.publishesMicrovmHelper(target)) return;
+  const helperName = lib.MICROVM_HELPER_APP_NAME;
+  const destBin = path.join(MICROVM_DIR, helperName);
+  const strict = process.env.INTENTD_REQUIRE_MICROVM_HELPER === '1';
+
+  if (!force && isStaged(lib, HELPER_STAMP_FILE, destBin, version, target)) {
+    console.log(
+      `${helperName} ${version} (${target}) already staged at ${destBin} — skipping (use --force to re-fetch)`,
+    );
+    return;
+  }
+
+  console.log(`Fetching ${helperName} ${tag} (${target}) from ${REPO}...`);
+  const rel = await getRelease();
+  const candidates = lib.assetCandidates(target, helperName);
+  const assetName = candidates.find((name) => rel.assetsByName.has(name));
+  if (!assetName) {
+    const message = `No ${helperName} asset for ${target} in release ${tag} (tried: ${candidates.join(', ')}); microVM sandboxes will be unavailable in this build.`;
+    if (strict) {
+      throw new Error(`${message} (INTENTD_REQUIRE_MICROVM_HELPER=1)`);
+    }
+    console.warn(`Warning: ${message} Set INTENTD_REQUIRE_MICROVM_HELPER=1 to fail instead.`);
+    // Never pair a stale helper from an earlier pin with this sidecar.
+    fs.rmSync(destBin, { force: true });
+    fs.rmSync(HELPER_STAMP_FILE, { force: true });
+    return;
+  }
+  await stageBinary(lib, rel, {
+    assetName,
+    binaryName: helperName,
+    destBin,
+    stampFile: HELPER_STAMP_FILE,
+    version,
+    target,
+    tmpPrefix: 'intentd-microvm-helper-',
+  });
+  console.log(`Staged ${helperName} ${version} (${target}) at ${destBin}`);
 }
 
 main().catch((err) => {

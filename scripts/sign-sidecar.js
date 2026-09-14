@@ -20,6 +20,7 @@ import { promisify } from 'util';
 import os from 'os';
 import path from 'path';
 import fs from 'fs';
+import { fileURLToPath } from 'url';
 
 const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
@@ -89,6 +90,98 @@ async function verifySignature(binaryPath) {
   } catch (error) {
     console.error('  ✗ Verification failed:', error.message);
     throw error;
+  }
+}
+
+/**
+ * Sign a binary with an explicit entitlements plist (hardened runtime + timestamp).
+ * @param {string} binaryPath - Absolute path to the binary to sign
+ * @param {string} identity - Code signing identity
+ * @param {string} entitlementsPath - Entitlements plist to embed
+ */
+async function signBinaryWithEntitlements(binaryPath, identity, entitlementsPath) {
+  console.log(`  Signing (entitlements ${path.basename(entitlementsPath)}): ${binaryPath}`);
+  try {
+    await execFileAsync('codesign', [
+      '--force',
+      '--options',
+      'runtime',
+      '--timestamp',
+      '--entitlements',
+      entitlementsPath,
+      '--sign',
+      identity,
+      binaryPath,
+    ]);
+    console.log('  ✓ Signed successfully');
+  } catch (error) {
+    console.error('  ✗ Signing failed:', error.message);
+    throw error;
+  }
+}
+
+/** Entitlements for the microVM helper (Hypervisor.framework access). */
+const MICROVM_HELPER_ENTITLEMENTS = path.resolve(
+  path.dirname(fileURLToPath(import.meta.url)),
+  '..',
+  'build',
+  'entitlements.microvm-helper.plist',
+);
+
+/**
+ * Regular (non-symlink) Mach-O dylibs in `dir`, in name order. The libkrun bundle
+ * stages `libkrun.dylib` / `libkrun.1.dylib` / `libkrunfw.dylib` as symlinks to the
+ * real versioned files; signing through a symlink would just re-sign the target, so
+ * only real files are returned.
+ *
+ * @param {string} dir - directory to scan (non-recursive)
+ * @returns {string[]} absolute paths
+ */
+export function listRealDylibs(dir) {
+  if (!fs.existsSync(dir)) return [];
+  return fs
+    .readdirSync(dir)
+    .filter((name) => name.endsWith('.dylib'))
+    .sort()
+    .map((name) => path.join(dir, name))
+    .filter((p) => fs.lstatSync(p).isFile());
+}
+
+/**
+ * Sign the microVM stack staged next to intentd: the libkrun/libkrunfw dylibs first
+ * (plain hardened-runtime signatures with the same identity, so the helper's library
+ * validation accepts them), then `intentd-microvm-helper` with the hypervisor
+ * entitlement. Everything is signed before the outer app seal, and the helper is
+ * excluded from electron-builder's own re-sign pass via mac.signIgnore so the
+ * entitlement written here is what ships.
+ *
+ * @param {string} intentdDir - Contents/Resources/intentd inside the app bundle
+ * @param {string} identity - Code signing identity
+ */
+async function signMicrovmStack(intentdDir, identity) {
+  const helperPath = path.join(intentdDir, 'intentd-microvm-helper');
+  const dylibs = listRealDylibs(intentdDir);
+  if (!fs.existsSync(helperPath) && dylibs.length === 0) {
+    console.log('  No microVM helper/libkrun bundle staged — skipping microVM signing');
+    return;
+  }
+  if (!fs.existsSync(helperPath)) {
+    console.warn(
+      `  libkrun dylibs are staged but ${helperPath} is missing — microVM will be unavailable in this build`,
+    );
+  }
+  if (fs.existsSync(helperPath) && dylibs.length === 0) {
+    console.warn(
+      `  ${helperPath} is staged without libkrun dylibs — microVM will be unavailable in this build`,
+    );
+  }
+  for (const dylib of dylibs) {
+    await signBinary(dylib, identity);
+    await verifySignature(dylib);
+  }
+  if (fs.existsSync(helperPath)) {
+    await signBinaryWithEntitlements(helperPath, identity, MICROVM_HELPER_ENTITLEMENTS);
+    await verifySignature(helperPath);
   }
 }
 
@@ -533,6 +626,11 @@ async function signSidecar(context) {
 
     // Verify the signature
     await verifySignature(sidecarPath);
+
+    // Sign the microVM helper + libkrun dylibs staged next to intentd when
+    // bundled (same seal-ordering constraint; the helper gets the hypervisor
+    // entitlement and is signIgnore'd from electron-builder's own pass).
+    await signMicrovmStack(path.dirname(sidecarPath), identity);
 
     // Sign the tailcat tunnel client when bundled (same seal-ordering constraint)
     if (fs.existsSync(tailcatPath)) {

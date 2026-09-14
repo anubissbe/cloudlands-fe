@@ -130,5 +130,9 @@ resources/speech-helper/
 # Keychain helper staging directory (build-keychain-helper.cjs output)
 resources/keychain-helper/
 
+# microVM helper + libkrun bundle staging directory
+# (fetch-sidecar.cjs / copy-sidecar.cjs / fetch-libkrun-bundle.mjs output)
+resources/microvm/
+
 # Generated production-only Paraglide bundle
 static/generated/

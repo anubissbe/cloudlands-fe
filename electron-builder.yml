@@ -29,6 +29,8 @@ files:
   - '!resources/speech-helper/**'
   # Keychain helper ships via mac.extraResources (keychain-helper/), not asar.
   - '!resources/keychain-helper/**'
+  # microVM helper + libkrun bundle ship via mac.extraResources (intentd/), not asar.
+  - '!resources/microvm/**'
 
 # Bundle the intentd binary into the packaged app
 # Runtime path: process.resourcesPath/intentd/intentd (intentd.exe on Windows)
@@ -95,6 +97,11 @@ mac:
   # The pre-signed bundle is sealed as-is into the outer app signature.
   signIgnore:
     - 'Resources/keychain-helper/intent-keychain-helper\.app'
+    # The microVM helper is signed by the afterPack hook with the
+    # com.apple.security.hypervisor entitlement (build/entitlements.microvm-helper.plist);
+    # electron-builder's pass would re-sign it with the main app entitlements above and
+    # drop it. The libkrun dylibs next to it carry no entitlements and may be re-signed.
+    - 'Resources/intentd/intentd-microvm-helper'
   # Bundle the macOS speech transcription helper (built by
   # scripts/build-speech-helper.cjs; signed by the afterPack hook).
   # Runtime path: process.resourcesPath/speech-helper/intent-speech-helper
@@ -113,6 +120,21 @@ mac:
     #   intent-keychain-helper.app/Contents/MacOS/intent-keychain-helper
     - from: resources/keychain-helper
       to: keychain-helper
+    # microVM stack (macOS arm64 only): intentd-microvm-helper (fetched from the
+    # pinned intentd release by scripts/fetch-sidecar.cjs, or built from source) plus
+    # the GPU-less libkrun/libkrunfw dylibs, their symlinks, LICENSES and manifest
+    # (scripts/fetch-libkrun-bundle.mjs, pinned by libkrun-bundle.version). Merged into
+    # the intentd/ resource dir: the daemon resolves the helper next to itself and the
+    # helper dlopens the dylibs from its own directory. Signed by the afterPack hook.
+    # Runtime path: process.resourcesPath/intentd/intentd-microvm-helper
+    - from: resources/microvm
+      to: intentd
+      filter:
+        - '**/*'
+        # Fetch stamps are build machinery with timestamps; keep them out so identical
+        # pinned inputs produce identical artifacts.
+        - '!.libkrun-bundle-fetch-stamp.json'
+        - '!.microvm-helper-fetch-stamp.json'
   # Microphone usage string shown by the one-time macOS TCC prompt
   # (voice dictation; pairs with com.apple.security.device.audio-input)
   extendInfo:

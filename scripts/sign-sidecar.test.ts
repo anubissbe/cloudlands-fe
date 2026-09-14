@@ -1,12 +1,45 @@
-import { describe, expect, it } from 'vitest';
+import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterEach, describe, expect, it } from 'vitest';
 import {
   SHARED_KEYCHAIN_GROUP_SUFFIX,
   buildHelperEntitlementsPlist,
+  listRealDylibs,
   parseKeychainAccessGroupsFromXml,
   parsePlutilRawArrayLength,
   resolveKeychainAccessGroups,
   sharedKeychainGroupGuardrailError,
 } from './sign-sidecar.js';
+
+describe('listRealDylibs', () => {
+  const dirs: string[] = [];
+  afterEach(() => {
+    for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('returns only real .dylib files, skipping the libkrun bundle symlinks and other files', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'sign-sidecar-dylibs-'));
+    dirs.push(dir);
+    writeFileSync(join(dir, 'libkrun.1.19.4.dylib'), 'a');
+    writeFileSync(join(dir, 'libkrunfw.5.dylib'), 'b');
+    symlinkSync('libkrun.1.19.4.dylib', join(dir, 'libkrun.1.dylib'));
+    symlinkSync('libkrun.1.dylib', join(dir, 'libkrun.dylib'));
+    symlinkSync('libkrunfw.5.dylib', join(dir, 'libkrunfw.dylib'));
+    writeFileSync(join(dir, 'intentd'), 'c');
+    writeFileSync(join(dir, 'intentd-microvm-helper'), 'd');
+    mkdirSync(join(dir, 'nested.dylib'));
+
+    expect(listRealDylibs(dir)).toEqual([
+      join(dir, 'libkrun.1.19.4.dylib'),
+      join(dir, 'libkrunfw.5.dylib'),
+    ]);
+  });
+
+  it('returns an empty list for a missing directory', () => {
+    expect(listRealDylibs(join(tmpdir(), 'sign-sidecar-does-not-exist'))).toEqual([]);
+  });
+});
 
 /**
  * Keychain-helper entitlement composition (scripts/sign-sidecar.js): the

@@ -11,6 +11,18 @@ import { createHash } from 'node:crypto';
 export const INTENTD_APP_NAME = 'intentd';
 
 /**
+ * cargo-dist app name of the microVM helper published alongside intentd in the same
+ * `vX.Y.Z` release (crates/intentd-microvm-helper: `dist = true`, aarch64-apple-darwin
+ * only — other targets would only ship its exit-69 stub).
+ */
+export const MICROVM_HELPER_APP_NAME = 'intentd-microvm-helper';
+
+/** True when the intentd release pipeline publishes the microVM helper for a target. */
+export function publishesMicrovmHelper(target) {
+  return target === 'aarch64-apple-darwin';
+}
+
+/**
  * Single source of truth for the platform/arch → cargo-dist target triple mapping.
  * Keep in sync with the target list in intent-hq/intentd's release pipeline.
  */

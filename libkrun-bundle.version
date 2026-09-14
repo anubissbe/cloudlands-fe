@@ -1,0 +1,5 @@
+# Exact libkrun bundle staged next to the intentd sidecar in macOS arm64 builds
+# (see README "libkrun bundle pin"). Format: <libkrun>+<libkrunfw>, matching the
+# `libkrun-bundle-v<libkrun>+<libkrunfw>` release tag on intent-hq/intentd.
+# Bump by PR, then verify with `node scripts/fetch-libkrun-bundle.mjs`.
+1.19.4+5.5.0

@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+    <dict>
+        <!-- intentd-microvm-helper boots libkrun guests through Hypervisor.framework
+             (hv_vm_create), which macOS grants only to binaries signed with this
+             entitlement. Mirrors intentd's
+             crates/intentd-microvm-helper/entitlements/hypervisor.entitlements.
+             No disable-library-validation: the libkrun/libkrunfw dylibs it dlopens
+             are signed with the same Developer ID (scripts/sign-sidecar.js). -->
+        <key>com.apple.security.hypervisor</key>
+        <true/>
+    </dict>
+</plist>

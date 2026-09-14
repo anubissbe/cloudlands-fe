@@ -146,6 +146,30 @@ The platform/arch → release-asset mapping lives in
 `scripts/fetch-sidecar-lib.test.ts`); update it there if the intentd release
 target list changes.
 
+## libkrun bundle pin
+
+macOS arm64 packages ship the intentd microVM stack next to the sidecar under
+`Contents/Resources/intentd/`: the `intentd-microvm-helper` binary and the
+GPU-less `libkrun` / `libkrunfw` dylibs it dlopens.
+
+- **Helper**: `node scripts/fetch-sidecar.cjs` also stages the
+  `intentd-microvm-helper` cargo-dist asset of the pinned intentd release at
+  `resources/microvm/`. A pinned release without the asset is tolerated with a
+  warning (the package ships without microVM support); set
+  `INTENTD_REQUIRE_MICROVM_HELPER=1` to fail instead. `scripts/copy-sidecar.cjs`
+  stages a locally built helper found next to the local `intentd` binary.
+- **Bundle**: [`libkrun-bundle.version`](./libkrun-bundle.version) pins the exact
+  `<libkrun>+<libkrunfw>` bundle, matching a `libkrun-bundle-v<libkrun>+<libkrunfw>`
+  release on [intent-hq/intentd](https://github.com/intent-hq/intentd).
+  `node scripts/fetch-libkrun-bundle.mjs` (run by `dist` / `dist:mac`) downloads
+  the archive, verifies its sha256, and stages the dylibs, their symlinks,
+  `LICENSES` and manifest at `resources/microvm/`; `LIBKRUN_BUNDLE_SKIP=1`
+  packages without it. Bump the pin in a normal reviewable PR, then run the
+  script to confirm the release assets exist and verify.
+- **Signing**: `scripts/sign-sidecar.js` signs the dylibs and then the helper with
+  `build/entitlements.microvm-helper.plist` (`com.apple.security.hypervisor`);
+  the helper is excluded from electron-builder's own signing pass.
+
 ## Release channels
 
 Desktop builds are distributed through three rolling releases (`alpha`, `beta`,

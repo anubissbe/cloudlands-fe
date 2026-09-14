@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  MICROVM_HELPER_APP_NAME,
   TARGET_BY_PLATFORM_ARCH,
   assetCandidates,
   checksumAssetName,
@@ -7,6 +8,7 @@ import {
   isSafeArchiveEntry,
   parseChecksumFile,
   parseVersionPin,
+  publishesMicrovmHelper,
   releaseTag,
   resolveTarget,
   sha256Hex,
@@ -83,6 +85,23 @@ describe('assetCandidates', () => {
       'intentd-x86_64-pc-windows-msvc.tar.xz',
       'intentd-x86_64-pc-windows-msvc.tar.gz',
     ]);
+  });
+
+  it('names the microVM helper asset the way cargo-dist publishes it', () => {
+    expect(assetCandidates('aarch64-apple-darwin', MICROVM_HELPER_APP_NAME)[0]).toBe(
+      'intentd-microvm-helper-aarch64-apple-darwin.tar.xz',
+    );
+  });
+});
+
+describe('publishesMicrovmHelper', () => {
+  it('is true only for aarch64-apple-darwin (the helper is dist-excluded elsewhere)', () => {
+    expect(publishesMicrovmHelper('aarch64-apple-darwin')).toBe(true);
+    for (const target of Object.values(TARGET_BY_PLATFORM_ARCH).filter(
+      (t) => t !== 'aarch64-apple-darwin',
+    )) {
+      expect(publishesMicrovmHelper(target)).toBe(false);
+    }
   });
 });
 
