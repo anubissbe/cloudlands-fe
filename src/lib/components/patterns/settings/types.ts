@@ -7,6 +7,7 @@ export type SettingsTab =
   | 'providers'
   | 'connections'
   | 'devices'
+  | 'guest-sessions'
   | 'setup'
   | 'advanced'
   | 'input'

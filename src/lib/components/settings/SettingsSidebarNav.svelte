@@ -11,6 +11,7 @@
     faRobot,
     faSliders,
     faTerminal,
+    faUsers,
     faWandMagicSparkles,
   } from '@fortawesome/free-solid-svg-icons';
   import type { Snippet } from 'svelte';
@@ -107,6 +108,14 @@
       icon: faServer,
       get label() {
         return m.settings_sidebar_devices_label();
+      },
+    },
+    {
+      id: 'guest-sessions',
+      group: 'environment',
+      icon: faUsers,
+      get label() {
+        return m.settings_sidebar_guestSessions_label();
       },
     },
     {
