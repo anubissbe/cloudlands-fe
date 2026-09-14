@@ -295,6 +295,27 @@ ${verticalSource}`;
     }
   }
 
+  function centerStateNodeLabels(svg: SVGSVGElement) {
+    if (!svg.classList.contains('statediagram')) return;
+    for (const node of svg.querySelectorAll<SVGGElement>('g.statediagram-state')) {
+      const shape = node.querySelector<SVGRectElement>(':scope > rect.basic.label-container');
+      const label = node.querySelector<SVGGElement>(':scope > g.label');
+      if (!shape || !label || !node.textContent?.trim()) continue;
+
+      const shapeBounds = shape.getBoundingClientRect();
+      const textBounds = visibleTextBounds(label);
+      const transform = readTranslate(label);
+      const matrix = label.getScreenCTM();
+      if (!textBounds || !transform || !matrix) continue;
+      const scaleX = Math.hypot(matrix.a, matrix.b) || 1;
+      const offsetX = textBounds.x + textBounds.width / 2 - (shapeBounds.x + shapeBounds.width / 2);
+      label.setAttribute(
+        'transform',
+        `translate(${transform.x - offsetX / scaleX}, ${transform.y})`,
+      );
+    }
+  }
+
   function padMermaidEdgeLabels(svg: SVGSVGElement) {
     for (const foreignObject of svg.querySelectorAll<SVGForeignObjectElement>(
       'foreignObject:has(span.edgeLabel)',
@@ -1272,6 +1293,7 @@ ${verticalSource}`;
     addSemanticLabelBreaks(svg);
     hideEmptyEdgeLabels(svg);
     centerFlowchartLabels(svg);
+    centerStateNodeLabels(svg);
     balanceMermaidEdgeLabelGlyphs(svg);
     padMermaidEdgeLabels(svg);
     addMermaidLabelKnockouts(svg);
