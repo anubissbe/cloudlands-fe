@@ -129,3 +129,24 @@ export function missingRequiredFiles(names) {
   const present = new Set(names);
   return REQUIRED_BUNDLE_FILES.filter((name) => !present.has(name));
 }
+
+/** Top-level names in the staging dir that belong to the libkrun bundle stage. */
+export const STAGED_LICENSES_DIR = 'libkrun-bundle.LICENSES';
+export const STAGED_MANIFEST = 'libkrun-bundle.MANIFEST.json';
+export const STAMP_FILE_NAME = '.libkrun-bundle-fetch-stamp.json';
+
+/**
+ * The top-level staging-dir entries owned by the libkrun bundle stage — the only ones a
+ * re-fetch or LIBKRUN_BUNDLE_SKIP=1 may remove. The dir is shared with the
+ * intentd-microvm-helper (staged by fetch-sidecar.cjs / copy-sidecar.cjs / CI), which
+ * must survive: `entries` are the dir's current names, `stamp` the previous stamp (or
+ * null); owned = everything the stamp recorded, the bundle's fixed names, and any
+ * `libkrun*.dylib` left by a stampless stage.
+ */
+export function bundleOwnedEntries(entries, stamp) {
+  const owned = new Set([STAGED_LICENSES_DIR, STAGED_MANIFEST, STAMP_FILE_NAME]);
+  for (const rel of [...Object.keys(stamp?.files ?? {}), ...Object.keys(stamp?.symlinks ?? {})]) {
+    owned.add(rel.split('/')[0]);
+  }
+  return entries.filter((name) => owned.has(name) || /^libkrun.*\.dylib$/.test(name));
+}

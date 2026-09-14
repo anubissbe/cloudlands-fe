@@ -5,6 +5,7 @@ import {
   archiveProblems,
   bundleAssetName,
   bundleChecksumAssetName,
+  bundleOwnedEntries,
   bundleReleaseTag,
   classifyListingLine,
   isBundleTarget,
@@ -140,5 +141,41 @@ describe('missingRequiredFiles', () => {
       'libkrun.dylib',
     ]);
     expect(missingRequiredFiles([])).toEqual(REQUIRED_BUNDLE_FILES);
+  });
+});
+
+describe('bundleOwnedEntries', () => {
+  const dirEntries = [
+    'intentd-microvm-helper',
+    '.microvm-helper-fetch-stamp.json',
+    'libkrun.1.19.4.dylib',
+    'libkrun.1.dylib',
+    'libkrun.dylib',
+    'libkrunfw.5.dylib',
+    'libkrunfw.dylib',
+    'libkrun-bundle.LICENSES',
+    'libkrun-bundle.MANIFEST.json',
+    '.libkrun-bundle-fetch-stamp.json',
+  ];
+
+  it('never selects the co-staged microvm helper or its stamp', () => {
+    const stamp = {
+      files: {
+        'libkrun.1.19.4.dylib': HASH,
+        'libkrunfw.5.dylib': HASH,
+        'libkrun-bundle.MANIFEST.json': HASH,
+        'libkrun-bundle.LICENSES/LICENSE': HASH,
+      },
+      symlinks: { 'libkrun.dylib': 'libkrun.1.19.4.dylib' },
+    };
+    const owned = bundleOwnedEntries(dirEntries, stamp);
+    expect(owned).not.toContain('intentd-microvm-helper');
+    expect(owned).not.toContain('.microvm-helper-fetch-stamp.json');
+    expect(owned).toEqual(dirEntries.slice(2));
+  });
+
+  it('falls back to fixed names and libkrun*.dylib without a stamp', () => {
+    expect(bundleOwnedEntries(dirEntries, null)).toEqual(dirEntries.slice(2));
+    expect(bundleOwnedEntries(['intentd-microvm-helper', 'other.dylib'], null)).toEqual([]);
   });
 });

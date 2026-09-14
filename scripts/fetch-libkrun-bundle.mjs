@@ -18,7 +18,7 @@
  *   INTENTD_READ_PAT / GH_TOKEN / GITHUB_TOKEN  optional auth token (rate limits)
  *   LIBKRUN_BUNDLE_VERSION   override the pin (<libkrun>+<libkrunfw>)
  *   LIBKRUN_BUNDLE_REPO      override the source repo (default intent-hq/intentd)
- *   LIBKRUN_BUNDLE_SKIP=1    skip staging AND remove previously staged files (the
+ *   LIBKRUN_BUNDLE_SKIP=1    skip staging AND remove the previously staged bundle (the
  *                            package then ships without microVM support)
  *
  * Flags: --force re-fetches even when the staged bundle already matches the pin.
@@ -37,11 +37,10 @@ import * as lib from './fetch-libkrun-bundle-lib.mjs';
 const FE_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const PIN_FILE = path.join(FE_DIR, 'libkrun-bundle.version');
 const DEST_DIR = path.join(FE_DIR, 'resources/microvm');
-const STAMP_FILE = path.join(DEST_DIR, '.libkrun-bundle-fetch-stamp.json');
+const STAMP_FILE = path.join(DEST_DIR, lib.STAMP_FILE_NAME);
 const REPO = process.env.LIBKRUN_BUNDLE_REPO?.trim() || 'intent-hq/intentd';
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
-const STAGED_LICENSES_DIR = 'libkrun-bundle.LICENSES';
-const STAGED_MANIFEST = 'libkrun-bundle.MANIFEST.json';
+const { STAGED_LICENSES_DIR, STAGED_MANIFEST } = lib;
 
 function authToken() {
   for (const name of ['INTENTD_READ_PAT', 'GH_TOKEN', 'GITHUB_TOKEN']) {
@@ -110,10 +109,20 @@ function findBundleRoot(dir) {
   return null;
 }
 
-/** Remove everything previously staged (files, symlinks, license dir, stamp). */
-function clearStagingDir() {
+/**
+ * Remove the previously staged bundle (dylibs, symlinks, license dir, manifest, stamp)
+ * and nothing else: resources/microvm/ also holds intentd-microvm-helper, staged
+ * earlier by fetch-sidecar.cjs / copy-sidecar.cjs / CI, which must survive.
+ */
+function clearStagedBundle() {
   if (!fs.existsSync(DEST_DIR)) return;
-  for (const entry of fs.readdirSync(DEST_DIR)) {
+  let stamp = null;
+  try {
+    stamp = JSON.parse(fs.readFileSync(STAMP_FILE, 'utf8'));
+  } catch {
+    // no/unreadable stamp: fall back to the bundle's fixed names
+  }
+  for (const entry of lib.bundleOwnedEntries(fs.readdirSync(DEST_DIR), stamp)) {
     fs.rmSync(path.join(DEST_DIR, entry), { recursive: true, force: true });
   }
 }
@@ -187,7 +196,7 @@ async function main() {
   const force = process.argv.includes('--force');
 
   if (process.env.LIBKRUN_BUNDLE_SKIP === '1') {
-    clearStagingDir();
+    clearStagedBundle();
     fs.mkdirSync(DEST_DIR, { recursive: true });
     console.log(
       'LIBKRUN_BUNDLE_SKIP=1 — libkrun bundle not staged (package ships without microVM)',
@@ -269,7 +278,7 @@ async function main() {
     if (!bundleRoot) {
       throw new Error(`libkrunfw.5.dylib not found inside ${assetName}`);
     }
-    clearStagingDir();
+    clearStagedBundle();
     const { files, symlinks } = stageBundle(bundleRoot);
     const missing = lib.missingRequiredFiles([...Object.keys(files), ...Object.keys(symlinks)]);
     if (missing.length > 0) {
