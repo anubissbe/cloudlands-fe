@@ -10,7 +10,6 @@ import { hardwareConsoleSaga, sagas, startAllAppSagas } from './sagas';
 describe('renderer app saga registry', () => {
   const expectedSagaNames = [
     'daemonEventsSaga',
-    'agentOverviewHistorySaga',
     'daemonHealthSaga',
     'connectionsSaga',
     'settingsHydrationSaga',
@@ -28,6 +27,7 @@ describe('renderer app saga registry', () => {
     'backgroundExecutorSaga',
     'agentMutationSaga',
     'editRegenerateSaga',
+    'regenerateFromMessageSaga',
     'agentFailureToastSaga',
     'gitReadSaga',
     'acceptChangesStatusSaga',
@@ -91,6 +91,7 @@ describe('renderer app saga registry', () => {
     'browserClientsSaga',
     'fileContentPruneSaga',
     'terminalPersistenceSaga',
+    'terminalCommandsSaga',
     'externalEditorsPersistenceSaga',
     'workspaceSettingsSaga',
     'updateChannelSaga',

@@ -111,10 +111,9 @@ async function openGithubTab(
   onProjectChange: (selection: ProjectSelection) => void,
 ): Promise<HTMLInputElement> {
   render(ProjectPickerMessage, { props: { onProjectChange } });
-  const tabButton = Array.from(document.body.querySelectorAll('button')).find(
-    (b) => b.textContent?.trim() === m.onboarding_projectPicker_githubRepo_label(),
-  );
-  if (!tabButton) throw new Error('GitHub repo tab button not found');
+  const tabButton = screen.getByRole('button', {
+    name: m.onboarding_projectPicker_githubRepo_label(),
+  });
   await fireEvent.click(tabButton);
   return waitFor(() => {
     const el = document.body.querySelector('input[role="combobox"]');
