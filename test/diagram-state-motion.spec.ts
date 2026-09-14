@@ -279,6 +279,7 @@ type ContentMotionFrame = {
       width: number;
       height: number;
       opacity: number;
+      background: string;
       sameAsBaseline: boolean;
     } | null
   >;
@@ -364,6 +365,9 @@ async function recordContentMotion(
                   width: bounds.right - bounds.left,
                   height: bounds.bottom - bounds.top,
                   opacity: Number(getComputedStyle(node).opacity),
+                  background: getComputedStyle(
+                    node.querySelector<HTMLElement>('.diagram-node-html')!,
+                  ).backgroundColor,
                   sameAsBaseline: node === initialNodes.get(id),
                 },
               ];
@@ -1197,6 +1201,130 @@ test('animates delivery nodes and painted connections between Observe and Publis
     expect(
       transitionCase.departingEdges.every(
         (id) => (firstEnteringEdge.edges[id]?.reveal ?? 0) <= 0.01,
+      ),
+    ).toBe(true);
+  }
+});
+
+test('animates the untouched initial ownership step before the following step', async ({
+  page,
+}) => {
+  test.setTimeout(60_000);
+  await openMotionFixture(page, 'custom-walkthrough');
+  const root = page.locator('#custom-walkthrough');
+  const renderer = root.locator('.diagram-renderer');
+  await expect(renderer).toHaveAttribute('data-diagram-state', 'request');
+  await expect(renderer).toHaveAttribute('data-diagram-settled', 'true');
+
+  const cases = [
+    {
+      from: 'request',
+      to: 'execute',
+      departingNodes: ['user'],
+      enteringNodes: ['daemon'],
+      departingEdges: ['w1', 'w2'],
+      enteringEdges: ['w4', 'w5'],
+      sharedNodes: ['chat', 'redux'],
+      sharedEdges: ['w3'],
+    },
+    {
+      from: 'execute',
+      to: 'render',
+      departingNodes: [],
+      enteringNodes: [],
+      departingEdges: ['w3', 'w4'],
+      enteringEdges: ['w2'],
+      sharedNodes: ['chat', 'redux', 'daemon'],
+      sharedEdges: ['w5'],
+    },
+  ];
+
+  for (const transitionCase of cases) {
+    const transition = await recordContentMotion(
+      page,
+      'custom-walkthrough',
+      'forward',
+      ['user', 'chat', 'redux', 'daemon'],
+      ['w1', 'w2', 'w3', 'w4', 'w5'],
+    );
+    const settled = transition.frames.at(-1)!;
+    expect(transition.baseline).toMatchObject({
+      state: transitionCase.from,
+      phase: 'settled',
+      settled: true,
+    });
+    expect(settled).toMatchObject({ state: transitionCase.to, phase: 'settled', settled: true });
+    expect(transition.frames.some((frame) => frame.phase === 'exit')).toBe(true);
+    expect(transition.frames.some((frame) => frame.phase === 'scene')).toBe(true);
+
+    for (const id of [...transitionCase.departingNodes, ...transitionCase.enteringNodes]) {
+      expect(
+        transition.frames.some((frame) => {
+          const opacity = frame.nodes[id]?.opacity;
+          return opacity !== undefined && opacity > 0.01 && opacity < 0.99;
+        }),
+        `${transitionCase.from}→${transitionCase.to} ${id} opacity`,
+      ).toBe(true);
+    }
+    for (const id of [...transitionCase.departingEdges, ...transitionCase.enteringEdges]) {
+      expect(
+        transition.frames.some((frame) => {
+          const edge = frame.edges[id];
+          return (
+            edge !== null &&
+            edge.reveal > 0.01 &&
+            edge.reveal < 0.99 &&
+            edge.maskDashOffset > 0.01 &&
+            edge.maskDashOffset < 0.99
+          );
+        }),
+        `${transitionCase.from}→${transitionCase.to} ${id} painted reveal`,
+      ).toBe(true);
+    }
+    for (const id of transitionCase.sharedNodes) {
+      const start = transition.baseline.nodes[id]!;
+      const end = settled.nodes[id]!;
+      expect(transition.frames.every((frame) => frame.nodes[id]?.sameAsBaseline)).toBe(true);
+      expect(Math.hypot(end.x - start.x, end.y - start.y)).toBeLessThanOrEqual(0.1);
+    }
+    for (const id of transitionCase.sharedEdges) {
+      const start = transition.baseline.edges[id]!;
+      const end = settled.edges[id]!;
+      const routeFrames = transition.frames.flatMap((frame) =>
+        frame.edges[id] ? [frame.edges[id]] : [],
+      );
+      expect(routeFrames.every(({ sameAsBaseline }) => sameAsBaseline)).toBe(true);
+      if (end.path !== start.path) {
+        expect(
+          routeFrames.some(
+            (edge) =>
+              edge.path !== start.path &&
+              edge.path !== end.path &&
+              edge.progress > 0 &&
+              edge.progress < 1,
+          ),
+        ).toBe(true);
+      }
+      expect(routeFrames.every(({ sourceDistance }) => Math.abs(sourceDistance) <= 2)).toBe(true);
+      const minimumTargetGap = Math.min(start.targetDistance, end.targetDistance);
+      const maximumTargetGap = Math.max(start.targetDistance, end.targetDistance);
+      expect(
+        routeFrames.every(
+          ({ targetDistance }) =>
+            targetDistance >= minimumTargetGap - 0.1 && targetDistance <= maximumTargetGap + 2,
+        ),
+      ).toBe(true);
+    }
+
+    const chatStart = transition.baseline.nodes.chat!.background;
+    const chatEnd = settled.nodes.chat!.background;
+    expect(chatEnd).not.toBe(chatStart);
+    expect(
+      transition.frames.some(
+        (frame) =>
+          frame.nodes.chat !== null &&
+          frame.nodes.chat.background !== chatStart &&
+          frame.nodes.chat.background !== chatEnd,
       ),
     ).toBe(true);
   }
