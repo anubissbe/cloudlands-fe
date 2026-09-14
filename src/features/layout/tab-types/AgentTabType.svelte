@@ -13,6 +13,8 @@
   import { subscribeToAgent } from '$features/agent/browser';
   import { useAgentSession } from '$lib/hooks/useAgentSession.svelte';
   import { selectInitialAgentId } from '$store/renderer/slices/workspace-agents/workspace-agents-selectors';
+  import { selectAgentPresencePeople } from '$store/renderer/slices/presence/presence-selectors';
+  import PresenceAvatarStack from '$features/presence/components/PresenceAvatarStack.svelte';
 
   import { selectWorkspaceById } from '$store/renderer/slices/workspace/workspace-selectors';
   import type { AgentSession } from '$shared/types';
@@ -68,6 +70,8 @@
   // Cache $workspace to prevent destruction during store reloads
   const workspace = selectWorkspaceById(workspaceIdStore);
   const defaultModel = selectSelectedModel();
+  // Other people whose focus is this chat (multiplayer w5 presence circles).
+  const presencePeople$ = selectAgentPresencePeople(workspaceIdStore, agentIdStore);
 
   // Reactive store subscription for specialist names
   const specialists$ = selectSpecialists();
@@ -242,6 +246,7 @@
 
 {#snippet agentPrimaryActions()}
   <div class="flex min-w-0 items-center gap-1.5">
+    <PresenceAvatarStack people={$presencePeople$} size={18} class="mr-1" />
     <TaskProgressControl tasks={taskProgressItems} presentation="checklist" />
     {#if tab.agentId}
       <BrowserTabsMenu {workspaceId} agentId={tab.agentId} />
