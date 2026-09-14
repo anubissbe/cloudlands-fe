@@ -114,15 +114,15 @@ describe('pinned response trigger', () => {
     expect((screen.getByRole('button') as HTMLButtonElement).title).toBe('Review the result');
   });
 
-  it('preserves attachment-only context and Chief attribution across updates', async () => {
+  it('preserves reference-attachment context and Chief attribution across updates', async () => {
     const onActivate = vi.fn();
     const source = message('');
     source.contentBlocks = [
       {
         type: 'file',
+        attachmentId: 'attachment-layout-reference',
         fileName: 'layout-reference.txt',
         mimeType: 'text/plain',
-        url: 'file:///layout-reference.txt',
       },
     ];
     const view = render(PinnedTurnPrompt, { props: { message: source, onActivate } });
@@ -140,4 +140,32 @@ describe('pinned response trigger', () => {
     await fireEvent.click(button);
     expect(onActivate).toHaveBeenCalledOnce();
   });
+
+  it.each([
+    [
+      'legacy inline file',
+      { type: 'file', fileName: 'layout-reference.txt', mimeType: 'text/plain', data: 'aGVsbG8=' },
+    ],
+    ['daemon-projected legacy file', { type: 'text', text: 'Attached file: layout-reference.txt' }],
+  ] as const)(
+    'preserves the served context for a %s when pinning and navigating',
+    async (_kind, block) => {
+      const onActivate = vi.fn();
+      const source = message('');
+      source.contentBlocks = [block];
+      const original = structuredClone(source);
+      const view = render(PinnedTurnPrompt, { props: { message: source, onActivate } });
+      const button = screen.getByRole('button') as HTMLButtonElement;
+
+      // Mirrors the daemon's legacy-file text projection, not a filename-only attachment reference.
+      expect(button.title).toBe('Attached file: layout-reference.txt');
+      expect(source).toEqual(original);
+      await fireEvent.click(button);
+      expect(onActivate).toHaveBeenCalledOnce();
+
+      await view.rerender({ message: message('Continue the review'), onActivate });
+      expect(button.title).toBe('Continue the review');
+      expect(button.title).not.toContain('layout-reference.txt');
+    },
+  );
 });

@@ -16,6 +16,7 @@ import { agentFailureToastSaga } from './slices/agent-session/sagas/agent-failur
 import { agentMutationSaga } from './slices/agent-session/sagas/agent-mutation-saga';
 import { agentStreamSaga } from './slices/agent-session/sagas/agent-stream-saga';
 import { editRegenerateSaga } from './slices/agent-session/sagas/edit-regenerate-saga';
+import { regenerateFromMessageSaga } from './slices/agent-session/sagas/regenerate-from-message-saga';
 import { agentSubscriptionReadSaga } from './slices/agent-subscription-ui/sagas/agent-subscription-read-saga';
 import { appLayoutNavigationSaga } from './slices/app-layout/sagas/app-layout-navigation-saga';
 import { browserIpcSaga } from './slices/app-layout/sagas/browser-ipc-saga';
@@ -85,6 +86,8 @@ import { workspaceTabCleanupSaga } from './slices/workspace-lifecycle/sagas/work
 import { workspaceLoadSaga } from './slices/workspace-lifecycle/sagas/workspace-load-saga';
 import { workspaceReconnectSaga } from './slices/workspace-lifecycle/sagas/workspace-reconnect-saga';
 import { taskAgentAssociationsSaga } from './slices/task-agent-associations/sagas/task-agent-associations-saga';
+import { terminalCommandsSaga } from './slices/terminals/sagas/terminal-commands-saga';
+import { terminalCreationSaga } from './slices/terminals/sagas/terminal-creation-saga';
 import { terminalPersistenceSaga } from './slices/terminals/sagas/terminal-persistence-saga';
 import { themeSaga } from './slices/theme/sagas/theme-saga';
 import { uiLayoutPersistenceSaga } from './slices/ui-layout/sagas/ui-layout-persistence-saga';
@@ -143,6 +146,7 @@ export const sagas = [
   backgroundExecutorSaga,
   agentMutationSaga,
   editRegenerateSaga,
+  regenerateFromMessageSaga,
   agentFailureToastSaga,
   gitReadSaga,
   acceptChangesStatusSaga,
@@ -204,7 +208,9 @@ export const sagas = [
   browserPersistenceSaga,
   browserClientsSaga,
   fileContentPruneSaga,
+  terminalCreationSaga,
   terminalPersistenceSaga,
+  terminalCommandsSaga,
   externalEditorsPersistenceSaga,
   workspaceSettingsSaga,
   updateChannelSaga,

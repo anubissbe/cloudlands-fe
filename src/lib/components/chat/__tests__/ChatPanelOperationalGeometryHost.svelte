@@ -2,6 +2,7 @@
   import { onDestroy, untrack } from 'svelte';
   import { faComment } from '@fortawesome/free-solid-svg-icons';
   import type { AgentMessage, AgentSession, ContentBlock } from '$shared/types';
+  import { AgentStatus } from '$shared/types/agent.types';
   import AgentTabType from '$features/layout/tab-types/AgentTabType.svelte';
   import InitialAgentChatTabType from './InitialAgentChatTabType.svelte';
   import { tabTypeRegistry } from '$features/layout/tab-types/registry';
@@ -622,6 +623,8 @@
           [
             {
               ...session,
+              status: status === 'thinking' ? AgentStatus.Active : AgentStatus.RuntimeIdle,
+              isActive: status === 'thinking',
               isStreaming: status === 'thinking',
               isProcessing: status === 'thinking',
               isResponding: status === 'thinking',
@@ -641,6 +644,11 @@
       );
       store.dispatch(chatErrorCleared(agentId));
       store.dispatch(chatModelUnavailableCleared(agentId));
+      if (status === 'idle' || status === 'reply') {
+        store.dispatch(
+          streamCompleted(agentId, { lastAttemptedMessage: null, modelUnavailable: null }),
+        );
+      }
       if (status === 'error') store.dispatch(chatSendFailed(agentId, 'The provider failed.'));
       if (status === 'model-unavailable') {
         store.dispatch(

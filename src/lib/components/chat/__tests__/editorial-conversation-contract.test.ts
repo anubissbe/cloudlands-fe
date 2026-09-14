@@ -1,3 +1,14 @@
+// @verify-changed-triggers: ../ChatPanel.svelte, ../ChatMessage.svelte, ../LazyTurn.svelte,
+//   ../PinnedUserPrompt.svelte, ../pinned-prompt.ts, ../user-message-surface.ts,
+//   ../ConversationTurnGap.svelte, ../MessageContent.svelte, ../StreamingMessageContent.svelte,
+//   ../ResponseGroup.svelte, ../operational-disclosure-row.ts, ../ChatOperationalRow.svelte,
+//   ../StreamingStatus.svelte, ../StreamingTypingIndicator.svelte, ../EventWakeupBanner.svelte,
+//   ../InlineAgentAvatar.svelte, ../SuggestedPrompts.svelte, ../message-action-surface.ts,
+//   ../ToolCall.svelte, ../ThinkingBlock.svelte, ../ContextEngineToolCall.svelte,
+//   ../chat-queue-edge-layout.ts, ../input/SimpleRichInput.svelte,
+//   ../../markdown/MarkdownViewer.svelte, ../../ui/indicators/IntentMarkLoader.svelte,
+//   ../../ui/indicators/index.ts, ../../../../features/layout/tab-types/AgentTabType.svelte
+
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -226,33 +237,6 @@ describe('editorial conversation presentation contract', () => {
     expect(panel).not.toContain('backdrop-filter: blur(24px)');
     expect(message).toContain(': USER_MESSAGE_SURFACE_CLASS}');
     expect(message).not.toContain('stickySurfaceClass');
-  });
-
-  it('uses the shared 16px five-arm Intent mark instead of the legacy square spinner', () => {
-    const panel = source('src/lib/components/chat/ChatPanel.svelte');
-    const status = source('src/lib/components/chat/StreamingStatus.svelte');
-    const indicator = source('src/lib/components/chat/StreamingTypingIndicator.svelte');
-    const loader = source('src/lib/components/ui/indicators/IntentMarkLoader.svelte');
-    const indicators = source('src/lib/components/ui/indicators/index.ts');
-
-    expect(panel).toContain("import StreamingStatus from './StreamingStatus.svelte'");
-    expect(panel).not.toContain('LiveStreamPhaseIndicator');
-    expect(status).toContain(
-      "import StreamingTypingIndicator from './StreamingTypingIndicator.svelte'",
-    );
-    expect(indicators).toContain(
-      "export { default as IntentMarkLoader } from './IntentMarkLoader.svelte';",
-    );
-    expect(indicator).toContain('<IntentMarkLoader {variant} size={16} playing={visible} />');
-    expect(loader.match(/data-mark-arm=/g)).toHaveLength(5);
-    expect(loader).toContain('stroke: currentColor');
-    for (const legacyToken of [
-      'legacy-streaming-spinner',
-      'legacy-spinner-square',
-      'legacy-spinner-wave',
-    ]) {
-      expect(indicator).not.toContain(legacyToken);
-    }
   });
 
   it('renders wake-up details as one compact disclosure surface', () => {

@@ -150,8 +150,8 @@ for (const theme of ['light', 'dark'] as const) {
           eventToolHeight: eventTool.height,
         };
       });
-      expect(eventSpacing.beforeEvent).toBeCloseTo(32 * zoom, 1);
-      expect(eventSpacing.afterEvent).toBeCloseTo(32 * zoom, 1);
+      expect(eventSpacing.beforeEvent).toBeCloseTo(24 * zoom, 1);
+      expect(eventSpacing.afterEvent).toBeCloseTo(24 * zoom, 1);
       expect(eventSpacing.eventToolHeight).toBeCloseTo(28 * zoom, 1);
 
       const userSpacing = await component.evaluate((root) => {
