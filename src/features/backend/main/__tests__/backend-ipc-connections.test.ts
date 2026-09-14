@@ -32,6 +32,8 @@ const lifecycle = vi.hoisted(() => ({ events: [] as Array<{ type: string; seq: n
 const rpc = vi.hoisted(() => ({
   handler: (async () => ({})) as (method: string) => Promise<unknown>,
   calls: [] as string[],
+  /** Per-call `options` argument, parallel to `calls`. */
+  options: [] as Array<{ timeoutMs?: number } | undefined>,
 }));
 
 vi.mock('../json-rpc-client', () => {
@@ -69,8 +71,9 @@ vi.mock('../json-rpc-client', () => {
     dispose(): void {
       lifecycle.events.push({ type: 'dispose', seq: this.id });
     }
-    request = vi.fn(async (method: string) => {
+    request = vi.fn(async (method: string, _params?: unknown, options?: { timeoutMs?: number }) => {
       rpc.calls.push(method);
+      rpc.options.push(options);
       return rpc.handler(method);
     });
     registerMethod(): () => void {
@@ -174,7 +177,9 @@ vi.mock('../connections-store', () => ({
 // removed-by-sync seams captured so a re-join / remote forget can be
 // simulated against the pool.
 const guestStore = vi.hoisted(() => ({
+  list: vi.fn(),
   findById: vi.fn(),
+  forget: vi.fn(),
   getDecryptedToken: vi.fn(),
   setTcAddress: vi.fn(),
   setHosts: vi.fn(),
@@ -182,8 +187,9 @@ const guestStore = vi.hoisted(() => ({
   removedListeners: [] as Array<(id: string) => void>,
 }));
 vi.mock('../guest-sessions-store', () => ({
-  list: vi.fn(async () => []),
+  list: guestStore.list,
   findById: guestStore.findById,
+  forget: guestStore.forget,
   getDecryptedToken: guestStore.getDecryptedToken,
   setHostname: vi.fn(async () => false),
   setTcAddress: guestStore.setTcAddress,
@@ -360,6 +366,7 @@ beforeEach(() => {
   lifecycle.events = [];
   rpc.handler = async () => ({});
   rpc.calls = [];
+  rpc.options = [];
   // Sensible defaults; individual tests override.
   store.getActiveId.mockResolvedValue('local');
   store.list.mockResolvedValue([LOCAL, REMOTE]);
@@ -369,7 +376,9 @@ beforeEach(() => {
   store.setDaemonVersion.mockResolvedValue(false);
   store.setHosts.mockResolvedValue(undefined);
   store.getDetectHosts.mockResolvedValue(true);
+  guestStore.list.mockResolvedValue([]);
   guestStore.findById.mockResolvedValue(null);
+  guestStore.forget.mockResolvedValue(true);
   guestStore.getDecryptedToken.mockResolvedValue(null);
   guestStore.setTcAddress.mockResolvedValue(false);
   guestStore.setHosts.mockResolvedValue(false);
@@ -4127,5 +4136,134 @@ describe('per-window backend IPC routing', () => {
         }),
       }),
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Guest sessions IPC (multiplayer w4): token-free list + Leave host
+// ---------------------------------------------------------------------------
+
+describe('guest-sessions:* IPC handlers', () => {
+  function installGuest() {
+    guestStore.list.mockResolvedValue([GUEST]);
+    guestStore.findById.mockImplementation(async (id: string) => (id === GUEST.id ? GUEST : null));
+    guestStore.getDecryptedToken.mockResolvedValue('guest-token-v1');
+  }
+
+  it('guest-sessions:list reports the sessions whose pooled client is connected', async () => {
+    installGuest();
+    const { mod } = await loadModule();
+    const guest = (await mod.connectBackendClient(GUEST.id)) as unknown as { status: string };
+    mod.registerBackendHandlers();
+    const handler = findHandler('guest-sessions:list')!;
+
+    await expect(handler({}, undefined)).resolves.toEqual({ sessions: [GUEST], connectedIds: [] });
+    guest.status = 'connected';
+    await expect(handler({}, undefined)).resolves.toEqual({
+      sessions: [GUEST],
+      connectedIds: [GUEST.id],
+    });
+  });
+
+  it('re-broadcasts guest-sessions:changed when a guest pooled client connects or drops', async () => {
+    installGuest();
+    const send = installWindow();
+    const { mod } = await loadModule();
+    const guest = (await mod.connectBackendClient(GUEST.id)) as unknown as {
+      status: string;
+      emit(event: string, arg: unknown): void;
+    };
+    mod.registerBackendHandlers();
+
+    guest.status = 'connected';
+    guest.emit('status', 'connected');
+    await vi.waitFor(() => {
+      const changed = send.mock.calls.filter(([c]) => c === 'guest-sessions:changed');
+      expect(changed.at(-1)?.[1]).toEqual({ sessions: [GUEST], connectedIds: [GUEST.id] });
+    });
+
+    guest.status = 'disconnected';
+    guest.emit('status', 'disconnected');
+    await vi.waitFor(() => {
+      const changed = send.mock.calls.filter(([c]) => c === 'guest-sessions:changed');
+      expect(changed.at(-1)?.[1]).toEqual({ sessions: [GUEST], connectedIds: [] });
+    });
+  });
+
+  it('a paired (owner) backend status change does not broadcast guest-sessions:changed', async () => {
+    const send = installWindow();
+    const { mod } = await loadModule();
+    const remote = (await mod.connectBackendClient('remote-1')) as unknown as {
+      status: string;
+      emit(event: string, arg: unknown): void;
+    };
+    mod.registerBackendHandlers();
+    remote.status = 'connected';
+    remote.emit('status', 'connected');
+    await vi.waitFor(() => {
+      expect(send.mock.calls.some(([c]) => c === 'connections:changed')).toBe(true);
+    });
+    expect(send.mock.calls.some(([c]) => c === 'guest-sessions:changed')).toBe(false);
+  });
+
+  it('guest-sessions:leave revokes on the host (5 s bound), forgets locally, then tears the host windows down', async () => {
+    installGuest();
+    const { mod, ensureLocalWindowBeforeClose, closeForBackend } = await loadModule();
+    const guest = (await mod.connectBackendClient(GUEST.id)) as unknown as { status: string };
+    guest.status = 'connected';
+    mod.registerBackendHandlers();
+    const handler = findHandler('guest-sessions:leave')!;
+
+    await expect(handler({}, { id: GUEST.id })).resolves.toEqual({ id: GUEST.id, revoked: true });
+    const revokeIndex = rpc.calls.indexOf('principal.revokeSelf');
+    expect(revokeIndex).toBeGreaterThanOrEqual(0);
+    expect(rpc.options[revokeIndex]).toEqual({ timeoutMs: mod.GUEST_REVOKE_SELF_TIMEOUT_MS });
+    expect(mod.GUEST_REVOKE_SELF_TIMEOUT_MS).toBe(5000);
+    expect(guestStore.forget).toHaveBeenCalledWith(GUEST.id);
+    expect(ensureLocalWindowBeforeClose).toHaveBeenCalledWith(GUEST.id);
+    expect(closeForBackend).toHaveBeenCalledWith(GUEST.id);
+    expect(mod.getBackendClientForConnection(GUEST.id)).toBeUndefined();
+    // The paired-backend registry is never touched by a guest leave.
+    expect(store.forget).not.toHaveBeenCalled();
+  });
+
+  it('guest-sessions:leave still deletes locally when principal.revokeSelf fails', async () => {
+    installGuest();
+    rpc.handler = async (method) => {
+      if (method === 'principal.revokeSelf') throw new Error('host unreachable');
+      return {};
+    };
+    const { mod, closeForBackend } = await loadModule();
+    const guest = (await mod.connectBackendClient(GUEST.id)) as unknown as { status: string };
+    guest.status = 'connected';
+    mod.registerBackendHandlers();
+    const handler = findHandler('guest-sessions:leave')!;
+
+    await expect(handler({}, { id: GUEST.id })).resolves.toEqual({ id: GUEST.id, revoked: false });
+    expect(rpc.calls).toContain('principal.revokeSelf');
+    expect(guestStore.forget).toHaveBeenCalledWith(GUEST.id);
+    expect(closeForBackend).toHaveBeenCalledWith(GUEST.id);
+  });
+
+  it('guest-sessions:leave skips the revoke when no pooled client is connected', async () => {
+    installGuest();
+    const { mod, closeForBackend } = await loadModule();
+    mod.registerBackendHandlers();
+    const handler = findHandler('guest-sessions:leave')!;
+
+    await expect(handler({}, { id: GUEST.id })).resolves.toEqual({ id: GUEST.id, revoked: false });
+    expect(rpc.calls).not.toContain('principal.revokeSelf');
+    expect(guestStore.forget).toHaveBeenCalledWith(GUEST.id);
+    expect(closeForBackend).toHaveBeenCalledWith(GUEST.id);
+  });
+
+  it('guest-sessions:leave rejects an unknown id before touching any store', async () => {
+    const { mod, closeForBackend } = await loadModule();
+    mod.registerBackendHandlers();
+    const handler = findHandler('guest-sessions:leave')!;
+
+    await expect(handler({}, { id: 'guest-unknown' })).rejects.toThrow(/unknown guest session/i);
+    expect(guestStore.forget).not.toHaveBeenCalled();
+    expect(closeForBackend).not.toHaveBeenCalled();
   });
 });
