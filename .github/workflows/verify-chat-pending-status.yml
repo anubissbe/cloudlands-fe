@@ -44,10 +44,10 @@ jobs:
       - name: Checkout exact PR source
         uses: actions/checkout@v7
         with:
-          ref: f316f6c2b196f4487cbdb749a917cc7b640c8d3b
+          ref: a8d95eccdff7c43e262c48f08727f11b2013dbe5
           persist-credentials: false
       - name: Verify source identity
-        run: test "$(git rev-parse HEAD)" = f316f6c2b196f4487cbdb749a917cc7b640c8d3b
+        run: test "$(git rev-parse HEAD)" = a8d95eccdff7c43e262c48f08727f11b2013dbe5
       - name: Setup pnpm
         uses: pnpm/action-setup@v6
         with:
@@ -78,7 +78,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: chat-queue-repair-f316f6c2-${{ matrix.pass }}
+          name: chat-queue-repair-a8d95ecc-${{ matrix.pass }}
           path: |
             playwright-report/
             test-results/
