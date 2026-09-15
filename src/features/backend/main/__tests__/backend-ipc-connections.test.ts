@@ -96,6 +96,9 @@ vi.mock('../json-rpc-client', () => {
     getReconnectAttempts(): number {
       return 0;
     }
+    isConnectionLimited(): boolean {
+      return false;
+    }
   }
   return { JsonRpcClient: FakeJsonRpcClient };
 });
