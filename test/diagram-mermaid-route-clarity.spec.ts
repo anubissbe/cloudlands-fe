@@ -1597,6 +1597,65 @@ for (const appearance of appearances) {
   }
 }
 
+test('custom multiline edge labels keep their three-line clamp and full tooltip', async ({
+  page,
+}) => {
+  const params = new URLSearchParams({
+    state: 'custom-disconnected-extremes',
+    theme: 'light',
+    width: '320',
+    motion: 'reduced',
+  });
+  await page.goto(`${baseUrl}/sandbox/diagram-workbench?${params}`);
+  await page.locator('[data-preview-ready="true"]').waitFor();
+  const root = page.locator('#custom-disconnected-extremes .diagram-renderer');
+  await expect(root).toHaveAttribute('data-diagram-settled', 'true');
+  await page.evaluate(() => document.fonts.ready);
+
+  const truncated = root.locator('.edge-label-container[data-truncated="true"]').first();
+  await expect(truncated).toBeVisible();
+  const metrics = await truncated.evaluate((foreignObject) => {
+    const label = foreignObject.querySelector<HTMLElement>('.edge-label-html')!;
+    const text = label.querySelector<HTMLElement>('.edge-label-text')!;
+    const style = getComputedStyle(label);
+    const oracle = document.createElement('div');
+    Object.assign(oracle.style, {
+      position: 'absolute',
+      visibility: 'hidden',
+      width: `${(foreignObject as SVGForeignObjectElement).width.baseVal.value}px`,
+      boxSizing: 'border-box',
+      padding: style.padding,
+      fontFamily: style.fontFamily,
+      fontSize: style.fontSize,
+      fontWeight: style.fontWeight,
+      lineHeight: style.lineHeight,
+      letterSpacing: style.letterSpacing,
+      whiteSpace: 'pre-line',
+      overflowWrap: 'normal',
+      wordBreak: 'normal',
+    });
+    oracle.textContent = text.textContent;
+    document.body.append(oracle);
+    const padding = Number.parseFloat(style.paddingTop) + Number.parseFloat(style.paddingBottom);
+    const lineHeight = Number.parseFloat(style.lineHeight);
+    const naturalLines = Math.round((oracle.getBoundingClientRect().height - padding) / lineHeight);
+    oracle.remove();
+    return {
+      fullText: text.textContent!,
+      accessibleText: label.getAttribute('aria-label'),
+      naturalLines,
+      renderedHeight: (foreignObject as SVGForeignObjectElement).height.baseVal.value,
+      expectedHeight: 3 * lineHeight + padding,
+    };
+  });
+  expect(metrics.naturalLines).toBeGreaterThan(3);
+  expect(metrics.renderedHeight).toBeCloseTo(metrics.expectedHeight, 1);
+  expect(metrics.accessibleText).toBe(metrics.fullText);
+
+  await truncated.locator('.edge-label-html').hover();
+  await expect(page.getByRole('tooltip')).toContainText(metrics.fullText);
+});
+
 test('keeps topology routes cardinal across live theme changes', async ({ page }) => {
   test.setTimeout(120_000);
   await openDiagram(page, 'mermaid-topology-stress', 960, appearances[0]);
@@ -1717,8 +1776,9 @@ for (const appearance of appearances) {
             '.diagram-node-html:not(.node-state-highlighted)',
           )!;
           const label = renderer.querySelector<HTMLElement>('.edge-label-html')!;
+          const text = label.querySelector<HTMLElement>('.edge-label-text')!;
           const labelRange = document.createRange();
-          labelRange.selectNodeContents(label);
+          labelRange.selectNodeContents(text);
           const labelBounds = label.getBoundingClientRect();
           const textBounds = labelRange.getBoundingClientRect();
           const edge = renderer.querySelector<SVGPathElement>('.edge-path')!;
@@ -1732,7 +1792,6 @@ for (const appearance of appearances) {
           const svg = renderer.querySelector<SVGSVGElement>('.diagram-svg-layer')!;
           const matrix = svg.getScreenCTM()!;
           const scale = Math.hypot(matrix.a, matrix.b);
-          const text = label.querySelector<HTMLElement>('.edge-label-text')!;
           const foreignObject = label.closest('foreignObject')!;
           const measurePadding = () => {
             const bounds = label.getBoundingClientRect();
@@ -1873,6 +1932,29 @@ for (const appearance of appearances) {
       // with text overflow unclipped as an independent check that no glyphs are lost.
       const label = root.locator('.edge-label-html').first();
       const text = label.locator('.edge-label-text');
+      const geometry = () =>
+        text.evaluate((element) => {
+          const label = element.closest<HTMLElement>('.edge-label-html')!;
+          const foreignObject = label.closest('foreignObject')!;
+          const rect = (item: Element) => {
+            const bounds = item.getBoundingClientRect();
+            return { x: bounds.x, y: bounds.y, width: bounds.width, height: bounds.height };
+          };
+          const range = document.createRange();
+          range.selectNodeContents(element);
+          const rangeBounds = range.getBoundingClientRect();
+          return {
+            label: rect(label),
+            foreignObject: rect(foreignObject),
+            range: {
+              x: rangeBounds.x,
+              y: rangeBounds.y,
+              width: rangeBounds.width,
+              height: rangeBounds.height,
+            },
+          };
+        });
+      const allowedGeometry = await geometry();
       const clipped = await label.screenshot();
       const originalStyle = await text.evaluate((element) => {
         const style = element.getAttribute('style');
@@ -1894,6 +1976,51 @@ for (const appearance of appearances) {
           if (style === null) element.removeAttribute('style');
           else element.setAttribute('style', style);
         }, originalStyle);
+      }
+      if (width === 960 && appearance.name === 'light') {
+        const originalAllowanceStyle = await text.evaluate((element) => {
+          const style = element.getAttribute('style');
+          element.style.marginInline = '0px';
+          element.style.paddingInline = '0px';
+          return style;
+        });
+        try {
+          const removedGeometry = await geometry();
+          const removedHidden = await label.screenshot();
+          await text.evaluate((element) => {
+            element.style.overflow = 'visible';
+          });
+          const removedVisible = await label.screenshot();
+          await testInfo.attach('custom-label-allowance-geometry', {
+            body: JSON.stringify({ allowed: allowedGeometry, removed: removedGeometry }, null, 2),
+            contentType: 'application/json',
+          });
+          await testInfo.attach('custom-label-allowance-removed-hidden', {
+            body: removedHidden,
+            contentType: 'image/png',
+          });
+          await testInfo.attach('custom-label-allowance-removed-visible', {
+            body: removedVisible,
+            contentType: 'image/png',
+          });
+          expect(
+            removedHidden.equals(removedVisible),
+            'Removing allowance must restore clipping',
+          ).toBe(false);
+          expect(removedGeometry.label).toEqual(allowedGeometry.label);
+          expect(removedGeometry.foreignObject).toEqual(allowedGeometry.foreignObject);
+          expect(removedGeometry.range).toEqual(allowedGeometry.range);
+        } finally {
+          await text.evaluate((element, style) => {
+            if (style === null) element.removeAttribute('style');
+            else element.setAttribute('style', style);
+          }, originalAllowanceStyle);
+        }
+        expect(await geometry()).toEqual(allowedGeometry);
+        expect(
+          (await label.screenshot()).equals(clipped),
+          'Allowance restoration must be exact',
+        ).toBe(true);
       }
       await page.locator('.catalog-topbar').evaluate((toolbar) => {
         toolbar.style.visibility = 'hidden';

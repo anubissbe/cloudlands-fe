@@ -2149,6 +2149,8 @@
     position: relative;
     z-index: 1;
     display: -webkit-box;
+    margin-inline: -1px;
+    padding-inline: 1px;
     overflow: hidden;
     white-space: pre-line;
     -webkit-box-orient: vertical;
