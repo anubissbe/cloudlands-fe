@@ -41,6 +41,7 @@ describe('MermaidRenderer theme updates', () => {
 
   afterEach(() => {
     cleanup();
+    vi.unstubAllGlobals();
     for (const name of Object.keys(tokens)) {
       document.documentElement.style.removeProperty(name);
     }
@@ -76,6 +77,23 @@ describe('MermaidRenderer theme updates', () => {
     await waitFor(() => expect(mermaidMocks.initialize).toHaveBeenCalledOnce());
     expect(mermaidMocks.initialize.mock.calls[0]?.[0].htmlLabels).toBe(false);
   });
+
+  it.each(['LR', 'RL', 'TB', 'TD', 'BT'])(
+    'passes authored %s source unchanged to Mermaid in a compact host',
+    async (direction) => {
+      vi.stubGlobal(
+        'ResizeObserver',
+        class {
+          observe() {}
+          disconnect() {}
+        },
+      );
+      const code = `flowchart ${direction}\n  A[Workspace tab] --> B[Remembered machine]`;
+      render(MermaidRenderer, { code });
+      await waitFor(() => expect(mermaidMocks.render).toHaveBeenCalledOnce());
+      expect(mermaidMocks.render.mock.calls[0]?.[1]).toBe(code);
+    },
+  );
 
   it('defaults state diagrams to a vertical topology without overriding an explicit one', async () => {
     const { rerender } = render(MermaidRenderer, {

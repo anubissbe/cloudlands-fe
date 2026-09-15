@@ -154,11 +154,7 @@
   }
 
   function applyResponsiveLayout(source: string): string {
-    if (!compactLayout) return source;
-    const verticalSource = /\bsubgraph\b/.test(source)
-      ? source
-      : source.replace(/^(\s*(?:flowchart|graph)\s+)(?:LR|RL)\b/m, '$1TB');
-    if (!narrowLayout || !/^\s*sequenceDiagram\b/m.test(verticalSource)) return verticalSource;
+    if (!compactLayout || !narrowLayout || !/^\s*sequenceDiagram\b/m.test(source)) return source;
     return `---
 config:
   sequence:
@@ -169,7 +165,7 @@ config:
     width: 96
     wrap: true
 ---
-${verticalSource}`;
+${source}`;
   }
 
   // Decode HTML entities that may have been escaped (legacy support)
@@ -613,6 +609,54 @@ ${verticalSource}`;
       if (y >= threshold) rect.setAttribute('y', String(y + amount));
       else if (y + height >= threshold) rect.setAttribute('height', String(height + amount));
     }
+    // Self-message curves and construct tabs are not line/rect geometry. Move
+    // their existing paint too, but never touch marker definitions or actor icons.
+    for (const element of svg.querySelectorAll<SVGGraphicsElement>('path, polygon, polyline')) {
+      if (element.ownerSVGElement !== svg || element.closest('defs, marker')) continue;
+      const matrix = element.transform.baseVal.consolidate()?.matrix;
+      const y = element.getBBox().y + (matrix?.f ?? 0);
+      if (y < threshold) continue;
+      const translate = svg.createSVGTransform();
+      translate.setTranslate(0, amount);
+      element.transform.baseVal.insertItemBefore(translate, 0);
+    }
+  }
+
+  function reserveSequenceNoteClearance(svg: SVGSVGElement, notes: SVGRectElement[]) {
+    const messages = [
+      ...svg.querySelectorAll<SVGLineElement>(
+        ':scope > line.messageLine0, :scope > line.messageLine1',
+      ),
+    ].filter((line) => line.y1.baseVal.value === line.y2.baseVal.value);
+    if (messages.length === 0) return;
+    for (const note of notes) {
+      const top = note.y.baseVal.value;
+      const preceding = messages
+        .filter((line) => line.y1.baseVal.value < top)
+        .sort((a, b) => b.y1.baseVal.value - a.y1.baseVal.value)[0];
+      if (!preceding) continue;
+      const strokeWidth = Number.parseFloat(getComputedStyle(preceding).strokeWidth) || 0;
+      let extent = strokeWidth / 2;
+      for (const attribute of ['marker-start', 'marker-end']) {
+        const id = preceding.getAttribute(attribute)?.match(/#([^)'"\s]+)/)?.[1];
+        const marker = id
+          ? svg.querySelector<SVGMarkerElement>(`marker[id="${CSS.escape(id)}"]`)
+          : null;
+        if (!marker) continue;
+        const height = marker.viewBox.baseVal.height || marker.markerHeight.baseVal.value;
+        const scale = marker.markerHeight.baseVal.value / height;
+        const units =
+          marker.markerUnits.baseVal === SVGMarkerElement.SVG_MARKERUNITS_STROKEWIDTH
+            ? strokeWidth
+            : 1;
+        // The marker viewport contains its painted stroke. Taking both sides
+        // handles leftward and rightward horizontal replies without ID heuristics.
+        const referenceY = marker.refY.baseVal.value - marker.viewBox.baseVal.y;
+        extent = Math.max(extent, Math.max(referenceY, height - referenceY) * scale * units);
+      }
+      const shortfall = preceding.y1.baseVal.value + extent + SEQUENCE_MESSAGE_INSET - top;
+      if (shortfall > 0) shiftSequenceGeometryAfter(svg, top, shortfall);
+    }
   }
 
   function insetSequenceMessageLabels(svg: SVGSVGElement, actorCenters: number[]) {
@@ -909,6 +953,10 @@ ${verticalSource}`;
       note.setAttribute('rx', '6');
     }
 
+    reserveSequenceNoteClearance(
+      svg,
+      notes.map(({ note }) => note),
+    );
     const finalBounds = svg.getBBox();
     const finalX = Math.min(originalViewBox.x, Math.floor(finalBounds.x));
     const finalRight = Math.max(
@@ -1266,6 +1314,9 @@ ${verticalSource}`;
     refineMermaidCylinderNodes(svg);
     repairFlowchartNodeOutlines(svg);
     const flowchart = svg.getAttribute('aria-roledescription') === 'flowchart-v2';
+    if (flowchart)
+      svg.dataset.flowchartDirection =
+        source.match(/^\s*(?:flowchart|graph)\s+(\w+)\b/m)?.[1] ?? '';
     const rendererWidth = rendererElement?.clientWidth ?? 0;
     const compactRendererLayout = rendererWidth > 0 ? rendererWidth <= 620 : compactLayout;
     if (flowchart && !compactRendererLayout && svg.querySelectorAll('g.cluster').length >= 2) {
@@ -1277,8 +1328,12 @@ ${verticalSource}`;
         : svg.getBBox();
     const captionSize = Number.parseFloat(getComputedStyle(svg).fontSize);
     const readableScale = 12 / (Number.isFinite(captionSize) ? captionSize : 13);
+    // Compact reflow stacks nodes downward, so it cannot preserve horizontal or
+    // bottom-up intent. Keep those layouts readable through natural scrolling.
+    const preservesCompactDirection = !/^\s*(?:flowchart|graph)\s+(?:LR|RL|BT)\b/m.test(source);
     const compactFlowchartLayout =
-      compactRendererLayout || (flowchart && initialBounds.width * readableScale > rendererWidth);
+      preservesCompactDirection &&
+      (compactRendererLayout || (flowchart && initialBounds.width * readableScale > rendererWidth));
     if (compactFlowchartLayout) {
       reflowCompactFlowchart(svg, false);
       reflowCompactFlowchart(svg);
@@ -1444,7 +1499,10 @@ ${verticalSource}`;
       svg.setAttribute('height', String(height));
       setReadableMermaidWidth(svg, width);
     }
-    if (normalizedState || (compactFlowchartLayout && flowchart && !groupedFlowchart)) {
+    if (
+      normalizedState ||
+      (compactFlowchartLayout && flowchart && !groupedFlowchart && !svg.dataset.decisionCycleLayout)
+    ) {
       svg.style.setProperty('--mermaid-readable-width', '0px');
       svg.style.setProperty('max-width', '100%');
     }

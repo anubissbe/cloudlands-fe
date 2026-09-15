@@ -17,10 +17,13 @@ import {
   chooseClearStateEntryRoute,
   diamondBoundaryPort,
   diamondRayIntersection,
+  expandFlowchartFeedbackLane,
+  findFlowchartDecisionCycle,
   measuredClusterHeaderHeight,
   preferClearStraightRoute,
   replacePathTerminal,
   routeOrthogonalAroundObstacles,
+  roundOrthogonalBends,
   separateFlowchartVerticalLane,
   simplifyOrthogonalPoints,
   snapOrthogonalTerminals,
@@ -65,6 +68,114 @@ function expectRouteAvoids(points: TestPoint[], bounds: TestBounds) {
 }
 
 describe('Mermaid path terminal geometry', () => {
+  describe('decision-cycle topology', () => {
+    const edges = [
+      { source: 'receive', target: 'gate' },
+      { source: 'gate', target: 'hold' },
+      { source: 'hold', target: 'gate' },
+      { source: 'gate', target: 'apply' },
+      { source: 'apply', target: 'finish' },
+    ];
+
+    it('identifies the continuation independently of edge order, names or labels', () => {
+      expect(findFlowchartDecisionCycle([...edges].reverse(), ['gate'])).toEqual({
+        decision: 'gate',
+        retry: 'hold',
+        spine: ['receive', 'gate', 'apply', 'finish'],
+      });
+      const rename = (id: string) => `unrelated_${id.length}_${id}`;
+      expect(
+        findFlowchartDecisionCycle(
+          edges.map(({ source, target }) => ({
+            source: rename(source),
+            target: rename(target),
+          })),
+          [rename('gate')],
+        )?.spine,
+      ).toEqual(['receive', 'gate', 'apply', 'finish'].map(rename));
+    });
+
+    it('rejects a work branch which also joins the continuation', () => {
+      expect(
+        findFlowchartDecisionCycle([...edges, { source: 'hold', target: 'apply' }], ['gate']),
+      ).toBeNull();
+    });
+
+    it('rejects ambiguous cycles and disconnected topology', () => {
+      expect(
+        findFlowchartDecisionCycle([...edges, { source: 'apply', target: 'gate' }], ['gate']),
+      ).toBeNull();
+      expect(
+        findFlowchartDecisionCycle(
+          [...edges, { source: 'elsewhere', target: 'elsewhere' }],
+          ['gate'],
+        ),
+      ).toBeNull();
+      expect(findFlowchartDecisionCycle(edges, ['gate', 'apply'])).toBeNull();
+    });
+
+    it('uses authored direction and rejects a missing return edge', () => {
+      expect(
+        findFlowchartDecisionCycle(
+          edges.filter((edge) => edge.source !== 'hold'),
+          ['gate'],
+        ),
+      ).toBeNull();
+      expect(
+        findFlowchartDecisionCycle(
+          edges.map(({ source, target }) => ({ source: target, target: source })),
+          ['gate'],
+        ),
+      ).toEqual({
+        decision: 'gate',
+        retry: 'hold',
+        spine: ['finish', 'apply', 'gate', 'receive'],
+      });
+    });
+  });
+
+  describe('final outer feedback envelope', () => {
+    const points = [
+      { x: 40, y: 400 },
+      { x: 80, y: 400 },
+      { x: 80, y: 500 },
+      { x: -70, y: 500 },
+      { x: -70, y: -12 },
+      { x: 0, y: -12 },
+      { x: 0, y: 0 },
+    ];
+
+    it('expands past a later annotate corridor without moving ports or shelves', () => {
+      const occupied = [{ x: -90, y: 150, width: 120, height: 150 }];
+      const result = expandFlowchartFeedbackLane(points, occupied);
+      expectOrthogonalRoute(result);
+      expect(result[3].x).toBeLessThanOrEqual(occupied[0].x - 20);
+      expect(result[4].x).toBe(result[3].x);
+      for (const index of [0, 1, 2, 5, 6]) expect(result[index]).toEqual(points[index]);
+      expectRouteAvoids(result, occupied[0]);
+      expect(expandFlowchartFeedbackLane(result, occupied)).toBe(result);
+    });
+
+    it('includes protruding labels but ignores vertically disjoint corridors', () => {
+      const result = expandFlowchartFeedbackLane(points, [
+        { x: -95, y: 200, width: 30, height: 20 },
+        { x: -200, y: 550, width: 60, height: 100 },
+      ]);
+      expect(result[3].x).toBe(-115);
+      expectOrthogonalRoute(result);
+    });
+
+    it('leaves a sufficiently external lane and other route shapes unchanged', () => {
+      expect(
+        expandFlowchartFeedbackLane(points, [{ x: -40, y: 100, width: 80, height: 100 }]),
+      ).toBe(points);
+      const local = points.slice(0, 4);
+      expect(
+        expandFlowchartFeedbackLane(local, [{ x: -100, y: 100, width: 80, height: 100 }]),
+      ).toBe(local);
+    });
+  });
+
   describe('adjacent feedback lane clearance', () => {
     const points = [
       { x: 20, y: 40 },
@@ -714,6 +825,48 @@ describe('Mermaid path terminal geometry', () => {
         { x: 40, y: 30 },
       ]),
     ).toBe('M 0 0 L 34 0 Q 40 0 40 6 L 40 30');
+  });
+
+  it.each(['edgePaths', 'transitions'])(
+    'rounds %s state connectors with the shared inset',
+    (containerClass) => {
+      const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+      svg.classList.add('statediagram');
+      svg.innerHTML = `<g class="${containerClass}"><path class="transition" data-edge="true" d="M 0 0 L 40 0 L 40 30" /></g>`;
+      roundOrthogonalBends(svg);
+      const path = svg.querySelector('path')!;
+      // Numeric geometry: original endpoints, tangent points six units from the
+      // corner, and the corner itself as the quadratic control point.
+      expect(
+        path
+          .getAttribute('d')!
+          .match(/-?\d+(?:\.\d+)?/g)!
+          .map(Number),
+      ).toEqual([0, 0, 34, 0, 40, 0, 40, 6, 40, 30]);
+      const rounded = path.getAttribute('d');
+      roundOrthogonalBends(svg);
+      expect(path.getAttribute('d')).toBe(rounded);
+    },
+  );
+
+  it('clamps adjacent short bends without moving endpoints or doubling back', () => {
+    const rounded = buildRoundedOrthogonalPath([
+      { x: 0, y: 0 },
+      { x: 30, y: 0 },
+      { x: 30, y: 4 },
+      { x: 60, y: 4 },
+    ]);
+    expect(rounded.match(/-?\d+(?:\.\d+)?/g)!.map(Number)).toEqual([
+      0, 0, 28, 0, 30, 0, 30, 2, 30, 2, 30, 4, 32, 4, 60, 4,
+    ]);
+  });
+
+  it('keeps collinear state routes straight', () => {
+    const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    svg.classList.add('statediagram');
+    svg.innerHTML = '<path class="transition" data-edge="true" d="M 8 12 L 8 32 L 8 52" />';
+    roundOrthogonalBends(svg);
+    expect(svg.querySelector('path')!.getAttribute('d')).toBe('M 8 12 L 8 32 L 8 52');
   });
 
   it('detours orthogonal routes outside unrelated node clearance', () => {

@@ -25,7 +25,7 @@ async function openMenu() {
 beforeEach(() => {
   vi.mocked(copyDiagramImage).mockResolvedValue();
   vi.mocked(copyDiagramSvg).mockResolvedValue();
-  vi.mocked(downloadDiagramSvg).mockImplementation(() => {});
+  vi.mocked(downloadDiagramSvg).mockResolvedValue();
 });
 
 afterEach(() => {
@@ -56,14 +56,12 @@ describe('DiagramActionsMenu', () => {
     await openMenu();
     await fireEvent.click(screen.getByRole('menuitem', { name: 'Download SVG' }));
     expect(downloadDiagramSvg).toHaveBeenCalledWith(container, 'Architecture');
-    expect(toast.success).toHaveBeenCalledWith('SVG downloaded');
+    await waitFor(() => expect(toast.success).toHaveBeenCalledWith('SVG downloaded'));
   });
 
   it('shows localized feedback when clipboard and download actions fail', async () => {
     vi.mocked(copyDiagramImage).mockRejectedValueOnce(new Error('clipboard denied'));
-    vi.mocked(downloadDiagramSvg).mockImplementationOnce(() => {
-      throw new Error('download denied');
-    });
+    vi.mocked(downloadDiagramSvg).mockRejectedValueOnce(new Error('download denied'));
     render(DiagramActionsMenu, { props: { container: document.createElement('div') } });
 
     await openMenu();
@@ -72,6 +70,6 @@ describe('DiagramActionsMenu', () => {
 
     await openMenu();
     await fireEvent.click(screen.getByRole('menuitem', { name: 'Download SVG' }));
-    expect(toast.error).toHaveBeenCalledWith('Could not download the diagram');
+    await waitFor(() => expect(toast.error).toHaveBeenCalledWith('Could not download the diagram'));
   });
 });

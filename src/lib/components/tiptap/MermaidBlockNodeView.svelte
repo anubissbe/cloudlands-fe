@@ -9,6 +9,8 @@
   import { tick } from 'svelte';
   import { selectIsDarkTheme } from '$store/renderer/slices/theme/theme-selectors';
   import DiagramPresentation from '$lib/components/diagrams/DiagramPresentation.svelte';
+  import { serializeDiagramSvg } from '$lib/components/diagrams/diagram-export';
+  import { toast } from '$lib/components/ui/toast';
   import MermaidRenderer, {
     type MermaidRenderState,
   } from '$lib/components/markdown/MermaidRenderer.svelte';
@@ -70,17 +72,21 @@
     // Prevent the click from propagating to ProseMirror selection handling
     e.stopPropagation();
     e.preventDefault();
+    try {
+      if (!diagramContainerEl) throw new Error('Diagram container is unavailable');
+      // eslint-disable-next-line intent/no-component-async-data-fetch -- synchronous DOM snapshot; this export helper does not fetch domain data
+      fullscreenSvg = serializeDiagramSvg(diagramContainerEl);
+    } catch {
+      fullscreenSvg = '';
+      toast.error(m.markdown_mermaid_renderFailed_error());
+      return;
+    }
     fullscreenOpenerElement = e.currentTarget as HTMLElement;
     // Blur any focused element (including TipTap editor) to avoid RangeError
     if (document.activeElement instanceof HTMLElement) {
       document.activeElement.blur();
     }
 
-    // Grab the rendered SVG from the diagram container
-    const svgEl = diagramContainerEl?.querySelector('.mermaid-svg svg, .mermaid-renderer svg');
-    if (svgEl) {
-      fullscreenSvg = svgEl.outerHTML;
-    }
     isFullscreen = true;
   }
 

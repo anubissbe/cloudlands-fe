@@ -229,6 +229,20 @@ export function buildGroupedReturnLanePoints(
   ];
 }
 
+/** Keep the dedicated outer return outside corridors chosen by later repairs. */
+export function expandFlowchartFeedbackLane(points: Point[], occupied: Bounds[]): Point[] {
+  if (points.length !== 7 || points[3].x !== points[4].x || points[3].y <= points[4].y)
+    return points;
+  const left = Math.min(
+    points[3].x,
+    ...occupied
+      .filter((bounds) => bounds.y < points[3].y && bounds.y + bounds.height > points[4].y)
+      .map((bounds) => bounds.x - 20),
+  );
+  if (left === points[3].x) return points;
+  return points.map((point, index) => (index === 3 || index === 4 ? { ...point, x: left } : point));
+}
+
 function boundsOverlap(left: Bounds, right: Bounds, padding = 4) {
   return (
     left.x < right.x + right.width + padding &&
@@ -891,24 +905,20 @@ export function buildRoundedOrthogonalPath(
 }
 
 export function roundOrthogonalBends(svg: SVGSVGElement) {
-  const cornerRadius = svg.classList.contains('statediagram') ? 2 : ORTHOGONAL_CORNER_RADIUS;
   for (const path of svg.querySelectorAll<SVGPathElement>(
-    '.flowchart-link, .edgePaths path, path.relation',
+    '.flowchart-link, .edgePaths path, path.relation, path.transition[data-edge="true"]',
   )) {
     const points = parseOrthogonalLinePath(path.getAttribute('d') ?? '');
     if (!points) continue;
     const simplified = simplifyOrthogonalPoints(points);
     path.dataset.manhattanPoints ??= simplified.map((point) => `${point.x},${point.y}`).join(' ');
-    const rounded = buildRoundedOrthogonalPath(simplified, cornerRadius);
+    const rounded = buildRoundedOrthogonalPath(simplified);
     if (!path.dataset.feedbackLane) {
       path.dataset.manhattanSegments = String(Math.max(0, simplified.length - 1));
     }
     if (!rounded.includes(' Q ')) continue;
     path.setAttribute('d', rounded);
     path.dataset.cornerRadius = String(ORTHOGONAL_CORNER_RADIUS);
-    if (cornerRadius !== ORTHOGONAL_CORNER_RADIUS) {
-      path.dataset.cornerRadius = String(cornerRadius);
-    }
   }
 }
 
@@ -1552,7 +1562,12 @@ export function snapFlowchartFeedbackPorts(svg: SVGSVGElement) {
 
 export function snapFlowchartFanoutPorts(svg: SVGSVGElement) {
   const edges = [...svg.querySelectorAll<SVGPathElement>('.edgePaths path')].flatMap((path) => {
-    if (path.dataset.clusterHeaderClearance || path.dataset.nestedDecisionRoute) return [];
+    if (
+      path.dataset.clusterHeaderClearance ||
+      path.dataset.nestedDecisionRoute ||
+      path.dataset.decisionCycleRoute
+    )
+      return [];
     const identity = flowchartEdgeIdentity(path);
     const points = (path.dataset.manhattanPoints ?? '')
       .trim()
@@ -1777,6 +1792,7 @@ export function snapFlowchartPorts(svg: SVGSVGElement) {
       path.dataset.clientRequestLane ||
       path.dataset.clusterHeaderClearance ||
       path.dataset.compactGroupedRoute ||
+      path.dataset.decisionCycleRoute ||
       path.dataset.nestedDecisionRoute
     )
       continue;
@@ -2239,6 +2255,7 @@ export function repairFlowchartRouteClearance(svg: SVGSVGElement) {
         route.path.dataset.fanoutSource ||
         route.path.dataset.feedbackLane ||
         route.path.dataset.groupedReturnLane ||
+        route.path.dataset.decisionCycleRoute ||
         route.path.dataset.nestedDecisionRoute ||
         source?.shape.tagName.toLowerCase() !== 'rect' ||
         target?.shape.tagName.toLowerCase() !== 'rect',
@@ -2350,6 +2367,26 @@ export function repairFlowchartRouteClearance(svg: SVGSVGElement) {
     route.points = points;
     route.path.dataset.manhattanPoints = points.map(({ x, y }) => `${x},${y}`).join(' ');
     route.path.setAttribute('d', points.map(({ x, y }, i) => `${i ? 'L' : 'M'}${x},${y}`).join(''));
+  }
+  // The ordinary routes can escape the envelope used by the earlier feedback
+  // pass. Expand only its left run now, retaining both terminal ports and the
+  // remaining routes; final label placement and rounding follow this pass.
+  for (const route of routes.filter((route) => route.path.dataset.feedbackLane === 'outer')) {
+    const others = routes.filter((other) => other !== route);
+    const occupied = others.flatMap((other) =>
+      segments(other.points).map(({ start, end }) => ({
+        x: Math.min(start.x, end.x),
+        y: Math.min(start.y, end.y),
+        width: Math.abs(end.x - start.x),
+        height: Math.abs(end.y - start.y),
+      })),
+    );
+    occupied.push(...[...labels].filter(([other]) => other !== route).map(([, bounds]) => bounds));
+    const points = expandFlowchartFeedbackLane(route.points, occupied);
+    if (points === route.points) continue;
+    route.path.dataset.manhattanPoints = points.map(({ x, y }) => `${x},${y}`).join(' ');
+    route.path.setAttribute('d', points.map(({ x, y }, i) => `${i ? 'L' : 'M'}${x},${y}`).join(''));
+    plannedLabels.delete(route.path.id);
   }
   return plannedLabels;
 }
@@ -2967,6 +3004,7 @@ function spreadCrowdedFlowchartPorts(svg: SVGSVGElement) {
       path.dataset.groupedReturnLane ||
       path.dataset.clientRequestLane ||
       path.dataset.compactGroupedRoute ||
+      path.dataset.decisionCycleRoute ||
       path.dataset.nestedDecisionRoute
     )
       continue;
@@ -3053,7 +3091,7 @@ export function snapFlowchartDiamondPorts(svg: SVGSVGElement) {
   const paths = [...svg.querySelectorAll<SVGPathElement>('.edgePaths path')];
   const diamondAttachments = allocateDiamondAttachments(svg, paths);
   for (const path of paths) {
-    if (path.dataset.nestedDecisionRoute) continue;
+    if (path.dataset.nestedDecisionRoute || path.dataset.decisionCycleRoute) continue;
     const identity = flowchartEdgeIdentity(path);
     const sourceNode = identity && flowchartNode(svg, identity.source);
     const targetNode = identity && flowchartNode(svg, identity.target);
@@ -4111,6 +4149,134 @@ function routeNestedDecisionHierarchy(svg: SVGSVGElement, edges: FlowchartRoute[
   return true;
 }
 
+/** A single reciprocal work branch off an otherwise linear directed flow.
+ * Reject joins, extra branches and ambiguous cycles rather than inventing meaning.
+ */
+export function findFlowchartDecisionCycle(
+  edges: Array<{ source: string; target: string }>,
+  decisionIds: string[],
+) {
+  if (decisionIds.length !== 1) return null;
+  const decision = decisionIds[0];
+  const branches = edges.filter((edge) => edge.source === decision);
+  if (branches.length !== 2) return null;
+  const returning = branches.filter((branch) =>
+    edges.some((edge) => edge.source === branch.target && edge.target === decision),
+  );
+  if (returning.length !== 1) return null;
+  const retry = returning[0].target;
+  if (
+    retry === decision ||
+    edges.filter((edge) => edge.source === retry || edge.target === retry).length !== 2
+  )
+    return null;
+  const forward = edges.filter((edge) => edge.source !== retry && edge.target !== retry);
+  const roots = forward.filter((edge) => !forward.some((other) => other.target === edge.source));
+  if (roots.length !== 1) return null;
+  const spine = [roots[0].source];
+  while (true) {
+    const outgoing = forward.filter((edge) => edge.source === spine.at(-1));
+    if (!outgoing.length) break;
+    if (outgoing.length !== 1 || spine.includes(outgoing[0].target)) return null;
+    spine.push(outgoing[0].target);
+  }
+  if (
+    spine.length !== forward.length + 1 ||
+    spine.indexOf(decision) <= 0 ||
+    spine.at(-1) === decision
+  )
+    return null;
+  return { decision, retry, spine };
+}
+
+function routeVerticalDecisionCycle(svg: SVGSVGElement, edges: FlowchartRoute[]) {
+  if (
+    !['TD', 'TB'].includes(svg.dataset.flowchartDirection ?? '') ||
+    svg.querySelector('g.cluster')
+  )
+    return false;
+  const nodes = [...svg.querySelectorAll<SVGGElement>('g.node')];
+  const topology = findFlowchartDecisionCycle(
+    edges,
+    nodes
+      .filter((node) => {
+        const shape = shapeForNode(node);
+        return shape && isDiamondShape(shape);
+      })
+      .map(flowchartNodeId),
+  );
+  if (!topology || nodes.length !== topology.spine.length + 1) return false;
+  const reference = edges[0].path;
+  const boxes = new Map(
+    nodes.flatMap((node) => {
+      const shape = shapeForNode(node);
+      const bounds = shape && boundsInPathSpace(shape, reference);
+      return bounds ? [[flowchartNodeId(node), bounds] as const] : [];
+    }),
+  );
+  if (boxes.size !== nodes.length) return false;
+  const branch = edges.find(
+    (edge) => edge.source === topology.decision && edge.target === topology.retry,
+  )!;
+  const branchLabel = branch.label?.getBBox();
+  const root = boxes.get(topology.spine[0])!;
+  const centerX = root.x + root.width / 2;
+  let top = root.y;
+  const compact = reference.dataset.compactFlowchart === 'true';
+  for (const id of topology.spine) {
+    const box = boxes.get(id)!;
+    box.x = centerX - box.width / 2;
+    box.y = top;
+    top += box.height + (compact ? 100 : 64);
+  }
+  const decision = boxes.get(topology.decision)!;
+  const retry = boxes.get(topology.retry)!;
+  retry.x = decision.x + decision.width + Math.max(80, (branchLabel?.width ?? 0) + 48);
+  retry.y = decision.y + (decision.height - retry.height) / 2;
+  for (const node of nodes)
+    setFlowchartNodeCenter(node, pointAt(boxes.get(flowchartNodeId(node))!, 0.5, 0.5), reference);
+  for (const edge of edges) {
+    const source = boxes.get(edge.source)!;
+    const target = boxes.get(edge.target)!;
+    const returning = edge.source === topology.retry;
+    const branching = edge === branch;
+    let points: Point[];
+    if (returning) {
+      // A separate upper-right diamond port keeps the return above the outgoing
+      // label and entirely outside the continuation and the decision interior.
+      const port = diamondBoundaryPort(target, 'right', -Math.min(32, target.height / 4));
+      const shelf = Math.min(source.y, target.y) - 32;
+      points = [
+        pointAt(source, 0.5, 0),
+        { x: source.x + source.width / 2, y: shelf },
+        { x: target.x + target.width + 24, y: shelf },
+        { x: target.x + target.width + 24, y: port.y },
+        port,
+      ];
+    } else if (branching) {
+      points = [pointAt(source, 1, 0.5), pointAt(target, 0, 0.5)];
+    } else {
+      points = [pointAt(source, 0.5, 1), pointAt(target, 0.5, 0)];
+    }
+    for (const key of [
+      'feedbackLane',
+      'fanoutSource',
+      'fanoutPort',
+      'parallelLane',
+      'decisionBranch',
+      'decisionReturn',
+    ])
+      delete edge.path.dataset[key];
+    edge.path.dataset.decisionCycleRoute = returning ? 'return' : branching ? 'branch' : 'spine';
+    edge.path.dataset.manhattanPoints = points.map(({ x, y }) => `${x},${y}`).join(' ');
+    edge.path.dataset.manhattanSegments = String(points.length - 1);
+    edge.path.setAttribute('d', points.map(({ x, y }, i) => `${i ? 'L' : 'M'}${x},${y}`).join(''));
+    placeFlowchartLabelOnRoute(edge.label, edge.path, points);
+  }
+  svg.dataset.decisionCycleLayout = 'vertical';
+  return true;
+}
+
 export function routeFlowchartDecisionBranches(svg: SVGSVGElement) {
   if (svg.getAttribute('aria-roledescription') !== 'flowchart-v2') return;
   const labels = [...svg.querySelectorAll<SVGGElement>('.edgeLabels > .edgeLabel')];
@@ -4123,6 +4289,7 @@ export function routeFlowchartDecisionBranches(svg: SVGSVGElement) {
   const referencePath = edges[0]?.path;
   if (!referencePath) return;
   if (routeNestedDecisionHierarchy(svg, edges)) return;
+  if (routeVerticalDecisionCycle(svg, edges)) return;
   const nodeBounds = (node: SVGGElement | undefined) => {
     const shape = node && shapeForNode(node);
     return shape ? boundsInPathSpace(shape, referencePath) : null;
@@ -5706,7 +5873,7 @@ export function repairStateEntryRoutes(svg: SVGSVGElement) {
       routes.filter((other) => other !== route).flatMap((other) => segments(other.points)),
     );
     if (next === points) continue;
-    const d = buildRoundedOrthogonalPath(next, 2);
+    const d = buildRoundedOrthogonalPath(next);
     path.setAttribute('d', d);
     path.dataset.terminalGapBasePath = d;
     path.dataset.manhattanPoints = next.map(({ x, y }) => `${x},${y}`).join(' ');

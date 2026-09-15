@@ -144,6 +144,7 @@ async function geometry(page: Page, kind: Kind) {
       })
       .map((element) => ({
         id: element.getAttribute('data-node-id') ?? element.getAttribute('class'),
+        elementId: element.id,
         ...bounds(element),
       }));
     return {
@@ -159,6 +160,26 @@ async function geometry(page: Page, kind: Kind) {
         : null,
       content: bounds(lane.querySelector('[data-diagram-presentation-content]')!),
       viewport: bounds(viewport),
+      svg: bounds(viewport.querySelector('svg')!),
+      mermaidLabels: [
+        ...viewport.querySelectorAll<HTMLElement>('g.node .nodeLabel, .edgeLabels p'),
+      ].map((label) => {
+        const range = document.createRange();
+        range.selectNodeContents(label);
+        const r = range.getBoundingClientRect();
+        const matrix = label.closest<SVGGraphicsElement>('foreignObject')!.getScreenCTM()!;
+        return {
+          text: label.textContent,
+          left: r.left,
+          right: r.right,
+          top: r.top,
+          bottom: r.bottom,
+          width: r.width,
+          height: r.height,
+          fontSize:
+            Number.parseFloat(getComputedStyle(label).fontSize) * Math.hypot(matrix.a, matrix.b),
+        };
+      }),
       paint,
       actions: bounds(lane.querySelector('[data-diagram-presentation-actions]')!),
       noteOverflow: note.scrollWidth - note.clientWidth,
@@ -210,18 +231,105 @@ function expectLane(result: Awaited<ReturnType<typeof geometry>>) {
   expect(result.actions.right).toBeLessThanOrEqual(result.lane.right);
 }
 
-function expectPaint(result: Awaited<ReturnType<typeof geometry>>, count: number) {
+function expectPaint(
+  result: Awaited<ReturnType<typeof geometry>>,
+  count: number,
+  horizontalMermaid = false,
+) {
   expect(result.paint).toHaveLength(count);
+  const horizontalBounds = horizontalMermaid ? result.svg : result.viewport;
   for (const painted of result.paint) {
     expect([painted.left, painted.top, painted.width, painted.height].every(Number.isFinite)).toBe(
       true,
     );
     expect(painted.width > 0 || painted.height > 0, painted.id ?? '').toBe(true);
-    expect(painted.left, painted.id ?? '').toBeGreaterThanOrEqual(result.viewport.left - 1);
-    expect(painted.right, painted.id ?? '').toBeLessThanOrEqual(result.viewport.right + 1);
+    expect(painted.left, painted.id ?? '').toBeGreaterThanOrEqual(horizontalBounds.left - 1);
+    expect(painted.right, painted.id ?? '').toBeLessThanOrEqual(horizontalBounds.right + 1);
     expect(painted.top, painted.id ?? '').toBeGreaterThanOrEqual(result.viewport.top - 1);
     expect(painted.bottom, painted.id ?? '').toBeLessThanOrEqual(result.viewport.bottom + 1);
   }
+  if (horizontalMermaid) {
+    expect(result.mermaidLabels).toHaveLength(5);
+    for (const label of result.mermaidLabels) {
+      expect(label.fontSize).toBeGreaterThanOrEqual(11.9);
+      expect(label.left).toBeGreaterThanOrEqual(result.svg.left - 1);
+      expect(label.right).toBeLessThanOrEqual(result.svg.right + 1);
+      expect(label.top).toBeGreaterThanOrEqual(result.viewport.top - 1);
+      expect(label.bottom).toBeLessThanOrEqual(result.viewport.bottom + 1);
+    }
+  }
+}
+
+async function expectHorizontalReachability(page: Page, info: TestInfo, name: string) {
+  const initial = await geometry(page, 'mermaid');
+  expectPaint(initial, paintCounts.mermaid, true);
+  const viewport = laneFor(page, 'mermaid').locator('.mermaid-svg-viewport');
+  const samples = [];
+  // Overlapping wheel positions cover the entire painted SVG, including long
+  // edges that cannot fit in a single viewport. No programmatic scroll writes.
+  const step = Math.max(1, Math.floor(initial.viewport.width / 2));
+  const targets = [0];
+  for (let x = step; x < initial.viewportOverflow; x += step) targets.push(x);
+  if (initial.viewportOverflow > 0) targets.push(initial.viewportOverflow);
+  for (const target of targets) {
+    const previous = await geometry(page, 'mermaid');
+    const hitPoint = await viewport.evaluate((viewport) => {
+      const r = viewport.getBoundingClientRect();
+      for (const yFraction of [0.5, 0.1, 0.9]) {
+        for (const xFraction of [0.5, 0.1, 0.9]) {
+          const x = r.left + r.width * xFraction;
+          const y = r.top + r.height * yFraction;
+          if (viewport.contains(document.elementFromPoint(x, y))) return { x, y };
+        }
+      }
+      return null;
+    });
+    if (!hitPoint) {
+      await page
+        .locator('#diagram-note-host')
+        .screenshot({ path: info.outputPath(`${name}-occluded.png`) });
+      throw new Error('No exposed diagram viewport point accepts wheel input');
+    }
+    await page.mouse.move(hitPoint.x, hitPoint.y);
+    await page.mouse.wheel(target - previous.scrollLeft, 0);
+    await expect
+      .poll(async () => (await geometry(page, 'mermaid')).scrollLeft)
+      .toBeCloseTo(target, 0);
+    const observed = await geometry(page, 'mermaid');
+    expectPaint(observed, paintCounts.mermaid, true);
+    expect(observed.paint.map((p) => p.elementId)).toEqual(initial.paint.map((p) => p.elementId));
+    expect(observed.mermaidLabels.map((p) => p.text)).toEqual(
+      initial.mermaidLabels.map((p) => p.text),
+    );
+    expect(observed.noteOverflow).toBeLessThanOrEqual(1);
+    expect(observed.pageOverflow).toBeLessThanOrEqual(1);
+    expect(observed.generation).toBe(initial.generation);
+    samples.push(observed);
+  }
+  const windows = samples.map((s) => ({
+    left: s.viewport.left - s.svg.left,
+    right: s.viewport.right - s.svg.left,
+  }));
+  for (const painted of [...initial.paint, ...initial.mermaidLabels]) {
+    const left = painted.left - initial.svg.left;
+    const right = painted.right - initial.svg.left;
+    let reached = left;
+    for (const window of windows) {
+      if (window.left <= reached + 1) reached = Math.max(reached, window.right);
+    }
+    expect(reached, 'every horizontal paint portion is wheel-reachable').toBeGreaterThanOrEqual(
+      right - 1,
+    );
+    if (painted.width <= initial.viewport.width) {
+      expect(
+        windows.some((w) => w.left <= left + 1 && w.right >= right - 1),
+        'complete node/label enters view',
+      ).toBe(true);
+    }
+  }
+  await writeFile(info.outputPath(`${name}-wheel.json`), JSON.stringify(samples, null, 2));
+  await page.mouse.wheel(-samples.at(-1)!.scrollLeft, 0);
+  await expect.poll(async () => (await geometry(page, 'mermaid')).scrollLeft).toBe(0);
 }
 
 async function resizeNote(page: Page, width: number, kind: Kind, crossesBreakpoint = true) {
@@ -251,7 +359,8 @@ for (const kind of ['mermaid', 'custom', 'stateful'] as const) {
       await mountNote(page, width, kind);
       const result = await capture(page, kind, info, 'note-geometry');
       expectLane(result);
-      expectPaint(result, paintCounts[kind]);
+      expectPaint(result, paintCounts[kind], kind === 'mermaid');
+      if (kind === 'mermaid') await expectHorizontalReachability(page, info, 'note-geometry');
       const inset = kind === 'mermaid' ? 8 : 0;
       expect(result.viewport.left - result.presentation.left).toBeCloseTo(inset, 0);
       expect(result.presentation.right - result.viewport.right).toBeCloseTo(inset, 0);
@@ -330,7 +439,9 @@ for (const kind of ['mermaid', 'custom', 'stateful'] as const) {
         );
       }
       expectLane(result);
-      expectPaint(result, paintCounts[kind]);
+      expectPaint(result, paintCounts[kind], kind === 'mermaid');
+      if (kind === 'mermaid')
+        await expectHorizontalReachability(page, info, `resize-${index}-${width}`);
       const started = Date.now();
       const samples: Awaited<ReturnType<typeof geometry>>[] = [];
       await expect
@@ -344,7 +455,7 @@ for (const kind of ['mermaid', 'custom', 'stateful'] as const) {
         .toBeGreaterThanOrEqual(1_000);
       for (const sample of samples) {
         expectLane(sample);
-        expectPaint(sample, paintCounts[kind]);
+        expectPaint(sample, paintCounts[kind], kind === 'mermaid');
         expect(sample.viewport.width).toBeCloseTo(result.viewport.width, 0);
         expect(sample.viewport.height).toBeCloseTo(result.viewport.height, 0);
         expect(sample.generation).toBe(result.generation);
@@ -526,7 +637,22 @@ test('valid to error to valid keeps expanded source aligned at the minimum note 
   await expect(card).toHaveCount(0);
   const recovered = await capture(page, 'mermaid', info, 'recovered');
   expectLane(recovered);
-  expectPaint(recovered, paintCounts.mermaid);
+  expectPaint(recovered, paintCounts.mermaid, true);
+  await expectHorizontalReachability(page, info, 'recovered');
+});
+
+test('horizontal note oracle rejects paint made inaccessible to wheel scrolling', async ({
+  page,
+}, info) => {
+  await mountNote(page, 320, 'mermaid');
+  await expectHorizontalReachability(page, info, 'reachable-control');
+  await laneFor(page, 'mermaid')
+    .locator('.mermaid-svg-viewport')
+    .evaluate((viewport) => {
+      viewport.style.overflowX = 'hidden';
+    });
+  // The full SVG and scrollWidth are unchanged: only actual user reachability fails.
+  await expect(expectHorizontalReachability(page, info, 'inaccessible-control')).rejects.toThrow();
 });
 
 async function loadComment(page: Page, content = 'Synthetic sidebar comment') {
@@ -600,7 +726,8 @@ for (const width of [320, 960]) {
     }
     await settled(page, 'mermaid');
     const active = await capture(page, 'mermaid', info, 'active-comments');
-    expectPaint(active, paintCounts.mermaid);
+    expectPaint(active, paintCounts.mermaid, true);
+    await expectHorizontalReachability(page, info, 'active-comments');
     expect(active.noteOverflow).toBeLessThanOrEqual(1);
     expect(active.pageOverflow).toBeLessThanOrEqual(1);
     const comment = (await sidebar.boundingBox())!;
@@ -660,10 +787,11 @@ for (const width of [320, 960]) {
         expect(bounds.height).toBeGreaterThan(0);
       }
     }
-    expectPaint(focusedDiagram, paintCounts.mermaid);
+    expectPaint(focusedDiagram, paintCounts.mermaid, true);
     expect(focusedDiagram.noteOverflow).toBeLessThanOrEqual(1);
     expect(focusedDiagram.pageOverflow).toBeLessThanOrEqual(1);
     expectLane(recovered);
+    await expectHorizontalReachability(page, info, 'comments-closed');
   });
 }
 
@@ -749,7 +877,7 @@ test('focused comments keep long text and controls usable through narrow-wide-na
       expect(line.left).toBeGreaterThanOrEqual(diagram.note.left - 1);
       expect(line.right).toBeLessThanOrEqual(diagram.note.right + 1);
     }
-    expectPaint(diagram, paintCounts.mermaid);
+    expectPaint(diagram, paintCounts.mermaid, true);
     expect(diagram.noteOverflow).toBeLessThanOrEqual(1);
     expect(diagram.pageOverflow).toBeLessThanOrEqual(1);
     samples.push({ width, comment, diagram, wrapped });
@@ -766,4 +894,47 @@ test('focused comments keep long text and controls usable through narrow-wide-na
   await expect(reply).toBeVisible();
   await page.keyboard.press('Escape');
   await expect(reply).toHaveCount(0);
+});
+
+test('collapsed comments allow wheel scrolling and reopen intact through narrow-wide-narrow resizing', async ({
+  page,
+}, info) => {
+  await mountNote(page, 320, 'mermaid', validSource, true);
+  const content =
+    'Review the complete request path, including validation, processing and the final response. Every label and comment action should remain readable inside a narrow note.';
+  await loadComment(page, content);
+  const sidebar = page.locator('[data-comment-id="width-comment"]');
+  const reply = sidebar.locator('[contenteditable="true"]');
+  await expect(sidebar).toBeVisible();
+  for (const [index, width] of [320, 960, 320].entries()) {
+    if (index) await resizeNote(page, width, 'mermaid');
+    await sidebar.focus();
+    await page.keyboard.press('Enter');
+    await expect(reply).toBeVisible();
+    await expect(sidebar.locator('.comment-content')).toHaveText(content);
+    expectPaint(await geometry(page, 'mermaid'), paintCounts.mermaid, true);
+    if (index === 1) {
+      await sidebar.locator('.comment-content').hover();
+      await sidebar.getByRole('button', { name: 'Collapse', exact: true }).click();
+    } else {
+      await page.keyboard.press('Escape');
+    }
+    await expect(reply).toHaveCount(0);
+    await expectHorizontalReachability(page, info, `collapsed-${index}-${width}`);
+    await sidebar.focus();
+    await page.keyboard.press('Enter');
+    await expect(reply).toBeVisible();
+    await expect(sidebar.locator('.comment-content')).toHaveText(content);
+    await reply.click();
+    await page.keyboard.type('Local unsent reply');
+    await expect(reply).toContainText('Local unsent reply');
+    await reply.press('ControlOrMeta+A');
+    await reply.press('Backspace');
+    await sidebar.locator('.comment-content').hover();
+    for (const control of await sidebar.locator('button').all()) {
+      await control.click({ trial: true });
+    }
+    await page.keyboard.press('Escape');
+    await expect(reply).toHaveCount(0);
+  }
 });
