@@ -1905,6 +1905,13 @@ ${source}`;
     overflow: visible;
   }
 
+  /* Layout reads must see the new transforms synchronously. The global reduced-motion
+     duration otherwise creates transitions on these groups' default `all` property. */
+  .mermaid-presentation
+    :global(svg[aria-roledescription='flowchart-v2'] :is(g.node, .edgeLabels > .edgeLabel)) {
+    transition-property: fill, stroke, opacity;
+  }
+
   .mermaid-presentation :global(.edge-pattern-solid),
   .mermaid-presentation :global(.flowchart-link),
   .mermaid-presentation :global(.relation),

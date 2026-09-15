@@ -705,7 +705,14 @@ test('state detour retains its safe exterior when the local departure is obstruc
   expect(result.hits).toEqual([false, false, false]);
 });
 
-async function open(page: Page, state: State, width: number, note: boolean, theme = 'light') {
+async function open(
+  page: Page,
+  state: State,
+  width: number,
+  note: boolean,
+  theme = 'light',
+  motion: 'reduced' | 'full' = 'reduced',
+) {
   const names = ['MermaidRenderer.svelte', 'mermaid-path-geometry.ts'];
   const responses = names.map((name) =>
     page.waitForResponse((response) => {
@@ -714,9 +721,9 @@ async function open(page: Page, state: State, width: number, note: boolean, them
     }),
   );
   await page.setViewportSize({ width: 1440, height: 1100 });
-  await page.emulateMedia({ reducedMotion: 'reduce' });
+  await page.emulateMedia({ reducedMotion: motion === 'reduced' ? 'reduce' : 'no-preference' });
   await page.goto(
-    `${baseUrl}/sandbox/diagram-workbench?state=${state}&theme=${theme}&width=${width}&motion=reduced`,
+    `${baseUrl}/sandbox/diagram-workbench?state=${state}&theme=${theme}&width=${width}&motion=${motion}`,
   );
   await expect(page.locator('[data-preview-ready=true]')).toBeVisible({ timeout: 30_000 });
   const hashes: Record<string, string> = {};
@@ -868,9 +875,18 @@ for (const width of [420, 960]) {
 }
 
 for (const state of ['mermaid-nested-groups', 'mermaid-dense-graph'] as const) {
-  for (const width of [420, 960]) {
-    test(`grouped spacing ${state} at ${width}px survives repeat fits`, async ({ page }, info) => {
-      const { root, hashes } = await open(page, state, width, false, 'dark');
+  const cases: { width: number; motion: 'reduced' | 'full' }[] = [
+    { width: 420, motion: 'reduced' },
+    { width: 960, motion: 'reduced' },
+  ];
+  // Full motion is a control for the compact transform/reduced-motion regression.
+  if (state === 'mermaid-dense-graph') cases.push({ width: 420, motion: 'full' });
+  for (const { width, motion } of cases) {
+    const suffix = motion === 'full' ? ' with full motion' : '';
+    test(`grouped spacing ${state} at ${width}px survives repeat fits${suffix}`, async ({
+      page,
+    }, info) => {
+      const { root, hashes } = await open(page, state, width, false, 'dark', motion);
       await page.setViewportSize({ width: 1440, height: 1800 });
       const results = [];
       for (const currentWidth of [width, width === 420 ? 960 : 420, width]) {
