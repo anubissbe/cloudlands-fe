@@ -13,9 +13,30 @@ concurrency:
 
 jobs:
   browser:
-    name: Chat queue-repair browser contracts
+    name: Chat queue repair — ${{ matrix.pass }}
     runs-on: gh-linux-8x
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - pass: contracts
+            files: >-
+              src/lib/components/__tests__/neutral-border-contract.ct.spec.ts
+              src/lib/components/chat/__tests__/chat-event-geometry.ct.spec.ts
+              src/lib/components/chat/__tests__/chat-panel-thinking-seams.ct.spec.ts
+              src/lib/components/chat/__tests__/chat-panel-tool-message-seams.ct.spec.ts
+              src/lib/components/chat/__tests__/destructive-contrast.ct.spec.ts
+              src/lib/components/chat/__tests__/agent-subscription-inline.ct.spec.ts
+              src/lib/components/chat/__tests__/chat-panel-pending-status-spacing.ct.spec.ts
+              src/lib/components/chat/__tests__/subscription-card-gap.ct.spec.ts
+              src/lib/components/chat/__tests__/attention-flow-spacing-geometry.ct.spec.ts
+              src/lib/components/chat/__tests__/sticky-scroll-stability.ct.spec.ts
+              src/lib/components/chat/__tests__/turn-failure-surface.ct.spec.ts
+            extra: ''
+          - pass: cold-snapshots
+            files: src/lib/components/chat/__tests__/agent-subscription-inline.ct.spec.ts
+            extra: '--grep screenshots'
     env:
       CI: 'true'
       GIT_TERMINAL_PROMPT: '0'
@@ -23,10 +44,10 @@ jobs:
       - name: Checkout exact PR source
         uses: actions/checkout@v7
         with:
-          ref: 3af809a69c06ca9b611b951d79eec7d89007f37d
+          ref: e99e4ded9bad590e1f569966e29a3fd32a899177
           persist-credentials: false
       - name: Verify source identity
-        run: test "$(git rev-parse HEAD)" = 3af809a69c06ca9b611b951d79eec7d89007f37d
+        run: test "$(git rev-parse HEAD)" = e99e4ded9bad590e1f569966e29a3fd32a899177
       - name: Setup pnpm
         uses: pnpm/action-setup@v6
         with:
@@ -48,25 +69,16 @@ jobs:
         env:
           NODE_OPTIONS: '--max-old-space-size=8192'
           PLAYWRIGHT_JSON_OUTPUT_NAME: test-results/results.json
+          CT_FILES: ${{ matrix.files }}
+          CT_EXTRA: ${{ matrix.extra }}
         run: >-
-          pnpm run test:ct --
-          src/lib/components/__tests__/neutral-border-contract.ct.spec.ts
-          src/lib/components/chat/__tests__/chat-event-geometry.ct.spec.ts
-          src/lib/components/chat/__tests__/chat-panel-thinking-seams.ct.spec.ts
-          src/lib/components/chat/__tests__/chat-panel-tool-message-seams.ct.spec.ts
-          src/lib/components/chat/__tests__/destructive-contrast.ct.spec.ts
-          src/lib/components/chat/__tests__/agent-subscription-inline.ct.spec.ts
-          src/lib/components/chat/__tests__/chat-panel-pending-status-spacing.ct.spec.ts
-          src/lib/components/chat/__tests__/subscription-card-gap.ct.spec.ts
-          src/lib/components/chat/__tests__/attention-flow-spacing-geometry.ct.spec.ts
-          src/lib/components/chat/__tests__/sticky-scroll-stability.ct.spec.ts
-          src/lib/components/chat/__tests__/turn-failure-surface.ct.spec.ts
+          pnpm run test:ct -- $CT_FILES $CT_EXTRA
           --workers=1 --retries=0 --fail-on-flaky-tests --reporter=list,html,json
       - name: Upload browser evidence
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: chat-queue-repair-3af809a6
+          name: chat-queue-repair-e99e4ded-${{ matrix.pass }}
           path: |
             playwright-report/
             test-results/
