@@ -3,6 +3,21 @@ import AgentSubscriptionInlineHost from './AgentSubscriptionInlineHost.svelte';
 
 const toolKinds = ['file', 'terminal', 'tool'] as const;
 
+test.beforeEach(async ({ page }) => {
+  // Load the bundled face before the avatar stack caches canvas text measurements.
+  const fontsLoaded = await page.evaluate(async () => {
+    const faces = await Promise.all(
+      ['400 15px "Inter Variable"', '500 12px "Inter Variable"'].map((font) =>
+        document.fonts.load(font),
+      ),
+    );
+    return faces.every(
+      (loaded) => loaded.length > 0 && loaded.every((face) => face.status === 'loaded'),
+    );
+  });
+  expect(fontsLoaded).toBe(true);
+});
+
 test.afterEach(async ({ page }) => {
   await page.locator('#root').evaluate(async (root) => {
     if (root.childElementCount > 0) await window.playwrightUnmount(root);
@@ -46,7 +61,10 @@ async function expectSubscriptionScreenshot(component: Locator, name: string, ra
         ),
       };
     });
-    const renderedFonts: Record<string, unknown> = {};
+    const renderedFonts: Record<
+      string,
+      { fonts: { familyName: string; isCustomFont: boolean }[] }
+    > = {};
     const page = component.page();
     const cdp = await page.context().newCDPSession(page);
     try {
@@ -73,6 +91,18 @@ async function expectSubscriptionScreenshot(component: Locator, name: string, ra
       body: JSON.stringify({ ...typography, renderedFonts }, null, 2),
       contentType: 'application/json',
     });
+    await test.info().attach(`${name}-render`, {
+      body: await component.screenshot({ animations: 'disabled' }),
+      contentType: 'image/png',
+    });
+    const fonts = Object.values(renderedFonts).flatMap((entry) => entry.fonts);
+    expect(fonts.length).toBeGreaterThan(0);
+    for (const font of fonts) {
+      expect(font).toMatchObject({
+        familyName: expect.stringMatching(/^Inter(?: Variable)?$/),
+        isCustomFont: true,
+      });
+    }
   }
 }
 
