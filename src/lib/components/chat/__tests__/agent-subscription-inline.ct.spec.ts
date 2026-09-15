@@ -22,6 +22,7 @@ async function expectSubscriptionScreenshot(component: Locator, name: string, ra
       };
       return {
         fontStatus: document.fonts.status,
+        fontUiToken: getComputedStyle(root).getPropertyValue('--font-ui'),
         interBodyReady: document.fonts.check('400 15px "Inter Variable"'),
         interOverflowReady: document.fonts.check('500 12px "Inter Variable"'),
         samples: Object.fromEntries(
@@ -45,8 +46,31 @@ async function expectSubscriptionScreenshot(component: Locator, name: string, ra
         ),
       };
     });
+    const renderedFonts: Record<string, unknown> = {};
+    const page = component.page();
+    const cdp = await page.context().newCDPSession(page);
+    try {
+      await cdp.send('DOM.enable');
+      await cdp.send('CSS.enable');
+      const { root } = await cdp.send('DOM.getDocument');
+      for (const selector of [
+        '[data-testid="one-shot-summary-title"]',
+        '[data-testid="agent-card-preview"]',
+        '[data-agent-avatar-overflow]',
+      ]) {
+        const { nodeId } = await cdp.send('DOM.querySelector', {
+          nodeId: root.nodeId,
+          selector: `[data-testid="subscription-inline-host"] ${selector}`,
+        });
+        if (nodeId) {
+          renderedFonts[selector] = await cdp.send('CSS.getPlatformFontsForNode', { nodeId });
+        }
+      }
+    } finally {
+      await cdp.detach();
+    }
     await test.info().attach(`${name}-typography`, {
-      body: JSON.stringify(typography, null, 2),
+      body: JSON.stringify({ ...typography, renderedFonts }, null, 2),
       contentType: 'application/json',
     });
   }

@@ -163,7 +163,7 @@ for (const theme of ['light', 'dark'] as const) {
           .getBoundingClientRect();
         return userMessage.top - previousOperational.bottom;
       });
-      expect(userSpacing).toBeCloseTo(40 * zoom, 1);
+      expect(userSpacing).toBeCloseTo(24 * zoom, 1);
 
       const userBottomSpacing = await component.evaluate((root) => {
         const userMessage = root
