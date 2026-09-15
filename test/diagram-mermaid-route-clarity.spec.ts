@@ -996,6 +996,11 @@ for (const appearance of appearances) {
                 y: (sign * (point.y - adjacent.y)) / magnitude,
               };
               const stroke = getComputedStyle(path);
+              const visiblePaint =
+                stroke.stroke !== 'none' &&
+                parseFloat(stroke.strokeWidth) > 0 &&
+                parseFloat(stroke.strokeOpacity) > 0 &&
+                parseFloat(stroke.opacity) > 0;
               const shaftRadius =
                 (parseFloat(stroke.strokeWidth) / 2) *
                 (stroke.vectorEffect === 'non-scaling-stroke' ? 1 : scale);
@@ -1043,6 +1048,7 @@ for (const appearance of appearances) {
                 forward,
                 lateral,
                 markerValid,
+                visiblePaint,
               };
             };
             const original = terminal(outer, true);
@@ -1050,20 +1056,22 @@ for (const appearance of appearances) {
               inside({ x: point.x + direction.x * 0.75, y: point.y + direction.y * 0.75 }) &&
               !inside({ x: point.x - direction.x * 0.75, y: point.y - direction.y * 0.75 });
             // Discover adjacent incoming AND outgoing paint from endpoints, not port datasets.
-            const neighbors = [...svg.querySelectorAll<SVGPathElement>('.edgePaths path')]
-              .filter((path) => path !== outer)
-              .flatMap((path) => [terminal(path, false), terminal(path, true)])
-              .filter(
-                (item) =>
-                  distance(item.point, item.boundary) <= 8 &&
-                  inwardAt(item.boundary, original.direction) &&
-                  Math.abs(
-                    (item.boundary.x - original.boundary.x) * original.direction.x +
-                      (item.boundary.y - original.boundary.y) * original.direction.y,
-                  ) < 0.2,
-              );
+            const findNeighbors = () =>
+              [...svg.querySelectorAll<SVGPathElement>('.edgePaths path')]
+                .filter((path) => path !== outer)
+                .flatMap((path) => [terminal(path, false), terminal(path, true)])
+                .filter(
+                  (item) =>
+                    distance(item.point, item.boundary) <= 8 &&
+                    inwardAt(item.boundary, original.direction) &&
+                    Math.abs(
+                      (item.boundary.x - original.boundary.x) * original.direction.x +
+                        (item.boundary.y - original.boundary.y) * original.direction.y,
+                    ) < 0.2,
+                );
             const inspectAttachment = () => {
               const item = terminal(outer, true);
+              const neighbors = findNeighbors();
               const { point, direction, boundary } = item;
               const tangent = { x: -direction.y, y: direction.x };
               const rawGap =
@@ -1091,6 +1099,10 @@ for (const appearance of appearances) {
                   ) -
                   neighbor.lateral -
                   item.lateral,
+                markerValid: neighbor.markerValid,
+                visiblePaint: neighbor.visiblePaint,
+                forward: neighbor.forward,
+                lateral: neighbor.lateral,
               }));
               return {
                 cardinal,
@@ -1105,8 +1117,10 @@ for (const appearance of appearances) {
                 boundary: { x: boundary.x, y: boundary.y },
               };
             };
+            const neighbors = findNeighbors();
             const attachment = inspectAttachment();
             const negativeControls: Record<string, ReturnType<typeof inspectAttachment>> = {};
+            let restoredAttachment: ReturnType<typeof inspectAttachment> | undefined;
             if (runNegativeControls) {
               // Mutate only this browser's rendered path, then restore it. The same
               // observer must reject real detached, tangential and colliding paint.
@@ -1115,6 +1129,7 @@ for (const appearance of appearances) {
               // Do not measure the first frame of a CSS d transition as the mutation.
               outer.style.setProperty('transition', 'none', 'important');
               getComputedStyle(outer).transition;
+              let collisionPath: SVGPathElement | undefined;
               const move = (dx: number, dy: number) => {
                 const m = outer.getScreenCTM()!;
                 const a = new DOMPoint(0, 0).matrixTransform(m.inverse());
@@ -1149,18 +1164,18 @@ for (const appearance of appearances) {
                 move(targetBox.left - original.point.x, 0);
                 negativeControls.corner = inspectAttachment();
                 restore();
-                if (neighbors[0]) {
-                  move(
-                    neighbors[0].boundary.x - original.boundary.x,
-                    neighbors[0].boundary.y - original.boundary.y,
-                  );
-                  negativeControls.colliding = inspectAttachment();
-                }
+                // Duplicate the rendered shaft and marker as real coincident SVG paint.
+                collisionPath = outer.cloneNode(true) as SVGPathElement;
+                collisionPath.id = 'collision-negative-control';
+                outer.parentElement!.append(collisionPath);
+                negativeControls.colliding = inspectAttachment();
               } finally {
+                collisionPath?.remove();
                 restore();
                 getComputedStyle(outer).d;
                 if (originalStyle === null) outer.removeAttribute('style');
                 else outer.setAttribute('style', originalStyle);
+                restoredAttachment = inspectAttachment();
               }
             }
             const sample = (path: SVGPathElement) => {
@@ -1193,6 +1208,7 @@ for (const appearance of appearances) {
                 boundary: { x: boundary.x, y: boundary.y },
               })),
               negativeControls,
+              restoredAttachment,
               targetCenterError: Math.abs(screenEnd.x - (targetBox.left + targetBox.right) / 2),
               targetGap:
                 outer.dataset.feedbackTargetSide === 'top'
@@ -1227,12 +1243,30 @@ for (const appearance of appearances) {
       if (feedback.neighbors.length === 0)
         expect(feedback.targetCenterError).toBeLessThanOrEqual(1);
       if (width === 420 && appearance.name === 'light') {
-        expect(feedback.neighbors.length).toBeGreaterThan(0);
         expect(feedback.negativeControls.detached.paintedGap).toBeGreaterThan(5.35);
         expect(feedback.negativeControls.tangential.inward).toBe(false);
         expect(feedback.negativeControls.outward.inward).toBe(false);
         expect(feedback.negativeControls.corner.straightBoundary).toBe(false);
         expect(feedback.negativeControls.colliding.nonconflicting).toBe(false);
+        const collision = feedback.negativeControls.colliding.clearance.find(
+          ({ id }) => id === 'collision-negative-control',
+        );
+        expect(collision).toBeDefined();
+        expect(collision!.separation).toBeLessThanOrEqual(0);
+        expect(collision).toMatchObject({ markerValid: true, visiblePaint: true });
+        expect(collision!.forward).toBeGreaterThan(0);
+        expect(collision!.lateral).toBeGreaterThan(0);
+        expect(feedback.restoredAttachment).toBeDefined();
+        expect(feedback.restoredAttachment).toMatchObject({
+          boundary: feedback.attachment.boundary,
+          paintedGap: feedback.attachment.paintedGap,
+          nonconflicting: true,
+        });
+        expect(
+          feedback.restoredAttachment!.clearance.some(
+            ({ id }) => id === 'collision-negative-control',
+          ),
+        ).toBe(false);
       }
       expect(feedback.targetGap).toBeGreaterThanOrEqual(0);
       expect(feedback.targetGap).toBeLessThanOrEqual(6);
