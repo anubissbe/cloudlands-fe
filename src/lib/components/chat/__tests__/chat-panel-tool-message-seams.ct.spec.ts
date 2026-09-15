@@ -176,7 +176,7 @@ for (const theme of ['light', 'dark'] as const) {
           .getBoundingClientRect();
         return assistantRow.top - userMessage.bottom;
       });
-      expect(userBottomSpacing).toBeCloseTo(28 * zoom, 1);
+      expect(userBottomSpacing).toBeCloseTo(24 * zoom, 1);
       await expect(
         component
           .getByTestId('chat-transcript-scroll-viewport')
