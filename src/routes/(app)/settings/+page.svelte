@@ -9,13 +9,12 @@
     installUpdate,
     simulateSetState,
   } from '$store/renderer/slices/auto-update/auto-update-slice';
-  import ProviderSelector from '$lib/components/settings/ProviderSelector.svelte';
+  import AdministratorSettings from '$lib/components/settings/AdministratorSettings.svelte';
   import AIBehaviorEditor from '$lib/components/settings/AIBehaviorEditor.svelte';
   import AIBehaviorSidebar, {
     type AIBehaviorView,
   } from '$lib/components/settings/AIBehaviorSidebar.svelte';
   import SettingsSidebarNav from '$lib/components/settings/SettingsSidebarNav.svelte';
-  import ConnectionsSettings from '$lib/components/settings/ConnectionsSettings.svelte';
   import DevicesSettings from '$lib/components/settings/DevicesSettings.svelte';
   import BackendSyncSettings from '$lib/components/settings/BackendSyncSettings.svelte';
   import VoiceSettings from '$lib/components/settings/VoiceSettings.svelte';
@@ -25,8 +24,6 @@
   import LanguageSettings from '$lib/components/settings/LanguageSettings.svelte';
   import GitHubLinkSettings from '$lib/components/settings/GitHubLinkSettings.svelte';
   import KeyboardShortcutsSettings from '$lib/components/settings/KeyboardShortcutsSettings.svelte';
-  import McpServersSettings from '$lib/components/settings/McpServersSettings.svelte';
-  import BackgroundAgentSettings from '$lib/components/settings/BackgroundAgentSettings.svelte';
   import ColorThemeSettings from '$lib/components/settings/ColorThemeSettings.svelte';
   import ReduceMotionOnBatterySettings from '$lib/components/settings/ReduceMotionOnBatterySettings.svelte';
   import NotificationSettings from '$lib/components/settings/NotificationSettings.svelte';
@@ -36,7 +33,6 @@
   import WorkspaceApiSettings from '$lib/components/settings/WorkspaceApiSettings.svelte';
   import AgentBackendSettings from '$lib/components/settings/AgentBackendSettings.svelte';
   import AgentFeaturesSettings from '$lib/components/settings/AgentFeaturesSettings.svelte';
-  import DefaultAgentModelSettings from '$lib/components/settings/DefaultAgentModelSettings.svelte';
   import Button from '$lib/components/ui/button/button.svelte';
   import CopyButton from '$lib/components/ui/CopyButton.svelte';
   import { highlightTarget } from '$lib/components/ui/highlight/highlight-target';
@@ -559,63 +555,9 @@
         aria-labelledby="settings-page-title"
       >
         <h1 id="settings-page-title" class="sr-only">{m.settings_page_title()}</h1>
-        <!-- Providers -->
-        {#if activeTab === 'providers' && !hiddenTabs.includes('providers')}
-          <div
-            id="providers"
-            data-highlight-id="providers"
-            use:highlightTarget
-            class="mb-12 scroll-mt-20"
-          >
-            <ProviderSelector />
-          </div>
-          <div
-            id="utility-default-model"
-            data-highlight-id="utility-default-model"
-            use:highlightTarget
-            class="mb-12"
-          >
-            <h2 class="text-xs font-medium text-muted-foreground uppercase tracking-wider mb-3">
-              {m.settings_section_defaults()}
-            </h2>
-            <div class="flex flex-col bg-card rounded-xl divide-y divide-border">
-              <section class="px-6 py-5">
-                <DefaultAgentModelSettings workspaceId={settingsWorkspaceId} />
-              </section>
-              <section class="px-6 py-5">
-                <h3 class="text-xs font-medium text-muted-foreground uppercase tracking-wider mb-5">
-                  {m.settings_section_quickActions()}
-                </h3>
-                <BackgroundAgentSettings />
-              </section>
-            </div>
-          </div>
-        {/if}
-
-        <!-- Connections -->
-        {#if activeTab === 'connections' && !hiddenTabs.includes('connections')}
-          <div
-            id="integrations"
-            data-highlight-id="integrations"
-            use:highlightTarget
-            class="mb-6 scroll-mt-20"
-          >
-            <h2 class="text-xs font-medium text-muted-foreground uppercase tracking-wider mb-3">
-              {m.settings_tab_accounts()}
-            </h2>
-            <div class="flex flex-col bg-card rounded-xl divide-y divide-border">
-              <section class="px-6 py-5">
-                <ConnectionsSettings />
-              </section>
-            </div>
-          </div>
-
-          <div id="mcp-servers" data-highlight-id="mcp-servers" use:highlightTarget class="mb-12">
-            <h2 class="text-xs font-medium text-muted-foreground uppercase tracking-wider mb-3">
-              {m.settings_section_mcpServers()}
-            </h2>
-            <McpServersSettings />
-          </div>
+        <!-- Providers / Connections (administrator-owned; withheld from collaborator-only clients) -->
+        {#if (activeTab === 'providers' || activeTab === 'connections') && !hiddenTabs.includes(activeTab)}
+          <AdministratorSettings tab={activeTab} workspaceId={settingsWorkspaceId} />
         {/if}
 
         <!-- Devices -->
