@@ -1,7 +1,7 @@
 import { THEME_PRESET_MANIFEST } from '../../shared/theme-presets-manifest';
 
 const catalogThemes = ['system', 'light', 'dark'] as const;
-export const catalogMotions = ['system', 'full', 'reduced'] as const;
+const catalogMotions = ['system', 'full', 'reduced'] as const;
 export const catalogColorThemes = [
   'default',
   ...THEME_PRESET_MANIFEST.map(({ id }) => id),

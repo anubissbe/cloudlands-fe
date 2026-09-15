@@ -75,7 +75,7 @@ function rootToken(name: string, fallback: string): string {
   return getComputedStyle(document.documentElement).getPropertyValue(name).trim() || fallback;
 }
 
-export function measureDiagramTextWidth(
+function measureDiagramTextWidth(
   text: string,
   fontSize: number,
   weight: string,
