@@ -380,7 +380,8 @@
    * The hover card offers Remove only to the workspace's owner, and only on
    * collaborator rows — so a card gets one (and becomes hoverable, see
    * `disableHoverableContent`) when this window owns the workspace and some
-   * other member is listed.
+   * other member is listed. The current tab normally has no preview, but a
+   * shared workspace's member rows stay reachable there too.
    */
   function canRemoveMembers(people: PresencePerson[]) {
     return (
@@ -1076,7 +1077,7 @@
                 delayDuration={workspaceHoverCardOpenDelay}
                 onOpenChange={(open) => handleWorkspaceHoverCardOpenChange(workspaceId, open)}
                 disableHoverableContent={!(canManageSharing || removableMembers)}
-                disabled={isCurrent || draggedWorkspaceId !== null}
+                disabled={(isCurrent && presencePeople.length === 0) || draggedWorkspaceId !== null}
                 showArrow={false}
                 maxWidth="none"
                 class="absolute -inset-px rounded-[inherit]"
