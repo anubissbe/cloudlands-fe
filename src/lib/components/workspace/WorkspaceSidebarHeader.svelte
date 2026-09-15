@@ -10,7 +10,6 @@
     faKeyboard,
     faRightLeft,
     faTableColumns,
-    faUserPlus,
   } from '@fortawesome/free-solid-svg-icons';
   import Fa from 'svelte-fa';
   import { tick } from 'svelte';
@@ -30,7 +29,6 @@
 
   import { requestDeleteWorkspace } from '$store/renderer/slices/workspace-operations/workspace-operations-slice';
   import { openTransferModal } from '$store/renderer/slices/workspace-transfer/workspace-transfer-slice';
-  import { openShareDialog } from '$store/renderer/slices/workspace-share/workspace-share-slice';
   import { setWorkspaceEntity } from '$store/renderer/slices/workspace/workspace-slice';
   import {
     markKeySlotUnassigned,
@@ -422,24 +420,9 @@
       : null,
   );
 
-  const shareAction: MenuAction | null = $derived(
-    workspace?.myRole === 'owner'
-      ? {
-          label: m.workspace_share_menu_label(),
-          icon: faUserPlus,
-          onClick: () => {
-            appStore.dispatch(
-              openShareDialog({ workspaceId: workspace.id, workspaceTitle: workspace.title }),
-            );
-          },
-        }
-      : null,
-  );
-
   const additionalActions: MenuAction[] = $derived([
     sidebarToggleAction,
     ...(microKeyAction ? [microKeyAction] : []),
-    ...(shareAction ? [shareAction] : []),
     ...(transferAction ? [transferAction] : []),
     sidebarSideAction,
   ]);
