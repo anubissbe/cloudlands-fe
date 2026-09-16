@@ -1,9 +1,6 @@
 <script lang="ts">
   import type { CatalogEntry } from './catalog';
   import { getCatalogRenderer } from './catalog-renderers';
-  import ProposalCatalogPreview from './renderers/ProposalCatalogPreview.svelte';
-  import ChatPolishCatalogPreview from './renderers/ChatPolishCatalogPreview.svelte';
-  import ChatPolishGeometryControls from './ChatPolishGeometryControls.svelte';
   import { m } from '$shared/paraglide/messages.js';
   import {
     defaultChatPolishGeometry,
@@ -12,6 +9,19 @@
 
   let { entry, mode = 'detail' }: { entry: CatalogEntry; mode?: 'gallery' | 'detail' } = $props();
   const renderer = $derived(getCatalogRenderer(entry.slug));
+  const proposalPreview = $derived(
+    entry.slug === 'proposal-card'
+      ? import('./renderers/ProposalCatalogPreview.svelte')
+      : undefined,
+  );
+  const chatPreview = $derived(
+    entry.slug === 'chat-polish'
+      ? import('./renderers/ChatPolishCatalogPreview.svelte')
+      : undefined,
+  );
+  const chatControls = $derived(
+    entry.slug === 'chat-polish' ? import('./ChatPolishGeometryControls.svelte') : undefined,
+  );
   let chatPolishGeometry = $state<ChatPolishGeometry>({ ...defaultChatPolishGeometry });
   const visibleFixtures = $derived(
     entry.slug === 'chat-polish' ? entry.fixtures.slice(0, 1) : entry.fixtures,
@@ -63,13 +73,19 @@
           data-catalog-fixture-id={fixture.id}
         >
           {#if entry.slug === 'proposal-card'}
-            <ProposalCatalogPreview {fixture} />
+            {#await proposalPreview then module}
+              {#if module}{@const Preview = module.default}<Preview {fixture} />{/if}
+            {:catch error}<p role="alert">{String(error)}</p>{/await}
           {:else if entry.slug === 'chat-polish'}
-            <ChatPolishCatalogPreview
-              {fixture}
-              compact={chatPolishGeometry.compact}
-              stickySimulation={chatPolishGeometry.stickySimulation}
-            />
+            {#await chatPreview then module}
+              {#if module}{@const Preview = module.default}
+                <Preview
+                  {fixture}
+                  compact={chatPolishGeometry.compact}
+                  stickySimulation={chatPolishGeometry.stickySimulation}
+                />
+              {/if}
+            {:catch error}<p role="alert">{String(error)}</p>{/await}
           {:else if entry.slug === 'diagram-workbench'}
             <a
               class="diagram-workbench-link"
@@ -78,9 +94,13 @@
               <span>{m.sandbox_diagramWorkbench_open_label()}</span>
               <small>{fixture.states.length} {m.sandbox_diagramWorkbench_states_label()}</small>
             </a>
-          {:else if renderer}
-            {@const Preview = renderer.component}
-            <Preview componentId={renderer.id} {fixture} />
+          {:else}
+            {#await renderer then loaded}
+              {#if loaded}{@const Preview = loaded.component}<Preview
+                  componentId={loaded.id}
+                  {fixture}
+                />{/if}
+            {:catch error}<p role="alert">{String(error)}</p>{/await}
           {/if}
         </div>
         {#if entry.slug !== 'chat-polish'}
@@ -150,7 +170,11 @@
     {#if entry.slug === 'chat-polish'}
       <div class="chat-polish-layout" data-testid="chat-polish-layout">
         <aside class="chat-polish-sidebar" data-testid="chat-polish-sidebar">
-          <ChatPolishGeometryControls bind:geometry={chatPolishGeometry} />
+          {#await chatControls then module}
+            {#if module}{@const Controls = module.default}<Controls
+                bind:geometry={chatPolishGeometry}
+              />{/if}
+          {:catch error}<p role="alert">{String(error)}</p>{/await}
         </aside>
         <section
           class="chat-polish-examples"
