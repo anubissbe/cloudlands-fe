@@ -53,12 +53,7 @@ function renderedBox(element: Element): Box {
 }
 
 function intersects(a: Box, b: Box) {
-  return (
-    a.x < b.x + b.width &&
-    a.x + a.width > b.x &&
-    a.y < b.y + b.height &&
-    a.y + a.height > b.y
-  );
+  return a.x < b.x + b.width && a.x + a.width > b.x && a.y < b.y + b.height && a.y + a.height > b.y;
 }
 
 function fixture(names: string[], nested = false) {
@@ -118,11 +113,61 @@ describe('semantic cluster framing', () => {
     const first = path.getAttribute('d')!.match(/^M([-\d.]+),([-\d.]+)/)!;
     const transform = matrix(path);
     expect(Number(first[2]) + transform.f).toBe(nodes[0].y + nodes[0].height);
+    expect(Number(first[1]) + transform.e).toBe(nodes[0].x + nodes[0].width / 2);
+    const last = path.getAttribute('d')!.match(/L([-\d.]+),([-\d.]+)$/)!;
+    expect(Number(last[1]) + transform.e).toBe(nodes[1].x + nodes[1].width / 2);
+    expect(Number(last[2]) + transform.f).toBe(nodes[1].y);
     expect(svg.querySelectorAll('g.node')).toHaveLength(6);
     expect(svg.querySelectorAll('path')).toHaveLength(1);
+    const route = path.getAttribute('d');
+    const logicalRoute = path.dataset.manhattanPoints;
     reserveFlowchartClusterHeaderBands(svg, membership);
     expect(renderedBox(svg.querySelector('g.cluster > rect')!)).toEqual(frame);
     expect([...svg.querySelectorAll('g.node > rect')].map(renderedBox)).toEqual(nodes);
+    expect(path.getAttribute('d')).toBe(route);
+    expect(path.dataset.manhattanPoints).toBe(logicalRoute);
+  });
+
+  it('retargets a straight horizontal connector to a moved outsider in path coordinates', () => {
+    const svg = fixture(['A', 'B', 'C', 'D', 'E', 'F']);
+    const membership = snapshotFlowchartClusterMembership([{ id: 'workers', nodes: ['B'] }]);
+    const path = svg.querySelector('path')!;
+    path.id = 'render-L_B_E_0';
+    // The path has its own coordinate system in addition to the translated graph.
+    path.setAttribute('transform', 'translate(5, -7)');
+    path.setAttribute('d', 'M155,167L295,167');
+    const before = renderedBox(svg.querySelector('#render-flowchart-E-4 > rect')!);
+    reserveFlowchartClusterHeaderBands(svg, membership);
+    const source = renderedBox(svg.querySelector('#render-flowchart-B-1 > rect')!);
+    const target = renderedBox(svg.querySelector('#render-flowchart-E-4 > rect')!);
+    expect(target.x).toBeGreaterThan(before.x);
+    const points = [...path.getAttribute('d')!.matchAll(/[ML]([-\d.]+),([-\d.]+)/g)].map(
+      (match) => ({ x: Number(match[1]) + matrix(path).e, y: Number(match[2]) + matrix(path).f }),
+    );
+    expect(points).toEqual([
+      { x: source.x + source.width, y: source.y + source.height / 2 },
+      { x: target.x, y: target.y + target.height / 2 },
+    ]);
+    expect(path.getAttribute('marker-end')).toBe('url(#arrow)');
+    const route = path.getAttribute('d');
+    reserveFlowchartClusterHeaderBands(svg, membership);
+    expect(path.getAttribute('d')).toBe(route);
+  });
+
+  it('leaves a straight connector unchanged when neither endpoint moves', () => {
+    const svg = fixture(['A', 'B', 'C', 'D', 'E', 'F']);
+    const membership = snapshotFlowchartClusterMembership([{ id: 'workers', nodes: ['B'] }]);
+    const path = svg.querySelector('path')!;
+    path.id = 'render-L_B_C_0';
+    path.setAttribute('d', 'M120,180L120,280');
+    const route = path.getAttribute('d');
+    const before = [...svg.querySelectorAll('g.node > rect')].map(renderedBox);
+    reserveFlowchartClusterHeaderBands(svg, membership);
+    const nodes = [...svg.querySelectorAll('g.node > rect')].map(renderedBox);
+    expect(nodes[0]).not.toEqual(before[0]);
+    expect(nodes.slice(1, 3)).toEqual(before.slice(1, 3));
+    expect(path.getAttribute('d')).toBe(route);
+    expect(path.dataset.manhattanPoints).toBeUndefined();
   });
 
   it('keeps both authored members and encloses a supported nested group', () => {

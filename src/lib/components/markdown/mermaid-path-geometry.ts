@@ -1,7 +1,4 @@
-import {
-  flowchartClusterId,
-  type FlowchartClusterMembership,
-} from './mermaid-cluster-membership';
+import { flowchartClusterId, type FlowchartClusterMembership } from './mermaid-cluster-membership';
 
 const ORTHOGONAL_CORNER_RADIUS = 6;
 const FLOWCHART_PORT_SLOT_GAP = 16;
@@ -827,7 +824,7 @@ export function applyMermaidTerminalGaps(svg: SVGSVGElement, cssGap = 5) {
   }
 }
 
-function parseOrthogonalLinePath(pathData: string): Point[] | null {
+function parseOrthogonalLinePath(pathData: string, minimumPoints: 2 | 3 = 3): Point[] | null {
   const numberPattern = '-?(?:\\d+(?:\\.\\d*)?|\\.\\d+)(?:e[-+]?\\d+)?';
   const tokens = pathData.match(new RegExp(`[ML]|${numberPattern}`, 'gi'));
   const residue = pathData.replace(new RegExp(`[ML]|${numberPattern}|[\\s,]`, 'gi'), '').trim();
@@ -847,7 +844,7 @@ function parseOrthogonalLinePath(pathData: string): Point[] | null {
     index += 1;
     command = 'L';
   }
-  if (points.length < 3) return null;
+  if (points.length < minimumPoints) return null;
   return points.slice(1).every((point, index) => {
     const previous = points[index];
     return Math.abs(point.x - previous.x) < 0.001 || Math.abs(point.y - previous.y) < 0.001;
@@ -1264,7 +1261,8 @@ export function reserveFlowchartClusterHeaderBands(
   const routes = membership
     ? [...svg.querySelectorAll<SVGPathElement>('.edgePaths path')].flatMap((path) => {
         const identity = flowchartEdgeIdentity(path);
-        const points = parseOrthogonalLinePath(path.getAttribute('d') ?? '');
+        // Straight connectors need terminal updates too when an endpoint moves.
+        const points = parseOrthogonalLinePath(path.getAttribute('d') ?? '', 2);
         if (!identity || !points) return [];
         const endpoint = (id: string) => {
           const node = flowchartNode(svg, id);
@@ -1302,9 +1300,7 @@ export function reserveFlowchartClusterHeaderBands(
     const memberFrames = record.members.flatMap((node) => {
       const shape = shapeForNode(node);
       const bounds =
-        membership && shape
-          ? boundsInPathSpace(shape, record.cluster)
-          : flowchartNodeBounds(node);
+        membership && shape ? boundsInPathSpace(shape, record.cluster) : flowchartNodeBounds(node);
       return bounds ? [bounds] : [];
     });
     const content = [...memberFrames, ...childFrames];
@@ -1340,9 +1336,7 @@ export function reserveFlowchartClusterHeaderBands(
     let bottom = Math.max(record.frame.y + record.frame.height, maxContentY + 20);
     if (
       membership &&
-      outside.some((box) =>
-        boundsOverlap({ x, y, width: right - x, height: bottom - y }, box, 12),
-      )
+      outside.some((box) => boundsOverlap({ x, y, width: right - x, height: bottom - y }, box, 12))
     ) {
       // Mermaid can widen a frame for its title after placing nodes. Rebuild the
       // unsafe allocation from semantic members, never from captured outsiders.
@@ -1409,8 +1403,7 @@ export function reserveFlowchartClusterHeaderBands(
     const roots = unrelated.filter(
       (candidate) =>
         !unrelated.some(
-          (parent) =>
-            parent !== candidate && candidate.id && parent.memberIds?.has(candidate.id),
+          (parent) => parent !== candidate && candidate.id && parent.memberIds?.has(candidate.id),
         ),
     );
     const units: SVGGraphicsElement[][] = roots.map((root) => [
@@ -5036,7 +5029,7 @@ function positionCompactGroupedFlowchart(
       (left, right) =>
         (left.memberIds?.size ?? 0) - (right.memberIds?.size ?? 0) ||
         left.originalRect.width * left.originalRect.height -
-        right.originalRect.width * right.originalRect.height,
+          right.originalRect.width * right.originalRect.height,
     )) {
       const memberBounds = record.members.flatMap((node) => {
         const bounds = projected.get(node);

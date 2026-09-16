@@ -136,13 +136,26 @@ function expectAttachment(point: Point, adjacent: Point, node: ComputedNode) {
 function expectClearRoutes(layout: ComputedLayout) {
   for (const edge of layout.edges) {
     const points = edge.points!;
-    expectAttachment(points[0], points[1], layout.nodes.find(({ id }) => id === edge.from)!);
-    expectAttachment(points.at(-1)!, points.at(-2)!, layout.nodes.find(({ id }) => id === edge.to)!);
+    expectAttachment(
+      points[0],
+      points[1],
+      layout.nodes.find(({ id }) => id === edge.from)!,
+    );
+    expectAttachment(
+      points.at(-1)!,
+      points.at(-2)!,
+      layout.nodes.find(({ id }) => id === edge.to)!,
+    );
     for (const [index, end] of points.slice(1).entries()) {
       const start = points[index];
       expect(start.x === end.x || start.y === end.y).toBe(true);
       expect(start).not.toEqual(end);
-      for (const node of layout.nodes) expect(enters(start, end, node), edge.id).toBe(false);
+      for (const node of layout.nodes) {
+        expect(
+          enters(start, end, node),
+          `${edge.id}/${node.id}: ${JSON.stringify({ start, end, node })}`,
+        ).toBe(false);
+      }
       for (const other of layout.edges.filter((other) => other !== edge)) {
         for (const [i, otherEnd] of other.points!.slice(1).entries()) {
           const otherStart = other.points![i];
@@ -215,7 +228,9 @@ describe('custom return corridor simplification', () => {
     it(`keeps renamed and reordered ${example.state.id} routes compact and directed`, () => {
       const renamed = structuredClone(example);
       const names = new Map(renamed.model.nodes.map(({ id }, index) => [id, `node-${9 - index}`]));
-      const edgeNames = new Map(renamed.model.edges.map(({ id }, index) => [id, `edge-${9 - index}`]));
+      const edgeNames = new Map(
+        renamed.model.edges.map(({ id }, index) => [id, `edge-${9 - index}`]),
+      );
       renamed.model.nodes = renamed.model.nodes.reverse().map((node, index) => ({
         ...node,
         id: names.get(node.id)!,
@@ -237,7 +252,10 @@ describe('custom return corridor simplification', () => {
       renamed.returnId = edgeNames.get(renamed.returnId)!;
       const layout = stateLayout(renamed, 56);
       for (const edge of layout.edges) {
-        expect(edge.points!.length).toBeLessThanOrEqual(4);
+        expect(
+          edge.points!.length,
+          `${edge.id}: ${JSON.stringify(edge.points)}`,
+        ).toBeLessThanOrEqual(4);
         const original = renamed.model.edges.find(({ id }) => id === edge.id)!;
         expect(edge).toMatchObject({ from: original.from, to: original.to, label: original.label });
       }
@@ -270,6 +288,45 @@ describe('custom return corridor simplification', () => {
     );
     for (const edge of layout.edges) {
       expect(reversed.edges.find(({ id }) => id === edge.id)!.points).toEqual(edge.points);
+    }
+  });
+
+  it('replaces an obstructed bottom departure without crossing either endpoint body', () => {
+    const layout = computeLayout(
+      {
+        nodes: [
+          { id: 'a', label: 'A', position: { x: 0, y: 0 }, size: { width: 140, height: 48 } },
+          { id: 'b', label: 'B', position: { x: 300, y: 32 }, size: { width: 140, height: 48 } },
+          {
+            id: 'block',
+            label: 'Block',
+            position: { x: 0, y: 64 },
+            size: { width: 140, height: 48 },
+          },
+        ],
+        edges: [
+          { id: 'out', from: 'a', to: 'b', label: 'starts work' },
+          { id: 'back', from: 'b', to: 'a', label: 'returns result' },
+        ],
+      },
+      { layout: { type: 'layered', direction: 'LR', edgeRouting: 'orthogonal' } },
+      'architecture',
+    );
+    // The return fits between facing sides. The outbound route must use the free
+    // top ports, not retain a shorter route through the lower sibling or an endpoint.
+    expect(layout.edges[1].points).toHaveLength(2);
+    expect(layout.edges[0].points).toHaveLength(4);
+    expect(Math.min(...layout.edges[0].points!.map(({ y }) => y))).toBeLessThan(0);
+    expectClearRoutes(layout);
+    for (const edge of layout.edges) {
+      const label = midpointLabel(edge);
+      const opposite = { x: label.x + label.width, y: label.y + label.height };
+      for (const node of layout.nodes) expect(enters(label, opposite, node)).toBe(false);
+      for (const other of layout.edges.filter((other) => other !== edge)) {
+        other.points!.slice(1).forEach((end, index) => {
+          expect(enters(other.points![index], end, label, 2)).toBe(false);
+        });
+      }
     }
   });
 

@@ -830,18 +830,26 @@ describe('Edge Routing', () => {
   it('keeps forward and return routes on separate lanes', () => {
     const diagram = createArchitectureDiagram(
       [
-        { id: 'left', label: 'Left', position: { x: 0, y: 0 } },
-        { id: 'right', label: 'Right', position: { x: 320, y: 0 } },
+        { id: 'left', label: 'Left' },
+        { id: 'right', label: 'Right' },
       ],
       [
-        { id: 'forward', from: 'left', to: 'right' },
-        { id: 'return', from: 'right', to: 'left' },
+        { from: 'left', to: 'right' },
+        { from: 'right', to: 'left' },
       ],
     );
+    // The template accepts semantic nodes only; author positions on the actual model.
+    diagram.model.nodes[0].position = { x: 0, y: 0 };
+    diagram.model.nodes[1].position = { x: 320, y: 0 };
     diagram.baseView.layout.type = 'manual';
+    diagram.baseView.layout.direction = 'LR';
     diagram.baseView.layout.edgeRouting = 'orthogonal';
 
     const layout = computeLayout(diagram.model, diagram.baseView, diagram.grammar);
+    const left = layout.nodes.find(({ id }) => id === 'left')!;
+    const right = layout.nodes.find(({ id }) => id === 'right')!;
+    expect(left.x + left.width).toBeLessThan(right.x);
+    expect(left.y + left.height / 2).toBeCloseTo(right.y + right.height / 2);
     const [forward, returnEdge] = layout.edges;
     expect(returnEdge.points).toHaveLength(2);
     expect(forward.points![0]).not.toEqual(returnEdge.points!.at(-1));

@@ -3026,14 +3026,17 @@ function computeOrthogonalEdgePaths(
         (groupId): groupId is string => groupId !== undefined,
       ),
     );
-    const nodeObstacles = nodes
-      .filter((node) => node.id !== info.fromNode.id && node.id !== info.toNode.id)
-      .map((node) => ({
-        left: node.x - ROUTE_NODE_CLEARANCE,
-        right: node.x + node.width + ROUTE_NODE_CLEARANCE,
-        top: node.y - ROUTE_NODE_CLEARANCE,
-        bottom: node.y + node.height + ROUTE_NODE_CLEARANCE,
-      }));
+    const nodeObstacles = nodes.map((node) => {
+      // Endpoint boundaries are valid attachments, but their interiors are never lanes.
+      const clearance =
+        node.id === info.fromNode.id || node.id === info.toNode.id ? 0 : ROUTE_NODE_CLEARANCE;
+      return {
+        left: node.x - clearance,
+        right: node.x + node.width + clearance,
+        top: node.y - clearance,
+        bottom: node.y + node.height + clearance,
+      };
+    });
     const groupObstacles = (groups ?? [])
       .filter((group) => !endpointGroups.has(group.id) && group.width > 0 && group.height > 0)
       .map((group) => ({
@@ -3541,8 +3544,7 @@ function computeOrthogonalEdgePaths(
     .map((info, index) => ({ info, route: computedEdges[index] }))
     .toSorted(
       (a, b) =>
-        Number(a.info.fromNode.x < a.info.toNode.x) -
-          Number(b.info.fromNode.x < b.info.toNode.x) ||
+        Number(a.info.fromNode.x < a.info.toNode.x) - Number(b.info.fromNode.x < b.info.toNode.x) ||
         a.info.fromNode.x - b.info.fromNode.x ||
         a.info.fromNode.y - b.info.fromNode.y ||
         a.info.toNode.x - b.info.toNode.x ||
@@ -3588,11 +3590,26 @@ function computeOrthogonalEdgePaths(
         const size = other.label ? measureEdgeLabel(other.label) : undefined;
         return (other.points ?? []).slice(1).map((end, index) => {
           const start = other.points![index];
+          const horizontal = Math.abs(start.y - end.y) < 0.001;
+          const labelFits =
+            size &&
+            Math.hypot(end.x - start.x, end.y - start.y) >=
+              (horizontal ? size.width : size.height) + 16;
+          // Reserve the shaft and fitted label across the lane, not a label-sized
+          // extension past every turn/port (including legs too short for a label).
+          const paddingX = Math.max(
+            TRACK_SPACING,
+            labelFits && !horizontal ? size.width / 2 + 2 : 0,
+          );
+          const paddingY = Math.max(
+            TRACK_SPACING,
+            labelFits && horizontal ? size.height / 2 + 2 : 0,
+          );
           return {
-            left: Math.min(start.x, end.x) - Math.max(TRACK_SPACING, (size?.width ?? 0) / 2 + 2),
-            right: Math.max(start.x, end.x) + Math.max(TRACK_SPACING, (size?.width ?? 0) / 2 + 2),
-            top: Math.min(start.y, end.y) - Math.max(TRACK_SPACING, (size?.height ?? 0) / 2 + 2),
-            bottom: Math.max(start.y, end.y) + Math.max(TRACK_SPACING, (size?.height ?? 0) / 2 + 2),
+            left: Math.min(start.x, end.x) - paddingX,
+            right: Math.max(start.x, end.x) + paddingX,
+            top: Math.min(start.y, end.y) - paddingY,
+            bottom: Math.max(start.y, end.y) + paddingY,
           };
         });
       });
@@ -3607,7 +3624,10 @@ function computeOrthogonalEdgePaths(
     );
     if (top <= bottom) {
       for (const y of [(top + bottom) / 2, top, bottom]) {
-        candidates.push([{ x: sourceX, y }, { x: targetX, y }]);
+        candidates.push([
+          { x: sourceX, y },
+          { x: targetX, y },
+        ]);
       }
     }
     const source = { x: sourceX, y: fromNode.y + fromNode.height / 2 };
@@ -3647,11 +3667,13 @@ function computeOrthogonalEdgePaths(
           );
         });
       });
+    const originalIsBlocked = routeEntersObstacles(route.points, boxes);
     const simpler = candidates
       .map(simplifyOrthogonalPoints)
       .filter(
         (points) =>
-          (points.length < route.points!.length ||
+          (originalIsBlocked ||
+            points.length < route.points!.length ||
             (points.length === route.points!.length &&
               routeLength(points) < routeLength(route.points!))) &&
           !routeEntersObstacles(points, obstacles) &&

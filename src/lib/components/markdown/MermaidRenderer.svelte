@@ -33,6 +33,7 @@
   } from './mermaid-cluster-membership';
   import { addMermaidLabelKnockouts, insertLabelKnockout } from './mermaid-label-knockouts';
   import { loadMermaidTextFont } from './mermaid-font-loading';
+  import { ensureMermaidLabelContrast } from './mermaid-label-contrast';
   import {
     alignMermaidOpenArrowheads,
     applyMermaidTerminalGaps,
@@ -1304,7 +1305,9 @@ ${source}`;
     await document.fonts?.ready;
     if (generation !== renderGeneration) return false;
     const svg = rendererElement?.querySelector<SVGSVGElement>('.mermaid-svg svg');
-    if (!svg || typeof svg.getBBox !== 'function') return false;
+    if (!svg) return false;
+    ensureMermaidLabelContrast(svg, clusterMembership);
+    if (typeof svg.getBBox !== 'function') return false;
     delete svg.dataset.layoutSettled;
     replaceSequenceActorFigures(svg);
     alignMermaidOpenArrowheads(svg);
@@ -2190,12 +2193,10 @@ ${source}`;
   .mermaid-presentation :global(.group-label) {
     font-family: var(--font-ui) !important;
     font-weight: 500 !important;
-    color: var(--diagram-metadata) !important;
-    fill: var(--diagram-metadata) !important;
   }
 
-  .mermaid-presentation :global(.cluster-label :is(text, tspan)),
-  .mermaid-presentation :global(.cluster-label foreignObject *) {
+  .mermaid-presentation :global(.edgeLabel),
+  .mermaid-presentation :global(.group-label) {
     color: var(--diagram-metadata) !important;
     fill: var(--diagram-metadata) !important;
   }

@@ -79,6 +79,25 @@ describe('MermaidRenderer theme updates', () => {
     expect(mermaidMocks.initialize).toHaveBeenCalledOnce();
   });
 
+  it('reapplies local contrast to new SVG output after a live theme change', async () => {
+    const output = async () => ({
+      svg: `<svg aria-roledescription="flowchart-v2" style="background-color:${document.documentElement.style.getPropertyValue('--diagram-canvas')}">
+        <g class="node"><rect style="fill:none"/><g class="label">
+          <text style="fill:#ffffff">Present label</text>
+        </g></g></svg>`,
+    });
+    mermaidMocks.render.mockImplementationOnce(output).mockImplementationOnce(output);
+    const result = render(MermaidRenderer, { code: 'flowchart TB\nA[Present label]' });
+    await waitFor(() =>
+      expect(result.container.querySelector<SVGElement>('text')?.style.fill).toBe('rgb(0, 0, 0)'),
+    );
+    document.documentElement.style.setProperty('--diagram-canvas', '#000000');
+    await waitFor(() => expect(mermaidMocks.render).toHaveBeenCalledTimes(2));
+    await waitFor(() =>
+      expect(result.container.querySelector<SVGElement>('text')?.style.fill).toBe('#ffffff'),
+    );
+  });
+
   it('keeps class diagrams on SVG labels for geometry repair', async () => {
     render(MermaidRenderer, { code: 'classDiagram\n  class PreviewDefinition' });
     await waitFor(() => expect(mermaidMocks.initialize).toHaveBeenCalledOnce());
@@ -182,9 +201,7 @@ describe('MermaidRenderer theme updates', () => {
     const view = render(MermaidRenderer, {
       code: 'flowchart TB\nsubgraph workers\nB\nend',
     });
-    await waitFor(() =>
-      expect(mermaidMocks.mermaidAPI.getDiagramFromText).toHaveBeenCalledOnce(),
-    );
+    await waitFor(() => expect(mermaidMocks.mermaidAPI.getDiagramFromText).toHaveBeenCalledOnce());
     await view.rerender({ code: 'sequenceDiagram\nA->>B: Current' });
     finish({
       type: 'flowchart-v2',

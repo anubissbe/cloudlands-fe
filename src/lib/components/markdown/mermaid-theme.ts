@@ -65,8 +65,13 @@ export function createMermaidConfig(styles: TokenStyle, htmlLabels = true): Merm
     // Mermaid scopes this CSS to its SVG before measuring temporary HTML labels.
     // A global reduced-motion duration otherwise animates their initial 2000px
     // dimensions, so Dagre reads the placeholder rather than the measured label.
-    themeCSS:
+    themeCSS: [
       '.label, foreignObject { transition-property: opacity, color, background-color !important; }',
+      // Defaults only: authored foregrounds win; the mounted label contrast pass
+      // checks each node/header against its own effective surface.
+      `.cluster-label text { fill: ${metadata}; }`,
+      `.cluster-label span { color: ${metadata}; }`,
+    ].join('\n'),
     flowchart: {
       useMaxWidth: false,
       curve: 'stepAfter',

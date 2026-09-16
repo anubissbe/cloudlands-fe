@@ -32,9 +32,7 @@ describe('CatalogFixtureList real previews', () => {
     await view.rerender({ entry });
 
     for (const fixture of entry.fixtures) {
-      const preview = view.container.querySelector(
-        `[data-catalog-fixture-id="${fixture.id}"]`,
-      )!;
+      const preview = view.container.querySelector(`[data-catalog-fixture-id="${fixture.id}"]`)!;
       const link = within(preview as HTMLElement).getByRole('link');
       const destination = new URL(link.getAttribute('href')!, 'https://intent.test');
       expect(destination.pathname).toBe('/sandbox/diagram-workbench');
