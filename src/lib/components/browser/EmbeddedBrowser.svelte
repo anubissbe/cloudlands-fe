@@ -9,10 +9,10 @@
    * - Loading indicator
    * - Error handling
    */
-  import { onMount, tick } from 'svelte';
+  import { onMount, tick, untrack } from 'svelte';
   import { createLogger } from '$lib/utils/client-logger';
   import { Button } from '$lib/components/ui/button';
-  import { toast } from '$lib/components/ui/toast';
+  import { notify } from '$lib/components/patterns/notify';
   import type { BrowserTabViewport } from '$shared/ipc/workspace-command-payloads';
   import { BROWSER_PANEL_PARTITION, BROWSER_PROTOCOLS } from '../../../shared/constants';
   import { writeTextToClipboard } from '$lib/utils/clipboard';
@@ -38,8 +38,6 @@
     isValidBrowserUrl,
     normalizeBrowserAddressInput,
   } from './embedded-browser-url-validation';
-  import { navigateToAgent } from '$lib/utils/workspace-navigation';
-  import InlineAgentAvatar from '$lib/components/chat/InlineAgentAvatar.svelte';
   import Fa from 'svelte-fa';
   import {
     faArrowLeft,
@@ -47,9 +45,9 @@
     faRefresh,
     faLock,
     faExclamationTriangle,
-    faTimes,
   } from '@fortawesome/free-solid-svg-icons';
   import Input from '../ui/input/input.svelte';
+  import { IntentMarkLoader } from '$lib/components/ui/indicators';
   import { store as appStore } from '$store/renderer/store';
   import { m } from '$shared/paraglide/messages.js';
   import { matchesShortcut } from '$lib/utils/shortcut-bindings';
@@ -77,7 +75,6 @@
     /** Unique tab ID for CDP registration */
     tabId?: string;
     onNavigate?: (url: string) => void;
-    onClose?: () => void;
     onTitleChange?: (title: string) => void;
     onFaviconChange?: (faviconUrl: string) => void;
     onFocus?: () => void;
@@ -89,8 +86,6 @@
     isActive?: boolean;
     /** Agent owning this tab (monorepo#2857); absent for unowned (user) tabs. */
     ownerAgentId?: string;
-    /** Resolved display name of the owning agent for the toolbar chip. */
-    ownerAgentName?: string;
     /** Persisted viewport mode for this tab; legacy tabs default to fit. */
     viewport?: BrowserTabViewport;
     onViewportChange?: (viewport: BrowserTabViewport) => void;
@@ -101,7 +96,6 @@
     workspaceId: _workspaceId,
     tabId,
     onNavigate,
-    onClose,
     onTitleChange,
     onFaviconChange,
     onFocus,
@@ -109,7 +103,6 @@
     isFocused = false,
     isActive = true,
     ownerAgentId,
-    ownerAgentName,
     viewport = { mode: 'fit' },
     onViewportChange,
   }: Props = $props();
@@ -592,7 +585,9 @@
       updateNavigationState();
     });
 
-    addWebviewListener('did-navigate-in-page', (e: any) => {
+    addWebviewListener('did-navigate-in-page', (e: { url: string; isMainFrame: boolean }) => {
+      // Iframe history changes must not replace the tab URL or webview src (intent#4767).
+      if (!e.isMainFrame) return;
       currentWebviewUrl = e.url;
       displayUrl = e.url;
       isSecure = e.url?.startsWith('https://');
@@ -848,29 +843,29 @@
   async function copyCurrentUrl() {
     const urlToCopy = currentLoadedUrl();
     if (!urlToCopy) {
-      toast.error(m.browser_embedded_noUrlToCopy_error());
+      notify.error(m.browser_embedded_noUrlToCopy_error());
       return;
     }
     try {
       await writeTextToClipboard(urlToCopy);
-      toast.success(m.browser_embedded_urlCopied_label());
+      notify.success(m.browser_embedded_urlCopied_label());
     } catch (error) {
       logger.error('Failed to copy browser URL', error, { url: urlToCopy });
-      toast.error(m.browser_embedded_copyFailed_error());
+      notify.error(m.browser_embedded_copyFailed_error());
     }
   }
 
   async function openInExternalBrowser() {
     const targetUrl = currentLoadedUrl();
     if (!targetUrl) {
-      toast.error(m.browser_embedded_noUrlToOpen_error());
+      notify.error(m.browser_embedded_noUrlToOpen_error());
       return;
     }
     try {
       await invoke('shell:openExternal', { url: targetUrl });
     } catch (error) {
       logger.error('Failed to open browser URL externally', error, { url: targetUrl });
-      toast.error(m.browser_embedded_openExternalFailed_error());
+      notify.error(m.browser_embedded_openExternalFailed_error());
     }
   }
 
@@ -895,7 +890,7 @@
     const targetAgentId =
       selectMostRecentAgentTab.select(appStore.state, _workspaceId)?.agentId ?? ownerAgentId;
     if (!targetAgentId) {
-      toast.error(m.browser_embedded_noTargetAgent_error());
+      notify.error(m.browser_embedded_noTargetAgent_error());
       return;
     }
     appStore.dispatch(
@@ -922,7 +917,7 @@
       dispatchBrowserCapture(parseCapturedImage(image.toDataURL()));
     } catch (error) {
       logger.error('Failed to capture browser screenshot', error);
-      toast.error(m.browser_embedded_screenshotFailed_error());
+      notify.error(m.browser_embedded_screenshotFailed_error());
     }
   }
 
@@ -941,7 +936,7 @@
       dispatchBrowserCapture(parseCapturedImage(image.toDataURL()), element);
     } catch (error) {
       logger.error('Failed to capture selected browser element', error);
-      toast.error(m.browser_embedded_screenshotFailed_error());
+      notify.error(m.browser_embedded_screenshotFailed_error());
     }
   }
 
@@ -1042,11 +1037,15 @@
     Workaround for Electron bug #43314: Hide webview during URL switch.
     When isRecreatingWebview is true, the webview is removed from DOM.
     When it becomes false, a fresh webview is created with the new URL.
+    Read src only when mounting: reflecting did-navigate/in-page back into
+    Electron's src attribute issues a second navigation and reloads SPA pages.
+    Electron maintains its own live src attribute for guest recreation on reparenting.
+    Explicit navigation uses loadURL; a newly mounted guest reads the latest URL.
   -->
   <webview
     bind:this={webviewRef}
     class="w-full h-full border-none"
-    src={currentWebviewUrl}
+    src={untrack(() => currentWebviewUrl)}
     partition={BROWSER_PANEL_PARTITION}
     allowpopups
     use:reportTabBounds={tabId}
@@ -1098,21 +1097,17 @@
         tooltipSide="bottom"
         aria-label={m.browser_embedded_refresh_ariaLabel()}
       >
-        <Fa icon={faRefresh} size="xs" class={isLoading ? 'animate-spin' : ''} />
+        {#if isLoading}
+          <IntentMarkLoader size={12} />
+        {:else}
+          <Fa icon={faRefresh} size="xs" />
+        {/if}
       </Button>
     </div>
 
     <!-- Page identity / editable address -->
     <div class="flex min-w-0 flex-1 items-center gap-2">
-      {#if ownerAgentId}
-        <span data-browser-owner-chip={ownerAgentId} class="flex shrink-0">
-          <InlineAgentAvatar
-            agentId={ownerAgentId}
-            agentName={ownerAgentName}
-            onclick={() => void navigateToAgent(ownerAgentId)}
-          />
-        </span>
-      {:else if faviconUrl}
+      {#if faviconUrl}
         <img src={faviconUrl} alt="" class="size-5 shrink-0 rounded-sm" data-browser-page-favicon />
       {/if}
 
@@ -1133,12 +1128,16 @@
               placeholder={m.browser_embedded_url_placeholder()}
               aria-label={m.browser_embedded_addressInput_ariaLabel()}
             />
-            <button type="submit" class="sr-only">{m.browser_embedded_go_label()}</button>
+            <Button type="submit" variant="ghost" size="xs" class="sr-only">
+              {m.browser_embedded_go_label()}
+            </Button>
           </form>
         {:else}
-          <button
+          <Button
             type="button"
-            class="relative z-10 flex h-full min-w-0 flex-1 cursor-text items-center gap-1.5 rounded-sm text-left outline-none hover:bg-muted/30 focus-visible:ring-1 focus-visible:ring-ring"
+            variant="ghost"
+            size="sm"
+            class="relative z-10 flex h-full min-w-0 flex-1 cursor-text items-center gap-1.5 rounded-sm text-left outline-none focus-visible:ring-1 focus-visible:ring-focus-ring"
             onclick={() => void focusUrlInput()}
             aria-label={m.browser_embedded_editAddress_ariaLabel()}
           >
@@ -1153,7 +1152,7 @@
                 >{pageHostname}</span
               >
             {/if}
-          </button>
+          </Button>
         {/if}
         <span
           aria-hidden="true"
@@ -1204,23 +1203,6 @@
         onReloadWithoutCache={reloadWithoutCache}
       />
     </div>
-
-    <!-- Actions -->
-    <div class="flex gap-0.5">
-      {#if onClose}
-        <Button
-          variant="ghost-light"
-          size="icon-xs"
-          onclick={onClose}
-          tooltip={m.browser_embedded_close_tooltip()}
-          tooltipShortcut="esc"
-          tooltipSide="bottom"
-          aria-label={m.browser_embedded_close_ariaLabel()}
-        >
-          <Fa icon={faTimes} size="xs" />
-        </Button>
-      {/if}
-    </div>
   </div>
 
   <!-- Error banner -->
@@ -1255,7 +1237,7 @@
               {m.browser_embedded_selfLoadBlocked_description()}
             {/if}
           </p>
-          <p class="text-xs mt-2 opacity-50 max-w-md break-all">{url}</p>
+          <p class="text-xs mt-2 max-w-md break-all text-muted-foreground">{url}</p>
         </div>
       </div>
     {:else}

@@ -1,4 +1,6 @@
 import { expect, test } from '@playwright/experimental-ct-svelte';
+import { recordCdpLifecycle } from '../../../../test/ct-cdp-lifecycle-recorder';
+import { isolateBrowserContextPerTest } from '../../../../test/ct-isolated-browser-context';
 import ChatPanelComposerGeometryHost from './ChatPanelComposerGeometryHost.svelte';
 import {
   applyAuroraPaintProbe,
@@ -8,6 +10,15 @@ import {
 } from './aurora-panel-pixels';
 
 test.setTimeout(120_000);
+
+// The first mount after the 'regular narrow dark at 200%' cell ('Chief wide dark
+// at 100%') intermittently failed with "Execution context was destroyed" on the
+// merge queue (intent-hq/intent#4783) — the same signature fe#2158 fixed for the
+// operational-geometry spec. Give every cell its own browser context so a heavy
+// zoom-200% teardown never races the next mount, and record the CDP lifecycle so
+// a recurrence reports the real event ordering.
+isolateBrowserContextPerTest(test, 'intent-hq/intent#4783');
+recordCdpLifecycle(test);
 
 const regularStates = (['light', 'dark'] as const).flatMap((theme) =>
   [1, 2].flatMap((zoom) =>
@@ -71,9 +82,9 @@ for (const state of states) {
       const actionBox = action.getBoundingClientRect();
       const style = getComputedStyle(node);
       const probe = document.createElement('div');
-      probe.className = 'bg-sidebar';
+      probe.className = 'bg-surface-2';
       document.body.append(probe);
-      const sidebarBackground = getComputedStyle(probe).backgroundColor;
+      const surfaceBackground = getComputedStyle(probe).backgroundColor;
       probe.remove();
       return {
         box: [box.left, box.top, box.right, box.bottom],
@@ -81,7 +92,7 @@ for (const state of states) {
         prompt: [promptBox.left, promptBox.top, promptBox.right, promptBox.bottom],
         lane: [laneBox.left, laneBox.top, laneBox.right, laneBox.bottom],
         background: style.backgroundColor,
-        sidebarBackground,
+        surfaceBackground,
         borders: [
           style.borderTopWidth,
           style.borderRightWidth,
@@ -96,7 +107,7 @@ for (const state of states) {
       };
     });
 
-    expect(geometry.background).toBe(geometry.sidebarBackground);
+    expect(geometry.background).toBe(geometry.surfaceBackground);
     expect(geometry.borders).toEqual(['0px', '0px', '0px', '0px']);
     expect(geometry.radii[0]).toBe(geometry.radii[1]);
     expect(Number.parseFloat(geometry.radii[0])).toBeGreaterThan(0);

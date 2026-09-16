@@ -3,6 +3,7 @@
  *
  * AgentTabType — read-only "Harness vX.Y" entry in the panel actions (⋯)
  * menu (PROTOCOL §5.5 `harnessVersion` / `harnessFeatures`; monorepo#2459).
+ * protocol-version-ok-file: "Harness v1.0" fixtures are `harnessVersion` values.
  *
  * Mirrors AgentCard-harness-version.test.ts for the tab menu: renders the
  * agentActions snippet through the real panel-header context and real Menu
@@ -37,6 +38,8 @@ const mockState = vi.hoisted(() => {
     defaultModel: store('auggie:default'),
     dispatch: vi.fn(),
     agents: store<Record<string, any>>({}),
+    panels: {} as Record<string, any>,
+    hiddenTabs: [] as any[],
   };
 });
 
@@ -60,6 +63,16 @@ vi.mock('$store/renderer/slices/workspace-agents/workspace-agents-selectors', ()
     subscribe: (run: (value: string | null) => void) => (run(null), () => {}),
   }),
 }));
+vi.mock('$store/renderer/slices/panel-layout/panel-layout-selectors', () => {
+  const readable = (getter: () => unknown) => ({
+    subscribe: (run: (value: unknown) => void) => (run(getter()), () => {}),
+  });
+  const selectPanels = () => readable(() => mockState.panels);
+  selectPanels.select = () => mockState.panels;
+  const selectHiddenTabs = () => readable(() => mockState.hiddenTabs);
+  selectHiddenTabs.select = () => mockState.hiddenTabs;
+  return { selectPanels, selectHiddenTabs };
+});
 vi.mock('$store/renderer/slices/agent-session/agent-session-selectors', () => ({
   selectAgentSession: (
     agentIdStore: { subscribe: (run: (value: string) => void) => () => void } | string,
@@ -327,5 +340,54 @@ describe('AgentTabType specialist panel-actions menu item', () => {
     expect(await screen.findByText('Delete agent')).toBeTruthy();
     expect(screen.queryByText(/^Specialist:/)).toBeNull();
     expect(separatorsAfterDelete()).toBe(0);
+  });
+});
+
+describe('AgentTabType primary header actions', () => {
+  beforeEach(() => {
+    seedSession();
+    mockState.panels = {
+      browser: {
+        id: 'browser',
+        activeTabId: 'browser-1',
+        tabs: [
+          {
+            id: 'browser-1',
+            type: 'browser',
+            title: 'Docs',
+            ownerAgentId: 'agent-1',
+            closable: true,
+          },
+        ],
+      },
+    };
+    mockState.hiddenTabs = [];
+  });
+
+  afterEach(() => {
+    cleanup();
+    mockState.panels = {};
+    mockState.hiddenTabs = [];
+  });
+
+  it('renders browser tabs before the message navigator in the primary actions', async () => {
+    render(MockTabTypeHeaderHarness, {
+      props: {
+        component: AgentTabType,
+        tab: { id: 'tab-1', type: 'agent', title: 'Agent', agentId: 'agent-1' },
+        workspaceId: 'ws-1',
+        isActive: true,
+        renderPrimary: true,
+      },
+    });
+
+    const primary = await screen.findByTestId('header-primary-actions');
+    const browserTabs = await screen.findByTestId('browser-tabs-trigger');
+    const navigator = await screen.findByTestId('chat-header-navigation-controls');
+    expect(primary.contains(browserTabs)).toBe(true);
+    expect(primary.contains(navigator)).toBe(true);
+    expect(
+      browserTabs.compareDocumentPosition(navigator) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
   });
 });

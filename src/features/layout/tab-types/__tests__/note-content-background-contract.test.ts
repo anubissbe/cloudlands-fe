@@ -1,3 +1,8 @@
+// @verify-changed-triggers: ../NoteTabType.svelte, ../NoteContentSurface.svelte,
+//   src/lib/components/layout/panel-system/PanelEmptyState.svelte, src/lib/components/notes/NotesPanel.svelte,
+//   src/lib/components/notes/primitives/ReferenceBlock.svelte, src/lib/components/notes/primitives/CliBlock.svelte,
+//   src/lib/components/notes/primitives/AgentActionBlock.svelte
+
 import fs from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -33,7 +38,7 @@ describe('note content background contract', () => {
 
     expect(owner.match(/bg-background/g)).toHaveLength(1);
     expect(owner).toContain('h-full min-h-0 w-full min-w-0 bg-background');
-    expect(emptyPanel).toContain('bg-background');
+    expect(emptyPanel).toContain('bg-sidebar');
     expect(notesSidebar).not.toContain('data-note-content-surface');
     for (const widget of [reference, cli, action]) expect(widget).toContain('bg-card');
   });

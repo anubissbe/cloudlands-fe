@@ -2,6 +2,7 @@ import { defineConfig } from 'vitest/config';
 import path from 'path';
 import os from 'os';
 import { readFileSync } from 'fs';
+import { gitignoreDirExcludes } from './scripts/gitignore-dir-excludes.mjs';
 
 // CI-only tuning for shared self-hosted runners (intent-hq/monorepo#3082; the
 // recurrence class #3032/#2586/#1406/#1171/#545). The CI unit job runs on the
@@ -41,6 +42,15 @@ export default defineConfig(async () => {
       globals: true,
       environment: 'jsdom',
       setupFiles: ['./src/test-setup.ts'],
+      // Node 24's V8 Sparkplug/GC regression (nodejs/node#62393) SIGSEGVs long
+      // test runs: forks surface it as dropped files, while threads crash the
+      // controller directly. Keep process isolation and disable only Sparkplug
+      // in workers until the pinned runtime contains the upstream fix.
+      pool: 'forks',
+      execArgv: ['--no-sparkplug'],
+      // Redirects every worker's os.tmpdir() into a private root and fails the
+      // run if a test leaves a temp entry behind (see src/test-global-setup.ts).
+      globalSetup: ['./src/test-global-setup.ts'],
       // Cap workers at 50% of logical cores. Vitest defaults to one worker per
       // core; ~20 jsdom workers oversubscribe the CPU and, when the machine is
       // under external load (builds, other agents), heavy component suites blow
@@ -56,14 +66,22 @@ export default defineConfig(async () => {
       testTimeout: isCI ? 60_000 : 30_000,
       hookTimeout: isCI ? 60_000 : 30_000,
       teardownTimeout: 10000,
+      // Pin typescript-eslint's single-run inference off in every worker so the
+      // ESLint rule tests behave the same locally and on CI (cloudlands-fe#2506).
+      // typescript-estree's `inferSingleRun` turns single-run mode on under
+      // `CI=true` and then builds its TypeScript Program from the files on disk,
+      // so a type-aware `lintText` probe whose content differs from the on-disk
+      // file is typed against the disk file and type-aware rules cannot fire —
+      // a deterministic CI-only failure of tests that pass locally. `'false'`
+      // matches the local default (a watch Program over the probe's own text).
+      env: { TSESTREE_SINGLE_RUN: 'false' },
       exclude: [
         '**/node_modules/**',
         '**/dist/**',
         '**/build/**',
         '**/.{idea,git,cache,output,temp}/**',
-        // Exclude any untracked git-worktree dirs (e.g. .wt-commit-details/) so
-        // vitest doesn't double-collect their test files alongside the primary tree.
-        '**/.wt-*/**',
+        // Scratch/sandbox excludes (worktrees, probes, .dev/, etc.) come from .gitignore.
+        ...gitignoreDirExcludes(path.join(__dirname, '.gitignore')),
         'test/**', // Exclude Playwright tests directory (package-root only; do not swallow src/test/**)
         // Required CI runs this suite separately with its Node-specific setup.
         'tests/integration/**',

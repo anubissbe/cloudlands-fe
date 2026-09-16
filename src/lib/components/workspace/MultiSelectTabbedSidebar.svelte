@@ -1,9 +1,9 @@
 <script lang="ts">
   /* eslint-disable max-lines -- splitting this workspace sidebar is outside launcher-only scope */
-  import { navigateAfterWorkspaceRemoval } from '$lib/utils/workspace-navigation';
   import { isCmdClickModifier } from '$shared/utils/link-helpers';
   import type { AgentSession } from '$shared/types';
   import './multi-select-sidebar-transitions.css';
+  import { prefersReducedMotion } from '$lib/utils/reduced-motion';
   import {
     selectStagedWorkingChanges,
     selectUnstagedWorkingChanges,
@@ -25,7 +25,6 @@
   } from '$features/agent/components/agent-avatar/avatar-state';
   import { getAgentAvatarStateLabel } from '$features/agent/components/agent-avatar/avatar-state-label';
   import { Button } from '$lib/components/ui/button';
-  import { withToastCountdown } from '$lib/components/ui/toast';
   import OpenComboButton from '$features/external-editors/components/OpenComboButton.svelte';
   import ResourceIconTile from '$lib/components/shared/ResourceIconTile.svelte';
 
@@ -46,12 +45,10 @@
     selectWorkspaceHasUnreadForegroundAgents,
   } from '$store/renderer/slices/workspace-agents/workspace-agents-selectors';
   import { selectAgentIsRunning } from '$store/renderer/slices/agent-session/agent-session-selectors';
-  import { workspaceClient } from '$store/renderer/slices/workspace/utils/workspace.client';
   import { cn } from '$lib/utils';
   import { scrollFade } from '$lib/actions/scroll-fade';
   import { scheduleLayoutRead } from '$lib/utils/layout-phases';
 
-  import { loadWorkspacesRequested } from '$store/renderer/slices/workspace/workspace-slice';
   import {
     locateItemInSidebarConsumed,
     openAgentTabRequested,
@@ -67,12 +64,11 @@
   import { buildWorkspacePRPresentationModel } from './sidebar/workspace-pr-presentation';
   import { constructPrUrl, legacyWorkspacePullRequest } from './sidebar/sidebar-changes-utils';
   import { selectPrMonitors } from '$store/renderer/slices/pr-monitor/pr-monitor-selectors';
+  import { spring, type ImmediateMotionConfig as TransitionConfig } from '$lib/motion';
 
   import { onDestroy, onMount, tick } from 'svelte';
-  import { cubicIn, cubicOut } from 'svelte/easing';
   import { writable } from 'svelte/store';
   import Fa from 'svelte-fa';
-  import type { TransitionConfig } from 'svelte/transition';
   import CreateAgentSection from './CreateAgentSection.svelte';
   import ExpandableFileSearch from './sidebar/ExpandableFileSearch.svelte';
   import { FilesPanel, SidebarChangesPanel, isChildNote, isSpecNote } from './sidebar';
@@ -107,7 +103,7 @@
     selectHudAgentHasPendingQuestion,
     selectHudQuestionsByAgentId,
   } from '$store/renderer/slices/hud/hud-selectors';
-  import { deriveWizardPendingQuestions } from '$lib/components/chat/questions/wizard-gate';
+  import { deriveAgentHasPendingQuestion } from '$lib/components/chat/questions/wizard-gate';
   import {
     deriveAgentLauncherItems,
     deriveNoteLauncherItems,
@@ -124,6 +120,7 @@
     type TabId,
   } from './multi-select-sidebar-tabs';
   import { getFixedContainingBlockOffset } from './utils/fixed-containing-block';
+  import { applyContentReveal } from './utils/sidebar-card-morph';
   import { pushEscapeLayer } from '$lib/utils/escapeLayers';
   import { formatInteger } from '$lib/i18n/format';
   import { m } from '$shared/paraglide/messages.js';
@@ -235,7 +232,7 @@
     void $hudQuestionsByAgentId$;
     const hasQuestion =
       selectHudAgentHasPendingQuestion.select(appStore.state, agent.id) ||
-      deriveWizardPendingQuestions(appStore.state, agent.id, agent.messages) !== null;
+      deriveAgentHasPendingQuestion(appStore.state, agent.id, agent.messages);
     return getAvatarStateForSession(agent, { hasQuestion });
   }
 
@@ -394,14 +391,14 @@
     },
   ): TransitionConfig {
     if (cardWorkspaceId !== workspaceId) return { duration: 0 };
-    if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) return { duration: 0 };
+    if (prefersReducedMotion()) return { duration: 0 };
 
     if (sidebarTabSwitchDirection !== 'none') {
       const incomingOffset = sidebarTabSwitchDirection === 'right' ? 24 : -24;
       const offset = direction === 'expand' ? incomingOffset : -incomingOffset;
       return {
-        duration: 180,
-        easing: cubicOut,
+        duration: spring.moderate.settleMs,
+        easing: spring.moderate.exit.easing,
         css: (t, u) =>
           `opacity: ${t}; transform: translateX(${u * offset}px); will-change: opacity, transform;`,
       };
@@ -427,24 +424,26 @@
     const fixedContainingBlockOffset = getFixedContainingBlockOffset(node);
     const fixedLeft = cardRect.left - fixedContainingBlockOffset.x;
     const fixedTop = cardRect.top - fixedContainingBlockOffset.y;
+    const content = node.querySelector<HTMLElement>('[data-sidebar-expanded-content]');
 
     return {
-      duration: 300,
+      duration: spring.slow.settleMs,
       css: (t) => {
-        const shellProgress = direction === 'expand' ? cubicOut(t) : cubicIn(t);
+        const shellProgress =
+          direction === 'expand' ? spring.slow.exit.easing(t) : 1 - spring.slow.exit.easing(1 - t);
         const shellInverse = 1 - shellProgress;
-        const contentProgress = Math.max(0, Math.min(1, (t - 0.72) / 0.28));
-        return `position: fixed; left: ${fixedLeft}px; top: ${fixedTop}px; width: ${cardRect.width}px; height: ${cardRect.height}px; transform-origin: top left; transform: translate(${shellInverse * translateX}px, ${shellInverse * translateY}px) scale(${scaleX + shellProgress * (1 - scaleX)}, ${scaleY + shellProgress * (1 - scaleY)}); background-color: hsl(var(--sidebar)); --sidebar-card-content-opacity: ${contentProgress}; --sidebar-card-content-y: ${(1 - contentProgress) * 4}px; will-change: transform;`;
+        return `position: fixed; left: ${fixedLeft}px; top: ${fixedTop}px; width: ${cardRect.width}px; height: ${cardRect.height}px; transform-origin: top left; transform: translate(${shellInverse * translateX}px, ${shellInverse * translateY}px) scale(${scaleX + shellProgress * (1 - scaleX)}, ${scaleY + shellProgress * (1 - scaleY)}); background-color: hsl(var(--sidebar)); will-change: transform;`;
       },
+      tick: (t) => applyContentReveal(content, t),
     };
   }
 
   function launcherGridReveal(_node: Element): TransitionConfig {
-    if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) return { duration: 0 };
+    if (prefersReducedMotion()) return { duration: 0 };
 
     return {
-      delay: 210,
-      duration: 90,
+      delay: spring.moderate.settleMs,
+      duration: spring.fast.settleMs,
       css: (t) => `opacity: ${t};`,
     };
   }
@@ -634,39 +633,6 @@
     });
   }
 
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  async function handleArchiveWorkspace() {
-    if (!$workspace) return;
-    const { toast } = await import('svelte-sonner');
-    const workspaceTitle = $workspace.title || m.workspace_multiSelectSidebar_space_label();
-
-    const result = await workspaceClient.archive($workspace.id);
-    if (result.ok) {
-      appStore.dispatch(loadWorkspacesRequested());
-      toast.warning(
-        m.workspace_multiSelectSidebar_archivedSpace_toast({ title: workspaceTitle }),
-        withToastCountdown(
-          {
-            duration: 15000,
-            action: {
-              label: m.workspace_multiSelectSidebar_undo_label(),
-              onClick: async () => {
-                const undoResult = await workspaceClient.unarchive($workspace.id);
-                if (undoResult.ok) {
-                  appStore.dispatch(loadWorkspacesRequested());
-                }
-              },
-            },
-          },
-          { pauseOnHover: false },
-        ),
-      );
-      await navigateAfterWorkspaceRemoval($workspace.id);
-    } else {
-      toast.error(m.workspace_multiSelectSidebar_archiveFailed_error());
-    }
-  }
-
   // File panel state
   let showOnlyChangedFiles = $state(false);
   let fileSearchQuery = $state('');
@@ -783,8 +749,8 @@
         );
         if (workspacePath) {
           navigator.clipboard.writeText(workspacePath);
-          import('$lib/components/ui/toast').then(({ toast }) => {
-            toast.success(m.ui_openCombo_pathCopied_label());
+          import('$lib/components/patterns/notify').then(({ notify }) => {
+            notify.success(m.ui_openCombo_pathCopied_label());
           });
         }
       }
@@ -1047,7 +1013,7 @@
                       </h6>
                       {#if tabId !== 'agents' && tabId !== 'shell'}
                         <p
-                          class="text-ui text-subtle mt-0.5 leading-snug transition-all duration-200"
+                          class="text-ui text-subtle mt-0.5 leading-snug transition-all duration-spring-moderate ease-spring-moderate motion-reduce:transition-none"
                         >
                           {#if tabId === 'context' && $workspace?.isRemote}
                             {tab.description}
@@ -1060,45 +1026,37 @@
                           {:else if tabId === 'context' && $workspace?.path}
                             {tab.description}
                             {m.workspace_multiSelectSidebar_contextAndMetadataLiveIn_before()}
-                            <span class="inline-flex items-baseline gap-1">
-                              <OpenComboButton
-                                filePath={$workspace.path + '/.workspace'}
-                                {workspaceId}
-                                isDirectory={true}
-                                variant="sidebar"
-                                compact
-                                class="inline-flex"
+                            <OpenComboButton
+                              filePath={$workspace.path + '/.workspace'}
+                              {workspaceId}
+                              isDirectory={true}
+                              variant="sidebar"
+                              inline
+                            >
+                              <span
+                                ><!-- i18n-ignore (file path) -->/{$workspace.path
+                                  .split(/[/\\]/)
+                                  .slice(-1)[0]}/.workspace<!-- i18n-ignore (file path) --></span
                               >
-                                <span
-                                  class="text-inherit underline underline-offset-2 decoration-muted-foreground/20"
-                                  ><!-- i18n-ignore (file path) -->/{$workspace.path
-                                    .split(/[/\\]/)
-                                    .slice(-1)[0]}/.workspace<!-- i18n-ignore (file path) --></span
-                                >
-                              </OpenComboButton></span
-                            >.
+                            </OpenComboButton>.
                           {:else if tabId === 'files' && $fileExplorerWorkspacePath}
                             {$workspace?.skipWorktree
                               ? m.workspace_multiSelectSidebar_workingDirectlyIn_before()
                               : m.workspace_multiSelectSidebar_repoCopyLivesIn_before()}
-                            <span class="inline-flex items-baseline gap-1">
-                              <OpenComboButton
-                                filePath={$fileExplorerWorkspacePath}
-                                {workspaceId}
-                                isDirectory={true}
-                                variant="sidebar"
-                                compact
-                                class="inline-flex"
-                              >
-                                <span
-                                  class="text-inherit underline underline-offset-2 decoration-muted-foreground/20"
-                                  >/{$fileExplorerWorkspacePath
-                                    .split(/[/\\]/)
-                                    .slice(-2)
-                                    .join('/')}.</span
-                                >
-                              </OpenComboButton></span
+                            <OpenComboButton
+                              filePath={$fileExplorerWorkspacePath}
+                              {workspaceId}
+                              isDirectory={true}
+                              variant="sidebar"
+                              inline
                             >
+                              <span
+                                >/{$fileExplorerWorkspacePath
+                                  .split(/[/\\]/)
+                                  .slice(-2)
+                                  .join('/')}</span
+                              >
+                            </OpenComboButton>.
                           {:else}
                             {tab.description}
                           {/if}
@@ -1118,7 +1076,10 @@
                       use:scrollFade
                     >
                       {#if tabId === 'agents'}
-                        <div class="px-4 transition-all duration-200" data-testid="agent-panel">
+                        <div
+                          class="px-4 transition-all duration-spring-moderate ease-spring-moderate motion-reduce:transition-none"
+                          data-testid="agent-panel"
+                        >
                           <WorkspaceAgentsList
                             agents={$allWorkspaceAgents}
                             loading={$agentsLoading}
@@ -1139,7 +1100,9 @@
                           />
                         </div>
                       {:else if tabId === 'context'}
-                        <div class="px-4 transition-all duration-200">
+                        <div
+                          class="px-4 transition-all duration-spring-moderate ease-spring-moderate motion-reduce:transition-none"
+                        >
                           <ContextPanel
                             notes={$notes}
                             {workspaceId}
@@ -1156,7 +1119,7 @@
                         </div>
                       {:else if tabId === 'changes'}
                         <div
-                          class="flex h-full flex-1 flex-col px-4 transition-all duration-200"
+                          class="flex h-full flex-1 flex-col px-4 transition-all duration-spring-moderate ease-spring-moderate motion-reduce:transition-none"
                           data-sidebar-changes-panel
                         >
                           <div class="w-full flex-1">
@@ -1187,7 +1150,9 @@
                           </div>
                         </div>
                       {:else if tabId === 'files'}
-                        <div class="flex h-full min-h-0 flex-col px-4 transition-all duration-200">
+                        <div
+                          class="flex h-full min-h-0 flex-col px-4 transition-all duration-spring-moderate ease-spring-moderate motion-reduce:transition-none"
+                        >
                           <!-- File filter controls -->
                           <div class="flex shrink-0 items-center gap-2 pb-2" data-file-tree-toolbar>
                             <ExpandableFileSearch
@@ -1207,7 +1172,7 @@
                               variant="ghost"
                               size="icon-xs"
                               class="shrink-0 {showOnlyChangedFiles
-                                ? 'text-primary'
+                                ? 'text-primary-ink'
                                 : 'text-subtle'}"
                               tooltip={showOnlyChangedFiles
                                 ? m.workspace_multiSelectSidebar_showAllFiles_tooltip()
@@ -1455,7 +1420,7 @@
     bind:this={bottomLaunchersElement}
     role="presentation"
     class={cn(
-      'relative z-30 w-full shrink-0 pb-3 transition-all duration-500',
+      'relative z-30 w-full shrink-0 pb-3 transition-all duration-spring-slow ease-spring-slow motion-reduce:transition-none',
       isLauncherOverview ? 'grid gap-3 px-6 pt-3' : 'px-4 pt-2',
       isLauncherOverview ? (isNewWorkspaceSession ? 'grid-cols-1' : 'grid-cols-2') : '',
     )}

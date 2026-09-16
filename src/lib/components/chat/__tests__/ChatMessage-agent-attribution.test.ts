@@ -365,7 +365,7 @@ describe('ChatMessage agent-to-agent sender attribution', () => {
     for (const token of SUBSCRIPTION_DISCLOSURE_ROW_CLASS.split(' ')) {
       expect(disclosureHeader.classList.contains(token)).toBe(true);
     }
-    for (const token of ['h-auto!', 'min-h-9', 'px-3!', 'py-2!', 'type-body', 'font-normal']) {
+    for (const token of ['min-h-9', 'px-3!', 'py-2!', 'type-body', 'font-normal']) {
       expect(disclosureHeader.classList.contains(token)).toBe(true);
     }
     expect(disclosureHeader.classList.contains('gap-2')).toBe(true);
@@ -593,21 +593,29 @@ describe('ChatMessage agent-to-agent sender attribution', () => {
 
   it('renders Chief attribution as an exact source-message link', async () => {
     const sourceUrl = 'intent://local/__chief__/agent/agent-chief-1/message/msg-source-1';
+    const body = 'Review the workspace.';
     render(ChatMessageRouteContextHarness, {
       props: {
         workspaceId: WorkspaceId('ws-1'),
-        message: userMessage({
-          type: 'chief_message',
-          fromAgentId: 'agent-chief-1',
-          fromAgentName: 'Ignored sender label',
-          fromWorkspaceId: '__chief__',
-          sourceMessageId: 'msg-source-1',
-          sourceUrl,
-        }),
+        message: userMessage(
+          {
+            type: 'chief_message',
+            fromAgentId: 'agent-chief-1',
+            fromAgentName: 'Chief of Staff',
+            fromWorkspaceId: '__chief__',
+            sourceMessageId: 'msg-source-1',
+            sourceUrl,
+          },
+          `[MESSAGE FROM AGENT Chief of Staff (agent-chief-1)]\n\n${body}`,
+        ),
       },
     });
 
     expect(screen.getByText('Chief of Staff')).toBeTruthy();
+    expect(screen.getByTestId('agent-message-preview').textContent).toContain(body);
+    expect(screen.getByTestId('agent-message-preview').textContent).not.toContain(
+      '[MESSAGE FROM AGENT',
+    );
     const sourceLink = screen.getByTestId('agent-message-attribution');
     expect(sourceLink.tagName).toBe('A');
     expect(sourceLink.getAttribute('href')).toBe(sourceUrl);
@@ -619,6 +627,10 @@ describe('ChatMessage agent-to-agent sender attribution', () => {
       event: expect.any(MouseEvent),
     });
     expect(dispatchMock).not.toHaveBeenCalled();
+
+    await fireEvent.click(screen.getByTestId('agent-message-disclosure-toggle'));
+    expect(screen.getByText(body)).toBeTruthy();
+    expect(screen.queryByText(/\[MESSAGE FROM AGENT/)).toBeNull();
   });
 
   it('preserves Chief attribution and source navigation for a queued delivery', async () => {
@@ -759,7 +771,7 @@ describe('ChatMessage agent-to-agent sender attribution', () => {
     for (const token of USER_MESSAGE_SURFACE_CLASS.split(' ')) {
       expect(surface.classList.contains(token)).toBe(true);
     }
-    expect(surface.className).not.toContain(SUBSCRIPTION_CARD_SURFACE_CLASS);
+    expect(surface.classList.contains('shadow-sm')).toBe(true);
 
     await rerender({
       message: userMessage(),
@@ -853,21 +865,9 @@ describe('ChatMessage hook wake attribution', () => {
     expect(surface.getAttribute('data-external-spacing-owner')).toBe('automated-wake-card');
     expect(screen.getByText('ci-watch')).toBeTruthy();
     expect(screen.getByText('woke the agent')).toBeTruthy();
-    const textLane = screen.getByTestId('automated-wake-text-lane');
-    expect(textLane.className).toContain('gap-x-1');
-    expect(textLane.classList.contains('flex-wrap')).toBe(true);
-    const leadingIcon = header.firstElementChild;
-    expect(leadingIcon?.classList.contains('self-start')).toBe(true);
-    expect(leadingIcon?.classList.contains('mt-1')).toBe(true);
-    expect(screen.getByTestId('automated-wake-toggle').classList.contains('self-start')).toBe(true);
     const primaryLabel = screen.getByTestId('automated-wake-primary-label');
     expect(primaryLabel.textContent?.trim()).toBe('ci-watch');
-    expect(primaryLabel.classList.contains('break-words')).toBe(true);
-    expect(primaryLabel.classList.contains('truncate')).toBe(false);
-    const status = screen.getByTestId('wake-status');
-    expect(status.classList.contains('min-w-0')).toBe(true);
-    expect(status.classList.contains('break-words')).toBe(true);
-    expect(status.classList.contains('truncate')).toBe(false);
+    expect(primaryLabel.getAttribute('title')).toBe('ci-watch');
     expect(screen.queryByTestId('automated-wake-details')).toBeNull();
     await expandAutomatedWake();
     expect(screen.getByText('CI is red')).toBeTruthy();
@@ -1132,14 +1132,8 @@ describe('ChatMessage PR-monitor wake attribution', () => {
     // Workspace repo unknown → owner/repo #N chip
     const chip = screen.getByTestId('pr-monitor-wake-chip');
     expect(chip.textContent?.trim()).toBe('intent-hq/monorepo #42');
-    // Label sits flush left next to the PR icon (overrides the Button base justify-center)
-    expect(chip.className).toContain('justify-start');
-    expect(chip.className).toContain('whitespace-normal');
-    expect(chip.className).toContain('break-words');
-    expect(chip.querySelector('.truncate')).toBeNull();
     expect(chip.getAttribute('title')).toBe('Open intent-hq/monorepo #42');
-    const lane = screen.getByTestId('automated-wake-text-lane');
-    expect(lane.classList.contains('flex-wrap')).toBe(true);
+    expect(screen.getByTestId('wake-status').textContent?.trim()).toBe('woke the agent');
     expect(screen.getByText('woke the agent')).toBeTruthy();
     await expandAutomatedWake();
     expect(screen.getByText('Checks failed')).toBeTruthy();

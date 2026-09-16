@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { Button } from '$lib/components/ui/button';
   /**
    * NewWorkspaceCard - Hover card for creating a new workspace
    *
@@ -23,6 +24,7 @@
   import { WorkspaceStatusEnum } from '$shared/types';
   import { compareWorkspaceActivityDisplayTimeDesc } from '$shared/utils/workspace-activity-time';
   import Header from '$lib/components/ui/Header.svelte';
+  import GitHubAvatar from '$lib/components/ui/GitHubAvatar.svelte';
   import { store as appStore } from '$store/renderer/store';
   import { deriveRecentRepoEntries } from './recent-repos';
 
@@ -83,21 +85,18 @@
     appStore.dispatch(closeAll(false));
     appStore.dispatch(setShowCreateModal(true));
   }
-
-  function getGitHubAvatarUrl(owner: string, size: number = 24): string {
-    return `https://github.com/${owner}.png?size=${size}`;
-  }
 </script>
 
 <div class="px-3 pb-3 flex flex-col gap-2">
   <!-- WIP Draft -->
   {#if hasDraft}
-    <button
+    <Button
+      variant="ghost"
       class="w-full text-left p-2.5 rounded-lg bg-primary/5 border border-primary/15 hover:bg-primary/10 transition-colors cursor-pointer group"
       onclick={openWithDraft}
     >
       <div class="flex items-center gap-2 mb-1">
-        <span class="text-ui font-semibold uppercase tracking-wider text-primary/70"
+        <span class="text-ui font-semibold text-primary-ink/70"
           >{m.layout_newWorkspaceCard_draft_label()}</span
         >
       </div>
@@ -108,7 +107,7 @@
         {m.layout_newWorkspaceCard_continueEditing_label()}
         <Fa icon={faArrowRight} size="xs" />
       </span>
-    </button>
+    </Button>
   {/if}
 
   <!-- Quick start with recent repos -->
@@ -117,7 +116,8 @@
     <div>
       <div class="flex flex-col">
         {#each recentRepos as repo}
-          <button
+          <Button
+            variant="ghost"
             class="flex items-center gap-2 px-1 py-1 rounded-md text-left hover:bg-sidebar cursor-pointer w-full focus:outline-0"
             onclick={(e) =>
               openModal(
@@ -130,12 +130,11 @@
               )}
           >
             {#if repo.owner}
-              <img
-                src={getGitHubAvatarUrl(repo.owner)}
+              <GitHubAvatar
+                identity={repo.owner}
                 alt={repo.owner}
+                size={16}
                 class="size-4 rounded-full shrink-0"
-                loading="lazy"
-                onerror={(e) => ((e.currentTarget as HTMLImageElement).style.display = 'none')}
               />
             {:else}
               <span class="text-ghost shrink-0"><Fa icon={faFolder} size="xs" /></span>
@@ -153,7 +152,7 @@
                 {repo.name ?? m.layout_newWorkspaceCard_unknownRepo_label()}
               {/if}
             </span>
-          </button>
+          </Button>
         {/each}
       </div>
     </div>

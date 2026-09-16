@@ -112,6 +112,9 @@ describe('BulkActionConfirmDialog', () => {
 
     const confirm = screen.getByRole('button', { name: 'Archive' });
     await waitFor(() => expect(document.activeElement).toBe(confirm));
+    expect(confirm.className).toContain('focus-visible:outline');
+    expect(confirm.className).toContain('focus-visible:-outline-offset-1');
+    expect(screen.getByRole('dialog').querySelector('.svelte-fa')).toBeNull();
   });
 
   it('focuses a destructive confirm action by default when the dialog opens', async () => {

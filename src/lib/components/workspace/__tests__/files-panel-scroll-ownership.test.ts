@@ -1,3 +1,9 @@
+// @verify-changed-triggers: ../MultiSelectTabbedSidebar.svelte, ../sidebar/FilesPanel.svelte,
+//   ../sidebar/ExpandableFileSearch.svelte, ../sidebar/SidebarExpandableSearch.svelte,
+//   ../../file-explorer/file-tree-view.svelte, ../../file-explorer/VirtualizedFileTree.svelte,
+//   ../../file-explorer/VSCodeFileExplorer.svelte, ../../ui/VSCodeScrollablePanel.svelte,
+//   ../../ui/list/ListItem.svelte
+
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 
@@ -57,6 +63,6 @@ describe('Files panel scroll ownership', () => {
     expect(sidebar).toContain('data-file-tree-toolbar');
     expect(search).toContain('placement="toolbar"');
     expect(sharedSearch).toContain("placement === 'toolbar'");
-    expect(listItem).toContain("padding: 'min-h-7 px-2 py-0.5'");
+    expect(listItem).toContain("padding: 'min-h-(--control-height-compact) px-2 py-0.5'");
   });
 });

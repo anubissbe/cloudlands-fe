@@ -20,6 +20,19 @@ async function composerHeight(input: Locator, zoom: number) {
   return input.evaluate((node, scale) => node.getBoundingClientRect().height / scale, zoom);
 }
 
+async function expectComposerMotionSettled(input: Locator) {
+  await expect
+    .poll(() =>
+      input.evaluate(
+        (node) =>
+          node
+            .getAnimations({ subtree: true })
+            .filter((animation) => animation.playState === 'running').length,
+      ),
+    )
+    .toBe(0);
+}
+
 async function placeholderMotion(editor: Locator) {
   return editor.locator('p').evaluate((node) => {
     const style = getComputedStyle(node, '::before');
@@ -30,6 +43,69 @@ async function placeholderMotion(editor: Locator) {
       easing: style.transitionTimingFunction,
     };
   });
+}
+
+// Resolve token units and CSS easing serialization through the browser, just as
+// a consumer does; the motion tokens now carry CSS time units.
+async function motionTier(input: Locator, tier: 'slow' | 'fast') {
+  return input.evaluate((node, name) => {
+    const probe = document.createElement('span');
+    probe.style.transitionDuration = name === 'slow' ? 'var(--spring-slow)' : 'var(--spring-fast)';
+    probe.style.transitionTimingFunction =
+      name === 'slow' ? 'var(--spring-slow-ease)' : 'var(--spring-fast-ease)';
+    node.append(probe);
+    const style = getComputedStyle(probe);
+    const result = { duration: style.transitionDuration, easing: style.transitionTimingFunction };
+    probe.remove();
+    return result;
+  }, tier);
+}
+
+/* Focus or blur the editor, catch the placeholder fade as it starts, pause it
+   and seek to its midpoint, then read the opacity there. Sampling after a fixed
+   delay reads the terminal value once the 0.3s transition has already finished
+   under load. Rejects when no fade starts, so a removed transition still fails. */
+async function placeholderFadeMidpointOpacity(editor: Locator, trigger: 'focus' | 'blur') {
+  return editor.evaluate(
+    (node, action) =>
+      new Promise<number>((resolve, reject) => {
+        const paragraph = node.querySelector('p')!;
+        const controller = new AbortController();
+        const timeout = setTimeout(() => {
+          controller.abort();
+          reject(new Error(`placeholder opacity transition did not start after ${action}`));
+        }, 5_000);
+        paragraph.addEventListener(
+          'transitionrun',
+          (event) => {
+            if (event.propertyName !== 'opacity' || event.pseudoElement !== '::before') return;
+            controller.abort();
+            clearTimeout(timeout);
+            const fade = paragraph
+              .getAnimations({ subtree: true })
+              .filter((animation) => animation instanceof CSSTransition)
+              .map((animation) => animation as CSSTransition)
+              .find(
+                (animation) =>
+                  animation.transitionProperty === 'opacity' &&
+                  animation.effect?.pseudoElement === '::before',
+              );
+            if (!fade) {
+              reject(new Error('placeholder opacity transition is not exposed via getAnimations'));
+              return;
+            }
+            fade.pause();
+            fade.currentTime = Number(fade.effect!.getComputedTiming().duration) / 2;
+            const opacity = Number(getComputedStyle(paragraph, '::before').opacity);
+            fade.play();
+            resolve(opacity);
+          },
+          { signal: controller.signal },
+        );
+        (node as HTMLElement)[action]();
+      }),
+    trigger,
+  );
 }
 
 async function expectImmediatePlaceholderOpacity(editor: Locator, opacity: number) {
@@ -60,15 +136,15 @@ for (const state of states) {
       .toBe(`${idle}px`);
     await expect(editorWrapper).toHaveClass(/placeholder-hidden/);
     await expect(editor.locator('p')).toHaveAttribute('data-placeholder', 'Ask anything');
-    /* The placeholder fades out over 0.3s after blur; on fast runners the
+    /* The placeholder fades out over the slow motion tier after blur; on fast runners the
        assertions above settle sooner than that, so sampling opacity without
        waiting reads a mid-transition value. Poll to the terminal value first. */
     await expect.poll(async () => (await placeholderMotion(editor)).opacity).toBe(0);
+    const slowTier = await motionTier(input, 'slow');
     expect(await placeholderMotion(editor)).toEqual({
       opacity: 0,
       property: 'opacity',
-      duration: '0.3s',
-      easing: 'ease-in-out',
+      ...slowTier,
     });
     const motion = await input.evaluate((node) => {
       const style = getComputedStyle(node);
@@ -79,17 +155,16 @@ for (const state of states) {
       };
     });
     expect(motion.property).toContain('min-height');
-    expect(motion.duration).toBe('0.1s');
-    expect(motion.easing).toBe('cubic-bezier(0.2, 0, 0, 1)');
+    const fastTier = await motionTier(input, 'fast');
+    expect(motion.duration).toBe(fastTier.duration);
+    expect(motion.easing).toBe(fastTier.easing);
 
     const idleRendered = await composerHeight(input, state.zoom);
-    await editor.focus();
+    const fadingIn = await placeholderFadeMidpointOpacity(editor, 'focus');
     await expect(editorWrapper).not.toHaveClass(/placeholder-hidden/);
     await expect
       .poll(() => input.evaluate((node) => getComputedStyle(node).minHeight))
       .toBe(`${idle}px`);
-    await page.waitForTimeout(150);
-    const fadingIn = (await placeholderMotion(editor)).opacity;
     expect(fadingIn).toBeGreaterThan(0);
     expect(fadingIn).toBeLessThan(0.85);
     await expect.poll(async () => (await placeholderMotion(editor)).opacity).toBeCloseTo(0.85, 2);
@@ -99,7 +174,7 @@ for (const state of states) {
     await expect
       .poll(() => input.evaluate((node) => getComputedStyle(node).minHeight))
       .toBe(`${active}px`);
-    await page.waitForTimeout(150);
+    await expectComposerMotionSettled(input);
     const activeRendered = await composerHeight(input, state.zoom);
     expect(expanding).toBeGreaterThanOrEqual(Math.min(idleRendered, activeRendered));
     expect(expanding).toBeLessThanOrEqual(Math.max(idleRendered, activeRendered));
@@ -112,14 +187,12 @@ for (const state of states) {
     await expect
       .poll(() => input.evaluate((node) => getComputedStyle(node).minHeight))
       .toBe(`${idle}px`);
-    await page.waitForTimeout(150);
+    await expectComposerMotionSettled(input);
     expect(await composerHeight(input, state.zoom)).toBeCloseTo(idleRendered, 0);
     await expect.poll(async () => (await placeholderMotion(editor)).opacity).toBeCloseTo(0.85, 2);
 
-    await editor.blur();
+    const fadingOut = await placeholderFadeMidpointOpacity(editor, 'blur');
     await expect(editorWrapper).toHaveClass(/placeholder-hidden/);
-    await page.waitForTimeout(150);
-    const fadingOut = (await placeholderMotion(editor)).opacity;
     expect(fadingOut).toBeGreaterThan(0);
     expect(fadingOut).toBeLessThan(0.85);
     await expect.poll(async () => (await placeholderMotion(editor)).opacity).toBe(0);
@@ -132,7 +205,7 @@ for (const state of states) {
     await expect
       .poll(() => input.evaluate((node) => getComputedStyle(node).minHeight))
       .toBe(`${idle}px`);
-    await page.waitForTimeout(150);
+    await expectComposerMotionSettled(input);
     expect(await composerHeight(input, state.zoom)).toBeCloseTo(idleRendered, 0);
 
     const containment = await input.evaluate((node) => {
