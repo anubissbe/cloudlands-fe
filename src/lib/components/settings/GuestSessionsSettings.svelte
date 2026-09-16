@@ -23,6 +23,7 @@
   import { Button } from '$lib/components/ui/button';
   import BulkActionConfirmDialog from '$lib/components/modals/BulkActionConfirmDialog.svelte';
   import HostedWorkspaceRoster from './HostedWorkspaceRoster.svelte';
+  import { formatGuestSessionAddress, formatGuestSessionLabel } from '$lib/utils/connection-label';
   import { m } from '$shared/paraglide/messages.js';
   import type { Workspace } from '$shared/types';
   import type { GuestSessionRecord, GuestWorkspaceRef } from '$shared/types/guest-sessions';
@@ -104,10 +105,12 @@
       appStore.dispatch(action);
       const result = await action.promise;
       if (result.status === 'secret-unavailable') {
-        openError = m.settings_guestSessions_open_secretUnavailable_error({ name: session.label });
+        openError = m.settings_guestSessions_open_secretUnavailable_error({
+          name: formatGuestSessionLabel(session),
+        });
       }
     } catch {
-      openError = m.settings_guestSessions_open_error({ name: session.label });
+      openError = m.settings_guestSessions_open_error({ name: formatGuestSessionLabel(session) });
     }
   }
 
@@ -313,11 +316,18 @@
         {#each $sessions$ as session (session.id)}
           {@const open = $openIds$.includes(session.id)}
           {@const connected = open && $connectedIds$.includes(session.id)}
+          {@const guestAddress = formatGuestSessionAddress(session)}
           <li class="px-6 py-4" data-session-id={session.id}>
             <div class="flex items-center justify-between gap-3">
               <div class="min-w-0">
-                <p class="truncate text-sm text-foreground">{session.label}</p>
+                <p class="truncate text-sm text-foreground">{formatGuestSessionLabel(session)}</p>
                 <p class="truncate text-xs text-muted-foreground">
+                  <!-- The dialled tc address / host stays visible once the
+                       captured machine name is the primary label. -->
+                  {#if guestAddress !== null}
+                    <span data-guest-address={guestAddress}>{guestAddress}</span>
+                    ·
+                  {/if}
                   <!-- Status only for a host with a window (pooled client); a
                        joined host that was never opened has no status. -->
                   {#if open}
@@ -350,7 +360,9 @@
             {#if session.workspaces.length > 0}
               <ul
                 class="mt-3 ml-3 border-l border-border pl-3 divide-y divide-border"
-                aria-label={m.settings_guestSessions_workspaces_ariaLabel({ name: session.label })}
+                aria-label={m.settings_guestSessions_workspaces_ariaLabel({
+                  name: formatGuestSessionLabel(session),
+                })}
                 data-testid="guest-session-workspaces"
               >
                 {#each session.workspaces as workspace (workspace.id)}
@@ -411,7 +423,7 @@
       data-session-id={failed.id}
     >
       <p class="text-sm text-danger">
-        {m.settings_guestSessions_leave_error({ name: failed.label })}
+        {m.settings_guestSessions_leave_error({ name: formatGuestSessionLabel(failed) })}
       </p>
       <Button
         variant="ghost"
@@ -448,7 +460,7 @@
   bind:open={leaveDialogOpen}
   title={m.settings_guestSessions_leaveConfirm_title()}
   description={m.settings_guestSessions_leaveConfirm_description({
-    name: leaveTarget?.label ?? '',
+    name: leaveTarget ? formatGuestSessionLabel(leaveTarget) : '',
   })}
   confirmText={m.settings_guestSessions_leave_label()}
   variant="destructive"
@@ -460,7 +472,7 @@
   title={m.settings_guestSessions_leaveWorkspaceConfirm_title()}
   description={m.settings_guestSessions_leaveWorkspaceConfirm_description({
     workspace: leaveWorkspaceTarget?.workspace.title ?? '',
-    name: leaveWorkspaceTarget?.session.label ?? '',
+    name: leaveWorkspaceTarget ? formatGuestSessionLabel(leaveWorkspaceTarget.session) : '',
   })}
   confirmText={m.settings_guestSessions_leaveWorkspace_label()}
   variant="destructive"
