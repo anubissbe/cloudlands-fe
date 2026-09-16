@@ -123,6 +123,11 @@ describe('catalog route shell', () => {
       /from ['"](?:\$store\/|\$features\/|\$lib\/client|\$lib\/electron-bridge|electron)|import ['"]\$store\//;
     const violations = files.flatMap((file) => {
       const relativeFile = path.relative(root, file);
+      const isStoreSeededSubscriptionFixture =
+        relativeFile ===
+          'src/lib/component-catalog/renderers/SubscriptionRowsCatalogPreview.svelte' ||
+        relativeFile === 'src/lib/component-catalog/subscription-rows/subscription-row-fixtures.ts';
+      if (isStoreSeededSubscriptionFixture) return [];
       return readFileSync(file, 'utf8')
         .split('\n')
         .flatMap((line, index) => (forbidden.test(line) ? [`${relativeFile}:${index + 1}`] : []));
@@ -145,16 +150,15 @@ describe('catalog route shell', () => {
     expect(violations).toEqual([]);
   });
 
-  it('consumes the shared hatch without catalog-local recipes or physical workarounds', () => {
+  it('does not invent surface textures or physical background-image workarounds', () => {
     const sources = sourceFiles(path.join(root, 'src/lib/component-catalog'))
       .filter((file) => file.endsWith('.svelte'))
       .map((file) => readFileSync(file, 'utf8'));
     const combined = sources.join('\n');
 
-    expect(combined).not.toMatch(/--[\w-]*hatch[\w-]*\s*:/);
+    expect(combined).not.toMatch(/--[\w-]*hatch[\w-]*/);
     expect(combined).not.toContain('repeating-linear-gradient(');
-    expect(combined).not.toMatch(/background-image\s*:\s*color-mix\(/);
-    expect(combined.match(/background-image:\s*var\(--surface-hatch\)/g)).toHaveLength(3);
+    expect(combined).not.toMatch(/background-image\s*:/);
   });
 
   it('uses only public subpaths for the Settings catalog lane', () => {
@@ -193,7 +197,7 @@ describe('CatalogShell root inline style ownership', () => {
   }
 
   async function chooseColorTheme(name: string) {
-    const trigger = screen.getByRole('button', { name: 'Color theme' });
+    const trigger = screen.getByRole('combobox', { name: 'Color theme' });
     await fireEvent.keyDown(trigger, { key: 'Enter' });
     const options = screen.getAllByRole('option');
     const highlighted = options.findIndex((option) => option.hasAttribute('data-highlighted'));

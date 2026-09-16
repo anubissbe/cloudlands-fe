@@ -1,3 +1,11 @@
+// @verify-changed-triggers: ../AgentSubscriptions.svelte, ../EventSubscriptionsCard.svelte, ../EventWakeupBanner.svelte, ../AutomatedWakeCardHeader.svelte, ../QueuedMessageNoticeHeader.svelte, ../subscription-disclosure.ts
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+import {
+  SUBSCRIPTION_ROW_TYPOGRAPHY_CLASS,
+  SUBSCRIPTION_DISCLOSURE_ROW_CLASS,
+} from '../subscription-disclosure';
+
 import '../../../../app.css';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/svelte';
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
@@ -14,12 +22,7 @@ const readable = <T>(value: T) => ({
 vi.mock('$store/renderer/store', async () => {
   const { createAppStoreMockModule } =
     await import('$store/renderer/utils/test-helpers/store-mock');
-  // BrowserTabsRow reads the real panel-layout selectors, which expect the
-  // panelLayout slice to exist on the store state.
-  return createAppStoreMockModule({
-    state: () => ({ panelLayout: { byWorkspaceId: {} } }),
-    dispatch: dispatchMock,
-  });
+  return createAppStoreMockModule({ state: () => ({}), dispatch: dispatchMock });
 });
 vi.mock('$store/renderer/slices/workspace/workspace-selectors', () => ({
   selectWorkspaceById: () =>
@@ -90,6 +93,8 @@ vi.mock('$store/renderer/slices/agent-subscription-ui/agent-subscription-ui-sele
     ]),
   selectAgentSubscriptionStatuses: () =>
     readable({ 'agent-a': 'running', 'agent-b': 'completed', 'agent-c': 'completed' }),
+  selectAgentSubscriptionLane: () =>
+    readable({ visible: true, count: 1, participantAgentIds: ['agent-a'] }),
   selectDelegationGroups: () => readable([]),
   selectWokenUpInfo: () => readable(null),
   selectWaitingState: () => readable('waiting'),
@@ -266,5 +271,36 @@ describe('subscription row typography', () => {
       expect(tone(icon)).toEqual(tone(label));
       expect(tone(icon).opacity).toBe('1');
     }
+    expect(tone(screen.getAllByTestId('agent-card-name')[0])).toEqual(
+      tone(screen.getByTestId('one-shot-summary-title')),
+    );
   });
+});
+
+describe('collapsed subscription typography contract', () => {
+  it('uses body typography for shared disclosure and status rows', () => {
+    for (const classes of [SUBSCRIPTION_ROW_TYPOGRAPHY_CLASS, SUBSCRIPTION_DISCLOSURE_ROW_CLASS]) {
+      expect(classes.split(' ')).toContain('type-body');
+      expect(classes.split(' ')).not.toContain('type-caption');
+    }
+  });
+  for (const file of [
+    'AgentSubscriptions.svelte',
+    'EventSubscriptionsCard.svelte',
+    'EventWakeupBanner.svelte',
+    'AutomatedWakeCardHeader.svelte',
+    'QueuedMessageNoticeHeader.svelte',
+  ]) {
+    it(`${file} consumes body typography for collapsed rows`, () => {
+      const source = readFileSync(resolve(process.cwd(), 'src/lib/components/chat', file), 'utf8');
+      expect(source).toMatch(/type-body|SUBSCRIPTION_(?:ROW_TYPOGRAPHY|DISCLOSURE_ROW)_CLASS/);
+      const collapsed = source
+        .split('class=')
+        .slice(1)
+        .filter((part) =>
+          /SUBSCRIPTION_(?:ROW_TYPOGRAPHY|DISCLOSURE_ROW)_CLASS/.test(part.split('>')[0]),
+        );
+      for (const part of collapsed) expect(part.split('>')[0]).not.toContain('type-caption');
+    });
+  }
 });

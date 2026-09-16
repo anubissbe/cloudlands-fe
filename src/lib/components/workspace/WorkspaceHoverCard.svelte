@@ -53,6 +53,7 @@
     loadAgentSessions?: boolean;
     loadWorkspaceData?: boolean;
     onkeydown?: (event: KeyboardEvent) => void;
+    staticData?: boolean;
   }
   let {
     workspace,
@@ -61,10 +62,17 @@
     loadAgentSessions = true,
     loadWorkspaceData = true,
     onkeydown,
+    staticData = false,
   }: Props = $props();
   const workspaceIdStore = writable('');
-  const workspaceAgents$ = selectAllWorkspaceAgents(workspaceIdStore);
-  const prMonitors$ = selectPrMonitors(workspaceIdStore);
+  function createWorkspaceAgentsStore() {
+    return staticData ? writable([]) : selectAllWorkspaceAgents(workspaceIdStore);
+  }
+  function createPrMonitorsStore() {
+    return staticData ? writable([]) : selectPrMonitors(workspaceIdStore);
+  }
+  const workspaceAgents$ = createWorkspaceAgentsStore();
+  const prMonitors$ = createPrMonitorsStore();
   $effect(() => workspaceIdStore.set(workspace?.id ?? ''));
   $effect(() => {
     if (workspace && loadWorkspaceData) {
@@ -165,7 +173,7 @@
       if (count > 1) {
         questionMeta = {
           compact: `${formatInteger(1)}/${formatInteger(count)}`,
-          accessible: `${m.workspace_hoverCard_question_label()} ${m.chat_questionWizard_stepCounter_label({ current: 1, total: count })}`,
+          accessible: m.chat_questionWizard_stepCounter_label({ current: 1, total: count }),
         };
       }
     } else if (canonicalState === 'attention-discussion') {
@@ -288,6 +296,7 @@
   }
   let activePullRequest = $derived.by(() => {
     if (!workspace) return null;
+    if (staticData) return getWorkspacePullRequest(workspace);
     return (
       selectWorkspaceActivePullRequest.select(appStore.state, workspace.id) ??
       getWorkspacePullRequest(workspace)
@@ -374,7 +383,7 @@
       <div class="min-w-0" data-workspace-hover-card-identity>
         <div class="flex min-w-0 items-center justify-between gap-3">
           <h2
-            class="type-body min-w-0 truncate font-medium! text-foreground"
+            class="type-body min-w-0 truncate font-medium text-foreground"
             data-workspace-hover-card-title
           >
             {workspace.title || m.workspace_links_untitled_label()}
@@ -419,6 +428,7 @@
               {#each visibleRows as row (row.id)}<div role="listitem">
                   <Button
                     variant="plain"
+                    wrapContent={false}
                     class="grid h-auto! min-h-8 w-full min-w-0 cursor-pointer grid-cols-[1.5rem_minmax(0,1fr)_auto] items-start justify-normal gap-x-2.5 gap-y-0 whitespace-normal rounded-sm border-0! px-2! py-0.5! text-left font-normal transition-colors hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
                     aria-label={rowAccessibleLabel(row)}
                     data-workspace-hover-card-agent-row
@@ -513,6 +523,7 @@
                   {#if pr.url}
                     <Button
                       variant="plain"
+                      wrapContent={false}
                       class="grid h-auto! w-full min-w-0 grid-cols-[1.5rem_minmax(0,1fr)_auto_auto] items-center justify-normal gap-x-2.5 whitespace-normal rounded-sm border-0! px-2! py-1! text-left font-normal transition-colors hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
                       aria-label={getWorkspacePrLabel(pr)}
                       data-workspace-hover-card-pr-row

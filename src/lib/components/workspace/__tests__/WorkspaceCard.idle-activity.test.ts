@@ -157,6 +157,19 @@ describe('WorkspaceCard compact agent metadata', () => {
     expect(icon?.getAttribute('data-workspace-status-icon')).toBe('xmark');
   });
 
+  it('can hide time while retaining the pin action and restore time when requested', async () => {
+    const workspace = makeWorkspace();
+    const onTogglePin = vi.fn();
+    const { container, rerender } = render(WorkspaceCard, {
+      props: { workspace, onTogglePin, showTime: false },
+    });
+    expect(container.querySelector('[data-workspace-card-time]')).toBeNull();
+    await fireEvent.click(screen.getByRole('button', { name: 'Pin', exact: true }));
+    expect(onTogglePin).toHaveBeenCalledOnce();
+    await rerender({ workspace, onTogglePin, showTime: true });
+    expect(container.querySelector('[data-workspace-card-time]')).toBeTruthy();
+  });
+
   it('uses the canonical compact row hierarchy and inset styling', () => {
     const { container } = render(WorkspaceCard, { props: { workspace: makeWorkspace() } });
     const row = container.querySelector('[data-workspace-card-row]');
@@ -195,8 +208,10 @@ describe('WorkspaceCard compact agent metadata', () => {
 
     expect(workspaceButton.contains(pinButton)).toBe(false);
     expect(workspaceButton.contains(markAsReadButton)).toBe(false);
-    expect(pinButton.className).toContain('size-7');
-    expect(markAsReadButton.className).toContain('size-7');
+    expect(pinButton.getAttribute('data-slot')).toBe('button');
+    expect(markAsReadButton.getAttribute('data-slot')).toBe('button');
+    expect(pinButton.className).toContain('size-(--control-height-compact)');
+    expect(markAsReadButton.className).toContain('size-(--control-height-compact)');
     expect(actions?.className).toContain('focus-within:opacity-100');
 
     pinButton.focus();
@@ -400,6 +415,47 @@ describe('WorkspaceCard compact agent metadata', () => {
     expect(container.querySelector('[data-workspace-card-agents]')).toBeNull();
     expect(container.querySelector('[data-testid="mock-avatar"]')).toBeNull();
     expect(container.textContent).not.toContain('+4');
+  });
+});
+
+describe('WorkspaceCard phase-card controls', () => {
+  it('keeps activation, task tooltip, and action controls as named siblings', async () => {
+    const onClick = vi.fn();
+    const onAction = vi.fn();
+    const { container, getByRole, getByText } = render(WorkspaceCard, {
+      props: {
+        phase: { phase: 'building', label: 'Building', subtitle: 'Implementing', isActive: true },
+        stats: {
+          tasks: { total: 4, completed: 1, inProgress: 1, notStarted: 2 },
+          files: { changed: 0, additions: 0, deletions: 0 },
+          commits: { total: 0, unpushed: 0 },
+          pr: { hasOpen: false, hasMerged: false, hasClosed: false },
+        },
+        title: 'Build search',
+        onClick,
+        onAction,
+      },
+    });
+    await tick();
+
+    const activation = getByRole('button', { name: 'Build search' });
+    const taskProgress = getByRole('button', { name: '1/4 tasks' });
+    const primaryAction = getByRole('button', { name: 'Show Coordinator' });
+    const secondaryAction = getByRole('button', { name: 'Pause' });
+
+    for (const button of [activation, taskProgress, primaryAction, secondaryAction]) {
+      expect(button.parentElement?.closest('button, [role="button"]')).toBeNull();
+    }
+
+    expect(getByText('Building')).toBeTruthy();
+    await fireEvent.click(activation);
+    expect(onClick).toHaveBeenCalledOnce();
+
+    await fireEvent.click(primaryAction);
+    expect(onAction).toHaveBeenCalledWith('show-coordinator');
+    expect(onClick).toHaveBeenCalledOnce();
+
+    expect(container.querySelectorAll('button button, [role="button"] button')).toHaveLength(0);
   });
 });
 

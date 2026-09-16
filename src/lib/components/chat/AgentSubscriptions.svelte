@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { IntentMarkLoader } from '$lib/components/ui/indicators';
   /**
    * AgentSubscriptions Component
    *
@@ -10,8 +11,8 @@
    * agent-subscription-ui read saga). No IPC listeners or polling live in
    * this component; short panel-focus retries are owned and cancelled here.
    */
-  import { fade } from 'svelte/transition';
-  import { safeSlide } from '$lib/utils/animations';
+  import { crispOut, springIn } from '$lib/motion';
+  import { safeDisclosureTransition } from './disclosure-motion';
   import * as Tooltip from '$lib/components/ui/tooltip';
   import { Button } from '$lib/components/ui/button';
   import {
@@ -57,6 +58,7 @@
 
   import {
     selectAgentSubscriptions,
+    selectAgentSubscriptionLane,
     selectAgentSubscriptionStatuses,
     selectDelegationGroups,
     selectWokenUpInfo,
@@ -76,7 +78,7 @@
     SUBSCRIPTION_CARD_SURFACE_CLASS,
     SUBSCRIPTION_CHEVRON_CLASS,
     SUBSCRIPTION_CHEVRON_SIZE_CLASS,
-    SUBSCRIPTION_FINISHED_ROW_GEOMETRY_CLASS,
+    SUBSCRIPTION_DISCLOSURE_ROW_CLASS,
     SUBSCRIPTION_ICON_CLASS,
     SUBSCRIPTION_INSET_ROW_DIVIDER_CLASS,
     SUBSCRIPTION_INSET_TOP_DIVIDER_CLASS,
@@ -84,6 +86,7 @@
     SUBSCRIPTION_LEADING_CONTENT_CLASS,
     SUBSCRIPTION_ROW_GEOMETRY_CLASS,
     SUBSCRIPTION_ROW_TYPOGRAPHY_CLASS,
+    SUBSCRIPTION_TRAILING_CONTROLS_CLASS,
   } from './subscription-disclosure';
   import { store as appStore } from '$store/renderer/store';
   import { openAgentTabRequested } from '$store/renderer/slices/app-layout/app-layout-slice';
@@ -188,6 +191,7 @@
   const resolvedWorkspace = $derived($workspaceById ?? null);
 
   const subs$ = selectAgentSubscriptions(workspaceIdStore, agentIdStore);
+  const subscriptionLane$ = selectAgentSubscriptionLane(workspaceIdStore, agentIdStore);
   const groups$ = selectDelegationGroups(workspaceIdStore, agentIdStore);
   const agentStatuses$ = selectAgentSubscriptionStatuses(workspaceIdStore, agentIdStore);
   const wokenUpInfo$ = selectWokenUpInfo(workspaceIdStore, agentIdStore);
@@ -537,9 +541,13 @@
   const showSubscriptionRow = $derived(isCompleted || waitingAgentRows.length > 0);
 
   $effect(() => {
-    visible = showSubscriptionRow || !!$wokenUpInfo$ || $snapshotStatus$ !== 'ready';
-    count = activeAgentRows.length;
-    participantAgentIds = activeAgentRows.map((row) => row.agentId);
+    visible = isolatedPreview
+      ? showSubscriptionRow || !!$wokenUpInfo$
+      : $subscriptionLane$.visible || $snapshotStatus$ !== 'ready';
+    count = isolatedPreview ? activeAgentRows.length : $subscriptionLane$.count;
+    participantAgentIds = isolatedPreview
+      ? activeAgentRows.map((row) => row.agentId)
+      : $subscriptionLane$.participantAgentIds;
     participantAvatarItems = getHeaderStackItems(activeAgentRows);
   });
 
@@ -730,17 +738,28 @@
 {#if $wokenUpInfo$ && !showSubscriptionRow}
   <!-- Standalone woken-up indicator: shown only when no subscription row is active -->
   <div
-    class="flex items-end gap-2 px-3 py-2 text-subtle font-family-child {SUBSCRIPTION_ROW_TYPOGRAPHY_CLASS}"
+    class="font-family-child {SUBSCRIPTION_DISCLOSURE_ROW_CLASS}"
     data-compact={compact}
-    transition:safeSlide={{ axis: 'y', duration: 200 }}
+    transition:safeDisclosureTransition={{ tier: 'moderate' }}
   >
     <Tooltip.Provider delayDuration={0}>
       <Tooltip.Root delayDuration={0}>
-        <Tooltip.Trigger>
-          <div class="shrink-0 flex items-center gap-2 pt-1.5 pb-0.5 text-subtle">
-            <Fa icon={faBolt} size={14} class="h-3.5! w-3.5! shrink-0 {SUBSCRIPTION_ICON_CLASS}" />
-            <span>{m.chat_agentSubscriptions_wokenUp_label()}</span>
-            <span class="text-subtle">
+        <Tooltip.Trigger class="ml-auto">
+          <div
+            class="ml-auto min-w-0 {SUBSCRIPTION_LEADING_CONTENT_CLASS}"
+            data-testid="standalone-woken-up-pill"
+          >
+            <span class={SUBSCRIPTION_LEADING_COLUMN_CLASS}>
+              <Fa
+                icon={faBolt}
+                size={14}
+                class="h-3.5! w-3.5! shrink-0 {SUBSCRIPTION_ICON_CLASS}"
+              />
+            </span>
+            <span class="shrink-0 whitespace-nowrap"
+              >{m.chat_agentSubscriptions_wokenUp_label()}</span
+            >
+            <span class="min-w-0 truncate whitespace-nowrap">
               {$wokenUpInfo$.eventCount === 1
                 ? m.chat_agentSubscriptions_eventCount_one({
                     count: formatInteger($wokenUpInfo$.eventCount),
@@ -772,9 +791,7 @@
     role={$snapshotStatus$ === 'failed' ? 'alert' : 'status'}
   >
     {#if $snapshotStatus$ === 'loading'}
-      <span
-        class="size-3 shrink-0 animate-spin rounded-full border-2 border-muted-foreground/30 border-t-muted-foreground"
-      ></span>
+      <span aria-hidden="true" class="shrink-0"><IntentMarkLoader size={12} /></span>
       <span>{m.chat_chatMessage_loading_label()}</span>
     {:else}
       <span>{m.chat_streamingStatus_responseFailed_label()}</span>
@@ -792,32 +809,58 @@
     onfocusin={rememberFocusedRowControl}
   >
     {#if isCompleted || $wokenUpInfo$}
-      <!-- Slim status row: transitional "Completed" state and/or "Woken up" pill -->
-      <div
-        class="flex w-full min-w-0 max-w-full items-center gap-2 overflow-hidden px-3 pt-1.5 pb-1 {SUBSCRIPTION_ROW_TYPOGRAPHY_CLASS}"
-      >
+      <!-- Slim status row: transitional "Completed" state and/or "Woken up" indicator -->
+      <div class={SUBSCRIPTION_DISCLOSURE_ROW_CLASS}>
         {#if isCompleted}
           <span
-            class="shrink-0 flex items-center gap-2 whitespace-nowrap text-muted-foreground"
-            transition:fade={{ duration: 200 }}
+            class={SUBSCRIPTION_LEADING_COLUMN_CLASS}
+            in:springIn={{ tier: 'moderate', y: 0, scale: 1 }}
+            out:crispOut={{ tier: 'moderate' }}
           >
-            <Fa icon={faCircleCheck} size={14} class="h-3.5! w-3.5! shrink-0" />
+            <Fa
+              icon={faCircleCheck}
+              size={14}
+              class="h-3.5! w-3.5! shrink-0 {SUBSCRIPTION_ICON_CLASS}"
+            />
+          </span>
+          <span
+            class="shrink-0 whitespace-nowrap"
+            in:springIn={{ tier: 'moderate', y: 0, scale: 1 }}
+            out:crispOut={{ tier: 'moderate' }}
+          >
             {m.chat_agentSubscriptions_completed_label()}
           </span>
         {/if}
         {#if $wokenUpInfo$}
+          {#if !isCompleted}
+            <span
+              class={SUBSCRIPTION_LEADING_COLUMN_CLASS}
+              in:springIn={{ tier: 'moderate', y: 0, scale: 1 }}
+              out:crispOut={{ tier: 'moderate' }}
+            >
+              <Fa
+                icon={faBolt}
+                size={14}
+                class="h-3.5! w-3.5! shrink-0 {SUBSCRIPTION_ICON_CLASS}"
+              />
+            </span>
+          {/if}
           <Tooltip.Provider delayDuration={0}>
             <Tooltip.Root delayDuration={0}>
-              <Tooltip.Trigger>
+              <Tooltip.Trigger class="ml-auto">
                 <span
-                  class="inline-flex items-center gap-1 rounded-full bg-muted/50 px-1.5 py-0.5 {SUBSCRIPTION_ROW_TYPOGRAPHY_CLASS}"
-                  transition:fade={{ duration: 200 }}
+                  class="ml-auto inline-flex min-w-0 items-center gap-1 truncate whitespace-nowrap {SUBSCRIPTION_ROW_TYPOGRAPHY_CLASS}"
+                  data-testid="status-woken-up-pill"
+                  in:springIn={{ tier: 'moderate', y: 0, scale: 1 }}
+                  out:crispOut={{ tier: 'moderate' }}
                 >
-                  <Fa
-                    icon={faBolt}
-                    size={14}
-                    class="h-3.5! w-3.5! shrink-0 {SUBSCRIPTION_ICON_CLASS}"
-                  />
+                  {#if isCompleted}
+                    <Fa
+                      icon={faBolt}
+                      size={14}
+                      class="h-3.5! w-3.5! shrink-0 {SUBSCRIPTION_ICON_CLASS}"
+                    />
+                  {/if}
                   {m.chat_agentSubscriptions_wokenUp_label()}
                 </span>
               </Tooltip.Trigger>
@@ -848,14 +891,15 @@
       <div
         class="w-full min-w-0 max-w-full overflow-hidden {SUBSCRIPTION_INSET_ROW_DIVIDER_CLASS}"
         data-testid="one-shot-watches"
-        transition:safeSlide={{ duration: 150 }}
+        transition:safeDisclosureTransition={{ tier: 'fast' }}
       >
         {#if shouldGroupWaitingAgents}
           <!-- Section header: compact waiting summary and disclosure for large lists. -->
           <div class="w-full min-w-0 max-w-full" data-testid="one-shot-header">
-            <button
+            <Button
               type="button"
-              class="relative flex w-full min-w-0 max-w-full cursor-pointer items-center gap-0 overflow-hidden rounded border-none bg-transparent text-left font-[inherit] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-ring {SUBSCRIPTION_ROW_GEOMETRY_CLASS} {SUBSCRIPTION_ROW_TYPOGRAPHY_CLASS}"
+              variant="plain"
+              class="relative cursor-pointer rounded bg-transparent text-left font-[inherit] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-ring {SUBSCRIPTION_DISCLOSURE_ROW_CLASS}"
               data-testid="one-shot-summary-toggle"
               data-subscription-row="agent-watch"
               aria-label={summaryHeading}
@@ -863,7 +907,7 @@
               aria-controls={waitingAgentListId}
               onclick={toggleWaitingAgentsCollapsed}
             >
-              <span class="w-max shrink-0 {SUBSCRIPTION_LEADING_CONTENT_CLASS}">
+              <span class="min-w-0 shrink {SUBSCRIPTION_LEADING_CONTENT_CLASS}">
                 <span
                   class={SUBSCRIPTION_LEADING_COLUMN_CLASS}
                   data-testid="one-shot-leading-column"
@@ -883,7 +927,7 @@
                   {/if}
                 </span>
                 <span
-                  class="whitespace-nowrap text-muted-foreground"
+                  class="min-w-0 truncate whitespace-nowrap text-muted-foreground"
                   data-testid="one-shot-summary-title"
                 >
                   {summaryHeading}
@@ -900,7 +944,7 @@
                   <span class="min-w-0 flex-1" aria-hidden="true"></span>
                 {/if}
                 <span
-                  class="inline-flex h-6 w-6 shrink-0 items-center justify-center"
+                  class="h-6 w-6 justify-center {SUBSCRIPTION_TRAILING_CONTROLS_CLASS}"
                   data-testid="one-shot-collapse-toggle"
                 >
                   <Fa
@@ -912,7 +956,7 @@
                   />
                 </span>
               </span>
-            </button>
+            </Button>
           </div>
         {/if}
 
@@ -935,9 +979,10 @@
                 class="w-full min-w-0 max-w-full overflow-hidden {SUBSCRIPTION_INSET_ROW_DIVIDER_CLASS}"
                 data-testid="finished-agent-group"
               >
-                <button
+                <Button
                   type="button"
-                  class="w-full min-w-0 max-w-full cursor-pointer items-center! overflow-hidden text-left focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-ring {SUBSCRIPTION_LEADING_CONTENT_CLASS} {SUBSCRIPTION_FINISHED_ROW_GEOMETRY_CLASS} {SUBSCRIPTION_ROW_TYPOGRAPHY_CLASS}"
+                  variant="plain"
+                  class="cursor-pointer text-left focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-ring {SUBSCRIPTION_DISCLOSURE_ROW_CLASS}"
                   data-testid="finished-agent-summary"
                   data-subscription-row="grouped-summary"
                   aria-expanded={finishedAgentsExpanded}
@@ -964,7 +1009,7 @@
                     })}
                   </span>
                   <span
-                    class="inline-flex h-6 w-6 shrink-0 items-center justify-center"
+                    class="h-6 w-6 justify-center {SUBSCRIPTION_TRAILING_CONTROLS_CLASS}"
                     data-testid="finished-agent-chevron"
                   >
                     <Fa
@@ -975,7 +1020,7 @@
                         : 'rotate-90'}"
                     />
                   </span>
-                </button>
+                </Button>
                 {#if finishedAgentsExpanded}
                   <div
                     id={finishedAgentListId}

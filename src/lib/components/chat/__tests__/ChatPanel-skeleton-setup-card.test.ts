@@ -82,7 +82,10 @@ vi.mock('$store/renderer/store', async () => {
   const { createAppStoreMockModule } =
     await import('$store/renderer/utils/test-helpers/store-mock');
   return createAppStoreMockModule({
-    state: () => ({ browser: { byWorkspaceId: {} } }),
+    state: () => ({
+      agentSubscriptionUI: { entries: {} },
+      browser: { byWorkspaceId: {} },
+    }),
     dispatch: testState.dispatch,
   });
 });
@@ -104,7 +107,9 @@ vi.mock('$lib/electron-bridge', () => ({
   invoke: vi.fn().mockResolvedValue({ success: true, data: [] }),
   listenSync: vi.fn(() => () => {}),
 }));
-vi.mock('svelte-sonner', () => ({ toast: { error: vi.fn(), success: vi.fn(), info: vi.fn() } }));
+vi.mock('$lib/components/patterns/notify', () => ({
+  notify: { error: vi.fn(), success: vi.fn(), info: vi.fn() },
+}));
 vi.mock('svelte-fa', async () => ({ default: (await import('./mocks/SlotOnly.svelte')).default }));
 
 vi.mock('$store/renderer/slices/panel-layout/panel-layout-selectors', () => ({
@@ -114,6 +119,7 @@ vi.mock('$store/renderer/slices/panel-layout/panel-layout-selectors', () => ({
 }));
 vi.mock('$store/renderer/slices/agent-session/agent-session-selectors', () => ({
   selectAgentSession: testState.selectorFrom(() => testState.agentSession),
+  selectAgentSessionsById: testState.selector({}),
   selectAgentIsResponding: testState.selector(false),
   selectAgentIsRunning: testState.selector(false),
   selectAgentSessionIsStreaming: testState.selector(false),

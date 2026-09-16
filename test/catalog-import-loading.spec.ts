@@ -34,7 +34,7 @@ for (const [kind, path, ready] of [
     await page.goto(`${baseUrl}${path}`, { waitUntil: 'domcontentloaded' });
     await page.locator(ready).first().waitFor({ state: 'visible', timeout: 60_000 });
     if (kind === 'legacy') {
-      await page.getByRole('button', { name: 'Run action', exact: true }).click();
+      await page.getByRole('button', { name: '1. Primary', exact: true }).click();
       await expect(page.getByLabel('Button click count', { exact: true })).toHaveText('1');
     }
     expect(unrelated).toEqual([]);

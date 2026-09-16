@@ -29,8 +29,9 @@ vi.mock('$lib/client', () => ({
     },
   },
 }));
-vi.mock('svelte-sonner', () => ({
-  toast: { warning: mocks.warning, error: mocks.error },
+vi.mock('$lib/components/patterns/notify', async () => ({
+  ...(await vi.importActual('$lib/components/ui/toast/toast-countdown')),
+  notify: { warning: mocks.warning, error: mocks.error },
 }));
 
 import {
@@ -78,7 +79,7 @@ import {
   proposalResolutionReconciled,
 } from '../../proposal-lifecycle/proposal-lifecycle-slice';
 import { selectAgentSession } from '../agent-session-selectors';
-import { TOAST_COUNTDOWN_CLASS } from '$lib/components/ui/toast';
+import { TOAST_COUNTDOWN_CLASS } from '$lib/components/patterns/notify';
 import { AGENT_DELETION_TOMBSTONE_TTL_MS, agentMutationSaga } from './agent-mutation-saga';
 
 const WS = 'ws-mutation';

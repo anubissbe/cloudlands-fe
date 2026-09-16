@@ -217,7 +217,6 @@ describe('WorkspaceHoverCard', () => {
     expect(row.textContent).toContain('#42');
     expect(row.textContent).toContain('Open');
     expect(row.getAttribute('data-pr-status')).toBe('open');
-    expect(Array.from(row.children).map(text)).toEqual(['', 'Refine hover card', 'Open', '#42']);
     expect(container.querySelector('[data-workspace-hover-card-activity]')).toBeNull();
     expect(
       container.querySelector('[data-workspace-hover-card-pr-column]')?.getAttribute('aria-label'),

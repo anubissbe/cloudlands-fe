@@ -13,7 +13,8 @@ import {
   agentAvatarCatalogStates,
 } from '../src/features/agent/components/agent-avatar/agent-avatar.catalog';
 
-test.describe.configure({ mode: 'serial', timeout: 120_000 });
+// Each test mounts a fresh host; report every contract failure independently.
+test.describe.configure({ mode: 'default', timeout: 120_000 });
 
 let server: ViteDevServer;
 let baseUrl: string;
@@ -114,7 +115,12 @@ async function catalogPalettePng(locator: Locator, scale: number): Promise<Buffe
 
 async function catalogStackPng(locator: Locator, scale: number): Promise<Buffer> {
   const dataUrl = await locator.evaluate((node, selectedScale) => {
-    const items = Array.from(node.children) as HTMLElement[];
+    // Avatar stack batch (96e48a0b) nests surfaces inside a positioning track.
+    const items = Array.from(
+      node.querySelectorAll<HTMLElement>(
+        '[data-agent-avatar-surface], [data-agent-avatar-overflow]',
+      ),
+    );
     const nodeRect = node.getBoundingClientRect();
     const canvas = document.createElement('canvas');
     canvas.width = Math.ceil(nodeRect.width * selectedScale);
@@ -184,6 +190,7 @@ function colorDistance(first: Rgba, second: Rgba): number {
   return Math.hypot(first[0] - second[0], first[1] - second[1], first[2] - second[2]);
 }
 
+// Avatar palette batch (96e48a0b): failures are red; completed glyphs use semantic ink.
 type SurfaceFamily = 'neutral' | 'completed' | 'attention' | 'failed' | 'active' | 'waiting';
 
 const surfaceFamilyByState = {
@@ -520,6 +527,16 @@ test('resolves opaque, separated semantic state tokens in light and dark modes',
     for (const [index, first] of familyColors.entries()) {
       for (const second of familyColors.slice(index + 1)) {
         expect(colorDistance(first, second)).toBeGreaterThan(8);
+        // Avatar palette batch (96e48a0b) uses muted neutral beside pale completed green.
+        if (
+          theme === 'light' &&
+          first === expectedSurfaceByTheme.light.neutral &&
+          second === expectedSurfaceByTheme.light.completed
+        ) {
+          expect(colorDistance(first, second)).toBeCloseTo(Math.sqrt(65), 6);
+        } else {
+          expect(colorDistance(first, second)).toBeGreaterThan(15);
+        }
       }
     }
     const waiting = expectedSurfaceByTheme[theme].waiting;
@@ -557,6 +574,7 @@ test("keeps every SVG path and circle on the state's opaque foreground in each c
             }),
           })),
         );
+      // Avatar palette batch (96e48a0b) gives completed avatars their own foreground.
       for (const presentation of presentations) {
         expect(presentation.opacity).toBe('1');
         if (mode !== 'forced-colors') {
@@ -626,6 +644,7 @@ test('keeps Settings Specialists at named compact geometry at 100% and 200%', as
       (node as HTMLElement).style.zoom = String(selectedZoom);
     }, zoom);
     for (const avatar of await settings.locator('[data-agent-avatar]').all()) {
+      // Settings navigation batch (7b81eb9b) deliberately uses compact avatars.
       await expect(avatar).toHaveAttribute('data-avatar-variant', 'compact');
       const [box, style] = await Promise.all([
         avatar.boundingBox(),
