@@ -4,7 +4,8 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/svelte';
 import axe from 'axe-core';
 import { createRawSnippet } from 'svelte';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { store as appStore } from '$store/renderer/store';
 import CatalogFoundations from './CatalogFoundations.svelte';
 import CatalogIntroduction from './CatalogIntroduction.svelte';
 import CatalogShell from './CatalogShell.svelte';
@@ -44,6 +45,8 @@ afterEach(() => {
 });
 
 describe('catalog workspace', () => {
+  beforeAll(() => appStore.init());
+
   it.each([
     { pathname: '/sandbox', name: 'Introduction' },
     { pathname: '/sandbox/recipes', name: 'Recipes' },

@@ -6,6 +6,10 @@
   "rules": {
     "duplicates": "warn",
   },
+  // Mirror the real icon alias: Knip 6.33.0's Vitest plugin cannot read alias arrays.
+  "paths": {
+    "svelte-fa": ["./src/lib/components/shared/icons/fa-proxy.ts"],
+  },
   "entry": [
     // Electron main process (tsconfig.main.json; package.json "main" points at its build output)
     "src/main/index.ts",
