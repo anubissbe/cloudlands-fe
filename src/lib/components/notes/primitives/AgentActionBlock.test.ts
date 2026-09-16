@@ -57,6 +57,13 @@ vi.mock('svelte-sonner', () => ({
   },
 }));
 
+vi.mock('$lib/components/patterns/notify', () => ({
+  notify: {
+    error: mocks.toastError,
+    success: mocks.toastSuccess,
+  },
+}));
+
 vi.mock('$shared/services/unified-id.service', () => ({
   unifiedIdService: {
     generateAgentId: mocks.generateAgentId,

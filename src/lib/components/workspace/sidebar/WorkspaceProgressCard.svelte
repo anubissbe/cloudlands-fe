@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { slide } from 'svelte/transition';
+  import { slide } from '$lib/motion';
   import type { Note } from '$shared/types';
   import { WORKSPACE_STATUS_MESSAGE_MAX_LENGTH, WorkspaceStatusEnum } from '$shared/types';
   import { isSpecNote } from '$shared/constants/notes';
@@ -23,6 +23,9 @@
   import { TooltipRich } from '$lib/components/ui/tooltip';
   import CheckoutModePill from '$lib/components/workspace/CheckoutModePill.svelte';
   import Button from '$lib/components/ui/button/button.svelte';
+  import { Input } from '$lib/components/ui/input';
+  import { Textarea } from '$lib/components/ui/textarea';
+  import { IntentMarkLoader } from '$lib/components/ui/indicators';
   import ImageLightbox from '$lib/components/ui/ImageLightbox.svelte';
   import DropdownMenu from '$lib/components/ui/dropdown-menu.svelte';
   import WorkspaceActionsMenu, {
@@ -36,11 +39,10 @@
   import { handleLink } from '$features/navigation/link-handler';
   import { m } from '$shared/paraglide/messages.js';
   import { WorkspaceId } from '$shared/types/branded-ids';
-  import { toast } from 'svelte-sonner';
+  import { notify } from '$lib/components/patterns/notify';
   import { onDestroy, tick } from 'svelte';
   import { writable } from 'svelte/store';
   import { logger } from '$lib/utils/client-logger';
-
   import { selectAllNotes } from '$store/renderer/slices/workspace-notes/workspace-notes-selectors';
   import { selectAllWorkspaceAgents } from '$store/renderer/slices/workspace-agents/workspace-agents-selectors';
   import {
@@ -79,7 +81,6 @@
   import DrivingClientIndicator from '$lib/components/workspace/DrivingClientIndicator.svelte';
   import SetPrimaryClientConfirmDialog from '$lib/components/workspace/SetPrimaryClientConfirmDialog.svelte';
   import { resolveDrivingClientSwitch } from '$lib/components/workspace/driving-indicator';
-
   interface Props {
     workspaceId?: string;
     onOpenNote?: (noteId: string) => void;
@@ -87,7 +88,6 @@
   }
 
   let { workspaceId, onOpenNote: _onOpenNote, onAcceptChanges }: Props = $props();
-
   const workspaceIdStore = writable('');
   $effect(() => {
     workspaceIdStore.set(workspaceId ?? '');
@@ -188,7 +188,7 @@
     isEditingTitle = false;
     if (mutation.error) {
       editedTitle = $workspace?.title || m.workspace_links_untitled_label();
-      toast.error(mutation.error);
+      notify.error(mutation.error);
     }
   });
 
@@ -726,8 +726,8 @@
     <div class="flex items-center justify-between group">
       <div class="relative flex-1 flex flex-col min-w-0">
         {#if isEditingTitle}
-          <input
-            bind:this={titleInputRef}
+          <Input
+            bind:ref={titleInputRef}
             type="text"
             bind:value={editedTitle}
             onblur={saveTitle}
@@ -740,14 +740,15 @@
             placeholder={m.workspace_links_untitled_label()}
           />
         {:else}
-          <button
+          <Button
+            variant="plain"
             class="relative z-10 text-xl font-semibold text-foreground bg-transparent
                border-none py-0.5 pr-1 rounded cursor-text text-left
                max-w-full overflow-hidden text-ellipsis whitespace-nowrap
                transition-all duration-150 leading-normal
                focus-visible:outline-1 focus-visible:outline-primary/50 focus-visible:-outline-offset-1
-               disabled:cursor-default disabled:opacity-50 truncate min-w-0"
-            class:opacity-50={!$workspace?.title}
+               disabled:cursor-default disabled:opacity-50 truncate min-w-0
+               {!$workspace?.title ? 'opacity-50' : ''}"
             onclick={startEditingTitle}
             title={m.workspace_sidebarHeader_editTitle_tooltip()}
             disabled={!$workspace}
@@ -755,7 +756,7 @@
             {#if $workspace}
               {$workspace.title || m.workspace_links_untitled_label()}
             {/if}
-          </button>
+          </Button>
         {/if}
         <span
           aria-hidden="true"
@@ -780,9 +781,7 @@
               disabled={isDeleting}
             >
               {#if isDeleting}
-                <div
-                  class="animate-spin h-3.5 w-3.5 border-2 border-current border-t-transparent rounded-full"
-                ></div>
+                <IntentMarkLoader size={14} />
               {:else}
                 <KebabIcon class="size-4" />
               {/if}
@@ -961,7 +960,7 @@
     <!-- Workflow action button (styled like AI-assisted action prompts) -->
     {#if workflowAction}
       {@const action = workflowAction}
-      <div class="flex-1 w-full" transition:slide={{ axis: 'y', duration: 200 }}>
+      <div class="flex-1 w-full" transition:slide={{ axis: 'y', tier: 'moderate' }}>
         {#if action}
           <div class="mt-1">
             <Tooltip
@@ -1045,8 +1044,8 @@
       <div class="pt-1">
         <div class="relative flex">
           {#if isEditingStatusMessage}
-            <textarea
-              bind:this={statusInputRef}
+            <Textarea
+              bind:ref={statusInputRef}
               bind:value={editedStatusMessage}
               onblur={saveStatusMessage}
               onkeydown={handleStatusMessageKeydown}
@@ -1057,9 +1056,11 @@
               class="edit-input type-body relative z-10 min-h-0 max-h-32 w-full resize-none overflow-hidden whitespace-pre-wrap break-words rounded border-none bg-transparent py-0.5 text-foreground outline-none leading-snug
                      focus:ring-none! focus:outline-none! transition-all duration-150 disabled:opacity-50"
               style="field-sizing: content;"
-              placeholder={m.workspace_sidebarHeader_addStatus_placeholder()}></textarea>
+              placeholder={m.workspace_sidebarHeader_addStatus_placeholder()}
+            ></Textarea>
           {:else if $workspace && currentStatusMessage}
-            <button
+            <Button
+              variant="plain"
               class="type-body relative z-10 w-full cursor-text whitespace-pre-wrap break-words rounded border-none bg-transparent py-0.5 text-left text-muted-foreground
                      transition-all duration-150 leading-snug hover:text-foreground
                      focus-visible:outline focus-visible:outline-1 focus-visible:outline-ring focus-visible:outline-offset-[-1px]
@@ -1074,7 +1075,7 @@
               disabled={!$workspace}
             >
               {currentStatusMessage}
-            </button>
+            </Button>
           {/if}
           <span
             aria-hidden="true"
@@ -1090,8 +1091,9 @@
     <!-- status screenshot (agent-authored, intent-hq/monorepo#997) -->
     {#if showStatusImage}
       <div class="py-1">
-        <button
-          bind:this={statusImageButtonRef}
+        <Button
+          variant="plain"
+          bind:ref={statusImageButtonRef}
           type="button"
           class="block w-full cursor-zoom-in bg-transparent border-none p-0
                  focus-visible:outline focus-visible:outline-1
@@ -1107,7 +1109,7 @@
             onerror={(e) =>
               (failedStatusImageUrl = e.currentTarget.getAttribute('src') ?? statusImageUrl)}
           />
-        </button>
+        </Button>
       </div>
       <ImageLightbox
         bind:open={statusImageLightboxOpen}
@@ -1121,38 +1123,41 @@
     <!-- {#if isLoadingReadyTasks}
     <div
       class="w-full px-4x pb-3 flex items-center gap-2 text-xs text-subtle"
-      transition:slide={{ axis: 'y', duration: 200 }}
+      transition:slide={{ axis: 'y', tier: 'moderate' }}
     >
-      <Fa icon={faSpinner} spin size="xs" />
+      <IntentMarkLoader size={12} />
       <span>Finding ready tasks...</span>
     </div>
   {:else if displayReadyTasks.length > 0 && currentDisplayReadyTask}
-    <div class="w-full px-4x pb-3" transition:slide={{ axis: 'y', duration: 200 }}>
+    <div class="w-full px-4x pb-3" transition:slide={{ axis: 'y', tier: 'moderate' }}>
       <div class="flex items-center justify-between text-xs text-subtle">
         <span>{displayReadyTasks.length} ready task{displayReadyTasks.length > 1 ? 's' : ''}:</span>
         {#if displayReadyTasks.length > 1}
           <span class="flex items-center gap-1">
-            <button
+            <Button
+              variant="plain"
               class="p-0.5 hover:bg-muted rounded transition-colors text-ghost cursor-pointer"
               onclick={navigatePrev}
               disabled={displayReadyTasks.length <= 1}
               title="Previous ready task"
             >
               <Fa icon={faChevronLeft} size="xs" />
-            </button>
-            <button
+            </Button>
+            <Button
+              variant="plain"
               class="p-0.5 hover:bg-muted rounded transition-colors text-ghost cursor-pointer"
               onclick={navigateNext}
               disabled={displayReadyTasks.length <= 1}
               title="Next ready task"
             >
               <Fa icon={faChevronRight} size="xs" />
-            </button>
+            </Button>
           </span>
         {/if}
       </div>
 
-      <button
+      <Button
+        variant="plain"
         class="flex items-center gap-2 w-full text-left text-sm text-subtle transition-colors py-1 rounded cursor-pointer"
         onclick={() => onOpenNote?.(currentDisplayReadyTask.id as string)}
         onmouseenter={() => (highlightedNoteId = currentDisplayReadyTask.id as string)}
@@ -1160,12 +1165,12 @@
       >
         <span class="flex-1 truncate text-xs">{currentDisplayReadyTask.title}</span>
         <Fa icon={faArrowRight} size="xs" class="text-ghost" />
-      </button>
+      </Button>
     </div>
   {:else if readyTasksError}
     <div
       class="w-full px-4x pb-3 text-xs text-danger mt-2"
-      transition:slide={{ axis: 'y', duration: 200 }}
+      transition:slide={{ axis: 'y', tier: 'moderate' }}
     >
       Error: {readyTasksError}
     </div>
@@ -1186,7 +1191,6 @@
   .edit-input::selection {
     background: hsl(var(--ring) / 0.3);
   }
-
   @container style(--motion-reduced: 1) {
     [data-workspace-title-edit-decoration],
     [data-workspace-status-edit-decoration] {

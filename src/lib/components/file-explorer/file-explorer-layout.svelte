@@ -8,13 +8,9 @@
   import { Separator } from '$lib/components/ui/separator';
   import * as Sidebar from '$lib/components/ui/sidebar';
   import { Button } from '$lib/components/ui/button';
+  import { IntentMarkLoader } from '$lib/components/ui/indicators';
   import { selectEffectiveFileExplorerWorkspacePath } from '$store/renderer/slices/file-explorer/file-explorer-selectors';
-  import {
-    faXmark,
-    faFileAlt,
-    faExclamationCircle,
-    faSpinner,
-  } from '@fortawesome/free-solid-svg-icons';
+  import { faXmark, faFileAlt, faExclamationCircle } from '@fortawesome/free-solid-svg-icons';
   import { m } from '$shared/paraglide/messages.js';
   import { store as appStore } from '$store/renderer/store';
   import {
@@ -255,7 +251,7 @@
               {#if fileData.modified}
                 <span class="w-2 h-2 bg-blue-500 rounded-full"></span>
               {/if}
-              <button
+              <Button
                 class="ml-1 hover:bg-accent rounded p-0.5"
                 onclick={(e) => {
                   e.stopPropagation();
@@ -263,7 +259,7 @@
                 }}
               >
                 <Fa icon={faXmark} size="xs" class="w-3 h-3" />
-              </button>
+              </Button>
             </Button>
           {/each}
         </div>
@@ -281,7 +277,7 @@
         </div>
       {:else if isLoading}
         <div class="flex items-center justify-center h-full">
-          <Fa icon={faSpinner} size="lg" class="w-8 h-8 animate-spin text-subtle" />
+          <IntentMarkLoader size={32} class="text-subtle" />
         </div>
       {:else if selectedFile}
         <CodeEditor
