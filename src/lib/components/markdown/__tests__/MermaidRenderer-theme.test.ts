@@ -5,6 +5,12 @@ const mermaidMocks = vi.hoisted(() => ({
   initialize: vi.fn(),
   registerLayoutLoaders: vi.fn(),
   render: vi.fn(async () => ({ svg: '<svg aria-roledescription="sequence"></svg>' })),
+  mermaidAPI: {
+    getDiagramFromText: vi.fn(async () => ({
+      type: 'flowchart-v2',
+      db: { getSubGraphs: () => [{ id: 'workers', nodes: ['B'] }] },
+    })),
+  },
 }));
 
 vi.mock('mermaid', () => ({ default: mermaidMocks }));
@@ -34,6 +40,7 @@ describe('MermaidRenderer theme updates', () => {
   beforeEach(() => {
     mermaidMocks.initialize.mockClear();
     mermaidMocks.render.mockClear();
+    mermaidMocks.mermaidAPI.getDiagramFromText.mockClear();
     for (const [name, value] of Object.entries(tokens)) {
       document.documentElement.style.setProperty(name, value);
     }
@@ -157,6 +164,36 @@ describe('MermaidRenderer theme updates', () => {
     await waitFor(() => expect(mermaidMocks.render).toHaveBeenCalledTimes(2));
     expect(mermaidMocks.render.mock.calls[1]?.[1]).toContain('Current');
     expect(view.container.querySelector('[data-obsolete]')).toBeNull();
+  });
+
+  it('discards a cancelled group parse before publishing SVG or fitting the next generation', async () => {
+    let finish!: (
+      value: Awaited<ReturnType<typeof mermaidMocks.mermaidAPI.getDiagramFromText>>,
+    ) => void;
+    mermaidMocks.mermaidAPI.getDiagramFromText.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finish = resolve;
+        }),
+    );
+    mermaidMocks.render.mockResolvedValueOnce({
+      svg: '<svg data-obsolete="true" aria-roledescription="flowchart-v2"><g class="cluster"/></svg>',
+    });
+    const view = render(MermaidRenderer, {
+      code: 'flowchart TB\nsubgraph workers\nB\nend',
+    });
+    await waitFor(() =>
+      expect(mermaidMocks.mermaidAPI.getDiagramFromText).toHaveBeenCalledOnce(),
+    );
+    await view.rerender({ code: 'sequenceDiagram\nA->>B: Current' });
+    finish({
+      type: 'flowchart-v2',
+      db: { getSubGraphs: () => [{ id: 'workers', nodes: ['B'] }] },
+    });
+    await waitFor(() => expect(mermaidMocks.render).toHaveBeenCalledTimes(2));
+    expect(view.container.querySelector('[data-obsolete]')).toBeNull();
+    expect(view.container.querySelector('svg[aria-roledescription="sequence"]')).toBeTruthy();
+    expect(mermaidMocks.mermaidAPI.getDiagramFromText).toHaveBeenCalledOnce();
   });
 
   it('joins automatic note wraps without removing authored line breaks or tspan text', async () => {

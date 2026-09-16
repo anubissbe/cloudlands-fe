@@ -456,7 +456,7 @@
     transition: none;
   }
 
-  @media (prefers-reduced-motion: reduce) {
+  @container style(--motion-reduced: 1) {
     :global(html:not(.catalog-full-motion)) .diagram-node-html {
       transition: none;
     }

@@ -26,6 +26,11 @@
   } from './mermaid-theme';
   import { splitSemanticLabel } from '$lib/components/diagrams/diagram-label-wrap';
   import type { SvgBounds } from './mermaid-state-layout';
+  import type { FlowDB } from 'mermaid/dist/diagrams/flowchart/flowDb';
+  import {
+    snapshotFlowchartClusterMembership,
+    type FlowchartClusterMembership,
+  } from './mermaid-cluster-membership';
   import { addMermaidLabelKnockouts, insertLabelKnockout } from './mermaid-label-knockouts';
   import { loadMermaidTextFont } from './mermaid-font-loading';
   import {
@@ -93,17 +98,25 @@
     code: string;
     className?: string;
     showExpandButton?: boolean;
+    showSourceButton?: boolean;
+    showSource?: boolean;
     onRenderStateChange?: (state: MermaidRenderState) => void;
   }
 
-  let { code, className = '', showExpandButton = true, onRenderStateChange }: Props = $props();
+  let {
+    code,
+    className = '',
+    showExpandButton = true,
+    showSourceButton = true,
+    showSource = $bindable(false),
+    onRenderStateChange,
+  }: Props = $props();
 
   let renderedSvg = $state('');
   let error = $state<string | null>(null);
   let mounted = $state(false);
   let isFullscreen = $state(false);
   let fullscreenSvg = $state('');
-  let showSource = $state(false);
   let fullscreenOpenerElement: HTMLElement | null = $state(null);
   let zoomPanViewport: ZoomPanViewport | undefined = $state();
   let rendererElement: HTMLDivElement | undefined = $state();
@@ -1281,7 +1294,11 @@ ${source}`;
     return { x: left, y: top, width: right - left, height: bottom - top };
   }
 
-  async function fitRenderedSvg(generation: number, source: string): Promise<boolean> {
+  async function fitRenderedSvg(
+    generation: number,
+    source: string,
+    clusterMembership?: FlowchartClusterMembership,
+  ): Promise<boolean> {
     const fit = ++fitGeneration;
     await tick();
     await document.fonts?.ready;
@@ -1309,7 +1326,7 @@ ${source}`;
     padMermaidEdgeLabels(svg);
     addMermaidLabelKnockouts(svg);
     addMermaidLabelFeathers(svg);
-    reserveFlowchartClusterHeaderBands(svg);
+    reserveFlowchartClusterHeaderBands(svg, clusterMembership);
     repairEntityDividers(svg);
     refineMermaidCylinderNodes(svg);
     repairFlowchartNodeOutlines(svg);
@@ -1335,8 +1352,8 @@ ${source}`;
       preservesCompactDirection &&
       (compactRendererLayout || (flowchart && initialBounds.width * readableScale > rendererWidth));
     if (compactFlowchartLayout) {
-      reflowCompactFlowchart(svg, false);
-      reflowCompactFlowchart(svg);
+      reflowCompactFlowchart(svg, false, clusterMembership);
+      reflowCompactFlowchart(svg, true, clusterMembership);
     }
     await new Promise<void>((resolve) =>
       requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
@@ -1350,7 +1367,7 @@ ${source}`;
     routeFlowchartDecisionBranches(svg);
     let compactFlowchartBounds: SvgBounds | null = null;
     if (compactFlowchartLayout) {
-      reflowCompactFlowchart(svg);
+      reflowCompactFlowchart(svg, true, clusterMembership);
       routeFlowchartFeedbackLane(svg, true);
       routeFlowchartCenteredFanouts(svg);
       routeFlowchartDecisionBranches(svg);
@@ -1581,10 +1598,20 @@ ${source}`;
           const id = `mermaid-${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
           const { svg } = await mermaid.render(id, renderCode);
           if (generation !== renderGeneration) return;
+          let clusterMembership: FlowchartClusterMembership | undefined;
+          if (usesHtmlLabels && /class="[^"]*\bcluster\b/.test(svg)) {
+            const diagram = await mermaid.mermaidAPI.getDiagramFromText(renderCode);
+            if (generation !== renderGeneration) return;
+            if (diagram.type === 'flowchart-v2') {
+              clusterMembership = snapshotFlowchartClusterMembership(
+                (diagram.db as FlowDB).getSubGraphs(),
+              );
+            }
+          }
           renderedSvg = svg;
           error = null;
           // Finish geometry before another diagram dirties the document for measurement.
-          const fitCompleted = await fitRenderedSvg(generation, renderCode);
+          const fitCompleted = await fitRenderedSvg(generation, renderCode, clusterMembership);
           if (fitCompleted && generation === renderGeneration) settledGeneration = generation;
         },
         () => generation === renderGeneration,
@@ -1720,42 +1747,49 @@ ${source}`;
     </div>
   {:else if renderedSvg}
     <div class="mermaid-svg-container">
-      <div class="mermaid-svg-viewport">
+      <div
+        class="mermaid-svg-viewport"
+        class:without-actions={!showSourceButton && !showExpandButton}
+      >
         <div class="mermaid-svg mermaid-presentation">
           {@html renderedSvg}
         </div>
       </div>
-      <div
-        class="mermaid-actions"
-        role="toolbar"
-        aria-label={m.markdown_mermaid_actions_ariaLabel()}
-      >
-        <Button
-          variant="ghost"
-          size="icon-xs"
-          iconOnly
-          class="mermaid-action-button"
-          onclick={toggleSource}
-          aria-pressed={showSource}
-          aria-label={m.markdown_mermaid_viewSource_label()}
-          tooltip={m.markdown_mermaid_viewSource_label()}
+      {#if showSourceButton || showExpandButton}
+        <div
+          class="mermaid-actions"
+          role="toolbar"
+          aria-label={m.markdown_mermaid_actions_ariaLabel()}
         >
-          <Fa icon={faCode} size="sm" />
-        </Button>
-        {#if showExpandButton}
-          <Button
-            variant="ghost"
-            size="icon-xs"
-            iconOnly
-            class="mermaid-action-button expand-button"
-            onclick={openFullscreen}
-            aria-label={m.markdown_mermaid_expand_ariaLabel()}
-            tooltip={m.markdown_mermaid_expand_tooltip()}
-          >
-            <Fa icon={faExpand} size="sm" />
-          </Button>
-        {/if}
-      </div>
+          {#if showSourceButton}
+            <Button
+              variant="ghost"
+              size="icon-xs"
+              iconOnly
+              class="mermaid-action-button"
+              onclick={toggleSource}
+              aria-pressed={showSource}
+              aria-label={m.markdown_mermaid_viewSource_label()}
+              tooltip={m.markdown_mermaid_viewSource_label()}
+            >
+              <Fa icon={faCode} size="sm" />
+            </Button>
+          {/if}
+          {#if showExpandButton}
+            <Button
+              variant="ghost"
+              size="icon-xs"
+              iconOnly
+              class="mermaid-action-button expand-button"
+              onclick={openFullscreen}
+              aria-label={m.markdown_mermaid_expand_ariaLabel()}
+              tooltip={m.markdown_mermaid_expand_tooltip()}
+            >
+              <Fa icon={faExpand} size="sm" />
+            </Button>
+          {/if}
+        </div>
+      {/if}
     </div>
     {#if showSource}
       <div class="mermaid-source" role="region" aria-label={m.markdown_mermaid_viewSource_label()}>
@@ -1827,6 +1861,10 @@ ${source}`;
     min-width: 0;
     max-width: 100%;
     overflow-x: auto;
+  }
+
+  .mermaid-svg-viewport.without-actions {
+    grid-row: 1;
   }
 
   .mermaid-svg-container:hover .mermaid-actions,
@@ -2312,7 +2350,7 @@ ${source}`;
     transition: none;
   }
 
-  @media (prefers-reduced-motion: reduce) {
+  @container style(--motion-reduced: 1) {
     :global(html:not(.catalog-full-motion) .mermaid-presentation .edgeLabel rect.background),
     :global(html:not(.catalog-full-motion) .mermaid-presentation .edge-label-knockout),
     :global(
@@ -2458,7 +2496,7 @@ ${source}`;
     animation: none;
   }
 
-  @media (prefers-reduced-motion: reduce) {
+  @container style(--motion-reduced: 1) {
     .mermaid-actions {
       transition: none;
       animation: none;

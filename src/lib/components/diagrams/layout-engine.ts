@@ -3534,6 +3534,136 @@ function computeOrthogonalEdgePaths(
     };
   });
 
+  // Outside tracks are a safe fallback, not a reason to retain a deep return U.
+  // Simplify against all occupied routes, including ones not processed yet. Visit
+  // right-to-left routes first so reciprocal separation does not depend on edge order.
+  const corridorOrder = edgeInfos
+    .map((info, index) => ({ info, route: computedEdges[index] }))
+    .toSorted(
+      (a, b) =>
+        Number(a.info.fromNode.x < a.info.toNode.x) -
+          Number(b.info.fromNode.x < b.info.toNode.x) ||
+        a.info.fromNode.x - b.info.fromNode.x ||
+        a.info.fromNode.y - b.info.fromNode.y ||
+        a.info.toNode.x - b.info.toNode.x ||
+        a.info.toNode.y - b.info.toNode.y,
+    );
+  for (const { info, route } of corridorOrder) {
+    const { fromNode, toNode, fromSide, toSide } = info;
+    if (
+      isVerticalLayout ||
+      !['left', 'right'].includes(fromSide) ||
+      !['left', 'right'].includes(toSide) ||
+      (directedParallelMap.get(route.id)?.count ?? 1) > 1 ||
+      !route.points ||
+      route.points.length <= 2
+    )
+      continue;
+
+    const forward = fromNode.x < toNode.x;
+    const sourceX = forward ? fromNode.x + fromNode.width : fromNode.x;
+    const targetX = forward ? toNode.x : toNode.x + toNode.width;
+    if ((targetX - sourceX) * (forward ? 1 : -1) <= 0) continue;
+
+    const label = route.label ? measureEdgeLabel(route.label) : undefined;
+    const endpointGroups = new Set([nodeGroup.get(fromNode.id), nodeGroup.get(toNode.id)]);
+    const boxes = [
+      ...nodes.map((node) => ({
+        node,
+        clearance: node.id === fromNode.id || node.id === toNode.id ? 0 : ROUTE_NODE_CLEARANCE,
+      })),
+      ...(groups ?? [])
+        .filter((group) => !endpointGroups.has(group.id))
+        .map((node) => ({ node, clearance: ROUTE_GROUP_CLEARANCE })),
+    ].map(({ node, clearance }) => ({
+      left: node.x - clearance,
+      right: node.x + node.width + clearance,
+      top: node.y - clearance,
+      bottom: node.y + node.height + clearance,
+    }));
+    boxes.push(...(groups ?? []).map(groupTitleObstacle));
+    const occupied = [...selfLoopEdges, ...computedEdges]
+      .filter((other) => other !== route)
+      .flatMap((other) => {
+        const size = other.label ? measureEdgeLabel(other.label) : undefined;
+        return (other.points ?? []).slice(1).map((end, index) => {
+          const start = other.points![index];
+          return {
+            left: Math.min(start.x, end.x) - Math.max(TRACK_SPACING, (size?.width ?? 0) / 2 + 2),
+            right: Math.max(start.x, end.x) + Math.max(TRACK_SPACING, (size?.width ?? 0) / 2 + 2),
+            top: Math.min(start.y, end.y) - Math.max(TRACK_SPACING, (size?.height ?? 0) / 2 + 2),
+            bottom: Math.max(start.y, end.y) + Math.max(TRACK_SPACING, (size?.height ?? 0) / 2 + 2),
+          };
+        });
+      });
+    const obstacles = [...boxes, ...occupied];
+    const candidates: RoutePoint[][] = [];
+    const sideInset = (node: ComputedNode) =>
+      Math.min(node.height / 4, ['db', 'store', 'data_store'].includes(node.kind ?? '') ? 10 : 6);
+    const top = Math.max(fromNode.y + sideInset(fromNode), toNode.y + sideInset(toNode));
+    const bottom = Math.min(
+      fromNode.y + fromNode.height - sideInset(fromNode),
+      toNode.y + toNode.height - sideInset(toNode),
+    );
+    if (top <= bottom) {
+      for (const y of [(top + bottom) / 2, top, bottom]) {
+        candidates.push([{ x: sourceX, y }, { x: targetX, y }]);
+      }
+    }
+    const source = { x: sourceX, y: fromNode.y + fromNode.height / 2 };
+    const target = { x: targetX, y: toNode.y + toNode.height / 2 };
+    if (Math.abs(targetX - sourceX) >= NODE_GAP * 2) {
+      const x = (sourceX + targetX) / 2;
+      candidates.push([source, { x, y: source.y }, { x, y: target.y }, target]);
+    }
+    for (const below of [false, true]) {
+      const start = {
+        x: fromNode.x + fromNode.width / 2,
+        y: fromNode.y + (below ? fromNode.height : 0),
+      };
+      const end = {
+        x: toNode.x + toNode.width / 2,
+        y: toNode.y + (below ? toNode.height : 0),
+      };
+      const lead = Math.max(NODE_GAP, (label?.height ?? 0) / 2 + ROUTE_LABEL_CLEARANCE);
+      const y = below ? Math.max(start.y, end.y) + lead : Math.min(start.y, end.y) - lead;
+      candidates.push([start, { x: start.x, y }, { x: end.x, y }, end]);
+    }
+    const supportsLabel = (points: RoutePoint[]) =>
+      !label ||
+      points.slice(1).some((end, index) => {
+        const start = points[index];
+        const extent = start.y === end.y ? label.width : label.height;
+        if (Math.hypot(end.x - start.x, end.y - start.y) < extent + 16) return false;
+        return [0.5, 0.25, 0.75].some((fraction) => {
+          const x = start.x + (end.x - start.x) * fraction;
+          const y = start.y + (end.y - start.y) * fraction;
+          return !obstacles.some(
+            (box) =>
+              x - label.width / 2 - 8 < box.right &&
+              x + label.width / 2 + 8 > box.left &&
+              y - label.height / 2 - 8 < box.bottom &&
+              y + label.height / 2 + 8 > box.top,
+          );
+        });
+      });
+    const simpler = candidates
+      .map(simplifyOrthogonalPoints)
+      .filter(
+        (points) =>
+          (points.length < route.points!.length ||
+            (points.length === route.points!.length &&
+              routeLength(points) < routeLength(route.points!))) &&
+          !routeEntersObstacles(points, obstacles) &&
+          supportsLabel(points),
+      )
+      .toSorted((a, b) => a.length - b.length || routeLength(a) - routeLength(b))[0];
+    if (simpler) {
+      route.points = simpler;
+      route.path = buildRoundedOrthogonalPath(simpler);
+    }
+  }
+
   return [...selfLoopEdges, ...computedEdges];
 
   function assignOrderedPortPositions(infos: EdgeInfo[]): Map<string, RoutePoint> {

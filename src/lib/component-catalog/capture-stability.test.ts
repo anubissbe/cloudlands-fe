@@ -82,7 +82,8 @@ function createImage({
 afterEach(() => {
   vi.useRealTimers();
   vi.restoreAllMocks();
-  document.documentElement.classList.remove('catalog-reduced-motion');
+  document.documentElement.classList.remove('catalog-reduced-motion', 'catalog-full-motion');
+  document.documentElement.removeAttribute('data-reduce-motion');
   document.body.replaceChildren();
   if (originalFonts) Object.defineProperty(document, 'fonts', originalFonts);
   else delete (document as Document & { fonts?: FontFaceSet }).fonts;
@@ -99,6 +100,33 @@ afterEach(() => {
 });
 
 describe('waitForCaptureStability', () => {
+  it('reports the final battery policy after pending frames and honors preview overrides', async () => {
+    setFonts(Promise.resolve());
+    const frames = useManualFrames();
+    const root = document.createElement('div');
+    const pending = waitForCaptureStability(root);
+    await frames.next();
+    document.documentElement.setAttribute('data-reduce-motion', '');
+    await frames.next();
+    await expect(pending).resolves.toMatchObject({ reducedMotion: true });
+
+    document.documentElement.classList.add('catalog-full-motion');
+    const full = waitForCaptureStability(root);
+    await frames.next();
+    await frames.next();
+    await expect(full).resolves.toMatchObject({ reducedMotion: false });
+  });
+
+  it('uses the capture root owning document rather than the host motion policy', async () => {
+    document.documentElement.setAttribute('data-reduce-motion', '');
+    const owner = document.implementation.createHTMLDocument();
+    const root = owner.createElement('div');
+    owner.body.append(root);
+    await expect(waitForCaptureStability(root)).resolves.toMatchObject({ reducedMotion: false });
+    owner.documentElement.classList.add('catalog-reduced-motion');
+    await expect(waitForCaptureStability(root)).resolves.toMatchObject({ reducedMotion: true });
+  });
+
   it('starts the stability budget after declared preview content is ready', async () => {
     setFonts(Promise.resolve());
     useTimerFrames();

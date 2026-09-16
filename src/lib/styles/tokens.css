@@ -456,20 +456,58 @@
   --theme-agent-avatar-surface-waiting: var(--theme-dark-agent-avatar-surface-waiting);
 }
 
+/* ===== Reduced motion ===== */
+/* `--motion-reduced` is the single CSS source of truth: 1 under the OS
+   preference OR the root `data-reduce-motion` attribute (battery saver), else 0.
+   Explicit catalog full/reduced previews override both sources, reduced first.
+   Component rules query it with `@container style(--motion-reduced: 1)`; the
+   JS mirror is `$lib/utils/reduced-motion`. The global blanket below is
+   duplicated for the attribute path (wrapped in `:where()` so its specificity
+   matches the media block's) because a style query cannot reach `html` itself. */
+:root {
+  --motion-reduced: 0;
+}
+
 @media (prefers-reduced-motion: reduce) {
-  html:not(.catalog-full-motion),
-  html:not(.catalog-full-motion) *,
-  html:not(.catalog-full-motion) *::before,
-  html:not(.catalog-full-motion) *::after,
-  html.catalog-reduced-motion,
-  html.catalog-reduced-motion *,
-  html.catalog-reduced-motion *::before,
-  html.catalog-reduced-motion *::after {
+  :root {
+    --motion-reduced: 1;
+  }
+
+  :where(:root:not(.catalog-full-motion)),
+  :where(:root:not(.catalog-full-motion))::before,
+  :where(:root:not(.catalog-full-motion))::after,
+  :where(:root:not(.catalog-full-motion)) *,
+  :where(:root:not(.catalog-full-motion)) *::before,
+  :where(:root:not(.catalog-full-motion)) *::after {
     scroll-behavior: auto !important;
     transition-duration: 0.01ms !important;
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
   }
+}
+
+:root[data-reduce-motion] {
+  --motion-reduced: 1;
+}
+
+:root.catalog-full-motion {
+  --motion-reduced: 0;
+}
+
+:root.catalog-reduced-motion {
+  --motion-reduced: 1;
+}
+
+:where(:root[data-reduce-motion]:not(.catalog-full-motion), :root.catalog-reduced-motion),
+:where(:root[data-reduce-motion]:not(.catalog-full-motion), :root.catalog-reduced-motion)::before,
+:where(:root[data-reduce-motion]:not(.catalog-full-motion), :root.catalog-reduced-motion)::after,
+:where(:root[data-reduce-motion]:not(.catalog-full-motion), :root.catalog-reduced-motion) *,
+:where(:root[data-reduce-motion]:not(.catalog-full-motion), :root.catalog-reduced-motion) *::before,
+:where(:root[data-reduce-motion]:not(.catalog-full-motion), :root.catalog-reduced-motion) *::after {
+  scroll-behavior: auto !important;
+  transition-duration: 0.01ms !important;
+  animation-duration: 0.01ms !important;
+  animation-iteration-count: 1 !important;
 }
 
 @media (forced-colors: active) {

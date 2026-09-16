@@ -1034,6 +1034,72 @@ test('honors reduced system motion by default without a motion query', async ({ 
   expect(Math.max(...transition.finiteAnimationCounts.map(({ count }) => count))).toBe(0);
 });
 
+test('keeps live battery policy and explicit preview choices consistent in CSS and stepped motion', async ({
+  page,
+}, info) => {
+  await openSystemMotionFixture(page, 'custom-walkthrough', false);
+  const shell = page.getByTestId('catalog-shell');
+  const root = page.locator('#custom-walkthrough');
+  const readPolicy = () =>
+    page.evaluate(async () => {
+      const modulePath = '/src/lib/utils/reduced-motion.ts';
+      const { prefersReducedMotion } = await import(/* @vite-ignore */ modulePath);
+      const dot = document.querySelector('#custom-walkthrough .stepper-dot')!;
+      return {
+        js: prefersReducedMotion(document),
+        css: getComputedStyle(document.documentElement).getPropertyValue('--motion-reduced').trim(),
+        stepTransition: getComputedStyle(dot).transitionProperty,
+      };
+    });
+  const evidence = [];
+  await page.evaluate(() => document.documentElement.setAttribute('data-reduce-motion', ''));
+  await expect(shell).toHaveAttribute('data-catalog-motion-preference', 'system');
+  await expect(shell).toHaveAttribute('data-catalog-motion', 'reduced');
+  expect(await readPolicy()).toMatchObject({ js: true, css: '1', stepTransition: 'none' });
+  const battery = await recordReducedControlMotion(page, 'custom-walkthrough', 'forward');
+  expect(battery).toMatchObject({ selectedStep: 1, phase: 'settled', settled: true });
+  expect(Math.max(...battery.finiteAnimationCounts.map(({ count }) => count))).toBe(0);
+  evidence.push({ policy: await readPolicy(), transition: battery });
+
+  await page.getByRole('radio', { name: 'Full', exact: true }).click();
+  await expect(shell).toHaveAttribute('data-catalog-motion', 'full');
+  expect(await readPolicy()).toMatchObject({ js: false, css: '0' });
+  expect((await readPolicy()).stepTransition).not.toBe('none');
+  const full = await recordControlMotion(page, 'custom-walkthrough', 'backward');
+  expect(full.sameMount).toBe(true);
+  expect(full.frames.some((frame) => frame.cameraAnimationCount > 0)).toBe(true);
+  expect(full.frames.at(-1)).toMatchObject({ selectedStep: 0, phase: 'settled', settled: true });
+  evidence.push({ policy: await readPolicy(), transition: full });
+
+  await page.getByRole('radio', { name: 'System', exact: true }).click();
+  await expect(shell).toHaveAttribute('data-catalog-motion', 'reduced');
+  await page.evaluate(() => document.documentElement.removeAttribute('data-reduce-motion'));
+  await expect(shell).toHaveAttribute('data-catalog-motion', 'full');
+  expect(await readPolicy()).toMatchObject({ js: false, css: '0' });
+  const restored = await recordControlMotion(page, 'custom-walkthrough', 'forward');
+  expect(restored.frames.some((frame) => frame.cameraAnimationCount > 0)).toBe(true);
+  expect(restored.frames.at(-1)).toMatchObject({
+    selectedStep: 1,
+    phase: 'settled',
+    settled: true,
+  });
+  evidence.push({ policy: await readPolicy(), transition: restored });
+
+  await page.getByRole('radio', { name: 'Reduced', exact: true }).click();
+  await expect(shell).toHaveAttribute('data-catalog-motion', 'reduced');
+  expect(await readPolicy()).toMatchObject({ js: true, css: '1', stepTransition: 'none' });
+  const reduced = await recordReducedControlMotion(page, 'custom-walkthrough', 'backward');
+  expect(reduced).toMatchObject({ selectedStep: 0, phase: 'settled', settled: true });
+  expect(Math.max(...reduced.finiteAnimationCounts.map(({ count }) => count))).toBe(0);
+  expect(await allRoutesComplete(page, 'custom-walkthrough')).toBe(true);
+  evidence.push({ policy: await readPolicy(), transition: reduced });
+  await info.attach('battery-policy-transitions', {
+    body: JSON.stringify(evidence),
+    contentType: 'application/json',
+  });
+  await root.screenshot({ path: info.outputPath('battery-policy-restored.png') });
+});
+
 test('persists accessible full and reduced motion choices across stepped fixtures', async ({
   page,
 }) => {

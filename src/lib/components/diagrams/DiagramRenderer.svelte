@@ -28,7 +28,7 @@
   import { cubicOut } from 'svelte/easing';
   import { flushSync, onDestroy, onMount, tick, untrack } from 'svelte';
   import { m } from '$shared/paraglide/messages.js';
-  import { shouldReduceMotion } from '$lib/utils/motion-preference';
+  import { prefersReducedMotion } from '$lib/utils/reduced-motion';
   import { cameraMotionKeyframes, partitionSceneIds } from './diagram-motion';
   import { freeLabelFractions } from './diagram-label-placement';
 
@@ -71,7 +71,7 @@
   let resizeFrame: number | undefined;
   let fitFrame: number | undefined;
   function motionDuration(duration: number): number {
-    return resizing || shouldReduceMotion() ? 0 : duration;
+    return resizing || prefersReducedMotion(scrollContainerEl?.ownerDocument) ? 0 : duration;
   }
 
   // Computed layout
@@ -2172,7 +2172,7 @@
     animation: none !important;
   }
 
-  @media (prefers-reduced-motion: reduce) {
+  @container style(--motion-reduced: 1) {
     :global(html:not(.catalog-full-motion) .edge-label-container),
     :global(html:not(.catalog-full-motion) .edge-label-html::before),
     :global(html:not(.catalog-full-motion) .diagram-geometry-motion),

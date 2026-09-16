@@ -1,3 +1,8 @@
+import {
+  flowchartClusterId,
+  type FlowchartClusterMembership,
+} from './mermaid-cluster-membership';
+
 const ORTHOGONAL_CORNER_RADIUS = 6;
 const FLOWCHART_PORT_SLOT_GAP = 16;
 const FLOWCHART_FANOUT_PORT_GAP = 18;
@@ -407,7 +412,7 @@ export function replacePathTerminal(pathData: string, terminal: Point): string |
     : replaced;
 }
 
-function boundsInPathSpace(element: SVGGraphicsElement, path: SVGPathElement): Bounds | null {
+function boundsInPathSpace(element: SVGGraphicsElement, path: SVGGraphicsElement): Bounds | null {
   const elementMatrix = element.getScreenCTM();
   const pathMatrix = path.getScreenCTM();
   if (!elementMatrix || !pathMatrix) return null;
@@ -1162,15 +1167,86 @@ export function routeFlowchartClientRequestLane(svg: SVGSVGElement) {
   return true;
 }
 
-export function reserveFlowchartClusterHeaderBands(svg: SVGSVGElement) {
+/** Smallest outward move, preferring a side on which the outsider already lies. */
+export function clusterOutsiderShift(frame: Bounds, content: Bounds, outside: Bounds): Point {
+  if (!boundsOverlap(frame, outside, 12)) return { x: 0, y: 0 };
+  const candidates = [
+    {
+      x: frame.x - outside.x - outside.width - 12,
+      y: 0,
+      clear: outside.x + outside.width <= content.x,
+    },
+    {
+      x: frame.x + frame.width - outside.x + 12,
+      y: 0,
+      clear: outside.x >= content.x + content.width,
+    },
+    {
+      x: 0,
+      y: frame.y - outside.y - outside.height - 12,
+      clear: outside.y + outside.height <= content.y,
+    },
+    {
+      x: 0,
+      y: frame.y + frame.height - outside.y + 12,
+      clear: outside.y >= content.y + content.height,
+    },
+  ];
+  const { x, y } = candidates.toSorted(
+    (left, right) =>
+      Number(right.clear) - Number(left.clear) ||
+      Math.hypot(left.x, left.y) - Math.hypot(right.x, right.y),
+  )[0];
+  return { x, y };
+}
+
+function unionClusterBounds(bounds: Bounds[]): Bounds {
+  const x = Math.min(...bounds.map((box) => box.x));
+  const y = Math.min(...bounds.map((box) => box.y));
+  return {
+    x,
+    y,
+    width: Math.max(...bounds.map((box) => box.x + box.width)) - x,
+    height: Math.max(...bounds.map((box) => box.y + box.height)) - y,
+  };
+}
+
+function translateInClusterSpace(
+  element: SVGGraphicsElement,
+  reference: SVGGraphicsElement,
+  delta: Point,
+) {
+  const parent = (element.parentElement as SVGGraphicsElement | null)?.getScreenCTM();
+  const matrix = reference.getScreenCTM();
+  if (!parent || !matrix) return;
+  const origin = new DOMPoint(0, 0).matrixTransform(matrix).matrixTransform(parent.inverse());
+  const target = new DOMPoint(delta.x, delta.y)
+    .matrixTransform(matrix)
+    .matrixTransform(parent.inverse());
+  const previous = element.getAttribute('transform') ?? '';
+  element.setAttribute(
+    'transform',
+    `translate(${target.x - origin.x}, ${target.y - origin.y}) ${previous}`,
+  );
+}
+
+export function reserveFlowchartClusterHeaderBands(
+  svg: SVGSVGElement,
+  membership?: FlowchartClusterMembership,
+) {
   if (svg.getAttribute('aria-roledescription') !== 'flowchart-v2') return;
   const nodes = [...svg.querySelectorAll<SVGGElement>('g.node')];
   const records = [...svg.querySelectorAll<SVGGElement>('g.cluster')].flatMap((cluster) => {
     const rect = cluster.querySelector<SVGRectElement>(':scope > rect');
     const label = cluster.querySelector<SVGGElement>(':scope > g.cluster-label');
     if (!rect || !label) return [];
+    const id = membership && flowchartClusterId(cluster, membership);
+    const memberIds = id ? membership?.get(id) : undefined;
+    // A semantic snapshot is authoritative, including an empty group.
+    if (membership && !memberIds) return [];
     const frame = rect.getBBox();
     const members = nodes.filter((node) => {
+      if (memberIds) return memberIds.has(flowchartNodeId(node));
       const bounds = flowchartNodeBounds(node);
       if (!bounds) return false;
       const center = pointAt(bounds, 0.5, 0.5);
@@ -1181,34 +1257,71 @@ export function reserveFlowchartClusterHeaderBands(svg: SVGSVGElement) {
         center.y <= frame.y + frame.height
       );
     });
-    return [{ cluster, rect, label, frame, members }];
+    return [{ cluster, rect, label, frame, members, id, memberIds }];
   });
+  // Retarget only paths whose node/frame actually changes. Preserve the original
+  // side, topology and markers, including edges whose endpoint is a subgraph.
+  const routes = membership
+    ? [...svg.querySelectorAll<SVGPathElement>('.edgePaths path')].flatMap((path) => {
+        const identity = flowchartEdgeIdentity(path);
+        const points = parseOrthogonalLinePath(path.getAttribute('d') ?? '');
+        if (!identity || !points) return [];
+        const endpoint = (id: string) => {
+          const node = flowchartNode(svg, id);
+          const shape =
+            (node && shapeForNode(node)) ?? records.find((record) => record.id === id)?.rect;
+          const bounds = shape && boundsInPathSpace(shape, path);
+          return shape && bounds ? { shape, bounds } : null;
+        };
+        return [
+          { path, points, source: endpoint(identity.source), target: endpoint(identity.target) },
+        ];
+      })
+    : [];
   const layouts = new Map<SVGGElement, Bounds>();
   for (const record of records.toSorted(
-    (left, right) => left.frame.width * left.frame.height - right.frame.width * right.frame.height,
+    (left, right) =>
+      (left.memberIds?.size ?? 0) - (right.memberIds?.size ?? 0) ||
+      left.frame.width * left.frame.height - right.frame.width * right.frame.height,
   )) {
     const childFrames = records
       .filter(
         (candidate) =>
           candidate !== record &&
-          candidate.frame.x >= record.frame.x &&
-          candidate.frame.y >= record.frame.y &&
-          candidate.frame.x + candidate.frame.width <= record.frame.x + record.frame.width &&
-          candidate.frame.y + candidate.frame.height <= record.frame.y + record.frame.height,
+          (record.memberIds
+            ? Boolean(candidate.id && record.memberIds.has(candidate.id))
+            : candidate.frame.x >= record.frame.x &&
+              candidate.frame.y >= record.frame.y &&
+              candidate.frame.x + candidate.frame.width <= record.frame.x + record.frame.width &&
+              candidate.frame.y + candidate.frame.height <= record.frame.y + record.frame.height),
       )
-      .flatMap(({ cluster }) => {
-        const bounds = layouts.get(cluster);
+      .flatMap(({ cluster, rect }) => {
+        const bounds = membership ? boundsInPathSpace(rect, record.cluster) : layouts.get(cluster);
         return bounds ? [bounds] : [];
       });
     const memberFrames = record.members.flatMap((node) => {
-      const bounds = flowchartNodeBounds(node);
+      const shape = shapeForNode(node);
+      const bounds =
+        membership && shape
+          ? boundsInPathSpace(shape, record.cluster)
+          : flowchartNodeBounds(node);
       return bounds ? [bounds] : [];
     });
     const content = [...memberFrames, ...childFrames];
     if (!content.length) continue;
     const viewport = record.label.querySelector<SVGForeignObjectElement>('foreignObject');
     const titleContent = viewport?.querySelector<HTMLElement>('div');
-    const titleHeight = Math.ceil(
+    const contentBounds = unionClusterBounds(content);
+    const outside = membership
+      ? nodes
+          .filter((node) => !record.members.includes(node))
+          .flatMap((node) => {
+            const shape = shapeForNode(node);
+            const bounds = shape && boundsInPathSpace(shape, record.cluster);
+            return bounds ? [bounds] : [];
+          })
+      : [];
+    let titleHeight = Math.ceil(
       Math.max(
         titleContent?.getBoundingClientRect().height ?? 0,
         titleContent?.scrollHeight ?? 0,
@@ -1216,15 +1329,49 @@ export function reserveFlowchartClusterHeaderBands(svg: SVGSVGElement) {
         18,
       ),
     );
-    const headerHeight = measuredClusterHeaderHeight(titleHeight);
+    let headerHeight = measuredClusterHeaderHeight(titleHeight);
     const minContentX = Math.min(...content.map(({ x }) => x));
     const maxContentX = Math.max(...content.map(({ x, width }) => x + width));
     const minContentY = Math.min(...content.map(({ y }) => y));
     const maxContentY = Math.max(...content.map(({ y, height }) => y + height));
-    const x = Math.min(record.frame.x, minContentX - CLUSTER_TITLE_INSET);
-    const y = Math.min(record.frame.y, minContentY - headerHeight);
-    const right = Math.max(record.frame.x + record.frame.width, maxContentX + CLUSTER_TITLE_INSET);
-    const bottom = Math.max(record.frame.y + record.frame.height, maxContentY + 20);
+    let x = Math.min(record.frame.x, minContentX - CLUSTER_TITLE_INSET);
+    let y = Math.min(record.frame.y, minContentY - headerHeight);
+    let right = Math.max(record.frame.x + record.frame.width, maxContentX + CLUSTER_TITLE_INSET);
+    let bottom = Math.max(record.frame.y + record.frame.height, maxContentY + 20);
+    if (
+      membership &&
+      outside.some((box) =>
+        boundsOverlap({ x, y, width: right - x, height: bottom - y }, box, 12),
+      )
+    ) {
+      // Mermaid can widen a frame for its title after placing nodes. Rebuild the
+      // unsafe allocation from semantic members, never from captured outsiders.
+      x = minContentX - CLUSTER_TITLE_INSET;
+      right = maxContentX + CLUSTER_TITLE_INSET;
+      bottom = maxContentY + 20;
+      if (viewport && titleContent) {
+        const measurement = viewport.cloneNode(true) as SVGForeignObjectElement;
+        const text = measurement.querySelector<HTMLElement>('div')!;
+        measurement.style.visibility = 'hidden';
+        measurement.setAttribute('height', '1');
+        measurement.setAttribute('width', String(right - x - CLUSTER_TITLE_INSET * 2));
+        text.style.setProperty('height', 'auto', 'important');
+        text.style.setProperty('width', '100%', 'important');
+        record.label.append(measurement);
+        try {
+          const width = Math.max(contentBounds.width, text.scrollWidth);
+          right = x + width + CLUSTER_TITLE_INSET * 2;
+          measurement.setAttribute('width', String(width));
+          titleHeight = Math.ceil(Math.max(18, text.scrollHeight));
+        } finally {
+          measurement.remove();
+        }
+      } else {
+        right = Math.max(right, x + record.label.getBBox().width + CLUSTER_TITLE_INSET * 2);
+      }
+      headerHeight = measuredClusterHeaderHeight(titleHeight);
+      y = minContentY - headerHeight;
+    }
     const frame = { x, y, width: right - x, height: bottom - y };
     record.rect.setAttribute('x', String(frame.x));
     record.rect.setAttribute('y', String(frame.y));
@@ -1248,6 +1395,105 @@ export function reserveFlowchartClusterHeaderBands(svg: SVGSVGElement) {
       );
     }
     layouts.set(record.cluster, frame);
+    if (!membership) continue;
+    // Move exterior groups atomically. Moving the whole outward half-plane also
+    // preserves gaps to their neighbours instead of introducing a new collision.
+    const unrelated = records.filter(
+      (candidate) =>
+        candidate !== record &&
+        candidate.id &&
+        record.id &&
+        !record.memberIds?.has(candidate.id) &&
+        !candidate.memberIds?.has(record.id),
+    );
+    const roots = unrelated.filter(
+      (candidate) =>
+        !unrelated.some(
+          (parent) =>
+            parent !== candidate && candidate.id && parent.memberIds?.has(candidate.id),
+        ),
+    );
+    const units: SVGGraphicsElement[][] = roots.map((root) => [
+      root.cluster,
+      ...root.members,
+      ...records
+        .filter((child) => child.id && root.memberIds?.has(child.id))
+        .map((child) => child.cluster),
+    ]);
+    units.push(
+      ...nodes
+        .filter(
+          (node) =>
+            !record.members.includes(node) && !roots.some((root) => root.members.includes(node)),
+        )
+        .map((node) => [node]),
+    );
+    for (const unit of units) {
+      const measure = (elements: SVGGraphicsElement[]) => {
+        const boxes = elements.flatMap((element) => {
+          const shape = element.matches('g.node')
+            ? shapeForNode(element as SVGGElement)
+            : element.querySelector<SVGRectElement>(':scope > rect');
+          const bounds = shape && boundsInPathSpace(shape, record.cluster);
+          return bounds ? [bounds] : [];
+        });
+        return boxes.length ? unionClusterBounds(boxes) : null;
+      };
+      const box = measure(unit);
+      if (!box) continue;
+      const delta = clusterOutsiderShift(frame, contentBounds, box);
+      if (!delta.x && !delta.y) continue;
+      const axis = delta.x ? 'x' : 'y';
+      const extent = delta.x ? 'width' : 'height';
+      const moving = units
+        .filter((candidate) => {
+          const bounds = measure(candidate);
+          return (
+            bounds &&
+            (delta[axis] > 0
+              ? bounds[axis] + bounds[extent] > box[axis]
+              : bounds[axis] < box[axis] + box[extent])
+          );
+        })
+        .flat();
+      for (const element of new Set(moving)) {
+        if (!moving.some((parent) => parent !== element && parent.contains(element)))
+          translateInClusterSpace(element, record.cluster, delta);
+      }
+    }
+  }
+  for (const { path, points, source, target } of routes) {
+    let changed = false;
+    const terminal = (endpoint: typeof source, point: Point) => {
+      const next = endpoint && boundsInPathSpace(endpoint.shape, path);
+      if (!endpoint || !next) return point;
+      const previous = endpoint.bounds;
+      if (
+        (['x', 'y', 'width', 'height'] as const).every(
+          (key) => Math.abs(next[key] - previous[key]) < 0.001,
+        )
+      )
+        return point;
+      changed = true;
+      return {
+        x: next.x + ((point.x - previous.x) * next.width) / (previous.width || 1),
+        y: next.y + ((point.y - previous.y) * next.height) / (previous.height || 1),
+      };
+    };
+    const start = terminal(source, points[0]);
+    const end = terminal(target, points[points.length - 1]);
+    if (!changed) continue;
+    const adjusted = snapOrthogonalTerminals(
+      points,
+      start,
+      end,
+      Math.abs(points[1].x - points[0].x) < 0.001,
+    );
+    path.setAttribute(
+      'd',
+      adjusted.map((point, index) => `${index ? 'L' : 'M'}${point.x},${point.y}`).join(''),
+    );
+    path.dataset.manhattanPoints = adjusted.map((point) => `${point.x},${point.y}`).join(' ');
   }
 }
 
@@ -4385,11 +4631,54 @@ export function routeFlowchartDecisionBranches(svg: SVGSVGElement) {
   }
 }
 
-export function reflowCompactFlowchart(svg: SVGSVGElement, routeEdges = true): Bounds | null {
+/** A grouped graph can use separate compact columns only for independent chains. */
+export function hasParallelFlowchartLanes(svg: SVGSVGElement): boolean {
+  if (
+    svg.getAttribute('aria-roledescription') !== 'flowchart-v2' ||
+    !svg.querySelector('g.cluster')
+  )
+    return false;
+  const nodes = [...svg.querySelectorAll<SVGGElement>('g.node')].map(flowchartNodeId);
+  const nodeIds = new Set(nodes);
+  const next = new Map<string, string>();
+  const incoming = new Set<string>();
+  for (const path of svg.querySelectorAll<SVGPathElement>('.edgePaths path')) {
+    const edge = flowchartEdgeIdentity(path);
+    if (
+      !edge ||
+      !nodeIds.has(edge.source) ||
+      !nodeIds.has(edge.target) ||
+      next.has(edge.source) ||
+      incoming.has(edge.target)
+    )
+      return false;
+    next.set(edge.source, edge.target);
+    incoming.add(edge.target);
+  }
+  const roots = nodes.filter((id) => !incoming.has(id));
+  if (roots.length < 2 || roots.some((id) => !next.has(id))) return false;
+  const visited = new Set<string>();
+  for (const root of roots) {
+    let id: string | undefined = root;
+    while (id !== undefined) {
+      if (visited.has(id)) return false;
+      visited.add(id);
+      id = next.get(id);
+    }
+  }
+  // Disconnected cycles (including self loops) cannot be reached from a root.
+  return visited.size === nodes.length;
+}
+
+export function reflowCompactFlowchart(
+  svg: SVGSVGElement,
+  routeEdges = true,
+  membership?: FlowchartClusterMembership,
+): Bounds | null {
   if (svg.getAttribute('aria-roledescription') !== 'flowchart-v2') return null;
   const nodes = [...svg.querySelectorAll<SVGGElement>('g.node')];
   if (svg.querySelector('g.cluster')) {
-    if (!routeEdges) positionCompactGroupedFlowchart(svg);
+    if (!routeEdges) positionCompactGroupedFlowchart(svg, membership);
     else routeCompactGroupedEdges(svg);
     return routeEdges ? measureCompactFlowchartBounds(svg, nodes) : null;
   }
@@ -4615,29 +4904,38 @@ function flowchartNodeBounds(node: SVGGElement): Bounds | null {
   };
 }
 
-function positionCompactGroupedFlowchart(svg: SVGSVGElement) {
+/** Reject a proposed group rectangle if its padding or header captures an outsider. */
+export function planCompactClusterFrame(
+  content: Bounds[],
+  outside: Bounds[],
+  headerHeight: number,
+): Bounds | null {
+  if (!content.length) return null;
+  const x = Math.min(...content.map((box) => box.x)) - 20;
+  const y = Math.min(...content.map((box) => box.y)) - headerHeight;
+  const right = Math.max(...content.map((box) => box.x + box.width)) + 20;
+  const bottom = Math.max(...content.map((box) => box.y + box.height)) + 20;
+  const frame = { x, y, width: right - x, height: bottom - y };
+  return outside.some((box) => boundsOverlap(frame, box, 4)) ? null : frame;
+}
+
+function positionCompactGroupedFlowchart(
+  svg: SVGSVGElement,
+  membership?: FlowchartClusterMembership,
+) {
   const nodes = [...svg.querySelectorAll<SVGGElement>('g.node')];
   const originalBounds = new Map(nodes.map((node) => [node, flowchartNodeBounds(node)]));
-  const placeColumn = (column: SVGGElement[], centerX: number, startY: number) => {
-    let y = startY;
-    for (const node of column) {
-      const bounds = node.getBBox();
-      node.setAttribute(
-        'transform',
-        `translate(${centerX - bounds.x - bounds.width / 2}, ${y - bounds.y})`,
-      );
-      y += bounds.height + 100;
-    }
-  };
-  const columnWidth = Math.max(...nodes.map((node) => node.getBBox().width));
-  placeColumn(nodes, columnWidth / 2, 48);
-
+  // Capture membership before either candidate moves nodes or reframes groups.
   const clusters = [...svg.querySelectorAll<SVGGElement>('g.cluster')].flatMap((cluster) => {
     const rect = cluster.querySelector<SVGRectElement>(':scope > rect');
     const label = cluster.querySelector<SVGGElement>(':scope > g.cluster-label');
     if (!rect || !label) return [];
     const originalRect = rect.getBBox();
+    const id = membership && flowchartClusterId(cluster, membership);
+    const memberIds = id ? membership?.get(id) : undefined;
+    if (membership && !memberIds) return [];
     const members = nodes.filter((node) => {
+      if (memberIds) return memberIds.has(flowchartNodeId(node));
       const bounds = originalBounds.get(node);
       if (!bounds) return false;
       const center = pointAt(bounds, 0.5, 0.5);
@@ -4648,50 +4946,192 @@ function positionCompactGroupedFlowchart(svg: SVGSVGElement) {
         center.y <= originalRect.y + originalRect.height
       );
     });
-    return [{ cluster, rect, label, originalRect, members }];
+    return [{ cluster, rect, label, originalRect, members, id, memberIds }];
   });
-  const layouts = new Map<SVGGElement, Bounds>();
-  for (const record of clusters.toSorted(
-    (left, right) =>
-      left.originalRect.width * left.originalRect.height -
-      right.originalRect.width * right.originalRect.height,
-  )) {
-    const memberBounds = record.members.flatMap((node) => {
-      const bounds = flowchartNodeBounds(node);
-      return bounds ? [bounds] : [];
-    });
-    const nestedBounds = clusters
-      .filter(
-        (candidate) =>
-          candidate !== record &&
-          candidate.originalRect.x >= record.originalRect.x &&
-          candidate.originalRect.y >= record.originalRect.y &&
-          candidate.originalRect.x + candidate.originalRect.width <=
-            record.originalRect.x + record.originalRect.width &&
-          candidate.originalRect.y + candidate.originalRect.height <=
-            record.originalRect.y + record.originalRect.height,
-      )
-      .flatMap(({ cluster }) => {
-        const bounds = layouts.get(cluster);
+  const positions = new Map<SVGGElement, Point>();
+  const placeColumn = (column: SVGGElement[], centerX: number, startY: number) => {
+    let y = startY;
+    for (const node of column) {
+      const bounds = node.getBBox();
+      positions.set(node, { x: centerX - bounds.x - bounds.width / 2, y: y - bounds.y });
+      y += bounds.height + 100;
+    }
+  };
+  const columnWidth = Math.max(...nodes.map((node) => node.getBBox().width));
+  const independentChains = hasParallelFlowchartLanes(svg);
+  let parallelLanes = independentChains;
+  if (parallelLanes) {
+    const next = new Map(
+      [...svg.querySelectorAll<SVGPathElement>('.edgePaths path')].map((path) => {
+        const edge = flowchartEdgeIdentity(path)!;
+        return [edge.source, edge.target];
+      }),
+    );
+    const targets = new Set(next.values());
+    const byId = new Map(nodes.map((node) => [flowchartNodeId(node), node]));
+    const lanes = nodes
+      .filter((node) => !targets.has(flowchartNodeId(node)))
+      .map((root) => {
+        const lane = [root];
+        let id = next.get(flowchartNodeId(root));
+        while (id !== undefined) {
+          lane.push(byId.get(id)!);
+          id = next.get(id);
+        }
+        return lane;
+      });
+    const rankHeights = Array.from(
+      { length: Math.max(...lanes.map((lane) => lane.length)) },
+      (_, rank) => Math.max(...lanes.map((lane) => lane[rank]?.getBBox().height ?? 0)),
+    );
+    let x = 0;
+    for (const lane of lanes) {
+      const width = Math.max(...lane.map((node) => node.getBBox().width));
+      let y = 48;
+      lane.forEach((node, rank) => {
+        const bounds = node.getBBox();
+        positions.set(node, {
+          x: x + width / 2 - bounds.x - bounds.width / 2,
+          y: y + rankHeights[rank] / 2 - bounds.y - bounds.height / 2,
+        });
+        y += rankHeights[rank] + 100;
+      });
+      x += width + 24;
+    }
+  } else {
+    placeColumn(nodes, columnWidth / 2, 48);
+  }
+
+  const planFrames = () => {
+    const projected = new Map(
+      nodes.flatMap((node) => {
+        const shape = shapeForNode(node);
+        const position = positions.get(node);
+        if (!shape || !position) return [];
+        const box = shape.getBBox();
+        return [
+          [
+            node,
+            { x: box.x + position.x, y: box.y + position.y, width: box.width, height: box.height },
+          ] as const,
+        ];
+      }),
+    );
+    if (
+      independentChains &&
+      (projected.size !== nodes.length ||
+        clusters.length !== svg.querySelectorAll('g.cluster').length ||
+        clusters.some(({ members }) => !members.length))
+    )
+      return null;
+    const layouts = new Map<
+      SVGGElement,
+      {
+        frame: Bounds;
+        measuredTitleHeight: number;
+        headerHeight: number;
+      }
+    >();
+    for (const record of clusters.toSorted(
+      (left, right) =>
+        (left.memberIds?.size ?? 0) - (right.memberIds?.size ?? 0) ||
+        left.originalRect.width * left.originalRect.height -
+        right.originalRect.width * right.originalRect.height,
+    )) {
+      const memberBounds = record.members.flatMap((node) => {
+        const bounds = projected.get(node);
         return bounds ? [bounds] : [];
       });
-    const contentBounds = [...memberBounds, ...nestedBounds];
-    if (!contentBounds.length) continue;
+      const nestedBounds = clusters
+        .filter(
+          (candidate) =>
+            candidate !== record &&
+            (record.memberIds
+              ? Boolean(candidate.id && record.memberIds.has(candidate.id))
+              : candidate.originalRect.x >= record.originalRect.x &&
+                candidate.originalRect.y >= record.originalRect.y &&
+                candidate.originalRect.x + candidate.originalRect.width <=
+                  record.originalRect.x + record.originalRect.width &&
+                candidate.originalRect.y + candidate.originalRect.height <=
+                  record.originalRect.y + record.originalRect.height),
+        )
+        .flatMap(({ cluster }) => {
+          const layout = layouts.get(cluster);
+          return layout ? [layout.frame] : [];
+        });
+      const contentBounds = [...memberBounds, ...nestedBounds];
+      if (!contentBounds.length) continue;
+      const titleViewport = record.label.querySelector<SVGForeignObjectElement>('foreignObject');
+      // The real title wraps after reframing. Measure that width in isolation so
+      // later header growth cannot invalidate the nonmember clearance check.
+      const measurement =
+        independentChains && titleViewport
+          ? (titleViewport.cloneNode(true) as SVGForeignObjectElement)
+          : null;
+      if (measurement) {
+        const width =
+          Math.max(...contentBounds.map((box) => box.x + box.width)) -
+          Math.min(...contentBounds.map((box) => box.x));
+        measurement.setAttribute('width', String(Math.max(24, width)));
+        measurement.style.visibility = 'hidden';
+        const content = measurement.querySelector<HTMLElement>('div');
+        if (content) {
+          content.style.width = '100%';
+          content.style.whiteSpace = 'normal';
+          content.style.overflowWrap = 'normal';
+          content.style.wordBreak = 'normal';
+        }
+        record.label.append(measurement);
+      }
+      let measuredTitleHeight: number;
+      try {
+        const titleContent = (measurement ?? titleViewport)?.querySelector<HTMLElement>('div');
+        measuredTitleHeight = Math.ceil(
+          Math.max(
+            titleContent?.getBoundingClientRect().height ?? 0,
+            titleContent?.scrollHeight ?? 0,
+            18,
+          ),
+        );
+      } finally {
+        measurement?.remove();
+      }
+      const headerHeight = measuredClusterHeaderHeight(measuredTitleHeight);
+      const outside = independentChains
+        ? nodes
+            .filter((node) => !record.members.includes(node))
+            .flatMap((node) => {
+              const bounds = projected.get(node);
+              return bounds ? [bounds] : [];
+            })
+        : [];
+      const frame = planCompactClusterFrame(contentBounds, outside, headerHeight);
+      if (!frame) return null;
+      layouts.set(record.cluster, { frame, measuredTitleHeight, headerHeight });
+    }
+    return layouts;
+  };
+  let layouts = planFrames();
+  if (parallelLanes && !layouts) {
+    parallelLanes = false;
+    placeColumn(nodes, columnWidth / 2, 48);
+    layouts = planFrames();
+  }
+  // Neither rejected plan ever touches the SVG. Routing must use this same choice.
+  svg.dataset.compactGroupedLayout = !layouts ? 'original' : parallelLanes ? 'parallel' : 'column';
+  if (!layouts) return;
+  for (const [node, position] of positions) {
+    node.setAttribute('transform', `translate(${position.x}, ${position.y})`);
+  }
+  for (const record of clusters) {
+    const layout = layouts.get(record.cluster);
+    if (!layout) continue;
+    const { frame, measuredTitleHeight, headerHeight } = layout;
+    const minX = frame.x;
+    const maxX = frame.x + frame.width;
+    const minY = frame.y;
     const titleViewport = record.label.querySelector<SVGForeignObjectElement>('foreignObject');
     const titleContent = titleViewport?.querySelector<HTMLElement>('div');
-    const measuredTitleHeight = Math.ceil(
-      Math.max(
-        titleContent?.getBoundingClientRect().height ?? 0,
-        titleContent?.scrollHeight ?? 0,
-        18,
-      ),
-    );
-    const headerHeight = measuredClusterHeaderHeight(measuredTitleHeight);
-    const minX = Math.min(...contentBounds.map(({ x }) => x)) - 20;
-    const maxX = Math.max(...contentBounds.map(({ x, width }) => x + width)) + 20;
-    const minY = Math.min(...contentBounds.map(({ y }) => y)) - headerHeight;
-    const maxY = Math.max(...contentBounds.map(({ y, height }) => y + height)) + 20;
-    const frame = { x: minX, y: minY, width: maxX - minX, height: maxY - minY };
     record.rect.setAttribute('x', String(frame.x));
     record.rect.setAttribute('y', String(frame.y));
     record.rect.setAttribute('width', String(frame.width));
@@ -4717,13 +5157,14 @@ function positionCompactGroupedFlowchart(svg: SVGSVGElement) {
         `translate(${(minX + maxX) / 2 - labelBounds.x - labelBounds.width / 2}, ${minY + 20 - labelBounds.y})`,
       );
     }
-    layouts.set(record.cluster, frame);
   }
 }
 
 function routeCompactGroupedEdges(svg: SVGSVGElement) {
+  if (svg.dataset.compactGroupedLayout === 'original') return;
   const paths = [...svg.querySelectorAll<SVGPathElement>('.edgePaths path')];
   const nodes = [...svg.querySelectorAll<SVGGElement>('g.node')];
+  const parallelLanes = svg.dataset.compactGroupedLayout === 'parallel';
   const nodeIndex = new Map(nodes.map((node, index) => [flowchartNodeId(node), index]));
   const records = paths.flatMap((path) => {
     const identity = flowchartEdgeIdentity(path);
@@ -4750,7 +5191,7 @@ function routeCompactGroupedEdges(svg: SVGSVGElement) {
       {
         ...record,
         side:
-          Math.abs(targetIndex - sourceIndex) === 1
+          parallelLanes || Math.abs(targetIndex - sourceIndex) === 1
             ? null
             : targetIndex < sourceIndex
               ? ('left' as const)

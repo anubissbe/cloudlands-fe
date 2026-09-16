@@ -15,11 +15,14 @@ import {
   chooseLabelSegment,
   chooseStateLabelPathIndex,
   chooseClearStateEntryRoute,
+  clusterOutsiderShift,
   diamondBoundaryPort,
   diamondRayIntersection,
   expandFlowchartFeedbackLane,
   findFlowchartDecisionCycle,
+  hasParallelFlowchartLanes,
   measuredClusterHeaderHeight,
+  planCompactClusterFrame,
   preferClearStraightRoute,
   replacePathTerminal,
   routeOrthogonalAroundObstacles,
@@ -68,6 +71,140 @@ function expectRouteAvoids(points: TestPoint[], bounds: TestBounds) {
 }
 
 describe('Mermaid path terminal geometry', () => {
+  describe('cluster outsider clearance', () => {
+    const frame = { x: 20, y: 20, width: 180, height: 200 };
+    const content = { x: 44, y: 100, width: 132, height: 100 };
+
+    it('preserves an upstream rank when a wrapped header needs more room', () => {
+      expect(clusterOutsiderShift(frame, content, { x: 70, y: 0, width: 80, height: 40 })).toEqual({
+        x: 0,
+        y: -32,
+      });
+    });
+
+    it('moves an external node clear of a group border without moving its members', () => {
+      expect(
+        clusterOutsiderShift(frame, content, { x: 180, y: 120, width: 80, height: 40 }),
+      ).toEqual({ x: 32, y: 0 });
+      expect(
+        clusterOutsiderShift(frame, content, { x: 220, y: 120, width: 80, height: 40 }),
+      ).toEqual({ x: 0, y: 0 });
+    });
+  });
+
+  describe('compact cluster frame safety', () => {
+    const box = (x: number, y: number) => ({ x, y, width: 80, height: 40 });
+
+    it('allows a complete rank and preserves room for its header and members', () => {
+      const members = [box(0, 100), box(140, 100), box(280, 100)];
+      const frame = planCompactClusterFrame(members, [box(0, 240), box(280, 240)], 80);
+      expect(frame).not.toBeNull();
+      for (const member of members) {
+        expect(frame!.x).toBeLessThan(member.x);
+        expect(frame!.x + frame!.width).toBeGreaterThan(member.x + member.width);
+        expect(frame!.y + 80).toBeLessThanOrEqual(member.y);
+        expect(frame!.y + frame!.height).toBeGreaterThan(member.y + member.height);
+      }
+    });
+
+    it('rejects the unrelated corner in an L-shaped membership regardless of order', () => {
+      const members = [box(0, 100), box(0, 240), box(140, 240)];
+      const outside = [box(140, 100), box(0, 380), box(140, 380)];
+      expect(planCompactClusterFrame(members, outside, 80)).toBeNull();
+      expect(
+        planCompactClusterFrame([...members].reverse(), [...outside].reverse(), 80),
+      ).toBeNull();
+    });
+
+    it('rejects partial nonmember overlap with padding or header, not just containment', () => {
+      expect(planCompactClusterFrame([box(0, 100)], [box(95, 100)], 80)).toBeNull();
+      expect(planCompactClusterFrame([box(0, 100)], [box(0, 0)], 80)).toBeNull();
+      expect(planCompactClusterFrame([box(0, 100)], [box(0, 0)], 50)).not.toBeNull();
+    });
+
+    it('allows a contiguous column fallback but rejects an interleaved outsider', () => {
+      const members = [box(0, 100), box(0, 240), box(0, 380)];
+      expect(planCompactClusterFrame(members, [box(0, 520)], 80)).not.toBeNull();
+      expect(planCompactClusterFrame([box(0, 100), box(0, 380)], [box(0, 240)], 80)).toBeNull();
+      expect(planCompactClusterFrame([], [], 80)).toBeNull();
+    });
+  });
+
+  describe('independent grouped lanes', () => {
+    const chains = [
+      ['alpha', 'delta', 'eta'],
+      ['beta', 'epsilon', 'theta'],
+      ['gamma', 'zeta', 'iota'],
+    ];
+    const nodes = chains.flat();
+    const edges = chains.flatMap((chain) => chain.slice(1).map((target, i) => [chain[i], target]));
+    function graph(nodeIds = nodes, links = edges, grouped = true) {
+      const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+      svg.setAttribute('aria-roledescription', 'flowchart-v2');
+      svg.innerHTML = `${grouped ? '<g class="cluster" />' : ''}${nodeIds.map((id, i) => `<g class="node" id="flowchart-${id}-${i}" />`).join('')}<g class="edgePaths">${links.map(([from, to], i) => `<path id="diagram-L_${from}_${to}_${i}" />`).join('')}</g>`;
+      return svg;
+    }
+
+    it('preserves disconnected chains regardless of names and declaration order', () => {
+      expect(hasParallelFlowchartLanes(graph())).toBe(true);
+      expect(hasParallelFlowchartLanes(graph([...nodes].reverse(), [...edges].reverse()))).toBe(
+        true,
+      );
+      expect(
+        hasParallelFlowchartLanes(
+          graph(
+            nodes.map((id) => `renamed-${id}`),
+            edges.map((pair) => pair.map((id) => `renamed-${id}`)),
+          ),
+        ),
+      ).toBe(true);
+    });
+
+    it('allows other lane counts and unequal chain lengths', () => {
+      expect(
+        hasParallelFlowchartLanes(
+          graph(
+            ['p', 'q', 'r', 's', 't'],
+            [
+              ['p', 'q'],
+              ['r', 's'],
+              ['s', 't'],
+            ],
+          ),
+        ),
+      ).toBe(true);
+    });
+
+    it('leaves single chains, ungrouped graphs and isolated nodes on the existing path', () => {
+      expect(hasParallelFlowchartLanes(graph(chains[0], edges.slice(0, 2)))).toBe(false);
+      expect(hasParallelFlowchartLanes(graph(nodes, edges, false))).toBe(false);
+      expect(hasParallelFlowchartLanes(graph([...nodes, 'isolated']))).toBe(false);
+      expect(hasParallelFlowchartLanes(graph([], []))).toBe(false);
+    });
+
+    it.each([
+      ['branch', ['alpha', 'epsilon']],
+      ['merge', ['delta', 'theta']],
+      ['cycle', ['eta', 'alpha']],
+      ['self loop', ['eta', 'eta']],
+      ['duplicate edge', ['alpha', 'delta']],
+      ['cluster endpoint', ['group', 'alpha']],
+    ])('rejects a %s rather than changing its existing routing', (_, edge) => {
+      expect(hasParallelFlowchartLanes(graph(nodes, [...edges, edge as string[]]))).toBe(false);
+    });
+
+    it('rejects disconnected cycles and unrecognized edge identities', () => {
+      expect(
+        hasParallelFlowchartLanes(graph([...nodes, 'loop'], [...edges, ['loop', 'loop']])),
+      ).toBe(false);
+      const svg = graph();
+      svg.querySelector('path')!.id = 'unrecognized';
+      expect(hasParallelFlowchartLanes(svg)).toBe(false);
+      svg.setAttribute('aria-roledescription', 'stateDiagram');
+      expect(hasParallelFlowchartLanes(svg)).toBe(false);
+    });
+  });
+
   describe('decision-cycle topology', () => {
     const edges = [
       { source: 'receive', target: 'gate' },

@@ -1,4 +1,4 @@
-import { shouldReduceMotion } from '$lib/utils/motion-preference';
+import { prefersReducedMotion } from '$lib/utils/reduced-motion';
 import type { PreviewCaptureReadiness } from './preview-definition';
 
 const DEFAULT_CAPTURE_STABILITY_TIMEOUT_MS = 5_000;
@@ -315,7 +315,7 @@ async function waitForCaptureStabilitySnapshot(
         continue;
       }
       return {
-        result: { ...images, reducedMotion: shouldReduceMotion(documentRef) },
+        result: { ...images, reducedMotion: prefersReducedMotion(documentRef) },
         markers,
       };
     } catch (error) {

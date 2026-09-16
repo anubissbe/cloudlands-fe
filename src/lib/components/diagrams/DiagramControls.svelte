@@ -12,7 +12,7 @@
   import { fly } from 'svelte/transition';
   import { cubicOut } from 'svelte/easing';
   import { m } from '$shared/paraglide/messages.js';
-  import { shouldReduceMotion } from '$lib/utils/motion-preference';
+  import { prefersReducedMotion } from '$lib/utils/reduced-motion';
   import { onDestroy } from 'svelte';
 
   interface Props {
@@ -48,7 +48,7 @@
   let focusFrame: number | undefined;
 
   function motionDuration(duration: number): number {
-    return shouldReduceMotion() ? 0 : duration;
+    return prefersReducedMotion(navigationElement?.ownerDocument) ? 0 : duration;
   }
 
   // Navigation stops at the first and last step so progression stays predictable.
@@ -393,7 +393,7 @@
     transition: none;
   }
 
-  @media (prefers-reduced-motion: reduce) {
+  @container style(--motion-reduced: 1) {
     :global(html:not(.catalog-full-motion)) .stepper-dot,
     :global(html:not(.catalog-full-motion)) .stepper-dot::after {
       transition: none;

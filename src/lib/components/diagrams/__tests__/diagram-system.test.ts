@@ -843,10 +843,9 @@ describe('Edge Routing', () => {
 
     const layout = computeLayout(diagram.model, diagram.baseView, diagram.grammar);
     const [forward, returnEdge] = layout.edges;
-    const top = Math.min(...layout.nodes.map((node) => node.y));
-    const bottom = Math.max(...layout.nodes.map((node) => node.y + node.height));
-    expect(Math.max(...forward.points!.map((point) => point.y))).toBeGreaterThan(bottom);
-    expect(Math.min(...returnEdge.points!.map((point) => point.y))).toBeLessThan(top);
+    expect(returnEdge.points).toHaveLength(2);
+    expect(forward.points![0]).not.toEqual(returnEdge.points!.at(-1));
+    expect(forward.points!.at(-1)).not.toEqual(returnEdge.points![0]);
     expect(forward.path).not.toBe(returnEdge.path);
   });
 

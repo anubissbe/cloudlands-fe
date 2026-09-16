@@ -4,7 +4,7 @@
   import hljs from 'highlight.js';
   import '$lib/styles/syntax-highlighting.css';
   import Fa from 'svelte-fa';
-  import { faPencil, faExpand } from '@fortawesome/free-solid-svg-icons';
+  import { faPencil, faExpand, faCode } from '@fortawesome/free-solid-svg-icons';
   import { slide } from 'svelte/transition';
   import { tick } from 'svelte';
   import { selectIsDarkTheme } from '$store/renderer/slices/theme/theme-selectors';
@@ -103,6 +103,13 @@
 
   // Whether code editor is visible
   let showCode = $state(false);
+  let showSource = $state(false);
+
+  function toggleSource(e: MouseEvent) {
+    e.stopPropagation();
+    e.preventDefault();
+    showSource = !showSource;
+  }
 
   // The code being edited (live updates the diagram)
   let editCode = $state('');
@@ -200,7 +207,7 @@
 </script>
 
 <NodeViewWrapper class="mermaid-block-wrapper" data-drag-handle data-render-state={renderState}>
-  <DiagramPresentation kind="mermaid" selected={Boolean(selected)}>
+  <DiagramPresentation kind="mermaid" selected={Boolean(selected)} actionsInTopMargin>
     {#snippet actions()}
       {#if !showCode}
         {#if isEditable}
@@ -211,6 +218,16 @@
             aria-label={m.tiptap_mermaidBlock_editCode_tooltip()}
           >
             <Fa icon={faPencil} size="xs" />
+          </button>
+        {:else if renderState === 'rendered'}
+          <button
+            type="button"
+            onclick={toggleSource}
+            aria-pressed={showSource}
+            title={m.markdown_mermaid_viewSource_label()}
+            aria-label={m.markdown_mermaid_viewSource_label()}
+          >
+            <Fa icon={faCode} size="xs" />
           </button>
         {/if}
         <button
@@ -229,6 +246,8 @@
         <MermaidRenderer
           code={displayCode}
           showExpandButton={false}
+          showSourceButton={false}
+          showSource={showSource && !isEditable}
           onRenderStateChange={(state) => (renderState = state)}
         />
       </div>

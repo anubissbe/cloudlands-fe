@@ -7,6 +7,7 @@
     children: Snippet;
     header?: Snippet;
     actions?: Snippet;
+    actionsInTopMargin?: boolean;
     selected?: boolean;
     exportable?: boolean;
     fileName?: string;
@@ -17,6 +18,7 @@
     children,
     header,
     actions,
+    actionsInTopMargin = false,
     selected = false,
     exportable = true,
     fileName,
@@ -80,7 +82,11 @@
   {/if}
 
   {#if actions || exportable}
-    <div class="diagram-presentation-actions" data-diagram-presentation-actions>
+    <div
+      class="diagram-presentation-actions"
+      class:actions-in-top-margin={actionsInTopMargin}
+      data-diagram-presentation-actions
+    >
       {@render actions?.()}
       {#if exportable}
         <DiagramActionsMenu container={contentElement} {fileName} />
@@ -165,6 +171,17 @@
     pointer-events: auto;
   }
 
+  .diagram-presentation-actions.actions-in-top-margin {
+    /* Note controls fit in the existing margin and content inset, above SVG paint.
+       Keep them out of flow even while hidden; do not move the canvas on focus. */
+    position: absolute;
+    bottom: calc(100% - var(--space-3));
+    inset-inline: 0;
+    width: min(100%, var(--diagram-controls-width, 100%));
+    margin-inline: auto;
+    box-sizing: border-box;
+  }
+
   .diagram-presentation-actions :global(button) {
     display: inline-flex;
     align-items: center;
@@ -208,7 +225,7 @@
     transition: none;
   }
 
-  @media (prefers-reduced-motion: reduce) {
+  @container style(--motion-reduced: 1) {
     .diagram-presentation-actions,
     .diagram-presentation-actions :global(button) {
       transition: none;

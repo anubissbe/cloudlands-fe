@@ -14,6 +14,7 @@
     type CatalogTheme,
   } from './catalog-preferences';
   import { installPreviewBrowserApi } from './preview-discovery';
+  import { onReducedMotionChange, prefersReducedMotion } from '$lib/utils/reduced-motion';
 
   let { activeSlug, children }: { activeSlug?: string; children?: Snippet } = $props();
   let theme = $state<CatalogTheme>(defaultCatalogPreferences.theme);
@@ -21,7 +22,7 @@
   let motion = $state<CatalogMotion>(defaultCatalogPreferences.motion);
   let fit = $state<CatalogPreviewFit>();
   let systemDark = $state(false);
-  let systemReducedMotion = $state(false);
+  let reducedMotion = $state(false);
   let hydrated = $state(false);
   let initialRootDark = false;
   let initialRootLight = false;
@@ -37,9 +38,6 @@
   const priorRootProperties = new Map<string, InlineDeclaration | null>();
 
   const resolvedTheme = $derived(theme === 'system' ? (systemDark ? 'dark' : 'light') : theme);
-  const reducedMotion = $derived(
-    motion === 'reduced' || (motion === 'system' && systemReducedMotion),
-  );
 
   function applyRootProperties(root: HTMLElement, next: Record<string, string>) {
     for (const property of [...priorRootProperties.keys()]) {
@@ -83,17 +81,15 @@
     const removePreviewBrowserApi = installPreviewBrowserApi(window);
 
     const media = window.matchMedia('(prefers-color-scheme: dark)');
-    const motionMedia = window.matchMedia('(prefers-reduced-motion: reduce)');
     const updateSystemTheme = () => (systemDark = media.matches);
-    const updateSystemMotion = () => (systemReducedMotion = motionMedia.matches);
     updateSystemTheme();
-    updateSystemMotion();
+    reducedMotion = prefersReducedMotion(document);
+    const stopMotion = onReducedMotionChange((next) => (reducedMotion = next), document);
     media.addEventListener('change', updateSystemTheme);
-    motionMedia.addEventListener('change', updateSystemMotion);
     hydrated = true;
     return () => {
       media.removeEventListener('change', updateSystemTheme);
-      motionMedia.removeEventListener('change', updateSystemMotion);
+      stopMotion();
       removePreviewBrowserApi();
       root.classList.toggle('dark', initialRootDark);
       root.classList.toggle('light', initialRootLight);
@@ -236,26 +232,6 @@
     .catalog-topbar-inner {
       align-items: flex-start;
       flex-direction: column;
-    }
-  }
-
-  :global(html.catalog-reduced-motion *),
-  :global(html.catalog-reduced-motion *::before),
-  :global(html.catalog-reduced-motion *::after) {
-    scroll-behavior: auto !important;
-    transition-duration: 0.01ms !important;
-    animation-duration: 0.01ms !important;
-    animation-iteration-count: 1 !important;
-  }
-
-  @media (prefers-reduced-motion: reduce) {
-    :global(html:not(.catalog-full-motion) *),
-    :global(html:not(.catalog-full-motion) *::before),
-    :global(html:not(.catalog-full-motion) *::after) {
-      scroll-behavior: auto !important;
-      transition-duration: 0.01ms !important;
-      animation-duration: 0.01ms !important;
-      animation-iteration-count: 1 !important;
     }
   }
 </style>

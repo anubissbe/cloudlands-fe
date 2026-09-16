@@ -155,6 +155,7 @@
     browserCaptureToContextItems,
   } from './browser-capture-context';
   import { createFileDropTarget } from '$lib/utils/file-drop';
+  import { prefersReducedMotion } from '$lib/utils/reduced-motion';
   import type { DropSplit } from '$lib/utils/drop-split';
   import { getPanelFileDropContext } from '$lib/components/layout/panel-system/panel-file-drop-context.svelte';
   import { createChatDraftManager } from './chat-panel-draft.svelte';
@@ -3850,7 +3851,7 @@
       targetScrollTop = scrollContainer.scrollTop + (elementRect.bottom - containerRect.bottom) + 1;
     }
 
-    if (window.matchMedia?.('(prefers-reduced-motion: reduce)').matches) {
+    if (prefersReducedMotion()) {
       scrollContainer.scrollTop = targetScrollTop;
       return;
     }
@@ -4235,7 +4236,7 @@
       scrollContainer.clientHeight,
       scrollContainer.scrollHeight,
     );
-    if (window.matchMedia?.('(prefers-reduced-motion: reduce)').matches) {
+    if (prefersReducedMotion()) {
       scrollContainer.scrollTop = entryScrollTop;
     } else {
       smoothScrollToPosition(entryScrollTop);
@@ -5249,7 +5250,7 @@
     if (!isActive) return;
     const container = scrollContainer;
     if (!container) return;
-    if (window.matchMedia?.('(prefers-reduced-motion: reduce)').matches) {
+    if (prefersReducedMotion()) {
       shouldFollowBottom = true;
       followToBottom(container);
       return;
@@ -6219,6 +6220,7 @@
                       >
                         <LazyTurn
                           turnKey={message.id}
+                          {isActive}
                           scrollRoot={scrollContainer}
                           heightCache={lazyTurnHeightCache}
                           hydrationController={messageHydrationPolicy}
@@ -6318,6 +6320,7 @@
                       {@const globalIndex = getMessageIndex(message.id)}
                       <LazyTurn
                         turnKey={message.id}
+                        {isActive}
                         scrollRoot={scrollContainer}
                         heightCache={lazyTurnHeightCache}
                         hydrationController={messageHydrationPolicy}
@@ -6493,6 +6496,7 @@
               onEdit={handleEditSuggestedPrompt}
               compact={isCompactMode}
               showShortcutHints={isChatFocused}
+              workspaceId={workspace?.id}
             />
           </div>
         {/if}
@@ -6805,7 +6809,7 @@
     animation: lock-confirmation-fade 1.5s ease-out forwards;
   }
 
-  @media (prefers-reduced-motion: reduce) {
+  @container style(--motion-reduced: 1) {
     .lock-confirmation {
       animation: none;
       opacity: 0.9;
@@ -6890,7 +6894,7 @@
     }
   }
 
-  @media (prefers-reduced-motion: reduce) {
+  @container style(--motion-reduced: 1) {
     :global(.conversation-column *),
     .conversation-composer {
       scroll-behavior: auto;
