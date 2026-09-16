@@ -31,7 +31,13 @@ function artifactName(pattern: string, version: string) {
 const OUT = join('C:', 'a', 'cloudlands-fe', 'dist-electron');
 
 describe('windows-sign shouldSign', () => {
-  it.each(['2.153.0', '2.153.0-manual.123', '3.0.0-alpha.7'])(
+  it.each([
+    '2.153.0',
+    '2.153.0-manual.123',
+    '3.0.0-alpha.7',
+    '1.2.3+build.1',
+    '1.2.3-rc.1+sha.abc',
+  ])(
     'signs the NSIS installer and the portable exe named by electron-builder.yml for %s',
     (version) => {
       const installer = artifactName(config.nsis.artifactName, version);

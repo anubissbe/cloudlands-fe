@@ -16,8 +16,9 @@ let loggedSkip = false;
 
 // electron-builder's unpacked app dir: win-unpacked, win-arm64-unpacked, win-ia32-unpacked.
 const UNPACKED_DIR = /^win(?:-[a-z0-9_]+)?-unpacked$/i;
-// `${version}` as electron-builder expands it (semver, optional prerelease such as -manual.123).
-const VERSION = String.raw`\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?`;
+// `${version}` as electron-builder expands it: the package.json semver verbatim, with
+// optional prerelease (-manual.123) and build metadata (+build.1) as set-version.cjs allows.
+const VERSION = String.raw`\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?`;
 
 function escapeRegExp(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
