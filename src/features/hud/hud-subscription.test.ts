@@ -1,4 +1,4 @@
-import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
 // FAKE transport: the WSS seam is replaced by the scripted MockBackendTransport
 // so no request reaches a real daemon. The REAL configured store is exercised:
@@ -40,8 +40,8 @@ import {
   HUD_RATE_HISTORY_POLL_MS,
   HUD_REPLACE_GROUP,
   HUD_SUBSCRIBE_EVENT_TYPES,
-  startHudSubscription,
-} from './hud-subscription';
+  hudSaga,
+} from '$store/renderer/slices/hud/sagas/hud-saga';
 import { HUD_FEED_EVENT_TYPES } from './hud-feed-mapper';
 import {
   connectionStatusChanged,
@@ -50,6 +50,8 @@ import {
 } from '$store/renderer/slices/daemon-health/daemon-health-slice';
 import { selectDaemonConnectionGeneration } from '$store/renderer/slices/daemon-health/daemon-health-selectors';
 import { bulkUpsertSessions } from '$store/renderer/slices/agent-session/agent-session-slice';
+import { hudActivated, hudDeactivated } from '$store/renderer/slices/hud/hud-slice';
+import { lifecycleReadSaga } from '$store/renderer/slices/workspace-lifecycle/sagas/lifecycle-read-saga';
 import {
   removeWorkspaceEntity,
   setWorkspaceEntity,
@@ -137,11 +139,21 @@ function scriptHappyBackend(backend: MockBackendHandle) {
   backend.onRequest('stats.getRateHistory', () => rateHistoryResult());
 }
 
+function startHudSubscription(): () => void {
+  appStore.dispatch(hudActivated());
+  return () => appStore.dispatch(hudDeactivated());
+}
+
 describe('HUD subscription (mock backend, real store)', () => {
   let backend: MockBackendHandle;
   let stop: (() => void) | undefined;
+  let stopSaga: (() => void) | undefined;
 
-  beforeAll(() => appStore.init());
+  beforeAll(() => {
+    appStore.init();
+    stopSaga = appStore.runSaga(hudSaga);
+  });
+  afterAll(() => stopSaga?.());
   beforeEach(() => {
     backend = installMockBackend();
   });
@@ -1046,6 +1058,7 @@ describe('HUD subscription (mock backend, real store)', () => {
     });
     appStore.dispatch(setWorkspaceEntity(makeHudWorkspace(WS_ID)));
     appStore.dispatch(setWorkspaceEntity(makeHudWorkspace(WS2_ID)));
+    const stopLifecycleReadSaga = appStore.runSaga(lifecycleReadSaga);
     try {
       stop = startHudSubscription();
       await flush();
@@ -1075,6 +1088,7 @@ describe('HUD subscription (mock backend, real store)', () => {
       await flush();
       expect(listCalls()).toHaveLength(3);
     } finally {
+      stopLifecycleReadSaga();
       appStore.dispatch(removeWorkspaceEntity(WS_ID));
       appStore.dispatch(removeWorkspaceEntity(WS2_ID));
       appStore.dispatch(removeWorkspaceEntity('33333333-3333-4333-8333-333333333333'));
