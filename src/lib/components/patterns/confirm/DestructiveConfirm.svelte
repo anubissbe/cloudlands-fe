@@ -11,6 +11,7 @@
     cancelLabel?: string;
     details?: Snippet;
     busy?: boolean;
+    /** Disable and show progress on submit while keeping cancellation available. */
     submitBusy?: boolean;
     canSubmit?: boolean;
     focusSubmit?: boolean;

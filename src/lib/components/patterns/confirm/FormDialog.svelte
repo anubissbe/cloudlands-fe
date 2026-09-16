@@ -20,6 +20,7 @@
     submitVariant?: ButtonVariant;
     canSubmit?: boolean;
     busy?: boolean;
+    /** Disable and show progress on submit while keeping cancellation available. */
     submitBusy?: boolean;
     role?: 'dialog' | 'alertdialog';
     dismissOnInteractOutside?: boolean;
@@ -91,7 +92,7 @@
   }
 
   async function submit() {
-    if (isBusy || !canSubmit) return;
+    if (isBusy || submitBusy || !canSubmit) return;
     internalBusy = true;
     try {
       await onSubmit();
@@ -163,7 +164,7 @@
                   ? 'focus-visible:outline focus-visible:-outline-offset-1'
                   : undefined}
                 loading={isBusy || submitBusy}
-                disabled={!canSubmit || isBusy}
+                disabled={!canSubmit || isBusy || submitBusy}
               >
                 {submitLabel}
               </Button>
