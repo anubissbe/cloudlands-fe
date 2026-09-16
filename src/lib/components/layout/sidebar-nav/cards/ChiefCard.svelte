@@ -1,5 +1,4 @@
 <script lang="ts" module>
-  import { Button } from '$lib/components/ui/button';
   // The Chief chat can render in two sidebar hosts at once (the hover card and
   // combined workspace panel). The chief virtual workspace is shared, so
   // mount/unmount is refcounted: only the last live instance unmounts it.
@@ -8,11 +7,10 @@
 
 <script lang="ts">
   import { onDestroy } from 'svelte';
-  import { faChevronDown, faPlus, faTrash } from '@fortawesome/free-solid-svg-icons';
+  import { faChevronDown, faPlus, faSpinner, faTrash } from '@fortawesome/free-solid-svg-icons';
   import Fa from 'svelte-fa';
-  import { IntentMarkLoader } from '$lib/components/ui/indicators';
   import { m } from '$shared/paraglide/messages.js';
-  import { notify } from '$lib/components/patterns/notify';
+  import { toast } from 'svelte-sonner';
   import ChatPanel from '$lib/components/chat/ChatPanel.svelte';
   import {
     Dropdown,
@@ -42,7 +40,10 @@
     deleteAgentWithUndoRequested,
     setActiveAgentId,
   } from '$store/renderer/slices/workspace-agents/workspace-agents-slice';
-  import { selectAgentsLoaded } from '$store/renderer/slices/workspace-agents/workspace-agents-selectors';
+  import {
+    selectAgentCreationRequest,
+    selectAgentsLoaded,
+  } from '$store/renderer/slices/workspace-agents/workspace-agents-selectors';
   import { selectHasResolvableProvider } from '$store/renderer/slices/model/model-selectors';
   import { createAgentTypeId } from '$shared/types/agent.types';
   import { CHIEF_WORKSPACE_ID } from '$shared/types/branded-ids';
@@ -53,7 +54,6 @@
   } from '$shared/chief-agent-config';
   import { WorkspaceStatus, type Workspace } from '$shared/types';
   import { formatChiefThreadName } from './chief-thread-name';
-  import { ensureChiefThreadCreation } from './chief-thread-creation';
   import { resolveChiefThreadOnExpansion } from './chief-thread-selection';
   import {
     selectEffectiveBehaviorPrompt,
@@ -66,6 +66,11 @@
   const chiefActiveAgentId$ = selectChiefActiveAgentId();
   const chiefAgentsLoaded$ = selectAgentsLoaded(CHIEF_WORKSPACE_ID);
   const hasResolvableProvider$ = selectHasResolvableProvider();
+  const CHIEF_CREATION_REQUEST_ID = 'chief-card-thread';
+  const chiefCreationRequest$ = selectAgentCreationRequest(
+    CHIEF_WORKSPACE_ID,
+    CHIEF_CREATION_REQUEST_ID,
+  );
 
   interface Props {
     expanded?: boolean;
@@ -93,7 +98,7 @@
   };
 
   let selectedAgentId = $state<string | null>(null);
-  let isCreatingThread = $state(false);
+  const isCreatingThread = $derived($chiefCreationRequest$?.loading ?? false);
   let hasAutoStartedRef = $state(false);
   let isWorkspaceRegistered = $state(false);
 
@@ -226,7 +231,7 @@
     appStore.dispatch(deleteAgentWithUndoRequested(CHIEF_WORKSPACE_ID, agentId, threadTitle));
   }
 
-  async function createNewThread() {
+  function createNewThread() {
     if (isCreatingThread) return;
     ensureChiefWorkspaceRegistered();
 
@@ -243,21 +248,23 @@
       return;
     }
 
-    isCreatingThread = true;
-    let ownsCreation = false;
-    const creation = ensureChiefThreadCreation(() => {
-      ownsCreation = true;
-      const chiefSpecialist = selectSpecialists
-        .select(reduxState)
-        .find((s) => s.id === CHIEF_SPECIALIST_ID);
-      const chiefBehaviorPrompt = buildChiefBehaviorPrompt(
-        selectEffectiveBehaviorPrompt.select(reduxState, CHIEF_SPECIALIST_ID),
-      );
-      const action = agentSessionLaunchAgentRequested(
+    const existingRequest = selectAgentCreationRequest.select(
+      reduxState,
+      CHIEF_WORKSPACE_ID,
+      CHIEF_CREATION_REQUEST_ID,
+    );
+    if (existingRequest?.loading) return;
+    const chiefSpecialist = selectSpecialists
+      .select(reduxState)
+      .find((s) => s.id === CHIEF_SPECIALIST_ID);
+    const chiefBehaviorPrompt = buildChiefBehaviorPrompt(
+      selectEffectiveBehaviorPrompt.select(reduxState, CHIEF_SPECIALIST_ID),
+    );
+    appStore.dispatch(
+      agentSessionLaunchAgentRequested(
         CHIEF_WORKSPACE_ID,
         {
           name: formatChiefThreadName(new Date()),
-          // Generated timestamp name — keep the session self-renameable.
           nameExplicitlySet: false,
           agentType: createAgentTypeId('workspace'),
           source: 'chief-card',
@@ -272,33 +279,31 @@
             behaviorPrompt: chiefBehaviorPrompt,
           },
         },
-        { openAgent: false },
-      );
-
-      appStore.dispatch(action);
-      return action.promise.then((session) => String(session.id));
-    });
-
-    try {
-      const agentId = await creation;
-      selectedAgentId = agentId;
-      appStore.dispatch(setChiefActiveAgentId(agentId));
-      appStore.dispatch(setActiveAgentId(CHIEF_WORKSPACE_ID, agentId));
-    } catch (error) {
-      if (ownsCreation) {
-        const message = error instanceof Error ? error.message : String(error);
-        notify.error(m.layout_chiefCard_startFailed_error({ message }));
-      }
-    } finally {
-      isCreatingThread = false;
-    }
+        { openAgent: false, requestId: CHIEF_CREATION_REQUEST_ID },
+      ),
+    );
   }
+
+  let handledChiefCreationAgentId = $state<string | null>(null);
+  let handledChiefCreationError = $state<string | null>(null);
+  $effect(() => {
+    const request = $chiefCreationRequest$;
+    if (!request || request.loading) return;
+    if (request.agentId && request.agentId !== handledChiefCreationAgentId) {
+      handledChiefCreationAgentId = request.agentId;
+      selectedAgentId = request.agentId;
+      appStore.dispatch(setChiefActiveAgentId(request.agentId));
+      appStore.dispatch(setActiveAgentId(CHIEF_WORKSPACE_ID, request.agentId));
+    } else if (request.error && request.error !== handledChiefCreationError) {
+      handledChiefCreationError = request.error;
+      toast.error(m.layout_chiefCard_startFailed_error({ message: request.error }));
+    }
+  });
 </script>
 
 {#if !expanded}
   <div class="p-3">
-    <Button
-      variant="ghost"
+    <button
       type="button"
       class="block w-full cursor-pointer rounded-sm text-left outline-none"
       onclick={openChiefPanel}
@@ -306,7 +311,7 @@
     >
       <p class="type-body truncate font-medium text-foreground">{title}</p>
       <p class="type-caption mt-1 text-muted-foreground line-clamp-3">{preview}</p>
-    </Button>
+    </button>
   </div>
 {:else}
   <div class="flex h-full flex-col {embedded ? 'min-h-0' : 'min-h-[460px]'}">
@@ -322,10 +327,8 @@
     >
       <div class="flex min-w-0 flex-1 items-center gap-1.5">
         {#if collapsed && ontoggle}
-          <Button
+          <button
             type="button"
-            variant="ghost"
-            size="xs"
             class="flex h-7! min-w-0 max-w-full flex-1 items-center justify-start px-1.5! text-foreground"
             aria-expanded="false"
             aria-controls="combined-panel-chief-content"
@@ -333,7 +336,7 @@
             <span class="text-ui min-w-0 flex-1 truncate text-left font-medium">
               {activeThread?.title ?? m.layout_chiefCard_startThread_label()}
             </span>
-          </Button>
+          </button>
         {:else}
           <Dropdown
             value={selectedAgentId ?? undefined}
@@ -397,9 +400,7 @@
           ? 'pointer-events-none -mr-1 w-0 opacity-0'
           : 'mr-0 w-6 opacity-100'}"
       >
-        <Button
-          variant="ghost"
-          size="icon-compact"
+        <button
           class="flex h-6 w-6 shrink-0 cursor-pointer items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted/50 hover:text-foreground disabled:cursor-not-allowed disabled:opacity-60"
           onclick={handleNewThreadClick}
           disabled={isCreatingThread || collapsed}
@@ -408,19 +409,17 @@
           aria-label={m.layout_chiefCard_newThread_tooltip()}
           title={m.layout_chiefCard_newThread_tooltip()}
         >
-          {#if isCreatingThread}
-            <IntentMarkLoader size={12} />
-          {:else}
-            <Fa icon={faPlus} size="xs" />
-          {/if}
-        </Button>
+          <Fa
+            icon={isCreatingThread ? faSpinner : faPlus}
+            size="xs"
+            class={isCreatingThread ? 'animate-spin' : ''}
+          />
+        </button>
       </div>
       {#if ontoggle}
-        <Button
+        <button
           type="button"
-          variant="ghost-light"
-          size="icon-xs"
-          class="flex h-7 w-6 shrink-0 cursor-pointer items-center justify-center rounded-sm text-muted-foreground outline-none hover:text-foreground focus-visible:outline-1 focus-visible:outline-ring"
+          class="flex h-7 w-6 shrink-0 cursor-pointer items-center justify-center rounded-sm text-muted-foreground outline-none hover:text-foreground focus-visible:outline-2 focus-visible:outline-ring"
           aria-label={m.layout_chiefCard_title()}
           aria-expanded={!collapsed}
           aria-controls="combined-panel-chief-content"
@@ -432,7 +431,7 @@
             size="xs"
             class="shrink-0 transition-transform {collapsed ? 'rotate-90' : ''}"
           />
-        </Button>
+        </button>
       {/if}
     </div>
 
