@@ -35,6 +35,7 @@ describe('preview discovery', () => {
     expect(ids).toEqual(
       expect.arrayContaining([
         'button',
+        'diagram-controls-host',
         'diagram-workbench',
         'mention-agent-avatar',
         'workspace-hover-card',

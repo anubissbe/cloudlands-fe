@@ -13,12 +13,17 @@ import CatalogSystemPage from './CatalogSystemPage.svelte';
 import { themePresets } from '$lib/utils/theme-presets';
 import { parseVSCodeTheme } from '$lib/utils/vscode-theme-parser';
 
-vi.mock('$app/state', () => ({ page: { params: {} } }));
+const { mockPage } = vi.hoisted(() => ({
+  mockPage: { params: {}, url: new URL('http://localhost/sandbox') },
+}));
+
+vi.mock('$app/state', () => ({ page: mockPage }));
 
 const originalResizeObserver = globalThis.ResizeObserver;
 const originalScrollIntoView = Element.prototype.scrollIntoView;
 
 beforeEach(() => {
+  mockPage.url = new URL('http://localhost/sandbox');
   globalThis.ResizeObserver = class ResizeObserverMock {
     observe() {}
     unobserve() {}
@@ -39,6 +44,24 @@ afterEach(() => {
 });
 
 describe('catalog workspace', () => {
+  it.each([
+    { pathname: '/sandbox', name: 'Introduction' },
+    { pathname: '/sandbox/recipes', name: 'Recipes' },
+  ])(
+    'selects the current navigation link from page.url at $pathname',
+    async ({ pathname, name }) => {
+      mockPage.url = new URL(pathname, 'http://localhost');
+      render(SandboxLayout);
+
+      const navigation = within(screen.getByRole('navigation', { name: 'Component catalog' }));
+      await waitFor(() =>
+        expect(navigation.getAllByRole('link', { current: 'page' })).toEqual([
+          navigation.getByRole('link', { name, exact: true }),
+        ]),
+      );
+    },
+  );
+
   it('lets the sandbox layout own the bundled UI font across themes and restore it', async () => {
     const root = document.documentElement;
     root.style.setProperty('--font-ui', 'Existing UI');

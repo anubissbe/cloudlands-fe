@@ -325,6 +325,9 @@ export const catalogEntries: CatalogEntry[] = [
     description: m.sandbox_diagramWorkbench_description(),
     category: 'product',
     source: 'src/lib/components/diagrams/diagram-workbench.preview.svelte',
+    exports: ['DiagramWorkbench'],
+    usage:
+      "import DiagramWorkbench from '$lib/components/diagrams/diagram-workbench.preview.svelte';",
     fixtures: [
       {
         id: 'mermaid-cases',

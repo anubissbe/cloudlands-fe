@@ -148,7 +148,7 @@
           {@const stateNarrative = getNarrative(state.narrative)}
           <Button
             variant="ghost"
-            size="icon-xs"
+            size="icon-compact"
             iconOnly
             class="stepper-dot {index === currentIndex ? 'active' : ''} {index < currentIndex
               ? 'completed'
@@ -205,7 +205,7 @@
         <div class="navigation-buttons">
           <Button
             variant="ghost"
-            size="icon-xs"
+            size="icon-compact"
             iconOnly
             class="diagram-nav-button"
             onclick={goToPrevState}
@@ -216,7 +216,7 @@
           </Button>
           <Button
             variant="ghost"
-            size="icon-xs"
+            size="icon-compact"
             iconOnly
             class="diagram-nav-button"
             onclick={goToNextState}

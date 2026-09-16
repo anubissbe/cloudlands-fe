@@ -35,10 +35,13 @@ function useTimerFrames() {
 
 function useManualFrames() {
   const frames: FrameRequestCallback[] = [];
+  let notifyFrame: (() => void) | undefined;
   Object.defineProperty(window, 'requestAnimationFrame', {
     configurable: true,
     value: vi.fn((callback: FrameRequestCallback) => {
       frames.push(callback);
+      notifyFrame?.();
+      notifyFrame = undefined;
       return frames.length;
     }),
   });
@@ -47,7 +50,11 @@ function useManualFrames() {
     value: vi.fn(),
   });
   const next = async () => {
-    await vi.waitFor(() => expect(frames.length).toBeGreaterThan(0));
+    if (frames.length === 0) {
+      await new Promise<void>((resolve) => {
+        notifyFrame = resolve;
+      });
+    }
     const frame = frames.shift();
     frame!(performance.now());
     await Promise.resolve();
@@ -172,7 +179,7 @@ describe('waitForCaptureStability', () => {
     vi.useFakeTimers();
     const fonts = deferred<void>();
     setFonts(fonts.promise);
-    useTimerFrames();
+    const frames = useManualFrames();
     const root = document.createElement('div');
     const marker = document.createElement('div');
     marker.dataset.ready = 'true';
@@ -190,11 +197,11 @@ describe('waitForCaptureStability', () => {
     await vi.advanceTimersByTimeAsync(15);
     root.append(marker);
     await Promise.resolve();
+    await Promise.resolve();
     await vi.advanceTimersByTimeAsync(90);
     fonts.resolve();
-    await Promise.resolve();
-    await vi.advanceTimersByTimeAsync(0);
-    await vi.advanceTimersByTimeAsync(0);
+    await frames.next();
+    await frames.next();
 
     await resolution;
     expect(window.requestAnimationFrame).toHaveBeenCalledTimes(2);

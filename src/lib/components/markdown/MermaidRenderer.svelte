@@ -451,7 +451,7 @@ ${source}`;
       maskRect.setAttribute('y', String(y + paddingY / 2));
       maskRect.setAttribute('width', String(Math.max(0, width - paddingX)));
       maskRect.setAttribute('height', String(Math.max(0, height - paddingY)));
-      maskRect.setAttribute('fill', '#fff');
+      maskRect.setAttribute('fill', 'hsl(var(--foreground))');
       maskRect.setAttribute('filter', `url(#${filterId})`);
       mask.append(maskRect);
       defs.append(mask);
@@ -1767,7 +1767,7 @@ ${source}`;
           {#if showSourceButton}
             <Button
               variant="ghost"
-              size="icon-xs"
+              size="icon-compact"
               iconOnly
               class="mermaid-action-button"
               onclick={toggleSource}
@@ -1781,7 +1781,7 @@ ${source}`;
           {#if showExpandButton}
             <Button
               variant="ghost"
-              size="icon-xs"
+              size="icon-compact"
               iconOnly
               class="mermaid-action-button expand-button"
               onclick={openFullscreen}
@@ -2126,7 +2126,6 @@ ${source}`;
     font-size: 11px !important;
     font-weight: 600 !important;
     letter-spacing: 0.02em !important;
-    text-transform: uppercase;
   }
 
   .mermaid-presentation :global(svg[aria-roledescription='sequence'] .sequence-branch-condition) {
@@ -2321,13 +2320,37 @@ ${source}`;
     content: '';
     background-color: var(--diagram-label-surface);
     -webkit-mask-image:
-      linear-gradient(to right, transparent, #000 6px, #000 calc(100% - 6px), transparent),
-      linear-gradient(to bottom, transparent, #000 4px, #000 calc(100% - 4px), transparent);
+      linear-gradient(
+        to right,
+        transparent,
+        hsl(var(--foreground)) 6px,
+        hsl(var(--foreground)) calc(100% - 6px),
+        transparent
+      ),
+      linear-gradient(
+        to bottom,
+        transparent,
+        hsl(var(--foreground)) 4px,
+        hsl(var(--foreground)) calc(100% - 4px),
+        transparent
+      );
     -webkit-mask-composite: source-in;
     -webkit-mask-repeat: no-repeat;
     mask-image:
-      linear-gradient(to right, transparent, #000 6px, #000 calc(100% - 6px), transparent),
-      linear-gradient(to bottom, transparent, #000 4px, #000 calc(100% - 4px), transparent);
+      linear-gradient(
+        to right,
+        transparent,
+        hsl(var(--foreground)) 6px,
+        hsl(var(--foreground)) calc(100% - 6px),
+        transparent
+      ),
+      linear-gradient(
+        to bottom,
+        transparent,
+        hsl(var(--foreground)) 4px,
+        hsl(var(--foreground)) calc(100% - 4px),
+        transparent
+      );
     mask-composite: intersect;
     mask-repeat: no-repeat;
     pointer-events: none;

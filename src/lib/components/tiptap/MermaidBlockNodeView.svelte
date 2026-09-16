@@ -216,7 +216,7 @@
           <Button
             type="button"
             variant="ghost"
-            size="icon-xs"
+            size="icon-compact"
             iconOnly
             onclick={openCodeView}
             title={m.tiptap_mermaidBlock_editCode_tooltip()}
@@ -228,7 +228,7 @@
           <Button
             type="button"
             variant="ghost"
-            size="icon-xs"
+            size="icon-compact"
             iconOnly
             onclick={toggleSource}
             aria-pressed={showSource}
@@ -241,7 +241,7 @@
         <Button
           type="button"
           variant="ghost"
-          size="icon-xs"
+          size="icon-compact"
           iconOnly
           onclick={openFullscreen}
           title={m.tiptap_mermaidBlock_fullscreen_tooltip()}

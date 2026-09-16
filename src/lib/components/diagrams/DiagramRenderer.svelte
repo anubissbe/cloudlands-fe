@@ -23,8 +23,7 @@
   import { Tooltip } from '$lib/components/ui/tooltip';
   import Fa from 'svelte-fa';
   import { faCompress, faExpand } from '@fortawesome/free-solid-svg-icons';
-  import { fade } from 'svelte/transition';
-  import type { TransitionConfig } from 'svelte/transition';
+  import { timedFade, type ImmediateMotionConfig as TransitionConfig } from '$lib/motion';
   import { cubicOut } from 'svelte/easing';
   import { flushSync, onDestroy, onMount, tick, untrack } from 'svelte';
   import { m } from '$shared/paraglide/messages.js';
@@ -1519,7 +1518,7 @@
     <div class="diagram-actions" role="toolbar" aria-label={m.diagram_renderer_actions_ariaLabel()}>
       <Button
         variant="ghost"
-        size="icon-xs"
+        size="icon-compact"
         iconOnly
         class="diagram-fit-button"
         onclick={toggleFitToWidth}
@@ -1743,11 +1742,11 @@
               {#if renderedGroups}
                 {#each renderedGroups as group (group.id)}
                   <g
-                    in:fade={{
+                    in:timedFade={{
                       delay: 0,
                       duration: motionDuration(SCENE_ENTRY_MS),
                     }}
-                    out:fade={{ duration: motionDuration(EXIT_CONTENT_MS) }}
+                    out:timedFade={{ duration: motionDuration(EXIT_CONTENT_MS) }}
                   >
                     <DiagramGroup
                       {group}
@@ -1807,7 +1806,7 @@
                     data-edge-id={edge.id}
                     data-semantic-style={edge.semanticStyle ?? 'default'}
                     data-truncated={labelPos.truncated}
-                    out:fade={{ duration: motionDuration(EXIT_CONTENT_MS / 2) }}
+                    out:timedFade={{ duration: motionDuration(EXIT_CONTENT_MS / 2) }}
                   >
                     {#if labelPos.truncated}
                       <Tooltip content={edge.label} side="top" class="edge-label-tooltip">
@@ -1843,12 +1842,12 @@
                   width={node.width}
                   height={node.height}
                   class="diagram-geometry-motion"
-                  in:fade={{
+                  in:timedFade={{
                     delay: 0,
                     duration: stateJustChanged ? motionDuration(SCENE_ENTRY_MS) : 0,
                     easing: cubicOut,
                   }}
-                  out:fade={{ duration: motionDuration(EXIT_CONTENT_MS) }}
+                  out:timedFade={{ duration: motionDuration(EXIT_CONTENT_MS) }}
                 >
                   <DiagramNodeHTML
                     {node}
@@ -2132,13 +2131,37 @@
     content: '';
     background-color: var(--diagram-label-surface);
     -webkit-mask-image:
-      linear-gradient(to right, transparent, #000 6px, #000 calc(100% - 6px), transparent),
-      linear-gradient(to bottom, transparent, #000 4px, #000 calc(100% - 4px), transparent);
+      linear-gradient(
+        to right,
+        transparent,
+        hsl(var(--foreground)) 6px,
+        hsl(var(--foreground)) calc(100% - 6px),
+        transparent
+      ),
+      linear-gradient(
+        to bottom,
+        transparent,
+        hsl(var(--foreground)) 4px,
+        hsl(var(--foreground)) calc(100% - 4px),
+        transparent
+      );
     -webkit-mask-composite: source-in;
     -webkit-mask-repeat: no-repeat;
     mask-image:
-      linear-gradient(to right, transparent, #000 6px, #000 calc(100% - 6px), transparent),
-      linear-gradient(to bottom, transparent, #000 4px, #000 calc(100% - 4px), transparent);
+      linear-gradient(
+        to right,
+        transparent,
+        hsl(var(--foreground)) 6px,
+        hsl(var(--foreground)) calc(100% - 6px),
+        transparent
+      ),
+      linear-gradient(
+        to bottom,
+        transparent,
+        hsl(var(--foreground)) 4px,
+        hsl(var(--foreground)) calc(100% - 4px),
+        transparent
+      );
     mask-composite: intersect;
     mask-repeat: no-repeat;
     pointer-events: none;

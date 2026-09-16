@@ -6,7 +6,7 @@
   import { getCatalogEntry, type CatalogEntry } from './catalog';
   import { loadPreview, setActivePreview } from './preview-discovery';
   import { resolvePreviewState, type PreviewState } from './preview-definition';
-  import { watchCaptureStability } from './capture-stability';
+  import { waitForCaptureStability, watchCaptureStability } from './capture-stability';
   import type { CatalogPreviewFit } from './catalog-preferences';
 
   interface RenderedScene {

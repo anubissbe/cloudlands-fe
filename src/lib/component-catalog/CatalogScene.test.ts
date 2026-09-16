@@ -8,6 +8,7 @@ import CatalogScene from './CatalogScene.svelte';
 const mocks = vi.hoisted(() => ({
   loadPreview: vi.fn(),
   setActivePreview: vi.fn(),
+  waitForCaptureStability: vi.fn(),
   watchCaptureStability: vi.fn(),
 }));
 
@@ -17,6 +18,7 @@ vi.mock('./preview-discovery', () => ({
 }));
 
 vi.mock('./capture-stability', () => ({
+  waitForCaptureStability: mocks.waitForCaptureStability,
   watchCaptureStability: mocks.watchCaptureStability,
 }));
 
@@ -33,6 +35,7 @@ describe('CatalogScene', () => {
   beforeEach(() => {
     mocks.loadPreview.mockReset();
     mocks.setActivePreview.mockReset();
+    mocks.waitForCaptureStability.mockReset();
     mocks.watchCaptureStability.mockReset();
     mocks.loadPreview.mockImplementation(async (slug: string) =>
       slug === 'button' ? loadedButton : undefined,
@@ -40,6 +43,11 @@ describe('CatalogScene', () => {
     mocks.watchCaptureStability.mockImplementation(async (_root, _options, lifecycle) => {
       lifecycle.onWaiting?.(1);
       lifecycle.onStable({ imageCount: 0, deferredImageCount: 0, reducedMotion: true }, 1);
+    });
+    mocks.waitForCaptureStability.mockResolvedValue({
+      imageCount: 0,
+      deferredImageCount: 0,
+      reducedMotion: true,
     });
   });
 
@@ -268,11 +276,53 @@ describe('CatalogScene', () => {
       expect(screen.getByTestId('catalog-scene').dataset.previewReady).toBe('true'),
     );
     expect(screen.getByTestId('catalog-scene').dataset.previewState).toBe('missing');
+    expect(mocks.waitForCaptureStability).toHaveBeenCalledWith(
+      screen.getByTestId('catalog-scene'),
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    );
+    expect(mocks.watchCaptureStability).not.toHaveBeenCalled();
     await waitFor(
       () => expect(container.querySelector('[data-catalog-renderer-fixture]')).not.toBeNull(),
       { timeout: 10_000 },
     );
     expect(screen.getByRole('button', { name: '1. Primary' })).not.toBeNull();
+  });
+
+  it('cancels fallback capture before starting a named preview generation', async () => {
+    let fallbackSignal: AbortSignal | undefined;
+    mocks.waitForCaptureStability.mockImplementationOnce(
+      (_root: HTMLElement, { signal }: { signal: AbortSignal }) => {
+        fallbackSignal = signal;
+        return new Promise((_, reject) =>
+          signal.addEventListener(
+            'abort',
+            () => reject(new DOMException('cancelled', 'AbortError')),
+            { once: true },
+          ),
+        );
+      },
+    );
+    const preview = render(CatalogScene, {
+      props: { slug: 'button', requestedState: 'missing', requestedWidth: 420 },
+    });
+    await waitFor(() => expect(mocks.waitForCaptureStability).toHaveBeenCalledTimes(1));
+
+    await preview.rerender({ slug: 'button', requestedState: 'loading', requestedWidth: 420 });
+
+    await waitFor(() => expect(fallbackSignal?.aborted).toBe(true));
+    await waitFor(() => expect(mocks.watchCaptureStability).toHaveBeenCalledTimes(1));
+    expect(mocks.setActivePreview).not.toHaveBeenCalledWith(
+      expect.objectContaining({ state: 'missing', status: 'ready' }),
+    );
+    await waitFor(() =>
+      expect(screen.getByTestId('catalog-scene').dataset.previewReady).toBe('true'),
+    );
+    expect(mocks.setActivePreview).toHaveBeenLastCalledWith({
+      slug: 'button',
+      state: 'loading',
+      width: 420,
+      status: 'ready',
+    });
   });
 
   it('shows a terminal error when the preview import rejects', async () => {

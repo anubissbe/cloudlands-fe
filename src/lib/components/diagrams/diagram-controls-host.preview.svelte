@@ -21,6 +21,7 @@
   import { WorkspaceStatus, type Workspace } from '$shared/types';
   import { WorkspaceId } from '$shared/types/branded-ids';
   import NoteWithComments from '$lib/components/workspace/NoteWithComments.svelte';
+  import { Button } from '$lib/components/ui/button';
 
   let enabled = $state(true);
   let mounted = $state(true);
@@ -55,9 +56,13 @@
 
 <!-- i18n-ignore (deterministic preview-only lifecycle controls) -->
 <div class="flex gap-3 mb-3">
-  <button onclick={() => (enabled = !enabled)} data-testid="toggle-band">Toggle editor view</button>
-  <button onclick={() => (note += 1)} data-testid="switch-note">Switch note</button>
-  <button onclick={() => (mounted = !mounted)} data-testid="toggle-mount">Toggle host</button>
+  <Button onclick={() => (enabled = !enabled)} data-testid="toggle-band">
+    Toggle editor view
+  </Button>
+  <Button onclick={() => (note += 1)} data-testid="switch-note">Switch note</Button>
+  <Button onclick={() => (mounted = !mounted)} data-testid="toggle-mount">
+    Toggle host
+  </Button>
 </div>
 
 <div class="hosts">
