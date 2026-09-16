@@ -120,7 +120,8 @@ function readDimensions(svg: SVGSVGElement): { width: number; height: number } {
   // export removes. Its screen rect is scaled, not the graph's viewport. Mermaid
   // already maps its viewBox into the rendered viewport, which we must preserve.
   const intrinsic = svg.classList.contains('diagram-svg-layer');
-  const width = (intrinsic ? attributeWidth : 0) || rect.width || attributeWidth || viewBoxWidth || 1;
+  const width =
+    (intrinsic ? attributeWidth : 0) || rect.width || attributeWidth || viewBoxWidth || 1;
   const height =
     (intrinsic ? attributeHeight : 0) || rect.height || attributeHeight || viewBoxHeight || 1;
   return { width, height };

@@ -1,16 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { cubicOut } from 'svelte/easing';
-import {
-  blur,
-  crispOut,
-  draw,
-  fade,
-  fly,
-  scale,
-  slide,
-  springIn,
-  timedFade,
-} from './transitions';
+import { blur, crispOut, draw, fade, fly, scale, slide, springIn, timedFade } from './transitions';
 
 function motionPreference(reduced: boolean) {
   vi.stubGlobal(

@@ -119,10 +119,13 @@ function waitForReadiness(
   if (current) return Promise.resolve(current);
 
   return new Promise<ReadinessMarker[]>((resolve, reject) => {
-    const timeoutId = setTimeout(() => {
-      cleanup();
-      reject(new CaptureStabilityTimeoutError(timeoutMs));
-    }, Math.max(0, timeoutMs));
+    const timeoutId = setTimeout(
+      () => {
+        cleanup();
+        reject(new CaptureStabilityTimeoutError(timeoutMs));
+      },
+      Math.max(0, timeoutMs),
+    );
     const observer = new MutationObserver(() => {
       const markers = readReadinessMarkers(root, readiness);
       if (!markers) return;

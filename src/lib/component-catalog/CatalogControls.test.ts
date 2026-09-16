@@ -45,15 +45,21 @@ describe('CatalogControls', () => {
   it('keeps tri-state motion alongside density, radius, and preview-width controls', () => {
     render(CatalogControls);
 
-    expect(within(screen.getByRole('group', { name: 'Motion' })).getByRole('radio', {
-      name: 'System',
-    })).not.toBeNull();
-    expect(within(screen.getByRole('group', { name: 'Size' })).getByRole('radio', {
-      name: 'Compact',
-    })).not.toBeNull();
-    expect(within(screen.getByRole('group', { name: 'Radius' })).getByRole('radio', {
-      name: 'Square',
-    })).not.toBeNull();
+    expect(
+      within(screen.getByRole('group', { name: 'Motion' })).getByRole('radio', {
+        name: 'System',
+      }),
+    ).not.toBeNull();
+    expect(
+      within(screen.getByRole('group', { name: 'Size' })).getByRole('radio', {
+        name: 'Compact',
+      }),
+    ).not.toBeNull();
+    expect(
+      within(screen.getByRole('group', { name: 'Radius' })).getByRole('radio', {
+        name: 'Square',
+      }),
+    ).not.toBeNull();
     expect(screen.getByRole('combobox', { name: 'Preview' })).not.toBeNull();
   });
 });

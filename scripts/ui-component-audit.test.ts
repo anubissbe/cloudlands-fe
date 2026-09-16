@@ -167,8 +167,7 @@ describe('UI component inventory gate', () => {
       'src/lib/components/notes/primitives/DiagramBlock.svelte',
     );
     expect(
-      components.find((component) => component.publicImport === '$lib/components/ui/menu')
-        ?.callers,
+      components.find((component) => component.publicImport === '$lib/components/ui/menu')?.callers,
     ).toContain('src/lib/components/diagrams/DiagramActionsMenu.svelte');
     expect(buildUiComponentInventory().components).toEqual(components);
   });

@@ -279,7 +279,8 @@
               onkeydown={handleKeyDown}
               spellcheck="false"
               autocorrect="off"
-              autocapitalize="off"></Textarea>
+              autocapitalize="off"
+            ></Textarea>
           </div>
           <div class="edit-actions">
             {#if hasChanges}

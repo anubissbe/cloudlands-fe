@@ -56,13 +56,9 @@
 
 <!-- i18n-ignore (deterministic preview-only lifecycle controls) -->
 <div class="flex gap-3 mb-3">
-  <Button onclick={() => (enabled = !enabled)} data-testid="toggle-band">
-    Toggle editor view
-  </Button>
+  <Button onclick={() => (enabled = !enabled)} data-testid="toggle-band">Toggle editor view</Button>
   <Button onclick={() => (note += 1)} data-testid="switch-note">Switch note</Button>
-  <Button onclick={() => (mounted = !mounted)} data-testid="toggle-mount">
-    Toggle host
-  </Button>
+  <Button onclick={() => (mounted = !mounted)} data-testid="toggle-mount">Toggle host</Button>
 </div>
 
 <div class="hosts">
