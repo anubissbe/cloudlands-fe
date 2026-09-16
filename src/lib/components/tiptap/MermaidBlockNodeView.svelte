@@ -1,11 +1,13 @@
 <script lang="ts">
+  import { Button } from '$lib/components/ui/button';
+  import { Textarea } from '$lib/components/ui/textarea';
   import { NodeViewWrapper } from '$lib/utils/tiptap/svelte-node-view';
   import type { NodeViewProps } from '@tiptap/core';
   import hljs from 'highlight.js';
   import '$lib/styles/syntax-highlighting.css';
   import Fa from 'svelte-fa';
   import { faPencil, faExpand, faCode } from '@fortawesome/free-solid-svg-icons';
-  import { slide } from 'svelte/transition';
+  import { slide } from '$lib/motion';
   import { tick } from 'svelte';
   import { selectIsDarkTheme } from '$store/renderer/slices/theme/theme-selectors';
   import DiagramPresentation from '$lib/components/diagrams/DiagramPresentation.svelte';
@@ -137,7 +139,7 @@
 
   // Debounce timer for auto-saving
   let saveTimeout: ReturnType<typeof setTimeout> | null = null;
-  let textareaEl: HTMLTextAreaElement;
+  let textareaEl = $state<HTMLTextAreaElement>();
 
   async function openCodeView(e: MouseEvent) {
     // Prevent the click from selecting text or triggering bubble menu
@@ -211,33 +213,42 @@
     {#snippet actions()}
       {#if !showCode}
         {#if isEditable}
-          <button
+          <Button
             type="button"
+            variant="ghost"
+            size="icon-xs"
+            iconOnly
             onclick={openCodeView}
             title={m.tiptap_mermaidBlock_editCode_tooltip()}
             aria-label={m.tiptap_mermaidBlock_editCode_tooltip()}
           >
             <Fa icon={faPencil} size="xs" />
-          </button>
+          </Button>
         {:else if renderState === 'rendered'}
-          <button
+          <Button
             type="button"
+            variant="ghost"
+            size="icon-xs"
+            iconOnly
             onclick={toggleSource}
             aria-pressed={showSource}
             title={m.markdown_mermaid_viewSource_label()}
             aria-label={m.markdown_mermaid_viewSource_label()}
           >
             <Fa icon={faCode} size="xs" />
-          </button>
+          </Button>
         {/if}
-        <button
+        <Button
           type="button"
+          variant="ghost"
+          size="icon-xs"
+          iconOnly
           onclick={openFullscreen}
           title={m.tiptap_mermaidBlock_fullscreen_tooltip()}
           aria-label={m.tiptap_mermaidBlock_fullscreen_tooltip()}
         >
           <Fa icon={faExpand} size="xs" />
-        </button>
+        </Button>
       {/if}
     {/snippet}
 
@@ -256,31 +267,31 @@
         <div
           class="mermaid-code-section"
           contenteditable="false"
-          transition:slide={{ axis: 'y', duration: 200 }}
+          transition:slide={{ axis: 'y', tier: 'moderate' }}
         >
           <div class="code-editor-wrapper">
             <pre class="code-highlight hljs" aria-hidden="true">{@html highlightedCode + '\n'}</pre>
-            <textarea
-              bind:this={textareaEl}
+            <Textarea
+              bind:ref={textareaEl}
               class="code-textarea"
               value={editCode}
               oninput={handleCodeInput}
               onkeydown={handleKeyDown}
               spellcheck="false"
               autocorrect="off"
-              autocapitalize="off"></textarea>
+              autocapitalize="off"></Textarea>
           </div>
           <div class="edit-actions">
             {#if hasChanges}
-              <button type="button" class="action-btn" onclick={cancelChanges}
-                >{m.tiptap_mermaidBlock_cancel_label()}</button
+              <Button type="button" variant="ghost" class="action-btn" onclick={cancelChanges}
+                >{m.tiptap_mermaidBlock_cancel_label()}</Button
               >
-              <button type="button" class="action-btn primary" onclick={saveChanges}
-                >{m.tiptap_mermaidBlock_save_label()}</button
+              <Button type="button" class="action-btn primary" onclick={saveChanges}
+                >{m.tiptap_mermaidBlock_save_label()}</Button
               >
             {:else}
-              <button type="button" class="action-btn" onclick={closeCodeView}
-                >{m.tiptap_mermaidBlock_close_label()}</button
+              <Button type="button" variant="ghost" class="action-btn" onclick={closeCodeView}
+                >{m.tiptap_mermaidBlock_close_label()}</Button
               >
             {/if}
           </div>

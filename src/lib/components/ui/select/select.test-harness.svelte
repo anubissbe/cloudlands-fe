@@ -5,9 +5,17 @@
     disabled?: boolean;
     invalid?: boolean;
     portal?: boolean;
+    consumerId?: string;
+    unlabelled?: boolean;
   }
 
-  let { disabled = false, invalid = false, portal = false }: Props = $props();
+  let {
+    disabled = false,
+    invalid = false,
+    portal = false,
+    consumerId,
+    unlabelled = false,
+  }: Props = $props();
   let value = $state('apple');
   let open = $state(false);
 
@@ -18,8 +26,14 @@
   ];
 </script>
 
+{#if consumerId}
+  <label for={consumerId}>Fruit</label>
+{/if}
 <Select.Root bind:value bind:open {items} {disabled} {invalid}>
-  <Select.Trigger aria-label="Choose fruit">
+  <Select.Trigger
+    id={consumerId}
+    aria-label={consumerId || unlabelled ? undefined : 'Choose fruit'}
+  >
     <Select.Value placeholder="Choose fruit" />
   </Select.Trigger>
   <Select.Content {portal}>

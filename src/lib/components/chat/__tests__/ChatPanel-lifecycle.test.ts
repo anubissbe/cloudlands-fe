@@ -96,6 +96,7 @@ const mocks = vi.hoisted(() => {
     animateMessageSend: vi.fn(),
     createMessageSendLaunchBubble: vi.fn(),
     pendingQuestions: null as { messageId: string; questions: unknown[] } | null,
+    agentSubscriptionUIEntries: {} as Record<string, unknown>,
     // Latched divider viewing session (Redux, mutated by tests): non-null
     // while the session is live; null after a stop-looking boundary's
     // endDividerSession.
@@ -127,7 +128,10 @@ vi.mock('$store/renderer/store', async () => {
   // Shallow-dedup emits like the production selector stream, so a test that
   // toggles store state proves the component anchors on the right selector.
   return createAppStoreMockModule({
-    state: () => mocks.storeState,
+    state: () => ({
+      ...(mocks.storeState as Record<string, unknown>),
+      agentSubscriptionUI: { entries: mocks.agentSubscriptionUIEntries },
+    }),
     dispatch: mocks.dispatch,
     dedupeEmits: true,
   });
@@ -141,6 +145,7 @@ vi.mock('$lib/client', () => ({
 vi.mock('$store/renderer/slices/agent-session/agent-session-selectors', () => ({
   selectAgentAttentionRequest: mocks.selector(null),
   selectAgentSession: Object.assign(() => mocks.agentSession, { select: () => null }),
+  selectAgentSessionsById: mocks.selector({}),
   selectAgentSessionIsStreaming: Object.assign(() => mocks.agentSessionIsStreaming, {
     select: () => false,
   }),
@@ -162,6 +167,10 @@ vi.mock('$store/renderer/slices/agent-queue/agent-queue-selectors', () => ({
 }));
 vi.mock('$store/renderer/slices/task-agent-associations/task-agent-associations-selectors', () => ({
   selectTasksForAgent: mocks.selector([]),
+}));
+vi.mock('$store/renderer/slices/workspace-tasks/workspace-tasks-selectors', () => ({
+  selectWorkspaceTasks: mocks.selector([]),
+  selectWorkspaceTasksInitialized: mocks.selector(false),
 }));
 vi.mock('$store/renderer/slices/chat-state/chat-state-selectors', () => ({
   selectAwaitingSwitchBackSnapshot: Object.assign(() => mocks.awaitingSwitchBackSnapshot, {
@@ -350,7 +359,7 @@ vi.mock('../ChatMessage.svelte', async () => ({
   default: (await import('./mocks/SlotOnly.svelte')).default,
 }));
 vi.mock('../AgentSubscriptions.svelte', async () => ({
-  default: (await import('./mocks/SlotOnly.svelte')).default,
+  default: (await import('./mocks/MockAgentSubscriptions.svelte')).default,
 }));
 vi.mock('../AttentionRequestBanner.svelte', async () => ({
   default: (await import('./mocks/SlotOnly.svelte')).default,
@@ -673,6 +682,9 @@ beforeEach(() => {
   mocks.draftSet.mockResolvedValue({ ok: true, updatedAt: '2026-01-01T00:00:00.000Z' });
   mocks.listUserMessages.mockResolvedValue({ ok: true, items: [], total: 0 });
   for (const key of Object.keys(mocks.chatDrafts)) delete mocks.chatDrafts[key];
+  for (const key of Object.keys(mocks.agentSubscriptionUIEntries)) {
+    delete mocks.agentSubscriptionUIEntries[key];
+  }
   mocks.dispatch.mockImplementation((action) => {
     if (action?.type !== 'transientUi/setChatDraft') return action;
     const [workspaceId, agentId, draft] = action.payload as [string, string, string];
@@ -3005,6 +3017,34 @@ describe('ChatPanel mounted lifecycle', () => {
     expect(view.container.querySelector('[data-testid="chat-scroll-lock-button"]')).toBeNull();
   });
 
+  it.each([
+    ['regular', 'workspace-a'],
+    ['Chief', '__chief__'],
+  ])('renders suggested prompts in the %s composer instead of the transcript', async (_, id) => {
+    mocks.draftGet.mockResolvedValue(null);
+    mocks.agentMessages.set([
+      {
+        id: 'assistant-with-prompts',
+        role: 'assistant',
+        timestamp: '2026-01-01T00:00:00.000Z',
+        contentBlocks: [
+          {
+            type: 'text',
+            text: 'Done.\n\n<!-- suggested-prompts\nRun the tests\nReview the diff\n-->',
+          },
+        ],
+      },
+    ]);
+    render(ChatPanel, {
+      props: { workspace: workspace(id), agentId: 'agent-a' },
+    });
+    await tick();
+
+    const prompts = screen.getByTestId('suggested-prompts-surface');
+    expect(screen.getByTestId('chat-composer-controls-inner').contains(prompts)).toBe(true);
+    expect(screen.getByTestId('chat-transcript-inner').contains(prompts)).toBe(false);
+  });
+
   it('reports true-bottom state to the stable header control', async () => {
     mocks.draftGet.mockResolvedValue(null);
     mocks.agentMessages.set([
@@ -3818,6 +3858,16 @@ describe('ChatPanel mounted lifecycle', () => {
     mocks.agentMessages.set([
       { id: 'm1', role: 'assistant', content: 'hello', timestamp: '2026-01-01T00:00:00.000Z' },
     ]);
+    // The lightweight store mock reads selector-store arguments once, before
+    // EventSubscriptionsCard's effects populate the workspace and agent IDs.
+    mocks.agentSubscriptionUIEntries[':'] = {
+      subscriptions: [],
+      delegationGroups: [],
+      agentStatuses: {},
+      waitingState: 'idle',
+      wokenUpInfo: null,
+      snapshotStatus: 'ready',
+    };
     const view = render(ChatPanel, {
       props: { workspace: workspace('workspace-a'), agentId: 'agent-a' },
     });
@@ -3831,6 +3881,51 @@ describe('ChatPanel mounted lifecycle', () => {
     expect(composer?.getAttribute('data-has-transcript-utility')).toBe('false');
     expect(composer?.classList.contains('pb-3')).toBe(false);
     expect(view.container.querySelector('[data-testid="chat-composer-lane"]')).not.toBeNull();
+  });
+
+  it('renders one visible subscription utility and clears it when the agent changes', async () => {
+    mocks.draftGet.mockResolvedValue(null);
+    mocks.agentMessages.set([
+      { id: 'm1', role: 'assistant', content: 'hello', timestamp: '2026-01-01T00:00:00.000Z' },
+    ]);
+    const currentWorkspace = workspace('workspace-a');
+    const view = render(ChatPanel, {
+      props: {
+        workspace: currentWorkspace,
+        agentId: 'agent-with-visible-subscription',
+      },
+    });
+    await tick();
+
+    await tick();
+    await tick();
+    const area = view.container.querySelector('[data-testid="subscription-utility-area"]');
+    const composer = view.container.querySelector('[data-testid="composer-prompt-layer"]');
+    expect(area?.getAttribute('data-has-subscriptions')).toBe('true');
+    expect(area?.classList.contains('hidden')).toBe(false);
+    expect(
+      view.container.querySelectorAll('[data-testid="event-subscriptions-card"]'),
+    ).toHaveLength(1);
+
+    mocks.agentSubscriptionUIEntries['workspace-a:agent-without-subscriptions'] = {
+      subscriptions: [],
+      delegationGroups: [],
+      agentStatuses: {},
+      waitingState: 'idle',
+      wokenUpInfo: null,
+      snapshotStatus: 'ready',
+    };
+    await view.rerender({ workspace: currentWorkspace, agentId: 'agent-without-subscriptions' });
+    await tick();
+    // The mock selector runtime needs an explicit emission after the agent rebinds.
+    (appStore as unknown as { emitState: () => void }).emitState();
+
+    await tick();
+    await tick();
+    const reboundArea = view.container.querySelector('[data-testid="subscription-utility-area"]');
+    expect(reboundArea?.getAttribute('data-has-subscriptions')).toBe('false');
+    expect(reboundArea?.classList.contains('hidden')).toBe(true);
+    expect(composer?.getAttribute('data-has-transcript-utility')).toBe('false');
   });
 
   it('resets the viewport on a resumed:false discard across the restart sequence (snapshot cleared first)', async () => {

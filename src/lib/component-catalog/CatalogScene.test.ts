@@ -258,12 +258,21 @@ describe('CatalogScene', () => {
     });
   });
 
-  it('keeps an invalid state visible and does not emit a false ready marker', async () => {
-    render(CatalogScene, { props: { slug: 'button', requestedState: 'missing' } });
+  it('falls back to the interactive fixture for an unavailable named state', async () => {
+    const { container } = render(CatalogScene, {
+      props: { slug: 'button', requestedState: 'missing' },
+    });
 
-    expect((await screen.findByRole('alert')).textContent).toContain('Unknown state “missing”.');
-    expect(screen.getByTestId('catalog-scene').dataset.previewReady).toBe('false');
-    expect(screen.getByText(/Available states:/).textContent).toContain('loading');
+    expect(await screen.findByText(/No named state “missing” for this component/)).not.toBeNull();
+    await waitFor(() =>
+      expect(screen.getByTestId('catalog-scene').dataset.previewReady).toBe('true'),
+    );
+    expect(screen.getByTestId('catalog-scene').dataset.previewState).toBe('missing');
+    await waitFor(
+      () => expect(container.querySelector('[data-catalog-renderer-fixture]')).not.toBeNull(),
+      { timeout: 10_000 },
+    );
+    expect(screen.getByRole('button', { name: '1. Primary' })).not.toBeNull();
   });
 
   it('shows a terminal error when the preview import rejects', async () => {

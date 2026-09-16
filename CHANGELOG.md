@@ -4,6 +4,55 @@
 
 From version 2.0.0 onward, release notes are published on the [GitHub Releases page](https://github.com/intent-hq/cloudlands-releases/releases). Auto-generated entries for 2.x releases also appear below.
 
+## [2.161.0](https://github.com/intent-hq/cloudlands-fe/compare/v2.160.0...v2.161.0) (2026-09-16)
+
+
+### 🚀 Features
+
+* **ui:** standardize shared controls and product layouts ([#2441](https://github.com/intent-hq/cloudlands-fe/issues/2441)) ([b64bd68](https://github.com/intent-hq/cloudlands-fe/commit/b64bd682e1dd11ffb5a4a7f09c6b81bde3f854b7))
+
+## [2.160.0](https://github.com/intent-hq/cloudlands-fe/compare/v2.159.4...v2.160.0) (2026-09-16)
+
+
+### 🚀 Features
+
+* integrate hardened agent task progress surfaces ([#2074](https://github.com/intent-hq/cloudlands-fe/issues/2074)) ([8f962a1](https://github.com/intent-hq/cloudlands-fe/commit/8f962a1e4374f414925d76d76517b4ca845e4fcd))
+* render math in chat and workspace note previews ([#2253](https://github.com/intent-hq/cloudlands-fe/issues/2253)) ([8162b44](https://github.com/intent-hq/cloudlands-fe/commit/8162b442ebb9718a43ab21c7eb4c8f8719678cf4))
+
+
+### 🐛 Bug Fixes
+
+* bump intentd sidecar to v0.9.65 ([#2512](https://github.com/intent-hq/cloudlands-fe/issues/2512)) ([b93ea20](https://github.com/intent-hq/cloudlands-fe/commit/b93ea20d61ec0feaf48b56e218bf3efeebaa5daa))
+* queue preview tunnel admission and recover capacity failures ([#2457](https://github.com/intent-hq/cloudlands-fe/issues/2457)) ([b5a76f4](https://github.com/intent-hq/cloudlands-fe/commit/b5a76f4253feea3740deb092136fae2e11d7bf31))
+
+## [2.159.4](https://github.com/intent-hq/cloudlands-fe/compare/v2.159.3...v2.159.4) (2026-09-16)
+
+
+### 🐛 Bug Fixes
+
+* bump intentd sidecar to v0.9.64 ([#2509](https://github.com/intent-hq/cloudlands-fe/issues/2509)) ([f679ff0](https://github.com/intent-hq/cloudlands-fe/commit/f679ff03d2e6d615cc9c392de27b7e01cbb37d36))
+
+## [2.159.3](https://github.com/intent-hq/cloudlands-fe/compare/v2.159.2...v2.159.3) (2026-09-16)
+
+
+### 🐛 Bug Fixes
+
+* bump intentd sidecar to v0.9.63 ([#2505](https://github.com/intent-hq/cloudlands-fe/issues/2505)) ([91e071c](https://github.com/intent-hq/cloudlands-fe/commit/91e071c8fd0ec2c2c7ff33424505748386f71e13))
+
+## [2.159.2](https://github.com/intent-hq/cloudlands-fe/compare/v2.159.1...v2.159.2) (2026-09-16)
+
+
+### 🐛 Bug Fixes
+
+* **main:** start intentd sidecar before daemon-dependent startup steps ([#2500](https://github.com/intent-hq/cloudlands-fe/issues/2500)) ([f979b88](https://github.com/intent-hq/cloudlands-fe/commit/f979b880a25fcdaff2dd1b9a67ae78e755d11eb8))
+
+## [2.159.1](https://github.com/intent-hq/cloudlands-fe/compare/v2.159.0...v2.159.1) (2026-09-16)
+
+
+### 🐛 Bug Fixes
+
+* bump intentd sidecar to v0.9.62 ([#2499](https://github.com/intent-hq/cloudlands-fe/issues/2499)) ([44c710c](https://github.com/intent-hq/cloudlands-fe/commit/44c710c844cfd5cc0bca083f78fabc39fced7e66))
+
 ## [2.159.0](https://github.com/intent-hq/cloudlands-fe/compare/v2.158.4...v2.159.0) (2026-09-16)
 
 

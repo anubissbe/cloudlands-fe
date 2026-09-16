@@ -237,7 +237,7 @@
         <SidebarNav />
       </div>
       <div
-        class="flex min-w-0 self-end items-center gap-1 transition-[margin-left] duration-200 ease-[cubic-bezier(0.215,0.61,0.355,1)] motion-reduce:transition-none"
+        class="flex min-w-0 self-end items-center gap-1 transition-[margin-left] duration-spring-moderate ease-spring-moderate motion-reduce:transition-none"
         style:margin-left={`${panelOffset}px`}
         data-titlebar-workspace-controls
       >
@@ -267,7 +267,7 @@
     </div>
     {#if activeTabBounds}
       <div
-        class="pointer-events-none absolute -bottom-px z-[60] h-px bg-sidebar motion-reduce:transition-none"
+        class="pointer-events-none absolute -bottom-0.5 z-[60] h-1 bg-sidebar motion-reduce:transition-none"
         style:left={`${activeTabBounds.left}px`}
         style:width={`${activeTabBounds.width}px`}
         style:mask-image={getWorkspaceTabBorderMaskImage(activeTabBounds)}

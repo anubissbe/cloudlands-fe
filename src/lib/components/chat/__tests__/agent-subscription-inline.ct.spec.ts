@@ -3,6 +3,29 @@ import AgentSubscriptionInlineHost from './AgentSubscriptionInlineHost.svelte';
 
 const toolKinds = ['file', 'terminal', 'tool'] as const;
 
+const delegatedTaskSets = [
+  [{ id: 'pending', title: 'Pending row task', status: 'pending' }],
+  [{ id: 'running', title: 'Running row task', status: 'running' }],
+  [{ id: 'completed', title: 'Completed row task', status: 'completed' }],
+  [
+    { id: 'mixed-pending', title: 'Mixed pending task', status: 'pending' },
+    { id: 'mixed-running', title: 'Mixed running task', status: 'running' },
+    { id: 'mixed-completed', title: 'Mixed completed task', status: 'completed' },
+  ],
+  Array.from({ length: 7 }, (_, index) => ({
+    id: `overflow-${index}`,
+    title: `Overflow row task ${index + 1}`,
+    status: index === 6 ? ('completed' as const) : ('pending' as const),
+  })),
+] as const;
+const delegatedTaskLabels = [
+  'Task progress: 0 of 1 completed',
+  'Task progress: 0 of 1 completed',
+  'Task progress: 1 of 1 completed',
+  'Task progress: 1 of 3 completed',
+  'Task progress: 1 of 7 completed',
+] as const;
+
 test.beforeEach(async ({ page }) => {
   // Load the bundled face before the avatar stack caches canvas text measurements.
   const fontsLoaded = await page.evaluate(async () => {
@@ -22,6 +45,157 @@ test.afterEach(async ({ page }) => {
   await page.locator('#root').evaluate(async (root) => {
     if (root.childElementCount > 0) await window.playwrightUnmount(root);
   });
+});
+
+test('keeps one 28px checklist control per delegated row across themes, narrow width, and motion settings', async ({
+  mount,
+  page,
+}) => {
+  const taskSets = delegatedTaskSets.map((tasks) => [...tasks]);
+  const component = await mount(AgentSubscriptionInlineHost, {
+    props: { agentCount: taskSets.length, taskSets, width: 240 },
+  });
+
+  await expect.poll(() => page.evaluate(() => matchMedia('(hover: hover)').matches)).toBe(true);
+  for (const theme of ['light', 'dark'] as const) {
+    for (const reducedMotion of ['no-preference', 'reduce'] as const) {
+      for (const zoom of [1, 2]) {
+        await page.emulateMedia({ reducedMotion });
+        await component.update({
+          props: { agentCount: taskSets.length, taskSets, width: 240, theme, zoom },
+        });
+        await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur());
+        await page.mouse.move(0, 0);
+        const triggers = component.getByTestId('task-progress-trigger');
+        await expect(triggers).toHaveCount(taskSets.length);
+        await expect(component.getByTestId('task-progress-checklist-icon')).toHaveCount(
+          taskSets.length,
+        );
+        await expect(component.getByTestId('task-progress-icon-stack')).toHaveCount(0);
+        await expect(component.getByTestId('task-progress-status-icon')).toHaveCount(0);
+        await expect(component.getByTestId('task-progress-overflow-indicator')).toHaveCount(0);
+        for (let index = 0; index < taskSets.length; index += 1) {
+          await expect(triggers.nth(index)).toHaveCSS('height', '28px');
+          await expect(triggers.nth(index)).toHaveCSS('width', '28px');
+          await expect(triggers.nth(index)).toHaveCSS('opacity', '0');
+          await expect(triggers.nth(index)).toHaveAccessibleName(delegatedTaskLabels[index]);
+          await expect(triggers.nth(index).locator('svg')).toHaveCount(1);
+          await expect(triggers.nth(index)).toHaveText('');
+        }
+        await expect(triggers.first()).toHaveCSS(
+          'transition-property',
+          reducedMotion === 'reduce' ? 'none' : /opacity/,
+        );
+        await expect(component.getByTestId('agent-list-item').first()).toHaveCSS(
+          'overflow',
+          'hidden',
+        );
+      }
+    }
+  }
+
+  await page.emulateMedia({ reducedMotion: 'no-preference' });
+  await component.update({
+    props: { agentCount: taskSets.length, taskSets, width: 240, theme: 'light', zoom: 1 },
+  });
+  const triggers = component.getByTestId('task-progress-trigger');
+  const firstGeometry = await triggers.first().boundingBox();
+  await component.getByTestId('agent-list-item').first().hover();
+  await expect(triggers.first()).toHaveCSS('opacity', '1');
+  for (let index = 1; index < taskSets.length; index += 1) {
+    await expect(triggers.nth(index)).toHaveCSS('opacity', '0');
+  }
+  expect(await triggers.first().boundingBox()).toEqual(firstGeometry);
+  await page.mouse.move(0, 0);
+  await expect(triggers.first()).toHaveCSS('opacity', '0');
+
+  const firstRowButton = component.getByTestId('agent-list-item').first().locator('button').first();
+  await firstRowButton.focus();
+  await page.keyboard.press('Tab');
+  await expect(triggers.first()).toBeFocused();
+  await expect(triggers.first()).toHaveCSS('opacity', '1');
+  await expect(page.getByRole('dialog', { name: 'Agent tasks' })).toHaveCount(0);
+  await component.getByTestId('agent-list-item').first().hover();
+  await expect(page.getByRole('tooltip', { name: delegatedTaskLabels[0] })).toBeVisible();
+  await expect(page.getByRole('dialog', { name: 'Agent tasks' })).toHaveCount(0);
+
+  await triggers.first().click();
+  await expect(page.getByRole('dialog', { name: 'Agent tasks' })).toBeVisible();
+  await expect(triggers.first()).toHaveAttribute('aria-expanded', 'true');
+  await page.mouse.move(0, 0);
+  await expect(triggers.first()).toHaveCSS('opacity', '1');
+  expect(await triggers.first().boundingBox()).toEqual(firstGeometry);
+  await expect(triggers.nth(1)).toHaveAttribute('aria-expanded', 'false');
+  await expect(page.getByRole('tooltip', { name: delegatedTaskLabels[0] })).toHaveCount(0);
+
+  await triggers.first().click();
+  await expect(page.getByRole('dialog', { name: 'Agent tasks' })).toHaveCount(0);
+  await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur());
+  await page.mouse.move(0, 0);
+  await expect(triggers.first()).toHaveCSS('opacity', '0');
+  expect(await triggers.first().boundingBox()).toEqual(firstGeometry);
+
+  await triggers.nth(1).click();
+  await expect(page.getByRole('dialog', { name: 'Agent tasks' })).toBeVisible();
+  await expect(triggers.first()).toHaveAttribute('aria-expanded', 'false');
+  await expect(triggers.nth(1)).toHaveAttribute('aria-expanded', 'true');
+  await page.keyboard.press('Escape');
+  await expect(page.getByRole('dialog', { name: 'Agent tasks' })).toHaveCount(0);
+  await expect(triggers.nth(1)).toBeFocused();
+  await expect(triggers.nth(1)).toHaveCSS('opacity', '1');
+});
+
+test('keeps delegated checklist controls visible for non-hover primary input', async ({
+  mount,
+  page,
+}) => {
+  const client = await page.context().newCDPSession(page);
+  await client.send('Emulation.setTouchEmulationEnabled', { enabled: true, maxTouchPoints: 1 });
+  await expect
+    .poll(() => page.evaluate(() => matchMedia('(hover: none), (pointer: coarse)').matches))
+    .toBe(true);
+
+  const component = await mount(AgentSubscriptionInlineHost, {
+    props: { agentCount: 2, taskSets: delegatedTaskSets.slice(0, 2).map((tasks) => [...tasks]) },
+  });
+  await page.mouse.move(0, 0);
+  await expect(component.getByTestId('task-progress-trigger').first()).toHaveCSS('opacity', '1');
+  await client.detach();
+});
+
+test('isolates outside-dismissed task help between delegated row controls', async ({
+  mount,
+  page,
+}) => {
+  const component = await mount(AgentSubscriptionInlineHost, {
+    props: {
+      agentCount: 2,
+      taskSets: [delegatedTaskSets[0], delegatedTaskSets[2]].map((tasks) => [...tasks]),
+      showOutsideTarget: true,
+    },
+  });
+  const rows = component.getByTestId('agent-list-item');
+  const triggers = component.getByTestId('task-progress-trigger');
+  const firstTooltip = page.getByRole('tooltip', { name: delegatedTaskLabels[0] });
+  const secondTooltip = page.getByRole('tooltip', { name: delegatedTaskLabels[2] });
+
+  await rows.first().hover();
+  await triggers.first().hover();
+  await expect(firstTooltip).toBeVisible();
+  await triggers.first().click();
+  await expect(page.getByRole('dialog', { name: 'Agent tasks' })).toBeVisible();
+  await component.getByTestId('outside-target').click();
+  await expect(page.getByRole('dialog', { name: 'Agent tasks' })).not.toBeVisible();
+
+  await triggers.first().hover();
+  await page.waitForTimeout(350);
+  await expect(firstTooltip).not.toBeVisible();
+  await triggers.nth(1).focus();
+  await expect(secondTooltip).toBeVisible();
+
+  await page.mouse.move(0, 0);
+  await triggers.first().hover();
+  await expect(firstTooltip).toBeVisible();
 });
 
 async function expectSubscriptionScreenshot(component: Locator, name: string, ratio: number) {
@@ -209,7 +383,7 @@ test('keeps peek text and timestamp on the shared secondary primitive', async ({
           if (interaction === 'rest') expect(value.previewStyle).toEqual(value.timestampStyle);
           expect(value.peekIconCount).toBe(0);
           expect(value.peekAriaLabelCount).toBe(0);
-          expect(value.nameStyle.color).not.toBe(value.previewStyle.color);
+          expect(value.nameStyle.color).toBe(value.previewStyle.color);
         }
       }
     }
@@ -293,6 +467,12 @@ test('keeps the waiting icon at the compact gap and on the header text tone', as
         for (const current of cases) {
           await component.update({ props: { theme, width, zoom, ...current } });
           const summary = component.getByTestId('one-shot-summary-toggle');
+          if (current.agentCount === 1) {
+            await expect(component.getByTestId('agent-list-item')).toHaveCount(1);
+            await expect(summary).toHaveCount(0);
+            await expect(component.getByTestId('one-shot-header')).toHaveCount(0);
+            continue;
+          }
           if ((await summary.getAttribute('aria-expanded')) === 'false') await summary.click();
           await expect(component.getByTestId('agent-list-item')).toHaveCount(current.agentCount);
 
@@ -341,8 +521,8 @@ test('keeps the waiting icon at the compact gap and on the header text tone', as
 
           const deviceDelta = (left: number, right: number) =>
             Math.abs(left - right) * expanded.devicePixelRatio;
-          expect(expanded.slot.width).toBeCloseTo(14 * zoom, 1);
-          expect(expanded.slot.height).toBeCloseTo(14 * zoom, 1);
+          expect(expanded.slot.width).toBeCloseTo(20 * zoom, 1);
+          expect(expanded.slot.height).toBeCloseTo(20 * zoom, 1);
           expect(deviceDelta(expanded.slot.left, expanded.avatar.left)).toBeLessThanOrEqual(0.5);
           expect(deviceDelta(expanded.slot.centerX, expanded.icon.centerX)).toBeLessThanOrEqual(
             0.5,
@@ -359,13 +539,13 @@ test('keeps the waiting icon at the compact gap and on the header text tone', as
               expanded.avatar.centerY - expanded.agentRow.top,
             ),
           ).toBeLessThanOrEqual(0.5);
-          expect(expanded.title.left - expanded.icon.right).toBeCloseTo(6 * zoom, 1);
-          // The icon and summary title share one opaque muted secondary tone.
-          // The agent name remains the opaque primary tone.
+          expect(expanded.title.left - expanded.slot.right).toBeCloseTo(8 * zoom, 1);
+          expect(deviceDelta(expanded.title.left, expanded.name.left)).toBeLessThanOrEqual(0.5);
+          // All summary labels share one opaque muted tone; avatars retain semantic colors.
           expect(expanded.iconStyle.opacity).toBe('1');
           expect(expanded.iconStyle.color).toBe(expanded.titleStyle.color);
           expect(expanded.titleStyle.opacity).toBe('1');
-          expect(expanded.titleStyle.color).not.toBe(expanded.nameColor);
+          expect(expanded.titleStyle.color).toBe(expanded.nameColor);
 
           await summary.click();
           await expect(summary).toHaveAttribute('aria-expanded', 'false');
@@ -836,6 +1016,25 @@ test('renders exactly one promoted Waiting disclosure in agent-only mode', async
   await expect(component.getByText('Waiting for 7 agents', { exact: true })).toHaveCount(1);
 });
 
+for (const snapshotStatus of ['loading', 'failed'] as const) {
+  test(`keeps the agent lane visible while its snapshot is ${snapshotStatus}`, async ({
+    mount,
+  }) => {
+    const component = await mount(AgentSubscriptionInlineHost, { props: { snapshotStatus } });
+
+    await expect(component.getByTestId('subscription-utility-area')).toBeVisible();
+    await expect(component.getByTestId('event-subscriptions-agents')).toBeVisible();
+    await expect(component.getByTestId('event-subscriptions-outer-header')).toHaveCount(0);
+    await expect(component.getByTestId('background-hooks-snapshot-status')).toHaveCount(0);
+    await expect(component.getByTestId('pr-monitors-snapshot-status')).toHaveCount(0);
+    await expect(component.getByTestId('agent-subscriptions-snapshot-status')).toBeVisible();
+    await expect(component.getByTestId('agent-subscriptions-snapshot-status')).toHaveAttribute(
+      'data-snapshot-status',
+      snapshotStatus,
+    );
+  });
+}
+
 test('keeps the outer Subscribed header and a distinct cohort header in mixed mode', async ({
   mount,
 }) => {
@@ -871,6 +1070,7 @@ test('keeps the bell at the compact gap and on the outer-header text tone', asyn
             const iconBox = icon.getBoundingClientRect();
             return {
               slotWidth: slotBox.width,
+              slotRight: slotBox.right,
               slotCenterX: (slotBox.left + slotBox.right) / 2,
               slotCenterY: (slotBox.top + slotBox.bottom) / 2,
               iconWidth: iconBox.width,
@@ -883,11 +1083,11 @@ test('keeps the bell at the compact gap and on the outer-header text tone', asyn
               titleColor: getComputedStyle(title).color,
             };
           });
-          expect(geometry.slotWidth).toBeCloseTo(14 * zoom, 1);
+          expect(geometry.slotWidth).toBeCloseTo(20 * zoom, 1);
           expect(geometry.iconWidth).toBeCloseTo(14 * zoom, 1);
           expect(geometry.iconCenterX).toBeCloseTo(geometry.slotCenterX, 1);
           expect(geometry.iconCenterY).toBeCloseTo(geometry.slotCenterY, 1);
-          expect(geometry.titleLeft - geometry.iconRight).toBeCloseTo(6 * zoom, 1);
+          expect(geometry.titleLeft - geometry.slotRight).toBeCloseTo(8 * zoom, 1);
           expect(geometry.iconOpacity).toBe('1');
           expect(geometry.iconColor).toBe(geometry.titleColor);
           await expect(
@@ -911,6 +1111,12 @@ test('caps one through eight participants at three and computes overflow from re
     await component.update({
       props: { mode: 'agents', agentCount, width: 600, initiallyExpanded: false },
     });
+    if (agentCount === 1) {
+      await expect(component.getByTestId('agent-list-item')).toHaveCount(1);
+      await expect(summary).toHaveCount(0);
+      await expect(component.getByTestId('one-shot-header')).toHaveCount(0);
+      continue;
+    }
     if ((await summary.getAttribute('aria-expanded')) === 'true') await summary.click();
     const stack = component.getByTestId('one-shot-header').locator('[data-agent-avatar-stack]');
     const visibleCount = Math.min(agentCount, 3);
@@ -1133,6 +1339,13 @@ test('pins the participant stack before a fixed trailing chevron slot', async ({
           });
           const summary = component.getByTestId('one-shot-summary-toggle');
           const chevron = component.getByTestId('one-shot-collapse-toggle');
+          if (agentCount === 1) {
+            await expect(component.getByTestId('agent-list-item')).toHaveCount(1);
+            await expect(summary).toHaveCount(0);
+            await expect(component.getByTestId('one-shot-header')).toHaveCount(0);
+            await expect(chevron).toHaveCount(0);
+            continue;
+          }
           if ((await summary.getAttribute('aria-expanded')) === 'true') await summary.click();
           await expect(summary).toHaveAttribute('aria-expanded', 'false');
           await expect(chevron.locator('[data-icon="chevron-down"]')).toHaveClass(/rotate-90/);

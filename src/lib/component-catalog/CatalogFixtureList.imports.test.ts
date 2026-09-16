@@ -16,17 +16,16 @@ vi.mock('./ChatPolishGeometryControls.svelte', () => {
 
 afterEach(cleanup);
 
-it('does not evaluate hidden chat preview imports in gallery mode', async () => {
+it('loads chat preview imports only when navigating to its entry', async () => {
   const view = render(CatalogFixtureList, {
-    props: { entry: getCatalogEntry('chat-polish')!, mode: 'gallery' },
+    props: { entry: getCatalogEntry('button')! },
   });
   await vi.dynamicImportSettled();
-  expect(screen.getByRole('link', { name: 'Focus view' })).toBeTruthy();
   expect(screen.queryByTestId('chat-polish-sidebar')).toBeNull();
   expect(imports.preview).not.toHaveBeenCalled();
   expect(imports.controls).not.toHaveBeenCalled();
 
-  await view.rerender({ entry: getCatalogEntry('chat-polish')!, mode: 'detail' });
+  await view.rerender({ entry: getCatalogEntry('chat-polish')! });
   await vi.dynamicImportSettled();
   expect(imports.preview).toHaveBeenCalledTimes(1);
   expect(imports.controls).toHaveBeenCalledTimes(1);

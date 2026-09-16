@@ -134,6 +134,7 @@ import { attachAppCommandHistoryNavigation } from './app-command-navigation';
 import { attachSwipeHistoryNavigation } from './swipe-navigation';
 import { attachRendererHangMonitor } from './renderer-hang-monitor';
 import { createBootWindowsGate, handleActivate } from './app-activate';
+import { markRendererWindowsAllowed } from './renderer-window-gate';
 import { setupHardwareConsoleMain } from '../features/hardware-console/main/hardware-console.ipc';
 import { setupConsoleOwnerTracking } from '../features/hardware-console/main/console-owner';
 import { requestHardwareConsoleLightingClear } from '../features/hardware-console/main/clear-lighting-shutdown';
@@ -592,8 +593,10 @@ async function saveOpenWindowSessions(): Promise<void> {
 
 // Released once the boot flow below has created its windows (or skipped
 // creating them: second instance, boot failure). `app.on('activate')` waits on
-// it so an early activate never creates a window before the critical IPC
-// handlers exist or duplicates the boot windows (see ./app-activate.ts).
+// it so an early activate never duplicates the boot windows (see
+// ./app-activate.ts). IPC readiness is a separate, central gate: every window
+// creator in ./window.ts awaits ./renderer-window-gate.ts, which the boot flow
+// releases right after the critical IPC block.
 const bootWindowsGate = createBootWindowsGate();
 
 const bootFlow = app.whenReady().then(async () => {
@@ -700,10 +703,11 @@ const bootFlow = app.whenReady().then(async () => {
   const showAboutDialog = (): void => {
     const options = buildAboutDialogOptions(aboutPanelInfo);
     const mainWindow = getMainWindow();
+    // The dialog result is not needed; fire-and-forget.
     if (mainWindow && !mainWindow.isDestroyed()) {
-      dialog.showMessageBox(mainWindow, options);
+      void dialog.showMessageBox(mainWindow, options);
     } else {
-      dialog.showMessageBox(options);
+      void dialog.showMessageBox(options);
     }
   };
 
@@ -943,7 +947,8 @@ const bootFlow = app.whenReady().then(async () => {
     );
   };
 
-  // Function to rebuild and set the application menu
+  // Function to rebuild and set the application menu. Callers fire-and-forget
+  // (`void rebuildMenu()`): the only await, in buildFileMenu, catches internally.
   const rebuildMenu = async () => {
     // Check if focused window is in a workspace (for enabling/disabling tab menu items)
     const inWorkspace = isFocusedWindowInWorkspace();
@@ -1083,13 +1088,13 @@ const bootFlow = app.whenReady().then(async () => {
             const result = await installIntentCli();
             if (result?.success) {
               if (mainWindow && !mainWindow.isDestroyed()) {
-                dialog.showMessageBox(mainWindow, {
+                await dialog.showMessageBox(mainWindow, {
                   type: 'info',
                   title: m.dialog_cli_install_title(),
                   message: result.message || m.dialog_cli_install_success(),
                 });
               } else {
-                dialog.showMessageBox({
+                await dialog.showMessageBox({
                   type: 'info',
                   title: m.dialog_cli_install_title(),
                   message: result.message || m.dialog_cli_install_success(),
@@ -1287,13 +1292,13 @@ const bootFlow = app.whenReady().then(async () => {
                 const result = await installIntentCli();
                 if (result?.success) {
                   if (mainWindow && !mainWindow.isDestroyed()) {
-                    dialog.showMessageBox(mainWindow, {
+                    await dialog.showMessageBox(mainWindow, {
                       type: 'info',
                       title: m.dialog_cli_install_title(),
                       message: result.message || m.dialog_cli_install_success(),
                     });
                   } else {
-                    dialog.showMessageBox({
+                    await dialog.showMessageBox({
                       type: 'info',
                       title: m.dialog_cli_install_title(),
                       message: result.message || m.dialog_cli_install_success(),
@@ -1435,7 +1440,7 @@ const bootFlow = app.whenReady().then(async () => {
   };
 
   // Build initial menu (workspaces may not be loaded yet, will update later)
-  rebuildMenu();
+  void rebuildMenu();
 
   // Rebuild menu when a window gains focus to refresh recent workspaces
   let menuRebuildTimeout: NodeJS.Timeout | null = null;
@@ -1445,7 +1450,7 @@ const bootFlow = app.whenReady().then(async () => {
       clearTimeout(menuRebuildTimeout);
     }
     menuRebuildTimeout = setTimeout(() => {
-      rebuildMenu();
+      void rebuildMenu();
       menuRebuildTimeout = null;
     }, 1000);
   });
@@ -1455,20 +1460,20 @@ const bootFlow = app.whenReady().then(async () => {
   // panel's localized credits are re-applied for the same reason.
   app.on('main-locale-changed', () => {
     applyAboutPanelOptions();
-    rebuildMenu();
+    void rebuildMenu();
   });
 
   // Rebuild menu when the active backend changes (backend switch or boot
   // restore of a remote) — the Help ▸ Sample intentd Process item is gated on
   // win32 + local sidecar (#1889)
   app.on('backend-connection-changed', () => {
-    rebuildMenu();
+    void rebuildMenu();
   });
 
   // Rebuild menu when connection records change (add/forget/rename/hostname
   // capture) so window entries pick up fresh backend labels
   app.on('connections-changed', () => {
-    rebuildMenu();
+    void rebuildMenu();
   });
 
   // Rebuild menu when workspace state changes (enables/disables tab menu items)
@@ -1481,7 +1486,7 @@ const bootFlow = app.whenReady().then(async () => {
         error: error instanceof Error ? error.message : String(error),
       });
     }
-    rebuildMenu();
+    void rebuildMenu();
   });
 
   // Set up custom protocol handler for production builds
@@ -1508,7 +1513,9 @@ const bootFlow = app.whenReady().then(async () => {
   if (process.env.NODE_ENV === 'development') {
     // Export handler info after a delay to ensure all handlers are registered
     setTimeout(() => {
-      exportHandlerDebugInfo();
+      exportHandlerDebugInfo().catch((error: unknown) =>
+        logger.error('Failed to export IPC handler debug info:', error as Error),
+      );
 
       // Get debug info and force save
       const debugInfo = ipcDebugTracker.getDebugInfo();
@@ -1524,6 +1531,22 @@ const bootFlow = app.whenReady().then(async () => {
   // Setup ONLY critical IPC handlers needed for initial render
   // This significantly improves startup time
   startupMetrics.start('criticalIPC');
+
+  // Start the intentd sidecar daemon (if spawn policy allows). This MUST be the
+  // first daemon-related step of the critical phase: the settings/config
+  // services below issue JSON-RPC requests, and on a cold launch a request
+  // against a not-yet-spawned daemon fails and arms the client's reconnect
+  // backoff, stalling every later request behind it. Starting the sidecar
+  // first also keeps it ahead of registerBackendHandlers() so the daemon is
+  // ready before the first JSON-RPC client connection attempt. Adoption logic
+  // (probe socket first) ensures we don't spawn when an external daemon is
+  // already running.
+  await startIntentdSidecar(process.env, app.isPackaged, process.resourcesPath, process.cwd());
+
+  // Per-process memory sampling → console-output.log, so a debug bundle can
+  // name the process that grew. Started after the daemon so the very first
+  // sample already sees the sidecar and its agent children.
+  startMemoryMonitor();
 
   // Initialize specialists service BEFORE workspace IPC - this is critical!
   // The instruction service calls formatSpecialistsForPrompt(), which needs the
@@ -1556,7 +1579,11 @@ const bootFlow = app.whenReady().then(async () => {
   setupGrokIPC(); // Needed for grok:get-models
   setupUnslothIPC(); // Needed for unsloth:get-models
   setupAntigravityIPC(); // Needed for antigravity:get-models
-  setupFeatureCodesIPC(); // Feature codes for gating experimental features
+  // Feature codes for gating experimental features; registers handlers after an
+  // async service init, so it is not awaited on the startup critical path.
+  setupFeatureCodesIPC().catch((error: unknown) =>
+    logger.error('Failed to set up feature codes IPC:', error as Error),
+  );
   setupProviderAvailabilityIPC(); // Needed for providers:get-availability
   setupEventsIPC(); // Needed for events:query
   registerSetupScriptsHandlers(); // Needed for onboarding setup scripts
@@ -1573,19 +1600,9 @@ const bootFlow = app.whenReady().then(async () => {
   setupAutoUpdateIPC(); // Needed for auto-update IPC on startup
   setupReleaseNotesIPC(); // Needed for the Help ▸ Show Release Notes fetch
 
-  // Start the intentd sidecar daemon (if spawn policy allows). This MUST run
-  // before registerBackendHandlers() so the daemon is ready before the first
-  // JSON-RPC client connection attempt. Adoption logic (probe socket first)
-  // ensures we don't spawn when an external daemon is already running.
-  await startIntentdSidecar(process.env, app.isPackaged, process.resourcesPath, process.cwd());
-
-  // Per-process memory sampling → console-output.log, so a debug bundle can
-  // name the process that grew. Started after the daemon so the very first
-  // sample already sees the sidecar and its agent children.
-  startMemoryMonitor();
-
-  // The daemon owns PATH discovery. Seed only after starting/adopting it, and
-  // retry briefly while a newly spawned sidecar creates its socket.
+  // The daemon owns PATH discovery. Seed only after starting/adopting it (at
+  // the top of this phase), and retry briefly while a newly spawned sidecar
+  // creates its socket.
   await seedPathFromHostEnv();
 
   // Fill in the bundled sidecar's build commit on the About box now that the
@@ -1595,6 +1612,10 @@ const bootFlow = app.whenReady().then(async () => {
   registerBackendHandlers(); // Needed for live JSON-RPC transport (workspaces domain)
   registerWorkspaceTransferHandlers(); // Workspace transfer relay (wizard steps 3–4)
   registerWorkspaceImportHandlers(); // Import Workspace from File (File menu)
+
+  // Every critical handler a renderer invokes on boot now exists: let the
+  // window creators in ./window.ts proceed (they all await this gate).
+  markRendererWindowsAllowed();
 
   // Hydrate the main-process provider catalog cache (non-blocking): the
   // JSON-RPC client queues the request until the daemon socket connects.
@@ -1774,7 +1795,7 @@ const bootFlow = app.whenReady().then(async () => {
           windowBackendId = LOCAL_CONNECTION_ID;
         }
       }
-      createWindow(windowBackendId);
+      await createWindow(windowBackendId);
     }
 
     startupMetrics.end('createWindow');
@@ -1864,13 +1885,27 @@ const bootFlow = app.whenReady().then(async () => {
 
     // Final metrics summary after all async operations
     setTimeout(() => startupMetrics.logSummary(), 2000);
-  })();
+  })().catch((error: unknown) => logger.error('Post-window setup failed:', error as Error));
 });
 
-// Boot threw before reaching the window-creation block: never leave an
-// awaiting activate handler hung. `finally` keeps the rejection observable by
-// the process-level unhandled-rejection handler, as before.
-void bootFlow.finally(() => bootWindowsGate.release());
+// Boot threw before reaching the window-creation block: log it, then never
+// leave an awaiting activate handler or window creator hung. This release is
+// deliberately fail-open: a boot error before `registerBackendHandlers()` still
+// lets a renderer open so the app stays reachable, at the cost that the renderer
+// may then hit missing IPC handlers. A fail-closed gate would leave a live
+// process with zero windows and no user-visible signal. `finally` keeps the
+// rejection observable by the process-level unhandled-rejection handler, as
+// before.
+void bootFlow.catch((error: unknown) => {
+  logger.error(
+    'Boot flow rejected before window creation; releasing renderer-window gate fail-open',
+    error instanceof Error ? error : new Error(String(error)),
+  );
+});
+void bootFlow.finally(() => {
+  bootWindowsGate.release();
+  markRendererWindowsAllowed();
+});
 
 // This window-all-closed handler was duplicated and has been removed.
 // The proper handler is defined below at line 448.
@@ -1943,7 +1978,7 @@ app.on('window-all-closed', async () => {
     if (!proceed) {
       logger.info('window-all-closed quit cancelled; re-opening a window');
       try {
-        createWindow();
+        await createWindow();
       } catch (err) {
         logger.error(
           // i18n-ignore (developer log message)
@@ -2033,13 +2068,15 @@ app.on('open-url', async (event: Electron.Event, url: string) => {
     return;
   }
 
-  // If app is ready and has a main window, create a new window for the deep link
+  // With a live main window, route the deep link now (settings/create go to
+  // that window; other types open a new one — the creator itself awaits the
+  // renderer-window gate). Without one, park the URL for the startup pass so
+  // it can be embedded in the boot window's load URL.
   const mainWindow = getMainWindow();
   if (mainWindow && !mainWindow.isDestroyed()) {
     await createWindowForDeepLink(url, deepLinkHandler);
   } else {
-    // App is not ready yet, store the URL for processing after startup
-    logger.info('App not ready, storing URL for later processing');
+    logger.info('No main window yet, storing URL for later processing');
     await deepLinkHandler.handleDeepLink(url, null);
   }
 });
@@ -2078,6 +2115,8 @@ if (!gotTheLock) {
         // instance is already running, so no parking or window is needed.
         await handlePairDeepLink(deepLinkUrl);
       } else {
+        // Route only when a main window exists to receive/anchor the link;
+        // any new window the creator opens awaits the renderer-window gate.
         const mainWindow = getMainWindow();
         if (mainWindow && !mainWindow.isDestroyed()) {
           await createWindowForDeepLink(deepLinkUrl, deepLinkHandler);
@@ -2100,8 +2139,8 @@ app.on('activate', async () => {
   if (isSecondInstance) return;
 
   // Waits for the boot flow's window creation first, so a first-launch
-  // activate becomes a focus of the boot window rather than a second window
-  // racing the critical IPC registration (see ./app-activate.ts).
+  // activate becomes a focus of the boot window rather than a duplicate; the
+  // IPC-readiness wait lives inside the creators (see ./app-activate.ts).
   await handleActivate<BrowserWindowType>({
     whenBootWindowsReady: () => bootWindowsGate.ready,
     getAllWindows: () => BrowserWindow.getAllWindows(),

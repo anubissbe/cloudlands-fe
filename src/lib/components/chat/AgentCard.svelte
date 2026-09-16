@@ -8,10 +8,11 @@
    */
   import { tick, type Snippet } from 'svelte';
   import { writable } from 'svelte/store';
-  import { toast } from 'svelte-sonner';
+  import { notify } from '$lib/components/patterns/notify';
   import { createLogger } from '$lib/utils/client-logger';
   import LineChangeStats from '$lib/components/shared/LineChangeStats.svelte';
   import RelativeTime from '$lib/components/ui/RelativeTime.svelte';
+  import { Input } from '$lib/components/ui/input';
   import {
     selectAgentIsResponding,
     selectAgentSession,
@@ -35,9 +36,9 @@
   import { isAgentRunningState, toAgentRuntimeStateInput } from '$shared/utils/agent-runtime-state';
   import { openAgentTabRequested } from '$store/renderer/slices/app-layout/app-layout-slice';
   import { selectPendingCount } from '$store/renderer/slices/permission/permission-selectors';
+  import { safeDisclosureTransition } from './disclosure-motion';
   import { selectHudAgentHasPendingQuestion } from '$store/renderer/slices/hud/hud-selectors';
   import { deriveAgentHasPendingQuestion } from './questions/wizard-gate';
-  import { safeSlide } from '$lib/utils/animations';
   import { findSourcePanelId } from '$lib/utils/workspace-navigation';
   import { updateSession as updateAgentSessionFields } from '$store/renderer/slices/agent-session/agent-session-slice';
   import {
@@ -68,6 +69,8 @@
   import { selectIsWorkspaceHostLocal } from '$store/renderer/slices/workspace/workspace-selectors';
   import { isCmdClickModifier } from '$shared/utils/link-helpers';
   import { isReplaceAgentEligible } from '$shared/utils/replace-agent-eligibility';
+  import TaskProgressControl from './TaskProgressControl.svelte';
+  import type { TaskProgressItem } from './workspace-task-fallback';
 
   interface Props {
     agentId: string;
@@ -113,6 +116,10 @@
     provider?: string;
     /** Optional actions rendered beside, never inside, the row activation button. */
     headerActions?: Snippet;
+    /** Optional per-agent task progress rendered beside row actions. */
+    taskProgress?: TaskProgressItem[];
+    /** Visual presentation for the optional task progress control. */
+    taskProgressPresentation?: 'status-stack' | 'checklist';
     /** Optional timestamp supplied by list data before the session selector is hydrated. */
     updatedAt?: AgentSession['updatedAt'];
     /** Disable navigation, mutation, editing, and file operations in isolated previews. */
@@ -140,12 +147,15 @@
     isCompleted = false,
     provider = undefined,
     headerActions,
+    taskProgress = [],
+    taskProgressPresentation = 'status-stack',
     updatedAt: updatedAtProp = undefined,
     readOnly = false,
   }: Props = $props();
 
   const logger = createLogger('AgentCard');
   const INLINE_PEEK_TYPOGRAPHY_CLASS = 'font-normal! text-muted-foreground';
+  const hasTaskProgress = $derived(taskProgress.length > 0);
 
   // svelte-ignore state_referenced_locally -- selectors are initialized with the current agent; the effect below mirrors prop changes.
   const agentIdStore = writable(agentId);
@@ -237,7 +247,7 @@
               nameExplicitlySet: previousNameExplicitlySet,
             } as any),
           );
-          toast.error(m.chat_agentCard_renameFailed_error());
+          notify.error(m.chat_agentCard_renameFailed_error());
         });
       }
     }
@@ -356,7 +366,7 @@
           try {
             await invoke('shell:showItemInFolder', { path: sandboxPath });
           } catch (error) {
-            toast.error(
+            notify.error(
               error instanceof Error
                 ? error.message
                 : m.chat_agentCard_revealFailed_error({ fileManager: fileManagerName }),
@@ -601,10 +611,10 @@
     if (!showStateBorder) return '';
     if (avatarState === 'running' || avatarState === 'responding') return 'agent-glow-active';
     if (avatarState === 'failed') return 'shadow shadow-red-500 shadow-sm';
-    if (avatarState === 'needs-permission') return 'shadow shadow-amber-500 shadow-sm';
-    if (avatarState === 'attention-discussion') return 'shadow shadow-amber-500 shadow-sm';
+    if (avatarState === 'needs-permission') return 'shadow shadow-warning shadow-sm';
+    if (avatarState === 'attention-discussion') return 'shadow shadow-warning shadow-sm';
     if (avatarState === 'attention-blocker') return 'shadow shadow-red-500 shadow-sm';
-    if (avatarState === 'waiting') return 'shadow shadow-amber-500 shadow-sm';
+    if (avatarState === 'waiting') return 'shadow shadow-warning shadow-sm';
     return 'glow-transparent';
   });
 
@@ -672,10 +682,10 @@
     <svelte:element
       this={isEditing ? 'div' : 'button'}
       type={isEditing ? undefined : 'button'}
-      class="flex w-full min-w-0 max-w-full text-left gap-2 transition-colors duration-150 {isEditing
+      class="flex w-full min-w-0 max-w-full text-left gap-2 transition-colors duration-spring-fast ease-spring-fast motion-reduce:transition-none {isEditing
         ? 'overflow-visible'
         : 'overflow-hidden'} {isEditing ? 'cursor-text' : 'cursor-pointer'} group border {panelRow
-        ? 'h-10 items-center rounded-md border-transparent bg-transparent px-2 py-2 type-body font-normal text-foreground hover:bg-transparent active:bg-transparent focus-visible:-outline-offset-2 focus-visible:bg-transparent focus-visible:outline-2 focus-visible:outline-ring focus-visible:ring-0'
+        ? 'h-10 items-center rounded-md border-transparent bg-transparent px-2 py-2 type-body font-normal text-foreground hover:bg-transparent active:bg-transparent focus-visible:-outline-offset-2 focus-visible:bg-transparent focus-visible:outline-1 focus-visible:outline-ring focus-visible:ring-0'
         : inline
           ? `type-body items-center rounded-md ${inlineRowClass}`
           : 'px-1.75 pt-1.25 pb-1.5'} {panelRow
@@ -712,9 +722,13 @@
       <div
         class="agent-card-content flex min-w-0 max-w-full flex-1 {isEditing
           ? 'overflow-visible'
-          : 'overflow-hidden'} {headerActions ? 'mr-14' : ''} {inline || panelRow
-          ? 'flex-row items-center gap-2'
-          : 'flex-col'}"
+          : 'overflow-hidden'} {hasTaskProgress
+          ? headerActions
+            ? 'mr-25'
+            : 'mr-11'
+          : headerActions
+            ? 'mr-14'
+            : ''} {inline || panelRow ? 'flex-row items-center gap-2' : 'flex-col'}"
       >
         <!-- Header row -->
         <div
@@ -750,8 +764,8 @@
             >
               {#if isEditing}
                 <!-- svelte-ignore a11y_autofocus -->
-                <input
-                  bind:this={editInputRef}
+                <Input
+                  bind:ref={editInputRef}
                   type="text"
                   bind:value={editingValue}
                   aria-label={m.chat_agentCard_menu_rename_label()}
@@ -779,8 +793,8 @@
                     ? 'min-w-0 flex-1 truncate type-body font-normal text-foreground'
                     : inline
                       ? typographyClass
-                        ? 'shrink-0 type-body font-normal text-foreground!'
-                        : 'shrink-0 type-body font-normal text-foreground'
+                        ? 'shrink-0 type-body font-normal text-muted-foreground!'
+                        : 'shrink-0 type-body font-normal text-muted-foreground'
                       : 'shrink-0 text-sm font-normal text-foreground'}"
                   data-testid="agent-card-name"
                   data-agent-row-name={panelRow ? '' : undefined}
@@ -893,14 +907,14 @@
           <div
             class="mt-0.5 w-full min-w-0 max-w-full overflow-hidden"
             data-testid="agent-card-preview-row"
-            transition:safeSlide={{ axis: 'y', duration: 150 }}
+            transition:safeDisclosureTransition={{ tier: 'fast' }}
           >
             {#if $preview$.kind === 'attention'}
               <p
                 class="block w-full min-w-0 max-w-full truncate whitespace-nowrap text-sm {$preview$
                   .attention.kind === 'blocker'
                   ? 'text-red-500'
-                  : 'text-amber-500'}"
+                  : 'text-warning-ink'}"
                 data-testid="agent-card-attention"
               >
                 {$preview$.attention.kind === 'blocker'
@@ -938,21 +952,32 @@
         {/if}
       </div>
     </svelte:element>
-    {#if headerActions}
+    {#if headerActions || hasTaskProgress}
       <div
-        class="absolute right-3 top-1/2 z-10 h-6 w-14 shrink-0 -translate-y-1/2"
+        class="absolute right-3 top-1/2 z-10 flex h-6 shrink-0 -translate-y-1/2 items-center justify-end {hasTaskProgress
+          ? headerActions
+            ? 'w-25'
+            : 'w-11'
+          : 'w-14'}"
         data-testid="agent-card-trailing-slot"
       >
-        {#if updatedAt}
-          <RelativeTime
-            date={updatedAt}
-            compact
-            class="type-caption tabular-nums absolute inset-0 flex items-center justify-end text-right {INLINE_PEEK_TYPOGRAPHY_CLASS} transition-opacity group-hover/watch:opacity-0 group-focus-within/watch:opacity-0"
-          />
+        {#if hasTaskProgress}
+          <TaskProgressControl tasks={taskProgress} presentation={taskProgressPresentation} />
         {/if}
-        <div class="absolute inset-0 flex items-center justify-end gap-1">
-          {@render headerActions()}
-        </div>
+        {#if headerActions}
+          <div class="relative h-6 w-14 shrink-0">
+            {#if updatedAt}
+              <RelativeTime
+                date={updatedAt}
+                compact
+                class="type-caption tabular-nums absolute inset-0 flex items-center justify-end text-right {INLINE_PEEK_TYPOGRAPHY_CLASS} transition-opacity group-hover/watch:opacity-0 group-focus-within/watch:opacity-0"
+              />
+            {/if}
+            <div class="absolute inset-0 flex items-center justify-end gap-1">
+              {@render headerActions()}
+            </div>
+          </div>
+        {/if}
       </div>
     {/if}
   </div>
@@ -1038,7 +1063,7 @@
   :global(.agent-glow-active) {
     position: relative;
     box-shadow: 0 0 12px 2px rgba(16, 185, 129, 0.1);
-    animation: agent-glow-pulse 2s ease-in-out infinite;
+    animation: agent-glow-pulse calc(var(--spring-slow) * 8) var(--spring-slow-ease) infinite;
   }
 
   :global(.agent-glow-active)::before {

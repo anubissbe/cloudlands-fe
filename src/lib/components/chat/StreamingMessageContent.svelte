@@ -38,6 +38,7 @@
   import SetupScriptCard from './SetupScriptCard.svelte';
   import ThinkingBlock from './ThinkingBlock.svelte';
   import ReasoningHistoryBlock from './ReasoningHistoryBlock.svelte';
+  import ExecutionPlanCard from './ExecutionPlanCard.svelte';
   import NavLink from './NavLink.svelte';
   import {
     parseAgentMessage,
@@ -561,7 +562,11 @@
     if (contentBlock.type === 'tool_result') {
       return isStandaloneToolResult(toolResultClassification, contentBlock);
     }
-    return contentBlock.type === 'tool_use' || contentBlock.type === 'thinking';
+    return (
+      contentBlock.type === 'tool_use' ||
+      contentBlock.type === 'thinking' ||
+      contentBlock.type === 'plan'
+    );
   }
 
   function isVisibleGroupChild(block: ContentBlock): boolean {
@@ -856,6 +861,8 @@
         {/if}
       </div>
     </div>
+  {:else if block.type === 'plan' && block.entries}
+    <ExecutionPlanCard entries={block.entries} />
   {:else if block.type === 'thinking'}
     <!-- Daemon-emitted thinking blocks carry `text` (PROTOCOL §7.1); the legacy
          <think>-tag parser path in messageParser emits `content`. -->
@@ -1055,6 +1062,12 @@
   }
 
   .content-block--animate-in {
-    animation: slideUpIn 250ms ease-out both;
+    animation: slideUpIn var(--spring-slow) var(--spring-slow-ease) both;
+  }
+
+  @container style(--motion-reduced: 1) {
+    .content-block--animate-in {
+      animation: none;
+    }
   }
 </style>

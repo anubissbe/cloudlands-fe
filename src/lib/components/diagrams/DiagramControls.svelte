@@ -9,10 +9,8 @@
   import HoverCard from '$lib/components/ui/HoverCard.svelte';
   import Fa from 'svelte-fa';
   import { faChevronLeft, faChevronRight } from '@fortawesome/free-solid-svg-icons';
-  import { fly } from 'svelte/transition';
-  import { cubicOut } from 'svelte/easing';
+  import { fly } from '$lib/motion';
   import { m } from '$shared/paraglide/messages.js';
-  import { prefersReducedMotion } from '$lib/utils/reduced-motion';
   import { onDestroy } from 'svelte';
 
   interface Props {
@@ -46,10 +44,6 @@
   let hoveredIndex = $state<number | null>(null);
   let navigationElement = $state<HTMLDivElement | null>(null);
   let focusFrame: number | undefined;
-
-  function motionDuration(duration: number): number {
-    return prefersReducedMotion(navigationElement?.ownerDocument) ? 0 : duration;
-  }
 
   // Navigation stops at the first and last step so progression stays predictable.
   function goToPrevState() {
@@ -120,14 +114,14 @@
           <div
             class="narrative"
             in:fly={{
-              x: slideDirection === 'left' ? 8 : -8,
-              duration: motionDuration(150),
-              easing: cubicOut,
+              axis: 'x',
+              distance: slideDirection === 'left' ? 8 : -8,
+              tier: 'fast',
             }}
             out:fly={{
-              x: slideDirection === 'left' ? -8 : 8,
-              duration: motionDuration(150),
-              easing: cubicOut,
+              axis: 'x',
+              distance: slideDirection === 'left' ? -8 : 8,
+              tier: 'fast',
             }}
           >
             {#if narrative?.title}
@@ -152,12 +146,15 @@
       <div class="stepper">
         {#each states as state, index (state.id)}
           {@const stateNarrative = getNarrative(state.narrative)}
-          <button
-            class="stepper-dot"
-            class:active={index === currentIndex}
-            class:completed={index < currentIndex}
+          <Button
+            variant="ghost"
+            size="icon-xs"
+            iconOnly
+            class="stepper-dot {index === currentIndex ? 'active' : ''} {index < currentIndex
+              ? 'completed'
+              : ''}"
             data-diagram-step-index={index}
-            style:anchor-name="--segment-{index}"
+            style="anchor-name: --segment-{index};"
             onclick={() => goToState(index)}
             onkeydown={(event) => handleStepKeydown(event, index)}
             onmouseenter={() => (hoveredIndex = index)}
@@ -170,7 +167,7 @@
                 stateNarrative?.title ||
                 m.diagram_controls_stateNumber_label({ number: index + 1 }),
             })}
-          ></button>
+          ></Button>
 
           <!-- Hover card -->
           {#if hoveredIndex === index && stateNarrative}
@@ -334,7 +331,7 @@
     font-variant-numeric: tabular-nums;
   }
 
-  .stepper-dot {
+  :global(.stepper-dot) {
     display: grid;
     width: 18px;
     height: 18px;
@@ -350,7 +347,7 @@
     flex-shrink: 0;
   }
 
-  .stepper-dot::after {
+  :global(.stepper-dot)::after {
     content: '';
     width: 6px;
     height: 6px;
@@ -361,21 +358,21 @@
       background var(--motion-standard) var(--ease-standard);
   }
 
-  .stepper-dot:hover {
+  :global(.stepper-dot):hover {
     background: hsl(var(--muted) / 0.55);
   }
 
-  .stepper-dot:focus-visible {
+  :global(.stepper-dot):focus-visible {
     outline: 2px solid hsl(var(--ring) / 0.55);
     outline-offset: 1px;
     background: hsl(var(--muted) / 0.55);
   }
 
-  .stepper-dot.completed::after {
+  :global(.stepper-dot.completed)::after {
     background: hsl(var(--primary) / 0.58);
   }
 
-  .stepper-dot.active::after {
+  :global(.stepper-dot.active)::after {
     width: 14px;
     background: hsl(var(--primary));
   }
@@ -388,14 +385,14 @@
     color: hsl(var(--foreground));
   }
 
-  :global(.catalog-reduced-motion) .stepper-dot,
-  :global(.catalog-reduced-motion) .stepper-dot::after {
+  :global(.catalog-reduced-motion .stepper-dot),
+  :global(.catalog-reduced-motion .stepper-dot)::after {
     transition: none;
   }
 
   @container style(--motion-reduced: 1) {
-    :global(html:not(.catalog-full-motion)) .stepper-dot,
-    :global(html:not(.catalog-full-motion)) .stepper-dot::after {
+    :global(html:not(.catalog-full-motion) .stepper-dot),
+    :global(html:not(.catalog-full-motion) .stepper-dot)::after {
       transition: none;
     }
   }

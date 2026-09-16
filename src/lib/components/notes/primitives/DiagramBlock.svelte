@@ -1,10 +1,11 @@
 <script lang="ts">
+  import { Button } from '$lib/components/ui/button';
   import { NodeViewWrapper } from 'svelte-tiptap';
   import type { NodeViewProps } from '@tiptap/core';
   import type { DiagramPrimitive } from '$shared/types/notes-primitives';
   import Fa from 'svelte-fa';
   import { faChevronDown } from '@fortawesome/free-solid-svg-icons';
-  import { slide } from 'svelte/transition';
+  import { slide } from '$lib/motion';
   import DiagramPresentation from '$lib/components/diagrams/DiagramPresentation.svelte';
   import DiagramRenderer from '$lib/components/diagrams/DiagramRenderer.svelte';
   import AgentAvatar from '$features/agent/components/agent-avatar/AgentAvatar.svelte';
@@ -84,8 +85,9 @@
         <div class="flex min-w-0 items-center gap-2">
           {#if linkedAgentId}
             <!-- Show agent avatar that opens the agent panel -->
-            <button
+            <Button
               type="button"
+              variant="ghost"
               class="flex-none hover:opacity-80 transition-opacity cursor-pointer"
               onclick={(event) => {
                 const agentWsId = workspaceId;
@@ -101,10 +103,11 @@
               title={m.notes_diagramBlock_viewAgent_tooltip()}
             >
               <AgentAvatar agentId={linkedAgentId} variant="compact" />
-            </button>
+            </Button>
           {/if}
-          <button
+          <Button
             type="button"
+            variant="ghost"
             class="flex items-center gap-1.5 text-subtle transition-colors flex-1 min-w-0 cursor-pointer"
             onclick={toggleExpanded}
             id={disclosureId}
@@ -122,14 +125,14 @@
                 {m.notes_diagramBlock_stateCount_label({ count: primitive.states.length })}
               </span>
             {/if}
-          </button>
+          </Button>
         </div>
       {/snippet}
 
       <!-- Expanded content -->
       <div id={regionId} role="region" aria-labelledby={disclosureId} aria-hidden={!expanded}>
         {#if expanded}
-          <div transition:slide={{ duration: 150 }}>
+          <div transition:slide={{ axis: 'y', tier: 'moderate' }}>
             <DiagramRenderer
               diagram={primitive}
               onUpdate={handleDiagramUpdate}
