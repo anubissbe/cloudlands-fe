@@ -329,6 +329,24 @@
     };
   });
 
+  function dismissHoverCardOnEscape(event: KeyboardEvent) {
+    if (event.key !== 'Escape') return;
+    const target = event.target;
+    // Card controls own Escape so they can restore focus to the trigger.
+    if (target instanceof Node && getHoverCardElement()?.contains(target)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    preventFocusOpenUntilRowExit = focusWithinRow;
+    clearHoverCardOpenTimer();
+    closeHoverCard();
+  }
+
+  $effect(() => {
+    if (!hoverCardVisible) return;
+    window.addEventListener('keydown', dismissHoverCardOnEscape, true);
+    return () => window.removeEventListener('keydown', dismissHoverCardOnEscape, true);
+  });
+
   const activePullRequest = $derived.by(() => {
     if (!workspace) return null;
     return selectWorkspaceActivePullRequest.select(appStore.state, workspace.id);

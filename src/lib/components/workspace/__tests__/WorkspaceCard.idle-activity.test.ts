@@ -920,6 +920,48 @@ describe('WorkspaceCard hover-intent delay', () => {
     }
   });
 
+  it.each(['close', 'destroy'])('removes the open-card Escape listener on %s', async (end) => {
+    vi.useFakeTimers();
+    const addListener = vi.spyOn(window, 'addEventListener');
+    const removeListener = vi.spyOn(window, 'removeEventListener');
+    const escapeListeners = () =>
+      addListener.mock.calls.filter(([type, , capture]) => type === 'keydown' && capture === true);
+    try {
+      const view = render(WorkspaceCard, { props: { workspace: makeWorkspace() } });
+      const row = view.container.querySelector<HTMLElement>('[data-workspace-card-row]')!;
+      expect(escapeListeners()).toHaveLength(0);
+      await fireEvent.mouseEnter(row);
+      await tick();
+      expect(escapeListeners()).toHaveLength(0);
+      vi.advanceTimersByTime(WORKSPACE_HOVER_CARD_OPEN_DELAY_MS);
+      await tick();
+      expect(hoverCard()).not.toBeNull();
+      expect(escapeListeners()).toHaveLength(1);
+      const listener = escapeListeners()[0][1];
+      await fireEvent.keyDown(document.body, { key: 'a' });
+      expect(hoverCard()).not.toBeNull();
+      if (end === 'close') {
+        await fireEvent.keyDown(document.body, { key: 'Escape' });
+        expect(hoverCard()).toBeNull();
+      } else {
+        view.unmount();
+      }
+      expect(removeListener).toHaveBeenCalledWith('keydown', listener, true);
+      const afterClose = new KeyboardEvent('keydown', {
+        key: 'Escape',
+        bubbles: true,
+        cancelable: true,
+      });
+      document.body.dispatchEvent(afterClose);
+      expect(afterClose.defaultPrevented).toBe(false);
+    } finally {
+      workspaceHoverCardIntentSession.reset();
+      addListener.mockRestore();
+      removeListener.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
   it('removes active dismissal listeners when the row is destroyed', async () => {
     vi.useFakeTimers();
     const addEventListener = vi.spyOn(window, 'addEventListener');
