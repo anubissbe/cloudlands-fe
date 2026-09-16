@@ -1,3 +1,17 @@
+// @verify-changed-triggers: ../Panel.svelte, ../PanelContainer.svelte, ../PanelLayout.svelte,
+//   ../PanelSplitHandle.svelte, ../PanelTabBar.svelte, ../LayoutPresetDropdown.svelte,
+//   ../../WindowTitleBar.svelte, ../../WorkspaceTabStrip.svelte,
+//   ../../sidebar-nav/SidebarNav.svelte, ../../sidebar-nav/SidebarPanel.svelte,
+//   ../../../workspace/WorkspaceLayout.svelte, ../../../workspace/WorkspaceSidebarHeader.svelte,
+//   ../../../workspace/MultiSelectTabbedSidebar.svelte,
+//   ../../../workspace/WorkspaceTerminalDock.svelte, ../../../workspace/multi-select-sidebar-tabs.ts,
+//   ../../../workspace/sidebar/SidebarHeaderAction.svelte,
+//   ../../../workspace/sidebar/WorkspaceProgressCard.svelte,
+//   ../../../terminal/QuakeTerminalOverlay.svelte, ../../../../../app.css, ../../../../../app.html,
+//   ../../../../../routes/(app)/+layout.svelte, ../../../../../routes/(app)/app-layout.css,
+//   ../../../../../routes/(app)/workspace/[id]/WorkspaceSurface.svelte,
+//   ../../../../../routes/(app)/workspace/[id]/composables/use-panel-shortcuts.svelte.ts
+
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 
@@ -36,12 +50,8 @@ describe('editorial workspace shell presentation contract', () => {
     expect(panel).toContain('overflow-hidden rounded-(--panel-shell-radius) text-foreground');
     expect(panel).toContain('--panel-shell-radius: var(--radius-large);');
     expect(panel).not.toContain('rounded-lg border border-border');
-    expect(panel).toContain(
-      'class:bg-sidebar={panel.pristine === true && panel.tabs.length === 0}',
-    );
-    expect(panel).toContain(
-      'class:bg-background={panel.pristine !== true || panel.tabs.length > 0}',
-    );
+    expect(panel).toContain('class:bg-sidebar={panel.tabs.length === 0}');
+    expect(panel).toContain('class:bg-background={panel.tabs.length > 0}');
     expect(panel).toContain('data-empty-panel-surface={');
     expect(container).toContain('class="h-full w-full min-h-0 min-w-0"');
     expect(container).toContain(
@@ -51,6 +61,11 @@ describe('editorial workspace shell presentation contract', () => {
     expect(panel).toContain('min-width: 0');
     expect(panel).not.toContain('min-width: 30em');
     expect(panel).toContain('box-shadow: var(--elevation-raised)');
+    expect(panel).toMatch(
+      /\.panel\[data-empty-panel-shell='true'\]:not\(\[data-focus-border-visible='true'\]\)\s*\{\s*border-width: 0;/,
+    );
+    expect(panel).toMatch(/\.panel\[data-empty-panel-shell='true'\]\s*\{\s*box-shadow: none;/);
+    expect(panel).not.toMatch(/\.panel\[data-empty-panel-shell='true'\]\s*\{\s*border-width: 0;/);
     expect(panel).not.toContain('.panel:focus-visible');
     expect(panel).not.toContain('.panel:has(:focus-visible)');
     expect(panel).not.toContain('.panel.focused');

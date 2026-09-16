@@ -1,6 +1,11 @@
 <script lang="ts">
   import type { Snippet } from 'svelte';
-  import { tick } from 'svelte';
+  import { tick, untrack } from 'svelte';
+  import { store as appStore } from '$store/renderer/store';
+  import {
+    prMonitorsSubscribeRequested,
+    prMonitorsUnsubscribeRequested,
+  } from '$store/renderer/slices/pr-monitor/pr-monitor-slice';
   import AgentSubscriptions from './AgentSubscriptions.svelte';
   import BackgroundHooksRow from './BackgroundHooksRow.svelte';
   import BrowserTabsRow from './BrowserTabsRow.svelte';
@@ -13,6 +18,8 @@
     type AgentAvatarStackItem,
   } from '$features/agent/components/agent-avatar/AgentAvatarStack.svelte';
   import {
+    SUBSCRIPTION_CARD_CONTAINMENT_CLASS,
+    SUBSCRIPTION_CARD_SURFACE_CLASS,
     SUBSCRIPTION_CHEVRON_CLASS,
     SUBSCRIPTION_CHEVRON_SIZE_CLASS,
     SUBSCRIPTION_DISCLOSURE_ROW_CLASS,
@@ -27,18 +34,28 @@
     setEventSubscriptionsExpanded,
   } from './agent-subscriptions-view-state';
   import { safeSubscriptionSlide } from './subscription-disclosure';
+  import type { TaskProgressItem } from './workspace-task-fallback';
 
   interface Props {
     workspaceId: string;
     agentId: string;
     compact?: boolean;
+    /** The surrounding transcript/preview owns the complete gap before this card. */
+    suppressTopGap?: boolean;
+    /** Whether the owning chat is active, independent of disclosure state. */
+    isActive?: boolean;
     visible?: boolean;
     /** Static, daemon-free content used by catalog and visual-test previews. */
     isolatedPreview?: {
       count: number;
       initiallyExpanded?: boolean;
       mode?: 'generic' | 'agents' | 'mixed';
-      agents?: Array<{ id: string; name: string; finished?: boolean }>;
+      agents?: Array<{
+        id: string;
+        name: string;
+        finished?: boolean;
+        taskProgress?: TaskProgressItem[];
+      }>;
     };
     previewContent?: Snippet;
   }
@@ -47,6 +64,8 @@
     workspaceId,
     agentId,
     compact = false,
+    suppressTopGap = false,
+    isActive = true,
     visible = $bindable(false),
     isolatedPreview,
     previewContent,
@@ -68,6 +87,17 @@
   let bodyElement: HTMLElement | undefined = $state();
   const componentId = $props.id();
   const bodyId = `event-subscriptions-body-${componentId}`;
+
+  // The visible chat owns this lease, not the selected workspace tab or the
+  // collapsible row. Chief lives outside the tab strip; collapse must not
+  // interrupt its snapshot or live updates.
+  $effect(() => {
+    if (isolatedPreview || !workspaceId || !isActive) return;
+    const currentWorkspaceId = workspaceId;
+    untrack(() => appStore.dispatch(prMonitorsSubscribeRequested(currentWorkspaceId)));
+    return () => appStore.dispatch(prMonitorsUnsubscribeRequested(currentWorkspaceId));
+  });
+
   const hasEventSubscriptions = $derived(
     isolatedPreview ? isolatedPreview.count > 0 : agentsVisible || hooksVisible || prsVisible,
   );
@@ -154,13 +184,13 @@
 </script>
 
 <div
-  class="w-full min-w-0 max-w-full {compact ? 'mt-6' : 'mt-8'}"
+  class="w-full min-w-0 max-w-full {suppressTopGap ? 'mt-0' : 'mt-6'}"
   class:hidden={!hasSubscriptions}
   data-testid="subscription-utility-area"
   data-has-subscriptions={hasSubscriptions}
 >
   <section
-    class="w-full min-w-0 max-w-full overflow-hidden rounded-lg border border-border bg-card/80 shadow-sm font-family-child"
+    class="{SUBSCRIPTION_CARD_CONTAINMENT_CLASS} {SUBSCRIPTION_CARD_SURFACE_CLASS}"
     data-conversation-layer="event-subscriptions"
     data-testid="event-subscriptions-card"
     aria-label={cardAriaLabel}

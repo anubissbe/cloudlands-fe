@@ -1,6 +1,7 @@
 import { cubicOut } from 'svelte/easing';
 import type { TransitionConfig } from 'svelte/transition';
 import { areAnimationsEnabled } from '$lib/utils/animations';
+import { prefersReducedMotion } from '$lib/utils/reduced-motion';
 import { beforeFollowBottomMutation, type FollowBottomMutation } from '$lib/utils/smartScroll';
 
 interface DisclosureMotionParams {
@@ -13,13 +14,6 @@ function numericStyle(style: CSSStyleDeclaration, property: keyof CSSStyleDeclar
   return Number.isFinite(value) ? value : 0;
 }
 
-function prefersReducedMotion(): boolean {
-  return (
-    typeof window !== 'undefined' &&
-    window.matchMedia?.('(prefers-reduced-motion: reduce)').matches === true
-  );
-}
-
 /** Shared intrinsic-height disclosure motion with an optional followed-bottom lease. */
 export function safeDisclosureTransition(
   node: Element,
@@ -27,13 +21,21 @@ export function safeDisclosureTransition(
   options: { direction?: 'in' | 'out' | 'both' } = {},
 ): TransitionConfig {
   const element = node as HTMLElement;
-  let bottomMutation: FollowBottomMutation | null = beforeFollowBottomMutation(element);
+  const duration = params.duration ?? 180;
+  // Svelte's `transition.stop()` aborts the animation without a terminal
+  // tick, so the lease also carries a lifetime bound: a full bidirectional
+  // reversal plus slack, after which the follower releases it on its own.
+  const leaseOptions = { maxHoldMs: duration * 2 + 500 };
+  let bottomMutation: FollowBottomMutation | null = beforeFollowBottomMutation(
+    element,
+    leaseOptions,
+  );
   const settleBottomMutation = () => {
     bottomMutation?.settle();
     bottomMutation = null;
   };
   const acquireBottomMutation = () => {
-    bottomMutation ??= beforeFollowBottomMutation(element);
+    bottomMutation ??= beforeFollowBottomMutation(element, leaseOptions);
   };
 
   if (!areAnimationsEnabled() || prefersReducedMotion()) {
@@ -49,7 +51,6 @@ export function safeDisclosureTransition(
   }
 
   const opacity = numericStyle(style, 'opacity') || 1;
-  const duration = params.duration ?? 180;
   const y = params.y ?? -4;
   const paddingTop = numericStyle(style, 'paddingTop');
   const paddingBottom = numericStyle(style, 'paddingBottom');
@@ -65,7 +66,11 @@ export function safeDisclosureTransition(
   // viewport run — so any same-frame reader observes the grown content with
   // the previous frame's scrollTop (a per-frame bottom-distance drift equal
   // to the height delta). Driving the styles from `tick` keeps the height
-  // mutation and the followed-bottom correction in one synchronous task.
+  // mutation inside the frame's rAF phase. The tick itself stays write-only:
+  // the lease's `request()` decides whether the pin can land post-layout
+  // (resize delivery on the leased element, same frame, pre-paint, with
+  // native anchoring carrying the viewport until then) or must be applied
+  // synchronously because the container opted out of native anchoring.
   const applyFrameStyles = (t: number, u: number) => {
     element.style.overflow = 'hidden';
     element.style.height = `${t * height}px`;

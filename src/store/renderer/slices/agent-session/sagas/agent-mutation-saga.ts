@@ -51,7 +51,13 @@ import {
   stopAgentSessionRequested,
   undoAgentDeletionRequested,
 } from '../../workspace-agents/workspace-agents-slice';
-import { bulkUpsertSessions, removeSession, upsertSession } from '../agent-session-slice';
+import {
+  bulkUpsertSessions,
+  removeSession,
+  restoreStoredSessions,
+  upsertSession,
+} from '../agent-session-slice';
+import type { StoredAgentSession, WireAgentSession } from '../agent-session-types';
 import { selectAgentSession } from '../agent-session-selectors';
 
 const logger = createLogger('AgentMutationSaga');
@@ -112,9 +118,28 @@ function preserveMessages(fetched: AgentSession, existing?: AgentSession): Agent
     : { ...fetched, messages: existing.messages };
 }
 
-function* persistSession(session: AgentSession): SagaGenerator<void> {
+/** Store a genuine daemon snapshot (`agent.get` result) and register membership. */
+function* persistSession(session: WireAgentSession): SagaGenerator<void> {
   yield* put(bulkUpsertSessions([session]));
   yield* put(upsertSession(session));
+}
+
+/**
+ * Local patch of an already-stored session (activation bookkeeping), applied to
+ * the CURRENT row through `updateSession`. Not a wire upsert: pushing the stored
+ * row back through `bulkUpsertSessions` would re-run the FE-owned carry-forward
+ * policy against it and drop fields such as a waiting `processQueueHint`. Not a
+ * `restoreStoredSessions` of a spread snapshot either: a row captured before an
+ * await would replace live updates (`liveTurnOpen`, `isStreaming`, …) that landed
+ * while the read was pending. No-op when the row has since been removed; the
+ * row's workspace membership was registered when it was first upserted.
+ */
+function* patchStoredSession(
+  agentId: string,
+  patch: Partial<AgentSession>,
+): SagaGenerator<StoredAgentSession | undefined> {
+  yield* put(updateSession(agentId, patch));
+  return yield* selectAgentSession.effect(agentId);
 }
 
 function* softHide(wsId: string, agentId: string): SagaGenerator<void> {
@@ -124,8 +149,14 @@ function* softHide(wsId: string, agentId: string): SagaGenerator<void> {
   yield* put(pruneRecentlyClosed(wsId, { agentId }));
 }
 
-function* restoreHiddenSession(wsId: string, session: AgentSession): SagaGenerator<void> {
-  yield* call(persistSession, session);
+/**
+ * Reinstate a session captured from this slice before a soft-hide. Goes
+ * through `restoreStoredSessions`, not the wire upsert: the upsert's FE-owned
+ * carry-forward seeds from the (now removed) existing row and would strip the
+ * snapshot's FE-owned fields.
+ */
+function* restoreHiddenSession(wsId: string, session: StoredAgentSession): SagaGenerator<void> {
+  yield* put(restoreStoredSessions([session]));
   yield* put(refreshWorkspaceSubscriptionEntriesRequested(wsId));
 }
 
@@ -151,7 +182,7 @@ function* restoreRetiredAgent(
     }
     const existing = yield* selectAgentSession.effect(agentId);
     if (existing?.retiredAt) {
-      yield* call(persistSession, { ...existing, retiredAt: undefined });
+      yield* put(restoreStoredSessions([{ ...existing, retiredAt: undefined }]));
     }
     yield* put(action.success(undefined as never));
     settled = true;
@@ -210,19 +241,16 @@ function* activateAgent(action: ReturnType<typeof activateAgentRequested>): Saga
     }
     const activationAttempts = (existing?.activationAttempts || 0) + 1;
     if (existing) {
-      yield* call(persistSession, {
-        ...existing,
+      yield* call(patchStoredSession, agentId, {
         workspaceId: wsId as AgentSession['workspaceId'],
         activationState: AgentActivationState.ACTIVATING,
         activationAttempts,
       });
     }
     const fetched = yield* call(readAgentSession, agentId);
-    const source = fetched ? preserveMessages(fetched, existing) : existing;
-    if (!source) {
-      yield* put(action.success(null));
-    } else {
-      const activated: AgentSession = {
+    if (fetched) {
+      const source = preserveMessages(fetched, existing);
+      const activated: WireAgentSession = {
         ...source,
         workspaceId: wsId as AgentSession['workspaceId'],
         status: source.backendSessionId ? AgentStatus.Active : source.status,
@@ -231,12 +259,23 @@ function* activateAgent(action: ReturnType<typeof activateAgentRequested>): Saga
       };
       yield* call(persistSession, activated);
       yield* put(action.success(activated));
+    } else {
+      // Reselect: the row may have changed (or gone) while the read was pending.
+      const current = yield* selectAgentSession.effect(agentId);
+      const activated = current
+        ? yield* call(patchStoredSession, agentId, {
+            workspaceId: wsId as AgentSession['workspaceId'],
+            status: current.backendSessionId ? AgentStatus.Active : current.status,
+            activationState: AgentActivationState.ACTIVE,
+            activationAttempts,
+          })
+        : undefined;
+      yield* put(action.success(activated ?? null));
     }
     settled = true;
   } catch (error) {
     if (existing) {
-      yield* call(persistSession, {
-        ...existing,
+      yield* call(patchStoredSession, agentId, {
         workspaceId: wsId as AgentSession['workspaceId'],
         activationState: AgentActivationState.ERROR,
         lastActivationError: mutationError(error, m.agent_mutation_activateFailed_error()).message,
@@ -438,6 +477,23 @@ function* clearTombstoneAfterGrace(entry: PendingAgentDeletion): SagaGenerator<v
   }
 }
 
+/** Clear an immediate-delete tombstone after stale reads have had time to settle. */
+function* clearImmediateTombstoneAfterGrace(entry: PendingAgentDeletion): SagaGenerator<void> {
+  yield* delay(AGENT_DELETION_TOMBSTONE_TTL_MS);
+  if (getPendingAgentDeletion(entry.agentId) === entry) {
+    removePendingAgentDeletion(entry.agentId);
+  }
+}
+
+/** Roll back only if this attempt still owns the agent's deletion barrier. */
+function* rollbackImmediateDeletion(entry: PendingAgentDeletion): SagaGenerator<void> {
+  if (getPendingAgentDeletion(entry.agentId) !== entry) return;
+  removePendingAgentDeletion(entry.agentId);
+  if (entry.snapshot) {
+    yield* call(restoreHiddenSession, entry.wsId, entry.snapshot);
+  }
+}
+
 /**
  * Daemon-owned delete grace window (PROTOCOL §5.5, delete grace window):
  * `agent.delete { undoDelayMs }` is sent IMMEDIATELY, so the deletion commits
@@ -560,12 +616,15 @@ function* deleteImmediately(
 ): SagaGenerator<void> {
   const [wsId, agentId] = action.payload;
   const snapshot = yield* selectAgentSession.effect(agentId);
+  const entry: PendingAgentDeletion = { wsId, agentId, snapshot };
   let settled = false;
+  let clearerSpawned = false;
+  setPendingAgentDeletion(entry);
   try {
     yield* call(softHide, wsId, agentId);
     const result = yield* call([appClient.agents, appClient.agents.delete], agentId, wsId);
     if (!result.success) {
-      if (snapshot) yield* call(restoreHiddenSession, wsId, snapshot);
+      yield* call(rollbackImmediateDeletion, entry);
       yield* call(showError, result.error || m.agent_mutation_deleteFailed_error());
       yield* put(action.failure(new Error(result.error || m.agent_mutation_deleteFailed_error())));
       settled = true;
@@ -573,14 +632,19 @@ function* deleteImmediately(
     }
     yield* put(action.success(undefined as never));
     settled = true;
+    yield* spawn(clearImmediateTombstoneAfterGrace, entry);
+    clearerSpawned = true;
   } catch (error) {
-    if (snapshot) yield* call(restoreHiddenSession, wsId, snapshot);
+    yield* call(rollbackImmediateDeletion, entry);
     yield* put(action.failure(mutationError(error, m.agent_mutation_deleteSessionFailed_error())));
     settled = true;
   } finally {
     if (!settled && (yield* cancelled())) {
-      if (snapshot) yield* call(restoreHiddenSession, wsId, snapshot);
+      yield* call(rollbackImmediateDeletion, entry);
       yield* put(action.failure(new Error(m.agent_mutation_deleteSessionFailed_error())));
+    }
+    if (settled && getPendingAgentDeletion(agentId) === entry && !clearerSpawned) {
+      yield* spawn(clearImmediateTombstoneAfterGrace, entry);
     }
   }
 }

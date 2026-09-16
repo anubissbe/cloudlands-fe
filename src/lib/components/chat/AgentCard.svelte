@@ -36,7 +36,7 @@
   import { openAgentTabRequested } from '$store/renderer/slices/app-layout/app-layout-slice';
   import { selectPendingCount } from '$store/renderer/slices/permission/permission-selectors';
   import { selectHudAgentHasPendingQuestion } from '$store/renderer/slices/hud/hud-selectors';
-  import { deriveWizardPendingQuestions } from './questions/wizard-gate';
+  import { deriveAgentHasPendingQuestion } from './questions/wizard-gate';
   import { safeSlide } from '$lib/utils/animations';
   import { findSourcePanelId } from '$lib/utils/workspace-navigation';
   import { updateSession as updateAgentSessionFields } from '$store/renderer/slices/agent-session/agent-session-slice';
@@ -68,6 +68,8 @@
   import { selectIsWorkspaceHostLocal } from '$store/renderer/slices/workspace/workspace-selectors';
   import { isCmdClickModifier } from '$shared/utils/link-helpers';
   import { isReplaceAgentEligible } from '$shared/utils/replace-agent-eligibility';
+  import TaskProgressControl from './TaskProgressControl.svelte';
+  import type { TaskProgressItem } from './workspace-task-fallback';
 
   interface Props {
     agentId: string;
@@ -113,6 +115,10 @@
     provider?: string;
     /** Optional actions rendered beside, never inside, the row activation button. */
     headerActions?: Snippet;
+    /** Optional per-agent task progress rendered beside row actions. */
+    taskProgress?: TaskProgressItem[];
+    /** Visual presentation for the optional task progress control. */
+    taskProgressPresentation?: 'status-stack' | 'checklist';
     /** Optional timestamp supplied by list data before the session selector is hydrated. */
     updatedAt?: AgentSession['updatedAt'];
     /** Disable navigation, mutation, editing, and file operations in isolated previews. */
@@ -140,12 +146,15 @@
     isCompleted = false,
     provider = undefined,
     headerActions,
+    taskProgress = [],
+    taskProgressPresentation = 'status-stack',
     updatedAt: updatedAtProp = undefined,
     readOnly = false,
   }: Props = $props();
 
   const logger = createLogger('AgentCard');
   const INLINE_PEEK_TYPOGRAPHY_CLASS = 'font-normal! text-muted-foreground';
+  const hasTaskProgress = $derived(taskProgress.length > 0);
 
   // svelte-ignore state_referenced_locally -- selectors are initialized with the current agent; the effect below mirrors prop changes.
   const agentIdStore = writable(agentId);
@@ -514,7 +523,8 @@
   const attentionRequest = $derived(getAgentAttentionRequest($agent$));
 
   // Mirrors PanelHeaderAgentAvatar / the mini dock: captured HUD question or
-  // transcript-derived pending question set.
+  // marker/transcript-derived pending question (the marker alone suffices for
+  // an out-of-view agent whose question row is not in the local store).
   const hasQuestion = $derived.by(() => {
     if ($hasCapturedQuestion$) return true;
     // The shared gate reads the responding flag, the marker/dismissal metadata
@@ -525,7 +535,7 @@
     void $agent$?.metadata?.pendingQuestionsMessageId;
     void $agent$?.metadata?.dismissedQuestionsMessageId;
     void $pendingQuestionRecovery$;
-    return deriveWizardPendingQuestions(appStore.state, agentId, $agent$?.messages ?? []) !== null;
+    return deriveAgentHasPendingQuestion(appStore.state, agentId, $agent$?.messages ?? []);
   });
 
   // Canonical running predicate for the session, independent of the display
@@ -711,9 +721,13 @@
       <div
         class="agent-card-content flex min-w-0 max-w-full flex-1 {isEditing
           ? 'overflow-visible'
-          : 'overflow-hidden'} {headerActions ? 'mr-14' : ''} {inline || panelRow
-          ? 'flex-row items-center gap-2'
-          : 'flex-col'}"
+          : 'overflow-hidden'} {hasTaskProgress
+          ? headerActions
+            ? 'mr-25'
+            : 'mr-11'
+          : headerActions
+            ? 'mr-14'
+            : ''} {inline || panelRow ? 'flex-row items-center gap-2' : 'flex-col'}"
       >
         <!-- Header row -->
         <div
@@ -937,21 +951,32 @@
         {/if}
       </div>
     </svelte:element>
-    {#if headerActions}
+    {#if headerActions || hasTaskProgress}
       <div
-        class="absolute right-3 top-1/2 z-10 h-6 w-14 shrink-0 -translate-y-1/2"
+        class="absolute right-3 top-1/2 z-10 flex h-6 shrink-0 -translate-y-1/2 items-center justify-end {hasTaskProgress
+          ? headerActions
+            ? 'w-25'
+            : 'w-11'
+          : 'w-14'}"
         data-testid="agent-card-trailing-slot"
       >
-        {#if updatedAt}
-          <RelativeTime
-            date={updatedAt}
-            compact
-            class="type-caption tabular-nums absolute inset-0 flex items-center justify-end text-right {INLINE_PEEK_TYPOGRAPHY_CLASS} transition-opacity group-hover/watch:opacity-0 group-focus-within/watch:opacity-0"
-          />
+        {#if hasTaskProgress}
+          <TaskProgressControl tasks={taskProgress} presentation={taskProgressPresentation} />
         {/if}
-        <div class="absolute inset-0 flex items-center justify-end gap-1">
-          {@render headerActions()}
-        </div>
+        {#if headerActions}
+          <div class="relative h-6 w-14 shrink-0">
+            {#if updatedAt}
+              <RelativeTime
+                date={updatedAt}
+                compact
+                class="type-caption tabular-nums absolute inset-0 flex items-center justify-end text-right {INLINE_PEEK_TYPOGRAPHY_CLASS} transition-opacity group-hover/watch:opacity-0 group-focus-within/watch:opacity-0"
+              />
+            {/if}
+            <div class="absolute inset-0 flex items-center justify-end gap-1">
+              {@render headerActions()}
+            </div>
+          </div>
+        {/if}
       </div>
     {/if}
   </div>
@@ -1088,7 +1113,7 @@
   }
 
   /* Reduced motion support */
-  @media (prefers-reduced-motion: reduce) {
+  @container style(--motion-reduced: 1) {
     :global(.agent-glow-active) {
       animation: none;
       box-shadow: 0 0 10px 3px rgba(16, 185, 129, 0.12);

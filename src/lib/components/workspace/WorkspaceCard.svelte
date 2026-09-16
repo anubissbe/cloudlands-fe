@@ -1191,7 +1191,7 @@
     transition-timing-function: linear;
   }
 
-  @media (prefers-reduced-motion: reduce) {
+  @container style(--motion-reduced: 1) {
     .wc-title-text {
       transform: none !important;
       transition: none;

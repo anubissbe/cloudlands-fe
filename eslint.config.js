@@ -10,11 +10,20 @@ import unusedImports from 'eslint-plugin-unused-imports';
 import { svelte as themisFullConfig } from '@augmentcode/themis/eslint-plugins';
 import noProductionDynamicImportRule from './eslint-rules/no-production-dynamic-import.js';
 import noComponentAsyncDataFetchRule from './eslint-rules/no-component-async-data-fetch.js';
+import noColdSvelteImportInTestsRule from './eslint-rules/no-cold-svelte-import-in-tests.js';
+import noFlushSyncInTeardownRule from './eslint-rules/no-flushsync-in-teardown.js';
+import noDirectReducedMotionQueryRule, {
+  SOURCE_OF_TRUTH_FILES as reducedMotionSourceOfTruthFiles,
+  TEST_FILE_GLOBS as reducedMotionTestFileGlobs,
+} from './eslint-rules/no-direct-reduced-motion-query.js';
 
 const intentPlugin = {
   rules: {
     'no-component-async-data-fetch': noComponentAsyncDataFetchRule,
     'no-production-dynamic-import': noProductionDynamicImportRule,
+    'no-cold-svelte-import-in-tests': noColdSvelteImportInTestsRule,
+    'no-flushsync-in-teardown': noFlushSyncInTeardownRule,
+    'no-direct-reduced-motion-query': noDirectReducedMotionQueryRule,
   },
 };
 
@@ -315,6 +324,14 @@ const rendererBrowserSafetyBaselineFiles = [
 
 const nodeBuiltinModules = [...new Set(builtinModules.map((name) => name.replace(/^node:/, '')))];
 
+// Electron main-process source globs shared by the main-process-only rule blocks.
+const mainProcessFiles = [
+  'src/main/**/*.ts',
+  'src/features/*/main/**/*.ts',
+  'src/shared/main/**/*.ts',
+  'src/shared/git/**/*.ts',
+];
+
 // Shared options for the renderer browser-safety no-restricted-imports rule;
 // applied at `error` to clean files and `warn` to the baselined files below so
 // new violations in baselined files stay visible while migration proceeds.
@@ -445,7 +462,7 @@ export default [
     },
   },
   {
-    files: ['**/*.ts', '**/*.tsx'],
+    files: ['**/*.ts', '**/*.tsx', '**/*.mts', '**/*.cts'],
     languageOptions: {
       parser: typescriptParser,
       parserOptions: {
@@ -526,17 +543,25 @@ export default [
       'intent/no-production-dynamic-import': 'error',
     },
   },
+  // A dynamic `.svelte` import inside a test body bills the component's whole
+  // cold module-graph transform to the first test's timeout, producing
+  // load-dependent timeout flakes (intent-hq/intent#1464). Warm the specifier
+  // at module scope (warmImport / static import) so test bodies hit the cache.
+  {
+    files: ['**/*.{test,spec}.{js,ts}'],
+    plugins: {
+      intent: intentPlugin,
+    },
+    rules: {
+      'intent/no-cold-svelte-import-in-tests': 'error',
+    },
+  },
   // Ban synchronous child_process calls in Electron main process code.
   // execSync/spawnSync block the main thread and can freeze the entire UI
   // if the spawned process hangs (see: hang report 2026-02-28).
   // Use execAsync (promisified exec) or spawn instead.
   {
-    files: [
-      'src/main/**/*.ts',
-      'src/features/*/main/**/*.ts',
-      'src/shared/main/**/*.ts',
-      'src/shared/git/**/*.ts',
-    ],
+    files: mainProcessFiles,
     rules: {
       'no-restricted-imports': [
         'error',
@@ -551,6 +576,30 @@ export default [
           ],
         },
       ],
+    },
+  },
+  // Type-aware lint for Electron main-process + preload code. An unawaited
+  // promise inside a try/catch silently succeeds: the Electron 42→44 bump made
+  // `clipboard.writeText()` async and the WRITE_CLIPBOARD handler kept
+  // returning `{ success: true }` without observing the write
+  // (cloudlands-fe#2164, fixed in cloudlands-fe#2493). Files are typed against
+  // the main tsconfig and a lint-only preload project: the shipped
+  // src/preload/index.ts is generated and gitignored (so globally ignored above),
+  // and tsconfig.preload.json excludes the tracked template to keep it out of the
+  // build, so tsconfig.preload.lint.json type-checks the template instead. Both
+  // tsconfigs exclude tests, so tests are excluded here too; renderer/Svelte
+  // linting stays syntax-only.
+  {
+    files: [...mainProcessFiles, 'src/preload/**/*.ts'],
+    ignores: ['**/__tests__/**', '**/*.test.ts'],
+    languageOptions: {
+      parserOptions: {
+        project: ['./tsconfig.preload.lint.json', './tsconfig.main.json'],
+        tsconfigRootDir: import.meta.dirname,
+      },
+    },
+    rules: {
+      '@typescript-eslint/no-floating-promises': 'error',
     },
   },
   // Guard raw `dismissedQuestionsMessageId` reads: the dismissal comparison lives
@@ -657,6 +706,35 @@ export default [
     },
     rules: {
       'intent/no-component-async-data-fetch': 'error',
+    },
+  },
+  // flushSync from an $effect cleanup, onDestroy callback, or action destroy()
+  // flushes unrelated effects mid-teardown; any component mounted by that flush
+  // throws effect_in_teardown (intent-hq/intent#4550, shipped in v2.141.0).
+  {
+    files: ['**/*.svelte'],
+    plugins: {
+      intent: intentPlugin,
+    },
+    rules: {
+      'intent/no-flushsync-in-teardown': 'error',
+    },
+  },
+  // A direct `prefers-reduced-motion` query (matchMedia in script, `@media` in a
+  // component <style>) sees only the OS preference and bypasses battery saver.
+  // Reduced motion has one source of truth — `--motion-reduced` in tokens.css,
+  // mirrored by `$lib/utils/reduced-motion` — so only those files may spell the
+  // query. `.css`/`.html` files are covered by scripts/check-reduced-motion-queries.mjs.
+  // Deliberately not `productionModuleIgnores`: generated files ship like any other
+  // source, so only tests and the source of truth are exempt.
+  {
+    files: ['src/**/*.{js,mjs,cjs,jsx,ts,tsx,mts,cts,svelte}'],
+    ignores: [...reducedMotionTestFileGlobs, ...reducedMotionSourceOfTruthFiles],
+    plugins: {
+      intent: intentPlugin,
+    },
+    rules: {
+      'intent/no-direct-reduced-motion-query': 'error',
     },
   },
   ...themisFullConfig,
