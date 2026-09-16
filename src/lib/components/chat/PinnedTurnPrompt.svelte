@@ -13,11 +13,12 @@
 
   interface Props {
     message: AgentMessage;
+    surface?: 'user' | 'subscription';
     workspace?: Workspace | null;
     onActivate: () => void;
   }
 
-  let { message, workspace = null, onActivate }: Props = $props();
+  let { message, surface = 'user', workspace = null, onActivate }: Props = $props();
   const eventWake = $derived(isEventWakeMessage(message));
   const attribution = $derived(getAgentMessageAttribution(message.metadata));
   const wake = $derived(getAutomatedWakePresentation(message));
@@ -63,5 +64,5 @@
     onPinnedActivate={onActivate}
   />
 {:else}
-  <PinnedUserPrompt {text} {icon} {onActivate} />
+  <PinnedUserPrompt {text} {icon} {surface} {onActivate} />
 {/if}

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { IntentMarkLoader } from '$lib/components/ui/indicators';
   /**
    * AgentSubscriptions Component
    *
@@ -10,8 +11,8 @@
    * agent-subscription-ui read saga). No IPC listeners or polling live in
    * this component; short panel-focus retries are owned and cancelled here.
    */
-  import { fade } from 'svelte/transition';
-  import { safeSlide } from '$lib/utils/animations';
+  import { crispOut, springIn } from '$lib/motion';
+  import { safeDisclosureTransition } from './disclosure-motion';
   import * as Tooltip from '$lib/components/ui/tooltip';
   import { Button } from '$lib/components/ui/button';
   import {
@@ -739,7 +740,7 @@
   <div
     class="font-family-child {SUBSCRIPTION_DISCLOSURE_ROW_CLASS}"
     data-compact={compact}
-    transition:safeSlide={{ axis: 'y', duration: 200 }}
+    transition:safeDisclosureTransition={{ tier: 'moderate' }}
   >
     <Tooltip.Provider delayDuration={0}>
       <Tooltip.Root delayDuration={0}>
@@ -790,9 +791,7 @@
     role={$snapshotStatus$ === 'failed' ? 'alert' : 'status'}
   >
     {#if $snapshotStatus$ === 'loading'}
-      <span
-        class="size-3 shrink-0 animate-spin rounded-full border-2 border-muted-foreground/30 border-t-muted-foreground"
-      ></span>
+      <span aria-hidden="true" class="shrink-0"><IntentMarkLoader size={12} /></span>
       <span>{m.chat_chatMessage_loading_label()}</span>
     {:else}
       <span>{m.chat_streamingStatus_responseFailed_label()}</span>
@@ -813,20 +812,32 @@
       <!-- Slim status row: transitional "Completed" state and/or "Woken up" indicator -->
       <div class={SUBSCRIPTION_DISCLOSURE_ROW_CLASS}>
         {#if isCompleted}
-          <span class={SUBSCRIPTION_LEADING_COLUMN_CLASS} transition:fade={{ duration: 200 }}>
+          <span
+            class={SUBSCRIPTION_LEADING_COLUMN_CLASS}
+            in:springIn={{ tier: 'moderate', y: 0, scale: 1 }}
+            out:crispOut={{ tier: 'moderate' }}
+          >
             <Fa
               icon={faCircleCheck}
               size={14}
               class="h-3.5! w-3.5! shrink-0 {SUBSCRIPTION_ICON_CLASS}"
             />
           </span>
-          <span class="shrink-0 whitespace-nowrap" transition:fade={{ duration: 200 }}>
+          <span
+            class="shrink-0 whitespace-nowrap"
+            in:springIn={{ tier: 'moderate', y: 0, scale: 1 }}
+            out:crispOut={{ tier: 'moderate' }}
+          >
             {m.chat_agentSubscriptions_completed_label()}
           </span>
         {/if}
         {#if $wokenUpInfo$}
           {#if !isCompleted}
-            <span class={SUBSCRIPTION_LEADING_COLUMN_CLASS} transition:fade={{ duration: 200 }}>
+            <span
+              class={SUBSCRIPTION_LEADING_COLUMN_CLASS}
+              in:springIn={{ tier: 'moderate', y: 0, scale: 1 }}
+              out:crispOut={{ tier: 'moderate' }}
+            >
               <Fa
                 icon={faBolt}
                 size={14}
@@ -840,7 +851,8 @@
                 <span
                   class="ml-auto inline-flex min-w-0 items-center gap-1 truncate whitespace-nowrap {SUBSCRIPTION_ROW_TYPOGRAPHY_CLASS}"
                   data-testid="status-woken-up-pill"
-                  transition:fade={{ duration: 200 }}
+                  in:springIn={{ tier: 'moderate', y: 0, scale: 1 }}
+                  out:crispOut={{ tier: 'moderate' }}
                 >
                   {#if isCompleted}
                     <Fa
@@ -879,13 +891,14 @@
       <div
         class="w-full min-w-0 max-w-full overflow-hidden {SUBSCRIPTION_INSET_ROW_DIVIDER_CLASS}"
         data-testid="one-shot-watches"
-        transition:safeSlide={{ duration: 150 }}
+        transition:safeDisclosureTransition={{ tier: 'fast' }}
       >
         {#if shouldGroupWaitingAgents}
           <!-- Section header: compact waiting summary and disclosure for large lists. -->
           <div class="w-full min-w-0 max-w-full" data-testid="one-shot-header">
-            <button
+            <Button
               type="button"
+              variant="plain"
               class="relative cursor-pointer rounded bg-transparent text-left font-[inherit] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-ring {SUBSCRIPTION_DISCLOSURE_ROW_CLASS}"
               data-testid="one-shot-summary-toggle"
               data-subscription-row="agent-watch"
@@ -943,7 +956,7 @@
                   />
                 </span>
               </span>
-            </button>
+            </Button>
           </div>
         {/if}
 
@@ -966,8 +979,9 @@
                 class="w-full min-w-0 max-w-full overflow-hidden {SUBSCRIPTION_INSET_ROW_DIVIDER_CLASS}"
                 data-testid="finished-agent-group"
               >
-                <button
+                <Button
                   type="button"
+                  variant="plain"
                   class="cursor-pointer text-left focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-ring {SUBSCRIPTION_DISCLOSURE_ROW_CLASS}"
                   data-testid="finished-agent-summary"
                   data-subscription-row="grouped-summary"
@@ -1006,7 +1020,7 @@
                         : 'rotate-90'}"
                     />
                   </span>
-                </button>
+                </Button>
                 {#if finishedAgentsExpanded}
                   <div
                     id={finishedAgentListId}

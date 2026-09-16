@@ -8,8 +8,9 @@
    */
   import { faBell, faChevronDown, faRotate } from '@fortawesome/free-solid-svg-icons';
   import Fa from 'svelte-fa';
+  import { Button } from '$lib/components/ui/button';
   import { onDestroy } from 'svelte';
-  import { safeSlide } from '$lib/utils/animations';
+  import { safeDisclosureTransition } from './disclosure-motion';
   import { getActivityLabel } from '$features/events/activity-labels';
   import type { WorkspaceEvent } from '$features/events/types';
   import InlineAgentAvatar from './InlineAgentAvatar.svelte';
@@ -484,9 +485,10 @@
                 />
               </span>
             {/if}
-            <button
+            <Button
               type="button"
-              class="flex min-w-0 flex-1 cursor-pointer items-center gap-2 overflow-hidden rounded border-none bg-transparent p-0 text-left font-[inherit] text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              variant="plain"
+              class="type-body flex min-w-0 flex-1 cursor-pointer items-center gap-2 overflow-hidden rounded border-none bg-transparent p-0 text-left font-[inherit] text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
               aria-label={friendlySummary}
               aria-expanded={detailsOpen}
               aria-controls={detailsId}
@@ -529,7 +531,7 @@
                     : 'rotate-90'}"
                 />
               </span>
-            </button>
+            </Button>
           </div>
 
           {#if detailsOpen}
@@ -558,11 +560,13 @@
                             >
                               {event.agentName}
                             </strong>
-                            <span class="type-caption font-normal text-muted-foreground">
+                            <span class="type-body font-normal text-muted-foreground">
                               {agentStatusLabel(event.type)}
                             </span>
                           {:else}
-                            <span class="type-caption font-medium text-primary">{event.label}</span>
+                            <span class="type-caption font-medium text-primary-ink"
+                              >{event.label}</span
+                            >
                             {#if event.agentName}
                               <span
                                 class="type-caption min-w-0 break-words font-normal text-muted-foreground [overflow-wrap:anywhere]"
@@ -619,8 +623,8 @@
 {:else}
   <!-- Inline style - compact banner inside message -->
   <div
-    class="event-wakeup-banner type-body mb-1 flex items-center gap-1.5 py-0.5 pr-2 pl-0 text-primary"
-    transition:safeSlide={{ axis: 'y', duration: 200 }}
+    class="event-wakeup-banner type-body mb-1 flex items-center gap-1.5 py-0.5 pr-2 pl-0 text-primary-ink"
+    transition:safeDisclosureTransition={{ tier: 'moderate' }}
   >
     <Fa icon={faRotate} class="h-2 w-2 opacity-40" />
     <span>{friendlySummary}</span>

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { COMPOSER_INSET_CLASS } from './composer-inset';
   /* eslint-disable max-lines */
   /**
    * Chat Panel Component
@@ -176,7 +177,7 @@
   } from './new-messages-divider';
   import EventWakeupBanner from './EventWakeupBanner.svelte';
   import ConversationTurnGap from './ConversationTurnGap.svelte';
-  import { toast } from 'svelte-sonner';
+  import { notify } from '$lib/components/patterns/notify';
   import { m } from '$shared/paraglide/messages.js';
   import { isDelegatedBackgroundTaskSession } from '$shared/utils/agent-session-metadata';
   import { getAgentStopReasonTimestamp } from '$shared/utils/agent-attention';
@@ -234,9 +235,9 @@
   import { createLogger } from '$lib/utils/client-logger';
   import { isFocusInEditableElement, isFocusInTerminal } from '$lib/utils/keyboardShortcuts';
   import Fa from 'svelte-fa';
-  import { faLock, faPaperclip, faSpinner, faSquareCheck } from '@fortawesome/free-solid-svg-icons';
-  import { fade } from 'svelte/transition';
-  import { safeSlide } from '$lib/utils/animations';
+  import { faLock, faPaperclip, faSquareCheck } from '@fortawesome/free-solid-svg-icons';
+  import { crispOut, spring, springIn } from '$lib/motion';
+  import { safeDisclosureTransition } from './disclosure-motion';
   import { navigateToTask } from '$lib/utils/workspace-navigation';
   import { seekConversationToMessage } from '$lib/utils/open-message';
   import { openTab } from '$store/renderer/slices/panel-layout/panel-layout-slice';
@@ -250,7 +251,8 @@
     selectNativeExecutionPlan,
     type TaskProgressItem,
   } from './workspace-task-fallback';
-  import Button from '../ui/button/button.svelte';
+  import { Button } from '$lib/components/ui/button';
+  import { IntentMarkLoader } from '$lib/components/ui/indicators';
   import { PanelFindBar } from '$lib/components/ui/panel-find-bar';
   import { getSelectedTextWithinSurface } from '$lib/utils/selected-text';
   import { Skeleton } from '$lib/components/ui/skeleton';
@@ -1106,8 +1108,9 @@
     chatTranscriptBottomInsetClass({
       isChiefWorkspace,
       isCompactMode,
-      // Mirrors the render gate: retired sessions hide the queue block.
-      showQueue: queuedMessagesVisibility.showQueue && !isRetiredSession,
+      // The queue now lives in the composer, so the transcript always owns its
+      // normal trailing inset.
+      showQueue: false,
     }),
   );
 
@@ -3887,9 +3890,9 @@
   }
 
   /**
-   * Smoothly scroll to a specific position with 150ms animation.
+   * Smoothly scroll to a specific position with the moderate motion tier.
    */
-  function smoothScrollToPosition(top: number, duration: number = 150) {
+  function smoothScrollToPosition(top: number, duration: number = spring.moderate.settleMs) {
     if (!isActive) return;
     animateScrollTo(() => (isActive ? scrollContainer : null), top, duration);
   }
@@ -4984,7 +4987,7 @@
       if (result.redriven === false) {
         // Nothing was queued to redrive — the error is cleared, but no new
         // turn starts. Tell the user what to do next instead of a silent no-op.
-        toast.info(m.chat_chatPanel_nothingToRetry_toast());
+        notify.info(m.chat_chatPanel_nothingToRetry_toast());
       }
       return;
     }
@@ -5493,7 +5496,8 @@
       class="composer-aurora-host regular-panel-aurora-host pointer-events-none absolute inset-x-0 bottom-0 z-0 overflow-hidden"
       style:height={`calc(${composerHeight}px + 10rem)`}
       data-testid="composer-aurora-host"
-      transition:fade
+      in:springIn={{ tier: 'moderate', y: 0, scale: 1 }}
+      out:crispOut={{ tier: 'moderate' }}
     >
       <AuroraBackground {agentId} />
     </div>
@@ -5505,7 +5509,7 @@
       class="absolute inset-0 z-50 flex items-center justify-center rounded-lg border border-dashed border-primary bg-primary/5 pointer-events-none"
       data-testid="chat-panel-drop-overlay"
     >
-      <div class="flex flex-col items-center gap-2 text-primary">
+      <div class="flex flex-col items-start gap-2 text-left text-primary-ink">
         <Fa icon={faPaperclip} class="w-6 h-6" />
         <span class="text-sm font-medium">{m.chat_richInput_dropFiles_label()}</span>
       </div>
@@ -5558,6 +5562,7 @@
           <div class={isChiefWorkspace ? 'mx-1 sm:mx-2' : ''}>
             <PinnedTurnPrompt
               message={pinnedPrompt.message}
+              surface={pinnedPrompt.surface}
               {workspace}
               onActivate={handlePinnedPromptClick}
             />
@@ -5654,7 +5659,7 @@
         {/snippet}
 
         {#if transcriptHydrationFailed && $agentMessages$.length === 0}
-          <div class="flex min-h-48 flex-col items-center justify-center gap-3 p-6 text-center">
+          <div class="flex min-h-48 flex-col items-start justify-center gap-3 p-6 text-left">
             <p class="text-sm text-muted-foreground">{m.chat_shared_actionFailed_label()}</p>
             <Button variant="outline" onclick={handleRetryTranscriptHydration}>
               {m.chat_shared_retry_label()}
@@ -5795,7 +5800,6 @@
                           onRetryWithProvider={gatedRetryWithProvider}
                           onStop={handleStop}
                           onStalledRetry={gatedStalledRetry}
-                          seed={agentId}
                           statusEvents={$chatStatusEvents$}
                           streamingStartTime={$chatStreamingStartTime$}
                         />
@@ -5826,7 +5830,6 @@
                         onRetryWithProvider={gatedRetryWithProvider}
                         onStop={handleStop}
                         onStalledRetry={gatedStalledRetry}
-                        seed={agentId}
                         statusEvents={$chatStatusEvents$}
                         streamingStartTime={$chatStreamingStartTime$}
                       />
@@ -5915,7 +5918,6 @@
                           onRetryWithProvider={gatedRetryWithProvider}
                           onStop={handleStop}
                           onStalledRetry={gatedStalledRetry}
-                          seed={agentId}
                           statusEvents={$chatStatusEvents$}
                           streamingStartTime={$chatStreamingStartTime$}
                         />
@@ -5946,7 +5948,6 @@
                         onRetryWithProvider={gatedRetryWithProvider}
                         onStop={handleStop}
                         onStalledRetry={gatedStalledRetry}
-                        seed={agentId}
                         statusEvents={$chatStatusEvents$}
                         streamingStartTime={$chatStreamingStartTime$}
                       />
@@ -5982,7 +5983,6 @@
                   onRetryWithProvider={gatedRetryWithProvider}
                   onStop={handleStop}
                   onStalledRetry={gatedStalledRetry}
-                  seed={agentId}
                   statusEvents={$chatStatusEvents$}
                   streamingStartTime={$chatStreamingStartTime$}
                   class={effectiveError ? 'mt-0' : undefined}
@@ -6055,11 +6055,11 @@
                    stops (see syncOlderHistoryIndicator). -->
               {#if olderHistoryIndicatorVisible}
                 <div
-                  class="flex items-center justify-center gap-2 py-2 text-xs text-muted-foreground"
+                  class="flex items-center justify-start gap-2 py-2 text-left text-xs text-muted-foreground"
                   data-testid="chat-older-history-loading"
                   aria-live="polite"
                 >
-                  <Fa icon={faSpinner} class="animate-spin" size="xs" />
+                  <IntentMarkLoader size={12} />
                   <span>{m.chat_chatPanel_loadingOlderMessages_label()}</span>
                 </div>
               {/if}
@@ -6078,7 +6078,7 @@
                 {#if groupIndex === historyGapBeforeGroupIndex}
                   <div
                     bind:this={historyGapSentinel}
-                    class="flex items-center justify-center py-3"
+                    class="flex items-center justify-start py-3 text-left"
                     data-testid="chat-history-gap"
                   >
                     {#if $fetchingGapFill$}
@@ -6086,7 +6086,7 @@
                         class="flex items-center gap-2 text-xs text-muted-foreground"
                         aria-live="polite"
                       >
-                        <Fa icon={faSpinner} class="animate-spin" size="xs" />
+                        <IntentMarkLoader size={12} />
                         <span>{m.chat_chatPanel_historyGapLoading_label()}</span>
                       </div>
                     {:else}
@@ -6213,6 +6213,7 @@
                       <!-- Source wake-up row remains owned by this transcript turn. -->
                       <div
                         data-message-id={message.id}
+                        data-pinnable-user-prompt
                         data-pinned-prompt-id={message.id}
                         data-message-index={globalIndex}
                         class="message-nav-target relative z-10 {eventCardAssistantMarginClass(
@@ -6220,7 +6221,7 @@
                           turn.assistantMessages.length > 0 || showPendingAssistantStatus,
                         )}"
                         use:attachPinnedPromptMessage={message}
-                        transition:safeSlide={{ axis: 'y', duration: 200 }}
+                        transition:safeDisclosureTransition={{ tier: 'moderate' }}
                       >
                         <EventWakeupBanner
                           metadata={message.metadata as {
@@ -6348,7 +6349,6 @@
                           onRetryWithProvider={gatedRetryWithProvider}
                           onStop={handleStop}
                           onStalledRetry={gatedStalledRetry}
-                          seed={agentId}
                           statusEvents={$chatStatusEvents$}
                           streamingStartTime={$chatStreamingStartTime$}
                         />
@@ -6438,7 +6438,6 @@
                                 onRetryWithProvider={gatedRetryWithProvider}
                                 onStop={handleStop}
                                 onStalledRetry={gatedStalledRetry}
-                                seed={agentId}
                                 statusEvents={$chatStatusEvents$}
                                 streamingStartTime={$chatStreamingStartTime$}
                               />
@@ -6522,7 +6521,6 @@
                     onRetryWithProvider={gatedRetryWithProvider}
                     onStop={handleStop}
                     onStalledRetry={gatedStalledRetry}
-                    seed={agentId}
                     statusEvents={$chatStatusEvents$}
                     streamingStartTime={$chatStreamingStartTime$}
                   />
@@ -6541,20 +6539,6 @@
               isAggregate={true}
               isStreaming={$agentSessionIsStreaming$}
               {agentId}
-            />
-          </div>
-        {/if}
-
-        <!-- Show suggested prompts for the last message only, when not streaming -->
-        {#if suggestedPrompts.length > 0 && !deferTranscriptReveal}
-          <div class="w-full {isCompactMode ? 'pb-1 pt-2' : 'py-2'}">
-            <SuggestedPrompts
-              prompts={suggestedPrompts}
-              onSelect={handleSelectSuggestedPrompt}
-              onEdit={handleEditSuggestedPrompt}
-              compact={isCompactMode}
-              showShortcutHints={isChatFocused}
-              workspaceId={workspace?.id}
             />
           </div>
         {/if}
@@ -6593,25 +6577,6 @@
                 bind:visible={hasVisibleTranscriptUtility}
               />
             {/key}
-          {/if}
-
-          <!-- Queued messages remain in the same scroll/follow surface.
-               Hidden on retired sessions: the queue's edit/remove/send-now
-               controls all mutate daemon state a retired agent rejects. -->
-          {#if queuedMessagesVisibility.showQueue && !isRetiredSession}
-            <div
-              class="relative z-20 mt-6 {isChiefWorkspace ? 'mx-1 sm:mx-2' : 'w-full'}"
-              data-testid="queued-message-utility-area"
-            >
-              <QueuedMessageList
-                bind:this={queuedMessageListRef}
-                messages={visibleQueuedMessages}
-                onedit={handleEditQueuedMessage}
-                onremove={handleRemoveQueuedMessage}
-                onsendnow={handleSendQueuedMessageNow}
-                ondone={() => inputComponent?.focus?.()}
-              />
-            </div>
           {/if}
         </div>
 
@@ -6654,7 +6619,8 @@
         class="composer-aurora-host pointer-events-none absolute -left-4 -right-2 -bottom-4 z-0 overflow-hidden"
         style="height: calc(100% + 10rem);"
         data-testid="composer-aurora-host"
-        transition:fade
+        in:springIn={{ tier: 'moderate', y: 0, scale: 1 }}
+        out:crispOut={{ tier: 'moderate' }}
       >
         <AuroraBackground {agentId} />
       </div>
@@ -6740,6 +6706,23 @@
               {/key}
             {/if}
             {#if (!pendingQuestions && !pendingQuestionRecoveryLoading) || questionWizardCollapsed}
+              <!-- Show suggested prompts for the last message only, when not streaming. -->
+              {#if suggestedPrompts.length > 0 && !deferTranscriptReveal}
+                <div
+                  class="w-full {isCompactMode ? 'pb-1' : 'pb-2'} {isChiefWorkspace
+                    ? 'px-0'
+                    : COMPOSER_INSET_CLASS}"
+                >
+                  <SuggestedPrompts
+                    prompts={suggestedPrompts}
+                    onSelect={handleSelectSuggestedPrompt}
+                    onEdit={handleEditSuggestedPrompt}
+                    compact={isCompactMode}
+                    showShortcutHints={isChatFocused}
+                    workspaceId={workspace?.id}
+                  />
+                </div>
+              {/if}
               {#if draftManager.gateVisible}
                 <ChatDraftLoadingGate />
               {/if}
@@ -6764,20 +6747,27 @@
                 {agentId}
                 selectedModel={hydratedInputModel}
                 compactMode={isCompactMode}
-                editorClassName={isChiefWorkspace
-                  ? 'w-full px-3!'
-                  : 'regular-composer-content-inset w-full'}
-                contentInsetClassName={isChiefWorkspace
-                  ? 'w-full px-3'
-                  : 'regular-composer-content-inset w-full'}
-                actionBarEndClassName={isChiefWorkspace
-                  ? 'pr-3!'
-                  : 'regular-composer-content-inset'}
+                editorClassName={`${COMPOSER_INSET_CLASS} w-full`}
+                contentInsetClassName={`${COMPOSER_INSET_CLASS} w-full`}
+                actionBarEndClassName={COMPOSER_INSET_CLASS}
                 edgeDocked
                 externalDropTarget
                 requiresModelSwitchConfirmation={!canChangeProvider}
                 providerId={inputProviderId}
-              />
+              >
+                {#snippet queueRegion()}
+                  {#if queuedMessagesVisibility.showQueue}
+                    <QueuedMessageList
+                      bind:this={queuedMessageListRef}
+                      messages={visibleQueuedMessages}
+                      onedit={handleEditQueuedMessage}
+                      onremove={handleRemoveQueuedMessage}
+                      onsendnow={handleSendQueuedMessageNow}
+                      ondone={() => inputComponent?.focus?.()}
+                    />
+                  {/if}
+                {/snippet}
+              </SimpleRichInput>
             {/if}
           {/if}
         </div>
@@ -6794,11 +6784,6 @@
   .regular-chat-content-inset {
     padding-left: 1rem;
     padding-right: 1rem;
-  }
-
-  :global(.regular-composer-content-inset) {
-    padding-right: 1rem !important;
-    padding-left: 1rem !important;
   }
 
   .workspace-setup-card-alignment {
@@ -6824,11 +6809,6 @@
       padding-left: 3.1rem;
       padding-right: 3.1rem;
     }
-
-    :global(.regular-composer-content-inset) {
-      padding-right: 1.5rem !important;
-      padding-left: 1.5rem !important;
-    }
   }
 
   .regular-panel-aurora-host {
@@ -6853,22 +6833,25 @@
 
   /* Flash animation for message navigation */
   :global(.message-highlight-flash) {
-    animation: message-flash 0.6s ease-out;
+    animation: message-flash calc(var(--spring-slow) * 2.5) var(--spring-exit-ease);
   }
 
   /* Flash animation for scroll-to-turn navigation */
   :global(.highlight-flash) {
-    animation: highlight-flash 1.5s ease-out;
+    animation: highlight-flash calc(var(--spring-slow) * 6) var(--spring-exit-ease);
   }
 
   /* Transient scroll re-lock confirmation: hold briefly, then fade out.
      Forwards fill keeps it invisible until the element unmounts. */
   .lock-confirmation {
-    animation: lock-confirmation-fade 1.5s ease-out forwards;
+    animation: lock-confirmation-fade calc(var(--spring-slow) * 6) var(--spring-exit-ease) forwards;
   }
 
   @container style(--motion-reduced: 1) {
-    .lock-confirmation {
+    .lock-confirmation,
+    :global(.message-highlight-flash),
+    :global(.highlight-flash),
+    .input-flash :global(.rich-input-container) {
       animation: none;
       opacity: 0.9;
     }
@@ -6906,7 +6889,7 @@
 
   /* Subtle flash animation for input when draft prompt is applied */
   .input-flash :global(.rich-input-container) {
-    animation: input-flash 0.6s ease-out;
+    animation: input-flash calc(var(--spring-slow) * 2.5) var(--spring-exit-ease);
   }
 
   .conversation-composer {

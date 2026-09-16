@@ -1,4 +1,4 @@
-import type { TransitionConfig } from 'svelte/transition';
+import type { ImmediateMotionConfig as TransitionConfig } from '$lib/motion';
 import { safeDisclosureTransition } from './disclosure-motion';
 
 export const SUBSCRIPTION_ICON_CLASS = 'text-muted-foreground! opacity-100';
@@ -19,7 +19,7 @@ export const SUBSCRIPTION_WAKE_BODY_PADDING_CLASS = 'py-2 pr-3 pl-10';
 export const SUBSCRIPTION_INSET_TOP_DIVIDER_CLASS =
   "relative before:pointer-events-none before:absolute before:inset-x-0 before:top-0 before:h-px before:bg-border before:content-['']";
 export const SUBSCRIPTION_INSET_ROW_DIVIDER_CLASS = `${SUBSCRIPTION_INSET_TOP_DIVIDER_CLASS} first:before:hidden`;
-export const SUBSCRIPTION_DISCLOSURE_ROW_CLASS = `${SUBSCRIPTION_ROW_GEOMETRY_CLASS} type-body justify-start! font-normal text-muted-foreground!`; // i18n-ignore (Tailwind class constants)
+export const SUBSCRIPTION_DISCLOSURE_ROW_CLASS = `${SUBSCRIPTION_ROW_GEOMETRY_CLASS} type-body justify-start! font-normal text-muted-foreground! [&_[data-slot=button]]:h-6!`; // i18n-ignore (Tailwind class constants)
 export const SUBSCRIPTION_CHEVRON_CLASS =
   'text-ghost opacity-60 transition-transform duration-[var(--motion-fast)] motion-reduce:transition-none';
 export const SUBSCRIPTION_CHEVRON_SIZE_CLASS = 'h-[16px]! w-[16px]!';
@@ -33,7 +33,7 @@ export function safeSubscriptionSlide(
   _params?: undefined,
   options: { direction?: 'in' | 'out' | 'both' } = {},
 ) {
-  return safeDisclosureTransition(node, { duration: 150 }, options);
+  return safeDisclosureTransition(node, { tier: 'fast' }, options);
 }
 
 /** Keyed row motion: zero height to natural height, then back to zero on removal. */
@@ -42,5 +42,5 @@ export function safeSubscriptionRowTransition(
   _params?: undefined,
   options: { direction?: 'in' | 'out' | 'both' } = {},
 ): TransitionConfig {
-  return safeDisclosureTransition(node, { duration: 160, y: -2 }, options);
+  return safeDisclosureTransition(node, { tier: 'moderate', y: -2 }, options);
 }

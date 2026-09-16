@@ -213,7 +213,7 @@
           <span class="min-w-0 flex-1 truncate text-muted-foreground">{label}</span>
           <Button
             variant="plain"
-            size="icon-xs"
+            size="icon-compact"
             type="button"
             class="size-6 shrink-0 focus-visible:ring-1"
             data-testid="browser-tab-close"

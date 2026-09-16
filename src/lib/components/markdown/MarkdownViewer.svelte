@@ -961,7 +961,7 @@
   }
 
   .markdown-viewer :global(.markdown-link) {
-    color: hsl(var(--primary));
+    color: hsl(var(--primary-ink));
   }
 
   .markdown-viewer :global(a:hover),
@@ -972,6 +972,12 @@
 
   .markdown-viewer :global(.markdown-link:hover) {
     opacity: 0.8;
+  }
+
+  /* Keep sentence punctuation visually attached to inline intent-link pills. */
+  .markdown-viewer :global(.mention-chip) {
+    margin-inline: 0;
+    padding-inline: 0.25rem;
   }
 
   /* Blockquotes */
