@@ -75,6 +75,64 @@ describe('diagram export', () => {
     expect(serialized).not.toContain('Not exported');
   });
 
+  it.each([0.5, 2])('keeps far-edge geometry inside the export at camera scale %s', (scale) => {
+    const { svg } = diagramFixture();
+    svg.style.transform = `translate(71px, -29px) scale(${scale})`;
+    svg.insertAdjacentHTML(
+      'beforeend',
+      '<g transform="translate(8 6)"><rect x="264" y="132" width="40" height="32" /></g>',
+    );
+    const original = svg.outerHTML;
+    // jsdom has no layout. Model only the camera's screen-space bounds; the
+    // authored far-edge geometry below is the independent containment oracle.
+    vi.spyOn(svg, 'getBoundingClientRect').mockReturnValue({
+      width: 320 * scale,
+      height: 180 * scale,
+    } as DOMRect);
+
+    const exported = prepareDiagramSvgForExport(svg);
+    const [, , width, height] = exported.getAttribute('viewBox')!.split(' ').map(Number);
+    expect(width - (264 + 8 + 40)).toBe(8);
+    expect(height - (132 + 6 + 32)).toBe(10);
+    expect(exported.querySelector('g')?.getAttribute('transform')).toBe('translate(8 6)');
+    expect(exported.style.transform).toBe('');
+    expect(svg.outerHTML).toBe(original);
+  });
+
+  it('preserves the Mermaid viewBox mapping into a smaller rendered viewport', () => {
+    const { svg } = diagramFixture();
+    svg.classList.remove('diagram-svg-layer');
+    svg.setAttribute('viewBox', '-20 -10 640 360');
+    svg.style.removeProperty('transform');
+    vi.spyOn(svg, 'getBoundingClientRect').mockReturnValue({
+      width: 160,
+      height: 90,
+    } as DOMRect);
+
+    const exported = prepareDiagramSvgForExport(svg);
+    const [x, y, width, height] = exported.getAttribute('viewBox')!.split(' ').map(Number);
+    expect([x, y]).toEqual([-20, -10]);
+    expect(width / Number(exported.getAttribute('width'))).toBe(4);
+    expect(height / Number(exported.getAttribute('height'))).toBe(4);
+    expect(exported.style.overflow).toBe('hidden');
+  });
+
+  it('uses viewBox dimensions when the viewport and absolute dimensions are unavailable', () => {
+    const { svg } = diagramFixture();
+    svg.setAttribute('width', '100%');
+    svg.removeAttribute('height');
+    svg.setAttribute('viewBox', '-20, -10, 640, 360');
+
+    const exported = prepareDiagramSvgForExport(svg);
+    expect(Number(exported.getAttribute('width')) / Number(exported.getAttribute('height'))).toBe(
+      16 / 9,
+    );
+    expect(exported.getAttribute('viewBox')).toBe('-20, -10, 640, 360');
+    svg.removeAttribute('viewBox');
+    const fallback = prepareDiagramSvgForExport(svg);
+    expect(fallback.getAttribute('viewBox')).toBe('0 0 1 1');
+  });
+
   it('copies serialized SVG text to the shared clipboard path', async () => {
     const { container } = diagramFixture();
     vi.mocked(writeTextToClipboard).mockResolvedValue();
@@ -85,9 +143,16 @@ describe('diagram export', () => {
     expect(vi.mocked(writeTextToClipboard).mock.calls[0][0]).toMatch(/^<svg[^>]+xmlns=/);
   });
 
-  it('copies a PNG using the visible theme canvas color', async () => {
-    const { container } = diagramFixture();
+  it('copies an intrinsic-sized PNG despite the camera scale, using the visible canvas color', async () => {
+    const { container, svg } = diagramFixture();
+    svg.style.transform = 'translate(71px, -29px) scale(.5)';
+    vi.spyOn(svg, 'getBoundingClientRect').mockReturnValue({ width: 160, height: 90 } as DOMRect);
+    const original = svg.outerHTML;
+    let encodedSvg = '';
     const image = { src: '', decode: vi.fn().mockResolvedValue(undefined) };
+    image.decode.mockImplementation(async () => {
+      encodedSvg = decodeURIComponent(image.src.slice(image.src.indexOf(',') + 1));
+    });
     const fillRect = vi.fn();
     const drawImage = vi.fn();
     const context = { fillStyle: '', fillRect, drawImage };
@@ -120,6 +185,14 @@ describe('diagram export', () => {
     expect(context.fillStyle).toBe('rgb(12, 34, 56)');
     expect(fillRect).toHaveBeenCalledWith(0, 0, 640, 360);
     expect(drawImage).toHaveBeenCalledOnce();
+    expect(drawImage).toHaveBeenCalledWith(image, 0, 0, 640, 360);
+    // Parse as HTML here because jsdom's XMLSerializer duplicates xmlns; real
+    // SVG decoding and PNG dimensions are covered in the export browser spec.
+    const exported = new DOMParser().parseFromString(encodedSvg, 'text/html').querySelector('svg')!;
+    expect(Number(exported.getAttribute('width')) * 2).toBe(640);
+    expect(Number(exported.getAttribute('height')) * 2).toBe(360);
+    expect(exported.style.transform).toBe('');
+    expect(svg.outerHTML).toBe(original);
     expect(clipboardWrite).toHaveBeenCalledOnce();
     expect(image.decode).toHaveBeenCalledOnce();
     expect(image.src).toBe('');

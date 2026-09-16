@@ -116,8 +116,13 @@ function readDimensions(svg: SVGSVGElement): { width: number; height: number } {
   const attributeHeight = /^\d+(?:\.\d+)?(?:px)?$/.test(heightAttribute)
     ? Number.parseFloat(heightAttribute)
     : 0;
-  const width = rect.width || attributeWidth || viewBoxWidth || 1;
-  const height = rect.height || attributeHeight || viewBoxHeight || 1;
+  // Custom graphs use intrinsic coordinates and an outer camera transform that
+  // export removes. Its screen rect is scaled, not the graph's viewport. Mermaid
+  // already maps its viewBox into the rendered viewport, which we must preserve.
+  const intrinsic = svg.classList.contains('diagram-svg-layer');
+  const width = (intrinsic ? attributeWidth : 0) || rect.width || attributeWidth || viewBoxWidth || 1;
+  const height =
+    (intrinsic ? attributeHeight : 0) || rect.height || attributeHeight || viewBoxHeight || 1;
   return { width, height };
 }
 

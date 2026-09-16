@@ -1,4 +1,4 @@
-import { expect, test, type Page } from '@playwright/test';
+import { expect, test, type Page, type TestInfo } from '@playwright/test';
 import { readFile, writeFile } from 'node:fs/promises';
 import { CUSTOM_WORKBENCH_CASES } from '../src/lib/components/diagrams/diagram-workbench.preview-fixtures';
 
@@ -89,16 +89,22 @@ async function mountNote(page: Page, extraBlock = '') {
             state.expectedExportIndex
           ];
           const rect = source.getBoundingClientRect();
+          // Custom exports omit the outer camera. Map live label rectangles
+          // back to intrinsic coordinates before sampling the decoded PNG.
+          const matrix = (source as SVGSVGElement).getScreenCTM()!;
+          const pixelScale = source.matches('svg.diagram-svg-layer')
+            ? 2 / Math.hypot(matrix.a, matrix.b)
+            : 2;
           const labelInk = [
             ...source.querySelectorAll('.nodeLabel p, .messageText, .node-label'),
           ].map((label) => {
             const range = document.createRange();
             range.selectNodeContents(label);
             const box = range.getBoundingClientRect();
-            const x = Math.max(0, Math.floor((box.x - rect.x) * 2));
-            const y = Math.max(0, Math.floor((box.y - rect.y) * 2));
-            const width = Math.min(canvas.width - x, Math.ceil(box.width * 2));
-            const height = Math.min(canvas.height - y, Math.ceil(box.height * 2));
+            const x = Math.max(0, Math.floor((box.x - rect.x) * pixelScale));
+            const y = Math.max(0, Math.floor((box.y - rect.y) * pixelScale));
+            const width = Math.min(canvas.width - x, Math.ceil(box.width * pixelScale));
+            const height = Math.min(canvas.height - y, Math.ceil(box.height * pixelScale));
             let ink = 0;
             if (width > 0 && height > 0) {
               const pixels = ctx.getImageData(x, y, width, height).data;
@@ -340,10 +346,17 @@ test('each Copy image control rasterizes the selected graph before isolated clip
   }
 });
 
-test('custom diagram exports retain graph labels and edges through the shared actions', async ({
-  page,
-}, info) => {
-  const diagram = CUSTOM_WORKBENCH_CASES['custom-network'].diagram;
+async function checkCustomDiagramExport(
+  page: Page,
+  info: TestInfo,
+  camera?: { zoom: number; pan: { x: number; y: number } },
+) {
+  const diagram = {
+    ...CUSTOM_WORKBENCH_CASES['custom-network'].diagram,
+    ...(camera
+      ? { states: [{ id: 'camera-export', camera }], currentStateId: 'camera-export' }
+      : {}),
+  };
   await mountNote(page, `\`\`\`diagram\n${JSON.stringify(diagram)}\n\`\`\``);
   const lane = page.locator('.node-diagram_block');
   await expect(lane.locator('.diagram-renderer')).toHaveAttribute('data-diagram-settled', 'true');
@@ -356,6 +369,21 @@ test('custom diagram exports retain graph labels and edges through the shared ac
     Object.assign(window, { expectedExportIndex: 2 });
   });
   const source = lane.locator('svg.diagram-svg-layer');
+  const sourceGeometry = await source.evaluate((svg: SVGSVGElement) => {
+    const matrix = svg.getScreenCTM()!;
+    return {
+      width: svg.width.baseVal.value,
+      height: svg.height.baseVal.value,
+      scale: Math.hypot(matrix.a, matrix.b),
+      style: svg.getAttribute('style'),
+      viewBox: svg.getAttribute('viewBox'),
+    };
+  });
+  expect(sourceGeometry.viewBox).toBeNull();
+  if (camera) {
+    if (camera.zoom < 1) expect(sourceGeometry.scale).toBeLessThan(1);
+    else expect(sourceGeometry.scale).toBeGreaterThan(1);
+  }
   await source.screenshot({ path: info.outputPath('custom-source.png') });
   await customAction('Copy image');
   await expect
@@ -389,9 +417,8 @@ test('custom diagram exports retain graph labels and edges through the shared ac
   );
   expect(result.labelInk).toHaveLength(4);
   expect(result.labelInk.every(({ ink }) => ink > 30)).toBe(true);
-  const rect = (await source.boundingBox())!;
-  expect(result.width).toBe(Math.round(rect.width * 2));
-  expect(result.height).toBe(Math.round(rect.height * 2));
+  expect(result.width).toBe(Math.round(sourceGeometry.width * 2));
+  expect(result.height).toBe(Math.round(sourceGeometry.height * 2));
   const pending = page.waitForEvent('download');
   await customAction('Download SVG');
   const path = info.outputPath('custom-download.svg');
@@ -421,14 +448,53 @@ test('custom diagram exports retain graph labels and edges through the shared ac
     document.body.append(frame);
     await loaded;
     await frame.contentDocument!.fonts.ready;
-    return { original, exported: measure(frame.contentDocument!.querySelector('svg')!) };
+    const exported = frame.contentDocument!.querySelector('svg')!;
+    const viewport = exported.getBoundingClientRect();
+    const bounds = [
+      ...exported.querySelectorAll('[data-node-id], .edge-path, .edge-label-container'),
+    ].map((element) => {
+      const rect = element.getBoundingClientRect();
+      return {
+        left: rect.left - viewport.left,
+        top: rect.top - viewport.top,
+        right: rect.right - viewport.left,
+        bottom: rect.bottom - viewport.top,
+      };
+    });
+    return {
+      original,
+      exported: measure(exported),
+      width: viewport.width,
+      height: viewport.height,
+      viewBox: exported.getAttribute('viewBox'),
+      bounds,
+    };
   }, bytes);
   await page.locator('iframe').screenshot({ path: info.outputPath('custom-download.png') });
   await page.locator('iframe').evaluate((frame) => frame.remove());
   await writeFile(info.outputPath('custom-typography.json'), JSON.stringify(typography, null, 2));
+  expect(typography.width).toBeCloseTo(sourceGeometry.width, 1);
+  expect(typography.height).toBeCloseTo(sourceGeometry.height, 1);
+  const [x, y, width, height] = typography.viewBox!.split(' ').map(Number);
+  expect([x, y]).toEqual([0, 0]);
+  expect(width).toBeCloseTo(sourceGeometry.width, 1);
+  expect(height).toBeCloseTo(sourceGeometry.height, 1);
+  expect(typography.bounds.length).toBeGreaterThan(4);
+  for (const bounds of typography.bounds) {
+    expect(bounds.left).toBeGreaterThanOrEqual(-1);
+    expect(bounds.top).toBeGreaterThanOrEqual(-1);
+    expect(bounds.right).toBeLessThanOrEqual(typography.width + 1);
+    expect(bounds.bottom).toBeLessThanOrEqual(typography.height + 1);
+  }
   for (let i = 0; i < typography.original.length; i++) {
-    expect(typography.exported[i].width).toBeCloseTo(typography.original[i].width, 0);
-    expect(typography.exported[i].height).toBeCloseTo(typography.original[i].height, 0);
+    expect(typography.exported[i].width).toBeCloseTo(
+      typography.original[i].width / sourceGeometry.scale,
+      0,
+    );
+    expect(typography.exported[i].height).toBeCloseTo(
+      typography.original[i].height / sourceGeometry.scale,
+      0,
+    );
   }
   const parsed = await page.evaluate((bytes) => {
     const doc = new DOMParser().parseFromString(bytes, 'image/svg+xml');
@@ -451,7 +517,26 @@ test('custom diagram exports retain graph labels and edges through the shared ac
   expect(
     await page.evaluate(() => (window as typeof window & { exportTexts: string[] }).exportTexts[0]),
   ).toBe(bytes);
+  expect(await source.getAttribute('style')).toBe(sourceGeometry.style);
+  expect(await source.getAttribute('viewBox')).toBeNull();
+}
+
+test('custom diagram exports retain graph labels and edges through the shared actions', async ({
+  page,
+}, info) => {
+  await checkCustomDiagramExport(page, info);
 });
+
+for (const camera of [
+  { zoom: 0.5, pan: { x: 61, y: -23 } },
+  { zoom: 1.75, pan: { x: -47, y: 31 } },
+]) {
+  test(`custom camera at zoom ${camera.zoom} exports complete intrinsic SVG and PNG geometry`, async ({
+    page,
+  }, info) => {
+    await checkCustomDiagramExport(page, info, camera);
+  });
+}
 
 test('missing graph reports errors without stale fullscreen, neighbor export or clipboard writes', async ({
   page,

@@ -151,6 +151,56 @@ describe('waitForCaptureStability', () => {
     expect(window.requestAnimationFrame).toHaveBeenCalledTimes(2);
   });
 
+  it('defaults missing readiness to the stability timeout and cleans up', async () => {
+    vi.useFakeTimers();
+    const disconnect = vi.spyOn(MutationObserver.prototype, 'disconnect');
+    const root = document.createElement('div');
+    const stability = waitForCaptureStability(root, {
+      readiness: { selector: '[data-ready="true"]' },
+      timeoutMs: 25,
+    });
+    const rejection = expect(stability).rejects.toBeInstanceOf(CaptureStabilityTimeoutError);
+
+    await vi.advanceTimersByTimeAsync(25);
+
+    await rejection;
+    expect(disconnect).toHaveBeenCalledTimes(1);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('preserves the full stability budget after delayed readiness', async () => {
+    vi.useFakeTimers();
+    const fonts = deferred<void>();
+    setFonts(fonts.promise);
+    useTimerFrames();
+    const root = document.createElement('div');
+    const marker = document.createElement('div');
+    marker.dataset.ready = 'true';
+    const stability = waitForCaptureStability(root, {
+      readiness: { selector: '[data-ready="true"]' },
+      readinessTimeoutMs: 20,
+      timeoutMs: 100,
+    });
+    const resolution = expect(stability).resolves.toEqual({
+      imageCount: 0,
+      deferredImageCount: 0,
+      reducedMotion: false,
+    });
+
+    await vi.advanceTimersByTimeAsync(15);
+    root.append(marker);
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(90);
+    fonts.resolve();
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(0);
+
+    await resolution;
+    expect(window.requestAnimationFrame).toHaveBeenCalledTimes(2);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
   it('waits for the exact declared marker count and a generation on every marker', async () => {
     setFonts(Promise.resolve());
     useTimerFrames();
@@ -267,18 +317,21 @@ describe('waitForCaptureStability', () => {
   });
 
   it('disconnects the readiness observer when a delayed marker wait is cancelled', async () => {
+    vi.useFakeTimers();
     setFonts(Promise.resolve());
     const disconnect = vi.spyOn(MutationObserver.prototype, 'disconnect');
     const root = document.createElement('div');
     const controller = new AbortController();
     const stability = waitForCaptureStability(root, {
       readiness: { selector: '[data-ready="true"]' },
+      readinessTimeoutMs: 25,
       signal: controller.signal,
     });
 
     controller.abort();
     await expect(stability).rejects.toMatchObject({ name: 'AbortError' });
     expect(disconnect).toHaveBeenCalledTimes(1);
+    expect(vi.getTimerCount()).toBe(0);
   });
 
   it('waits for fonts, images, reduced-motion styles, and two settled frames', async () => {

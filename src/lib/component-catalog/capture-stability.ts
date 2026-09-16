@@ -6,6 +6,13 @@ const DEFAULT_CAPTURE_STABILITY_TIMEOUT_MS = 5_000;
 export interface CaptureStabilityOptions {
   readiness?: PreviewCaptureReadiness;
   signal?: AbortSignal;
+  /**
+   * Maximum wait for declared readiness markers. This deadline is independent of
+   * `timeoutMs`, whose full budget starts after readiness. Defaults to `timeoutMs`
+   * when supplied, otherwise to the capture-stability default.
+   */
+  readinessTimeoutMs?: number;
+  /** Maximum post-readiness wait for fonts, images, and settled frames. */
   timeoutMs?: number;
 }
 
@@ -104,6 +111,7 @@ function markersMatch(current: ReadinessMarker[] | null, expected: ReadinessMark
 function waitForReadiness(
   root: HTMLElement,
   readiness: PreviewCaptureReadiness,
+  timeoutMs: number,
   signal?: AbortSignal,
 ): Promise<ReadinessMarker[]> {
   if (signal?.aborted) return Promise.reject(abortError());
@@ -111,6 +119,10 @@ function waitForReadiness(
   if (current) return Promise.resolve(current);
 
   return new Promise<ReadinessMarker[]>((resolve, reject) => {
+    const timeoutId = setTimeout(() => {
+      cleanup();
+      reject(new CaptureStabilityTimeoutError(timeoutMs));
+    }, Math.max(0, timeoutMs));
     const observer = new MutationObserver(() => {
       const markers = readReadinessMarkers(root, readiness);
       if (!markers) return;
@@ -122,6 +134,7 @@ function waitForReadiness(
       reject(abortError());
     };
     const cleanup = () => {
+      clearTimeout(timeoutId);
       observer.disconnect();
       signal?.removeEventListener('abort', onAbort);
     };
@@ -259,9 +272,10 @@ function waitForAnimationFrame(documentRef: Document, signal: AbortSignal): Prom
 }
 
 /**
- * Wait for capture-affecting fonts and images, then allow two animation frames for
- * reduced-motion styles and layout to settle. The wait always ends at the timeout
- * or when its signal is aborted.
+ * Wait for declared readiness, then wait for capture-affecting fonts and images and
+ * allow two animation frames for reduced-motion styles and layout to settle. Readiness
+ * and post-readiness stability have independent timeout budgets, and either wait ends
+ * when its signal is aborted.
  *
  * Image readiness uses viewport semantics: every eager image, every already-complete
  * image, and every rendered lazy image that intersects the window viewport must finish
@@ -285,8 +299,11 @@ async function waitForCaptureStabilitySnapshot(
 ): Promise<CaptureStabilitySnapshot> {
   while (true) {
     const readiness = options.readiness;
-    const markers = readiness ? await waitForReadiness(root, readiness, options.signal) : null;
     const timeoutMs = options.timeoutMs ?? DEFAULT_CAPTURE_STABILITY_TIMEOUT_MS;
+    const readinessTimeoutMs = options.readinessTimeoutMs ?? timeoutMs;
+    const markers = readiness
+      ? await waitForReadiness(root, readiness, readinessTimeoutMs, options.signal)
+      : null;
     const controller = new AbortController();
     let timedOut = false;
     const onAbort = () => controller.abort();

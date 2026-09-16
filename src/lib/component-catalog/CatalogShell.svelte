@@ -119,6 +119,7 @@
     if (activeSlug) {
       const url = new URL(window.location.href);
       url.searchParams.set('theme', theme);
+      url.searchParams.delete('reducedMotion');
       if (motion === 'system') url.searchParams.delete('motion');
       else url.searchParams.set('motion', motion);
       window.history.replaceState(window.history.state, '', url);
