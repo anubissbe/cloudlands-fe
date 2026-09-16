@@ -55,6 +55,8 @@
   import type { PRInfo } from '$lib/components/file-tracking/accept-changes/types';
   import LineChangesBadge from '$lib/components/shared/LineChangesBadge.svelte';
   import { Button } from '$lib/components/ui/button';
+  import { Input } from '$lib/components/ui/input';
+  import { IntentMarkLoader } from '$lib/components/ui/indicators';
   import { Textarea } from '$lib/components/ui/textarea';
   import { toast } from '$lib/components/ui/toast';
   import { m } from '$shared/paraglide/messages.js';
@@ -73,13 +75,12 @@
     faEye,
     faLink,
     faRobot,
-    faSpinner,
     faStop,
   } from '@fortawesome/free-solid-svg-icons';
   import { untrack } from 'svelte';
   import { readable, writable } from 'svelte/store';
   import Fa from 'svelte-fa';
-  import { slide } from 'svelte/transition';
+  import { slide } from '$lib/motion';
   import DividerButton from './DividerButton.svelte';
   import DividerPanel from './DividerPanel.svelte';
   import { aggregatePRFiles, getPRStatusTooltip } from './sidebar-changes-utils';
@@ -765,7 +766,7 @@
               <span class="text-xs text-subtle mb-1 block"
                 >{m.workspace_prCreator_titleField_label()}</span
               >
-              <input
+              <Input
                 type="text"
                 class="w-full px-2.5 py-1.5 text-sm bg-muted/30 border border-border rounded-md focus:outline-none focus:ring-1 focus:ring-primary/50 placeholder:text-muted-foreground/50"
                 placeholder={m.workspace_prSection_prTitle_placeholder()}
@@ -819,7 +820,7 @@
               disabled={!prTitle.trim() || isCreatingPR || (isGeneratingPR && $createPRWhenReady$)}
             >
               {#if isCreatingPR || (isGeneratingPR && $createPRWhenReady$)}
-                <Fa icon={faSpinner} size="xs" class="animate-spin" />
+                <IntentMarkLoader size={12} />
                 <span
                   >{isCreatingPR
                     ? m.workspace_prSection_creatingPr_label()
@@ -838,7 +839,7 @@
                   class="rounded-r-none border-r-0"
                   onclick={handleStopGeneratingPR}
                 >
-                  <Fa icon={faSpinner} size="xs" class="animate-spin" />
+                  <IntentMarkLoader size={12} />
                   <span class="mr-1">{m.workspace_prCreator_autoFill_label()}</span>
                   <Fa icon={faStop} size="xs" />
                 </Button>
@@ -975,7 +976,7 @@
         <div class="flex items-center gap-2">
           <Button variant="default" size="xs" onclick={handleForcePush} disabled={isForcePushing}>
             {#if isForcePushing}
-              <Fa icon={faSpinner} size="xs" class="animate-spin" />
+              <IntentMarkLoader size={12} />
               <span>{m.workspace_prSection_pushing_label()}</span>
             {:else}
               <span>{m.workspace_prSection_forcePush_label()}</span>
@@ -1001,7 +1002,7 @@
      primary workspace has no remote (monorepo#2053). Primary-only
      affordances (create PR / push / merge) stay gated on hasRemote above. -->
 {#if hasAnyPRs}
-  <div transition:slide={{ duration: 200 }}>
+  <div transition:slide={{ tier: 'moderate' }}>
     <TimelineSection
       title={m.workspace_prSection_pullRequests_label()}
       active={hasAnyPRs}
@@ -1012,7 +1013,8 @@
                state, so it is suppressed in the read-only listOnly
                (secondary-root browsing) mode (monorepo#2053). -->
         {#if !listOnly && (hasAnyPRs || $githubAuthIsAuthenticated$)}
-          <button
+          <Button
+            variant="plain"
             type="button"
             class="p-1 rounded hover:bg-muted transition-colors text-muted-foreground hover:text-foreground disabled:opacity-50 cursor-pointer"
             onclick={() => {
@@ -1028,11 +1030,12 @@
               ? m.workspace_prSection_refreshPrStatus_tooltip()
               : m.workspace_prSection_connectToGithub_label()}
           >
-            <Fa
-              icon={faArrowsRotate}
-              class="opacity-50 text-ui {isRefreshingPR ? 'animate-spin' : ''}"
-            />
-          </button>
+            {#if isRefreshingPR}
+              <IntentMarkLoader size={12} class="opacity-50 text-ui" />
+            {:else}
+              <Fa icon={faArrowsRotate} class="opacity-50 text-ui" />
+            {/if}
+          </Button>
         {/if}
       {/snippet}
       {#snippet children()}
@@ -1094,7 +1097,8 @@
               {/if}
 
               <Fa icon={statusIcon} size="xs" class="{statusColor} shrink-0" />
-              <button
+              <Button
+                variant="plain"
                 type="button"
                 class="flex items-center gap-2 flex-1 min-w-0 text-left cursor-pointer"
                 onclick={onOpenFullPanel}
@@ -1125,7 +1129,7 @@
                     >{m.workspace_prSection_closed_label()}</span
                   >
                 {/if}
-              </button>
+              </Button>
 
               <div
                 class="absolute -right-1 pl-1 bg-sidebar flex items-center opacity-0 group-hover:opacity-100 transition-opacity"
@@ -1151,7 +1155,7 @@
             {#if isPRExpanded}
               <div
                 class="pl-5 pr-1.5 pb-0.5 pt-0.5 space-y-px"
-                transition:slide={{ duration: 150 }}
+                transition:slide={{ tier: 'moderate' }}
               >
                 {#each prFiles as file (file.path)}
                   <FileRow
@@ -1250,7 +1254,7 @@
       <div>
         <span class="text-xs text-subtle mb-1 block">{m.workspace_prSection_remoteUrl_label()}</span
         >
-        <input
+        <Input
           type="text"
           class="w-full px-2.5 py-1.5 text-sm bg-muted/30 border border-border rounded-md focus:outline-none focus:ring-1 focus:ring-primary/50 placeholder:text-muted-foreground/50"
           placeholder={m.workspace_prSection_remoteUrl_placeholder()}
@@ -1271,7 +1275,7 @@
           disabled={connectRemote.adding || !connectRemote.url.trim()}
         >
           {#if connectRemote.adding}
-            <Fa icon={faSpinner} size="xs" class="animate-spin" />
+            <IntentMarkLoader size={12} />
             <span>{m.workspace_prSection_adding_label()}</span>
           {:else}
             <Fa icon={faLink} size="xs" class="opacity-50" />

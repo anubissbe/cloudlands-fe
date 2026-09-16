@@ -7,10 +7,12 @@
 
 <script lang="ts">
   import { onDestroy } from 'svelte';
-  import { faChevronDown, faPlus, faSpinner, faTrash } from '@fortawesome/free-solid-svg-icons';
+  import { faChevronDown, faPlus, faTrash } from '@fortawesome/free-solid-svg-icons';
   import Fa from 'svelte-fa';
   import { m } from '$shared/paraglide/messages.js';
-  import { toast } from 'svelte-sonner';
+  import { notify } from '$lib/components/patterns/notify';
+  import { Button } from '$lib/components/ui/button';
+  import { IntentMarkLoader } from '$lib/components/ui/indicators';
   import ChatPanel from '$lib/components/chat/ChatPanel.svelte';
   import {
     Dropdown,
@@ -296,14 +298,15 @@
       appStore.dispatch(setActiveAgentId(CHIEF_WORKSPACE_ID, request.agentId));
     } else if (request.error && request.error !== handledChiefCreationError) {
       handledChiefCreationError = request.error;
-      toast.error(m.layout_chiefCard_startFailed_error({ message: request.error }));
+      notify.error(m.layout_chiefCard_startFailed_error({ message: request.error }));
     }
   });
 </script>
 
 {#if !expanded}
   <div class="p-3">
-    <button
+    <Button
+      variant="ghost"
       type="button"
       class="block w-full cursor-pointer rounded-sm text-left outline-none"
       onclick={openChiefPanel}
@@ -311,7 +314,7 @@
     >
       <p class="type-body truncate font-medium text-foreground">{title}</p>
       <p class="type-caption mt-1 text-muted-foreground line-clamp-3">{preview}</p>
-    </button>
+    </Button>
   </div>
 {:else}
   <div class="flex h-full flex-col {embedded ? 'min-h-0' : 'min-h-[460px]'}">
@@ -327,8 +330,10 @@
     >
       <div class="flex min-w-0 flex-1 items-center gap-1.5">
         {#if collapsed && ontoggle}
-          <button
+          <Button
             type="button"
+            variant="ghost"
+            size="xs"
             class="flex h-7! min-w-0 max-w-full flex-1 items-center justify-start px-1.5! text-foreground"
             aria-expanded="false"
             aria-controls="combined-panel-chief-content"
@@ -336,7 +341,7 @@
             <span class="text-ui min-w-0 flex-1 truncate text-left font-medium">
               {activeThread?.title ?? m.layout_chiefCard_startThread_label()}
             </span>
-          </button>
+          </Button>
         {:else}
           <Dropdown
             value={selectedAgentId ?? undefined}
@@ -400,7 +405,8 @@
           ? 'pointer-events-none -mr-1 w-0 opacity-0'
           : 'mr-0 w-6 opacity-100'}"
       >
-        <button
+        <Button
+          variant="ghost"
           class="flex h-6 w-6 shrink-0 cursor-pointer items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted/50 hover:text-foreground disabled:cursor-not-allowed disabled:opacity-60"
           onclick={handleNewThreadClick}
           disabled={isCreatingThread || collapsed}
@@ -409,16 +415,18 @@
           aria-label={m.layout_chiefCard_newThread_tooltip()}
           title={m.layout_chiefCard_newThread_tooltip()}
         >
-          <Fa
-            icon={isCreatingThread ? faSpinner : faPlus}
-            size="xs"
-            class={isCreatingThread ? 'animate-spin' : ''}
-          />
-        </button>
+          {#if isCreatingThread}
+            <IntentMarkLoader size={12} />
+          {:else}
+            <Fa icon={faPlus} size="xs" />
+          {/if}
+        </Button>
       </div>
       {#if ontoggle}
-        <button
+        <Button
           type="button"
+          variant="ghost-light"
+          size="icon-xs"
           class="flex h-7 w-6 shrink-0 cursor-pointer items-center justify-center rounded-sm text-muted-foreground outline-none hover:text-foreground focus-visible:outline-2 focus-visible:outline-ring"
           aria-label={m.layout_chiefCard_title()}
           aria-expanded={!collapsed}
@@ -431,7 +439,7 @@
             size="xs"
             class="shrink-0 transition-transform {collapsed ? 'rotate-90' : ''}"
           />
-        </button>
+        </Button>
       {/if}
     </div>
 

@@ -253,8 +253,8 @@ vi.mock('$store/renderer/slices/connections/connections-slice', () => ({
   },
 }));
 
-vi.mock('$lib/components/ui/toast', () => ({
-  toast: { error: mocks.toastError, success: vi.fn() },
+vi.mock('$lib/components/patterns/notify', () => ({
+  notify: { error: mocks.toastError, success: vi.fn() },
 }));
 
 import DevicesSettings from './DevicesSettings.svelte';

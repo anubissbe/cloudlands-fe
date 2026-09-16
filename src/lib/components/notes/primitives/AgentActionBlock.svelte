@@ -7,11 +7,11 @@
   import {
     faRobot,
     faPlay,
-    faSpinner,
     faArrowUpRightFromSquare,
     faCheck,
   } from '@fortawesome/free-solid-svg-icons';
-  import { toast } from 'svelte-sonner';
+  import { IntentMarkLoader } from '$lib/components/ui/indicators';
+  import { notify } from '$lib/components/patterns/notify';
   import { parseAgentTypeId } from '$shared/types/agent.types';
   import { selectSelectedModel } from '$store/renderer/slices/model/model-selectors';
 
@@ -51,7 +51,7 @@
   // Get button state
   let buttonState = $derived.by(() => {
     if (running) {
-      return { label: m.notes_agentActionBlock_running_label(), icon: faSpinner, spin: true };
+      return { label: m.notes_agentActionBlock_running_label(), icon: null };
     }
     if (agentId) {
       return {
@@ -70,7 +70,7 @@
   function runAction() {
     if (!primitive || running) return;
     if (!workspaceId) {
-      toast.error(m.notes_agentActionBlock_noWorkspace_error());
+      notify.error(m.notes_agentActionBlock_noWorkspace_error());
       return;
     }
     running = true;
@@ -127,7 +127,7 @@
           },
         },
       });
-      toast.error(request.error);
+      notify.error(request.error);
     } else if (request.agentId) {
       agentId = request.agentId;
       updateAttributes?.({
@@ -137,7 +137,7 @@
           lastRun: { status: 'running', startedAt: requestStartedAt },
         },
       });
-      toast.success(m.notes_agentActionBlock_started_label());
+      notify.success(m.notes_agentActionBlock_started_label());
     }
     appStore.dispatch(clearAgentCreationRequest(wsId, request.requestId));
   });
@@ -180,14 +180,15 @@
     >
       {#if linkedAgentId}
         <!-- Show agent avatar that opens the agent panel -->
-        <button
+        <Button
+          variant="ghost"
           type="button"
           class="shrink-0 rounded-sm transition-opacity hover:opacity-80"
           onclick={(e) => handleOpenAgent(e, linkedAgentId)}
           title={m.notes_agentActionBlock_viewAgent_tooltip()}
         >
           <AgentAvatar agentId={linkedAgentId} variant="compact" />
-        </button>
+        </Button>
       {:else}
         <Fa icon={faRobot} size="sm" class="shrink-0 text-muted-foreground" />
       {/if}
@@ -201,7 +202,11 @@
         onclick={handleButtonClick}
         disabled={running}
       >
-        <Fa icon={buttonState.icon} size="xs" class={buttonState.spin ? 'animate-spin' : ''} />
+        {#if running}
+          <IntentMarkLoader size={12} />
+        {:else if buttonState.icon}
+          <Fa icon={buttonState.icon} size="xs" />
+        {/if}
         {buttonState.label}
       </Button>
     </div>

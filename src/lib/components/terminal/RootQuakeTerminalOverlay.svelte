@@ -19,8 +19,7 @@
    */
   import { sanitizeCommandForDisplay } from '$shared/utils/sanitize-credentials';
   import { onDestroy } from 'svelte';
-  import { slide } from 'svelte/transition';
-  import { cubicOut } from 'svelte/easing';
+  import { slide } from '$lib/motion';
   import {
     selectIsTerminalOverlayOpenForWorkspace,
     selectTerminalOverlayHeight,
@@ -51,6 +50,7 @@
     faBan,
   } from '@fortawesome/free-solid-svg-icons';
   import { cn } from '$lib/utils';
+  import { Input } from '$lib/components/ui/input';
   import { Tooltip } from '$lib/components/ui/tooltip';
   import Button from '$lib/components/ui/button/button.svelte';
   import { terminalManager } from '$features/terminal/terminal-manager.svelte';
@@ -358,7 +358,7 @@
       class="terminal-panel relative flex flex-col bg-sidebar border-t border-border shadow-2xl w-full"
       class:is-resizing={isResizing}
       style="height: {renderedHeight}vh;"
-      transition:slide={{ axis: 'y', duration: 200, easing: cubicOut }}
+      transition:slide={{ axis: 'y', tier: 'moderate' }}
     >
       <!-- Resize Handle -->
       <!-- svelte-ignore a11y_no_static_element_interactions -->
@@ -379,7 +379,7 @@
           <Fa icon={faTerminal} class="w-3.5 h-3.5 opacity-60" />
           <div class="relative inline-flex min-w-0 items-center">
             {#if isEditingHeaderName}
-              <input
+              <Input
                 type="text"
                 data-edit-header-terminal
                 bind:value={headerEditValue}
@@ -477,7 +477,7 @@
             >
               <div class="relative inline-flex min-w-0 items-center">
                 {#if editingTerminalId === term.id}
-                  <input
+                  <Input
                     type="text"
                     data-edit-terminal={term.id}
                     bind:value={editingValue}
@@ -502,14 +502,15 @@
                 ></span>
               </div>
 
-              <button
+              <Button
+                variant="ghost"
                 type="button"
                 class="ml-0.5 p-1 text-muted-foreground hover:text-muted-foreground opacity-0 group-hover/tab:opacity-100 transition-opacity duration-150 cursor-pointer"
                 onclick={(e) => closeTerminal(term.id, e)}
                 aria-label={m.terminal_quakeOverlay_closeTerminal_ariaLabel()}
               >
                 <Fa icon={faXmark} size="xs" />
-              </button>
+              </Button>
             </div>
           {/each}
 
@@ -518,14 +519,16 @@
             side="top"
             delayDuration={300}
           >
-            <button
+            <Button
+              variant="ghost"
+              size="icon-sm"
               type="button"
               class="flex items-center justify-center w-7 h-7 ml-1 border-none rounded-md bg-transparent text-muted-foreground cursor-pointer transition-all duration-150 hover:bg-muted/80 hover:text-foreground"
               onclick={createNewTerminal}
               aria-label={m.terminal_quakeOverlay_newTerminal_ariaLabel()}
             >
               <Fa icon={faPlus} class="w-3.5 h-3.5" />
-            </button>
+            </Button>
           </Tooltip>
         </div>
 
