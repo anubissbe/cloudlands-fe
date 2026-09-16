@@ -52,6 +52,12 @@ async function expectReadableLabels(component: Locator, htmlLabels: boolean) {
         {
           name,
           fill,
+          outlineAlphas: [...owner.querySelectorAll(':scope > .flowchart-node-outline')].map(
+            (outline) => {
+              const style = getComputedStyle(outline);
+              return rgba(style.fill)[3] * Number(style.fillOpacity) * Number(style.opacity);
+            },
+          ),
           labels: leaves.map((leaf) => {
             const style = getComputedStyle(leaf);
             const html = leaf.namespaceURI === 'http://www.w3.org/1999/xhtml';
@@ -92,6 +98,7 @@ async function expectReadableLabels(component: Locator, htmlLabels: boolean) {
   ]);
   for (const row of rows) {
     expect(row.labels.length, row.name).toBeGreaterThan(0);
+    for (const alpha of row.outlineAlphas) expect(alpha, row.name).toBe(0);
     for (const label of row.labels) {
       expect(label.visible, row.name).toBe(true);
       expect(label.html, row.name).toBe(htmlLabels);

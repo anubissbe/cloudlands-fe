@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, render, waitFor } from '@testing-library/svelte';
+import { color } from 'd3';
 
 const mermaidMocks = vi.hoisted(() => ({
   initialize: vi.fn(),
@@ -35,6 +36,21 @@ const tokens = {
   '--text-caption-size': '0.8125rem',
   '--radius-small': '5px',
 };
+
+// Independent WCAG oracle, matching the local label tests rather than the repair's choice.
+function contrast(foreground: string, background: string): number {
+  const luminance = (value: string) => {
+    const { r, g, b } = color(value)!.rgb();
+    const channels = [r, g, b].map((channel) => {
+      const s = channel / 255;
+      return s <= 0.04045 ? s / 12.92 : ((s + 0.055) / 1.055) ** 2.4;
+    });
+    return channels[0] * 0.2126 + channels[1] * 0.7152 + channels[2] * 0.0722;
+  };
+  const a = luminance(foreground);
+  const b = luminance(background);
+  return (Math.max(a, b) + 0.05) / (Math.min(a, b) + 0.05);
+}
 
 describe('MermaidRenderer theme updates', () => {
   beforeEach(() => {
@@ -80,22 +96,39 @@ describe('MermaidRenderer theme updates', () => {
   });
 
   it('reapplies local contrast to new SVG output after a live theme change', async () => {
-    const output = async () => ({
-      svg: `<svg aria-roledescription="flowchart-v2" style="background-color:${document.documentElement.style.getPropertyValue('--diagram-canvas')}">
+    const authoredPaints: { fill: string; priority: string }[] = [];
+    const output = async () => {
+      const svg = `<svg aria-roledescription="flowchart-v2" style="background-color:${document.documentElement.style.getPropertyValue('--diagram-canvas')}">
         <g class="node"><rect style="fill:none"/><g class="label">
           <text style="fill:#ffffff">Present label</text>
-        </g></g></svg>`,
-    });
+        </g></g></svg>`;
+      const source = document.createElement('div');
+      source.innerHTML = svg;
+      const label = source.querySelector<SVGElement>('text')!;
+      authoredPaints.push({
+        fill: label.style.fill,
+        priority: label.style.getPropertyPriority('fill'),
+      });
+      return { svg };
+    };
     mermaidMocks.render.mockImplementationOnce(output).mockImplementationOnce(output);
     const result = render(MermaidRenderer, { code: 'flowchart TB\nA[Present label]' });
-    await waitFor(() =>
-      expect(result.container.querySelector<SVGElement>('text')?.style.fill).toBe('rgb(0, 0, 0)'),
-    );
+    const expectForeground = (expected: string, background: string) => {
+      const text = result.container.querySelector<SVGElement>('text')!;
+      const foreground = getComputedStyle(text).fill;
+      expect(color(foreground)?.rgb()).toEqual(color(expected)!.rgb());
+      expect(contrast(foreground, background)).toBeGreaterThanOrEqual(4.5);
+      return text;
+    };
+    const initialText = await waitFor(() => expectForeground('#000000', '#ffffff'));
     document.documentElement.style.setProperty('--diagram-canvas', '#000000');
     await waitFor(() => expect(mermaidMocks.render).toHaveBeenCalledTimes(2));
-    await waitFor(() =>
-      expect(result.container.querySelector<SVGElement>('text')?.style.fill).toBe('#ffffff'),
-    );
+    await waitFor(() => {
+      const text = expectForeground('#ffffff', '#000000');
+      expect(text).not.toBe(initialText);
+      expect(text.style.fill).toBe(authoredPaints[1].fill);
+      expect(text.style.getPropertyPriority('fill')).toBe(authoredPaints[1].priority);
+    });
   });
 
   it('keeps class diagrams on SVG labels for geometry repair', async () => {

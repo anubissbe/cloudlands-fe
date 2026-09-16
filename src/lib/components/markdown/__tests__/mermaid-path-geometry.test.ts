@@ -24,6 +24,7 @@ import {
   measuredClusterHeaderHeight,
   planCompactClusterFrame,
   preferClearStraightRoute,
+  repairFlowchartNodeOutlines,
   replacePathTerminal,
   routeOrthogonalAroundObstacles,
   roundOrthogonalBends,
@@ -71,6 +72,51 @@ function expectRouteAvoids(points: TestPoint[], bounds: TestBounds) {
 }
 
 describe('Mermaid path terminal geometry', () => {
+  it.each([false, true])(
+    'keeps cloned outlines unfilled without changing authored shapes or labels (HTML=%s)',
+    (html) => {
+      const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+      svg.setAttribute('aria-roledescription', 'flowchart-v2');
+      svg.innerHTML = ['#dbeafe', '#dcfce7']
+        .map((fill, index) => {
+          const label = html
+            ? `<foreignObject><div xmlns="http://www.w3.org/1999/xhtml"><p>Label ${index}</p></div></foreignObject>`
+            : `<text><tspan>Label ${index}</tspan></text>`;
+          return `<g class="node"><rect class="label-container" x="-40" y="-20"
+          width="80" height="40" transform="translate(10, 15)"
+          style="fill:${fill} !important;stroke:#123456 !important"/>
+          <g class="label">${label}</g></g>`;
+        })
+        .join('');
+      document.body.append(svg);
+      try {
+        const originals = [...svg.querySelectorAll<SVGElement>('.label-container')];
+        const originalMarkup = originals.map((shape) => shape.outerHTML);
+        const labels = [...svg.querySelectorAll('.label')];
+        const labelMarkup = labels.map((label) => label.outerHTML);
+        for (let repeat = 0; repeat < 2; repeat++) {
+          repairFlowchartNodeOutlines(svg);
+          const outlines = [...svg.querySelectorAll<SVGElement>('.flowchart-node-outline')];
+          expect(outlines).toHaveLength(originals.length);
+          for (const [index, outline] of outlines.entries()) {
+            expect(getComputedStyle(outline).fill).toBe('none');
+            expect(outline.style.getPropertyPriority('fill')).toBe('important');
+            expect(outline.style.stroke).toBe(originals[index].style.stroke);
+            for (const attribute of ['x', 'y', 'width', 'height', 'transform']) {
+              expect(outline.getAttribute(attribute)).toBe(
+                originals[index].getAttribute(attribute),
+              );
+            }
+          }
+          expect(originals.map((shape) => shape.outerHTML)).toEqual(originalMarkup);
+          expect(labels.map((label) => label.outerHTML)).toEqual(labelMarkup);
+        }
+      } finally {
+        svg.remove();
+      }
+    },
+  );
+
   describe('cluster outsider clearance', () => {
     const frame = { x: 20, y: 20, width: 180, height: 200 };
     const content = { x: 44, y: 100, width: 132, height: 100 };

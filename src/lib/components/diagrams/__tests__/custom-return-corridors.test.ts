@@ -330,6 +330,42 @@ describe('custom return corridor simplification', () => {
     }
   });
 
+  it('keeps an offset return inside the facing corridor with a horizontal label carrier', () => {
+    const model: DiagramModel = {
+      nodes: [
+        { id: 'a', label: 'A', position: { x: 0, y: 0 }, size: { width: 100, height: 48 } },
+        { id: 'b', label: 'B', position: { x: 201, y: 80 }, size: { width: 100, height: 48 } },
+      ],
+      edges: [{ id: 'back', from: 'b', to: 'a', label: 'Signal 0' }],
+    };
+    const view: DiagramBaseView = {
+      layout: { type: 'manual', direction: 'LR', edgeRouting: 'orthogonal' },
+    };
+    const layout = computeLayout(model, view, 'architecture');
+    const [edge] = layout.edges;
+    const left = layout.nodes.find(({ id }) => id === 'a')!;
+    const right = layout.nodes.find(({ id }) => id === 'b')!;
+    const size = measureEdgeLabel(edge.label!);
+    expect(right.x - left.x - left.width).toBeLessThan((size.width + 16) * 2);
+    expect(edge.points).toHaveLength(4);
+    expect(Math.min(...edge.points!.map(({ y }) => y))).toBeGreaterThanOrEqual(left.y);
+    expect(Math.max(...edge.points!.map(({ y }) => y))).toBeLessThanOrEqual(right.y + right.height);
+    const horizontalSpan = Math.max(
+      ...edge.points!.slice(1).map((end, index) => Math.abs(end.x - edge.points![index].x)),
+    );
+    expect(horizontalSpan).toBeGreaterThanOrEqual(size.width + 16);
+    const label = midpointLabel(edge);
+    const opposite = { x: label.x + label.width, y: label.y + label.height };
+    for (const node of layout.nodes) expect(enters(label, opposite, node, 8)).toBe(false);
+    expectClearRoutes(layout);
+    const reordered = computeLayout(
+      { ...model, nodes: model.nodes.toReversed() },
+      view,
+      'architecture',
+    );
+    expect(reordered.edges[0].points).toEqual(edge.points);
+  });
+
   it('keeps an obstacle detour instead of shortening through a blocked facing corridor', () => {
     const layout = computeLayout(
       {

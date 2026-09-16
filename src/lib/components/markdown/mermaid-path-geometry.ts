@@ -974,6 +974,8 @@ export function repairFlowchartNodeOutlines(svg: SVGSVGElement) {
     outline.classList.add('flowchart-node-outline');
     outline.setAttribute('aria-hidden', 'true');
     outline.setAttribute('focusable', 'false');
+    // Authored inline !important fills survive cloning and otherwise cover labels.
+    outline.style.setProperty('fill', 'none', 'important');
     node.append(outline);
   }
 }

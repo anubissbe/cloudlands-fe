@@ -1,10 +1,18 @@
-import type { FlowSubGraph } from 'mermaid/dist/diagrams/flowchart/types';
+interface FlowchartSubgraph {
+  id: string;
+  nodes: string[];
+}
+
+// Mermaid does not expose its flowchart database types from the public entry point.
+export interface FlowchartSubgraphDatabase {
+  getSubGraphs(): FlowchartSubgraph[];
+}
 
 export type FlowchartClusterMembership = ReadonlyMap<string, ReadonlySet<string>>;
 
 /** Copy Mermaid's semantic subgraphs before the next parse clears its database. */
 export function snapshotFlowchartClusterMembership(
-  groups: Pick<FlowSubGraph, 'id' | 'nodes'>[],
+  groups: FlowchartSubgraph[],
 ): FlowchartClusterMembership {
   const direct = new Map(groups.map(({ id, nodes }) => [id, [...nodes]]));
   const result = new Map<string, ReadonlySet<string>>();

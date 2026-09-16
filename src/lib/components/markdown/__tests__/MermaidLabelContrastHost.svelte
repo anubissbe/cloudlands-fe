@@ -2,9 +2,12 @@
   import MermaidRenderer from '../MermaidRenderer.svelte';
   import { MERMAID_WORKBENCH_CASES } from '../../diagrams/diagram-workbench.preview-fixtures';
 
-  let { theme = 'dark', htmlLabels = true }: { theme?: 'light' | 'dark'; htmlLabels?: boolean } =
-    $props();
-  // Representative existing fixture, not the unavailable user @test source.
+  let {
+    theme = 'dark',
+    htmlLabels = true,
+    exactSource,
+  }: { theme?: 'light' | 'dark'; htmlLabels?: boolean; exactSource?: string } = $props();
+  // Additional synthetic coverage for transparent fills and readable authored colors.
   const source = [
     MERMAID_WORKBENCH_CASES['mermaid-nested-groups'].source,
     'style Client fill:#dbeafe',
@@ -15,7 +18,7 @@
     'class Queue,Worker darkChild',
     'style Store fill:none,color:#eeeeee',
   ].join('\n');
-  const code = $derived(`---\nconfig:\n  htmlLabels: ${htmlLabels}\n---\n${source}`);
+  const code = $derived(exactSource ?? `---\nconfig:\n  htmlLabels: ${htmlLabels}\n---\n${source}`);
 
   $effect(() => {
     const root = document.documentElement;

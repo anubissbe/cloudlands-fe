@@ -3588,11 +3588,48 @@ function computeOrthogonalEdgePaths(
       .filter((other) => other !== route)
       .flatMap((other) => {
         const size = other.label ? measureEdgeLabel(other.label) : undefined;
-        return (other.points ?? []).slice(1).map((end, index) => {
-          const start = other.points![index];
+        const segments = (other.points ?? []).slice(1).map((end, index) => ({
+          start: other.points![index],
+          end,
+        }));
+        // The presenter prefers a clear horizontal label carrier. Reserving an
+        // additional label on its vertical leads can close an otherwise free gap.
+        const hasHorizontalLabelLane =
+          size &&
+          segments.some(({ start, end }) => {
+            if (start.y !== end.y || Math.abs(end.x - start.x) < size.width + 16) return false;
+            if (
+              segments.some(
+                (segment) => Math.abs(segment.end.y - segment.start.y) > Math.abs(end.x - start.x),
+              )
+            )
+              return false;
+            const x = (start.x + end.x) / 2;
+            const bounds = {
+              left: x - size.width / 2 - 8,
+              right: x + size.width / 2 + 8,
+              top: start.y - size.height / 2 - 8,
+              bottom: start.y + size.height / 2 + 8,
+            };
+            return (
+              !boxes.some(
+                (box) =>
+                  bounds.left < box.right &&
+                  bounds.right > box.left &&
+                  bounds.top < box.bottom &&
+                  bounds.bottom > box.top,
+              ) &&
+              ![...selfLoopEdges, ...computedEdges].some(
+                (candidate) =>
+                  candidate !== other && routeEntersObstacles(candidate.points ?? [], [bounds]),
+              )
+            );
+          });
+        return segments.map(({ start, end }) => {
           const horizontal = Math.abs(start.y - end.y) < 0.001;
           const labelFits =
             size &&
+            (horizontal || !hasHorizontalLabelLane) &&
             Math.hypot(end.x - start.x, end.y - start.y) >=
               (horizontal ? size.width : size.height) + 16;
           // Reserve the shaft and fitted label across the lane, not a label-sized
@@ -3630,11 +3667,38 @@ function computeOrthogonalEdgePaths(
         ]);
       }
     }
-    const source = { x: sourceX, y: fromNode.y + fromNode.height / 2 };
-    const target = { x: targetX, y: toNode.y + toNode.height / 2 };
-    if (Math.abs(targetX - sourceX) >= NODE_GAP * 2) {
-      const x = (sourceX + targetX) / 2;
-      candidates.push([source, { x, y: source.y }, { x, y: target.y }, target]);
+    const sideYs = (node: ComputedNode) => [
+      node.y + node.height / 2,
+      node.y + sideInset(node),
+      node.y + node.height - sideInset(node),
+    ];
+    const corridorDirection = forward ? 1 : -1;
+    if (Math.abs(targetX - sourceX) >= TRACK_SPACING * 2) {
+      // A midpoint turn can split a label-sized corridor into two unusable legs.
+      // Try local turns and painted-side ports as well, without moving the nodes.
+      const turns = [
+        (sourceX + targetX) / 2,
+        sourceX + corridorDirection * NODE_GAP,
+        targetX - corridorDirection * NODE_GAP,
+        sourceX + corridorDirection * TRACK_SPACING,
+        targetX - corridorDirection * TRACK_SPACING,
+      ].filter(
+        (x) =>
+          (x - sourceX) * corridorDirection >= TRACK_SPACING &&
+          (targetX - x) * corridorDirection >= TRACK_SPACING,
+      );
+      for (const sourceY of sideYs(fromNode)) {
+        for (const targetY of sideYs(toNode)) {
+          for (const x of turns) {
+            candidates.push([
+              { x: sourceX, y: sourceY },
+              { x, y: sourceY },
+              { x, y: targetY },
+              { x: targetX, y: targetY },
+            ]);
+          }
+        }
+      }
     }
     for (const below of [false, true]) {
       const start = {

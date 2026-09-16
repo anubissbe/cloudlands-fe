@@ -32,9 +32,23 @@ function contrast(foreground: string, background: string): number {
   return (Math.max(a, b) + 0.05) / (Math.min(a, b) + 0.05);
 }
 
+function expectSameColor(actual: string, expected: string): void {
+  const parsed = color(actual);
+  expect(parsed).not.toBeNull();
+  expect(parsed!.rgb()).toEqual(color(expected)!.rgb());
+}
+
 afterEach(() => document.body.replaceChildren());
 
 describe('Mermaid local label contrast', () => {
+  it('compares color values without depending on CSSOM serialization', () => {
+    expectSameColor('rgb(255, 255, 255)', '#ffffff');
+    expectSameColor('#fff', 'rgb(255, 255, 255)');
+    for (const incorrect of ['#000000', '#fffffe', 'rgba(255,255,255,0.5)', 'invalid']) {
+      expect(() => expectSameColor(incorrect, '#ffffff')).toThrow();
+    }
+  });
+
   it.each([false, true])('repairs pale nodes and preserves readable authors (HTML=%s)', (html) => {
     const svg = fixture(
       node('Blue', '#dbeafe', '#eeeeee', html) +
@@ -76,13 +90,19 @@ describe('Mermaid local label contrast', () => {
       ['Outer', new Set(['Inner', 'Push', 'Transparent'])],
       ['Inner', new Set(['Push', 'Transparent'])],
     ]);
+    const push = svg.querySelector<SVGElement>('#flowchart-Push-0 tspan')!;
+    const originalFill = push.style.fill;
+    const originalPriority = push.style.getPropertyPriority('fill');
     ensureMermaidLabelContrast(svg, membership);
     for (const text of svg.querySelectorAll<SVGElement>(
       '.cluster-label text, #flowchart-Transparent-0 tspan',
     )) {
       expect(contrast(getComputedStyle(text).fill, '#fef3c7')).toBeGreaterThanOrEqual(4.5);
     }
-    expect(svg.querySelector<SVGElement>('#flowchart-Push-0 tspan')!.style.fill).toBe('#ffffff');
+    expectSameColor(getComputedStyle(push).fill, '#ffffff');
+    expect(contrast(getComputedStyle(push).fill, '#172554')).toBeGreaterThanOrEqual(4.5);
+    expect(push.style.fill).toBe(originalFill);
+    expect(push.style.getPropertyPriority('fill')).toBe(originalPriority);
   });
 
   it.each([false, true])('preserves a readable authored group foreground (HTML=%s)', (html) => {
@@ -107,17 +127,26 @@ describe('Mermaid local label contrast', () => {
     },
   );
 
-  it('reconsiders the original foreground when a transparent backdrop changes', () => {
-    const svg = fixture(node('Transparent', 'none', '#ffffff'), '#ffffff');
-    const text = svg.querySelector<SVGElement>('tspan')!;
-    ensureMermaidLabelContrast(svg);
-    expect(contrast(getComputedStyle(text).fill, '#ffffff')).toBeGreaterThanOrEqual(4.5);
-    svg.style.backgroundColor = '#000000';
-    ensureMermaidLabelContrast(svg);
-    expect(text.style.fill).toBe('#ffffff');
-    ensureMermaidLabelContrast(svg);
-    expect(text.style.fill).toBe('#ffffff');
-  });
+  it.each(['', 'important'])(
+    'reconsiders the original foreground when a transparent backdrop changes (priority=%s)',
+    (priority) => {
+      const foreground = priority ? '#ffffff !important' : '#ffffff';
+      const svg = fixture(node('Transparent', 'none', foreground), '#ffffff');
+      const text = svg.querySelector<SVGElement>('tspan')!;
+      const originalFill = text.style.fill;
+      const originalPriority = text.style.getPropertyPriority('fill');
+      ensureMermaidLabelContrast(svg);
+      expect(contrast(getComputedStyle(text).fill, '#ffffff')).toBeGreaterThanOrEqual(4.5);
+      svg.style.backgroundColor = '#000000';
+      for (let repeat = 0; repeat < 2; repeat++) {
+        ensureMermaidLabelContrast(svg);
+        expectSameColor(getComputedStyle(text).fill, '#ffffff');
+        expect(contrast(getComputedStyle(text).fill, '#000000')).toBeGreaterThanOrEqual(4.5);
+        expect(text.style.fill).toBe(originalFill);
+        expect(text.style.getPropertyPriority('fill')).toBe(originalPriority);
+      }
+    },
+  );
 
   it('accounts for HTML label backgrounds and nested authored text independently', () => {
     const svg = fixture(`<g class="node"><rect style="fill:#000000"/><g class="label">

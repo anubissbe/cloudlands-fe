@@ -26,10 +26,10 @@
   } from './mermaid-theme';
   import { splitSemanticLabel } from '$lib/components/diagrams/diagram-label-wrap';
   import type { SvgBounds } from './mermaid-state-layout';
-  import type { FlowDB } from 'mermaid/dist/diagrams/flowchart/flowDb';
   import {
     snapshotFlowchartClusterMembership,
     type FlowchartClusterMembership,
+    type FlowchartSubgraphDatabase,
   } from './mermaid-cluster-membership';
   import { addMermaidLabelKnockouts, insertLabelKnockout } from './mermaid-label-knockouts';
   import { loadMermaidTextFont } from './mermaid-font-loading';
@@ -1607,7 +1607,7 @@ ${source}`;
             if (generation !== renderGeneration) return;
             if (diagram.type === 'flowchart-v2') {
               clusterMembership = snapshotFlowchartClusterMembership(
-                (diagram.db as FlowDB).getSubGraphs(),
+                (diagram.db as typeof diagram.db & FlowchartSubgraphDatabase).getSubGraphs(),
               );
             }
           }

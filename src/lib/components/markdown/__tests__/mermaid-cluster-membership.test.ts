@@ -1,7 +1,9 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import mermaid from 'mermaid';
-import type { FlowDB } from 'mermaid/dist/diagrams/flowchart/flowDb';
-import { snapshotFlowchartClusterMembership } from '../mermaid-cluster-membership';
+import {
+  snapshotFlowchartClusterMembership,
+  type FlowchartSubgraphDatabase,
+} from '../mermaid-cluster-membership';
 import { reserveFlowchartClusterHeaderBands } from '../mermaid-path-geometry';
 
 type Box = { x: number; y: number; width: number; height: number };
@@ -200,9 +202,10 @@ describe('semantic cluster framing', () => {
       { id: 'inner', nodes: ['member'] },
       { id: 'outer', nodes: ['inner'] },
     ];
-    const first = snapshotFlowchartClusterMembership(groups);
+    const database: FlowchartSubgraphDatabase = { getSubGraphs: () => groups };
+    const first = snapshotFlowchartClusterMembership(database.getSubGraphs());
     groups[0].nodes.splice(0, 1, 'replacement');
-    const second = snapshotFlowchartClusterMembership(groups);
+    const second = snapshotFlowchartClusterMembership(database.getSubGraphs());
     expect([...first.get('outer')!].sort()).toEqual(['inner', 'member']);
     expect([...second.get('outer')!].sort()).toEqual(['inner', 'replacement']);
     expect(snapshotFlowchartClusterMembership([]).size).toBe(0);
@@ -223,7 +226,9 @@ describe('semantic cluster framing', () => {
       Dev[Developer] --> Machine
       Machine <-->|Logbook| Bucket
       CDN[Static files] -.-> Bucket`);
-    const membership = snapshotFlowchartClusterMembership((diagram.db as FlowDB).getSubGraphs());
+    const membership = snapshotFlowchartClusterMembership(
+      (diagram.db as typeof diagram.db & FlowchartSubgraphDatabase).getSubGraphs(),
+    );
     expect([...membership.get('Machine')!].sort()).toEqual([
       'Bundle',
       'Git',
