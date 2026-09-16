@@ -75,7 +75,7 @@ const walkthroughs: Walkthrough[] = [
       visibleNodes: ['chat', 'redux', 'daemon'],
       visibleEdges: ['w2', 'w3', 'w4'],
       highlightedNodes: ['daemon'],
-      camera: { focus: 'daemon', zoom: 1.1 },
+      camera: { focus: 'daemon', zoom: 1.1 }, // protocol-version-ok: camera zoom; daemon is a node ID
       narrative: {
         title: '2. Follow execution',
         text: 'The daemon runs the turn and streams state events back.',

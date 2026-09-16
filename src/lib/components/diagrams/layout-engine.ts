@@ -3584,6 +3584,17 @@ function computeOrthogonalEdgePaths(
       bottom: node.y + node.height + clearance,
     }));
     boxes.push(...(groups ?? []).map(groupTitleObstacle));
+    // Labels apply their own 8px node margin, independent of shaft clearance.
+    // Keep the existing group and title obstacles unchanged for both checks.
+    const labelBoxes = [
+      ...nodes.map((node) => ({
+        left: node.x,
+        right: node.x + node.width,
+        top: node.y,
+        bottom: node.y + node.height,
+      })),
+      ...boxes.slice(nodes.length),
+    ];
     const occupied = [...selfLoopEdges, ...computedEdges]
       .filter((other) => other !== route)
       .flatMap((other) => {
@@ -3612,7 +3623,7 @@ function computeOrthogonalEdgePaths(
               bottom: start.y + size.height / 2 + 8,
             };
             return (
-              !boxes.some(
+              !labelBoxes.some(
                 (box) =>
                   bounds.left < box.right &&
                   bounds.right > box.left &&
@@ -3655,6 +3666,7 @@ function computeOrthogonalEdgePaths(
         });
       });
     const obstacles = [...boxes, ...occupied];
+    const labelObstacles = [...labelBoxes, ...occupied];
     const candidates: RoutePoint[][] = [];
     const sideInset = (node: ComputedNode) =>
       Math.min(node.height / 4, ['db', 'store', 'data_store'].includes(node.kind ?? '') ? 10 : 6);
@@ -3732,7 +3744,7 @@ function computeOrthogonalEdgePaths(
         return (centeredHorizontal ? [0.5] : [0.5, 0.25, 0.75]).some((fraction) => {
           const x = start.x + (end.x - start.x) * fraction;
           const y = start.y + (end.y - start.y) * fraction;
-          return !obstacles.some(
+          return !labelObstacles.some(
             (box) =>
               x - label.width / 2 - 8 < box.right &&
               x + label.width / 2 + 8 > box.left &&
