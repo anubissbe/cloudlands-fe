@@ -27,6 +27,8 @@
     // $app alias stubs wired in playwright-ct.config.ts ctViteConfig (alias resolution
     // is not followed by knip); playwright/index.ts is listed under "playwright-ct" below
     "playwright/app-stubs/*.ts",
+    // Explicit CT root keeps its exact-source fixture imports reachable for analysis.
+    "src/lib/components/markdown/__tests__/mermaid-label-contrast-exact-source.ct.spec.ts",
     // Loaded via <script src> in operate-patterns.visual.html (visual test harness)
     "src/lib/components/ui/card/operate-patterns.visual.ts",
     // Dynamically imported as import('$lib/dev-tools') in src/routes/(app)/+layout.svelte

@@ -3619,9 +3619,13 @@ function computeOrthogonalEdgePaths(
                   bounds.top < box.bottom &&
                   bounds.bottom > box.top,
               ) &&
+              // The replacement is checked against this reserved carrier below;
+              // its discarded detour must not veto the carrier first.
               ![...selfLoopEdges, ...computedEdges].some(
                 (candidate) =>
-                  candidate !== other && routeEntersObstacles(candidate.points ?? [], [bounds]),
+                  candidate !== other &&
+                  candidate !== route &&
+                  routeEntersObstacles(candidate.points ?? [], [bounds]),
               )
             );
           });
@@ -3713,13 +3717,19 @@ function computeOrthogonalEdgePaths(
       const y = below ? Math.max(start.y, end.y) + lead : Math.min(start.y, end.y) - lead;
       candidates.push([start, { x: start.x, y }, { x: end.x, y }, end]);
     }
-    const supportsLabel = (points: RoutePoint[]) =>
-      !label ||
-      points.slice(1).some((end, index) => {
-        const start = points[index];
+    const supportsLabel = (points: RoutePoint[], centeredHorizontal = false) => {
+      if (!label) return true;
+      const segments = routeSegments(points);
+      const carriers = centeredHorizontal
+        ? segments
+            .filter(({ horizontal }) => horizontal)
+            .toSorted((a, b) => Math.abs(b.end.x - b.start.x) - Math.abs(a.end.x - a.start.x))
+            .slice(0, 1)
+        : segments;
+      return carriers.some(({ start, end }) => {
         const extent = start.y === end.y ? label.width : label.height;
         if (Math.hypot(end.x - start.x, end.y - start.y) < extent + 16) return false;
-        return [0.5, 0.25, 0.75].some((fraction) => {
+        return (centeredHorizontal ? [0.5] : [0.5, 0.25, 0.75]).some((fraction) => {
           const x = start.x + (end.x - start.x) * fraction;
           const y = start.y + (end.y - start.y) * fraction;
           return !obstacles.some(
@@ -3731,19 +3741,31 @@ function computeOrthogonalEdgePaths(
           );
         });
       });
+    };
     const originalIsBlocked = routeEntersObstacles(route.points, boxes);
+    const originalHasCenteredLabel = supportsLabel(route.points, true);
     const simpler = candidates
       .map(simplifyOrthogonalPoints)
+      .map((points) => ({ points, centeredLabel: supportsLabel(points, true) }))
       .filter(
-        (points) =>
+        ({ points, centeredLabel }) =>
           (originalIsBlocked ||
             points.length < route.points!.length ||
             (points.length === route.points!.length &&
-              routeLength(points) < routeLength(route.points!))) &&
+              ((centeredLabel && !originalHasCenteredLabel) ||
+                (centeredLabel === originalHasCenteredLabel &&
+                  routeLength(points) < routeLength(route.points!))))) &&
           !routeEntersObstacles(points, obstacles) &&
           supportsLabel(points),
       )
-      .toSorted((a, b) => a.length - b.length || routeLength(a) - routeLength(b))[0];
+      // With equal bend counts, prefer the presenter's long horizontal midpoint
+      // over a shorter route that only supports an off-center or vertical label.
+      .toSorted(
+        (a, b) =>
+          a.points.length - b.points.length ||
+          Number(b.centeredLabel) - Number(a.centeredLabel) ||
+          routeLength(a.points) - routeLength(b.points),
+      )[0]?.points;
     if (simpler) {
       route.points = simpler;
       route.path = buildRoundedOrthogonalPath(simpler);

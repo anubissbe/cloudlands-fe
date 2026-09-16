@@ -209,7 +209,10 @@ describe('custom return corridor simplification', () => {
         for (const [index, label] of labels.entries()) {
           const opposite = { x: label.x + label.width, y: label.y + label.height };
           for (const node of layout.nodes) {
-            expect(enters(label, opposite, node)).toBe(false);
+            expect(
+              enters(label, opposite, node),
+              JSON.stringify({ edge: labeledEdges[index], label, node }),
+            ).toBe(false);
           }
           for (const other of labels.slice(index + 1)) {
             expect(enters(label, opposite, other)).toBe(false);
@@ -334,7 +337,7 @@ describe('custom return corridor simplification', () => {
     const model: DiagramModel = {
       nodes: [
         { id: 'a', label: 'A', position: { x: 0, y: 0 }, size: { width: 100, height: 48 } },
-        { id: 'b', label: 'B', position: { x: 201, y: 80 }, size: { width: 100, height: 48 } },
+        { id: 'b', label: 'B', position: { x: 250, y: 80 }, size: { width: 100, height: 48 } },
       ],
       edges: [{ id: 'back', from: 'b', to: 'a', label: 'Signal 0' }],
     };
@@ -346,7 +349,10 @@ describe('custom return corridor simplification', () => {
     const left = layout.nodes.find(({ id }) => id === 'a')!;
     const right = layout.nodes.find(({ id }) => id === 'b')!;
     const size = measureEdgeLabel(edge.label!);
-    expect(right.x - left.x - left.width).toBeLessThan((size.width + 16) * 2);
+    const facingGap = right.x - left.x - left.width;
+    // Layout may compact authored coordinates; establish the intended gap from its output.
+    expect(facingGap).toBeGreaterThanOrEqual(size.width + 16 + 16);
+    expect(facingGap).toBeLessThan((size.width + 16) * 2);
     expect(edge.points).toHaveLength(4);
     expect(Math.min(...edge.points!.map(({ y }) => y))).toBeGreaterThanOrEqual(left.y);
     expect(Math.max(...edge.points!.map(({ y }) => y))).toBeLessThanOrEqual(right.y + right.height);

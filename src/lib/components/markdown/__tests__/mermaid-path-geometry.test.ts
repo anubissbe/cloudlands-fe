@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { color } from 'd3';
 import {
   alignMermaidOpenArrowheads,
   buildDownstreamFanoutRoutes,
@@ -36,6 +37,13 @@ import {
 type TestPoint = { x: number; y: number };
 type TestBounds = TestPoint & { width: number; height: number };
 
+function expectNonpaintingFill(fill: string): void {
+  if (fill.trim().toLowerCase() === 'none') return;
+  const parsed = color(fill);
+  expect(parsed).not.toBeNull();
+  expect(parsed!.opacity).toBe(0);
+}
+
 function expectOrthogonalRoute(points: TestPoint[]) {
   expect(
     points.slice(0, -1).every((point, index) => {
@@ -72,6 +80,15 @@ function expectRouteAvoids(points: TestPoint[], bounds: TestBounds) {
 }
 
 describe('Mermaid path terminal geometry', () => {
+  it('recognizes nonpainting fills without accepting visible or unknown paints', () => {
+    for (const fill of ['none', 'transparent', 'rgba(0,0,0,0)', '#dbeafe00']) {
+      expectNonpaintingFill(fill);
+    }
+    for (const fill of ['#dbeafe', '#dcfce7', 'rgba(0,0,0,0.5)', 'url(#paint)', 'invalid', '']) {
+      expect(() => expectNonpaintingFill(fill), fill).toThrow();
+    }
+  });
+
   it.each([false, true])(
     'keeps cloned outlines unfilled without changing authored shapes or labels (HTML=%s)',
     (html) => {
@@ -99,7 +116,10 @@ describe('Mermaid path terminal geometry', () => {
           const outlines = [...svg.querySelectorAll<SVGElement>('.flowchart-node-outline')];
           expect(outlines).toHaveLength(originals.length);
           for (const [index, outline] of outlines.entries()) {
-            expect(getComputedStyle(outline).fill).toBe('none');
+            expect(outline.style.getPropertyValue('fill')).toBe('none');
+            expectNonpaintingFill(getComputedStyle(outline).fill);
+            const originalFill = getComputedStyle(originals[index]).fill;
+            expect(() => expectNonpaintingFill(originalFill)).toThrow();
             expect(outline.style.getPropertyPriority('fill')).toBe('important');
             expect(outline.style.stroke).toBe(originals[index].style.stroke);
             for (const attribute of ['x', 'y', 'width', 'height', 'transform']) {
