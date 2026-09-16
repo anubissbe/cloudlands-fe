@@ -7,11 +7,11 @@
   import {
     faRobot,
     faPlay,
+    faSpinner,
     faArrowUpRightFromSquare,
     faCheck,
   } from '@fortawesome/free-solid-svg-icons';
-  import { IntentMarkLoader } from '$lib/components/ui/indicators';
-  import { notify } from '$lib/components/patterns/notify';
+  import { toast } from 'svelte-sonner';
   import { parseAgentTypeId } from '$shared/types/agent.types';
   import { selectSelectedModel } from '$store/renderer/slices/model/model-selectors';
 
@@ -19,7 +19,11 @@
   import AgentAvatar from '$features/agent/components/agent-avatar/AgentAvatar.svelte';
   import { createLogger } from '$lib/utils/client-logger';
   import { openAgentTabRequested } from '$store/renderer/slices/app-layout/app-layout-slice';
-  import { createAgentFromConfigRequested } from '$store/renderer/slices/workspace-agents/workspace-agents-slice';
+  import {
+    clearAgentCreationRequest,
+    createAgentFromConfigRequested,
+  } from '$store/renderer/slices/workspace-agents/workspace-agents-slice';
+  import { selectAgentCreationRequest } from '$store/renderer/slices/workspace-agents/workspace-agents-selectors';
   import { store as appStore } from '$store/renderer/store';
   import { m } from '$shared/paraglide/messages.js';
 
@@ -34,120 +38,109 @@
   // Component state
   let running = $state(false);
   let agentId = $state<string | null>(null);
+  let requestStartedAt = $state('');
+  let creationRequestHandled = $state(false);
 
   // Get workspaceId from extension options
   let workspaceId = $derived(extension?.options?.workspaceId as string | undefined);
-
-  function getErrorMessage(err: unknown): string {
-    if (err instanceof Error) return err.message;
-    if (typeof err === 'string') return err;
-    return m.notes_agentActionBlock_unknown_error();
-  }
+  // svelte-ignore state_referenced_locally -- node-view identity is fixed for this instance.
+  const initialWorkspaceId = extension?.options?.workspaceId as string | undefined;
+  const creationRequestId = globalThis.crypto.randomUUID();
+  const creationRequest$ = selectAgentCreationRequest(initialWorkspaceId, creationRequestId);
 
   // Get button state
   let buttonState = $derived.by(() => {
     if (running) {
-      return { label: m.notes_agentActionBlock_running_label(), icon: null };
+      return { label: m.notes_agentActionBlock_running_label(), icon: faSpinner, spin: true };
     }
     if (agentId) {
       return {
         label: m.notes_agentActionBlock_view_label(),
         icon: faArrowUpRightFromSquare,
+        spin: false,
       };
     }
     if (primitive?.lastRun?.status === 'success') {
-      return { label: m.notes_agentActionBlock_done_label(), icon: faCheck };
+      return { label: m.notes_agentActionBlock_done_label(), icon: faCheck, spin: false };
     }
-    return { label: m.notes_agentActionBlock_run_label(), icon: faPlay };
+    return { label: m.notes_agentActionBlock_run_label(), icon: faPlay, spin: false };
   });
 
   // Run the agent action
-  async function runAction() {
+  function runAction() {
     if (!primitive || running) return;
     if (!workspaceId) {
-      notify.error(m.notes_agentActionBlock_noWorkspace_error());
+      toast.error(m.notes_agentActionBlock_noWorkspace_error());
       return;
     }
     running = true;
+    creationRequestHandled = false;
 
-    try {
-      // Build context references from primitive inputs
-      const contextReferences =
-        primitive.inputs?.map((input) => ({
-          type: input.kind === 'semantic_ref' ? 'file' : input.kind,
-          path: input.semanticId || input.pattern || input.heading,
-          content: input.content,
-        })) || [];
-
-      const state = appStore.state;
-      const action = createAgentFromConfigRequested(workspaceId, {
-        name: primitive.goal.length > 40 ? primitive.goal.slice(0, 40) + '...' : primitive.goal,
-        // Derived from the primitive goal, not user-chosen — keep the session
-        // self-renameable.
-        nameExplicitlySet: false,
-        workspaceId: WorkspaceId(workspaceId),
-        model: selectSelectedModel.select(state),
-        agentType: parseAgentTypeId(primitive.agentId || '') || 'chat',
-        source: 'agent-action-block',
-        initialMessage: primitive.goal,
-        contextReferences,
-        metadata: {
-          source: 'agent-action-block',
-          primitiveId: primitive.id,
-        },
-      });
-      appStore.dispatch(action);
-
-      const createdAgent = await action.promise;
-      // The daemon assigns the agent id; adopt it from the created session.
-      agentId = createdAgent.id;
-      running = false;
-
-      // Update primitive with running status and agent link
-      const now = new Date().toISOString();
-      if (updateAttributes) {
-        updateAttributes({
-          data: {
-            ...primitive,
-            createdByAgentId: agentId,
-            lastRun: {
-              status: 'running',
-              startedAt: now,
-            },
-          },
-        });
-      }
-
-      notify.success(m.notes_agentActionBlock_started_label());
-    } catch (err) {
-      const errorMessage = getErrorMessage(err);
-      logger.error('[runAction] Error running agent action', {
-        error: err,
+    const contextReferences =
+      primitive.inputs?.map((input) => ({
+        type: input.kind === 'semantic_ref' ? 'file' : input.kind,
+        path: input.semanticId || input.pattern || input.heading,
+        content: input.content,
+      })) || [];
+    requestStartedAt = new Date().toISOString();
+    appStore.dispatch(
+      createAgentFromConfigRequested(
         workspaceId,
+        {
+          name: primitive.goal.length > 40 ? primitive.goal.slice(0, 40) + '...' : primitive.goal,
+          nameExplicitlySet: false,
+          workspaceId: WorkspaceId(workspaceId),
+          model: selectSelectedModel.select(appStore.state),
+          agentType: parseAgentTypeId(primitive.agentId || '') || 'chat',
+          source: 'agent-action-block',
+          initialMessage: primitive.goal,
+          contextReferences,
+          metadata: { source: 'agent-action-block', primitiveId: primitive.id },
+        },
+        { requestId: creationRequestId },
+      ),
+    );
+  }
+
+  $effect(() => {
+    const request = $creationRequest$;
+    const wsId = workspaceId;
+    if (!request || request.loading || !wsId || creationRequestHandled) return;
+    creationRequestHandled = true;
+    running = false;
+    if (request.error) {
+      const now = new Date().toISOString();
+      agentId = null;
+      logger.error('[runAction] Error running agent action', {
+        error: request.error,
+        workspaceId: wsId,
         agentId: primitive?.agentId,
       });
-      running = false;
-      agentId = null;
-
-      // Update with error status
-      if (updateAttributes && primitive) {
-        const now = new Date().toISOString();
-        updateAttributes({
-          data: {
-            ...primitive,
-            lastRun: {
-              status: 'error',
-              startedAt: now,
-              finishedAt: now,
-              errorMessage,
-            },
+      updateAttributes?.({
+        data: {
+          ...primitive,
+          lastRun: {
+            status: 'error',
+            startedAt: requestStartedAt,
+            finishedAt: now,
+            errorMessage: request.error,
           },
-        });
-      }
-
-      notify.error(errorMessage);
+        },
+      });
+      toast.error(request.error);
+    } else if (request.agentId) {
+      agentId = request.agentId;
+      updateAttributes?.({
+        data: {
+          ...primitive,
+          createdByAgentId: agentId,
+          lastRun: { status: 'running', startedAt: requestStartedAt },
+        },
+      });
+      toast.success(m.notes_agentActionBlock_started_label());
     }
-  }
+    appStore.dispatch(clearAgentCreationRequest(wsId, request.requestId));
+  });
 
   // Handle button click
   function handleButtonClick(event: MouseEvent) {
@@ -187,15 +180,14 @@
     >
       {#if linkedAgentId}
         <!-- Show agent avatar that opens the agent panel -->
-        <Button
+        <button
           type="button"
-          variant="ghost"
           class="shrink-0 rounded-sm transition-opacity hover:opacity-80"
           onclick={(e) => handleOpenAgent(e, linkedAgentId)}
           title={m.notes_agentActionBlock_viewAgent_tooltip()}
         >
           <AgentAvatar agentId={linkedAgentId} variant="compact" />
-        </Button>
+        </button>
       {:else}
         <Fa icon={faRobot} size="sm" class="shrink-0 text-muted-foreground" />
       {/if}
@@ -209,11 +201,7 @@
         onclick={handleButtonClick}
         disabled={running}
       >
-        {#if running}
-          <IntentMarkLoader size={12} />
-        {:else if buttonState.icon}
-          <Fa icon={buttonState.icon} size="xs" />
-        {/if}
+        <Fa icon={buttonState.icon} size="xs" class={buttonState.spin ? 'animate-spin' : ''} />
         {buttonState.label}
       </Button>
     </div>
