@@ -33,10 +33,11 @@ describe('compareProtocolMajor', () => {
     expect(compareProtocolMajor('1.2', '1.5.3')).toBe('match');
   });
 
-  it('treats the execution-environment daemon surface (10.2) as compatible with a 10.x baseline', () => {
-    expect(compareProtocolMajor('10.0', '10.2')).toBe('match');
-    expect(compareProtocolMajor('10.1', '10.2')).toBe('match');
-    expect(compareProtocolMajor('10.2', '10.2')).toBe('match');
+  it('treats the execution-environment daemon surface (10.3) as compatible with a 10.x baseline', () => {
+    expect(compareProtocolMajor('10.0', '10.3')).toBe('match');
+    expect(compareProtocolMajor('10.1', '10.3')).toBe('match');
+    expect(compareProtocolMajor('10.2', '10.3')).toBe('match');
+    expect(compareProtocolMajor('10.3', '10.3')).toBe('match');
   });
 
   it('reports a mismatch when the majors differ', () => {
