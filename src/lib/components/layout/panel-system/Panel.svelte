@@ -194,7 +194,7 @@
   let panelRef = $state.raw<HTMLDivElement | null>(null);
 
   // Keep recently-visited tabs mounted for faster switching
-  // Tabs are kept for PANEL_TAB_CACHE_TTL_MS after switching away, then unmounted
+  // Non-browser tabs expire after PANEL_TAB_CACHE_TTL_MS; live browser pages persist.
   const tabCacheOptions = {
     ttlMs: PANEL_TAB_CACHE_TTL_MS,
     maxInactiveTabs: MAX_CACHED_INACTIVE_TABS,
@@ -248,20 +248,20 @@
     }
   });
 
-  // Enforce the TTL even when the active tab does not change again. Without
-  // this timer, inactive browser/editor/diff tabs can stay mounted forever.
+  // Retained browser workspaces still expire disposable content while hidden.
+  // Their selected tab is inactive too; only live browser pages bypass expiry.
   $effect(() => {
-    if (!active) return;
+    const cacheActiveTabId = active ? panel.activeTabId : null;
     const delay = getNextPanelTabCacheExpiryDelay(
       cachedTabIds,
-      panel.activeTabId,
+      cacheActiveTabId,
       Date.now(),
       PANEL_TAB_CACHE_TTL_MS,
       panel.tabs,
     );
     if (delay === null) return;
 
-    const timeout = setTimeout(() => applyTabCacheUpdate(panel.tabs, panel.activeTabId), delay);
+    const timeout = setTimeout(() => applyTabCacheUpdate(panel.tabs, cacheActiveTabId), delay);
     return () => clearTimeout(timeout);
   });
 
@@ -525,7 +525,8 @@
     - Render active tab + recently visited tabs (cached for 30s)
     - Inactive tabs are hidden with CSS but remain mounted
     - This provides instant tab switching for recently used tabs
-    - After 30s of inactivity, tabs are unmounted to save memory
+    - After 30s of inactivity, non-browser tabs are unmounted to save memory
+    - Browser pages stay mounted until closed, including in inactive workspaces
 
     During tab drag operations, pointer-events are disabled to prevent:
     - Editors from showing paste cursors
