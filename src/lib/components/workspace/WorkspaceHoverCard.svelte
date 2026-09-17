@@ -365,9 +365,9 @@
         <Skeleton class="h-4 w-40" />
         <Skeleton class="mt-2 h-10 w-full" />
       </div>
-      <div class="my-4 border-t border-border" data-workspace-hover-card-divider></div>
+      <div class="my-3 border-t border-border" data-workspace-hover-card-divider></div>
       <div
-        class="body-grid grid min-w-0 grid-cols-1 items-stretch gap-2 px-5 pb-4"
+        class="body-grid grid min-w-0 grid-cols-1 items-stretch gap-3 px-5 pb-4"
         data-workspace-hover-card-columns
       >
         <div class="grid" data-workspace-hover-card-activity>
@@ -411,11 +411,11 @@
       </div>
     </header>
     {#if hasBodyContent}<div
-        class="my-4 border-t border-border"
+        class="my-3 border-t border-border"
         data-workspace-hover-card-divider
       ></div>
       <div
-        class="body-grid grid min-w-0 grid-cols-1 items-stretch gap-2 px-5 pb-4"
+        class="body-grid grid min-w-0 grid-cols-1 items-stretch gap-3 px-5 pb-4"
         data-workspace-hover-card-columns
       >
         {#if hasAgentRows}<section
@@ -429,7 +429,7 @@
                   <Button
                     variant="plain"
                     wrapContent={false}
-                    class="grid h-auto! min-h-8 w-full min-w-0 cursor-pointer grid-cols-[1.5rem_minmax(0,1fr)_auto] items-start justify-normal gap-x-2.5 gap-y-0 whitespace-normal rounded-sm border-0! px-2! py-0.5! text-left font-normal transition-colors hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                    class="grid h-auto! min-h-8 w-full min-w-0 cursor-pointer grid-cols-[1rem_minmax(0,1fr)_auto] items-start justify-normal gap-x-2 gap-y-0 whitespace-normal rounded-sm border-0! px-2! py-0! text-left font-normal transition-colors hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
                     aria-label={rowAccessibleLabel(row)}
                     data-workspace-hover-card-agent-row
                     data-agent-group-row={row.group}
@@ -438,16 +438,16 @@
                     onclick={(event) => openAgentRow(event, row.id)}
                   >
                     <span
-                      class="row-span-2 flex h-8 w-6 items-center justify-start"
+                      class="row-span-2 flex h-(--text-caption-line-height) items-center"
                       aria-hidden="true"
                       ><AgentAvatarWithState
                         agentId={row.id}
-                        variant="emphasized"
+                        variant="compact"
                         state={row.avatarState}
                         specialist={row.specialist ?? null}
                       /></span
                     ><span
-                      class="type-body min-w-0 truncate text-foreground"
+                      class="type-caption min-w-0 truncate text-foreground"
                       data-workspace-hover-card-agent-name>{row.name}</span
                     ><time
                       class="type-caption whitespace-nowrap text-muted-foreground"
@@ -473,7 +473,7 @@
                 </div>{/each}
             </div>
             {#if hiddenCount}<div
-                class="type-body mt-4 flex items-center justify-between text-muted-foreground"
+                class="type-caption mt-3 flex items-center justify-between text-muted-foreground"
                 data-workspace-hover-card-overflow
               >
                 <span
@@ -500,11 +500,11 @@
                   {#snippet prRowContent()}
                     <Fa
                       icon={pr.statusIcon}
-                      size={18}
+                      size={16}
                       class="shrink-0 justify-self-start {pr.foregroundClass}"
                     />
                     <span
-                      class="type-body min-w-0 truncate text-foreground"
+                      class="type-caption min-w-0 truncate text-foreground"
                       data-workspace-hover-card-pr-title
                     >
                       {pr.title || m.workspace_hoverCard_pullRequest_label()}
@@ -524,7 +524,7 @@
                     <Button
                       variant="plain"
                       wrapContent={false}
-                      class="grid h-auto! w-full min-w-0 grid-cols-[1.5rem_minmax(0,1fr)_auto_auto] items-center justify-normal gap-x-2.5 whitespace-normal rounded-sm border-0! px-2! py-1! text-left font-normal transition-colors hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                      class="grid h-auto! w-full min-w-0 grid-cols-[1rem_minmax(0,1fr)_auto_auto] items-center justify-normal gap-x-2 whitespace-normal rounded-sm border-0! px-2! py-0! text-left font-normal transition-colors hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
                       aria-label={getWorkspacePrLabel(pr)}
                       data-workspace-hover-card-pr-row
                       data-pr-identity={pr.identity}
@@ -536,7 +536,7 @@
                     </Button>
                   {:else}
                     <div
-                      class="grid w-full min-w-0 grid-cols-[1.5rem_minmax(0,1fr)_auto_auto] items-center gap-x-2.5 rounded-sm px-2 py-1 text-left"
+                      class="grid w-full min-w-0 grid-cols-[1rem_minmax(0,1fr)_auto_auto] items-center gap-x-2 rounded-sm px-2 py-0 text-left"
                       data-workspace-hover-card-pr-row
                       data-pr-identity={pr.identity}
                       data-pr-status={pr.status}
@@ -548,7 +548,7 @@
               {/each}
             </div>
             {#if hiddenPrCount}<div
-                class="type-body mt-4 flex items-center justify-between text-muted-foreground"
+                class="type-caption mt-3 flex items-center justify-between text-muted-foreground"
                 data-workspace-hover-card-pr-overflow
               >
                 <span

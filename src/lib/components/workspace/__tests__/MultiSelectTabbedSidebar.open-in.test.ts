@@ -263,6 +263,9 @@ vi.mock('../sidebar/WorkspaceProgressCard.svelte', async () => ({
 vi.mock('../WorkspaceTerminalDock.svelte', async () => ({
   default: (await import('../sidebar/__tests__/mocks/MockSimple.svelte')).default,
 }));
+vi.mock('../WorkspaceShellList.svelte', async () => ({
+  default: (await import('../sidebar/__tests__/mocks/MockSimple.svelte')).default,
+}));
 vi.mock('../SidebarBrowserLauncher.svelte', async () => ({
   default: (await import('../sidebar/__tests__/mocks/MockSimple.svelte')).default,
 }));
@@ -428,7 +431,6 @@ describe('MultiSelectTabbedSidebar Files Open In', () => {
     const label = launcher.querySelector<HTMLElement>('[data-sidebar-launcher-label]')!;
     const dropdown = launcher.querySelector<HTMLElement>('[data-sidebar-pr-dropdown]')!;
     const trigger = launcher.querySelector<HTMLButtonElement>('[data-sidebar-pr-trigger]')!;
-    const resource = container.querySelector<HTMLElement>('[data-sidebar-changes-resource]');
 
     expect(label.textContent).toBe('Changes');
     expect(label.nextElementSibling).toBe(dropdown);
@@ -446,11 +448,6 @@ describe('MultiSelectTabbedSidebar Files Open In', () => {
     // The menu content is portaled, so a closed menu renders no rows anywhere.
     expect(document.body.querySelector('[data-sidebar-pr-link]')).toBeNull();
     expect(launcher.textContent).not.toContain('1,373');
-    expect(
-      resource
-        ?.querySelector('[data-resource-icon-tile]')
-        ?.getAttribute('data-resource-icon-variant'),
-    ).toBe('emphasized');
 
     await fireEvent.click(trigger);
     await waitFor(() => expect(trigger.getAttribute('aria-expanded')).toBe('true'));
@@ -480,6 +477,98 @@ describe('MultiSelectTabbedSidebar Files Open In', () => {
     await fireEvent.click(cardAction);
     expect(mocks.dispatch).toHaveBeenCalledWith(
       expect.objectContaining({ type: 'sidebarNav/setMultiSelectSidebarSelectedTabs' }),
+    );
+  });
+
+  it('round-trips the Changes launcher without redirecting direct PR actions', async () => {
+    const prUrl = 'https://github.com/intent-hq/project/pull/77';
+    mocks.pullRequests = [
+      {
+        id: 'pr-77',
+        number: 77,
+        url: prUrl,
+        title: 'Launcher round-trip pull request',
+        status: 'Open',
+        createdAt: '2026-08-12T00:00:00.000Z',
+        updatedAt: '2026-08-12T00:00:00.000Z',
+      },
+    ];
+    const Sidebar = (await import('../MultiSelectTabbedSidebar.svelte')).default;
+    await mocks.dispatch.withImplementation(
+      (action) => {
+        if (action?.type === 'sidebarNav/setMultiSelectSidebarSelectedTabs') {
+          const [workspaceId, tabIds] = action.payload as [string, string[]];
+          mocks.setSelectedTabs(workspaceId, tabIds);
+        }
+        return action;
+      },
+      async () => {
+        const { container } = render(Sidebar, { props: { workspaceId: 'ws-1' } });
+        const selections = () =>
+          mocks.dispatch.mock.calls
+            .map(([action]) => action)
+            .filter((action) => action.type === 'sidebarNav/setMultiSelectSidebarSelectedTabs');
+        const openPr = async (owner: HTMLElement) => {
+          const trigger = owner.querySelector<HTMLButtonElement>('[data-sidebar-pr-trigger]')!;
+          await fireEvent.click(trigger);
+          await waitFor(() => expect(trigger.getAttribute('aria-expanded')).toBe('true'));
+          const link = await waitFor(() => {
+            const found = document.body.querySelector<HTMLElement>(
+              '[role="menu"] [data-sidebar-pr-link]',
+            );
+            expect(found).not.toBeNull();
+            return found!;
+          });
+          expect(link.dataset.sidebarPrUrl).toBe(prUrl);
+          await fireEvent.click(link);
+          await waitFor(() => expect(trigger.getAttribute('aria-expanded')).toBe('false'));
+          await waitFor(() => expect(document.body.querySelector('[role="menu"]')).toBeNull());
+        };
+        const launcher = container.querySelector<HTMLElement>('[data-sidebar-launcher="changes"]')!;
+        await openPr(launcher);
+        expect(mocks.handleLink.mock.calls).toEqual([[prUrl, { workspaceId: 'ws-1' }]]);
+        expect(selections()).toEqual([]);
+        expect(container.querySelector('[data-sidebar-card-tab="changes"]')).toBeNull();
+
+        await fireEvent.click(within(launcher).getByRole('button', { name: 'Expand panel' }));
+        const expandedSelection = {
+          type: 'sidebarNav/setMultiSelectSidebarSelectedTabs',
+          payload: ['ws-1', ['changes']],
+        };
+        expect(selections()).toEqual([expandedSelection]);
+        await waitFor(() =>
+          expect(container.querySelector('[data-testid="sidebar-launchers"]')).toBeNull(),
+        );
+        const card = container.querySelector<HTMLElement>('[data-sidebar-card-tab="changes"]')!;
+        expect(card).not.toBeNull();
+        await openPr(card);
+        expect(mocks.handleLink.mock.calls).toEqual([
+          [prUrl, { workspaceId: 'ws-1' }],
+          [prUrl, { workspaceId: 'ws-1' }],
+        ]);
+        expect(selections()).toEqual([expandedSelection]);
+        expect(container.querySelector('[data-sidebar-card-tab="changes"]')).toBe(card);
+
+        await fireEvent.click(card.querySelector<HTMLButtonElement>('[data-sidebar-close]')!);
+        const expectedSelections = [
+          expandedSelection,
+          { type: 'sidebarNav/setMultiSelectSidebarSelectedTabs', payload: ['ws-1', ['overview']] },
+        ];
+        expect(selections()).toEqual(expectedSelections);
+        await waitFor(() =>
+          expect(container.querySelector('[data-sidebar-card-tab="changes"]')).toBeNull(),
+        );
+        const restored = container.querySelector<HTMLElement>('[data-sidebar-launcher="changes"]')!;
+        expect(restored).not.toBeNull();
+        await openPr(restored);
+        expect(mocks.handleLink.mock.calls).toEqual([
+          [prUrl, { workspaceId: 'ws-1' }],
+          [prUrl, { workspaceId: 'ws-1' }],
+          [prUrl, { workspaceId: 'ws-1' }],
+        ]);
+        expect(selections()).toEqual(expectedSelections);
+        expect(container.querySelector('[data-sidebar-card-tab="changes"]')).toBeNull();
+      },
     );
   });
 
@@ -555,7 +644,15 @@ describe('MultiSelectTabbedSidebar Files Open In', () => {
 
     expect(container.querySelector('[data-sidebar-pr-trigger]')).toBeNull();
     expect(document.body.querySelector('[data-sidebar-pr-link]')).toBeNull();
-    expect(container.querySelector('[data-sidebar-changes-resource]')).not.toBeNull();
+    await fireEvent.click(
+      container.querySelector<HTMLButtonElement>(
+        '[data-sidebar-launcher="changes"] .launcher-tile-action',
+      )!,
+    );
+    expect(mocks.dispatch).toHaveBeenCalledWith({
+      type: 'sidebarNav/setMultiSelectSidebarSelectedTabs',
+      payload: ['ws-1', ['changes']],
+    });
   });
 
   it.each([
@@ -1332,5 +1429,25 @@ describe('MultiSelectTabbedSidebar Files Open In', () => {
 
     expect(second.container.querySelector('.sidebar-expanded-card')).not.toBeNull();
     expect(second.container.querySelector('[data-expanded-agent="agent-1"]')).not.toBeNull();
+  });
+
+  it('describes the expanded Shells card but leaves the Agents card without prose', async () => {
+    const { TAB_DEFINITIONS } = await import('../multi-select-sidebar-tabs');
+    const shellDescription = TAB_DEFINITIONS.find((tab) => tab.id === 'shell')!.description;
+    const agentsDescription = TAB_DEFINITIONS.find((tab) => tab.id === 'agents')!.description;
+    const Sidebar = (await import('../MultiSelectTabbedSidebar.svelte')).default;
+
+    mocks.selectedTabs = ['shell'];
+    const shell = render(Sidebar, { props: { workspaceId: 'ws-1' } });
+    const shellCard = shell.container.querySelector<HTMLElement>('.sidebar-expanded-card')!;
+    expect(within(shellCard).getByText(shellDescription)).toBeTruthy();
+
+    cleanup();
+    mocks.agents = [makeAgent('agent-1')];
+    mocks.selectedTabs = ['agents'];
+    const agents = render(Sidebar, { props: { workspaceId: 'ws-1' } });
+    const agentsCard = agents.container.querySelector<HTMLElement>('.sidebar-expanded-card')!;
+    expect(within(agentsCard).queryByText(agentsDescription)).toBeNull();
+    expect(within(agentsCard).queryByText(shellDescription)).toBeNull();
   });
 });
