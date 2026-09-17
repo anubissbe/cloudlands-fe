@@ -24,7 +24,7 @@
    * commit 27293564. The WebSocket API settings are transient UI state that do not
    * belong in Redux; the settings themselves are persisted by the daemon.
    */
-  import { onDestroy, tick } from 'svelte';
+  import { onDestroy, tick, type Snippet } from 'svelte';
   import { slide } from '$lib/motion';
   import {
     Button,
@@ -60,6 +60,8 @@
     SelfPublishedStateResult,
     UnpublishSelfResult,
   } from '$shared/types/connections';
+
+  let { expanded = true, children }: { expanded?: boolean; children?: Snippet } = $props();
 
   const CONNECTIONS = IPC_CHANNELS.CONNECTIONS;
 
@@ -688,7 +690,7 @@
                   kind: 'switch',
                   id: 'websocket-api-enabled',
                   label: m.settings_wsApi_enable_label(),
-                  description: m.settings_wsApi_enable_description(),
+                  description: m.settings_devices_remoteAccess_description(),
                   get: () => enabled,
                   set: handleToggle,
                   disabled: () => loading || toggleBusy,
@@ -703,69 +705,11 @@
 <div class="flex min-w-0 flex-col gap-4" data-settings-websocket-api>
   <SettingsForm schema={connectionSchema} embedded compact={false} />
 
-  {#if !isRemote}
-    {#if enabled && tunnelSupported}
-      <div transition:slide={{ tier: 'moderate' }} class="space-y-4">
-        <!-- Tailcat tunnel toggle: drives server.tunnel.enabled. Absent on
-             old daemons predating the server.tunnel.* settings. -->
-        {#snippet tunnelDescription()}
-          {m.settings_tunnel_enable_description()}{' '}<Button
-            variant="link"
-            size="sm"
-            href="https://github.com/tailscale/tailcat"
-            target="_blank"
-            rel="noopener noreferrer"
-            class="h-auto px-0">{m.settings_tunnel_github_link()}</Button
-          >
-        {/snippet}
-        <section data-tunnel-toggle-row>
-          <SettingsFieldRow
-            id="websocket-tunnel"
-            label={m.settings_tunnel_enable_label()}
-            descriptionContent={tunnelDescription}
-            disabled={toggleBusy || listenSaving}
-          >
-            {#snippet control({ labelId, descriptionId })}
-              <Switch
-                checked={tunnelEnabled}
-                onCheckedChange={handleTunnelToggle}
-                disabled={toggleBusy || listenSaving}
-                ariaLabelledby={labelId}
-                ariaDescribedby={descriptionId}
-              />
-            {/snippet}
-          </SettingsFieldRow>
-        </section>
+  {#if expanded}
+    {@render children?.()}
+  {/if}
 
-        <!-- This daemon's own tailcat tunnel address (copyable) — shown only
-             while the tunnel is on and the daemon reports one. -->
-        {#if tunnelEnabled && tcAddress}
-          <section data-tunnel-address-row>
-            <div class="flex items-center justify-between gap-2">
-              <span class="type-body text-muted-foreground">
-                {m.settings_tunnel_tcAddress_label()}
-              </span>
-              <div class="flex items-center gap-2 shrink-0">
-                <code
-                  class="type-caption font-mono text-foreground bg-muted px-2 py-0.5 rounded max-w-[280px] truncate"
-                  title={tcAddress}>{tcAddress}</code
-                >
-                <Button
-                  variant="ghost"
-                  type="button"
-                  onclick={handleCopyTcAddress}
-                  class="p-1.5 text-muted-foreground hover:text-foreground rounded-md hover:bg-muted transition-colors cursor-pointer"
-                  title={m.settings_tunnel_tcAddress_copy()}
-                >
-                  <Fa icon={faCopy} size="sm" />
-                </Button>
-              </div>
-            </div>
-          </section>
-        {/if}
-      </div>
-    {/if}
-
+  {#if !isRemote && expanded}
     {#if enabled && bindAddressSupported}
       <div transition:slide={{ tier: 'moderate' }}>
         <!-- Local Network Access: a view over server.bindAddress (ON when a
@@ -793,48 +737,11 @@
       </div>
     {/if}
 
-    <!-- Port (always visible) -->
-    <SettingsFieldRow
-      id="websocket-port"
-      label={m.settings_wsApi_port_label()}
-      error={portValid ? undefined : m.settings_wsApi_port_invalid()}
-      disabled={portSaving}
-    >
-      {#snippet control({ labelId, errorId })}
-        <div class="flex items-center gap-2">
-          <div class="shrink-0 w-32">
-            <Input
-              type="number"
-              min="1024"
-              max="65535"
-              bind:value={editedPort}
-              disabled={portSaving}
-              aria-label={m.settings_wsApi_port_ariaLabel()}
-              aria-labelledby={labelId}
-              aria-describedby={errorId}
-            />
-          </div>
-          {#if Number(editedPort) !== persistedPort}
-            <Button
-              variant="link"
-              size="sm"
-              type="button"
-              onclick={handlePortSave}
-              disabled={portSaving || !portValid}
-              class="h-auto px-0"
-            >
-              {portSaving ? m.settings_wsApi_port_saving() : m.settings_wsApi_port_save()}
-            </Button>
-          {/if}
-        </div>
-      {/snippet}
-    </SettingsFieldRow>
-
     {#if enabled}
       <div transition:slide={{ tier: 'moderate' }} class="space-y-4">
         <!-- Listen targets: the daemon's bind candidates with the bound ones
              selected. Shown only while Local Network Access is ON; the tunnel
-             is toggled above, not in the selector. -->
+             is configured under Advanced, not in the selector. -->
         {#if localNetworkShown}
           <section transition:slide={{ tier: 'moderate' }}>
             <ListenTargetSelector
@@ -885,12 +792,167 @@
           </SettingsFieldRow>
         {/if}
 
+        <!-- Token -->
+        <section class="space-y-3">
+          <SettingsFieldRow id="websocket-token" label={m.settings_wsApi_apiToken_label()}>
+            {#snippet control()}
+              <div class="flex min-w-0 max-w-full items-center gap-2">
+                <code
+                  class="type-caption font-mono text-foreground bg-muted px-2 py-1 rounded min-w-0 max-w-[280px] truncate select-all"
+                >
+                  {showToken ? token : maskedToken}
+                </code>
+                <Button
+                  variant="ghost"
+                  type="button"
+                  onclick={() => (showToken = !showToken)}
+                  class="p-1.5 text-muted-foreground hover:text-foreground rounded-md hover:bg-muted transition-colors cursor-pointer"
+                  title={showToken ? m.settings_wsApi_hideToken() : m.settings_wsApi_showToken()}
+                >
+                  <Fa icon={showToken ? faEyeSlash : faEye} size="sm" />
+                </Button>
+                <Button
+                  variant="ghost"
+                  type="button"
+                  onclick={handleCopy}
+                  class="p-1.5 text-muted-foreground hover:text-foreground rounded-md hover:bg-muted transition-colors cursor-pointer"
+                  title={m.settings_wsApi_copyToken()}
+                >
+                  <Fa icon={faCopy} size="sm" />
+                </Button>
+                <Button
+                  variant="ghost"
+                  type="button"
+                  onclick={handleRegenerate}
+                  disabled={regenerating}
+                  class="p-1.5 text-muted-foreground hover:text-foreground rounded-md hover:bg-muted transition-colors cursor-pointer disabled:opacity-50"
+                  title={m.settings_wsApi_regenerateToken()}
+                >
+                  {#if regenerating}
+                    <IntentMarkLoader size={14} />
+                  {:else}
+                    <Fa icon={faRotateRight} size="sm" />
+                  {/if}
+                </Button>
+              </div>
+            {/snippet}
+          </SettingsFieldRow>
+          <p class="type-body text-warning-ink">
+            {m.settings_wsApi_tokenSecretWarning()}
+          </p>
+        </section>
+      </div>
+    {/if}
+    <div class="space-y-4 border-t border-border pt-4">
+      <h3 class="type-caption font-medium text-muted-foreground">
+        {m.settings_devices_advanced_label()}
+      </h3>
+      {#if enabled && tunnelSupported}
+        <div transition:slide={{ tier: 'moderate' }} class="space-y-4">
+          <!-- Tailcat tunnel toggle: drives server.tunnel.enabled. Absent on
+             old daemons predating the server.tunnel.* settings. -->
+          {#snippet tunnelDescription()}
+            {m.settings_tunnel_enable_description()}{' '}<Button
+              variant="link"
+              size="sm"
+              href="https://github.com/tailscale/tailcat"
+              target="_blank"
+              rel="noopener noreferrer"
+              class="h-auto px-0">{m.settings_tunnel_github_link()}</Button
+            >
+          {/snippet}
+          <section data-tunnel-toggle-row>
+            <SettingsFieldRow
+              id="websocket-tunnel"
+              label={m.settings_tunnel_enable_label()}
+              descriptionContent={tunnelDescription}
+              disabled={toggleBusy || listenSaving}
+            >
+              {#snippet control({ labelId, descriptionId })}
+                <Switch
+                  checked={tunnelEnabled}
+                  onCheckedChange={handleTunnelToggle}
+                  disabled={toggleBusy || listenSaving}
+                  ariaLabelledby={labelId}
+                  ariaDescribedby={descriptionId}
+                />
+              {/snippet}
+            </SettingsFieldRow>
+          </section>
+
+          <!-- This daemon's own tailcat tunnel address (copyable) — shown only
+             while the tunnel is on and the daemon reports one. -->
+          {#if tunnelEnabled && tcAddress}
+            <section data-tunnel-address-row>
+              <div class="flex items-center justify-between gap-2">
+                <span class="type-body text-muted-foreground">
+                  {m.settings_tunnel_tcAddress_label()}
+                </span>
+                <div class="flex items-center gap-2 shrink-0">
+                  <code
+                    class="type-caption font-mono text-foreground bg-muted px-2 py-0.5 rounded max-w-[280px] truncate"
+                    title={tcAddress}>{tcAddress}</code
+                  >
+                  <Button
+                    variant="ghost"
+                    type="button"
+                    onclick={handleCopyTcAddress}
+                    class="p-1.5 text-muted-foreground hover:text-foreground rounded-md hover:bg-muted transition-colors cursor-pointer"
+                    title={m.settings_tunnel_tcAddress_copy()}
+                  >
+                    <Fa icon={faCopy} size="sm" />
+                  </Button>
+                </div>
+              </div>
+            </section>
+          {/if}
+        </div>
+      {/if}
+
+      <!-- Port remains configurable even while remote access is disabled. -->
+      <SettingsFieldRow
+        id="websocket-port"
+        label={m.settings_wsApi_port_label()}
+        error={portValid ? undefined : m.settings_wsApi_port_invalid()}
+        disabled={portSaving}
+      >
+        {#snippet control({ labelId, errorId })}
+          <div class="flex items-center gap-2">
+            <div class="shrink-0 w-32">
+              <Input
+                type="number"
+                min="1024"
+                max="65535"
+                bind:value={editedPort}
+                disabled={portSaving}
+                aria-label={m.settings_wsApi_port_ariaLabel()}
+                aria-labelledby={labelId}
+                aria-describedby={errorId}
+              />
+            </div>
+            {#if Number(editedPort) !== persistedPort}
+              <Button
+                variant="link"
+                size="sm"
+                type="button"
+                onclick={handlePortSave}
+                disabled={portSaving || !portValid}
+                class="h-auto px-0"
+              >
+                {portSaving ? m.settings_wsApi_port_saving() : m.settings_wsApi_port_save()}
+              </Button>
+            {/if}
+          </div>
+        {/snippet}
+      </SettingsFieldRow>
+
+      {#if enabled}
         <!-- TLS Certificate Fingerprint (truncated single line by user
              preference — reverses cloudlands-fe#1979's full-width display;
              the full value stays available via the title tooltip) -->
         {#if certFingerprint}
           <section>
-            <div class="flex items-center justify-between">
+            <div class="flex flex-wrap items-center justify-between gap-2">
               <span class="type-body text-muted-foreground"
                 >{m.settings_wsApi_tlsFingerprint_label()}</span
               >
@@ -901,57 +963,8 @@
             </div>
           </section>
         {/if}
-
-        <!-- Token -->
-        <section class="space-y-3">
-          <div class="flex items-center justify-between">
-            <span class="type-body text-muted-foreground">{m.settings_wsApi_apiToken_label()}</span>
-            <div class="flex items-center gap-2">
-              <code
-                class="type-caption font-mono text-foreground bg-muted px-2 py-1 rounded max-w-[280px] truncate select-all"
-              >
-                {showToken ? token : maskedToken}
-              </code>
-              <Button
-                variant="ghost"
-                type="button"
-                onclick={() => (showToken = !showToken)}
-                class="p-1.5 text-muted-foreground hover:text-foreground rounded-md hover:bg-muted transition-colors cursor-pointer"
-                title={showToken ? m.settings_wsApi_hideToken() : m.settings_wsApi_showToken()}
-              >
-                <Fa icon={showToken ? faEyeSlash : faEye} size="sm" />
-              </Button>
-              <Button
-                variant="ghost"
-                type="button"
-                onclick={handleCopy}
-                class="p-1.5 text-muted-foreground hover:text-foreground rounded-md hover:bg-muted transition-colors cursor-pointer"
-                title={m.settings_wsApi_copyToken()}
-              >
-                <Fa icon={faCopy} size="sm" />
-              </Button>
-              <Button
-                variant="ghost"
-                type="button"
-                onclick={handleRegenerate}
-                disabled={regenerating}
-                class="p-1.5 text-muted-foreground hover:text-foreground rounded-md hover:bg-muted transition-colors cursor-pointer disabled:opacity-50"
-                title={m.settings_wsApi_regenerateToken()}
-              >
-                {#if regenerating}
-                  <IntentMarkLoader size={14} />
-                {:else}
-                  <Fa icon={faRotateRight} size="sm" />
-                {/if}
-              </Button>
-            </div>
-          </div>
-          <p class="type-body text-warning-ink">
-            {m.settings_wsApi_tokenSecretWarning()}
-          </p>
-        </section>
-      </div>
-    {/if}
+      {/if}
+    </div>
   {/if}
 </div>
 

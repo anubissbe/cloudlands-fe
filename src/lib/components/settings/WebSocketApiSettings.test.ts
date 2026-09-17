@@ -1221,14 +1221,6 @@ describe('WebSocketApiSettings', () => {
         screen.getByRole('switch', { name: LOCAL_NETWORK() }).getAttribute('aria-checked'),
       ).toBe('true');
       expect(screen.getByRole('checkbox', { name: '10.0.0.5' })).toBeTruthy();
-      // Positioned after the tunnel toggle row.
-      const tunnelRow = screen
-        .getByRole('switch', { name: m.settings_tunnel_enable_label() })
-        .closest('section') as HTMLElement;
-      const localRow = screen
-        .getByRole('switch', { name: LOCAL_NETWORK() })
-        .closest('section') as HTMLElement;
-      expect(tunnelRow.compareDocumentPosition(localRow)).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
     });
 
     it('is OFF with Listen targets hidden when bindAddress is loopback only', async () => {

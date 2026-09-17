@@ -1,6 +1,7 @@
 import { expect, test } from '@playwright/experimental-ct-svelte';
 import type { ConnectionRecord } from '$shared/types/connections';
 import DeviceRow from '../DeviceRow.svelte';
+import Preview from '../devices-settings.preview.svelte';
 
 const device: ConnectionRecord = {
   id: 'remote-1',
@@ -43,3 +44,39 @@ test('keeps edit fields and controls contained at narrow width', async ({ mount,
     expect(inputBox!.x + inputBox!.width).toBeLessThanOrEqual(formBox!.x + formBox!.width + 1);
   }
 });
+
+for (const width of [360, 1024]) {
+  test(`local configuration stays contained at the ${width < 768 ? 'stacked' : 'two-column'} settings breakpoint`, async ({
+    mount,
+    page,
+  }) => {
+    await page.setViewportSize({ width, height: 900 });
+    await page.emulateMedia({ reducedMotion: 'reduce' });
+    await mount(Preview, {
+      props: { expanded: true },
+      hooksConfig: { geometrySnapshot: { scene: 'devices-settings', state: 'local-expanded' } },
+    });
+    const local = page.getByRole('article', { name: 'This machine (local)' });
+    await expect(local.getByRole('button', { name: 'Show QR Code' })).toBeVisible();
+    await page.evaluate(() => document.fonts.ready);
+    const overflowing = await local.evaluate((row) => {
+      const bounds = row.getBoundingClientRect();
+      return [...row.querySelectorAll('button, input, code')]
+        .filter((node) => node.getClientRects().length > 0)
+        .filter((node) => {
+          const rect = node.getBoundingClientRect();
+          return rect.left < bounds.left - 1 || rect.right > bounds.right + 1;
+        })
+        .map((node) => node.getAttribute('aria-label') ?? node.textContent);
+    });
+    expect(overflowing).toEqual([]);
+    await local.getByRole('button', { name: 'Done', exact: true }).click();
+    await expect(local.getByRole('spinbutton', { name: 'Port' })).toHaveCount(0);
+    const actions = local.getByRole('button', { name: 'Actions for This machine (local)' });
+    await expect(actions).toBeFocused();
+    await page.keyboard.press('Enter');
+    await page.getByRole('menuitem', { name: 'Edit', exact: true }).click();
+    await expect(local.getByTestId('device-icon-picker-trigger')).toBeVisible();
+    await expect(local.getByRole('spinbutton', { name: 'Port' })).toHaveValue('5181');
+  });
+}
