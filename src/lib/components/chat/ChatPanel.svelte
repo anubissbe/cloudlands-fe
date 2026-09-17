@@ -278,7 +278,11 @@
     eventCardAssistantMarginClass,
     isAttentionQuestionAnswerSeam,
   } from './attention-flow-spacing';
-  import { getSubscriptionCardSeam, isChatCardMessage } from './subscription-card-spacing';
+  import {
+    getSubscriptionCardSeam,
+    hasVisibleTurnBody,
+    isChatCardMessage,
+  } from './subscription-card-spacing';
   import {
     captureMessageSendOrigin,
     createMessageSendLaunchBubble,
@@ -6083,12 +6087,6 @@
                   )}
                   {@const currentIsChatCard = isChatCardMessage(turn.userMessage)}
                   {@const nextIsChatCard = isChatCardMessage(nextTurn?.userMessage)}
-                  {@const subscriptionCardSeam = getSubscriptionCardSeam(
-                    currentIsChatCard &&
-                      turn.assistantMessages.length === 0 &&
-                      turn.noticeMessages.length === 0,
-                    nextIsChatCard,
-                  )}
                   {@const isLastTurnInConversation =
                     globalTurnIndexMap.get(turnKey) === globalTurnIndexMap.size - 1}
                   {@const showPendingAssistantStatus =
@@ -6101,10 +6099,27 @@
                       error: effectiveError,
                       modelUnavailable: $chatModelUnavailable$,
                     })}
-                  {@const hasTurnBody =
-                    turn.assistantMessages.length > 0 ||
-                    turn.noticeMessages.length > 0 ||
-                    showPendingAssistantStatus}
+                  {@const hasTurnBody = hasVisibleTurnBody({
+                    assistantMessages: turn.assistantMessages,
+                    hasVisibleNotice: turn.noticeMessages.some((notice) =>
+                      Boolean(getModelChangeNotice(notice)),
+                    ),
+                    hasPendingStatus:
+                      showPendingAssistantStatus ||
+                      (groupIndex === groupedMessages.length - 1 &&
+                        turnIndex === turns.length - 1 &&
+                        turn.assistantMessages.length > 0 &&
+                        Boolean(
+                          $agentSessionIsStreaming$ || effectiveError || $chatModelUnavailable$,
+                        )),
+                    suppressCoordinationStoppedIndicator: turn.userMessage
+                      ? isAutomatedMessage(turn.userMessage)
+                      : false,
+                  })}
+                  {@const subscriptionCardSeam = getSubscriptionCardSeam(
+                    currentIsChatCard && !hasTurnBody,
+                    nextIsChatCard,
+                  )}
                   {@const compactOperationalTurnBoundary = hasOperationalAssistantTurnBoundary(
                     turn,
                     nextTurn,
@@ -6165,7 +6180,7 @@
                         data-message-index={globalIndex}
                         class="message-nav-target relative z-10 {eventCardAssistantMarginClass(
                           message,
-                          turn.assistantMessages.length > 0 || showPendingAssistantStatus,
+                          hasTurnBody,
                         )}"
                         use:attachPinnedPromptMessage={message}
                         transition:safeDisclosureTransition={{ tier: 'moderate' }}

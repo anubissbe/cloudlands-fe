@@ -1296,6 +1296,7 @@
         .map((group) => group.parentKey ?? group.key),
     ]),
   ]);
+  let activeBrowseProviderId = $state('');
   const providerTabsEnabled = $derived(activeBrowseProviderId !== '');
   const preferredBrowseProviderId = $derived(
     providerTabIds.includes(selectedModelProviderId)
@@ -1304,7 +1305,6 @@
         ? normalizeProviderId(effectiveProviderId)
         : (providerTabIds[0] ?? ''),
   );
-  let activeBrowseProviderId = $state('');
 
   $effect(() => {
     if (!providerTabIds.includes(activeBrowseProviderId)) {
