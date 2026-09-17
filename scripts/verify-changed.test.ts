@@ -355,6 +355,49 @@ describe('verification planning', () => {
     expect(deletedPlan.checks.map((check) => check.id)).toContain('vitest-ui-invariants');
   });
 
+  it('runs the full component suite for CT-contract paths and nothing else', () => {
+    const root = fixtureRoot({
+      'src/app.css': "@import '$lib/styles/tokens.css';",
+      'src/lib/styles/tokens.css': ':root { --color: red; }',
+      'scripts/run-ct-tests.mjs': '',
+      'playwright-ct.config.ts': '',
+      'playwright/index.ts': '',
+      'src/lib/component-catalog/capture-stability.ts': '',
+      'src/lib/component-catalog/geometry-probe.ts': '',
+      'src/lib/component-catalog/preview-definition.ts': '',
+      'src/lib/component-catalog/catalog.ts': '',
+      'src/foo.test.ts': '',
+      'src/lib/example.ts': '',
+    });
+    const ids = (files: string[]) =>
+      createVerificationPlan(files, { root, ctTests: [] }).checks.map((check) => check.id);
+    for (const file of [
+      'src/lib/styles/tokens.css',
+      'src/lib/styles/removed.css',
+      'src/app.css',
+      'scripts/run-ct-tests.mjs',
+      'playwright-ct.config.ts',
+      'playwright/index.ts',
+      'src/lib/component-catalog/capture-stability.ts',
+      'src/lib/component-catalog/geometry-probe.ts',
+      'src/lib/component-catalog/preview-definition.ts',
+      'package.json',
+      'pnpm-lock.yaml',
+    ]) {
+      expect(ids([file]), file).toContain('ct-full');
+      expect(ids([file]), file).not.toContain('ct-related');
+    }
+    for (const file of [
+      'src/foo.test.ts',
+      'src/lib/example.ts',
+      'src/lib/component-catalog/catalog.ts',
+      'scripts/verify-changed.mjs',
+    ]) {
+      expect(ids([file]), file).not.toContain('ct-full');
+      expect(ids([file]), file).not.toContain('ct-related');
+    }
+  });
+
   describe('suites declaring verify:changed triggers', () => {
     const driftTest = 'scripts/inline-ipc-channels.test.ts';
     const catalogTest = 'src/lib/components/__tests__/catalog.test.ts';
