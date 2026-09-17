@@ -553,7 +553,8 @@
         <Button
           type="button"
           variant="plain"
-          class="inline-flex shrink-0 p-0 border-0 bg-transparent cursor-pointer align-text-bottom rounded-sm focus:outline-none focus:ring-1 focus:ring-primary"
+          size="compact"
+          class="inline-flex shrink-0 p-0 border-0 bg-transparent cursor-pointer align-text-bottom rounded-xs focus:outline-none focus:ring-1 focus:ring-primary"
           data-testid="queued-image-thumbnail"
           onclick={(e) => {
             e.stopPropagation();
@@ -568,14 +569,14 @@
             <img
               {src}
               alt={m.chat_chatMessage_attachedImage_alt({ number: formatInteger(i + 1) })}
-              class="h-[1.1em] w-[1.1em] rounded-sm border border-border object-cover hover:opacity-90 transition-opacity"
+              class="h-[1.1em] w-[1.1em] rounded-xs border border-border object-cover hover:opacity-90 transition-opacity"
               onerror={() => handleReferenceImageError(block, src)}
             />
           {:else}
             <!-- Reference still resolving, failed to load, or its file is
              gone: neutral placeholder tile instead of a broken img. -->
             <span
-              class="h-[1.1em] w-[1.1em] rounded-sm border border-border bg-muted/50 inline-block"
+              class="h-[1.1em] w-[1.1em] rounded-xs border border-border bg-muted/50 inline-block"
               data-testid="queued-image-placeholder"
             ></span>
           {/if}

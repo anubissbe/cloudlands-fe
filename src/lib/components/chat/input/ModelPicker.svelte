@@ -47,6 +47,7 @@
   import {
     clearModelFallbackInfo,
     selectModel,
+    setLoadingStateForProvider,
     setModelFallbackInfo,
     setModelPickerGroupCollapsed,
     setAgentModelRequested,
@@ -61,7 +62,10 @@
     selectIsProviderModelAccessAllowed,
     selectModelFetchProviderIds,
   } from '$store/renderer/slices/provider-settings/provider-settings-selectors';
-  import { loadProviderModelsRequested } from '$store/renderer/slices/provider-models/provider-models-slice';
+  import {
+    loadProviderModelsRequested,
+    providerModelsLoaded,
+  } from '$store/renderer/slices/provider-models/provider-models-slice';
   import {
     selectProviderModelsCacheEntry,
     selectProviderModelsCacheMap,
@@ -69,6 +73,7 @@
   } from '$store/renderer/slices/provider-models/provider-models-selectors';
 
   import { splitLegacyCompoundId } from '$shared/utils/legacy-model-id';
+  import { getModelsForProviderForLoadingState } from '$store/renderer/slices/model/model-utils';
   import {
     selectEffectiveDefaultProviderId,
     selectNormalizedProviderId,
@@ -91,6 +96,7 @@
   import { navigateToSettings } from '$lib/utils/workspace-navigation';
   import { notify } from '$lib/components/patterns/notify';
   import { IntentMarkLoader } from '$lib/components/ui/indicators';
+  import { OPTION_LIST_END_SLOT_CLASS } from '$lib/styles/option-list-row';
   import { m } from '$shared/paraglide/messages.js';
   import {
     faArrowsRotate,
@@ -317,6 +323,24 @@
   ): ProviderWarningNotice | null {
     const normalizedId = normalizeProviderId(providerId);
     return createProviderWarningNotice(normalizedId, warnings[normalizedId]);
+  }
+
+  function setProviderWarningState(
+    providerId: string,
+    warning: string | undefined,
+    stale: boolean | undefined,
+  ) {
+    const normalizedId = normalizeProviderId(providerId);
+    appStore.dispatch(
+      setLoadingStateForProvider({ providerId: normalizedId, status: 'success', warning, stale }),
+    );
+  }
+
+  function setProviderErrorState(providerId: string, error: string) {
+    const normalizedId = normalizeProviderId(providerId);
+    appStore.dispatch(
+      setLoadingStateForProvider({ providerId: normalizedId, status: 'error', error }),
+    );
   }
 
   // Hydrate from the session-lifetime provider-models cache
@@ -641,10 +665,21 @@
       // True force refresh: the daemon skips its cache and awaits a fresh
       // probe (PROTOCOL §6.7), so the spinner spins for the real probe
       // duration and the returned list replaces the group immediately.
-      appStore.dispatch(loadProviderModelsRequested(providerId, true));
+      const result = await getModelsForProviderForLoadingState(providerId, {
+        forceRefresh: true,
+      });
       if (isStale()) return;
+      setProviderWarningState(providerId, result.warning, result.stale);
+      if (providerId === effectiveProviderId && usesAgentProviderFetch) {
+        agentProviderModels = result.models;
+      }
       const { [providerId]: _clearedError, ...remainingErrors } = allProviderErrors;
       allProviderErrors = remainingErrors;
+      allProviderModels = {
+        ...allProviderModels,
+        [providerId]: toDropdownOptions(result.models),
+      };
+      appStore.dispatch(providerModelsLoaded(providerId, result, cacheEpoch));
     } catch (err) {
       if (isStale()) return;
       const providerError = formatProviderLoadError(providerId, err);
@@ -652,9 +687,13 @@
         ...allProviderErrors,
         [providerId]: providerError,
       };
+      setProviderErrorState(providerId, providerError.displayText);
       logger.warn('Failed to refresh models for provider', { providerId, error: err });
     } finally {
-      // Redux loading state owns terminal settlement for dispatched requests.
+      refreshingProviderEpochs.delete(providerId);
+      const next = new Set(refreshingProviders);
+      next.delete(providerId);
+      refreshingProviders = next;
     }
   }
 
@@ -1245,7 +1284,7 @@
         .map((group) => group.parentKey ?? group.key),
     ]),
   ]);
-  const providerTabsEnabled = $derived(providerTabIds.length > 1);
+  const providerTabsEnabled = $derived(activeBrowseProviderId !== '');
   const preferredBrowseProviderId = $derived(
     providerTabIds.includes(selectedModelProviderId)
       ? selectedModelProviderId
@@ -1727,7 +1766,7 @@
     clearFallbackInfo();
   }
 
-  async function handleModelChange(value: string | string[]) {
+  async function handleModelChange(value: string | string[], event?: MouseEvent) {
     const modelValue = value as string;
     // Gate user-picked changes to a *different* model behind the optional
     // confirmation callback (mid-conversation switch warning). Re-selecting
@@ -1751,7 +1790,7 @@
         return;
       }
     }
-    if (modalAware) {
+    if (modalAware || !event) {
       queueMicrotask(() => {
         dropdownOpen = false;
         dropdownRef?.focusTrigger();
@@ -1857,21 +1896,6 @@
   {/snippet}
 
   {#snippet dropdownFooter()}
-    {#if showReasoningFooter}
-      <div class="px-2 py-2" data-testid="model-reasoning-section">
-        <EffortPicker
-          mode="embedded"
-          {agentId}
-          {workspaceId}
-          effortLevels={reasoningLevels}
-          effort={persistedReasoningEffort}
-          disabled={reasoningControlDisabled}
-          busy={updatingReasoningEffort}
-          {modalAware}
-          onEffortChange={handleReasoningSelect}
-        />
-      </div>
-    {/if}
     {#if !allProvidersLoaded && Object.keys(allProviderModels).length > 0}
       <div class="px-3 py-2 flex items-center gap-2 text-xs text-muted-foreground">
         <IntentMarkLoader size={12} />
@@ -1891,6 +1915,22 @@
             />
           </div>
         {/each}
+      </div>
+    {/if}
+    {#if showReasoningFooter}
+      <div class="w-full min-w-0 px-3 py-2" data-testid="model-reasoning-section">
+        <EffortPicker
+          mode="embedded"
+          class="w-full min-w-0 gap-2! [&>div]:w-24 [&>span]:min-w-0 [&>span>span]:truncate"
+          {agentId}
+          {workspaceId}
+          effortLevels={reasoningLevels}
+          effort={persistedReasoningEffort}
+          disabled={reasoningControlDisabled}
+          busy={updatingReasoningEffort}
+          {modalAware}
+          onEffortChange={handleReasoningSelect}
+        />
       </div>
     {/if}
   {/snippet}
@@ -2107,20 +2147,14 @@
           />
         {:else}
           <div class="flex-1 min-w-0">
-            <div class="flex items-baseline justify-between gap-2">
-              <span
-                class={cn(
-                  'truncate text-sm font-medium',
-                  option.value === USE_DEFAULT_VALUE && 'italic text-muted-foreground',
-                  selected && 'font-medium',
-                )}
-              >
-                {option.label}
-              </span>
-              {#if selected}
-                <Fa icon={faCheck} class="text-xs text-primary shrink-0" />
-              {/if}
-            </div>
+            <span
+              class={cn(
+                'block truncate text-sm font-normal',
+                option.value === USE_DEFAULT_VALUE && 'text-muted-foreground',
+              )}
+            >
+              {option.label}
+            </span>
             {#if option.description}
               <div class="text-xs text-subtle truncate mt-0.5" title={option.description}>
                 {option.description}
@@ -2128,7 +2162,9 @@
             {/if}
           </div>
           {#if selected}
-            <Fa icon={faCheck} class="size-4 text-primary-ink shrink-0" />
+            <span class={OPTION_LIST_END_SLOT_CLASS}>
+              <Fa icon={faCheck} class="size-4 text-primary-ink shrink-0" />
+            </span>
           {/if}
         {/if}
       </div>
