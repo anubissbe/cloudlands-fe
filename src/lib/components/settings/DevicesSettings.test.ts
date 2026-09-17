@@ -541,8 +541,6 @@ describe('DevicesSettings', () => {
       await fireEvent.click(await screen.findByRole('menuitem', { name: 'Edit' }));
       await fireEvent.click(screen.getByRole('button', { name: 'Advanced', exact: true }));
       expect(screen.getByRole('spinbutton', { name: 'Port' })).toBeTruthy();
-      await fireEvent.click(screen.getByRole('button', { name: 'Done' }));
-      expect(screen.queryByRole('spinbutton', { name: 'Port' })).toBeNull();
     });
 
     it('shows no badge or Update affordance for the sidecar local row', async () => {
@@ -663,7 +661,6 @@ describe('DevicesSettings', () => {
     const loads = mocks.settingsList.mock.calls.length;
     await openAction('Edit', m.layout_daemonStatus_localConnection_label());
     expect(screen.getByRole('button', { name: m.settings_wsApi_showQrCode() })).toBeTruthy();
-    await fireEvent.click(screen.getByRole('button', { name: 'Done' }));
     expect(toggle.getAttribute('aria-checked')).toBe('true');
     expect(mocks.settingsList).toHaveBeenCalledTimes(loads);
   });

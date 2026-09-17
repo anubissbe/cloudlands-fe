@@ -93,11 +93,10 @@ for (const width of [360, 1024]) {
         .map((node) => node.getAttribute('aria-label') ?? node.textContent);
     });
     expect(overflowing).toEqual([]);
-    await local.getByRole('button', { name: 'Done', exact: true }).click();
+    await page.getByRole('button', { name: 'Actions for Studio Mac' }).click();
+    await page.getByRole('menuitem', { name: 'Edit', exact: true }).click();
     await expect(local.getByRole('spinbutton', { name: 'Port' })).toHaveCount(0);
-    const actions = local.getByRole('button', { name: 'Actions for This machine (local)' });
-    await expect(actions).toBeFocused();
-    await page.keyboard.press('Enter');
+    await local.getByRole('button', { name: 'Actions for This machine (local)' }).click();
     await page.getByRole('menuitem', { name: 'Edit', exact: true }).click();
     await expect(local.getByTestId('device-icon-picker-trigger')).toBeVisible();
     await local.getByRole('button', { name: 'Advanced', exact: true }).click();

@@ -583,6 +583,28 @@
     }
   }
 
+  function getPairingUri(): string {
+    // Use one URI for QR pairing and clipboard sharing, including tunnel-only access.
+    return `intent://pair?token=${encodeURIComponent(token)}&host=${localIps
+      .map(encodeURIComponent)
+      .join(',')}&port=${port}&path=/ws${
+      certFingerprint ? `&certFingerprint=${encodeURIComponent(certFingerprint)}` : ''
+    }${tcAddress ? `&tc=${encodeURIComponent(tcAddress)}` : ''}`;
+  }
+
+  async function handleCopyShareLink() {
+    if (!port) {
+      notify.error(m.settings_wsApi_serverNotRunning());
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(getPairingUri());
+      notify.success(m.settings_wsApi_shareLink_copied());
+    } catch {
+      notify.error(m.settings_wsApi_shareLink_copyError());
+    }
+  }
+
   async function handleShowQr() {
     if (!port) {
       notify.error(m.settings_wsApi_serverNotRunning());
@@ -590,14 +612,7 @@
     }
     try {
       const QRCode = (await import('qrcode')).default;
-      // `tc=` carries the tunnel address (PROTOCOL §12.3) so a scanned device
-      // can reach the daemon in tunnel-only mode or away from the LAN.
-      const pairingUri = `intent://pair?token=${encodeURIComponent(token)}&host=${localIps
-        .map(encodeURIComponent)
-        .join(',')}&port=${port}&path=/ws${
-        certFingerprint ? `&certFingerprint=${encodeURIComponent(certFingerprint)}` : ''
-      }${tcAddress ? `&tc=${encodeURIComponent(tcAddress)}` : ''}`;
-      qrDataUrl = await QRCode.toDataURL(pairingUri, {
+      qrDataUrl = await QRCode.toDataURL(getPairingUri(), {
         width: 544,
         margin: 2,
         color: { dark: '#000000', light: '#ffffff' },
@@ -689,10 +704,22 @@
           description={m.settings_wsApi_mobilePairing_description()}
         >
           {#snippet control()}
-            <Button variant="secondary" size="sm" type="button" onclick={handleShowQr}>
-              <Fa icon={faQrcode} size="sm" />
-              {m.settings_wsApi_showQrCode()}
-            </Button>
+            <div class="flex flex-wrap gap-2">
+              <Button variant="secondary" size="sm" type="button" onclick={handleShowQr}>
+                <Fa icon={faQrcode} size="sm" />
+                {m.settings_wsApi_showQrCode()}
+              </Button>
+              <Button
+                variant="secondary"
+                size="sm"
+                type="button"
+                onclick={handleCopyShareLink}
+                disabled={!port || loading}
+              >
+                <Fa icon={faCopy} size="sm" />
+                {m.settings_wsApi_shareLink_label()}
+              </Button>
+            </div>
           {/snippet}
         </SettingsFieldRow>
 

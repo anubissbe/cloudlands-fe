@@ -1212,6 +1212,86 @@ describe('WebSocketApiSettings', () => {
     });
   });
 
+  describe('share link', () => {
+    const expectedLink =
+      'intent://pair?token=token%2B%26%3F&host=192.0.2.10,2001%3Adb8%3A%3A1&port=5181&path=/ws&certFingerprint=AA%3ABB';
+    async function renderPairing(tcAddress = '') {
+      mocks.mockSettingsList.mockResolvedValue([
+        { path: 'server.wsApi.enabled', value: true },
+        { path: 'server.wsApi.port', value: 5181 },
+      ]);
+      mocks.mockPairingInfo.mockResolvedValue({
+        token: 'token+&?',
+        port: 5181,
+        certFingerprint: 'AA:BB',
+        localIps: ['192.0.2.10', '2001:db8::1'],
+        hostname: 'my-mac',
+        tcAddress,
+      });
+      render(WebSocketApiSettings);
+      const button = await screen.findByRole('button', {
+        name: m.settings_wsApi_shareLink_label(),
+      });
+      await waitFor(() => expect((button as HTMLButtonElement).disabled).toBe(false));
+      return button;
+    }
+
+    it.each(['', 'tc-key+/='])(
+      'copies exactly the QR pairing URI, with tunnel address %s',
+      async (tcAddress) => {
+        const writeText = vi.fn().mockResolvedValue(undefined);
+        Object.assign(navigator, { clipboard: { writeText } });
+        const button = await renderPairing(tcAddress);
+        await fireEvent.click(button);
+        const expected = expectedLink + (tcAddress ? '&tc=tc-key%2B%2F%3D' : '');
+        await waitFor(() => expect(writeText).toHaveBeenCalledWith(expected));
+        expect(mockToast.success).toHaveBeenCalledWith(m.settings_wsApi_shareLink_copied());
+        await fireEvent.click(screen.getByRole('button', { name: m.settings_wsApi_showQrCode() }));
+        await waitFor(() =>
+          expect(qrMocks.toDataURL).toHaveBeenCalledWith(expected, expect.anything()),
+        );
+      },
+    );
+
+    it('reports a clipboard failure without claiming success or opening the QR overlay', async () => {
+      const writeText = vi.fn().mockRejectedValue(new Error('Clipboard denied'));
+      Object.assign(navigator, { clipboard: { writeText } });
+      const button = await renderPairing();
+      await fireEvent.click(button);
+      await waitFor(() =>
+        expect(mockToast.error).toHaveBeenCalledWith(m.settings_wsApi_shareLink_copyError()),
+      );
+      expect(mockToast.success).not.toHaveBeenCalled();
+      expect(qrMocks.toDataURL).not.toHaveBeenCalled();
+    });
+
+    it('does not offer copying before pairing details have loaded', async () => {
+      mocks.mockSettingsList.mockResolvedValue([
+        { path: 'server.wsApi.enabled', value: true },
+        { path: 'server.wsApi.port', value: 5181 },
+      ]);
+      let resolvePairing!: (value: unknown) => void;
+      mocks.mockPairingInfo.mockReturnValue(
+        new Promise((resolve) => {
+          resolvePairing = resolve;
+        }),
+      );
+      render(WebSocketApiSettings);
+      const button = await screen.findByRole('button', {
+        name: m.settings_wsApi_shareLink_label(),
+      });
+      expect((button as HTMLButtonElement).disabled).toBe(true);
+      resolvePairing({
+        token: 'token',
+        port: 5181,
+        certFingerprint: '',
+        localIps: [],
+        hostname: 'my-mac',
+      });
+      await waitFor(() => expect((button as HTMLButtonElement).disabled).toBe(false));
+    });
+  });
+
   describe('Available Networks', () => {
     const PAIRING = {
       token: 'tok-1234567890',

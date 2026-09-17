@@ -571,12 +571,6 @@
           {/snippet}
         </SettingsFieldRow>
       </WebSocketApiSettings>
-      {#if panelMode === 'edit'}
-        <div class="mt-4 flex justify-end">
-          <Button variant="secondary" onclick={closePanel}>{m.settings_devices_done_label()}</Button
-          >
-        </div>
-      {/if}
     </div>
   {/if}
 
