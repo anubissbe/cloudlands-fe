@@ -775,7 +775,7 @@
       label={m.settings_devices_advanced_label()}
       flush
       muted
-      class="border-t border-border pt-4 [&_[data-accordion-trigger]]:flex-none"
+      class="pt-4 [&_[data-accordion-trigger]]:flex-none"
     >
       <div class="space-y-4">
         {#if enabled && tunnelSupported}
