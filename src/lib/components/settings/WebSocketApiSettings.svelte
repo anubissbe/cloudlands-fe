@@ -269,20 +269,7 @@
   // stand alone and already covers loopback (out-of-band config only).
   const UNSPECIFIED = new Set([ALL_INTERFACES, '::']);
 
-  // "Enable Local Network Access" is a view over server.bindAddress (no
-  // daemon setting of its own): ON whenever a non-loopback target is bound.
-  // Tunnel-only has no direct listeners (the persisted bindAddress is kept
-  // only for later restoration), so it reads OFF there; toggling ON from
-  // that posture emits 0.0.0.0 + tunnel.only=false.
   const localNetworkEnabled = $derived(!tunnelOnly && bindIps.some((ip) => ip !== LOOPBACK));
-
-  // Sticky UI-only counterpart: once the user hand-picks targets in the
-  // selector, the section stays open even when the pick lands loopback-only
-  // (e.g. unchecking 0.0.0.0 to pick specific IPs) — otherwise the section
-  // would collapse under them mid-edit. Cleared by an explicit Local Network
-  // Access OFF and by turning the WebSocket API off.
-  let localNetworkOpen = $state(false);
-  const localNetworkShown = $derived(localNetworkEnabled || localNetworkOpen);
 
   /**
    * Loopback is always bound: this app and the tailcat sidecar (which forwards
@@ -308,43 +295,14 @@
   }
 
   /**
-   * The "Enable Local Network Access" toggle rewrites the bind set: OFF
-   * narrows it to loopback only (the tunnel, when on, still forwards to
-   * 127.0.0.1) and collapses the section, ON widens it to all interfaces.
-   * The tunnel state is carried through untouched. When the section is open
-   * only via the sticky flag (loopback-only already persisted), OFF just
-   * collapses it — no round-trip.
-   */
-  function handleLocalNetworkToggle() {
-    if (listenSaving) return;
-    const turningOff = localNetworkShown;
-    if (turningOff) {
-      localNetworkOpen = false;
-      if (!localNetworkEnabled) return;
-    }
-    void handleListenTargetChange({
-      ips: turningOff ? [LOOPBACK] : [ALL_INTERFACES],
-      tunnel: tunnelEnabled,
-    });
-  }
-
-  /** Selector picks keep the section open (see localNetworkOpen). */
-  function handleSelectorChange(selection: ListenTargetSelection) {
-    if (listenSaving) return;
-    localNetworkOpen = true;
-    void handleListenTargetChange(selection);
-  }
-
-  /**
    * Loopback-only enable default: the daemon binds loopback only out of the
    * box, so turning the WebSocket API on from that state widens the bind set
-   * to all interfaces (Local Network Access ON). This applies on EVERY enable
-   * from loopback-only, not just the first — an explicit Local Network Access
-   * OFF followed by disable/enable re-applies the default by design.
+   * to all interfaces. This applies on every enable from loopback-only,
+   * including after choosing loopback in Available Networks.
    * A bindAddress the user already customized beyond loopback is left alone,
    * the tunnel is untouched, and a persisted tunnel-only posture is respected
    * (writing 0.0.0.0 there would contradict tunnel.only=true). Runs under
-   * listenSaving so the LNA/tunnel toggles cannot issue a concurrent
+   * listenSaving so the network picker and tunnel toggle cannot issue a concurrent
    * bindAddress write.
    * Fail-soft: a failure surfaces a toast and never rolls back the toggle.
    */
@@ -404,7 +362,6 @@
         await maybeDefaultLocalNetworkAccess();
         await maybeAutoPublish();
       } else {
-        localNetworkOpen = false;
         await maybeAutoUnpublish();
       }
     } catch (error) {
@@ -711,46 +668,16 @@
   {/if}
 
   {#if !isRemote && expanded}
-    {#if enabled && bindAddressSupported}
-      <div transition:slide={{ tier: 'moderate' }}>
-        <!-- Local Network Access: a view over server.bindAddress (ON when a
-             non-loopback target is bound, or while the user is hand-picking
-             targets). Absent on daemons that do not report
-             server.bindAddress. -->
-        <section data-local-network-toggle-row>
-          <SettingsFieldRow
-            id="websocket-local-network"
-            label={m.settings_wsApi_localNetworkAccess_label()}
-            description={m.settings_wsApi_localNetworkAccess_description()}
-            disabled={toggleBusy || listenSaving}
-          >
-            {#snippet control({ labelId, descriptionId })}
-              <Switch
-                checked={localNetworkShown}
-                onCheckedChange={handleLocalNetworkToggle}
-                disabled={toggleBusy || listenSaving}
-                ariaLabelledby={labelId}
-                ariaDescribedby={descriptionId}
-              />
-            {/snippet}
-          </SettingsFieldRow>
-        </section>
-      </div>
-    {/if}
-
     {#if enabled}
       <div transition:slide={{ tier: 'moderate' }} class="space-y-4">
-        <!-- Listen targets: the daemon's bind candidates with the bound ones
-             selected. Shown only while Local Network Access is ON; the tunnel
-             is configured under Advanced, not in the selector. -->
-        {#if localNetworkShown}
+        {#if bindAddressSupported}
           <section transition:slide={{ tier: 'moderate' }}>
             <ListenTargetSelector
               availableIps={availableIps ?? localIps}
               selectedIps={tunnelOnly ? [] : bindIps}
               tunnelSelected={tunnelEnabled}
-              saving={listenSaving}
-              onchange={handleSelectorChange}
+              saving={toggleBusy || listenSaving}
+              onchange={handleListenTargetChange}
             />
           </section>
         {/if}

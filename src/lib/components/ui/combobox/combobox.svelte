@@ -237,7 +237,12 @@
   }
 
   function withoutListboxSemantics(props: Record<string, unknown>) {
-    const { role: _role, tabindex: _tabindex, ...contentProps } = props;
+    const {
+      role: _role,
+      tabindex: _tabindex,
+      'aria-multiselectable': _multi,
+      ...contentProps
+    } = props;
     return contentProps;
   }
 </script>
@@ -309,6 +314,7 @@
           {...viewportProps}
           id={listboxId}
           role="listbox"
+          aria-multiselectable={multiple || undefined}
           aria-labelledby={labelId}
           tabindex="0"
         >
