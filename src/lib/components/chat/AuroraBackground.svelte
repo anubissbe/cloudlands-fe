@@ -7,7 +7,7 @@
    *
    * Performance optimizations:
    * - Throttled to 30fps instead of 60fps (halves GPU usage)
-   * - Renders at native display resolution to preserve fine grain
+   * - Renders at native display resolution for smooth gradients
    * - Pauses when tab is hidden (Page Visibility API)
    * - Simplified shader with fewer blobs (5 instead of 10)
    * - Respects reduced motion (OS preference or battery saver)
@@ -164,7 +164,7 @@
     uniform vec3 u_color3;
     uniform float u_seed;
 
-    // Hash function for grain and randomness
+    // Hash function for the session's blob phases
     float hash(vec2 p) {
       vec3 p3 = fract(vec3(p.xyx) * 0.1031);
       p3 += dot(p3, p3.yzx + 33.33);
@@ -211,8 +211,8 @@
       vec2 uv = gl_FragCoord.xy / u_resolution;
       float time = u_time * 0.6;
 
-      // Vertical gradient
-      float verticalFade = pow(1.0 - uv.y, 1.0);
+      // Keep the glow near the composer and fade gently into the conversation.
+      float verticalFade = pow(1.0 - uv.y, 2.0);
 
       // Color variety (reduced from 10 to 5)
       vec3 color4 = mix(u_color1, u_color3, 0.5);
@@ -285,11 +285,7 @@
       // Breathing pulse
       intensity *= 0.85 + sin(time * 0.5) * 0.15;
 
-      // Simplified grain (less expensive)
-      float grainValue = hash(gl_FragCoord.xy * 0.5);
-      color = color + (grainValue - 0.5) * 0.15;
-
-      float alpha = intensity * 0.9;
+      float alpha = intensity * 0.65;
       gl_FragColor = vec4(color * alpha, alpha);
     }
   `;

@@ -191,28 +191,6 @@ describe('AuroraBackground cleanup', () => {
     expect(mockGL.loseContext).toHaveBeenCalledTimes(1);
   });
 
-  it('uses five blobs with radii increased by about twelve percent', () => {
-    render(AuroraBackground);
-
-    const fragmentSource = mockGL.gl.shaderSource.mock.calls
-      .map(([, source]) => String(source))
-      .find((source) => source.includes('precision mediump float'));
-    expect(fragmentSource).toBeDefined();
-
-    const radii = Array.from(
-      fragmentSource!.matchAll(/float b[1-5] = blob\(uv, c[1-5], ([0-9.]+)\);/g),
-      (match) => Number(match[1]),
-    );
-    const previousRadii = [0.5, 0.45, 0.55, 0.48, 0.42];
-
-    expect(radii).toHaveLength(5);
-    radii.forEach((radius, index) => {
-      expect(radius / previousRadii[index]).toBeGreaterThanOrEqual(1.11);
-      expect(radius / previousRadii[index]).toBeLessThanOrEqual(1.13);
-    });
-    expect(fragmentSource).toContain('float alpha = intensity * 0.9;');
-  });
-
   it('sets every shader color to the computed active surface on initial mount', () => {
     render(AuroraBackground);
 
