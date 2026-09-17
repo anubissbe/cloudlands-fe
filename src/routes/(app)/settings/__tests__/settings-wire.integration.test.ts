@@ -229,6 +229,9 @@ describe('Settings deterministic mock-BE contracts', () => {
     ]);
 
     render(WebSocketApiSettings);
+    await fireEvent.click(
+      screen.getByRole('button', { name: m.settings_devices_advanced_label() }),
+    );
     const input = (await screen.findByRole('spinbutton', {
       name: m.settings_wsApi_port_label(),
     })) as HTMLInputElement;

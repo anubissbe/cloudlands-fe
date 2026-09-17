@@ -539,6 +539,7 @@ describe('DevicesSettings', () => {
       expect(screen.queryByRole('menuitem', { name: 'Connect' })).toBeNull();
       expect(screen.queryByRole('menuitem', { name: 'Remove' })).toBeNull();
       await fireEvent.click(await screen.findByRole('menuitem', { name: 'Edit' }));
+      await fireEvent.click(screen.getByRole('button', { name: 'Advanced', exact: true }));
       expect(screen.getByRole('spinbutton', { name: 'Port' })).toBeTruthy();
       await fireEvent.click(screen.getByRole('button', { name: 'Done' }));
       expect(screen.queryByRole('spinbutton', { name: 'Port' })).toBeNull();
@@ -670,7 +671,9 @@ describe('DevicesSettings', () => {
   it('opens local configuration when requested by the remote-access deep link', async () => {
     render(DevicesSettings, { localSettingsRequested: 1 });
     expect(await screen.findByTestId('device-icon-picker-trigger')).toBeTruthy();
-    expect(screen.getByRole('spinbutton', { name: 'Port' })).toBeTruthy();
+    expect(
+      screen.getByRole('button', { name: 'Advanced', exact: true }).getAttribute('aria-expanded'),
+    ).toBe('false');
   });
 
   it('persists a local icon override through connections:update', async () => {

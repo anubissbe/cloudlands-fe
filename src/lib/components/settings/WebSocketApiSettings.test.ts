@@ -103,6 +103,14 @@ function installElectronApi() {
   (window as unknown as { electronAPI: unknown }).electronAPI = { invoke: ipcMocks.invoke };
 }
 
+// Existing configuration tests exercise controls after opening their disclosure.
+async function renderExpandedSettings() {
+  const view = render(WebSocketApiSettings);
+  const advanced = screen.queryByRole('button', { name: m.settings_devices_advanced_label() });
+  if (advanced) await fireEvent.click(advanced);
+  return view;
+}
+
 describe('WebSocketApiSettings', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -119,6 +127,28 @@ describe('WebSocketApiSettings', () => {
     delete (window as unknown as { electronAPI?: unknown }).electronAPI;
   });
 
+  it('starts Advanced collapsed and preserves a port draft when toggled', async () => {
+    mocks.mockSettingsList.mockResolvedValue([
+      { path: 'server.wsApi.enabled', value: false },
+      { path: 'server.wsApi.port', value: 5181 },
+    ]);
+    render(WebSocketApiSettings);
+    const advanced = screen.getByRole('button', { name: m.settings_devices_advanced_label() });
+    expect(advanced.getAttribute('aria-expanded')).toBe('false');
+    expect(screen.queryByRole('spinbutton', { name: 'Port' })).toBeNull();
+    await fireEvent.click(advanced);
+    const port = await screen.findByRole('spinbutton', { name: 'Port' });
+    await fireEvent.input(port, { target: { value: '5182' } });
+    await fireEvent.click(advanced);
+    expect(advanced.getAttribute('aria-expanded')).toBe('false');
+    expect(screen.queryByRole('spinbutton', { name: 'Port' })).toBeNull();
+    await fireEvent.click(advanced);
+    expect((screen.getByRole('spinbutton', { name: 'Port' }) as HTMLInputElement).value).toBe(
+      '5182',
+    );
+    expect(mocks.mockSettingsUpdate).not.toHaveBeenCalled();
+  });
+
   describe('mobile pairing dialog', () => {
     async function renderPairing() {
       mocks.mockSettingsList.mockResolvedValue([
@@ -132,7 +162,7 @@ describe('WebSocketApiSettings', () => {
         localIps: ['192.0.2.10'],
         hostname: 'fixture-device',
       });
-      render(WebSocketApiSettings);
+      await renderExpandedSettings();
       await screen.findByRole('button', { name: m.settings_wsApi_showQrCode() });
     }
 
@@ -190,7 +220,7 @@ describe('WebSocketApiSettings', () => {
       { path: 'server.wsApi.port', value: 5181 },
     ]);
 
-    render(WebSocketApiSettings);
+    await renderExpandedSettings();
 
     await waitFor(() => expect(screen.getByRole('switch')).toBeTruthy());
 
@@ -228,7 +258,7 @@ describe('WebSocketApiSettings', () => {
       { path: 'server.wsApi.port', value: 5181 },
     ]);
 
-    render(WebSocketApiSettings);
+    await renderExpandedSettings();
 
     await waitFor(() => expect(screen.getByRole('switch')).toBeTruthy());
 
@@ -248,14 +278,14 @@ describe('WebSocketApiSettings', () => {
     });
   });
 
-  it('always shows port row even when WSS is disabled', async () => {
+  it('allows configuring the port under Advanced even when WSS is disabled', async () => {
     // Arrange: WSS disabled
     mocks.mockSettingsList.mockResolvedValue([
       { path: 'server.wsApi.enabled', value: false },
       { path: 'server.wsApi.port', value: 5181 },
     ]);
 
-    render(WebSocketApiSettings);
+    await renderExpandedSettings();
 
     // Assert: port row is visible
     await waitFor(() => {
@@ -272,7 +302,7 @@ describe('WebSocketApiSettings', () => {
 
     mocks.mockSettingsUpdate.mockResolvedValueOnce([{ path: 'server.wsApi.port', value: 5182 }]);
 
-    render(WebSocketApiSettings);
+    await renderExpandedSettings();
 
     // Wait for port input to be visible
     const portInput = await waitFor(() => screen.getByDisplayValue('5181') as HTMLInputElement);
@@ -304,7 +334,7 @@ describe('WebSocketApiSettings', () => {
       { path: 'server.wsApi.port', value: 5181 },
     ]);
 
-    render(WebSocketApiSettings);
+    await renderExpandedSettings();
 
     // Wait for port input to be visible
     const portInput = await waitFor(() => screen.getByDisplayValue('5181') as HTMLInputElement);
@@ -341,7 +371,7 @@ describe('WebSocketApiSettings', () => {
       hostname: 'my-mac',
     });
 
-    render(WebSocketApiSettings);
+    await renderExpandedSettings();
 
     await waitFor(() => {
       expect(screen.getByText(`${fullFingerprint.slice(0, 23)}…`)).toBeTruthy();
@@ -366,7 +396,7 @@ describe('WebSocketApiSettings', () => {
         { path: 'server.wsApi.port', value: 5181 },
       ]);
       mocks.mockPairingInfo.mockResolvedValue(PAIRING);
-      render(WebSocketApiSettings);
+      await renderExpandedSettings();
       await waitFor(() => expect(mocks.mockPairingInfo).toHaveBeenCalled());
     }
 
@@ -411,7 +441,7 @@ describe('WebSocketApiSettings', () => {
         { path: 'server.wsApi.enabled', value: false },
         { path: 'server.wsApi.port', value: 5181 },
       ]);
-      render(WebSocketApiSettings);
+      await renderExpandedSettings();
       mocks.mockSettingsUpdate.mockResolvedValueOnce([{ path: 'server.wsApi.port', value: 5182 }]);
 
       const portInput = await waitFor(() => screen.getByDisplayValue('5181') as HTMLInputElement);
@@ -428,7 +458,7 @@ describe('WebSocketApiSettings', () => {
       // Arrange: active connection is remote
       connectionState.activeId = 'remote-1';
 
-      render(WebSocketApiSettings);
+      await renderExpandedSettings();
 
       // Assert: info-only panel is rendered
       await waitFor(() => {
@@ -461,7 +491,7 @@ describe('WebSocketApiSettings', () => {
         hostname: 'my-mac',
       });
 
-      render(WebSocketApiSettings);
+      await renderExpandedSettings();
 
       // Assert: toggle rendered and pairing info fetched
       await waitFor(() => {
@@ -482,7 +512,7 @@ describe('WebSocketApiSettings', () => {
         { path: 'server.wsApi.port', value: 5181 },
       ]);
 
-      render(WebSocketApiSettings);
+      await renderExpandedSettings();
 
       await waitFor(() => {
         expect(screen.getByText(m.settings_wsApi_remoteInfo_description())).toBeTruthy();
@@ -510,7 +540,7 @@ describe('WebSocketApiSettings', () => {
         }),
       );
 
-      render(WebSocketApiSettings);
+      await renderExpandedSettings();
 
       await waitFor(() => {
         expect(mocks.mockSettingsList).toHaveBeenCalled();
@@ -549,7 +579,7 @@ describe('WebSocketApiSettings', () => {
         { path: 'server.wsApi.enabled', value: false },
         { path: 'server.wsApi.port', value: 5181 },
       ]);
-      render(WebSocketApiSettings);
+      await renderExpandedSettings();
       await waitFor(() => expect(screen.getByRole('switch')).toBeTruthy());
 
       mocks.mockSettingsUpdate.mockResolvedValueOnce([
@@ -679,7 +709,7 @@ describe('WebSocketApiSettings', () => {
         { path: 'server.wsApi.port', value: 5181 },
       ]);
       mocks.mockPairingInfo.mockResolvedValue(PAIRING);
-      render(WebSocketApiSettings);
+      await renderExpandedSettings();
       await waitFor(() => {
         expect(ipcMocks.invoke).toHaveBeenCalledWith('connections:self-published-state');
       });
@@ -775,7 +805,7 @@ describe('WebSocketApiSettings', () => {
         { path: 'server.wsApi.port', value: 5181 },
       ]);
       mocks.mockPairingInfo.mockResolvedValue(PAIRING);
-      render(WebSocketApiSettings);
+      await renderExpandedSettings();
       await waitFor(() => {
         expect(ipcMocks.invoke).toHaveBeenCalledWith('connections:self-published-state');
       });
@@ -819,7 +849,7 @@ describe('WebSocketApiSettings', () => {
         { path: 'server.wsApi.enabled', value: false },
         { path: 'server.wsApi.port', value: 5181 },
       ]);
-      render(WebSocketApiSettings);
+      await renderExpandedSettings();
       await waitFor(() => expect(screen.getByRole('switch')).toBeTruthy());
 
       // Toggle WSS on → auto-publish.
@@ -898,7 +928,7 @@ describe('WebSocketApiSettings', () => {
       // settings.update would reject the whole batch).
       mocks.mockSettingsList.mockResolvedValue(settingsRows());
       mocks.mockPairingInfo.mockResolvedValue(PAIRING);
-      render(WebSocketApiSettings);
+      await renderExpandedSettings();
       await waitFor(() => expect(screen.getByRole('checkbox', { name: '10.0.0.5' })).toBeTruthy());
 
       mocks.mockSettingsUpdate.mockResolvedValueOnce([]);
@@ -914,7 +944,7 @@ describe('WebSocketApiSettings', () => {
     it('includes the tunnel paths in the batch when the daemon supports them', async () => {
       mocks.mockSettingsList.mockResolvedValue(settingsRows({ enabled: false, only: false }));
       mocks.mockPairingInfo.mockResolvedValue(PAIRING);
-      render(WebSocketApiSettings);
+      await renderExpandedSettings();
       await waitFor(() => expect(screen.getByRole('checkbox', { name: '10.0.0.5' })).toBeTruthy());
 
       mocks.mockSettingsUpdate.mockResolvedValueOnce([]);
@@ -934,7 +964,7 @@ describe('WebSocketApiSettings', () => {
       // re-upsert after the save (same fail-soft trigger as port/token).
       mocks.mockSettingsList.mockResolvedValue(settingsRows({ enabled: false, only: false }));
       mocks.mockPairingInfo.mockResolvedValue(PAIRING);
-      render(WebSocketApiSettings);
+      await renderExpandedSettings();
       await waitFor(() => expect(screen.getByRole('checkbox', { name: '10.0.0.5' })).toBeTruthy());
 
       mocks.mockSettingsUpdate.mockResolvedValueOnce([]);
@@ -950,7 +980,7 @@ describe('WebSocketApiSettings', () => {
       // published field on the self record.
       mocks.mockSettingsList.mockResolvedValue(settingsRows({ enabled: false, only: false }));
       mocks.mockPairingInfo.mockResolvedValue(PAIRING);
-      render(WebSocketApiSettings);
+      await renderExpandedSettings();
       await waitFor(() =>
         expect(screen.getByRole('switch', { name: m.settings_tunnel_enable_label() })).toBeTruthy(),
       );
@@ -966,7 +996,7 @@ describe('WebSocketApiSettings', () => {
     it('a failed listen-targets save never fires connections:refresh-self', async () => {
       mocks.mockSettingsList.mockResolvedValue(settingsRows({ enabled: false, only: false }));
       mocks.mockPairingInfo.mockResolvedValue(PAIRING);
-      render(WebSocketApiSettings);
+      await renderExpandedSettings();
       await waitFor(() => expect(screen.getByRole('checkbox', { name: '10.0.0.5' })).toBeTruthy());
 
       mocks.mockSettingsUpdate.mockRejectedValueOnce(new Error('daemon says no'));
@@ -981,7 +1011,7 @@ describe('WebSocketApiSettings', () => {
       // turning the tunnel on must write loopback into server.bindAddress.
       mocks.mockSettingsList.mockResolvedValue(settingsRows({ enabled: false, only: false }));
       mocks.mockPairingInfo.mockResolvedValue(PAIRING);
-      render(WebSocketApiSettings);
+      await renderExpandedSettings();
       await waitFor(() =>
         expect(screen.getByRole('switch', { name: m.settings_tunnel_enable_label() })).toBeTruthy(),
       );
@@ -1004,7 +1034,7 @@ describe('WebSocketApiSettings', () => {
       // targets never persist.
       mocks.mockSettingsList.mockResolvedValue(settingsRows({ enabled: true, only: true }));
       mocks.mockPairingInfo.mockResolvedValue({ ...PAIRING, tcAddress: 'tc-key-abc' });
-      render(WebSocketApiSettings);
+      await renderExpandedSettings();
       await waitFor(() =>
         expect(screen.getByRole('switch', { name: m.settings_tunnel_enable_label() })).toBeTruthy(),
       );
@@ -1024,7 +1054,7 @@ describe('WebSocketApiSettings', () => {
     it('hides the tunnel toggle on daemons without tunnel support', async () => {
       mocks.mockSettingsList.mockResolvedValue(settingsRows());
       mocks.mockPairingInfo.mockResolvedValue(PAIRING);
-      render(WebSocketApiSettings);
+      await renderExpandedSettings();
       await waitFor(() => expect(screen.getByRole('checkbox', { name: '10.0.0.5' })).toBeTruthy());
 
       expect(screen.queryByRole('switch', { name: m.settings_tunnel_enable_label() })).toBeNull();
@@ -1033,7 +1063,7 @@ describe('WebSocketApiSettings', () => {
     it('renders no DERP relay URL field (config.toml only)', async () => {
       mocks.mockSettingsList.mockResolvedValue(settingsRows({ enabled: true, only: false }));
       mocks.mockPairingInfo.mockResolvedValue({ ...PAIRING, tcAddress: 'tc-key-abc' });
-      render(WebSocketApiSettings);
+      await renderExpandedSettings();
       await waitFor(() =>
         expect(screen.getByRole('switch', { name: m.settings_tunnel_enable_label() })).toBeTruthy(),
       );
@@ -1047,7 +1077,7 @@ describe('WebSocketApiSettings', () => {
       // but server.bindAddress carries only a specific IP.
       mocks.mockSettingsList.mockResolvedValue(settingsRows({ enabled: true, only: false }));
       mocks.mockPairingInfo.mockResolvedValue(PAIRING);
-      render(WebSocketApiSettings);
+      await renderExpandedSettings();
       await waitFor(() =>
         expect(
           screen.getByRole('checkbox', { name: m.settings_listenTargets_loopback_label() }),
@@ -1078,7 +1108,7 @@ describe('WebSocketApiSettings', () => {
       // as active listeners (Local Network Access reads OFF, no selector).
       mocks.mockSettingsList.mockResolvedValue(settingsRows({ enabled: true, only: true }));
       mocks.mockPairingInfo.mockResolvedValue({ ...PAIRING, tcAddress: 'tc-key-abc' });
-      render(WebSocketApiSettings);
+      await renderExpandedSettings();
 
       await waitFor(() =>
         expect(
@@ -1098,7 +1128,7 @@ describe('WebSocketApiSettings', () => {
     it('includes tc= in the QR pairing URI when the daemon reports a tunnel address', async () => {
       mocks.mockSettingsList.mockResolvedValue(settingsRows({ enabled: true, only: false }));
       mocks.mockPairingInfo.mockResolvedValue({ ...PAIRING, tcAddress: 'tc-key-abc' });
-      render(WebSocketApiSettings);
+      await renderExpandedSettings();
       await waitFor(() => expect(screen.getByText(m.settings_wsApi_showQrCode())).toBeTruthy());
 
       await fireEvent.click(screen.getByText(m.settings_wsApi_showQrCode()));
@@ -1114,7 +1144,7 @@ describe('WebSocketApiSettings', () => {
     it('omits tc= from the QR pairing URI when the daemon reports none', async () => {
       mocks.mockSettingsList.mockResolvedValue(settingsRows());
       mocks.mockPairingInfo.mockResolvedValue(PAIRING);
-      render(WebSocketApiSettings);
+      await renderExpandedSettings();
       await waitFor(() => expect(screen.getByText(m.settings_wsApi_showQrCode())).toBeTruthy());
 
       await fireEvent.click(screen.getByText(m.settings_wsApi_showQrCode()));
@@ -1126,7 +1156,7 @@ describe('WebSocketApiSettings', () => {
     it('shows the Tailcat address row before the TLS fingerprint when the daemon reports one', async () => {
       mocks.mockSettingsList.mockResolvedValue(settingsRows({ enabled: true, only: false }));
       mocks.mockPairingInfo.mockResolvedValue({ ...PAIRING, tcAddress: 'tc-key-abc' });
-      render(WebSocketApiSettings);
+      await renderExpandedSettings();
 
       await waitFor(() => expect(screen.getByText('tc-key-abc')).toBeTruthy());
       expect(screen.getByText(m.settings_tunnel_tcAddress_label())).toBeTruthy();
@@ -1143,7 +1173,7 @@ describe('WebSocketApiSettings', () => {
       mocks.mockPairingInfo.mockResolvedValue({ ...PAIRING, tcAddress: 'tc-key-abc' });
       const writeText = vi.fn().mockResolvedValue(undefined);
       Object.assign(navigator, { clipboard: { writeText } });
-      render(WebSocketApiSettings);
+      await renderExpandedSettings();
       await waitFor(() => expect(screen.getByText('tc-key-abc')).toBeTruthy());
 
       await fireEvent.click(screen.getByTitle(m.settings_tunnel_tcAddress_copy()));
@@ -1156,7 +1186,7 @@ describe('WebSocketApiSettings', () => {
       // render no row at all.
       mocks.mockSettingsList.mockResolvedValue(settingsRows());
       mocks.mockPairingInfo.mockResolvedValue(PAIRING);
-      render(WebSocketApiSettings);
+      await renderExpandedSettings();
 
       await waitFor(() =>
         expect(screen.getByText(m.settings_wsApi_tlsFingerprint_label())).toBeTruthy(),
@@ -1167,7 +1197,7 @@ describe('WebSocketApiSettings', () => {
     it('hides the Tailcat address row while the tunnel toggle is off, even if an address is reported', async () => {
       mocks.mockSettingsList.mockResolvedValue(settingsRows({ enabled: false, only: false }));
       mocks.mockPairingInfo.mockResolvedValue({ ...PAIRING, tcAddress: 'tc-key-abc' });
-      render(WebSocketApiSettings);
+      await renderExpandedSettings();
 
       await waitFor(() =>
         expect(screen.getByRole('switch', { name: m.settings_tunnel_enable_label() })).toBeTruthy(),
@@ -1212,7 +1242,7 @@ describe('WebSocketApiSettings', () => {
         settingsRows({ tunnel: { enabled: false, only: false } }),
       );
       mocks.mockPairingInfo.mockResolvedValue(PAIRING);
-      render(WebSocketApiSettings);
+      await renderExpandedSettings();
 
       await waitFor(() =>
         expect(screen.getByRole('switch', { name: LOCAL_NETWORK() })).toBeTruthy(),
@@ -1226,7 +1256,7 @@ describe('WebSocketApiSettings', () => {
     it('is OFF with Listen targets hidden when bindAddress is loopback only', async () => {
       mocks.mockSettingsList.mockResolvedValue(settingsRows({ bindAddress: ['127.0.0.1'] }));
       mocks.mockPairingInfo.mockResolvedValue(PAIRING);
-      render(WebSocketApiSettings);
+      await renderExpandedSettings();
 
       await waitFor(() =>
         expect(screen.getByRole('switch', { name: LOCAL_NETWORK() })).toBeTruthy(),
@@ -1242,7 +1272,7 @@ describe('WebSocketApiSettings', () => {
         settingsRows({ tunnel: { enabled: false, only: false } }),
       );
       mocks.mockPairingInfo.mockResolvedValue(PAIRING);
-      render(WebSocketApiSettings);
+      await renderExpandedSettings();
       await waitFor(() => expect(screen.getByRole('checkbox', { name: '10.0.0.5' })).toBeTruthy());
 
       mocks.mockSettingsUpdate.mockResolvedValueOnce([]);
@@ -1272,7 +1302,7 @@ describe('WebSocketApiSettings', () => {
         settingsRows({ bindAddress: ['0.0.0.0'], tunnel: { enabled: false, only: false } }),
       );
       mocks.mockPairingInfo.mockResolvedValue(PAIRING);
-      render(WebSocketApiSettings);
+      await renderExpandedSettings();
       await waitFor(() =>
         expect(
           screen.getByRole('checkbox', { name: m.settings_listenTargets_allInterfaces_label() }),
@@ -1337,7 +1367,7 @@ describe('WebSocketApiSettings', () => {
         ...PAIRING,
         availableIps: ['192.168.1.2', '10.0.0.5'],
       });
-      render(WebSocketApiSettings);
+      await renderExpandedSettings();
       await waitFor(() =>
         expect(
           screen.getByRole('checkbox', { name: m.settings_listenTargets_allInterfaces_label() }),
@@ -1399,7 +1429,7 @@ describe('WebSocketApiSettings', () => {
         localIps: ['192.168.1.2'],
         availableIps: ['192.168.1.2', '10.0.0.5'],
       });
-      render(WebSocketApiSettings);
+      await renderExpandedSettings();
 
       await waitFor(() => expect(screen.getByRole('checkbox', { name: '10.0.0.5' })).toBeTruthy());
       expect(isCheckboxChecked(screen.getByRole('checkbox', { name: '10.0.0.5' }))).toBe(false);
@@ -1417,7 +1447,7 @@ describe('WebSocketApiSettings', () => {
         }),
       );
       mocks.mockPairingInfo.mockResolvedValue({ ...PAIRING, localIps: ['192.168.1.2'] });
-      render(WebSocketApiSettings);
+      await renderExpandedSettings();
 
       await waitFor(() =>
         expect(screen.getByRole('checkbox', { name: '192.168.1.2' })).toBeTruthy(),
@@ -1442,7 +1472,7 @@ describe('WebSocketApiSettings', () => {
         localIps: ['192.168.1.2'],
         availableIps: ['192.168.1.2', '10.0.0.5'],
       });
-      render(WebSocketApiSettings);
+      await renderExpandedSettings();
       await waitFor(() => expect(screen.getByText(m.settings_wsApi_showQrCode())).toBeTruthy());
 
       await fireEvent.click(screen.getByText(m.settings_wsApi_showQrCode()));
@@ -1461,7 +1491,7 @@ describe('WebSocketApiSettings', () => {
         }),
       );
       mocks.mockPairingInfo.mockResolvedValue(PAIRING);
-      render(WebSocketApiSettings);
+      await renderExpandedSettings();
       await waitFor(() =>
         expect(screen.getByRole('checkbox', { name: '192.168.1.2' })).toBeTruthy(),
       );
@@ -1507,7 +1537,7 @@ describe('WebSocketApiSettings', () => {
         settingsRows({ bindAddress: ['::'], tunnel: { enabled: false, only: false } }),
       );
       mocks.mockPairingInfo.mockResolvedValue(PAIRING);
-      render(WebSocketApiSettings);
+      await renderExpandedSettings();
       await waitFor(() =>
         expect(screen.getByRole('switch', { name: m.settings_tunnel_enable_label() })).toBeTruthy(),
       );
@@ -1532,7 +1562,7 @@ describe('WebSocketApiSettings', () => {
         settingsRows({ bindAddress: ['0.0.0.0'], tunnel: { enabled: false, only: false } }),
       );
       mocks.mockPairingInfo.mockResolvedValue(PAIRING);
-      render(WebSocketApiSettings);
+      await renderExpandedSettings();
       await waitFor(() =>
         expect(
           screen.getByRole('checkbox', { name: m.settings_listenTargets_allInterfaces_label() }),
@@ -1591,7 +1621,7 @@ describe('WebSocketApiSettings', () => {
     it('toggling ON persists bindAddress = [0.0.0.0] and shows Listen targets with All interfaces checked', async () => {
       mocks.mockSettingsList.mockResolvedValue(settingsRows({ bindAddress: ['127.0.0.1'] }));
       mocks.mockPairingInfo.mockResolvedValue(PAIRING);
-      render(WebSocketApiSettings);
+      await renderExpandedSettings();
       await waitFor(() =>
         expect(screen.getByRole('switch', { name: LOCAL_NETWORK() })).toBeTruthy(),
       );
@@ -1625,7 +1655,7 @@ describe('WebSocketApiSettings', () => {
         }),
       );
       mocks.mockPairingInfo.mockResolvedValue({ ...PAIRING, tcAddress: 'tc-key-abc' });
-      render(WebSocketApiSettings);
+      await renderExpandedSettings();
       await waitFor(() =>
         expect(screen.getByRole('switch', { name: LOCAL_NETWORK() })).toBeTruthy(),
       );
@@ -1650,7 +1680,7 @@ describe('WebSocketApiSettings', () => {
           tunnel: { enabled: false, only: false },
         }),
       );
-      render(WebSocketApiSettings);
+      await renderExpandedSettings();
       await waitFor(() => expect(screen.getByRole('switch')).toBeTruthy());
 
       mocks.mockSettingsUpdate.mockResolvedValueOnce([
@@ -1701,7 +1731,7 @@ describe('WebSocketApiSettings', () => {
       mocks.mockSettingsList.mockResolvedValue(
         settingsRows({ enabled: false, bindAddress: ['192.168.1.2'] }),
       );
-      render(WebSocketApiSettings);
+      await renderExpandedSettings();
       await waitFor(() => expect(screen.getByRole('switch')).toBeTruthy());
 
       mocks.mockSettingsUpdate.mockResolvedValueOnce([
@@ -1722,7 +1752,7 @@ describe('WebSocketApiSettings', () => {
       mocks.mockSettingsList.mockResolvedValue(
         settingsRows({ enabled: false, bindAddress: ['127.0.0.1'] }),
       );
-      render(WebSocketApiSettings);
+      await renderExpandedSettings();
       await waitFor(() => expect(screen.getByRole('switch')).toBeTruthy());
 
       mocks.mockSettingsUpdate.mockResolvedValueOnce([
@@ -1746,7 +1776,7 @@ describe('WebSocketApiSettings', () => {
       // anyway, so neither the toggle nor the selector is rendered.
       mocks.mockSettingsList.mockResolvedValue(settingsRows({ bindAddress: null }));
       mocks.mockPairingInfo.mockResolvedValue(PAIRING);
-      render(WebSocketApiSettings);
+      await renderExpandedSettings();
       await waitFor(() =>
         expect(screen.getByText(m.settings_wsApi_tlsFingerprint_label())).toBeTruthy(),
       );
@@ -1760,7 +1790,7 @@ describe('WebSocketApiSettings', () => {
         settingsRows({ bindAddress: ['192.168.1.2'], tunnel: { enabled: true, only: true } }),
       );
       mocks.mockPairingInfo.mockResolvedValue({ ...PAIRING, tcAddress: 'tc-key-abc' });
-      render(WebSocketApiSettings);
+      await renderExpandedSettings();
 
       await waitFor(() =>
         expect(
@@ -1775,7 +1805,7 @@ describe('WebSocketApiSettings', () => {
         settingsRows({ bindAddress: ['192.168.1.2'], tunnel: { enabled: true, only: true } }),
       );
       mocks.mockPairingInfo.mockResolvedValue({ ...PAIRING, tcAddress: 'tc-key-abc' });
-      render(WebSocketApiSettings);
+      await renderExpandedSettings();
       await waitFor(() =>
         expect(screen.getByRole('switch', { name: LOCAL_NETWORK() })).toBeTruthy(),
       );
@@ -1800,7 +1830,7 @@ describe('WebSocketApiSettings', () => {
           tunnel: { enabled: true, only: true },
         }),
       );
-      render(WebSocketApiSettings);
+      await renderExpandedSettings();
       await waitFor(() => expect(screen.getByRole('switch')).toBeTruthy());
 
       mocks.mockSettingsUpdate.mockResolvedValueOnce([
@@ -1829,7 +1859,7 @@ describe('WebSocketApiSettings', () => {
         settingsRows({ bindAddress: ['192.168.1.2'], tunnel: { enabled: false, only: false } }),
       );
       mocks.mockPairingInfo.mockResolvedValue(PAIRING);
-      render(WebSocketApiSettings);
+      await renderExpandedSettings();
       await waitFor(() =>
         expect(screen.getByRole('switch', { name: LOCAL_NETWORK() })).toBeTruthy(),
       );

@@ -42,6 +42,7 @@
   } from '@fortawesome/free-solid-svg-icons';
   import { notify } from '$lib/components/patterns/notify';
   import {
+    SettingsDisclosure,
     SettingsFieldRow,
     SettingsForm,
     defineSettings,
@@ -843,128 +844,132 @@
         </section>
       </div>
     {/if}
-    <div class="space-y-4 border-t border-border pt-4">
-      <h3 class="type-caption font-medium text-muted-foreground">
-        {m.settings_devices_advanced_label()}
-      </h3>
-      {#if enabled && tunnelSupported}
-        <div transition:slide={{ tier: 'moderate' }} class="space-y-4">
-          <!-- Tailcat tunnel toggle: drives server.tunnel.enabled. Absent on
+    <SettingsDisclosure
+      label={m.settings_devices_advanced_label()}
+      flush
+      muted
+      class="border-t border-border pt-4 [&_[data-accordion-trigger]]:flex-none"
+    >
+      <div class="space-y-4">
+        {#if enabled && tunnelSupported}
+          <div transition:slide={{ tier: 'moderate' }} class="space-y-4">
+            <!-- Tailcat tunnel toggle: drives server.tunnel.enabled. Absent on
              old daemons predating the server.tunnel.* settings. -->
-          {#snippet tunnelDescription()}
-            {m.settings_tunnel_enable_description()}{' '}<Button
-              variant="link"
-              size="sm"
-              href="https://github.com/tailscale/tailcat"
-              target="_blank"
-              rel="noopener noreferrer"
-              class="h-auto px-0">{m.settings_tunnel_github_link()}</Button
-            >
-          {/snippet}
-          <section data-tunnel-toggle-row>
-            <SettingsFieldRow
-              id="websocket-tunnel"
-              label={m.settings_tunnel_enable_label()}
-              descriptionContent={tunnelDescription}
-              disabled={toggleBusy || listenSaving}
-            >
-              {#snippet control({ labelId, descriptionId })}
-                <Switch
-                  checked={tunnelEnabled}
-                  onCheckedChange={handleTunnelToggle}
-                  disabled={toggleBusy || listenSaving}
-                  ariaLabelledby={labelId}
-                  ariaDescribedby={descriptionId}
-                />
-              {/snippet}
-            </SettingsFieldRow>
-          </section>
+            {#snippet tunnelDescription()}
+              {m.settings_tunnel_enable_description()}{' '}<Button
+                variant="link"
+                size="sm"
+                href="https://github.com/tailscale/tailcat"
+                target="_blank"
+                rel="noopener noreferrer"
+                class="h-auto px-0">{m.settings_tunnel_github_link()}</Button
+              >
+            {/snippet}
+            <section data-tunnel-toggle-row>
+              <SettingsFieldRow
+                id="websocket-tunnel"
+                label={m.settings_tunnel_enable_label()}
+                descriptionContent={tunnelDescription}
+                disabled={toggleBusy || listenSaving}
+              >
+                {#snippet control({ labelId, descriptionId })}
+                  <Switch
+                    checked={tunnelEnabled}
+                    onCheckedChange={handleTunnelToggle}
+                    disabled={toggleBusy || listenSaving}
+                    ariaLabelledby={labelId}
+                    ariaDescribedby={descriptionId}
+                  />
+                {/snippet}
+              </SettingsFieldRow>
+            </section>
 
-          <!-- This daemon's own tailcat tunnel address (copyable) — shown only
+            <!-- This daemon's own tailcat tunnel address (copyable) — shown only
              while the tunnel is on and the daemon reports one. -->
-          {#if tunnelEnabled && tcAddress}
-            <section data-tunnel-address-row>
-              <div class="flex items-center justify-between gap-2">
-                <span class="type-body text-muted-foreground">
-                  {m.settings_tunnel_tcAddress_label()}
-                </span>
-                <div class="flex items-center gap-2 shrink-0">
-                  <code
-                    class="type-caption font-mono text-foreground bg-muted px-2 py-0.5 rounded max-w-[280px] truncate"
-                    title={tcAddress}>{tcAddress}</code
-                  >
-                  <Button
-                    variant="ghost"
-                    type="button"
-                    onclick={handleCopyTcAddress}
-                    class="p-1.5 text-muted-foreground hover:text-foreground rounded-md hover:bg-muted transition-colors cursor-pointer"
-                    title={m.settings_tunnel_tcAddress_copy()}
-                  >
-                    <Fa icon={faCopy} size="sm" />
-                  </Button>
+            {#if tunnelEnabled && tcAddress}
+              <section data-tunnel-address-row>
+                <div class="flex items-center justify-between gap-2">
+                  <span class="type-body text-muted-foreground">
+                    {m.settings_tunnel_tcAddress_label()}
+                  </span>
+                  <div class="flex items-center gap-2 shrink-0">
+                    <code
+                      class="type-caption font-mono text-foreground bg-muted px-2 py-0.5 rounded max-w-[280px] truncate"
+                      title={tcAddress}>{tcAddress}</code
+                    >
+                    <Button
+                      variant="ghost"
+                      type="button"
+                      onclick={handleCopyTcAddress}
+                      class="p-1.5 text-muted-foreground hover:text-foreground rounded-md hover:bg-muted transition-colors cursor-pointer"
+                      title={m.settings_tunnel_tcAddress_copy()}
+                    >
+                      <Fa icon={faCopy} size="sm" />
+                    </Button>
+                  </div>
                 </div>
+              </section>
+            {/if}
+          </div>
+        {/if}
+
+        <!-- Port remains configurable even while remote access is disabled. -->
+        <SettingsFieldRow
+          id="websocket-port"
+          label={m.settings_wsApi_port_label()}
+          error={portValid ? undefined : m.settings_wsApi_port_invalid()}
+          disabled={portSaving}
+        >
+          {#snippet control({ labelId, errorId })}
+            <div class="flex items-center gap-2">
+              <div class="shrink-0 w-32">
+                <Input
+                  type="number"
+                  min="1024"
+                  max="65535"
+                  bind:value={editedPort}
+                  disabled={portSaving}
+                  aria-label={m.settings_wsApi_port_ariaLabel()}
+                  aria-labelledby={labelId}
+                  aria-describedby={errorId}
+                />
+              </div>
+              {#if Number(editedPort) !== persistedPort}
+                <Button
+                  variant="link"
+                  size="sm"
+                  type="button"
+                  onclick={handlePortSave}
+                  disabled={portSaving || !portValid}
+                  class="h-auto px-0"
+                >
+                  {portSaving ? m.settings_wsApi_port_saving() : m.settings_wsApi_port_save()}
+                </Button>
+              {/if}
+            </div>
+          {/snippet}
+        </SettingsFieldRow>
+
+        {#if enabled}
+          <!-- TLS Certificate Fingerprint (truncated single line by user
+             preference — reverses cloudlands-fe#1979's full-width display;
+             the full value stays available via the title tooltip) -->
+          {#if certFingerprint}
+            <section>
+              <div class="flex flex-wrap items-center justify-between gap-2">
+                <span class="type-body text-muted-foreground"
+                  >{m.settings_wsApi_tlsFingerprint_label()}</span
+                >
+                <code
+                  class="type-caption font-mono text-foreground bg-muted px-2 py-0.5 rounded max-w-[280px] truncate"
+                  title={certFingerprint}>{certFingerprint.slice(0, 23)}…</code
+                >
               </div>
             </section>
           {/if}
-        </div>
-      {/if}
-
-      <!-- Port remains configurable even while remote access is disabled. -->
-      <SettingsFieldRow
-        id="websocket-port"
-        label={m.settings_wsApi_port_label()}
-        error={portValid ? undefined : m.settings_wsApi_port_invalid()}
-        disabled={portSaving}
-      >
-        {#snippet control({ labelId, errorId })}
-          <div class="flex items-center gap-2">
-            <div class="shrink-0 w-32">
-              <Input
-                type="number"
-                min="1024"
-                max="65535"
-                bind:value={editedPort}
-                disabled={portSaving}
-                aria-label={m.settings_wsApi_port_ariaLabel()}
-                aria-labelledby={labelId}
-                aria-describedby={errorId}
-              />
-            </div>
-            {#if Number(editedPort) !== persistedPort}
-              <Button
-                variant="link"
-                size="sm"
-                type="button"
-                onclick={handlePortSave}
-                disabled={portSaving || !portValid}
-                class="h-auto px-0"
-              >
-                {portSaving ? m.settings_wsApi_port_saving() : m.settings_wsApi_port_save()}
-              </Button>
-            {/if}
-          </div>
-        {/snippet}
-      </SettingsFieldRow>
-
-      {#if enabled}
-        <!-- TLS Certificate Fingerprint (truncated single line by user
-             preference — reverses cloudlands-fe#1979's full-width display;
-             the full value stays available via the title tooltip) -->
-        {#if certFingerprint}
-          <section>
-            <div class="flex flex-wrap items-center justify-between gap-2">
-              <span class="type-body text-muted-foreground"
-                >{m.settings_wsApi_tlsFingerprint_label()}</span
-              >
-              <code
-                class="type-caption font-mono text-foreground bg-muted px-2 py-0.5 rounded max-w-[280px] truncate"
-                title={certFingerprint}>{certFingerprint.slice(0, 23)}…</code
-              >
-            </div>
-          </section>
         {/if}
-      {/if}
-    </div>
+      </div>
+    </SettingsDisclosure>
   {/if}
 </div>
 
