@@ -57,6 +57,11 @@
      * transcript author this map resolves it to.
      */
     authors?: ReadonlyMap<string, MessageAuthor> | null;
+    /**
+     * The viewer's own principal (`presence.ownPrincipalId`): their own
+     * entries render no author. `null` = not yet known, every author shown.
+     */
+    ownPrincipalId?: string | null;
   }
 
   let {
@@ -67,6 +72,7 @@
     onsendnow,
     ondone,
     authors = null,
+    ownPrincipalId = null,
   }: Props = $props();
 
   const workspaceId = getWorkspaceRouteContext()?.workspaceId ?? undefined;
@@ -613,7 +619,7 @@
                   </Button>
                 </div>
               {:else}
-                {@const queuedAuthor = getQueuedMessageAuthor(message, authors)}
+                {@const queuedAuthor = getQueuedMessageAuthor(message, authors, ownPrincipalId)}
                 {@const queuedAuthorLabel = queuedAuthor
                   ? getMessageAuthorLabel(queuedAuthor)
                   : null}
