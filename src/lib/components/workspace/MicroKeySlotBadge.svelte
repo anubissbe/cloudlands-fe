@@ -87,6 +87,7 @@
      numbered rows keep the same height and dot/title offset as un-numbered rows. -->
 <Button
   variant="ghost"
+  size="icon"
   type="button"
   class="micro-key-slot-badge size-4 min-w-0 shrink-0 cursor-pointer rounded-[3px] p-0 a11y-ignore"
   aria-label={m.workspace_microKeyBadge_ariaLabel({ number: formatInteger(slot + 1) })}
