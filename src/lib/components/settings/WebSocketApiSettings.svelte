@@ -41,6 +41,7 @@
     faQrcode,
   } from '@fortawesome/free-solid-svg-icons';
   import { notify } from '$lib/components/patterns/notify';
+  import { FormDialog } from '$lib/components/patterns/confirm';
   import {
     SettingsDisclosure,
     SettingsFieldRow,
@@ -935,42 +936,24 @@
   {/if}
 </div>
 
-{#if showQr}
-  <!-- QR Code overlay -->
-  <div
-    class="fixed inset-0 bg-black/50 flex items-center justify-center p-4 z-50"
-    onclick={(event) => {
-      if (event.target === event.currentTarget) handleCloseQr();
-    }}
-    onkeydown={(e) => e.key === 'Escape' && handleCloseQr()}
-    role="dialog"
-    aria-modal="true"
-    aria-label={m.settings_wsApi_qrDialogAriaLabel()}
-    tabindex="-1"
-  >
-    <div class="w-full max-w-xs rounded-xl bg-card p-6 text-left shadow-xl">
-      <h3 class="type-body font-medium text-foreground mb-3">
-        {m.settings_wsApi_mobilePairing_label()}
-      </h3>
-      {#if qrDataUrl}
-        <img
-          src={qrDataUrl}
-          alt={m.settings_wsApi_qrImageAlt()}
-          class="w-full h-auto rounded-lg"
-          width="544"
-          height="544"
-        />
-      {/if}
-      <p class="type-body text-subtle mt-3">
-        {m.settings_wsApi_scanDescription()}
-      </p>
-      <Button
-        type="button"
-        onclick={handleCloseQr}
-        class="mt-4 px-4 py-1.5 type-body font-medium text-foreground bg-muted hover:bg-muted/80 rounded-md transition-colors cursor-pointer"
-      >
-        {m.settings_wsApi_close()}
-      </Button>
-    </div>
-  </div>
-{/if}
+<FormDialog
+  bind:open={showQr}
+  title={m.settings_wsApi_mobilePairing_label()}
+  submitLabel={m.settings_wsApi_close()}
+  showCancel={false}
+  showCloseButton={false}
+  class="max-w-xs"
+  onSubmit={handleCloseQr}
+  onCancel={handleCloseQr}
+>
+  {#if qrDataUrl}
+    <img
+      src={qrDataUrl}
+      alt={m.settings_wsApi_qrImageAlt()}
+      class="w-full h-auto rounded-lg"
+      width="544"
+      height="544"
+    />
+  {/if}
+  <p class="type-body text-subtle">{m.settings_wsApi_scanDescription()}</p>
+</FormDialog>

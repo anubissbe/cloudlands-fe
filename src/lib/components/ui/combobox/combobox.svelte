@@ -55,6 +55,7 @@
   }
 
   type StaticContentChildProps = { props: Record<string, unknown> };
+  type OptionChildProps = StaticContentChildProps & { selected: boolean };
   type ContentChildProps = StaticContentChildProps & {
     wrapperProps: Record<string, unknown>;
   };
@@ -354,14 +355,7 @@
                   </ComboboxPrimitive.GroupHeading>
                 {/if}
                 {#each group.options as option (option.value)}
-                  <!-- i18n-ignore (snippet parameter type annotation, not UI text) -->
-                  {#snippet optionChild({
-                    props,
-                    selected,
-                  }: {
-                    props: Record<string, unknown>;
-                    selected: boolean;
-                  })}
+                  {#snippet optionChild({ props, selected }: OptionChildProps)}
                     <div
                       {...props}
                       data-slot="combobox-option-motion"
