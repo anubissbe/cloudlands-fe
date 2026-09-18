@@ -59,10 +59,9 @@ interface ChatSnapshotPayload {
   isResponding?: boolean;
   turnInFlight?: boolean;
   /**
-   * Resume disposition (§7.1): present ONLY when the registration carried
-   * `sinceMessageId` — `true` when `messages` is the post-anchor delta,
-   * `false` when the daemon fell back to the standard newest page (unknown/
-   * pruned anchor). Absent on non-resume snapshots.
+   * Resume/reset disposition (§7.1): `true` for a post-anchor delta;
+   * `false` for a missing anchor or a mid-stream transcript invalidation.
+   * A false flag invalidates cached history even without a resume anchor.
    */
   resumed?: boolean;
   /**
@@ -779,7 +778,7 @@ export class LiveChatClient implements ChatClient {
         // §7.1 resume: the anchor rides only until the first snapshot lands
         // — after that the reconciler holds daemon-served state, and every
         // internal re-registration must take the full newest page.
-        const resumed = resumeAnchor === undefined ? undefined : extractResumedFlag(push.snapshot);
+        const resumed = extractResumedFlag(push.snapshot);
         resumeAnchor = undefined;
         if (reconciler.applySnapshot(push.seq, push.snapshot)) {
           const reconcilerResult = sawSnapshot ? 'reset' : 'applied';
