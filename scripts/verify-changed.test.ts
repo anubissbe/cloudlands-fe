@@ -1,7 +1,16 @@
 // @verify-changed-triggers: vitest.config.ts, playwright.config.ts, test/actions-status-visual.spec.ts
 
-import { execFileSync } from 'node:child_process';
-import { mkdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { execFileSync, spawnSync } from 'node:child_process';
+import {
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -21,6 +30,7 @@ import {
   verificationLockKey,
   vitestExcludePatterns,
 } from './verify-changed.mjs';
+import { lockOwner } from './verification-lock.mjs';
 
 const requireFromTest = createRequire(import.meta.url);
 
@@ -736,6 +746,16 @@ describe('verification planning', () => {
     expect(testRunner('tests/unit/edge-cases.test.ts')).toBe('vitest');
     expect(testRunner('src/test/factories/__tests__/workspace.factory.test.ts')).toBe('vitest');
     expect(testRunner('src/lib/__tests__/button.ct.spec.ts')).toBe('ct');
+    // Playwright matches testMatch with nocase + dot, so these are CT specs too.
+    expect(testRunner('src/.fixtures/button.ct.spec.ts')).toBe('ct');
+    expect(testRunner('src/.hidden.ct.spec.ts')).toBe('ct');
+    expect(testRunner('src/button.CT.spec.ts')).toBe('ct');
+    expect(testRunner('src/button.CT.SPEC.TS')).toBe('ct');
+    // Only the files playwright-ct.config.ts discovers (`**/*.ct.spec.ts`) are
+    // CT; vitest.config.ts excludes just that pattern, so a `.ct.test.ts` under
+    // `src/` is a Vitest suite, not a CT one.
+    expect(testRunner('src/x/y.ct.test.ts')).toBe('vitest');
+    expect(testRunner('src/x/y.ct.spec.tsx')).toBe('vitest');
     expect(testRunner('scripts/verify-changed.test.ts')).toBe('vitest');
     expect(testRunner('src/lib/example.ts')).toBeNull();
   });
@@ -963,6 +983,16 @@ describe('verification planning', () => {
     }
   });
 
+  it('feeds playwright/ sources to vitest related so their colocated suites run', () => {
+    const root = fixtureRoot({
+      'playwright/ct-spec-pattern.mjs': 'export const CT_TEST_DIR = "src";',
+      'playwright/ct-spec-pattern.test.ts': "import './ct-spec-pattern.mjs';",
+    });
+    const plan = createVerificationPlan(['playwright/ct-spec-pattern.mjs'], { root, ctTests: [] });
+    const related = plan.checks.find((check) => check.id === 'vitest-related');
+    expect(related?.args).toContain('playwright/ct-spec-pattern.mjs');
+  });
+
   it('runs the whole Playwright browser suite when its config changes', () => {
     const root = fixtureRoot({ 'playwright.config.ts': '', 'test/a.spec.ts': '' });
     const plan = createVerificationPlan(['playwright.config.ts', 'test/a.spec.ts'], {
@@ -1125,12 +1155,10 @@ describe('expensive-check coordination', () => {
     const lockPath = join(parent, 'lock');
     const cwd = '/current/worktree';
     const release = await acquireVerificationLock({ lockPath, timeoutMs: 15, pollMs: 5, cwd });
-    expect(JSON.parse(readFileSync(join(lockPath, 'owner.json'), 'utf8'))).toMatchObject({
-      pid: process.pid,
-      cwd,
-    });
+    expect(lockOwner(lockPath)).toMatchObject({ pid: process.pid, cwd });
     release();
-    expect(() => readFileSync(join(lockPath, 'owner.json'), 'utf8')).toThrow();
+    expect(existsSync(lockPath)).toBe(false);
+    expect(readdirSync(parent)).toEqual([]);
   });
 
   it('times out without removing or stopping a live owner', async () => {
@@ -1143,13 +1171,58 @@ describe('expensive-check coordination', () => {
     await expect(acquireVerificationLock({ lockPath, timeoutMs: 15, pollMs: 5 })).rejects.toThrow(
       new RegExp(`owner pid ${process.pid} cwd ${ownerCwd}; waited [0-9]+ms`),
     );
-    expect(JSON.parse(readFileSync(join(lockPath, 'owner.json'), 'utf8')).token).toBe('other');
+    expect(lockOwner(lockPath).token).toBe('other');
+  });
+
+  it('reclaims a lock whose owner process is gone', async () => {
+    const lockPath = temporaryDirectory();
+    const deadPid = spawnSync(process.execPath, ['-e', '0']).pid;
+    writeFileSync(
+      join(lockPath, 'owner-dead.json'),
+      JSON.stringify({ pid: deadPid, cwd: '/gone', token: 'dead' }),
+    );
+
+    const release = await acquireVerificationLock({ lockPath, timeoutMs: 15, pollMs: 5 });
+    expect(lockOwner(lockPath).pid).toBe(process.pid);
+    release();
+    expect(existsSync(lockPath)).toBe(false);
+  });
+
+  it('never removes a lock another contender re-created while reclaiming the same stale owner', async () => {
+    const lockPath = temporaryDirectory();
+    writeFileSync(join(lockPath, 'owner-dead.json'), 'not json');
+    let inspections = 0;
+
+    await expect(
+      acquireVerificationLock({
+        lockPath,
+        timeoutMs: 15,
+        pollMs: 5,
+        statLock(path: string) {
+          // Between this contender judging the owner stale and acting on it, another
+          // contender finishes the same reclaim and acquires the lock.
+          if (inspections++ === 0) {
+            rmSync(path, { recursive: true, force: true });
+            mkdirSync(path);
+            writeFileSync(
+              join(path, 'owner-fresh.json'),
+              JSON.stringify({ pid: process.pid, cwd: '/other/worktree', token: 'fresh' }),
+            );
+          }
+          return { mtimeMs: Date.now() - 5 * 60 * 60 * 1000 } as ReturnType<typeof statSync>;
+        },
+      }),
+    ).rejects.toThrow(new RegExp(`owner pid ${process.pid} cwd /other/worktree; waited [0-9]+ms`));
+
+    expect(inspections).toBe(1);
+    expect(lockOwner(lockPath).token).toBe('fresh');
   });
 
   it('retries when the lock disappears before its metadata can be inspected', async () => {
     const parent = temporaryDirectory();
     const lockPath = join(parent, 'lock');
     mkdirSync(lockPath);
+    writeFileSync(join(lockPath, 'owner.json'), 'not json');
 
     const release = await acquireVerificationLock({
       lockPath,
@@ -1161,12 +1234,13 @@ describe('expensive-check coordination', () => {
       },
     });
 
-    expect(readFileSync(join(lockPath, 'owner.json'), 'utf8')).toContain(String(process.pid));
+    expect(lockOwner(lockPath).pid).toBe(process.pid);
     release();
   });
 
   it('preserves unexpected lock inspection errors', async () => {
     const lockPath = temporaryDirectory();
+    writeFileSync(join(lockPath, 'owner.json'), 'not json');
     const error = Object.assign(new Error('lock inspection failed'), { code: 'EACCES' });
 
     await expect(
