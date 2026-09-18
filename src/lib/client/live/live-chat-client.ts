@@ -221,9 +221,8 @@ function extractSnapshot(raw: unknown, expectedAgentId?: string): ChatSnapshotRe
 }
 
 /**
- * The §7.1 resume disposition carried on a resume-requesting registration's
- * seq-0 snapshot, or `undefined` when the snapshot does not carry one (the
- * registration sent no `sinceMessageId`).
+ * The §7.1 resume/reset disposition on an initial or mid-stream snapshot,
+ * or `undefined` when the wire payload does not carry one.
  */
 function extractResumedFlag(raw: unknown): boolean | undefined {
   if (!raw || typeof raw !== 'object') return undefined;
@@ -723,9 +722,9 @@ export class LiveChatClient implements ChatClient {
       }
     };
 
-    // Snapshot-apply emits carry `fromSnapshot: true` (plus the §7.1 resume
-    // disposition when the registration requested one) so consumers can seed
-    // hydration from the authoritative newest page.
+    // Snapshot-apply emits carry `fromSnapshot: true` plus any §7.1 resume/reset
+    // disposition, including mid-stream invalidation without a resume request.
+    // Consumers hydrate or discard cached history from this authoritative page.
     const emitSnapshot = (
       resumed: boolean | undefined,
       diagnostic: StreamLifecycleDiagnostic,
