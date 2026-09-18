@@ -302,6 +302,28 @@ describe('AuroraBackground cleanup', () => {
     now.mockRestore();
   });
 
+  it.each([30, 'display'] as const)('benchmarks actual draws at %s cadence', (frameRate) => {
+    const now = vi.spyOn(performance, 'now').mockReturnValue(0);
+    const onDraw = vi.fn();
+    render(AuroraBackground, {
+      benchmark: { pixelRatio: 0.5, frameRate, seed: 123, onDraw },
+    });
+    flushRafCallbacks();
+    MockResizeObserver.instances[0].fire(800, 272);
+    mockGL.gl.drawArrays.mockClear();
+    onDraw.mockClear();
+
+    for (const time of [10, 20, 34]) {
+      now.mockReturnValue(time);
+      flushRafCallbacks();
+    }
+    expect(mockGL.gl.drawArrays).toHaveBeenCalledTimes(frameRate === 30 ? 1 : 3);
+    expect(onDraw).toHaveBeenCalledTimes(frameRate === 30 ? 1 : 3);
+    expect(onDraw).toHaveBeenLastCalledWith({ time: 34, submissionMs: 0, width: 400, height: 136 });
+    expect(mockGL.gl.uniform1f).toHaveBeenCalledWith({ name: 'u_seed' }, 123);
+    expect(mockGL.gl.viewport).toHaveBeenLastCalledWith(0, 0, 400, 136);
+  });
+
   it('advances shader time while retaining the session seed across frames', () => {
     const now = vi.spyOn(performance, 'now').mockReturnValue(0);
     vi.spyOn(Math, 'random').mockReturnValue(0.42);

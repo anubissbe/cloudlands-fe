@@ -13,6 +13,7 @@
    * - Respects reduced motion (OS preference or battery saver)
    */
   import { onMount, onDestroy } from 'svelte';
+  import type { AuroraBenchmarkOptions } from './aurora-performance';
   import { browser } from '$app/environment';
   import {
     scheduleLayoutRead,
@@ -26,9 +27,11 @@
 
   interface Props {
     agentId?: string;
+    /** Developer benchmark only; remount when changing these controls. */
+    benchmark?: AuroraBenchmarkOptions;
   }
 
-  let { agentId = 'default' }: Props = $props();
+  let { agentId = 'default', benchmark }: Props = $props();
 
   let canvas = $state<HTMLCanvasElement>();
   let gl = $state<WebGLRenderingContext | null>(null);
@@ -47,10 +50,11 @@
   let semanticColorReady = false;
 
   // Target 30fps instead of 60fps to reduce GPU usage
-  const TARGET_FRAME_TIME = 1000 / 30; // ~33ms per frame
+  const targetFrameTime = $derived(benchmark?.frameRate === 'display' ? 0 : 1000 / 30);
 
   // Random seed for variety each session
-  const seed = Math.random() * 1000;
+  const randomSeed = Math.random() * 1000;
+  const seed = $derived(benchmark?.seed ?? randomSeed);
 
   // Cached uniform locations (avoid getUniformLocation every frame)
   let uniformLocations: {
@@ -453,14 +457,14 @@
       return;
     }
 
-    // Throttle to ~30fps to reduce GPU usage
+    // Production stays at 30fps; the benchmark can follow the display cadence.
     const now = performance.now();
     const elapsed = now - lastFrameTime;
-    if (elapsed < TARGET_FRAME_TIME) {
+    if (elapsed < targetFrameTime) {
       scheduleRender();
       return;
     }
-    lastFrameTime = now - (elapsed % TARGET_FRAME_TIME);
+    lastFrameTime = targetFrameTime ? now - (elapsed % targetFrameTime) : now;
 
     const width = canvas.width;
     const height = canvas.height;
@@ -487,6 +491,7 @@
 
     gl.uniform1f(uniformLocations.seed, seed);
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    benchmark?.onDraw({ time: now, submissionMs: performance.now() - now, width, height });
 
     scheduleRender();
   }
@@ -559,7 +564,10 @@
     const dpr = window.devicePixelRatio || 1;
     const dprQuery = window.matchMedia(`(resolution: ${dpr}dppx)`);
     const handler = () => {
-      cachedDpr = window.devicePixelRatio || 1;
+      cachedDpr = Math.min(
+        window.devicePixelRatio || 1,
+        benchmark?.pixelRatio === 0.5 ? 0.5 : Infinity,
+      );
       scheduleCanvasSizeUpdate();
       // Remove old listener and set up a new one with the updated DPR
       dprQuery.removeEventListener('change', handler);
@@ -574,7 +582,10 @@
     isPageVisible = !document.hidden;
     isWindowFocused = !document.documentElement.hasAttribute('data-window-blurred');
     prefersReducedMotion = isReducedMotionPreferred();
-    cachedDpr = window.devicePixelRatio || 1;
+    cachedDpr = Math.min(
+      window.devicePixelRatio || 1,
+      benchmark?.pixelRatio === 0.5 ? 0.5 : Infinity,
+    );
 
     // Listen for visibility changes
     document.addEventListener('visibilitychange', handleVisibilityChange);
