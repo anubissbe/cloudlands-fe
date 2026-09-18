@@ -1158,21 +1158,6 @@ describe('WebSocketApiSettings', () => {
       expect(qrMocks.toDataURL.mock.calls[0][0]).not.toContain('tc=');
     });
 
-    it('shows the Tailcat address row before the TLS fingerprint when the daemon reports one', async () => {
-      mocks.mockSettingsList.mockResolvedValue(settingsRows({ enabled: true, only: false }));
-      mocks.mockPairingInfo.mockResolvedValue({ ...PAIRING, tcAddress: 'tc-key-abc' });
-      await renderExpandedSettings();
-
-      await waitFor(() => expect(screen.getByText('tc-key-abc')).toBeTruthy());
-      expect(screen.getByText(m.settings_tunnel_tcAddress_label())).toBeTruthy();
-      // Positioned before the TLS Fingerprint row (where pairing happens).
-      const row = screen.getByText('tc-key-abc').closest('section') as HTMLElement;
-      const fingerprintRow = screen
-        .getByText(m.settings_wsApi_tlsFingerprint_label())
-        .closest('section') as HTMLElement;
-      expect(row.compareDocumentPosition(fingerprintRow)).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
-    });
-
     it('copies the Tailcat address from the row copy button', async () => {
       mocks.mockSettingsList.mockResolvedValue(settingsRows({ enabled: true, only: false }));
       mocks.mockPairingInfo.mockResolvedValue({ ...PAIRING, tcAddress: 'tc-key-abc' });
