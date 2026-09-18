@@ -292,6 +292,9 @@ describe('Settings deterministic mock-BE contracts', () => {
       return { ok: true, result: { applied: expectedChanges } };
     });
     render(WebSocketApiSettings);
+    await fireEvent.click(
+      screen.getByRole('button', { name: m.settings_devices_advanced_label() }),
+    );
     const input = await screen.findByRole('combobox', { name: m.settings_listenTargets_label() });
     await waitFor(() => expect((input as HTMLInputElement).disabled).toBe(false));
     await fireEvent.focus(input);

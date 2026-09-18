@@ -89,6 +89,10 @@ vi.mock('$store/renderer/slices/connections/connections-slice', () => ({
   setKeychainSyncEnabledRequested: (enabled: boolean) => mocks.setSyncEnabled(enabled),
 }));
 
+vi.mock('$lib/components/patterns/notify', () => ({
+  notify: { error: mocks.toastError, success: vi.fn() },
+}));
+
 vi.mock('$lib/components/ui/toast', () => ({
   toast: { error: mocks.toastError, success: vi.fn() },
 }));
@@ -645,7 +649,7 @@ describe('DevicesSettings', () => {
     );
   });
 
-  it('toggles remote access from the collapsed local row and reveals details without refetching', async () => {
+  it('enabling remote access from the collapsed local row opens configuration', async () => {
     mocks.connections = [local];
     render(DevicesSettings);
     const toggle = screen.getByRole('switch', { name: m.settings_wsApi_enable_label() });
@@ -657,17 +661,24 @@ describe('DevicesSettings', () => {
       ]),
     );
     await waitFor(() => expect(mocks.pairingInfo).toHaveBeenCalled());
-    expect(screen.queryByRole('button', { name: m.settings_wsApi_showQrCode() })).toBeNull();
-    const loads = mocks.settingsList.mock.calls.length;
-    await openAction('Edit', m.layout_daemonStatus_localConnection_label());
-    expect(screen.getByRole('button', { name: m.settings_wsApi_showQrCode() })).toBeTruthy();
+    expect(await screen.findByRole('button', { name: m.settings_wsApi_showQrCode() })).toBeTruthy();
     expect(toggle.getAttribute('aria-checked')).toBe('true');
-    expect(mocks.settingsList).toHaveBeenCalledTimes(loads);
+  });
+
+  it('keeps local configuration closed if enabling remote access fails', async () => {
+    mocks.connections = [local];
+    mocks.settingsUpdate.mockRejectedValueOnce(new Error('listener failed'));
+    render(DevicesSettings);
+    const toggle = screen.getByRole('switch', { name: m.settings_wsApi_enable_label() });
+    await waitFor(() => expect((toggle as HTMLButtonElement).disabled).toBe(false));
+    await fireEvent.click(toggle);
+    await waitFor(() => expect(mocks.toastError).toHaveBeenCalled());
+    expect(toggle.getAttribute('aria-checked')).toBe('false');
+    expect(screen.queryByRole('button', { name: m.settings_devices_advanced_label() })).toBeNull();
   });
 
   it('opens local configuration when requested by the remote-access deep link', async () => {
     render(DevicesSettings, { localSettingsRequested: 1 });
-    expect(await screen.findByTestId('device-icon-picker-trigger')).toBeTruthy();
     expect(
       screen.getByRole('button', { name: 'Advanced', exact: true }).getAttribute('aria-expanded'),
     ).toBe('false');
@@ -678,6 +689,9 @@ describe('DevicesSettings', () => {
     render(DevicesSettings);
 
     await openAction('Edit', m.layout_daemonStatus_localConnection_label());
+    await fireEvent.click(
+      screen.getByRole('button', { name: m.settings_devices_advanced_label() }),
+    );
 
     const picker = screen.getByTestId('device-icon-picker-trigger');
     expect(picker.getAttribute('aria-label')).toContain('Automatic (Laptop)');
@@ -709,6 +723,9 @@ describe('DevicesSettings', () => {
     render(DevicesSettings);
 
     await openAction('Edit', m.layout_daemonStatus_localConnection_label());
+    await fireEvent.click(
+      screen.getByRole('button', { name: m.settings_devices_advanced_label() }),
+    );
 
     const picker = screen.getByTestId('device-icon-picker-trigger');
     expect(picker.getAttribute('aria-label')).toContain('Robot');

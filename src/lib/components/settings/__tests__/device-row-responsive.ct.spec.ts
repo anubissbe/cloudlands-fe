@@ -58,6 +58,16 @@ for (const width of [360, 1024]) {
     });
     const local = page.getByRole('article', { name: 'This machine (local)' });
     await expect(local.getByRole('button', { name: 'Show QR Code' })).toBeVisible();
+    const advanced = local.getByRole('button', { name: 'Advanced', exact: true });
+    await expect(advanced).toHaveAttribute('aria-expanded', 'false');
+    await expect(local.getByRole('spinbutton', { name: 'Port' })).toBeHidden();
+    await advanced.focus();
+    await page.keyboard.press('Enter');
+    await expect(advanced).toHaveAttribute('aria-expanded', 'true');
+    await expect(local.getByRole('spinbutton', { name: 'Port' })).toBeVisible();
+    await page.keyboard.press('Space');
+    await expect(local.getByRole('spinbutton', { name: 'Port' })).toBeHidden();
+    await page.keyboard.press('Enter');
     const networks = local.getByRole('combobox', { name: 'Available Networks' });
     await networks.focus();
     await expect(page.getByRole('listbox')).toHaveAttribute('aria-multiselectable', 'true');
@@ -71,16 +81,6 @@ for (const width of [360, 1024]) {
     await expect(networks).toBeEnabled();
     await page.keyboard.press('Escape');
     await expect(networks).toHaveValue('127.0.0.1 (localhost), 192.0.2.10');
-    const advanced = local.getByRole('button', { name: 'Advanced', exact: true });
-    await expect(advanced).toHaveAttribute('aria-expanded', 'false');
-    await expect(local.getByRole('spinbutton', { name: 'Port' })).toBeHidden();
-    await advanced.focus();
-    await page.keyboard.press('Enter');
-    await expect(advanced).toHaveAttribute('aria-expanded', 'true');
-    await expect(local.getByRole('spinbutton', { name: 'Port' })).toBeVisible();
-    await page.keyboard.press('Space');
-    await expect(local.getByRole('spinbutton', { name: 'Port' })).toBeHidden();
-    await page.keyboard.press('Enter');
     await page.evaluate(() => document.fonts.ready);
     const overflowing = await local.evaluate((row) => {
       const bounds = row.getBoundingClientRect();
@@ -98,8 +98,8 @@ for (const width of [360, 1024]) {
     await expect(local.getByRole('spinbutton', { name: 'Port' })).toHaveCount(0);
     await local.getByRole('button', { name: 'Actions for This machine (local)' }).click();
     await page.getByRole('menuitem', { name: 'Edit', exact: true }).click();
-    await expect(local.getByTestId('device-icon-picker-trigger')).toBeVisible();
     await local.getByRole('button', { name: 'Advanced', exact: true }).click();
+    await expect(local.getByTestId('device-icon-picker-trigger')).toBeVisible();
     await expect(local.getByRole('spinbutton', { name: 'Port' })).toHaveValue('5181');
   });
 }

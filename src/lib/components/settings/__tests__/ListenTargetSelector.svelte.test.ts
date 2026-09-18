@@ -62,7 +62,7 @@ describe('Available Networks multiselect', () => {
         tunnelSelected: true,
       });
       expect(screen.getByRole('option', { name: '10.0.0.5' }).hasAttribute('data-disabled')).toBe(
-        true,
+        false,
       );
       await pick(
         wildcard === '0.0.0.0' ? m.settings_listenTargets_allInterfaces_label() : wildcard,

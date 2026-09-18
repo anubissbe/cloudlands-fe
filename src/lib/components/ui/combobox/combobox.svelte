@@ -340,6 +340,9 @@
               </div>
             {/if}
             {#each filteredGroups as group (group.key)}
+              {#if group.separatorBefore && group.options.length > 0}
+                <ComboboxPrimitive.Separator decorative class="my-1 border-t border-border" />
+              {/if}
               <ComboboxPrimitive.Group>
                 {#if group.label}
                   <ComboboxPrimitive.GroupHeading
@@ -352,7 +355,13 @@
                 {/if}
                 {#each group.options as option (option.value)}
                   <!-- i18n-ignore (snippet parameter type annotation, not UI text) -->
-                  {#snippet optionChild({ props }: { props: Record<string, unknown> })}
+                  {#snippet optionChild({
+                    props,
+                    selected,
+                  }: {
+                    props: Record<string, unknown>;
+                    selected: boolean;
+                  })}
                     <div
                       {...props}
                       data-slot="combobox-option-motion"
@@ -372,7 +381,8 @@
                         data-slot="combobox-item-check"
                         class={cn(
                           OPTION_LIST_END_SLOT_CLASS,
-                          'text-primary-ink font-medium opacity-0 group-data-[selected]:opacity-100',
+                          'text-primary-ink font-medium',
+                          selected ? 'opacity-100' : 'opacity-0',
                         )}
                         aria-hidden="true">✓</span
                       >

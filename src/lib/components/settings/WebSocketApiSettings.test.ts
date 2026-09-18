@@ -1319,6 +1319,37 @@ describe('WebSocketApiSettings', () => {
       },
     );
 
+    it.each(['192.168.1.2', '127.0.0.1'])('selecting %s replaces All interfaces', async (ip) => {
+      mocks.mockSettingsList.mockResolvedValue(
+        settingsRows({ bindAddress: ['0.0.0.0'], tunnel: { enabled: true, only: false } }),
+      );
+      mocks.mockPairingInfo.mockResolvedValue(PAIRING);
+      await renderExpandedSettings();
+      await openNetworks();
+      const ips = ip === '127.0.0.1' ? [ip] : [ip, '127.0.0.1'];
+      mocks.mockSettingsUpdate.mockResolvedValue([]);
+      mocks.mockSettingsList.mockResolvedValue(
+        settingsRows({ bindAddress: ips, tunnel: { enabled: true, only: false } }),
+      );
+      await pickNetwork(ip === '127.0.0.1' ? m.settings_listenTargets_loopback_label() : ip);
+      await waitFor(() =>
+        expect(mocks.mockSettingsUpdate).toHaveBeenCalledWith([
+          { path: 'server.bindAddress', value: ips },
+          { path: 'server.tunnel.enabled', value: true },
+          { path: 'server.tunnel.only', value: false },
+        ]),
+      );
+      await waitFor(() =>
+        expect(
+          isNetworkSelected(
+            screen.getByRole('option', {
+              name: m.settings_listenTargets_allInterfaces_label(),
+            }),
+          ),
+        ).toBe(false),
+      );
+    });
+
     it('narrows All interfaces to localhost and then adds specific networks without hiding the selector', async () => {
       mocks.mockSettingsList.mockResolvedValue(
         settingsRows({ bindAddress: ['0.0.0.0'], tunnel: { enabled: true, only: false } }),

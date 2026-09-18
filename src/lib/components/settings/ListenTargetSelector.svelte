@@ -46,22 +46,27 @@
   ]);
 
   const selection = $derived(new Set(selectedIps));
-  // While an unspecified address is bound, every other address is already
-  // covered by it — render them checked but locked until it is unchecked.
   const allInterfacesSelected = $derived(selectedIps.some((ip) => UNSPECIFIED.has(ip)));
-
-  const renderedSelection = $derived(
-    allInterfacesSelected
-      ? ipOptions.filter((ip) => selection.has(ip) || !UNSPECIFIED.has(ip))
-      : withLoopback(selectedIps),
-  );
-  const options = $derived(
-    ipOptions.map((ip) => ({
-      value: ip,
-      label: ipLabel(ip),
-      disabled: ip === LOOPBACK || (allInterfacesSelected && !UNSPECIFIED.has(ip)),
-    })),
-  );
+  const renderedSelection = $derived(withLoopback(selectedIps));
+  const groups = $derived([
+    {
+      key: 'all',
+      label: '',
+      options: [{ value: ALL_INTERFACES, label: ipLabel(ALL_INTERFACES) }],
+    },
+    {
+      key: 'interfaces',
+      label: '',
+      separatorBefore: true,
+      options: ipOptions
+        .filter((ip) => ip !== ALL_INTERFACES)
+        .map((ip) => ({
+          value: ip,
+          label: ipLabel(ip),
+          disabled: ip === LOOPBACK && !allInterfacesSelected,
+        })),
+    },
+  ]);
   const displayValue = $derived(selectedIps.map(ipLabel).join(', '));
 
   function ipLabel(ip: string): string {
@@ -84,7 +89,7 @@
   }
 
   function toggleIp(ip: string): void {
-    if (ip === LOOPBACK) return; // always bound, never toggled
+    if (ip === LOOPBACK && !allInterfacesSelected) return; // always bound
     let ips: string[];
     if (selection.has(ip)) {
       ips = selectedIps.filter((v) => v !== ip);
@@ -115,7 +120,7 @@
       <Combobox
         multiple
         bind:value={() => renderedSelection, () => {}}
-        {options}
+        {groups}
         {displayValue}
         disabled={saving}
         ariaLabel={m.settings_listenTargets_label()}

@@ -558,7 +558,7 @@
 
   {#if device.isLocal}
     <div class="px-4 pb-4 sm:px-5">
-      <WebSocketApiSettings expanded={panelMode === 'edit'}>
+      <WebSocketApiSettings expanded={panelMode === 'edit'} onEnabled={() => onOpenPanel('edit')}>
         <SettingsFieldRow id="local-device-icon" label={m.settings_devices_icon_label()}>
           {#snippet control()}
             <DeviceIconPicker
