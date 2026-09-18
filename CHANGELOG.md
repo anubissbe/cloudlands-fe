@@ -4,6 +4,60 @@
 
 From version 2.0.0 onward, release notes are published on the [GitHub Releases page](https://github.com/intent-hq/cloudlands-releases/releases). Auto-generated entries for 2.x releases also appear below.
 
+## [2.165.1](https://github.com/intent-hq/cloudlands-fe/compare/v2.165.0...v2.165.1) (2026-09-18)
+
+
+### 🐛 Bug Fixes
+
+* bump intentd sidecar to v0.9.77 ([#2647](https://github.com/intent-hq/cloudlands-fe/issues/2647)) ([3b3ee7c](https://github.com/intent-hq/cloudlands-fe/commit/3b3ee7ca6986e893f05934400a7b5a3deb7c601f))
+* **ct-failures:** fall back to job logs when an artifact disappears mid-run ([#2632](https://github.com/intent-hq/cloudlands-fe/issues/2632)) ([10c077d](https://github.com/intent-hq/cloudlands-fe/commit/10c077d477eae7b9a658624a4fcb7e7e38b01b82))
+* **ct:** assert the CSS-defined 12px composer inset instead of a mount-time sample ([#2639](https://github.com/intent-hq/cloudlands-fe/issues/2639)) ([bdab4a5](https://github.com/intent-hq/cloudlands-fe/commit/bdab4a56e3b5f9e222abecd94cae26e6c54b81c9))
+* **fe:** keep collapsed accordion content at zero height ([#2634](https://github.com/intent-hq/cloudlands-fe/issues/2634)) ([2cb93cf](https://github.com/intent-hq/cloudlands-fe/commit/2cb93cf15d93d5f6cf3d1b5e2fbdce69c17ccbc4))
+* **fe:** let GitHub Reconnect start a fresh device flow when already connected ([#2633](https://github.com/intent-hq/cloudlands-fe/issues/2633)) ([c8c1413](https://github.com/intent-hq/cloudlands-fe/commit/c8c1413d05544abd093b1b30cd4c812aab9f0586))
+* **fe:** route provider model catalog through the platform detector ([#2631](https://github.com/intent-hq/cloudlands-fe/issues/2631)) ([b72081f](https://github.com/intent-hq/cloudlands-fe/commit/b72081f39cb4c0c7dd42bf2d356d9b04f8c55734))
+* keep Mac mini and Mac Studio icon strokes visible inside buttons ([#2635](https://github.com/intent-hq/cloudlands-fe/issues/2635)) ([a17814f](https://github.com/intent-hq/cloudlands-fe/commit/a17814f8b43bf16bc56f2c91546e5c096ad73203))
+* recover from benign render errors inside ErrorBoundary ([#2637](https://github.com/intent-hq/cloudlands-fe/issues/2637)) ([a5c44e8](https://github.com/intent-hq/cloudlands-fe/commit/a5c44e8dfabe8ead6f180984584329160a4fc274))
+
+## [2.165.0](https://github.com/intent-hq/cloudlands-fe/compare/v2.164.3...v2.165.0) (2026-09-18)
+
+
+### 🚀 Features
+
+* **lint:** report Tailwind numeric duration and keyword easing utilities ([#2629](https://github.com/intent-hq/cloudlands-fe/issues/2629)) ([8136e2f](https://github.com/intent-hq/cloudlands-fe/commit/8136e2f8f7632dd5bcedb2ca1d521f2f56c74055))
+
+
+### 🐛 Bug Fixes
+
+* bump intentd sidecar to v0.9.76 ([#2636](https://github.com/intent-hq/cloudlands-fe/issues/2636)) ([5b8fe06](https://github.com/intent-hq/cloudlands-fe/commit/5b8fe06f31aaf9971eaaea3d3a4971bdd7fada11))
+* **design-system:** commit the generated cheatsheet in-repo and enforce it in lint ([#2624](https://github.com/intent-hq/cloudlands-fe/issues/2624)) ([ab63975](https://github.com/intent-hq/cloudlands-fe/commit/ab639755c569c6f33528b96419c6132b3d59e1fa))
+
+## [2.164.3](https://github.com/intent-hq/cloudlands-fe/compare/v2.164.2...v2.164.3) (2026-09-18)
+
+
+### 🐛 Bug Fixes
+
+* bump intentd sidecar to v0.9.75 ([#2626](https://github.com/intent-hq/cloudlands-fe/issues/2626)) ([a101155](https://github.com/intent-hq/cloudlands-fe/commit/a101155f752fa24a22a5ab60d0f9ed448c45baf3))
+* **chat:** keep context picker open and clear checked context after send ([#2612](https://github.com/intent-hq/cloudlands-fe/issues/2612)) ([76f77b1](https://github.com/intent-hq/cloudlands-fe/commit/76f77b128bb63fd63e48060fe51ce666092f6991))
+* **ct:** settle the empty-composer prompt inset before sampling the queue baseline ([#2613](https://github.com/intent-hq/cloudlands-fe/issues/2613)) ([5bedf37](https://github.com/intent-hq/cloudlands-fe/commit/5bedf3763cc3245284852c82313916e89593600f))
+* **initializer:** keep typed branch filter across background fetches and return focus to the trigger after Enter ([#2614](https://github.com/intent-hq/cloudlands-fe/issues/2614)) ([221e21e](https://github.com/intent-hq/cloudlands-fe/commit/221e21e6efae55e66afc97d19a595e13fa35c18a))
+* name the unreachable machine in the daemon-stopped overlay ([#2623](https://github.com/intent-hq/cloudlands-fe/issues/2623)) ([c88adee](https://github.com/intent-hq/cloudlands-fe/commit/c88adee1b6ef9e730c9f20b88f5b133c42b10dff))
+* **settings:** Move Tailcat attribution into General licenses ([#2600](https://github.com/intent-hq/cloudlands-fe/issues/2600)) ([1256fd0](https://github.com/intent-hq/cloudlands-fe/commit/1256fd026f91f909e0ee0939371c9aaa368f58f1))
+* **test:** keep the Vitest fork --no-sparkplug flag out of worker_threads execArgv ([#2605](https://github.com/intent-hq/cloudlands-fe/issues/2605)) ([34f6ae4](https://github.com/intent-hq/cloudlands-fe/commit/34f6ae4f48ae438020d398bb3e9a98057909e793))
+* **workspace:** pin Create-button progress bar to the button edge ([#2609](https://github.com/intent-hq/cloudlands-fe/issues/2609)) ([f0661cb](https://github.com/intent-hq/cloudlands-fe/commit/f0661cb3039f2a8501eee98fadb8f62831eb027b))
+
+## [2.164.2](https://github.com/intent-hq/cloudlands-fe/compare/v2.164.1...v2.164.2) (2026-09-18)
+
+
+### 🐛 Bug Fixes
+
+* bump intentd sidecar to v0.9.73 ([#2608](https://github.com/intent-hq/cloudlands-fe/issues/2608)) ([d699cdf](https://github.com/intent-hq/cloudlands-fe/commit/d699cdfe207d4c75bd738125e9e0c06223ea5939))
+* bump intentd sidecar to v0.9.74 ([#2618](https://github.com/intent-hq/cloudlands-fe/issues/2618)) ([6027b83](https://github.com/intent-hq/cloudlands-fe/commit/6027b839950a2bc559719af5c5663693243ddeb9))
+* **ct:** wait for the panel menu to settle before measuring containment in agent-header-icons ([#2596](https://github.com/intent-hq/cloudlands-fe/issues/2596)) ([919e0d0](https://github.com/intent-hq/cloudlands-fe/commit/919e0d0319d2e17ee9459b2c9537b1c3f15f713f))
+* **ct:** wait for the restored composer inset to settle in SimpleRichInput.queue ([#2606](https://github.com/intent-hq/cloudlands-fe/issues/2606)) ([a59926a](https://github.com/intent-hq/cloudlands-fe/commit/a59926a50a0cf4ea12c77ef3e2498c69cea3b1c3))
+* restore Chief sidebar new-thread icon ([#5315](https://github.com/intent-hq/cloudlands-fe/issues/5315)) ([#2603](https://github.com/intent-hq/cloudlands-fe/issues/2603)) ([038bdf3](https://github.com/intent-hq/cloudlands-fe/commit/038bdf319553737836b57359363735f9926704bd))
+* share benign-error classification so ErrorBoundary honours webview stale-guest suppression ([#2610](https://github.com/intent-hq/cloudlands-fe/issues/2610)) ([5279bed](https://github.com/intent-hq/cloudlands-fe/commit/5279bed493d399dd9b8d22780560fa87926d7072))
+* show filename in file panel header ([#2595](https://github.com/intent-hq/cloudlands-fe/issues/2595)) ([e86c575](https://github.com/intent-hq/cloudlands-fe/commit/e86c5755842cbdb8845fcc778df5c7e830c43603))
+
 ## [2.164.1](https://github.com/intent-hq/cloudlands-fe/compare/v2.164.0...v2.164.1) (2026-09-18)
 
 
