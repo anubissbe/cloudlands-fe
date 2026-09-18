@@ -16,14 +16,14 @@ Quick routing guide for AI agents. Start here, then open the smallest relevant d
 ## UI rules
 
 - Start with the [“I need to…” decision tree](docs/DESIGN_SYSTEM.md#i-need-to), not raw markup.
-- Use the generated [pattern cheatsheet](../../docs/fe/DESIGN_SYSTEM_CHEATSHEET.md) for imports and API summaries.
+- Use the generated [pattern cheatsheet](docs/DESIGN_SYSTEM_CHEATSHEET.md) for imports and API summaries.
 - Inspect live fixtures and copyable compositions at `/sandbox` and `/sandbox/recipes` via `pnpm run dev:ui`.
 - Use public `$lib/components/patterns/*` or `$lib/components/ui/*` subpaths; do not deep-import implementations.
 - Follow the [Never list](docs/DESIGN_SYSTEM.md#never), enforced by `eslint-rules/design-system/`.
 - Never hand-write motion durations or physical colors; use `$lib/motion` and semantic tokens.
 - Never add a raw control, direct toast/native dialog, bespoke settings row, or feature-owned dialog root.
 - Ratchets only shrink: do not raise `scripts/ui-component-guardrails.ts` ceilings or expand lint baselines.
-- Run `pnpm exec tsx scripts/generate-design-cheatsheet.ts --check` with the focused lint/tests.
+- Run `pnpm run lint:design-cheatsheet` (part of `pnpm run lint`) with the focused lint/tests; regenerate the cheatsheet with `pnpm exec tsx scripts/generate-design-cheatsheet.ts`.
 
 ## Project layout
 
