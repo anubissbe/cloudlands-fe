@@ -97,6 +97,7 @@
     updatePanels as updateMultiPanels,
     setSelection as setMultiPanelSelection,
     clearSelection as clearMultiPanelSelection,
+    clearChecked as clearMultiPanelChecked,
     type PanelContextItem,
   } from '$store/renderer/slices/multi-panel-context/multi-panel-context-slice';
   import {
@@ -4874,6 +4875,12 @@
       // restore the just-sent prompt into the editor.
       draftManager.invalidatePendingRestore();
       setContextItems([]);
+      // Checked panels/selections were folded into this send; uncheck them so
+      // they do not ride along with the next message. A selection write still
+      // deferred to the next frame must land first, or it would re-check
+      // itself after the cleanup.
+      flushPendingSelectionWrites();
+      appStore.dispatch(clearMultiPanelChecked());
       inputValue = '';
       inputComponent?.clear();
       commitDraftWrite('');

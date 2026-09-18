@@ -2081,6 +2081,15 @@ describe('ChatPanel mounted lifecycle', () => {
 
     expect(screen.getByTestId('mock-rich-input').getAttribute('data-value')).toBe('');
     expect(mocks.draftClear).toHaveBeenCalledWith('workspace-a', 'agent-a');
+    // The checked multi-panel context rode along with this send, so it is
+    // released before the backend draft clear is issued.
+    const clearCheckedIndex = mocks.dispatch.mock.calls.findIndex(
+      ([action]) => action?.type === 'multiPanelContext/clearChecked',
+    );
+    expect(clearCheckedIndex).toBeGreaterThanOrEqual(0);
+    expect(mocks.dispatch.mock.invocationCallOrder[clearCheckedIndex]).toBeLessThan(
+      mocks.draftClear.mock.invocationCallOrder[0],
+    );
 
     draft.resolve({ text: 'send this once' });
     await Promise.resolve();
@@ -2337,15 +2346,58 @@ describe('ChatPanel mounted lifecycle', () => {
     await fireEvent.click(screen.getByTestId('mock-input-submit'));
     await tick();
 
-    // The clear is still pending, yet the scroll + re-lock already happened.
+    // The clear is still pending, yet the scroll + re-lock already happened,
+    // and the checked multi-panel context was already released.
     expect(mocks.draftClear).toHaveBeenCalledWith('workspace-a', 'agent-a');
     expect(vi.mocked(scrollToBottomUtil)).toHaveBeenCalledWith(scrollContainer);
+    expect(dispatchedTypes()).toContain('multiPanelContext/clearChecked');
 
     // Follow was re-engaged: the unmount-time cache records follow=true.
     view.unmount();
     expect(getCachedChatScroll('workspace-a', 'agent-a')).toMatchObject({
       shouldFollowBottom: true,
     });
+  });
+
+  it('folds a same-frame editor selection into the send cleanup instead of re-checking it', async () => {
+    mocks.draftGet.mockResolvedValue(null);
+    mocks.draftClear.mockResolvedValue({ ok: true });
+    render(ChatPanel, {
+      props: { workspace: workspace('workspace-a'), agentId: 'agent-a' },
+    });
+    await tick();
+
+    await fireEvent.input(screen.getByTestId('mock-rich-input-editor'), {
+      target: { value: 'send with a selection made this frame' },
+    });
+    window.dispatchEvent(
+      new CustomEvent('editor:selection-change', {
+        detail: {
+          text: 'const answer = 42;',
+          file: 'src/app.ts',
+          language: 'typescript',
+          source: 'editor',
+        },
+      }),
+    );
+    // The selection write is still deferred to the next animation frame.
+    expect(dispatchedTypes()).not.toContain('multiPanelContext/setSelection');
+
+    await fireEvent.click(screen.getByTestId('mock-input-submit'));
+    await tick();
+
+    // The deferred write lands before the checked context is released, so the
+    // selection is part of the cleared set rather than a survivor of it.
+    const types = dispatchedTypes();
+    const setSelectionIndex = types.indexOf('multiPanelContext/setSelection');
+    const clearCheckedIndex = types.indexOf('multiPanelContext/clearChecked');
+    expect(setSelectionIndex).toBeGreaterThanOrEqual(0);
+    expect(clearCheckedIndex).toBeGreaterThan(setSelectionIndex);
+
+    // Any frame left in the queue must not re-check the selection after cleanup.
+    while (frames.length > 0) flushFrame();
+    await tick();
+    expect(dispatchedTypes().lastIndexOf('multiPanelContext/setSelection')).toBe(setSelectionIndex);
   });
 
   it('re-engages follow and scrolls to the bottom on edit-and-regenerate when scrolled up', async () => {
