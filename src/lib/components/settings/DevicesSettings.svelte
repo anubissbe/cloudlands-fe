@@ -20,7 +20,7 @@
   import { forgetConnectionRequested } from '$store/renderer/slices/connections/connections-slice';
   import { store as appStore } from '$store/renderer/store';
 
-  let { localSettingsRequested = 0 }: { localSettingsRequested?: number } = $props();
+  let { localSettingsRequested = $bindable(0) }: { localSettingsRequested?: number } = $props();
 
   // Full ordered list (local first) drives the rows AND the empty state (the
   // always-present local row and the "no devices" box must not render
@@ -38,7 +38,10 @@
   let removing = $state(false);
 
   $effect(() => {
-    if (localSettingsRequested > 0) openPanel(LOCAL_CONNECTION_ID, 'edit');
+    if (localSettingsRequested > 0) {
+      openPanel(LOCAL_CONNECTION_ID, 'edit');
+      localSettingsRequested = 0;
+    }
   });
 
   const defaultAccent = $derived(

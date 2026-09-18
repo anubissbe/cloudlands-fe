@@ -67,7 +67,7 @@
         })),
     },
   ]);
-  const displayValue = $derived(selectedIps.map(ipLabel).join(', '));
+  const displayValue = $derived(renderedSelection.map(ipLabel).join(', '));
 
   function ipLabel(ip: string): string {
     return ip === ALL_INTERFACES

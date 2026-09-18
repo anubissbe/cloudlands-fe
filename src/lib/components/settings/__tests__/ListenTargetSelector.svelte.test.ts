@@ -26,6 +26,21 @@ const selected = (name: string) =>
   screen.getByRole('option', { name }).getAttribute('aria-selected') === 'true';
 
 describe('Available Networks multiselect', () => {
+  it('summarizes implicit localhost and removes it from the summary when switching to all interfaces', async () => {
+    const { input, onchange, rerender } = await renderSelector();
+    expect(selected(m.settings_listenTargets_loopback_label())).toBe(true);
+    await fireEvent.keyDown(input, { key: 'Escape' });
+    expect((input as HTMLInputElement).value).toBe(
+      `192.168.1.10, ${m.settings_listenTargets_loopback_label()}`,
+    );
+    expect(onchange).not.toHaveBeenCalled();
+    await fireEvent.focus(input);
+    await pick(m.settings_listenTargets_allInterfaces_label());
+    expect(onchange).toHaveBeenCalledWith({ ips: ['0.0.0.0'], tunnel: false });
+    await rerender({ selectedIps: ['0.0.0.0'] });
+    await fireEvent.keyDown(input, { key: 'Escape' });
+    expect((input as HTMLInputElement).value).toBe(m.settings_listenTargets_allInterfaces_label());
+  });
   it('adds a network while preserving existing addresses and ensuring loopback', async () => {
     const { onchange } = await renderSelector();
     await pick('10.0.0.5');

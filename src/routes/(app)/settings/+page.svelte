@@ -608,7 +608,7 @@
         {#if activeTab === 'devices'}
           <div id="devices" class="mb-6 scroll-mt-20">
             <div id="websocket-api" data-highlight-id="websocket-api" use:highlightTarget>
-              <DevicesSettings {localSettingsRequested} />
+              <DevicesSettings bind:localSettingsRequested />
             </div>
           </div>
 
