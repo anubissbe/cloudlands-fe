@@ -226,9 +226,23 @@
     }
   }
 
-  // Update cache when active tab or tab membership changes.
+  let lastActiveTabId: string | null | undefined;
+
+  // Update cache when active tab or tab membership changes. On deactivation,
+  // start the selected tab's inactivity window now, not at its activation time.
   $effect(() => {
-    if (active) applyTabCacheUpdate(panel.tabs, panel.activeTabId);
+    if (active) {
+      applyTabCacheUpdate(panel.tabs, panel.activeTabId);
+      lastActiveTabId = panel.activeTabId;
+    } else if (lastActiveTabId) {
+      const tabId = lastActiveTabId;
+      untrack(() => {
+        if (cachedTabIds.has(tabId)) {
+          cachedTabIds = new Map(cachedTabIds).set(tabId, Date.now());
+        }
+      });
+      lastActiveTabId = null;
+    }
   });
 
   // Clear focus before a tab switch or panel deactivation flips `inert` on a

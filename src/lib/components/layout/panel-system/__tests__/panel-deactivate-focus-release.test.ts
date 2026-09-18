@@ -100,6 +100,33 @@ describe('panel deactivation focus release', () => {
 });
 
 describe('inactive panel content retention', () => {
+  it.each(['note', 'file', 'diff'] as const)(
+    'starts the selected %s inactivity window when the workspace deactivates',
+    async (type) => {
+      vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+      const props = (active: boolean) => ({
+        ...baseProps(active),
+        panel: {
+          id: 'retained',
+          tabs: [{ id: 'editor', type, title: 'Editor', closable: true }],
+          activeTabId: 'editor',
+        },
+      });
+      const view = render(Panel, { props: props(true) });
+      const content = view.container.querySelector('[data-tab-id="editor"]')!;
+      expect(content).not.toBeNull();
+      await vi.advanceTimersByTimeAsync(60_000);
+      await view.rerender(props(false));
+      await vi.advanceTimersByTimeAsync(29_999);
+      await tick();
+      expect(view.container.querySelector('[data-tab-id="editor"]')).toBe(content);
+      await view.rerender(props(false));
+      await vi.advanceTimersByTimeAsync(1);
+      await tick();
+      expect(content.isConnected).toBe(false);
+    },
+  );
+
   it('expires notes, files and diffs while preserving the browser instance across workspace switches', async () => {
     vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
     const tabs: PanelState['tabs'] = [
@@ -143,6 +170,7 @@ describe('inactive panel content retention', () => {
     const view = render(Panel, { props: baseProps(true) });
     const content = view.container.querySelector('[data-tab-id="deactivate-tab"]');
     expect(content).not.toBeNull();
+    await vi.advanceTimersByTimeAsync(60_000);
     await view.rerender(baseProps(false));
     await vi.advanceTimersByTimeAsync(15_000);
     await view.rerender(baseProps(true));
