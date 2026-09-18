@@ -146,6 +146,23 @@ export function registerWindowCycleFocusBridge(): void {
 }
 
 /**
+ * Forward the window-close invoke (`window:close`, the guest-offline overlay's
+ * "Close window") to the registered main-process handler (system.ipc.ts —
+ * closes the SENDER window, opening a local window first when it is the app's
+ * last live window). Resolves undefined without a bridge (browser dev build).
+ * Idempotent.
+ */
+export function registerWindowCloseBridge(): void {
+  registerMockIpcHandler(IPC_CHANNELS.WINDOW.CLOSE, async (payload?: unknown) => {
+    const bridge = typeof window !== 'undefined' ? window.electronAPI : undefined;
+    if (bridge && typeof bridge.invoke === 'function') {
+      return bridge.invoke(IPC_CHANNELS.WINDOW.CLOSE, payload);
+    }
+    return undefined;
+  });
+}
+
+/**
  * Forward the Electron app-version read (`app:get-version`) to the registered
  * main-process handler (system.ipc.ts, `app.getVersion()`). No production
  * renderer caller remains today (the analytics common-properties reader was
@@ -169,4 +186,5 @@ registerWindowThemeBridge();
 registerWindowFullScreenBridge();
 registerWindowFullScreenEventRelay();
 registerWindowCycleFocusBridge();
+registerWindowCloseBridge();
 registerAppVersionBridge();
