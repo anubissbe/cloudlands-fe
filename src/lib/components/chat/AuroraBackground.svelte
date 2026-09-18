@@ -155,6 +155,7 @@
 
   // Simplified shader: 5 blobs instead of 10, reduced fbm iterations (2 instead of 4)
   // This reduces GPU load by ~60% while maintaining visual quality
+  // i18n-ignore (GLSL shader source, not user-facing text)
   const fragmentShaderSource = `
     precision mediump float;
     uniform float u_time;
