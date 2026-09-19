@@ -236,6 +236,19 @@ describe('selected note markdown copy', () => {
     editor.destroy();
   });
 
+  it('quotes every line when a quoted paragraph contains hard breaks', () => {
+    const editor = createEditor(
+      '<blockquote><p>First<br>second</p><p>Third<br><br>Fourth</p></blockquote>',
+    );
+    editor.commands.selectAll();
+
+    expect(serializeSelectionToMarkdown(editor.view)).toBe(
+      '> First\n> second\n>\n> Third\n>\n> Fourth',
+    );
+
+    editor.destroy();
+  });
+
   it('keeps the existing output for nested blockquotes', () => {
     const editor = createEditor(
       '<blockquote><p>Outer</p><blockquote><p>Inner</p></blockquote></blockquote>',
