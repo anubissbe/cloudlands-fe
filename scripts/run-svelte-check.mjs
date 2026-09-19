@@ -283,7 +283,10 @@ export function readProbedRssMiB(probeDir) {
  * quoting). Resolves with the exit code and the child's peak RSS in MiB: the
  * high-water mark the child records itself on exit or fatal abort (see
  * `rssProbeArgs`), combined with /proc or ps samples taken right after spawn
- * and every `sampleIntervalMs` so a SIGKILL still leaves a figure. Null when
+ * and every `sampleIntervalMs`. A SIGKILL (e.g. the kernel OOM killer) runs
+ * neither the exit hook nor the fatal report, so only the sampled value
+ * remains: that fallback is a lower bound that can miss the final peak, and a
+ * kill within the first interval reports the spawn-time sample only. Null when
  * no source produced one.
  */
 export function runSvelteCheck({
