@@ -229,12 +229,62 @@ export function formatPeakRss(peakRssMiB, env = process.env) {
   return `svelte-check peak RSS: ${peakRssMiB} MiB (${capNote})`;
 }
 
+/** Env var naming the file the child's exit hook writes its maxRSS (KiB) to. */
+export const RSS_FILE_ENV = 'SVELTE_CHECK_RSS_FILE';
+const RSS_FILE = 'max-rss';
+const FATAL_REPORT_FILE = 'fatal-report.json';
+const RSS_EXIT_HOOK = `data:text/javascript,${encodeURIComponent(
+  `import { writeFileSync } from 'node:fs';
+process.on('exit', () => {
+  try {
+    writeFileSync(process.env[${JSON.stringify(RSS_FILE_ENV)}], String(process.resourceUsage().maxRSS));
+  } catch {}
+});`,
+)}`;
+
+/**
+ * Node flags that make the child record its own peak RSS into `probeDir`: an
+ * exit hook for normal exits (`process.exit` included) and a diagnostic report
+ * for V8 fatal errors such as a heap-limit OOM abort, which skips exit hooks.
+ * The parent cannot read the peak after the fact — by the time `close` fires
+ * the child is reaped and /proc/<pid> is gone — so the child has to leave it.
+ */
+export function rssProbeArgs(probeDir) {
+  return [
+    '--import',
+    RSS_EXIT_HOOK,
+    '--report-on-fatalerror',
+    `--report-directory=${probeDir}`,
+    `--report-filename=${FATAL_REPORT_FILE}`,
+  ];
+}
+
+/** Peak RSS in MiB the child left in `probeDir`, or null when it left nothing. */
+export function readProbedRssMiB(probeDir) {
+  let peak = null;
+  try {
+    const kib = Number(readFileSync(path.join(probeDir, RSS_FILE), 'utf8'));
+    if (kib > 0) peak = Math.round(kib / 1024);
+  } catch {
+    // no normal exit
+  }
+  try {
+    const bytes = JSON.parse(readFileSync(path.join(probeDir, FATAL_REPORT_FILE), 'utf8'))
+      ?.resourceUsage?.maxRss;
+    if (bytes > 0) peak = Math.max(peak ?? 0, Math.round(bytes / (1024 * 1024)));
+  } catch {
+    // no fatal error
+  }
+  return peak;
+}
+
 /**
  * Spawn the checker with optional space-separated CT_NODE_ARGS (no shell
- * quoting). Resolves with the exit code and the child's peak RSS in MiB
- * (null when the platform exposes neither /proc nor ps), sampled right after
- * spawn, every `sampleIntervalMs`, and once more as the child exits so the
- * figure survives an OOM abort at any point in the run.
+ * quoting). Resolves with the exit code and the child's peak RSS in MiB: the
+ * high-water mark the child records itself on exit or fatal abort (see
+ * `rssProbeArgs`), combined with /proc or ps samples taken right after spawn
+ * and every `sampleIntervalMs` so a SIGKILL still leaves a figure. Null when
+ * no source produced one.
  */
 export function runSvelteCheck({
   cliPath,
@@ -245,12 +295,17 @@ export function runSvelteCheck({
   printError = console.error,
   sampleRss = readRssMiB,
   sampleIntervalMs = 1000,
+  probeDir = mkdtempSync(path.join(tmpdir(), 'cloudlands-svelte-check-rss-')),
 }) {
   const flags = env.CT_NODE_ARGS?.trim().split(/\s+/).filter(Boolean) ?? [];
-  const child = spawnImpl(process.execPath, [...flags, cliPath, ...args], {
-    stdio: ['inherit', outputFd, 'inherit'],
-    env: syncEnv(env),
-  });
+  const child = spawnImpl(
+    process.execPath,
+    [...rssProbeArgs(probeDir), ...flags, cliPath, ...args],
+    {
+      stdio: ['inherit', outputFd, 'inherit'],
+      env: { ...syncEnv(env), [RSS_FILE_ENV]: path.join(probeDir, RSS_FILE) },
+    },
+  );
   let peakRssMiB = null;
   const sample = () => {
     const rss = sampleRss(child.pid);
@@ -259,18 +314,21 @@ export function runSvelteCheck({
   const timer = setInterval(sample, sampleIntervalMs);
   timer.unref?.();
   sample();
+  const finish = (exitCode) => {
+    clearInterval(timer);
+    const probed = readProbedRssMiB(probeDir);
+    rmSync(probeDir, { recursive: true, force: true });
+    if (probed !== null && (peakRssMiB === null || probed > peakRssMiB)) peakRssMiB = probed;
+    return { exitCode, peakRssMiB };
+  };
   return new Promise((resolve) => {
     child.on('error', (error) => {
-      clearInterval(timer);
-      sample();
       printError(`svelte-check failed to spawn: ${error.message}`);
-      resolve({ exitCode: 1, peakRssMiB });
+      resolve(finish(1));
     });
     child.on('close', (code, signal) => {
-      clearInterval(timer);
-      sample();
       if (code === null && signal) printError(`svelte-check died with ${signal}`);
-      resolve({ exitCode: code ?? 1, peakRssMiB });
+      resolve(finish(code ?? 1));
     });
   });
 }

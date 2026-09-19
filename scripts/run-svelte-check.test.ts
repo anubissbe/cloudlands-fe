@@ -1,7 +1,19 @@
 import { EventEmitter } from 'node:events';
+import {
+  closeSync,
+  existsSync,
+  mkdtempSync,
+  openSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
   MIN_FILES,
+  RSS_FILE_ENV,
   createOutputCollector,
   evaluateRun,
   formatDiagnostic,
@@ -261,12 +273,18 @@ describe('runSvelteCheck', () => {
         sampleRss: () => null,
       });
       expect(calls[0]?.[0]).toBe(process.execPath);
-      expect(calls[0]?.[1]).toEqual([
+      const expectedTail = [
         ...(nodeArgs?.trim() ? nodeArgs.trim().split(/\s+/) : []),
         '/checker.js',
         '--output',
         'machine-verbose',
-      ]);
+      ];
+      const spawnArgs = calls[0]?.[1] as string[];
+      expect(spawnArgs.slice(-expectedTail.length)).toEqual(expectedTail);
+      expect(spawnArgs).toContain('--report-on-fatalerror');
+      expect(spawnArgs[spawnArgs.indexOf('--import') + 1]).toMatch(/^data:text\/javascript,/);
+      const spawnEnv = (calls[0]?.[2] as { env: Record<string, string> }).env;
+      expect(spawnEnv[RSS_FILE_ENV]).toBeTruthy();
       child.emit('close', 0, null);
       await expect(result).resolves.toEqual({ exitCode: 0, peakRssMiB: null });
     },
@@ -310,26 +328,75 @@ describe('runSvelteCheck', () => {
     expect(sampledPids.every((pid) => pid === 4242)).toBe(true);
   });
 
-  it('samples at spawn and at exit so a run shorter than one interval still reports a peak', async () => {
+  it('prefers the high-water mark the child left behind over the sparse samples', async () => {
     const child = Object.assign(new EventEmitter(), { pid: 4242 });
-    const samples = [128, 3999];
-    let sampleCount = 0;
+    const probeDir = mkdtempSync(path.join(tmpdir(), 'rss-probe-test-'));
+    let rssFile: string | undefined;
     const result = runSvelteCheck({
       cliPath: '/checker.js',
       args: [],
       outputFd: 42,
-      spawnImpl: (() => child) as never,
+      spawnImpl: ((_cmd: string, _args: string[], opts: { env: Record<string, string> }) => {
+        rssFile = opts.env[RSS_FILE_ENV];
+        return child;
+      }) as never,
       printError: () => {},
-      sampleRss: () => {
-        sampleCount += 1;
-        return samples.shift() ?? null;
-      },
+      sampleRss: () => 128,
       sampleIntervalMs: 60_000,
+      probeDir,
     });
-    expect(sampleCount).toBe(1);
-    child.emit('close', null, 'SIGABRT');
-    await expect(result).resolves.toEqual({ exitCode: 1, peakRssMiB: 3999 });
-    expect(sampleCount).toBe(2);
+    expect(rssFile && path.dirname(rssFile)).toBe(probeDir);
+    writeFileSync(rssFile as string, String(3999 * 1024));
+    child.emit('close', 0, null);
+    await expect(result).resolves.toEqual({ exitCode: 0, peakRssMiB: 3999 });
+    expect(existsSync(probeDir)).toBe(false);
+  });
+
+  describe('with a real child process', () => {
+    const runChild = async (code: string, nodeArgs = '') => {
+      const dir = mkdtempSync(path.join(tmpdir(), 'rss-child-test-'));
+      const outputPath = path.join(dir, 'output');
+      const outputFd = openSync(outputPath, 'w');
+      const errors: string[] = [];
+      const result = await runSvelteCheck({
+        cliPath: code,
+        args: [],
+        outputFd,
+        env: { ...process.env, CT_NODE_ARGS: `${nodeArgs} --input-type=module --eval` },
+        printError: (message: string) => errors.push(message),
+      });
+      closeSync(outputFd);
+      const output = readFileSync(outputPath, 'utf8');
+      rmSync(dir, { recursive: true, force: true });
+      return { ...result, errors, output };
+    };
+
+    it.each([0, 1])(
+      'reports a child that touched 256 MiB and exited %i, even within one interval',
+      async (exitCode) => {
+        const { peakRssMiB, output, ...rest } = await runChild(
+          `Buffer.alloc(256 * 1024 * 1024, 1); console.log(process.resourceUsage().maxRSS); process.exit(${exitCode});`,
+        );
+        expect(rest).toEqual({ exitCode, errors: [] });
+        const childMaxRssMiB = Math.round(Number(output.trim()) / 1024);
+        expect(childMaxRssMiB).toBeGreaterThanOrEqual(256);
+        expect(peakRssMiB).toBeGreaterThanOrEqual(childMaxRssMiB);
+      },
+    );
+
+    it('still reports a peak after a V8 heap-limit OOM abort', async () => {
+      const { exitCode, peakRssMiB, errors } = await runChild(
+        [
+          "import { closeSync, openSync } from 'node:fs';",
+          "closeSync(2); openSync('/dev/null', 'w');",
+          'const a = []; for (;;) a.push(new Array(1e5).fill(1));',
+        ].join('\n'),
+        '--max-old-space-size=32',
+      );
+      expect(exitCode).toBe(1);
+      expect(errors).toEqual(['svelte-check died with SIGABRT']);
+      expect(peakRssMiB).toBeGreaterThanOrEqual(32);
+    }, 30_000);
   });
 });
 
