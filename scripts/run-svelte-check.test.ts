@@ -309,6 +309,28 @@ describe('runSvelteCheck', () => {
     await expect(result).resolves.toEqual({ exitCode: 1, peakRssMiB: 3900 });
     expect(sampledPids.every((pid) => pid === 4242)).toBe(true);
   });
+
+  it('samples at spawn and at exit so a run shorter than one interval still reports a peak', async () => {
+    const child = Object.assign(new EventEmitter(), { pid: 4242 });
+    const samples = [128, 3999];
+    let sampleCount = 0;
+    const result = runSvelteCheck({
+      cliPath: '/checker.js',
+      args: [],
+      outputFd: 42,
+      spawnImpl: (() => child) as never,
+      printError: () => {},
+      sampleRss: () => {
+        sampleCount += 1;
+        return samples.shift() ?? null;
+      },
+      sampleIntervalMs: 60_000,
+    });
+    expect(sampleCount).toBe(1);
+    child.emit('close', null, 'SIGABRT');
+    await expect(result).resolves.toEqual({ exitCode: 1, peakRssMiB: 3999 });
+    expect(sampleCount).toBe(2);
+  });
 });
 
 describe('readRssMiB', () => {

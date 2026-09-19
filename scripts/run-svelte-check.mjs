@@ -232,8 +232,9 @@ export function formatPeakRss(peakRssMiB, env = process.env) {
 /**
  * Spawn the checker with optional space-separated CT_NODE_ARGS (no shell
  * quoting). Resolves with the exit code and the child's peak RSS in MiB
- * (null when the platform exposes neither /proc nor ps), sampled every
- * `sampleIntervalMs` so the figure survives an OOM abort.
+ * (null when the platform exposes neither /proc nor ps), sampled right after
+ * spawn, every `sampleIntervalMs`, and once more as the child exits so the
+ * figure survives an OOM abort at any point in the run.
  */
 export function runSvelteCheck({
   cliPath,
@@ -257,14 +258,17 @@ export function runSvelteCheck({
   };
   const timer = setInterval(sample, sampleIntervalMs);
   timer.unref?.();
+  sample();
   return new Promise((resolve) => {
     child.on('error', (error) => {
       clearInterval(timer);
+      sample();
       printError(`svelte-check failed to spawn: ${error.message}`);
       resolve({ exitCode: 1, peakRssMiB });
     });
     child.on('close', (code, signal) => {
       clearInterval(timer);
+      sample();
       if (code === null && signal) printError(`svelte-check died with ${signal}`);
       resolve({ exitCode: code ?? 1, peakRssMiB });
     });
