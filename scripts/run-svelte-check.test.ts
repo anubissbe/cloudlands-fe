@@ -5,7 +5,10 @@ import {
   createOutputCollector,
   evaluateRun,
   formatDiagnostic,
+  formatPeakRss,
+  heapCapMB,
   parseMachineLine,
+  readRssMiB,
   syncEnv,
   runSvelteCheck,
 } from './run-svelte-check.mjs';
@@ -255,6 +258,7 @@ describe('runSvelteCheck', () => {
           calls.push(args);
           return child;
         }) as never,
+        sampleRss: () => null,
       });
       expect(calls[0]?.[0]).toBe(process.execPath);
       expect(calls[0]?.[1]).toEqual([
@@ -264,7 +268,7 @@ describe('runSvelteCheck', () => {
         'machine-verbose',
       ]);
       child.emit('close', 0, null);
-      await expect(result).resolves.toBe(0);
+      await expect(result).resolves.toEqual({ exitCode: 0, peakRssMiB: null });
     },
   );
 
@@ -277,9 +281,68 @@ describe('runSvelteCheck', () => {
       outputFd: 42,
       spawnImpl: (() => child) as never,
       printError: (message: string) => errors.push(message),
+      sampleRss: () => null,
     });
     child.emit('close', null, signal);
-    await expect(result).resolves.toBe(1);
+    await expect(result).resolves.toMatchObject({ exitCode: 1 });
     expect(errors).toEqual([`svelte-check died with ${signal}`]);
+  });
+
+  it('keeps the peak of the sampled RSS across the run, including an OOM abort', async () => {
+    const child = Object.assign(new EventEmitter(), { pid: 4242 });
+    const samples = [512, 3900, 3700];
+    const sampledPids: unknown[] = [];
+    const result = runSvelteCheck({
+      cliPath: '/checker.js',
+      args: [],
+      outputFd: 42,
+      spawnImpl: (() => child) as never,
+      printError: () => {},
+      sampleRss: (pid: unknown) => {
+        sampledPids.push(pid);
+        return samples.shift() ?? null;
+      },
+      sampleIntervalMs: 1,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    child.emit('close', null, 'SIGABRT');
+    await expect(result).resolves.toEqual({ exitCode: 1, peakRssMiB: 3900 });
+    expect(sampledPids.every((pid) => pid === 4242)).toBe(true);
+  });
+});
+
+describe('readRssMiB', () => {
+  it('reads a positive RSS for the current process', () => {
+    const rss = readRssMiB(process.pid);
+    expect(rss).not.toBeNull();
+    expect(rss).toBeGreaterThan(0);
+  });
+
+  it('returns null for a missing pid or a process that is gone', () => {
+    expect(readRssMiB(undefined)).toBeNull();
+    expect(readRssMiB(2 ** 22 - 1)).toBeNull();
+  });
+});
+
+describe('heapCapMB and formatPeakRss', () => {
+  it('reads the last --max-old-space-size across NODE_OPTIONS and CT_NODE_ARGS', () => {
+    expect(heapCapMB({ NODE_OPTIONS: '--max-old-space-size=4096' })).toBe(4096);
+    expect(
+      heapCapMB({
+        NODE_OPTIONS: '--max-old-space-size=4096',
+        CT_NODE_ARGS: '--max-old-space-size=6144',
+      }),
+    ).toBe(6144);
+    expect(heapCapMB({})).toBeNull();
+  });
+
+  it('formats the peak with the cap it ran under and stays silent without a sample', () => {
+    expect(formatPeakRss(3412, { NODE_OPTIONS: '--max-old-space-size=4096' })).toBe(
+      'svelte-check peak RSS: 3412 MiB (--max-old-space-size=4096)',
+    );
+    expect(formatPeakRss(3412, {})).toBe(
+      'svelte-check peak RSS: 3412 MiB (no --max-old-space-size set)',
+    );
+    expect(formatPeakRss(null, {})).toBeNull();
   });
 });
