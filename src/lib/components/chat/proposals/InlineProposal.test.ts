@@ -100,6 +100,25 @@ vi.mock('$lib/components/chat/SpecialistDropdown.svelte', async () => ({
 vi.mock('$store/renderer/slices/pr-branch-lookup/pr-branch-lookup-selectors', () => ({
   selectPrBranchLookupEntries: vi.fn(() => readable(() => ({}))),
 }));
+vi.mock('$store/renderer/slices/workspace-initializer/workspace-initializer-selectors', () => ({
+  selectNewWorkspaceDefaultSpecialist: Object.assign(
+    vi.fn(() => readable(() => null)),
+    { select: vi.fn(() => null) },
+  ),
+  selectWorkspaceInitializerHydrated: Object.assign(
+    vi.fn(() => readable(() => true)),
+    { select: vi.fn(() => true) },
+  ),
+}));
+vi.mock('$store/renderer/slices/specialists/specialists-selectors', async (importOriginal) => ({
+  ...(await importOriginal<
+    typeof import('$store/renderer/slices/specialists/specialists-selectors')
+  >()),
+  selectSpecialists: Object.assign(
+    vi.fn(() => readable(() => [])),
+    { select: vi.fn(() => []) },
+  ),
+}));
 vi.mock('$store/renderer/slices/workspace-agents/workspace-agents-selectors', () => ({
   selectWorkspaceAgentIds: vi.fn(() => readable(() => [])),
   selectWorkspaceAgentsLoading: vi.fn(() => readable(() => false)),
