@@ -156,6 +156,8 @@ export const WorkspaceSchema = z.object({
   prNumber: z.number().nullable().optional(),
   prStatus: z.string().nullable().optional(),
   pullRequests: z.array(z.any()).optional(),
+  /** Full pool size when a list row's `pullRequests` was capped (PROTOCOL §5.1); omitted when not truncated. */
+  pullRequestsTotal: z.number().int().nonnegative().optional(),
   activePullRequest: z.any().optional(),
   /** Issue/PR context links persisted at create (PROTOCOL §5.1); write-once, omitted when there are none. */
   contextLinks: z.array(ContextLinkSchema).max(20).optional(),
@@ -397,6 +399,7 @@ export const AgentSessionSchema = z.object({
   acpSessionId: z.string().optional(),
   sessionId: z.string().nullable().optional(), // Legacy support
   workspaceId: workspaceIdSchema, // Accepts slug format, UUID, or optimistic IDs
+  parentAgentId: z.string().optional(), // Daemon parent linkage (§5.5 `AgentLite.parentAgentId`), omitted when top-level
   threadId: z.string().optional(),
   messages: z.array(AgentMessageSchema),
   name: z.string().optional(),
