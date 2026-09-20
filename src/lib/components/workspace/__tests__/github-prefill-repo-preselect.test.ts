@@ -34,8 +34,13 @@ vi.mock('$app/navigation', () => ({ goto: mocks.goto }));
 vi.mock('$store/renderer/store', async () => {
   const { createAppStoreMockModule } =
     await import('$store/renderer/utils/test-helpers/store-mock');
+  const { initialState: githubAuth } =
+    await import('$store/renderer/slices/github-auth/github-auth-slice');
   return createAppStoreMockModule({
-    state: () => ({ hardwareConsole: { pttRecording: false, voiceTranscribing: false } }),
+    state: () => ({
+      githubAuth,
+      hardwareConsole: { pttRecording: false, voiceTranscribing: false },
+    }),
     dispatch: mocks.dispatch,
   });
 });
@@ -228,7 +233,10 @@ import { resolveGitHubPrefillSelection } from '$lib/components/workspace/initial
 import { warmImport } from '../../../../test/warm-import';
 
 function remoteUrlResponse(owner: string, repo: string) {
-  return { success: true, data: { owner, repo } };
+  return {
+    success: true,
+    data: { owner, repo, remoteUrl: `https://github.com/${owner}/${repo}.git` },
+  };
 }
 
 /** Set the pending prefill and notify live subscribers (simulates a new dispatch). */
@@ -305,7 +313,7 @@ describe('CompactWorkspaceInitializer GitHub-prefill repo preselection', () => {
     });
   });
 
-  it('preselects via stored recent-repo owner metadata without probing that repo', async () => {
+  it('preselects via stored recent-repo URL with a verified authority', async () => {
     mocks.pendingPrefill = {
       owner: 'intent-hq',
       repo: 'monorepo',
@@ -314,7 +322,13 @@ describe('CompactWorkspaceInitializer GitHub-prefill repo preselection', () => {
       url: 'https://github.com/intent-hq/monorepo/pull/7',
     };
     mocks.recentRepos = [
-      { path: '/repos/monorepo', type: 'local', name: 'monorepo', owner: 'intent-hq' },
+      {
+        path: '/repos/monorepo',
+        type: 'local',
+        name: 'monorepo',
+        owner: 'intent-hq',
+        githubUrl: 'https://github.com/intent-hq/monorepo',
+      },
     ];
 
     const result = renderInitializer();
@@ -349,7 +363,13 @@ describe('CompactWorkspaceInitializer GitHub-prefill repo preselection', () => {
     });
     mocks.recentRepos = [
       { path: '/repos/one', type: 'local', name: 'one' },
-      { path: '/repos/two', type: 'local', name: 'two', owner: 'intent-hq' },
+      {
+        path: '/repos/two',
+        type: 'local',
+        name: 'two',
+        owner: 'intent-hq',
+        githubUrl: 'https://github.com/intent-hq/two',
+      },
     ];
     mocks.getRemoteUrl.mockImplementation((repoPath: string) =>
       repoPath === '/repos/one'
@@ -389,6 +409,33 @@ describe('CompactWorkspaceInitializer GitHub-prefill repo preselection', () => {
       repo: 'two',
       number: 2,
     });
+  });
+
+  it('preserves a GitLab MR server and nested namespace through repository preselection', async () => {
+    mocks.pendingPrefill = {
+      provider: 'gitlab',
+      connectionId: 'https://git.euraika.net',
+      instanceUrl: 'https://git.euraika.net',
+      projectUrl: 'https://git.euraika.net/team/platform/camiel',
+      owner: 'team/platform',
+      repo: 'camiel',
+      number: 17,
+      kind: 'pr',
+      url: 'https://git.euraika.net/team/platform/camiel/-/merge_requests/17',
+    };
+    const result = renderInitializer();
+    await waitFor(() => {
+      expect(textOf(result, 'picker-github-url')).toBe(
+        'https://git.euraika.net/team/platform/camiel',
+      );
+      expect(textOf(result, 'picker-repo-path')).toBe('team/platform/camiel');
+    });
+    expect(resolveGitHubPrefillSelection).toHaveBeenCalledWith(
+      expect.objectContaining({
+        connectionId: 'https://git.euraika.net',
+        projectUrl: 'https://git.euraika.net/team/platform/camiel',
+      }),
+    );
   });
 
   it('keeps the current selection when probing errors (non-fatal)', async () => {

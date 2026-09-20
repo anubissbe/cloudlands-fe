@@ -129,3 +129,55 @@ describe('matchGitHubPrefillRepo', () => {
     expect(probeRemote).toHaveBeenCalledTimes(10);
   });
 });
+
+describe('registered GitLab prefill authority', () => {
+  const target = {
+    owner: 'team/platform',
+    repo: 'camiel',
+    provider: 'gitlab' as const,
+    instanceUrl: 'https://git.euraika.net',
+    connectionId: 'https://git.euraika.net',
+    projectUrl: 'https://git.euraika.net/team/platform/camiel',
+  };
+  it('keeps the self-hosted nested project when no checkout matches', async () => {
+    expect(
+      await matchGitHubPrefillRepo({ ...target, candidates: [], probeRemote: noRemote }),
+    ).toEqual({
+      kind: 'github',
+      path: 'team/platform/camiel',
+      githubUrl: 'https://git.euraika.net/team/platform/camiel',
+    });
+  });
+  it('does not select a same-slug checkout on another GitLab host', async () => {
+    const result = await matchGitHubPrefillRepo({
+      ...target,
+      connections: [{ provider: 'gitlab', instanceUrl: 'https://other.example' }],
+      candidates: [local('/wrong', { owner: 'team/platform', name: 'camiel' }), local('/right')],
+      probeRemote: async (path) => ({
+        owner: 'team/platform',
+        repo: 'camiel',
+        remoteUrl:
+          path === '/wrong'
+            ? 'git@other.example:team/platform/camiel.git'
+            : 'git@git.euraika.net:team/platform/camiel.git',
+      }),
+    });
+    expect(result).toEqual({ kind: 'local', path: '/right' });
+  });
+  it('rejects a foreign URL that embeds github.com in its path', async () => {
+    const result = await matchGitHubPrefillRepo({
+      owner: 'team',
+      repo: 'camiel',
+      url: 'https://github.com/team/camiel/pull/7',
+      candidates: [
+        { path: 'bad', type: 'github', githubUrl: 'https://evil.example/github.com/team/camiel' },
+      ],
+      probeRemote: noRemote,
+    });
+    expect(result).toEqual({
+      kind: 'github',
+      path: 'team/camiel',
+      githubUrl: 'https://github.com/team/camiel',
+    });
+  });
+});

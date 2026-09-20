@@ -25,7 +25,13 @@ const mocks = vi.hoisted(() => {
     { id: 'octo/alpha', owner: 'octo', name: 'alpha' },
     { id: 'octo/beta', owner: 'octo', name: 'beta' },
   ];
-  return { readable, selector, dispatch, repos };
+  const settings = {
+    provider: 'github' as 'github' | 'gitlab',
+    instanceUrl: 'https://github.com',
+    tokenSource: 'auto',
+    gitlabSupported: true,
+  };
+  return { readable, selector, dispatch, repos, settings };
 });
 
 vi.mock('$store/renderer/store', async () => {
@@ -47,7 +53,9 @@ vi.mock('$store/renderer/slices/github-auth/github-auth-slice', () => ({
   initializeGitHubAuth: () => ({ type: 'githubAuth/initialize' }),
 }));
 vi.mock('$store/renderer/slices/github-auth/github-auth-selectors', () => ({
+  selectSourceControlSettings: mocks.selector(() => mocks.settings),
   selectGitHubAuthIsAuthenticated: mocks.selector(() => true),
+  selectSourceControlIsAuthenticated: mocks.selector(() => true),
 }));
 vi.mock('$store/renderer/slices/github-repos/github-repos-slice', () => ({
   loadGithubRepos: () => ({ type: 'githubRepos/load' }),
@@ -86,6 +94,23 @@ describe('GitHubRepoTab — pure repo picker', () => {
   afterEach(() => {
     cleanup();
     mocks.dispatch.mockReset();
+    mocks.settings.provider = 'github';
+    mocks.settings.instanceUrl = 'https://github.com';
+    mocks.repos.splice(
+      0,
+      mocks.repos.length,
+      { id: 'octo/alpha', owner: 'octo', name: 'alpha' },
+      { id: 'octo/beta', owner: 'octo', name: 'beta' },
+    );
+  });
+
+  it('labels an empty account using its selected provider', () => {
+    mocks.settings.provider = 'gitlab';
+    mocks.settings.instanceUrl = 'https://git.euraika.net';
+    mocks.repos.splice(0);
+    const { getByText, queryByText } = render(GitHubRepoTab, { props: baseProps() });
+    expect(getByText('No repositories found on your GitLab account')).toBeTruthy();
+    expect(queryByText('No repositories found on your GitHub account')).toBeNull();
   });
 
   it('clicking a repo reports its GitHub URL', async () => {
@@ -131,4 +156,31 @@ describe('GitHubRepoTab — pure repo picker', () => {
     ).toBeNull();
     expect(container.textContent).not.toContain('Store the repository in');
   });
+});
+
+it('picks a nested GitLab API URL and preserves explicit SSH paste on Enter-to-advance', async () => {
+  mocks.settings.provider = 'gitlab';
+  mocks.settings.instanceUrl = 'https://git.euraika.net';
+  mocks.repos.splice(0, mocks.repos.length, {
+    id: 'euraika/platform/camiel',
+    owner: 'euraika/platform',
+    name: 'camiel',
+    htmlUrl: 'https://git.euraika.net/euraika/platform/camiel',
+  } as (typeof mocks.repos)[number]);
+  const props = { ...baseProps(), onSelectAndAdvance: vi.fn() };
+  const { container } = render(GitHubRepoTab, { props });
+  await fireEvent.click(repoOptions(container)[0]);
+  expect(props.onGithubUrlChange).toHaveBeenLastCalledWith(
+    'https://git.euraika.net/euraika/platform/camiel',
+  );
+  const input = container.querySelector<HTMLInputElement>('input[role="combobox"]')!;
+  await fireEvent.paste(input, {
+    clipboardData: { getData: () => 'git@git.euraika.net:euraika/platform/camiel.git' },
+  });
+  expect(props.onGithubUrlChange).toHaveBeenLastCalledWith(
+    'git@git.euraika.net:euraika/platform/camiel.git',
+  );
+  expect(props.onSelectAndAdvance).toHaveBeenLastCalledWith(
+    'git@git.euraika.net:euraika/platform/camiel.git',
+  );
 });

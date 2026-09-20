@@ -24,7 +24,7 @@ import {
   isAuthUrl,
   isCmdClickModifier,
   parseFilePathLineSuffix,
-  parseGitHubIssueOrPrUrl,
+  parseSourceControlIssueOrPrUrl,
 } from '$shared/utils/link-helpers';
 import { setShowCreateModal } from '$store/renderer/slices/sidebar-nav/sidebar-nav-slice';
 import { selectGithubLinkDefaultAction } from '$store/renderer/slices/user-preferences/user-preferences-selectors';
@@ -38,6 +38,8 @@ import {
 import { m } from '$shared/paraglide/messages.js';
 import { store as appStore } from '$store/renderer/store';
 import { invoke as invokeIpc } from '../../shared/generated/ipc-client';
+
+import { selectSourceControlConnections } from '$store/renderer/slices/source-control/source-control-selectors';
 
 const logger = new Logger('LinkHandler');
 
@@ -121,7 +123,10 @@ export async function handleLink(url: string, options: LinkHandlerOptions): Prom
       }
 
       // GitHub issue/PR links (plain click) → configured default action
-      const gitHubRef = parseGitHubIssueOrPrUrl(url);
+      const gitHubRef = parseSourceControlIssueOrPrUrl(
+        url,
+        selectSourceControlConnections.select(appStore.state),
+      );
       const { event } = options;
       if (gitHubRef && event) {
         const defaultAction =

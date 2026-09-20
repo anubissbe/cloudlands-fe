@@ -93,6 +93,13 @@ vi.mock('$store/renderer/slices/github-auth/github-auth-selectors', async () => 
   const store = createAppStoreMock({ state: {} });
   return {
     selectGitHubAuthIsAuthenticated: store.createSelector(() => false),
+    selectSourceControlIsAuthenticated: store.createSelector(() => false),
+    selectSourceControlSettings: store.createSelector(() => ({
+      provider: 'github',
+      instanceUrl: 'https://gitlab.com',
+      tokenSource: 'auto',
+      gitlabSupported: true,
+    })),
     selectGitHubAuthIsAuthenticating: store.createSelector(() => false),
     selectGitHubAuthDeviceFlow: store.createSelector(() => null),
     selectGitHubAuthError: store.createSelector(() => null),

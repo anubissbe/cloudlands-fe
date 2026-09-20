@@ -56,9 +56,25 @@ vi.mock('$store/renderer/store', async () => {
   });
 });
 
-vi.mock('$store/renderer/slices/github-auth/github-auth-selectors', () => ({
-  selectGitHubAuthIsAuthenticated: mocks.selector(() => mocks.state.githubAuthed),
-}));
+vi.mock(
+  '$store/renderer/slices/source-control/source-control-selectors',
+  async (importOriginal) => ({
+    ...(await importOriginal<Record<string, unknown>>()),
+    selectWorkspaceSourceControlSettings: () => ({
+      subscribe: (fn: (value: unknown) => void) => {
+        fn({
+          provider: 'github',
+          instanceUrl: 'https://github.com',
+          connectionId: 'https://github.com',
+          tokenSource: 'auto',
+          gitlabSupported: true,
+        });
+        return () => {};
+      },
+    }),
+    selectWorkspaceSourceControlIsAuthenticated: mocks.selector(() => mocks.state.githubAuthed),
+  }),
+);
 
 vi.mock('$store/renderer/slices/github-auth/github-auth-slice', () => ({
   initializeGitHubAuth: vi.fn(() => ({ type: 'githubAuth/initialize' })),

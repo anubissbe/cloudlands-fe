@@ -114,8 +114,13 @@
   }
 
   /** Cache key for the repo set a GitHub issues/PRs listing was fetched against. */
-  function repoSetKey(owner: string, repo: string, related: GitHubRepoRef[]): string {
-    return [repoRefKey({ owner, repo }), ...related.map(repoRefKey)].join(',');
+  function repoSetKey(
+    owner: string,
+    repo: string,
+    related: GitHubRepoRef[],
+    namespace = 'https://github.com',
+  ): string {
+    return namespace + '|' + [repoRefKey({ owner, repo }), ...related.map(repoRefKey)].join(',');
   }
 
   // Related (submodule) repos per primary `owner/repo`, resolved once per
@@ -125,8 +130,12 @@
   const relatedReposCache: Map<string, GitHubRepoRef[]> = new Map();
   const relatedReposInFlight: Map<string, Promise<GitHubRepoRef[]>> = new Map();
 
-  async function resolveRelatedRepos(owner: string, repo: string): Promise<GitHubRepoRef[]> {
-    const key = repoRefKey({ owner, repo });
+  async function resolveRelatedRepos(
+    owner: string,
+    repo: string,
+    connectionId: string,
+  ): Promise<GitHubRepoRef[]> {
+    const key = `${connectionId}|${repoRefKey({ owner, repo })}`;
     const cached = relatedReposCache.get(key);
     if (cached) return cached;
     const inFlight = relatedReposInFlight.get(key);
@@ -136,11 +145,11 @@
         success: boolean;
         data?: GitHubRepoRef[];
         error?: string;
-      }>('git-tracking:list-related-repos', { owner, repo });
+      }>('git-tracking:list-related-repos', { owner, repo, connectionId });
       if (!response?.success) {
         throw new Error(response?.error ?? 'Failed to list related repositories');
       }
-      const seen = new Set<string>([key]);
+      const seen = new Set<string>([repoRefKey({ owner, repo })]);
       const related: GitHubRepoRef[] = [];
       for (const ref of response.data ?? []) {
         const refKey = repoRefKey(ref);
@@ -288,11 +297,13 @@
   import { linearAuthClient } from '$features/linear-auth/renderer/linear-auth.client';
   import { handleLink } from '$features/navigation/link-handler';
   import { sentryAuthClient } from '$features/sentry-auth/renderer/sentry-auth.client';
+  import { parseSourceControlLink } from '$shared/utils/source-control-url';
   import {
-    selectGitHubAuthIsAuthenticated,
-    selectGitHubAuthIsAuthenticating,
-  } from '$store/renderer/slices/github-auth/github-auth-selectors';
-  import { startGitHubAuth } from '$store/renderer/slices/github-auth/github-auth-slice';
+    selectSourceControlConnections,
+    selectSelectedSourceControlConnection,
+  } from '$store/renderer/slices/source-control/source-control-selectors';
+  import SourceControlIcon from '$features/source-control/SourceControlIcon.svelte';
+  import SourceControlAuthBanner from '$features/source-control/SourceControlAuthBanner.svelte';
   import { startLinearAuth } from '$store/renderer/slices/linear-auth/linear-auth-slice';
   import { selectLinearIsAuthenticating } from '$store/renderer/slices/linear-auth/linear-auth-selectors';
 
@@ -326,8 +337,8 @@
   } from './context-source-preference';
 
   const logger = createLogger('ContextPicker');
-  const githubAuthIsAuthenticated$ = selectGitHubAuthIsAuthenticated();
-  const githubAuthIsAuthenticating$ = selectGitHubAuthIsAuthenticating();
+  const connections$ = selectSourceControlConnections();
+  const selectedConnection$ = selectSelectedSourceControlConnection();
   const linearIsAuthenticating$ = selectLinearIsAuthenticating();
   const sentryIsConnecting$ = selectSentryIsConnecting();
   const sentryError$ = selectSentryError();
@@ -377,6 +388,7 @@
     repositoryOwner?: string;
     /** GitHub repository name (e.g., "augment") */
     repositoryName?: string;
+    repositoryUrl?: string;
     /** Start with the panel expanded (default: false) */
     initiallyExpanded?: boolean;
     /** Hide the toggle button - useful when embedded in a portal */
@@ -393,6 +405,7 @@
     onSelect,
     repositoryOwner,
     repositoryName,
+    repositoryUrl,
     initiallyExpanded = false,
     hideToggle = false,
     initialSource,
@@ -400,6 +413,16 @@
     prFilter,
   }: Props = $props();
 
+  const repositoryIdentity = $derived(
+    repositoryUrl ? parseSourceControlLink(repositoryUrl, $connections$) : null,
+  );
+  const repositoryConnection = $derived(
+    repositoryUrl
+      ? $connections$.find((item) => item.id === repositoryIdentity?.connectionId)
+      : $selectedConnection$,
+  );
+  const connectionId = $derived(repositoryConnection?.id ?? '');
+  const repositoryContext = $derived(repositoryUrl ? { repoUrl: repositoryUrl } : { connectionId });
   const workspaceId = getWorkspaceRouteContext()?.workspaceId ?? undefined;
 
   // Panel state
@@ -460,7 +483,9 @@
   const githubIssues = $derived(githubIssuesPage.items);
   let isLoadingGitHub = $state(false);
   let isRefreshingGitHub = $state(false);
-  let isGitHubAuthenticated = $state(false);
+  const isGitHubAuthenticated = $derived(
+    repositoryConnection?.enabled === true && repositoryConnection.isConfigured,
+  );
 
   // GitHub PRs state
   let githubPRsPage = $state(emptyPage<GitHubPRLocal>());
@@ -474,7 +499,7 @@
   let relatedRepos = $state<GitHubRepoRef[]>([]);
   const githubRepoSetKey = $derived(
     repositoryOwner && repositoryName
-      ? repoSetKey(repositoryOwner, repositoryName, relatedRepos)
+      ? repoSetKey(repositoryOwner, repositoryName, relatedRepos, connectionId)
       : '',
   );
   // Row labels are only shown when more than one repo contributes. Short
@@ -646,16 +671,6 @@
     // Close any open tooltip when scrolling
     openTooltipId = null;
   }
-
-  // Watch for GitHub auth state changes (e.g., after user connects via Settings)
-  $effect(() => {
-    const storeIsAuth = $githubAuthIsAuthenticated$;
-    if (storeIsAuth && !isGitHubAuthenticated) {
-      // Auth completed (e.g., user connected via Settings)
-      isGitHubAuthenticated = true;
-      // Issues will be loaded by the repo context $effect
-    }
-  });
 
   // Instant pre-filter over already-loaded rows while the debounced server
   // search is pending. Server results replace the list once the query commits.
@@ -985,6 +1000,7 @@
       return { items: [] as GitHubIssueLocal[], nextToken: null };
     }
     const response = await invoke<any>('git-tracking:search-github-issues', {
+      ...repositoryContext,
       owner: repositoryOwner,
       repo: repositoryName,
       options: {
@@ -1044,7 +1060,6 @@
       // this function, causing an infinite loop (effect_update_depth_exceeded).
       // Auth initialization is handled by the components that manage GitHub auth
       // (GitHubAuthBanner, GitHubAuthConnection, etc.).
-      isGitHubAuthenticated = selectGitHubAuthIsAuthenticated.select(appStore.state);
 
       logger.debug('GitHub auth state', {
         isAuthenticated: isGitHubAuthenticated,
@@ -1125,6 +1140,7 @@
       return { items: [] as GitHubPRLocal[], nextToken: null };
     }
     const response = await invoke<any>('git-tracking:search-pull-requests', {
+      ...repositoryContext,
       owner: repositoryOwner,
       repo: repositoryName,
       options: {
@@ -1425,6 +1441,7 @@
     if (!sourceBranch && isElectronPlatform()) {
       try {
         const response = await invoke<any>('git-tracking:get-pull-request', {
+          repoUrl: pr.url,
           owner: pr.owner,
           repo: pr.repo,
           number: pr.number,
@@ -1527,17 +1544,22 @@
   // Resolve the primary repo's submodule repos; when they arrive (and differ
   // from what the listing was fetched against), refresh both GitHub tabs
   // once so the blended list includes them.
-  async function loadRelatedRepos(owner: string, repo: string) {
+  async function loadRelatedRepos(owner: string, repo: string, requestedConnectionId: string) {
     if (!isElectronPlatform()) return;
     let related: GitHubRepoRef[];
     try {
-      related = await resolveRelatedRepos(owner, repo);
+      related = await resolveRelatedRepos(owner, repo, requestedConnectionId);
     } catch (error) {
       logger.warn('Failed to list related repositories', { owner, repo, error });
       return;
     }
-    if (repositoryOwner !== owner || repositoryName !== repo) return;
-    if (repoSetKey(owner, repo, related) === githubRepoSetKey) return;
+    if (
+      repositoryOwner !== owner ||
+      repositoryName !== repo ||
+      connectionId !== requestedConnectionId
+    )
+      return;
+    if (repoSetKey(owner, repo, related, requestedConnectionId) === githubRepoSetKey) return;
     relatedRepos = related;
     loadGitHubIssues();
     loadGitHubPRs();
@@ -1549,6 +1571,7 @@
     const owner = repositoryOwner;
     const repo = repositoryName;
     const authed = isGitHubAuthenticated;
+    const currentConnectionId = connectionId;
     // Only reload if we have both and are authenticated
     if (owner && repo && authed) {
       // Use untrack to prevent infinite loop - the load functions update state
@@ -1556,10 +1579,11 @@
       untrack(() => {
         // Search the primary repo alone until the related set is known;
         // a session-cached set applies immediately.
-        relatedRepos = relatedReposCache.get(repoRefKey({ owner, repo })) ?? [];
+        relatedRepos =
+          relatedReposCache.get(`${currentConnectionId}|${repoRefKey({ owner, repo })}`) ?? [];
         loadGitHubIssues();
         loadGitHubPRs();
-        void loadRelatedRepos(owner, repo);
+        void loadRelatedRepos(owner, repo, currentConnectionId);
       });
     } else {
       untrack(() => {
@@ -1574,8 +1598,22 @@
     {
       linear: { label: 'Linear', icon: LinearIcon },
       sentry: { label: 'Sentry', icon: SentryIcon },
-      'github-issues': { label: 'GH Issues', icon: GitHubIcon },
-      'github-prs': { label: 'GH PRs', icon: GitHubIcon },
+      'github-issues': {
+        get label() {
+          return repositoryConnection?.provider === 'gitlab'
+            ? m.workspace_issueSuggestions_sourceIssues_label({ provider: 'GitLab' })
+            : 'GH Issues';
+        },
+        icon: GitHubIcon,
+      },
+      'github-prs': {
+        get label() {
+          return repositoryConnection?.provider === 'gitlab'
+            ? m.workspace_prSection_mergeRequests_label()
+            : 'GH PRs';
+        },
+        icon: GitHubIcon,
+      },
     };
   const PROVIDER_ICONS: Record<ContextSourceProvider, typeof LinearIcon> = {
     github: GitHubIcon,
@@ -1635,7 +1673,9 @@
       case 'sentry':
         return m.workspace_issueSuggestions_searchSentry_placeholder();
       case 'github-issues':
-        return m.workspace_issueSuggestions_searchGithubIssues_placeholder();
+        return repositoryConnection?.provider === 'gitlab'
+          ? m.workspace_issueSuggestions_searchProviderIssues_placeholder({ provider: 'GitLab' })
+          : m.workspace_issueSuggestions_searchGithubIssues_placeholder();
       case 'github-prs':
         return m.workspace_issueSuggestions_searchPullRequests_placeholder();
       default:
@@ -1688,7 +1728,15 @@
       <div class="flex items-end gap-2 ml-1 -mb-0.5">
         {#each orderedProviders as provider (provider)}
           {@const ProviderIcon = PROVIDER_ICONS[provider]}
-          <ProviderIcon size={12} class={PROVIDER_ICON_CLASSES[provider]} />
+          {#if provider === 'github'}
+            <SourceControlIcon
+              provider={repositoryConnection?.provider ?? 'github'}
+              size={12}
+              class={PROVIDER_ICON_CLASSES[provider]}
+            />
+          {:else}
+            <ProviderIcon size={12} class={PROVIDER_ICON_CLASSES[provider]} />
+          {/if}
         {/each}
       </div>
       <!-- {/if} -->
@@ -1745,7 +1793,10 @@
       <!-- Repo context: primary repo plus the submodule repos also searched -->
       {#if (activeSource === 'github-issues' || activeSource === 'github-prs') && showRepoLabels && repositoryOwner && repositoryName}
         <div class="flex items-center gap-1.5 px-3 py-1.5 border-b border-border text-xs">
-          <GitHubIcon class="w-3 h-3 text-ghost shrink-0 opacity-50" />
+          <SourceControlIcon
+            provider={repositoryConnection?.provider ?? 'github'}
+            class="w-3 h-3 text-ghost shrink-0 opacity-50"
+          />
           <span class="text-subtle truncate">{repositoryOwner}/{repositoryName}</span>
           {@render relatedReposBadge()}
         </div>
@@ -2230,7 +2281,10 @@
                   onclick={() => handleGitHubIssueClick(issue)}
                   class="w-full flex items-center gap-2 px-3 py-1.5 text-left hover:bg-muted/40 transition-colors group cursor-pointer"
                 >
-                  <GitHubIcon class="w-3.5 h-3.5 text-ghost shrink-0 opacity-50" />
+                  <SourceControlIcon
+                    provider={repositoryConnection?.provider ?? 'github'}
+                    class="w-3.5 h-3.5 text-ghost shrink-0 opacity-50"
+                  />
                   <span class="text-xs font-medium text-subtle shrink-0"
                     >{#if showRepoLabels}{repoLabelFor(
                         issue.owner,
@@ -2251,7 +2305,10 @@
               {#snippet content()}
                 <div class="space-y-2">
                   <div class="flex items-center gap-2">
-                    <GitHubIcon class="w-4 h-4 text-ghost shrink-0" />
+                    <SourceControlIcon
+                      provider={repositoryConnection?.provider ?? 'github'}
+                      class="w-4 h-4 text-ghost shrink-0"
+                    />
                     <span class="text-xs font-medium text-subtle"
                       >{#if showRepoLabels}{repoLabelFor(
                           issue.owner,
@@ -2306,7 +2363,10 @@
                   onclick={() => handleGitHubPRClick(pr)}
                   class="w-full flex items-center gap-2 px-3 py-1.5 text-left hover:bg-muted/40 transition-colors group cursor-pointer"
                 >
-                  <GitHubIcon class="w-3.5 h-3.5 text-ghost shrink-0 opacity-50" />
+                  <SourceControlIcon
+                    provider={repositoryConnection?.provider ?? 'github'}
+                    class="w-3.5 h-3.5 text-ghost shrink-0 opacity-50"
+                  />
                   <span class="text-xs font-medium text-subtle shrink-0"
                     >{#if showRepoLabels}{repoLabelFor(pr.owner, pr.repo)}{/if}#{pr.number}</span
                   >
@@ -2329,7 +2389,10 @@
               {#snippet content()}
                 <div class="space-y-2">
                   <div class="flex items-center gap-2">
-                    <GitHubIcon class="w-4 h-4 text-ghost shrink-0" />
+                    <SourceControlIcon
+                      provider={repositoryConnection?.provider ?? 'github'}
+                      class="w-4 h-4 text-ghost shrink-0"
+                    />
                     <span class="text-xs font-medium text-subtle"
                       >{#if showRepoLabels}{repoLabelFor(pr.owner, pr.repo)}{/if}#{pr.number}</span
                     >
@@ -2416,30 +2479,7 @@
 
         <!-- GitHub auth status - only show when not authenticated -->
         {#if (activeSource === 'github-issues' || activeSource === 'github-prs') && !isLoading && !isGitHubAuthenticated}
-          <div
-            class="flex items-center justify-between px-3 py-2 text-sm border-t border-border"
-            transition:slide={{ tier: 'moderate' }}
-          >
-            <div class="flex items-center gap-2">
-              <GitHubIcon class="w-3.5 h-3.5 text-ghost" />
-              <span class="text-subtle"
-                >{activeSource === 'github-prs'
-                  ? m.workspace_issueSuggestions_connectGithubPrs_label()
-                  : m.workspace_issueSuggestions_connectGithubIssues_label()}</span
-              >
-            </div>
-            <Button
-              variant="ghost"
-              type="button"
-              disabled={$githubAuthIsAuthenticating$}
-              onclick={() => appStore.dispatch(startGitHubAuth())}
-              class="text-primary-ink hover:text-primary-ink/80 transition-colors font-medium cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
-            >
-              {$githubAuthIsAuthenticating$
-                ? m.workspace_issueSuggestions_connecting_label()
-                : m.workspace_issueSuggestions_connect_label()}
-            </Button>
-          </div>
+          <SourceControlAuthBanner connectionId={connectionId || undefined} />
         {/if}
         <!-- Show repository hint when authenticated but no repo selected -->
         {#snippet repositoryHint()}

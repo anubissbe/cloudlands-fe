@@ -60,9 +60,11 @@
 
   const startWorkspaceLabel = $derived(
     linkActionMenuState.gitHubRef?.kind === 'pr'
-      ? m.navigation_linkActionMenu_startWorkspacePr_label({
-          number: linkActionMenuState.gitHubRef.number,
-        })
+      ? linkActionMenuState.gitHubRef.provider === 'gitlab'
+        ? m.navigation_linkActionMenu_startWorkspaceMr_label()
+        : m.navigation_linkActionMenu_startWorkspacePr_label({
+            number: linkActionMenuState.gitHubRef.number,
+          })
       : m.navigation_linkActionMenu_startWorkspaceIssue_label({
           number: linkActionMenuState.gitHubRef?.number ?? 0,
         }),
@@ -75,10 +77,7 @@
     if (!ref) return;
     appStore.dispatch(
       setWorkspaceInitializerPendingGitHubPrefill({
-        owner: ref.owner,
-        repo: ref.repo,
-        number: ref.number,
-        kind: ref.kind,
+        ...ref,
         url,
       }),
     );

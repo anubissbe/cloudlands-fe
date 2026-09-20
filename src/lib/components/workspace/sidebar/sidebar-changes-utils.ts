@@ -6,6 +6,7 @@
 import type { TrackedChange, CommitInfo } from '$features/file-tracking/types';
 import type { PullRequestInfo, Workspace } from '$shared/types';
 import { PullRequestStatus } from '$shared/types';
+import type { SourceControlSettings } from '$features/source-control/types';
 import type { PrMonitorRow } from '$features/pr-monitor/pr-monitor-service';
 import type {
   AgentChangeGroup,
@@ -76,7 +77,14 @@ export function constructPrUrl(
   repoOwner: string | undefined,
   repoName: string | undefined,
   fallbackUrl?: string,
+  forge?: Pick<SourceControlSettings, 'provider' | 'instanceUrl'>,
 ): string {
+  if (fallbackUrl) return fallbackUrl;
+  if (forge?.provider === 'gitlab') {
+    return repoOwner && repoName
+      ? `${forge.instanceUrl.replace(/\/$/, '')}/${repoOwner}/${repoName}/-/merge_requests/${prNumber}`
+      : '';
+  }
   if (repoOwner && repoName) {
     return `https://github.com/${repoOwner}/${repoName}/pull/${prNumber}`;
   }
@@ -290,8 +298,19 @@ export function computeTotalStats(
  * daemon synthesizes for merged `pullRequests` entries — see the protocol's
  * workspace.md PR-field ownership section), or undefined for any other URL. */
 export function prRepoFromUrl(url: string | undefined): string | undefined {
-  const match = url?.match(/^https?:\/\/github\.com\/([^/]+)\/([^/]+)\/pull\/\d+/i);
-  return match ? `${match[1]}/${match[2]}` : undefined;
+  if (!url) return undefined;
+  try {
+    const parsed = new URL(url);
+    if (!['https:', 'http:'].includes(parsed.protocol)) return undefined;
+    const gitlab = parsed.pathname.match(/^\/(.+)\/-\/merge_requests\/[1-9][0-9]*(?:\/|$)/);
+    if (gitlab) return gitlab[1];
+    const github =
+      parsed.hostname === 'github.com' &&
+      parsed.pathname.match(/^\/([^/]+\/[^/]+)\/pull\/[1-9][0-9]*(?:\/|$)/);
+    return github ? github[1] : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /**

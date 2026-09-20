@@ -21,6 +21,7 @@ const mocks = vi.hoisted(() => {
     gitOperations: {},
   };
   const executorState = { status: 'idle', result: null, error: null, agentId: null };
+  const sourceControl = { provider: 'github' };
   const selector = <T>(getter: () => T) => {
     const fn = () => ({
       subscribe(run: (v: T) => void) {
@@ -30,8 +31,16 @@ const mocks = vi.hoisted(() => {
     });
     return Object.assign(fn, { select: () => getter() });
   };
-  return { dispatch, workspaceEntity, sidebarChanges, executorState, selector };
+  return { dispatch, workspaceEntity, sidebarChanges, executorState, sourceControl, selector };
 });
+
+vi.mock(
+  '$store/renderer/slices/source-control/source-control-selectors',
+  async (importOriginal) => ({
+    ...(await importOriginal<Record<string, unknown>>()),
+    selectWorkspaceSourceControlSettings: mocks.selector(() => mocks.sourceControl),
+  }),
+);
 
 vi.mock('$store/renderer/store', async () => {
   const { createAppStoreMockModule } =
@@ -217,6 +226,8 @@ describe('MergePanel', () => {
     mockExecute.mockClear();
     mockExecute.mockResolvedValue({ success: true, result: { newHeadSha: 'h1' } });
     mockMergePR.mockClear();
+    mockMergePR.mockResolvedValue({ success: true });
+    mocks.sourceControl.provider = 'github';
     mocks.sidebarChanges.mergeWhenReady = false;
     mocks.executorState.status = 'idle';
     mocks.executorState.agentId = null;
@@ -266,6 +277,35 @@ describe('MergePanel', () => {
       expect(opts.viaPR).toBe(true);
       expect(opts.pushAfter).toBe(true);
     });
+  });
+
+  it('labels GitLab merge requests and preserves failure from the remote merge', async () => {
+    const { notify } = await import('$lib/components/patterns/notify');
+    vi.mocked(notify.success).mockClear();
+    vi.mocked(notify.error).mockClear();
+    mocks.sourceControl.provider = 'gitlab';
+    mockMergePR.mockResolvedValue({ success: false, error: 'Merge request is blocked' });
+    const onMergeComplete = vi.fn();
+    const { getByRole, getByText } = await renderMerge({
+      hasOpenPR: true,
+      hasRemote: true,
+      pullRequests: [
+        {
+          number: 7,
+          title: 'Ready',
+          status: 'open',
+          url: 'https://git.euraika.net/team/repo/-/merge_requests/7',
+        },
+      ],
+      onMergeComplete,
+    });
+    expect(getByText('Via MR')).toBeTruthy();
+    expect(getByText(/MR !7 will be merged on GitLab into/)).toBeTruthy();
+    await fireEvent.click(getByRole('button', { name: 'Merge MR', exact: true }));
+    await waitFor(() => expect(notify.error).toHaveBeenCalledWith('Merge request is blocked'));
+    expect(mockMergePR).toHaveBeenCalledWith('ws-1', 7, { mergeMethod: 'merge' });
+    expect(onMergeComplete).not.toHaveBeenCalled();
+    expect(notify.success).not.toHaveBeenCalled();
   });
 
   it('dispatches setSidebarMergeWhenReady when stop-generating is clicked while generating a merge commit', async () => {

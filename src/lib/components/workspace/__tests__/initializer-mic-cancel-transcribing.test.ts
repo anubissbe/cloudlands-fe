@@ -30,8 +30,10 @@ vi.mock('$app/navigation', () => ({ goto: mocks.goto }));
 vi.mock('$store/renderer/store', async () => {
   const { createAppStoreMockModule } =
     await import('$store/renderer/utils/test-helpers/store-mock');
+  const { initialState: githubAuth } =
+    await import('$store/renderer/slices/github-auth/github-auth-slice');
   return createAppStoreMockModule({
-    state: () => ({ hardwareConsole: mocks.hardwareConsole }),
+    state: () => ({ githubAuth, hardwareConsole: mocks.hardwareConsole }),
     dispatch: mocks.dispatch,
   });
 });

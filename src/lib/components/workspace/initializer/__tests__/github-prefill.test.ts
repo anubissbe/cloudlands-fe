@@ -110,3 +110,38 @@ describe('resolveGitHubPrefillSelection', () => {
     });
   });
 });
+
+it('routes GitLab MR details with the full registered connection and nested project URL', async () => {
+  const handler = vi.fn(async () => ({
+    success: true,
+    data: {
+      number: 17,
+      title: 'Finish Camiel',
+      state: 'open',
+      sourceBranch: 'finish/camiel',
+      targetBranch: 'stable',
+    },
+  }));
+  registerMockIpcHandler(CHANNEL, handler);
+  const selection = await resolveGitHubPrefillSelection({
+    provider: 'gitlab',
+    connectionId: 'https://git.euraika.net',
+    instanceUrl: 'https://git.euraika.net',
+    projectUrl: 'https://git.euraika.net/team/platform/camiel',
+    owner: 'team/platform',
+    repo: 'camiel',
+    number: 17,
+    kind: 'pr',
+    url: 'https://git.euraika.net/team/platform/camiel/-/merge_requests/17',
+  });
+  expect(handler).toHaveBeenCalledWith({
+    owner: 'team/platform',
+    repo: 'camiel',
+    number: 17,
+    connectionId: 'https://git.euraika.net',
+    repoUrl: 'https://git.euraika.net/team/platform/camiel',
+  });
+  expect(selection.metadata?.sourceBranch).toBe('finish/camiel');
+  expect(selection.metadata?.targetBranch).toBe('stable');
+  expect(selection.url).toBe('https://git.euraika.net/team/platform/camiel/-/merge_requests/17');
+});

@@ -30,6 +30,29 @@ vi.mock('$store/renderer/store', async () => {
   return createAppStoreMockModule({ state: () => ({ theme: { name: 'dark' } }) });
 });
 
+vi.mock('$features/source-control/SourceControlAuthBanner.svelte', async () => ({
+  default: (await import('./mocks/MockComponent.svelte')).default,
+}));
+vi.mock('$store/renderer/slices/source-control/source-control-selectors', () => ({
+  selectSourceControlConnections: mocks.selector(
+    ['https://github.com', 'https://git.one.example', 'https://git.two.example'].map((id) => ({
+      id,
+      provider: id === 'https://github.com' ? 'github' : 'gitlab',
+      instanceUrl: id,
+      enabled: true,
+      isConfigured: true,
+      user: { login: 'fixture' },
+    })),
+  ),
+  selectSelectedSourceControlConnection: mocks.selector({
+    id: 'https://github.com',
+    provider: 'github',
+    instanceUrl: 'https://github.com',
+    enabled: true,
+    isConfigured: true,
+    user: { login: 'fixture' },
+  }),
+}));
 vi.mock('$store/renderer/slices/github-auth/github-auth-selectors', () => ({
   selectGitHubAuthIsAuthenticated: mocks.selector(true),
   selectGitHubAuthIsAuthenticating: mocks.selector(false),
@@ -237,6 +260,7 @@ describe('IssueSuggestions server-side search + pagination wire contract', () =>
 
     expect(issueCalls.length).toBeGreaterThan(0);
     expect(issueCalls[0]).toEqual({
+      connectionId: 'https://github.com',
       owner: 'owner-a',
       repo: 'repo-a',
       options: { state: 'open', per_page: 20, filter: 'all' },
@@ -252,6 +276,7 @@ describe('IssueSuggestions server-side search + pagination wire contract', () =>
 
     expect(issueCalls.length).toBe(before + 1);
     expect(issueCalls.at(-1)).toEqual({
+      connectionId: 'https://github.com',
       owner: 'owner-a',
       repo: 'repo-a',
       options: { state: 'open', per_page: 20, filter: 'all', query: 'flaky websocket' },
@@ -362,6 +387,7 @@ describe('IssueSuggestions server-side search + pagination wire contract', () =>
 
     expect(prCalls.length).toBeGreaterThan(0);
     expect(prCalls[0]).toEqual({
+      connectionId: 'https://github.com',
       owner: 'owner-c',
       repo: 'repo-c',
       options: { state: 'open', per_page: 50, filter: 'all' },
@@ -372,6 +398,7 @@ describe('IssueSuggestions server-side search + pagination wire contract', () =>
     await settle(301);
 
     expect(prCalls.at(-1)).toEqual({
+      connectionId: 'https://github.com',
       owner: 'owner-c',
       repo: 'repo-c',
       options: { state: 'open', per_page: 50, filter: 'all', query: 'dark mode' },
@@ -421,7 +448,9 @@ describe('IssueSuggestions server-side search + pagination wire contract', () =>
     });
     await settle();
 
-    expect(relatedCalls).toEqual([{ owner: 'owner-d', repo: 'repo-d' }]);
+    expect(relatedCalls).toEqual([
+      { owner: 'owner-d', repo: 'repo-d', connectionId: 'https://github.com' },
+    ]);
 
     // The first listing goes out against the primary repo alone; once the
     // related set resolves the listing refreshes with the extras.
@@ -434,6 +463,7 @@ describe('IssueSuggestions server-side search + pagination wire contract', () =>
       { owner: 'owner-d', repo: 'sub-5' },
     ];
     expect(issueCalls.at(-1)).toEqual({
+      connectionId: 'https://github.com',
       owner: 'owner-d',
       repo: 'repo-d',
       options: { state: 'open', per_page: 20, filter: 'all', repos: expectedRepos },
@@ -444,6 +474,7 @@ describe('IssueSuggestions server-side search + pagination wire contract', () =>
     await fireEvent.input(input, { target: { value: 'submodule' } });
     await settle(301);
     expect(issueCalls.at(-1)).toEqual({
+      connectionId: 'https://github.com',
       owner: 'owner-d',
       repo: 'repo-d',
       options: {
@@ -618,6 +649,7 @@ describe('IssueSuggestions server-side search + pagination wire contract', () =>
 
     expect(prCalls[0].options).not.toHaveProperty('repos');
     expect(prCalls.at(-1)).toEqual({
+      connectionId: 'https://github.com',
       owner: 'owner-h',
       repo: 'repo-h',
       options: {
@@ -676,6 +708,7 @@ describe('IssueSuggestions server-side search + pagination wire contract', () =>
 
     const pagedIssues = issueCalls.find((c) => c.options?.nextToken !== undefined);
     expect(pagedIssues).toEqual({
+      connectionId: 'https://github.com',
       owner: 'owner-i',
       repo: 'repo-i',
       options: {
@@ -706,6 +739,7 @@ describe('IssueSuggestions server-side search + pagination wire contract', () =>
 
     const pagedPRs = prCalls.find((c) => c.options?.nextToken !== undefined);
     expect(pagedPRs).toEqual({
+      connectionId: 'https://github.com',
       owner: 'owner-i',
       repo: 'repo-i',
       options: {
@@ -716,5 +750,38 @@ describe('IssueSuggestions server-side search + pagination wire contract', () =>
         nextToken: 'prs-cursor',
       },
     });
+  });
+  it('uses the repository host for identical nested projects while browsing GitHub', async () => {
+    const calls: unknown[] = [];
+    registerMockIpcHandler('git-tracking:list-related-repos', () => ({ success: true, data: [] }));
+    registerMockIpcHandler('git-tracking:search-pull-requests', () => ({
+      success: true,
+      data: [],
+      nextToken: null,
+    }));
+    registerMockIpcHandler('git-tracking:search-github-issues', (payload) => {
+      calls.push(payload);
+      return { success: true, data: [], nextToken: null };
+    });
+    for (const host of ['git.one.example', 'git.two.example']) {
+      render(IssueSuggestions, {
+        props: {
+          repositoryOwner: 'team/sub',
+          repositoryName: 'camiel',
+          repositoryUrl: `https://${host}/team/sub/camiel`,
+          initiallyExpanded: true,
+          initialSource: 'github-issues',
+          hideSourceTabs: true,
+        },
+      });
+      await settle();
+      expect(calls.at(-1)).toEqual({
+        repoUrl: `https://${host}/team/sub/camiel`,
+        owner: 'team/sub',
+        repo: 'camiel',
+        options: { state: 'open', per_page: 20, filter: 'all' },
+      });
+      cleanup();
+    }
   });
 });

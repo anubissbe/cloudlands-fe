@@ -357,14 +357,30 @@ vi.mock('$features/file-tracking/file-tracking.client', async (importOriginal) =
 
 const mockGitHubAuthIsAuthenticated = vi.hoisted(() => ({ value: false }));
 
-vi.mock('$store/renderer/slices/github-auth/github-auth-selectors', () => ({
-  selectGitHubAuthIsAuthenticated: () => ({
-    subscribe: (fn: (v: boolean) => void) => {
-      fn(mockGitHubAuthIsAuthenticated.value);
-      return () => {};
-    },
+vi.mock(
+  '$store/renderer/slices/source-control/source-control-selectors',
+  async (importOriginal) => ({
+    ...(await importOriginal<Record<string, unknown>>()),
+    selectWorkspaceSourceControlSettings: () => ({
+      subscribe: (fn: (value: unknown) => void) => {
+        fn({
+          provider: 'github',
+          instanceUrl: 'https://github.com',
+          connectionId: 'https://github.com',
+          tokenSource: 'auto',
+          gitlabSupported: true,
+        });
+        return () => {};
+      },
+    }),
+    selectWorkspaceSourceControlIsAuthenticated: () => ({
+      subscribe: (fn: (v: boolean) => void) => {
+        fn(mockGitHubAuthIsAuthenticated.value);
+        return () => {};
+      },
+    }),
   }),
-}));
+);
 
 vi.mock('$store/renderer/slices/github-auth/github-auth-slice', async (importOriginal) => ({
   ...(await importOriginal<Record<string, unknown>>()),

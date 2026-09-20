@@ -46,7 +46,14 @@ vi.mock('$store/renderer/slices/github-auth/github-auth-slice', () => ({
   clearGitHubAuthError: () => ({ type: 'githubAuth/clearError' }),
 }));
 vi.mock('$store/renderer/slices/github-auth/github-auth-selectors', () => ({
+  selectSourceControlSettings: mocks.selector(() => ({
+    provider: 'github',
+    instanceUrl: 'https://gitlab.com',
+    tokenSource: 'auto',
+    gitlabSupported: true,
+  })),
   selectGitHubAuthIsAuthenticated: mocks.selector(() => false),
+  selectSourceControlIsAuthenticated: mocks.selector(() => false),
   selectGitHubAuthIsAuthenticating: mocks.selector(() => false),
   selectGitHubAuthDeviceFlow: mocks.selector(() => null),
   selectGitHubAuthError: mocks.selector(() => null),

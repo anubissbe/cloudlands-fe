@@ -7,7 +7,7 @@
  * A fetch failure renders an explicit error/auth state and NEVER the old
  * fabricated ['main','master',...] fallback.
  */
-import { render, screen, fireEvent, waitFor } from '@testing-library/svelte';
+import { render, screen, fireEvent, waitFor, cleanup } from '@testing-library/svelte';
 import { describe, expect, it, vi, beforeEach } from 'vitest';
 
 const {
@@ -18,7 +18,14 @@ const {
   mockToastError,
   debugFlags,
   savedBranchByRepo,
+  sourceControl,
 } = vi.hoisted(() => ({
+  sourceControl: {
+    provider: 'github' as 'github' | 'gitlab',
+    instanceUrl: 'https://github.com',
+    tokenSource: 'auto',
+    gitlabSupported: true,
+  },
   mockGetBranches: vi.fn(),
   mockBranchStatus: vi.fn(async () => null),
   mockGithubBranches: vi.fn(),
@@ -29,6 +36,12 @@ const {
   debugFlags: {} as Record<string, boolean>,
   savedBranchByRepo: {} as Record<string, string>,
 }));
+
+vi.mock('$store/renderer/slices/source-control/source-control-selectors', async () => {
+  const { createAppStoreMock } = await import('$store/renderer/utils/test-helpers/store-mock');
+  const store = createAppStoreMock({ state: {} });
+  return { selectSourceControlSettings: store.createSelector(() => sourceControl) };
+});
 
 vi.mock('$lib/client', () => ({
   appClient: {
@@ -48,7 +61,7 @@ vi.mock('$store/renderer/store', async () => {
   const { createAppStoreMockModule } =
     await import('$store/renderer/utils/test-helpers/store-mock');
   return createAppStoreMockModule({
-    state: {},
+    state: { githubAuth: { sourceControl } },
     // Mirror the real reducer: persisting a branch updates the saved map
     // (this is exactly the clobbering the reconciliation fix guards against).
     dispatch: (action: { type?: string; payload?: [string, string] }) => {
@@ -118,6 +131,8 @@ function deferred<T>() {
 
 describe('BranchSelector (daemon-backed branch listing, no fabricated fallbacks)', () => {
   beforeEach(() => {
+    sourceControl.provider = 'github';
+    sourceControl.instanceUrl = 'https://github.com';
     mockGetBranches.mockReset();
     mockGithubBranches.mockReset();
     mockGithubBranchesCached.mockReset();
@@ -288,7 +303,11 @@ describe('BranchSelector (daemon-backed branch listing, no fabricated fallbacks)
       },
     });
 
-    await waitFor(() => expect(mockGithubBranches).toHaveBeenCalledWith('octo', 'intent'));
+    await waitFor(() =>
+      expect(mockGithubBranches).toHaveBeenCalledWith('octo', 'intent', undefined, {
+        repoUrl: 'https://github.com/octo/intent',
+      }),
+    );
     await waitFor(() => expect(onchange).toHaveBeenCalled());
     expect(onchange.mock.calls[0][0].detail).toEqual({ branch: 'dev' });
   });
@@ -562,7 +581,11 @@ describe('BranchSelector (cached-first GitHub load, github.branches.listCached �
     const onchange = vi.fn();
     const { container } = render(BranchSelector, { props: { ...githubProps, onchange } });
 
-    await waitFor(() => expect(mockGithubBranchesCached).toHaveBeenCalledWith('octo', 'intent'));
+    await waitFor(() =>
+      expect(mockGithubBranchesCached).toHaveBeenCalledWith('octo', 'intent', {
+        repoUrl: 'https://github.com/octo/intent',
+      }),
+    );
     // Cached hit paints instantly: default branch selected, trigger loader gone —
     // all while the authoritative GitHub API request is still in flight.
     await waitFor(() => expect(onchange).toHaveBeenCalled());
@@ -612,7 +635,11 @@ describe('BranchSelector (cached-first GitHub load, github.branches.listCached �
     const onchange = vi.fn();
     const { container } = render(BranchSelector, { props: { ...githubProps, onchange } });
 
-    await waitFor(() => expect(mockGithubBranchesCached).toHaveBeenCalledWith('octo', 'intent'));
+    await waitFor(() =>
+      expect(mockGithubBranchesCached).toHaveBeenCalledWith('octo', 'intent', {
+        repoUrl: 'https://github.com/octo/intent',
+      }),
+    );
     // Fallback paints like a warm cache: default branch selected, trigger
     // loader gone — all while the authoritative GitHub API request is still
     // in flight.
@@ -635,7 +662,11 @@ describe('BranchSelector (cached-first GitHub load, github.branches.listCached �
     const onchange = vi.fn();
     const { container } = render(BranchSelector, { props: { ...githubProps, onchange } });
 
-    await waitFor(() => expect(mockGithubBranchesCached).toHaveBeenCalledWith('octo', 'intent'));
+    await waitFor(() =>
+      expect(mockGithubBranchesCached).toHaveBeenCalledWith('octo', 'intent', {
+        repoUrl: 'https://github.com/octo/intent',
+      }),
+    );
     // Cold cache: still loading (inline trigger loader), nothing selected.
     await waitFor(() =>
       expect(container.querySelector('[data-slot="intent-mark-loader"]')).toBeTruthy(),
@@ -844,13 +875,21 @@ describe('BranchSelector (server-side prefix search, github.branches.list prefix
     );
     const { container } = render(BranchSelector, { props: githubProps });
 
-    await waitFor(() => expect(mockGithubBranches).toHaveBeenCalledWith('octo', 'intent'));
+    await waitFor(() =>
+      expect(mockGithubBranches).toHaveBeenCalledWith('octo', 'intent', undefined, {
+        repoUrl: 'https://github.com/octo/intent',
+      }),
+    );
     await openDropdown(container);
     const searchInput = await screen.findByPlaceholderText('Search or enter branch name...');
     await fireEvent.input(searchInput, { target: { value: 'feat' } });
 
     // Debounced search fires the prefix-filtered daemon request…
-    await waitFor(() => expect(mockGithubBranches).toHaveBeenCalledWith('octo', 'intent', 'feat'));
+    await waitFor(() =>
+      expect(mockGithubBranches).toHaveBeenCalledWith('octo', 'intent', 'feat', {
+        repoUrl: 'https://github.com/octo/intent',
+      }),
+    );
     // …and the beyond-first-page branch becomes selectable.
     await waitFor(() => expect(screen.getByText('feat/beyond-page')).toBeTruthy());
     expect(screen.getByText('feat/x')).toBeTruthy();
@@ -866,7 +905,11 @@ describe('BranchSelector (server-side prefix search, github.branches.list prefix
     );
     const { container } = render(BranchSelector, { props: githubProps });
 
-    await waitFor(() => expect(mockGithubBranches).toHaveBeenCalledWith('octo', 'intent'));
+    await waitFor(() =>
+      expect(mockGithubBranches).toHaveBeenCalledWith('octo', 'intent', undefined, {
+        repoUrl: 'https://github.com/octo/intent',
+      }),
+    );
     await openDropdown(container);
     const searchInput = await screen.findByPlaceholderText('Search or enter branch name...');
     await fireEvent.input(searchInput, { target: { value: 'feat' } });
@@ -893,12 +936,20 @@ describe('BranchSelector (server-side prefix search, github.branches.list prefix
       props: { repoPath: 'octo/intent', repoType: 'github' as const, githubUrl: '' },
     });
 
-    await waitFor(() => expect(mockGithubBranches).toHaveBeenCalledWith('octo', 'intent'));
+    await waitFor(() =>
+      expect(mockGithubBranches).toHaveBeenCalledWith('octo', 'intent', undefined, {
+        repoUrl: 'https://github.com/octo/intent',
+      }),
+    );
     await openDropdown(container);
     const searchInput = await screen.findByPlaceholderText('Search or enter branch name...');
     await fireEvent.input(searchInput, { target: { value: 'feat' } });
 
-    await waitFor(() => expect(mockGithubBranches).toHaveBeenCalledWith('octo', 'intent', 'feat'));
+    await waitFor(() =>
+      expect(mockGithubBranches).toHaveBeenCalledWith('octo', 'intent', 'feat', {
+        repoUrl: 'https://github.com/octo/intent',
+      }),
+    );
     await waitFor(() => expect(screen.getByText('feat/beyond-page')).toBeTruthy());
   });
 
@@ -910,7 +961,11 @@ describe('BranchSelector (server-side prefix search, github.branches.list prefix
     );
     const { container } = render(BranchSelector, { props: githubProps });
 
-    await waitFor(() => expect(mockGithubBranches).toHaveBeenCalledWith('octo', 'intent'));
+    await waitFor(() =>
+      expect(mockGithubBranches).toHaveBeenCalledWith('octo', 'intent', undefined, {
+        repoUrl: 'https://github.com/octo/intent',
+      }),
+    );
     await openDropdown(container);
     const searchInput = await screen.findByPlaceholderText('Search or enter branch name...');
     await fireEvent.input(searchInput, { target: { value: 'feat' } });
@@ -939,7 +994,11 @@ describe('BranchSelector (server-side prefix search, github.branches.list prefix
     });
     const { container } = render(BranchSelector, { props: githubProps });
 
-    await waitFor(() => expect(mockGithubBranches).toHaveBeenCalledWith('octo', 'intent'));
+    await waitFor(() =>
+      expect(mockGithubBranches).toHaveBeenCalledWith('octo', 'intent', undefined, {
+        repoUrl: 'https://github.com/octo/intent',
+      }),
+    );
     await openDropdown(container);
     const searchInput = await screen.findByPlaceholderText('Search or enter branch name...');
     await fireEvent.input(searchInput, { target: { value: 'feat' } });
@@ -949,7 +1008,11 @@ describe('BranchSelector (server-side prefix search, github.branches.list prefix
     // though it locally matches 'e' — only the loaded first page may match
     // until the new request settles.
     await fireEvent.input(searchInput, { target: { value: 'e' } });
-    await waitFor(() => expect(mockGithubBranches).toHaveBeenCalledWith('octo', 'intent', 'e'));
+    await waitFor(() =>
+      expect(mockGithubBranches).toHaveBeenCalledWith('octo', 'intent', 'e', {
+        repoUrl: 'https://github.com/octo/intent',
+      }),
+    );
     await waitFor(() => expect(screen.queryByText('feat-e-beyond')).toBeNull());
 
     slow.resolve({ branches: ['epic/beyond-page'], defaultBranch: undefined });
@@ -969,14 +1032,24 @@ describe('BranchSelector (server-side prefix search, github.branches.list prefix
     });
     const { container } = render(BranchSelector, { props: githubProps });
 
-    await waitFor(() => expect(mockGithubBranches).toHaveBeenCalledWith('octo', 'intent'));
+    await waitFor(() =>
+      expect(mockGithubBranches).toHaveBeenCalledWith('octo', 'intent', undefined, {
+        repoUrl: 'https://github.com/octo/intent',
+      }),
+    );
     await openDropdown(container);
     const searchInput = await screen.findByPlaceholderText('Search or enter branch name...');
     await fireEvent.input(searchInput, { target: { value: 'rel' } });
-    await waitFor(() => expect(mockGithubBranches).toHaveBeenCalledWith('octo', 'intent', 'rel'));
+    await waitFor(() =>
+      expect(mockGithubBranches).toHaveBeenCalledWith('octo', 'intent', 'rel', {
+        repoUrl: 'https://github.com/octo/intent',
+      }),
+    );
     await fireEvent.input(searchInput, { target: { value: 'release' } });
     await waitFor(() =>
-      expect(mockGithubBranches).toHaveBeenCalledWith('octo', 'intent', 'release'),
+      expect(mockGithubBranches).toHaveBeenCalledWith('octo', 'intent', 'release', {
+        repoUrl: 'https://github.com/octo/intent',
+      }),
     );
 
     // Newer request settles first…
@@ -1093,4 +1166,31 @@ describe('BranchSelector (uncommitted-changes indicator gated on skipIsolation, 
     );
     expect(screen.queryByText("Uncommitted changes won't be included.")).toBeNull();
   });
+});
+
+it('loads GitLab branches with the full nested namespace from the selected instance', async () => {
+  cleanup();
+  vi.clearAllMocks();
+  sourceControl.provider = 'gitlab';
+  sourceControl.instanceUrl = 'https://git.euraika.net';
+  mockGithubBranches.mockResolvedValue({ branches: ['trunk'], defaultBranch: 'trunk' });
+  mockGithubBranchesCached.mockResolvedValue({ branches: [], defaultBranch: null });
+  const onchange = vi.fn();
+  render(BranchSelector, {
+    props: {
+      repoPath: 'euraika/platform/camiel',
+      repoType: 'github',
+      githubUrl: 'https://git.euraika.net/euraika/platform/camiel',
+      onchange,
+    },
+  });
+  await waitFor(() =>
+    expect(mockGithubBranches).toHaveBeenCalledWith('euraika/platform', 'camiel', undefined, {
+      repoUrl: 'https://git.euraika.net/euraika/platform/camiel',
+    }),
+  );
+  await waitFor(() =>
+    expect(onchange).toHaveBeenCalledWith(expect.objectContaining({ detail: { branch: 'trunk' } })),
+  );
+  expect(mockGetBranches).not.toHaveBeenCalledWith('euraika/platform/camiel', expect.anything());
 });
