@@ -1,3 +1,5 @@
+import type { SourceControlRepositoryContext } from '$features/source-control/types';
+import { m } from '$shared/paraglide/messages.js';
 import { invoke } from '$lib/electron-bridge';
 import { GITHUB_AUTH_CHANNELS } from '../constants';
 import type {
@@ -105,19 +107,15 @@ export const githubAuthClient = {
   /**
    * List GitHub repositories for the authenticated user
    */
-  async listRepos(page?: number): Promise<GithubRepo[]> {
-    try {
-      const result = await invoke<{ success: boolean; data?: GithubRepo[]; error?: string }>(
-        GITHUB_AUTH_CHANNELS.LIST_REPOS,
-        { page },
-      );
-      if (result.success && result.data) {
-        return result.data;
-      }
-      return [];
-    } catch {
-      return [];
+  async listRepos(page?: number, context?: SourceControlRepositoryContext): Promise<GithubRepo[]> {
+    const result = await invoke<{ success: boolean; data?: GithubRepo[]; error?: string }>(
+      GITHUB_AUTH_CHANNELS.LIST_REPOS,
+      { page, ...context },
+    );
+    if (!result.success) {
+      throw new Error(result.error || m.sourceControl_repositories_loadFailed_error());
     }
+    return result.data ?? [];
   },
 
   /**
@@ -128,11 +126,12 @@ export const githubAuthClient = {
    */
   async searchRepos(
     query: string,
+    context?: SourceControlRepositoryContext,
   ): Promise<{ success: boolean; data?: GithubRepo[]; error?: string }> {
     try {
       return await invoke<{ success: boolean; data?: GithubRepo[]; error?: string }>(
         GITHUB_AUTH_CHANNELS.SEARCH_REPOS,
-        { query },
+        { query, ...context },
       );
     } catch (error) {
       return { success: false, error: error instanceof Error ? error.message : String(error) };

@@ -30,7 +30,9 @@ export function invalidateGitHubAuthStatus(): void {
 
 if (typeof onBackendNotification === 'function') {
   onBackendNotification((notification) => {
-    if (eventType(notification) === 'github:auth-changed') invalidateGitHubAuthStatus();
+    if (['github:auth-changed', 'settings:changed'].includes(eventType(notification) ?? '')) {
+      invalidateGitHubAuthStatus();
+    }
   });
 }
 if (typeof onBackendReconnected === 'function') {

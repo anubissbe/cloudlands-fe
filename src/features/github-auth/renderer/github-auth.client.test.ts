@@ -56,3 +56,29 @@ describe('githubAuthClient user search', () => {
     });
   });
 });
+
+describe('githubAuthClient repository listing', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it('keeps the selected server in the list request', async () => {
+    const repos = [{ owner: 'group/nested', name: 'project', default_branch: 'main' }];
+    mocks.invoke.mockResolvedValueOnce({ success: true, data: repos });
+    await expect(
+      githubAuthClient.listRepos(undefined, { connectionId: 'https://git.euraika.net' }),
+    ).resolves.toEqual(repos);
+    expect(mocks.invoke).toHaveBeenCalledWith(GITHUB_AUTH_CHANNELS.LIST_REPOS, {
+      page: undefined,
+      connectionId: 'https://git.euraika.net',
+    });
+  });
+
+  it('surfaces an unsuccessful RPC envelope instead of treating it as an empty account', async () => {
+    mocks.invoke.mockResolvedValueOnce({ success: false, error: 'Connection is not configured' });
+    await expect(githubAuthClient.listRepos()).rejects.toThrow('Connection is not configured');
+  });
+
+  it('preserves a transport failure for the retry UI', async () => {
+    mocks.invoke.mockRejectedValueOnce(new Error('Socket disconnected'));
+    await expect(githubAuthClient.listRepos()).rejects.toThrow('Socket disconnected');
+  });
+});

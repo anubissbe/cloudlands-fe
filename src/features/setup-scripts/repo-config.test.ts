@@ -137,7 +137,7 @@ describe('fetchGitHubRepoConfigSetupScript', () => {
 
     const script = await fetchGitHubRepoConfigSetupScript('octo', 'intent');
 
-    expect(githubRepoConfig).toHaveBeenCalledWith('octo', 'intent', undefined);
+    expect(githubRepoConfig).toHaveBeenCalledWith('octo', 'intent', undefined, undefined);
     expect(script).toBe('pnpm install');
   });
 
@@ -146,7 +146,7 @@ describe('fetchGitHubRepoConfigSetupScript', () => {
 
     await fetchGitHubRepoConfigSetupScript('octo', 'intent', 'release-1.x');
 
-    expect(githubRepoConfig).toHaveBeenCalledWith('octo', 'intent', 'release-1.x');
+    expect(githubRepoConfig).toHaveBeenCalledWith('octo', 'intent', 'release-1.x', undefined);
   });
 
   it('resolves null when the file is missing (config null)', async () => {

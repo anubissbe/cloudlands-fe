@@ -510,7 +510,7 @@ describe('integrations-bridge-seeder', () => {
       };
       mockedRequest.mockResolvedValueOnce({ repos: [wireRepo] });
       const listResponse = await mockInvoke(GITHUB_AUTH_CHANNELS.LIST_REPOS, { page: 1 });
-      expect(mockedRequest).toHaveBeenCalledWith('github.repos.list');
+      expect(mockedRequest).toHaveBeenCalledWith('github.repos.list', undefined);
       expect(listResponse).toEqual({
         success: true,
         data: [
@@ -1338,6 +1338,41 @@ describe('integrations-bridge-seeder', () => {
 
       mockedRequest.mockRejectedValueOnce(new Error('issue not found'));
       expect(await mockInvoke(SENTRY_AUTH_CHANNELS.GET_ISSUE, 'WEB-404')).toBeNull();
+    });
+  });
+  it('routes browsing and MR details through neutral methods with the explicit server identity', async () => {
+    mockedRequest.mockResolvedValueOnce({ repos: [] }).mockResolvedValueOnce({
+      pull: {
+        number: 12,
+        title: 'Review',
+        state: 'open',
+        htmlUrl: 'https://git.example/team/sub/project/-/merge_requests/12',
+        headRef: 'feature',
+        baseRef: 'main',
+      },
+    });
+    await mockInvoke(GITHUB_AUTH_CHANNELS.LIST_REPOS, { connectionId: 'https://git.example' });
+    const result = await mockInvoke(IPC_CHANNELS.GIT_TRACKING.GET_PULL_REQUEST, {
+      repoUrl: 'https://git.example/team/sub/project/-/merge_requests/12',
+      owner: 'team/sub',
+      repo: 'project',
+      number: 12,
+    });
+    expect(mockedRequest.mock.calls).toEqual([
+      ['sourceControl.repos.list', { connectionId: 'https://git.example' }],
+      [
+        'sourceControl.pulls.get',
+        {
+          repoUrl: 'https://git.example/team/sub/project/-/merge_requests/12',
+          owner: 'team/sub',
+          repo: 'project',
+          number: 12,
+        },
+      ],
+    ]);
+    expect(result).toMatchObject({
+      success: true,
+      data: { sourceBranch: 'feature', targetBranch: 'main' },
     });
   });
 });

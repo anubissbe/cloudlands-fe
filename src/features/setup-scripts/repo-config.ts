@@ -1,3 +1,4 @@
+import type { SourceControlRepositoryContext } from '$features/source-control/types';
 /**
  * Repo-committed setup script detection (`.intent/config.json`).
  *
@@ -133,11 +134,12 @@ export async function fetchGitHubRepoConfigSetupScript(
   owner: string,
   repo: string,
   ref?: string,
+  context?: SourceControlRepositoryContext,
 ): Promise<string | null> {
   if (!owner || !repo) return null;
   try {
     const { appClient } = await import('$lib/client');
-    const result = await appClient.integrations.githubRepoConfig(owner, repo, ref);
+    const result = await appClient.integrations.githubRepoConfig(owner, repo, ref, context);
     return toRepoConfigSubset(result.config).setupScript;
   } catch {
     return null;

@@ -318,10 +318,56 @@ describe('git-bridge-seeder', () => {
   });
 
   describe('git-tracking:get-remote-url → git -C <repoPath> config remote.origin.url', () => {
+    it('routes a configured self-hosted GitLab remote with nested namespaces', async () => {
+      mockedRequest
+        .mockResolvedValueOnce(
+          execResult({ stdout: 'git@git.euraika.net:team/subgroup/project.git\n' }),
+        )
+        .mockResolvedValueOnce({
+          connectionId: 'https://git.euraika.net',
+          provider: 'gitlab',
+          instanceUrl: 'https://git.euraika.net',
+          repo: {
+            owner: 'team/subgroup',
+            name: 'project',
+            htmlUrl: 'https://git.euraika.net/team/subgroup/project',
+          },
+        });
+      expect(
+        await mockInvoke(IPC_CHANNELS.GIT_TRACKING.GET_REMOTE_URL, { repoPath: '/src/project' }),
+      ).toEqual({
+        success: true,
+        data: {
+          remoteUrl: 'git@git.euraika.net:team/subgroup/project.git',
+          owner: 'team/subgroup',
+          repo: 'project',
+          repoUrl: 'https://git.euraika.net/team/subgroup/project',
+          connectionId: 'https://git.euraika.net',
+          provider: 'gitlab',
+        },
+      });
+      expect(mockedRequest.mock.calls).toEqual([
+        [
+          'host.exec',
+          {
+            command: 'git',
+            args: ['-C', '/src/project', 'config', '--get', 'remote.origin.url'],
+            timeoutMs: 60_000,
+          },
+        ],
+        ['sourceControl.resolve', { repoUrl: 'git@git.euraika.net:team/subgroup/project.git' }],
+      ]);
+    });
+
     it('parses a github ssh remote into owner/repo (path-based, no workspace cwd)', async () => {
-      mockedRequest.mockResolvedValueOnce(
-        execResult({ stdout: 'git@github.com:acme/widgets.git\n' }),
-      );
+      mockedRequest
+        .mockResolvedValueOnce(execResult({ stdout: 'git@github.com:acme/widgets.git\n' }))
+        .mockResolvedValueOnce({
+          connectionId: 'https://github.com',
+          provider: 'github',
+          instanceUrl: 'https://github.com',
+          repo: { owner: 'acme', name: 'widgets', htmlUrl: 'https://github.com/acme/widgets' },
+        });
 
       const result = await mockInvoke(IPC_CHANNELS.GIT_TRACKING.GET_REMOTE_URL, {
         repoPath: '/src/widgets',
@@ -334,7 +380,14 @@ describe('git-bridge-seeder', () => {
       });
       expect(result).toEqual({
         success: true,
-        data: { remoteUrl: 'git@github.com:acme/widgets.git', owner: 'acme', repo: 'widgets' },
+        data: {
+          remoteUrl: 'git@github.com:acme/widgets.git',
+          owner: 'acme',
+          repo: 'widgets',
+          repoUrl: 'https://github.com/acme/widgets',
+          connectionId: 'https://github.com',
+          provider: 'github',
+        },
       });
     });
 
@@ -345,10 +398,10 @@ describe('git-bridge-seeder', () => {
       ).toEqual({ success: true, data: { remoteUrl: '', owner: null, repo: null } });
     });
 
-    it('a non-github remote keeps the URL with null owner/repo', async () => {
-      mockedRequest.mockResolvedValueOnce(
-        execResult({ stdout: 'https://gitlab.com/acme/widgets.git\n' }),
-      );
+    it('an unregistered remote keeps the URL with null owner/repo', async () => {
+      mockedRequest
+        .mockResolvedValueOnce(execResult({ stdout: 'https://gitlab.com/acme/widgets.git\n' }))
+        .mockRejectedValueOnce(new Error('Unregistered server'));
       expect(
         await mockInvoke(IPC_CHANNELS.GIT_TRACKING.GET_REMOTE_URL, { repoPath: '/src/x' }),
       ).toEqual({

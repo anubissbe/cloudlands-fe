@@ -19,3 +19,9 @@ export const selectGitHubAuthDeviceFlow = store.createSelector(
 );
 
 export const selectGitHubAuthError = store.createSelector((state) => state.githubAuth.error);
+
+export {
+  selectSourceControlSettings,
+  selectSourceControlIsAuthenticated,
+  selectSourceControlRepositoryNamespace,
+} from '../source-control/source-control-selectors';

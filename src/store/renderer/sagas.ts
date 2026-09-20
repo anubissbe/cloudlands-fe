@@ -1,3 +1,4 @@
+import { sourceControlSaga } from './slices/source-control/sagas/source-control-saga';
 /**
  * Root app saga registry.
  *
@@ -195,6 +196,7 @@ export const sagas = [
   proposalLifecycleSaga,
   settingsProposalHistorySaga,
   specialistProposalHistorySaga,
+  sourceControlSaga,
   githubAuthSaga,
   githubRepoSearchSaga,
   githubUserSearchSaga,

@@ -182,7 +182,12 @@ describe('probeRepoConfigSetupScript', () => {
     probeRepoConfigSetupScript(options);
     await flush();
 
-    expect(fetches.github).toHaveBeenCalledWith('owner', 'repo', 'release-1.x');
+    expect(fetches.github).toHaveBeenCalledWith(
+      'owner',
+      'repo',
+      'release-1.x',
+      expect.objectContaining({ repoUrl: expect.any(String) }),
+    );
     expect(options.applyScript).toHaveBeenCalledWith('echo gh-config');
   });
 
@@ -192,7 +197,78 @@ describe('probeRepoConfigSetupScript', () => {
     probeRepoConfigSetupScript(options);
     await flush();
 
-    expect(fetches.github).toHaveBeenCalledWith('owner', 'repo', undefined);
+    expect(fetches.github).toHaveBeenCalledWith(
+      'owner',
+      'repo',
+      undefined,
+      expect.objectContaining({ repoUrl: expect.any(String) }),
+    );
+  });
+
+  it('probes the selected GitLab instance with the complete subgroup and branch', async () => {
+    fetches.github.mockResolvedValue('echo gitlab-config');
+    const options = makeOptions({
+      path: '/clones/repo',
+      type: 'github',
+      githubUrl: 'https://git.example/team/subgroup/repo',
+      sourceControl: { provider: 'gitlab', instanceUrl: 'https://git.example' },
+      branch: 'release/mobile',
+    });
+
+    await probeRepoConfigSetupScript(options);
+
+    expect(fetches.github).toHaveBeenCalledWith(
+      'team/subgroup',
+      'repo',
+      'release/mobile',
+      expect.objectContaining({ repoUrl: expect.any(String) }),
+    );
+    expect(options.applyScript).toHaveBeenCalledWith('echo gitlab-config');
+  });
+
+  it('does not fetch config from an unregistered server', async () => {
+    for (const githubUrl of ['https://other.example/team/repo']) {
+      await probeRepoConfigSetupScript(
+        makeOptions({
+          path: '/clones/repo',
+          type: 'github',
+          githubUrl,
+          sourceControl: { provider: 'gitlab', instanceUrl: 'https://git.example' },
+        }),
+      );
+    }
+
+    expect(fetches.github).not.toHaveBeenCalled();
+  });
+
+  it('discards a pending config after switching the active GitLab instance', async () => {
+    const pending = deferred<string | null>();
+    fetches.github.mockReturnValue(pending.promise);
+    const identity: RepoIdentity = {
+      path: '/clones/repo',
+      type: 'github',
+      githubUrl: 'team/repo',
+      sourceControl: { provider: 'gitlab', instanceUrl: 'https://git.example' },
+    };
+    const options = makeOptions(identity, {
+      getCurrentIdentity: () => ({
+        ...identity,
+        sourceControl: { provider: 'gitlab', instanceUrl: 'https://other.example' },
+      }),
+    });
+
+    const probe = probeRepoConfigSetupScript(options);
+    pending.resolve('echo old-server-config');
+    await probe;
+
+    expect(fetches.github).toHaveBeenCalledWith(
+      'team',
+      'repo',
+      undefined,
+      expect.objectContaining({ repoUrl: expect.any(String) }),
+    );
+    expect(options.onProbeResult).not.toHaveBeenCalled();
+    expect(options.applyScript).not.toHaveBeenCalled();
   });
 
   it('caches a null result without applying anything', async () => {
@@ -260,7 +336,12 @@ describe('probeRepoConfigSetupScript', () => {
     probe.resolve('echo main-config');
     await flush();
 
-    expect(fetches.github).toHaveBeenCalledWith('owner', 'x', 'main');
+    expect(fetches.github).toHaveBeenCalledWith(
+      'owner',
+      'x',
+      'main',
+      expect.objectContaining({ repoUrl: expect.any(String) }),
+    );
     expect(options.onProbeResult).not.toHaveBeenCalled();
     expect(options.applyScript).not.toHaveBeenCalled();
   });
@@ -375,7 +456,12 @@ describe('createRepoConfigProbeScheduler', () => {
       isInitialMount: true,
       preservedRestoredState: false,
     });
-    expect(fetches.github).toHaveBeenCalledWith('owner', 'repo', 'main');
+    expect(fetches.github).toHaveBeenCalledWith(
+      'owner',
+      'repo',
+      'main',
+      expect.objectContaining({ repoUrl: expect.any(String) }),
+    );
     await vi.runAllTimersAsync();
     expect(spies.applyScript).toHaveBeenCalledWith('echo gh-config');
   });
@@ -394,7 +480,12 @@ describe('createRepoConfigProbeScheduler', () => {
 
     await vi.advanceTimersByTimeAsync(DEBOUNCE);
     expect(fetches.github).toHaveBeenCalledTimes(1);
-    expect(fetches.github).toHaveBeenCalledWith('owner', 'repo', 'release-1.x');
+    expect(fetches.github).toHaveBeenCalledWith(
+      'owner',
+      'repo',
+      'release-1.x',
+      expect.objectContaining({ repoUrl: expect.any(String) }),
+    );
   });
 
   it('coalesces rapid branch changes into a single request for the final ref', async () => {
@@ -412,7 +503,12 @@ describe('createRepoConfigProbeScheduler', () => {
     await vi.advanceTimersByTimeAsync(DEBOUNCE);
 
     expect(fetches.github).toHaveBeenCalledTimes(1);
-    expect(fetches.github).toHaveBeenCalledWith('owner', 'repo', 'release-1.x');
+    expect(fetches.github).toHaveBeenCalledWith(
+      'owner',
+      'repo',
+      'release-1.x',
+      expect.objectContaining({ repoUrl: expect.any(String) }),
+    );
   });
 
   it('re-probes with the repo default (no ref) when the branch is cleared', async () => {
@@ -425,7 +521,12 @@ describe('createRepoConfigProbeScheduler', () => {
     select(ghIdentity(''));
     await vi.advanceTimersByTimeAsync(DEBOUNCE);
 
-    expect(fetches.github).toHaveBeenCalledWith('owner', 'repo', undefined);
+    expect(fetches.github).toHaveBeenCalledWith(
+      'owner',
+      'repo',
+      undefined,
+      expect.objectContaining({ repoUrl: expect.any(String) }),
+    );
   });
 
   it('is a no-op when nothing probe-relevant changed', async () => {
@@ -500,7 +601,12 @@ describe('createRepoConfigProbeScheduler', () => {
 
     // Only the new repo's immediate probe fires — never the superseded ref's.
     expect(fetches.github).toHaveBeenCalledTimes(1);
-    expect(fetches.github).toHaveBeenCalledWith('other', 'repo', 'release-1.x');
+    expect(fetches.github).toHaveBeenCalledWith(
+      'other',
+      'repo',
+      'release-1.x',
+      expect.objectContaining({ repoUrl: expect.any(String) }),
+    );
   });
 
   it('does not re-probe local repos on branch changes', async () => {
@@ -532,7 +638,9 @@ describe('createRepoConfigProbeScheduler', () => {
     await vi.runAllTimersAsync();
 
     // Re-probed with the new ref, cached, but restored state still wins.
-    expect(fetches.github).toHaveBeenLastCalledWith('owner', 'repo', 'release-1.x');
+    expect(fetches.github).toHaveBeenLastCalledWith('owner', 'repo', 'release-1.x', {
+      repoUrl: 'https://github.com/owner/repo',
+    });
     expect(spies.onProbeResult).toHaveBeenCalledWith('echo gh-config');
     expect(spies.applyScript).not.toHaveBeenCalled();
   });
