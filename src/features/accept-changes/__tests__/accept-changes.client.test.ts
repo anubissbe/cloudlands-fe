@@ -290,6 +290,22 @@ describe('AcceptChangesClient (accept-changes.* over backendRequest)', () => {
     expect(failed).toEqual({ success: false, steps: [], error: 'merge conflict' });
   });
 
+  it('mergePR forwards the exact reviewed head to reject a concurrently updated MR', async () => {
+    mocks.backendRequest.mockResolvedValue({ success: true, steps: [] });
+    await AcceptChangesClient.mergePR(WS, 42, {
+      mergeMethod: 'squash',
+      expectedHeadSha: 'reviewed-head',
+    });
+    expect(mocks.backendRequest).toHaveBeenCalledWith(
+      'accept-changes.mergePR',
+      expect.objectContaining({
+        workspaceId: WS,
+        prNumber: 42,
+        expectedHeadSha: 'reviewed-head',
+      }),
+    );
+  });
+
   it('addRemote sends accept-changes.addRemote and returns the refreshed status', async () => {
     mocks.backendRequest.mockResolvedValue(gitStatus);
     const status = await AcceptChangesClient.addRemote(WS, 'git@github.com:o/r.git');

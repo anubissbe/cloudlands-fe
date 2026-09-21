@@ -275,6 +275,7 @@
     try {
       const result = await AcceptChangesClient.mergePR(workspaceId as WorkspaceId, openPR.number, {
         mergeMethod: options?.mergeMethod || (mergeOptions.squash ? 'squash' : 'merge'),
+        expectedHeadSha: openPR.headSha ?? allCommits[0]?.hash,
       });
       if (result.success) {
         dispatchPostMergeUpdate({

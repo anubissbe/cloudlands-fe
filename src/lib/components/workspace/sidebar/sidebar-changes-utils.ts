@@ -346,6 +346,7 @@ export function mapWorkspacePRs(
           : undefined;
       return {
         number: pr.number,
+        headSha: pr.headSha,
         title: getDisplayTitle(pr),
         url,
         htmlUrl: url,
@@ -361,6 +362,7 @@ export function mapWorkspacePRs(
     return [
       {
         number: activePR.number,
+        headSha: activePR.headSha,
         title: getDisplayTitle(activePR),
         url: buildPrUrl(activePR.number, activePR.url),
         htmlUrl: buildPrUrl(activePR.number, activePR.url),
@@ -590,6 +592,7 @@ export function sectionPRs(
         workspaceRepoLower !== undefined && repo.toLowerCase() === workspaceRepoLower;
       rootRows.push({
         number: pr.number,
+        headSha: pr.headSha,
         title: getDisplayTitle(pr),
         url,
         htmlUrl: url,

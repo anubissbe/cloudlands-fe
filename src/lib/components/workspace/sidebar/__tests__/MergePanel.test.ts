@@ -293,6 +293,7 @@ describe('MergePanel', () => {
         {
           number: 7,
           title: 'Ready',
+          headSha: 'reviewed-mr-head',
           status: 'open',
           url: 'https://git.euraika.net/team/repo/-/merge_requests/7',
         },
@@ -303,7 +304,10 @@ describe('MergePanel', () => {
     expect(getByText(/MR !7 will be merged on GitLab into/)).toBeTruthy();
     await fireEvent.click(getByRole('button', { name: 'Merge MR', exact: true }));
     await waitFor(() => expect(notify.error).toHaveBeenCalledWith('Merge request is blocked'));
-    expect(mockMergePR).toHaveBeenCalledWith('ws-1', 7, { mergeMethod: 'merge' });
+    expect(mockMergePR).toHaveBeenCalledWith('ws-1', 7, {
+      mergeMethod: 'merge',
+      expectedHeadSha: 'reviewed-mr-head',
+    });
     expect(onMergeComplete).not.toHaveBeenCalled();
     expect(notify.success).not.toHaveBeenCalled();
   });
