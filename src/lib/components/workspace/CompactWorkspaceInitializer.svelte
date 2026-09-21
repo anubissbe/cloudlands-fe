@@ -1,4 +1,9 @@
 <script lang="ts">
+  import { parseRepositoryInput } from '$features/source-control/utils/repository';
+  import { selectSourceControlSettings } from '$store/renderer/slices/github-auth/github-auth-selectors';
+  import { parseSourceControlLink } from '$shared/utils/source-control-url';
+  import { selectSourceControlConnection } from '$store/renderer/slices/source-control/source-control-slice';
+  const sourceControl$ = selectSourceControlSettings();
   /* eslint-disable max-lines */
   import { untrack, onMount, onDestroy, type Snippet } from 'svelte';
   import {
@@ -43,6 +48,7 @@
     selectWorkspaceInitializerRecentRepos,
   } from '$store/renderer/slices/workspace-initializer/workspace-initializer-selectors';
   import type {
+    WorkspaceInitializerPendingGitHubPrefill,
     CompactWorkspaceInitializerFormState,
     WorkspaceInitializerRepoSelection,
   } from '$store/renderer/slices/workspace-initializer/workspace-initializer-types';
@@ -72,7 +78,6 @@
   import { createLogger } from '$lib/utils/client-logger';
   import {
     getGitErrorMessage,
-    parseGitHubUrl,
     validateBranchName,
     validateInitialPrompt,
     validateRepoPath,
@@ -1017,7 +1022,7 @@
   // flow when nothing matches, and 'keep' (no change) on errors so the
   // last-used repo stays selected (non-fatal).
   async function preselectGitHubPrefillRepo(
-    target: { owner: string; repo: string },
+    target: WorkspaceInitializerPendingGitHubPrefill,
     isStale?: () => boolean,
   ) {
     const candidates: GitHubPrefillRepoCandidate[] = [];
@@ -1034,22 +1039,28 @@
       });
     }
     const selection = await matchGitHubPrefillRepo({
-      owner: target.owner,
-      repo: target.repo,
+      ...target,
+      connections: $sourceControl$.connections,
       candidates,
       probeRemote: async (path) => {
         if (typeof window === 'undefined' || !window.electronAPI) return null;
         const response = await invoke<{
           success?: boolean;
-          data?: { owner?: string; repo?: string };
+          data?: { owner?: string; repo?: string; remoteUrl?: string; repoUrl?: string };
         }>('git-tracking:get-remote-url', { repoPath: path });
         return response?.success && response.data?.owner && response.data?.repo
-          ? { owner: response.data.owner, repo: response.data.repo }
+          ? {
+              owner: response.data.owner,
+              repo: response.data.repo,
+              remoteUrl: response.data.remoteUrl,
+              repoUrl: response.data.repoUrl,
+            }
           : null;
       },
     });
     if (isStale?.()) return;
     if (selection.kind === 'keep') return;
+    if (target.connectionId) appStore.dispatch(selectSourceControlConnection(target.connectionId));
     if (selection.kind === 'local') {
       // Already selected — leave the form (incl. branch) untouched
       if (repoType === 'local' && repoPath === selection.path) return;
@@ -1105,6 +1116,7 @@
   // Detected GitHub owner/repo from local git remote
   let detectedGitHubOwner = $state<string | null>(null);
   let detectedGitHubRepo = $state<string | null>(null);
+  let detectedRepositoryUrl = $state<string | null>(null);
 
   // Track last applied initial repo to avoid re-applying (string key avoids $state proxy mismatch)
   let lastAppliedInitialRepoKey = '__uninitialized__';
@@ -1349,6 +1361,7 @@
     // repo's detected owner/repo
     detectedGitHubOwner = null;
     detectedGitHubRepo = null;
+    detectedRepositoryUrl = null;
 
     // Only fetch for local repos with valid paths
     if (type !== 'local' || !path || (!path.startsWith('/') && !path.startsWith('~'))) {
@@ -1371,6 +1384,7 @@
         if (response?.success && response.data?.owner && response.data?.repo) {
           detectedGitHubOwner = response.data.owner;
           detectedGitHubRepo = response.data.repo;
+          detectedRepositoryUrl = response.data.repoUrl ?? response.data.remoteUrl ?? null;
           logger.debug('Detected GitHub from local repo', {
             path,
             owner: response.data.owner,
@@ -1411,6 +1425,7 @@
     const identity = {
       path,
       type,
+      sourceControl: $sourceControl$,
       githubUrl: type === 'github' ? githubUrl : null,
       branch: type === 'github' ? branch : null,
     };
@@ -1437,7 +1452,13 @@
           }
         }
       },
-      getCurrentIdentity: () => ({ path: repoPath, type: repoType, githubUrl, branch }),
+      getCurrentIdentity: () => ({
+        path: repoPath,
+        type: repoType,
+        githubUrl,
+        branch,
+        sourceControl: $sourceControl$,
+      }),
       getSetupScript: () => setupScript,
       isSetupScriptModalOpen: () => showSetupScript,
       isCustomSetupScript: () => isCustomSetupScript,
@@ -1473,7 +1494,7 @@
   const githubRepoInfo = $derived.by(() => {
     // First try the explicit GitHub URL
     if (githubUrl) {
-      return parseGitHubUrl(githubUrl);
+      return parseSourceControlLink(githubUrl, $sourceControl$.connections);
     }
     // Try detected owner/repo from local repo's remote URL
     if (detectedGitHubOwner && detectedGitHubRepo) {
@@ -1481,7 +1502,7 @@
     }
     // Then try the repoPath (might be owner/repo format from GitHub selection)
     if (repoPath) {
-      return parseGitHubUrl(repoPath);
+      return parseRepositoryInput(repoPath, $sourceControl$);
     }
     return null;
   });
@@ -1714,7 +1735,7 @@
       // picked repos have no local path at all, and with an explicit clone
       // path the destination won't exist until after cloning
       if (repoType === 'github' && githubUrl) {
-        const repoValidation = await validateRepoPath(githubUrl, false);
+        const repoValidation = await validateRepoPath(githubUrl, false, $sourceControl$);
         if (!repoValidation.valid) throw new Error(repoValidation.error);
         // Note: We don't validate the parent directory here because:
         // 1. The backend will create it if it doesn't exist (using mkdir with recursive: true)
@@ -2219,13 +2240,13 @@
       // Register a picked repo as a path-less GitHub recent so re-picking it
       // prefills the tab (keyed by the owner/repo shorthand, no local path).
       if (isGithubPick) {
-        const ghInfo = parseGitHubUrl(githubUrl);
+        const ghInfo = parseRepositoryInput(githubUrl, $sourceControl$);
         if (ghInfo) {
           void invoke(WORKSPACE_CHANNELS.ADD_RECENT_REPOSITORY, {
             repository: `${ghInfo.owner}/${ghInfo.repo}`,
             name: ghInfo.repo,
             owner: ghInfo.owner,
-            githubUrl: `https://github.com/${ghInfo.owner}/${ghInfo.repo}`,
+            githubUrl,
           }).catch((err) => {
             logger.warn('Failed to register picked repo as recent', { error: err });
           });
@@ -3089,6 +3110,7 @@
           onSelect={handleIssueSelect}
           repositoryOwner={githubRepoInfo?.owner}
           repositoryName={githubRepoInfo?.repo}
+          repositoryUrl={githubUrl || detectedRepositoryUrl || undefined}
         />
 
         <!-- Mic latch button: click starts dictation, click again (Esc

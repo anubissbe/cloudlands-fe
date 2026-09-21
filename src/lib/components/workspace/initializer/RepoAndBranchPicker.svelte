@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { selectSourceControlSettings } from '$store/renderer/slices/github-auth/github-auth-selectors';
+  const sourceControl$ = selectSourceControlSettings();
   import { Button } from '$lib/components/ui/button';
   import GitRepoIcon from '$lib/components/icons/GitRepoIcon.svelte';
   import ServerIcon from '$lib/components/icons/ServerIcon.svelte';
@@ -179,11 +181,23 @@
   }
 
   function formatGithubDisplayName(url: string): string {
-    const normalized = url.trim().replace(/^git@github\.com:/, 'https://github.com/');
+    const normalized = url.trim().replace(/^git@([^/:]+):/, 'ssh://git@$1/');
     try {
-      const parsed = new URL(normalized.startsWith('http') ? normalized : `https://${normalized}`);
-      if (parsed.hostname !== 'github.com') return formatRepoDisplayName(url);
-      return parsed.pathname.replace(/^\//, '').replace(/\.git$/, '') || formatRepoDisplayName(url);
+      const host =
+        $sourceControl$.provider === 'gitlab'
+          ? new URL($sourceControl$.instanceUrl).host
+          : 'github.com';
+      if (!normalized.includes('://') && !normalized.startsWith(`${host}/`))
+        return normalized.replace(/\.git$/, '');
+      const parsed = new URL(normalized.includes('://') ? normalized : `https://${normalized}`);
+      let path = parsed.pathname;
+      if ($sourceControl$.provider === 'gitlab' && parsed.protocol !== 'ssh:') {
+        const base = new URL($sourceControl$.instanceUrl);
+        const prefix = base.pathname.replace(/\/$/, '');
+        if (parsed.origin === base.origin && path.startsWith(`${prefix}/`))
+          path = path.slice(prefix.length);
+      }
+      return path.replace(/^\//, '').replace(/\.git$/, '') || formatRepoDisplayName(url);
     } catch {
       return formatRepoDisplayName(url.replace(/\.git$/, ''));
     }

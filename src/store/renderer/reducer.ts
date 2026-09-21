@@ -1,3 +1,4 @@
+import { sourceControlReducer } from './slices/source-control/source-control-slice';
 import { providerSettingsReducer } from './slices/provider-settings/provider-settings-slice';
 import { antigravitySetupReducer } from './slices/antigravity-setup/antigravity-setup-slice';
 import { providerCatalogReducer } from './slices/provider-catalog/provider-catalog-slice';
@@ -138,6 +139,7 @@ export const reducers = {
   releaseNotes: releaseNotesReducer,
   workspace: workspaceReducer,
   skills: skillsReducer,
+  sourceControl: sourceControlReducer,
   githubAuth: githubAuthReducer,
   githubRepos: githubReposReducer,
   githubRepoSearch: githubRepoSearchReducer,

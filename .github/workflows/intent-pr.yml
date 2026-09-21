@@ -132,6 +132,14 @@ jobs:
           # burst is the fail-open default; it just never uses tinybox).
           github-token: ${{ secrets.CI_QUEUE_READ_TOKEN || github.token }}
           script: |
+            // Intent's larger and self-hosted runners are org-scoped. A
+            // same-repo PR inside a fork must use public hosted labels.
+            if (context.repo.owner !== "intent-hq") {
+              core.setOutput("linux_labels", JSON.stringify(["ubuntu-latest"]));
+              core.setOutput("linux_burst", "true");
+              core.info("Fork CI: standard GitHub-hosted runners");
+              return;
+            }
             const tinybox = ["self-hosted", "Linux", "X64"];
             // All the routed heavy jobs burst to the 8-core / 32 GB runner:
             // build-web needs well over 8 GB of heap with sourcemaps on
@@ -596,7 +604,7 @@ jobs:
               -e "await import('./$MODULE'); process.exit(0);" \
               2>&1) || EXIT_CODE=$?
 
-            if [ "$EXIT_CODE" -ne 0 ] && echo "$OUTPUT" | grep -q "Cannot find package 'svelte'"; then
+            if [ "$EXIT_CODE" -ne 0 ] && grep -q "Cannot find package 'svelte'" <<<"$OUTPUT"; then
               echo "FAIL: $MODULE"
               echo "$OUTPUT" | head -3
               FAILED=1
@@ -635,7 +643,9 @@ jobs:
       # box runs more build work in parallel), so the cap is 16384 — within
       # tinybox's RAM and the burst runner's 32 GB (gh-linux-8x; never burst
       # this job to anything smaller).
-      NODE_OPTIONS: '--max-old-space-size=16384'
+      # Public fork runners have 16 GB RAM; reserve room for the OS and
+      # native allocations while retaining production sourcemaps.
+      NODE_OPTIONS: ${{ github.repository_owner == 'intent-hq' && '--max-old-space-size=16384' || '--max-old-space-size=12288' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v7

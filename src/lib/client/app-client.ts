@@ -1,3 +1,4 @@
+import type { SourceControlRepositoryContext } from '$features/source-control/types';
 /**
  * AppClient — the single boundary the renderer uses to reach "the backend".
  *
@@ -2204,12 +2205,22 @@ export interface IntegrationsClient {
    * daemon reports no such PR, so the link hover card renders an explicit
    * URL-only fallback — never a fabricated card.
    */
-  githubPullRequest(owner: string, repo: string, number: number): Promise<GitHubPullRequestDetails>;
+  githubPullRequest(
+    owner: string,
+    repo: string,
+    number: number,
+    context?: SourceControlRepositoryContext,
+  ): Promise<GitHubPullRequestDetails>;
   /**
    * One issue by number (`github.issues.get`, §5.27). Same THROWS contract as
    * `githubPullRequest`.
    */
-  githubIssue(owner: string, repo: string, number: number): Promise<GitHubIssueDetails>;
+  githubIssue(
+    owner: string,
+    repo: string,
+    number: number,
+    context?: SourceControlRepositoryContext,
+  ): Promise<GitHubIssueDetails>;
   /**
    * Remote branch names for a GitHub repo (`github.branches.list`, §5.27),
    * with the default branch from `github.repos.get` (best-effort). Unlike the
@@ -2219,7 +2230,12 @@ export interface IntegrationsClient {
    * `prefix` narrows the listing server-side (GitHub's `refs/heads/{prefix}`
    * matching-refs semantics) so branches beyond the first page are findable.
    */
-  githubBranches(owner: string, repo: string, prefix?: string): Promise<GitHubBranchListing>;
+  githubBranches(
+    owner: string,
+    repo: string,
+    prefix?: string,
+    context?: SourceControlRepositoryContext,
+  ): Promise<GitHubBranchListing>;
   /**
    * Branch names from the daemon's local repo cache — or its `git ls-remote`
    * fallback on a cache miss (`github.branches.listCached`, §5.27) — purely
@@ -2227,7 +2243,11 @@ export interface IntegrationsClient {
    * to a cold-cache miss (`{ cached: false, branches: [] }`) so
    * `githubBranches` stays the only error authority.
    */
-  githubBranchesCached(owner: string, repo: string): Promise<GitHubCachedBranchListing>;
+  githubBranchesCached(
+    owner: string,
+    repo: string,
+    context?: SourceControlRepositoryContext,
+  ): Promise<GitHubCachedBranchListing>;
   /**
    * The repo's committed `.intent/config.json` (`github.repoConfig.get`,
    * §5.27) for a GitHub repo without a local checkout. `ref` defaults to
@@ -2235,7 +2255,12 @@ export interface IntegrationsClient {
    * transport/daemon errors (e.g. unauthenticated private repo); the
    * setup-script probe folds failures to "no script" at the call site.
    */
-  githubRepoConfig(owner: string, repo: string, ref?: string): Promise<GitHubRepoConfigResult>;
+  githubRepoConfig(
+    owner: string,
+    repo: string,
+    ref?: string,
+    context?: SourceControlRepositoryContext,
+  ): Promise<GitHubRepoConfigResult>;
   linearIssues(): Promise<LinearIssueResult[]>;
   sentryIssues(): Promise<SentryIssueResult[]>;
   subscribe(handler: SubscriptionHandler<{ githubUser: GitHubUser | null }>): Unsubscribe;

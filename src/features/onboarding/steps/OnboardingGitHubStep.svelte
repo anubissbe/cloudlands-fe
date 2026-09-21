@@ -1,12 +1,9 @@
 <script lang="ts">
   /**
-   * Onboarding step: connect GitHub via the daemon-owned device flow
-   * (PROTOCOL §5.27). Reuses the shared GitHubDeviceCodeCard and the
-   * github-auth slice — this is the same flow Settings drives, framed for
-   * first-run onboarding. The step is optional: "Skip for now" advances
-   * without connecting, and Settings remains the later entry point.
+   * Choose a source control provider and connect it during onboarding.
+   * GitHub uses the daemon device flow; GitLab reuses the connection form
+   * from Settings. Each connection keeps its own authentication state. Connection is optional.
    */
-  import { faGithub } from '@fortawesome/free-brands-svg-icons';
   import { faCheck } from '@fortawesome/free-solid-svg-icons';
   import { onMount } from 'svelte';
   import Fa from 'svelte-fa';
@@ -18,13 +15,22 @@
     checkGitHubAuthStatus,
   } from '$store/renderer/slices/github-auth/github-auth-slice';
   import {
-    selectGitHubAuthIsAuthenticated,
+    selectSourceControlIsAuthenticated,
+    selectSourceControlSettings,
     selectGitHubAuthIsAuthenticating,
     selectGitHubAuthDeviceFlow,
-    selectGitHubAuthUser,
     selectGitHubAuthError,
     selectGitHubAuthRequiresDaemonAuth,
   } from '$store/renderer/slices/github-auth/github-auth-selectors';
+  import SourceControlSettings from '$lib/components/settings/SourceControlSettings.svelte';
+  import SourceControlIcon from '$features/source-control/SourceControlIcon.svelte';
+  import {
+    selectSourceControlConnections,
+    selectSourceControlBusy,
+    selectSourceControlUser,
+  } from '$store/renderer/slices/source-control/source-control-selectors';
+  import { selectSourceControlConnection } from '$store/renderer/slices/source-control/source-control-slice';
+  import type { SourceControlProvider } from '$features/source-control/types';
   import GitHubDeviceCodeCard from '$lib/components/GitHubDeviceCodeCard.svelte';
   import { m } from '$shared/paraglide/messages.js';
   import { Button } from '$lib/components/ui/button';
@@ -35,14 +41,43 @@
     onContinue: () => void;
     /** Advance without connecting — GitHub stays optional. */
     onSkip: () => void;
+    onAdvanceAllowedChange?: (allowed: boolean) => void;
   }
 
-  let { onContinue, onSkip }: Props = $props();
+  let { onContinue, onSkip, onAdvanceAllowedChange }: Props = $props();
 
-  const isAuthenticated$ = selectGitHubAuthIsAuthenticated();
+  const authenticated$ = selectSourceControlIsAuthenticated();
+  const connections$ = selectSourceControlConnections();
+  const registryBusy$ = selectSourceControlBusy();
+  const settings$ = selectSourceControlSettings();
   const isAuthenticating$ = selectGitHubAuthIsAuthenticating();
+  let providerDraft = $state<SourceControlProvider>();
+  let gitlabConnectionReady = $state(false);
+  const provider = $derived(providerDraft ?? $settings$.provider);
+  const isAuthenticated = $derived(
+    $authenticated$ &&
+      provider === $settings$.provider &&
+      (provider !== 'gitlab' || gitlabConnectionReady),
+  );
+
+  const canAdvance = $derived(
+    (provider === 'github' || !$registryBusy$) &&
+      (!($authenticated$ && provider === $settings$.provider) || isAuthenticated),
+  );
+  $effect(() => onAdvanceAllowedChange?.(canAdvance));
+
+  function chooseProvider(next: SourceControlProvider) {
+    if (next === provider) return;
+    if ($isAuthenticating$ && $deviceFlow$) appStore.dispatch(cancelGitHubAuth());
+    providerDraft = next;
+    gitlabConnectionReady = false;
+    const target =
+      $connections$.find((item) => item.provider === next && item.isConfigured) ??
+      $connections$.find((item) => item.provider === next);
+    if (target) appStore.dispatch(selectSourceControlConnection(target.id));
+  }
   const deviceFlow$ = selectGitHubAuthDeviceFlow();
-  const user$ = selectGitHubAuthUser();
+  const user$ = selectSourceControlUser();
   const error$ = selectGitHubAuthError();
   const requiresDaemonAuth$ = selectGitHubAuthRequiresDaemonAuth();
 
@@ -88,68 +123,112 @@
 </script>
 
 <div class="space-y-6">
-  {#if $isAuthenticated$}
-    <div class="flex items-center gap-3 text-base" data-testid="github-step-connected">
-      <Fa icon={faGithub} class="text-foreground" />
-      <span class="flex items-center gap-2">
-        <Fa icon={faCheck} class="text-green-500" />
-        {#if $user$}
-          {m.onboarding_githubStep_connectedAs_label({ username: `@${$user$.login}` })}
-        {:else}
-          {m.onboarding_githubStep_connected_label()}
-        {/if}
-      </span>
-    </div>
-  {:else if $isAuthenticating$ && $deviceFlow$}
-    <div class="max-w-sm space-y-3" data-testid="github-step-device-flow">
-      <GitHubDeviceCodeCard
-        userCode={$deviceFlow$.userCode}
-        verificationUri={$deviceFlow$.verificationUri}
-      />
+  <div class="flex gap-2" role="group" aria-label={m.settings_sourceControl_provider_label()}>
+    {#each ['github', 'gitlab'] as option}
+      {@const choice = option as SourceControlProvider}
+      <Button
+        variant={provider === choice ? 'secondary' : 'outline'}
+        aria-pressed={provider === choice}
+        onclick={() => chooseProvider(choice)}
+        disabled={$registryBusy$ ||
+          ($isAuthenticating$ && !$deviceFlow$) ||
+          (choice === 'gitlab' && !$settings$.gitlabSupported)}
+      >
+        <SourceControlIcon provider={choice} />
+        <!-- i18n-ignore (brand names) -->
+        {choice === 'github' ? 'GitHub' : 'GitLab'}
+      </Button>
+    {/each}
+  </div>
+  {#if provider === 'gitlab'}
+    <SourceControlSettings
+      initialProvider="gitlab"
+      showProviderPicker={false}
+      embedded
+      onConnectionReadyChange={(ready) => (gitlabConnectionReady = ready)}
+    />
+  {:else}
+    {#if isAuthenticated}
+      <div class="flex items-center gap-3 text-base" data-testid="github-step-connected">
+        <SourceControlIcon {provider} class="text-foreground" />
+        <span class="flex items-center gap-2">
+          <Fa icon={faCheck} class="text-green-500" />
+          {#if $user$}
+            {m.onboarding_githubStep_connectedAs_label({ username: `@${$user$.login}` })}
+          {:else}
+            {m.onboarding_githubStep_connected_label()}
+          {/if}
+        </span>
+      </div>
+    {:else if $isAuthenticating$ && $deviceFlow$}
+      <div class="max-w-sm space-y-3" data-testid="github-step-device-flow">
+        <GitHubDeviceCodeCard
+          userCode={$deviceFlow$.userCode}
+          verificationUri={$deviceFlow$.verificationUri}
+        />
+        <div class="flex items-center gap-2 text-subtle text-sm">
+          <IntentMarkLoader size={16} class="shrink-0" />
+          <span>{m.onboarding_githubStep_waitingForAuthorization_label()}</span>
+          <Button
+            variant="ghost"
+            type="button"
+            class="text-muted-foreground hover:text-foreground cursor-pointer transition-colors ml-2"
+            onclick={handleCancel}
+          >
+            {m.onboarding_githubStep_cancel_label()}
+          </Button>
+        </div>
+      </div>
+    {:else if $isAuthenticating$}
       <div class="flex items-center gap-2 text-subtle text-sm">
         <IntentMarkLoader size={16} class="shrink-0" />
-        <span>{m.onboarding_githubStep_waitingForAuthorization_label()}</span>
-        <Button
-          variant="ghost"
-          type="button"
-          class="text-muted-foreground hover:text-foreground cursor-pointer transition-colors ml-2"
-          onclick={handleCancel}
-        >
-          {m.onboarding_githubStep_cancel_label()}
-        </Button>
+        <span>{m.onboarding_githubStep_startingAuthentication_label()}</span>
       </div>
-    </div>
-  {:else if $isAuthenticating$}
-    <div class="flex items-center gap-2 text-subtle text-sm">
-      <IntentMarkLoader size={16} class="shrink-0" />
-      <span>{m.onboarding_githubStep_startingAuthentication_label()}</span>
-    </div>
-  {:else if $requiresDaemonAuth$}
-    <p class="text-sm text-subtle">{m.onboarding_githubStep_requiresDaemonAuth_label()}</p>
-  {:else}
-    <Button class="group/button" size="xl" variant="primary" onclick={handleConnect}>
-      <Fa icon={faGithub} />
-      {m.onboarding_githubStep_connectGithub_label()}
-    </Button>
-  {/if}
+    {:else if $requiresDaemonAuth$}
+      <p class="text-sm text-subtle">{m.onboarding_githubStep_requiresDaemonAuth_label()}</p>
+    {:else}
+      <Button
+        class="group/button"
+        size="xl"
+        variant="primary"
+        onclick={handleConnect}
+        disabled={$settings$.provider !== 'github'}
+      >
+        <SourceControlIcon {provider} />
+        {m.onboarding_githubStep_connectGithub_label()}
+      </Button>
+    {/if}
 
-  {#if $error$}
-    <p class="text-sm text-danger">{$error$}</p>
+    {#if $error$}
+      <p class="text-sm text-danger">{$error$}</p>
+    {/if}
   {/if}
 
   <div class="flex flex-col items-start gap-2 mt-9">
-    {#if $isAuthenticated$}
-      <Button class="group/button" size="xl" variant="primary" onclick={onContinue}>
+    {#if $authenticated$ && provider === $settings$.provider}
+      <Button
+        class="group/button"
+        size="xl"
+        variant="primary"
+        onclick={onContinue}
+        disabled={!isAuthenticated}
+      >
         {m.onboarding_githubStep_continue_label()}
         <span class="ml-1 opacity-50">⌘↵</span>
       </Button>
     {:else}
-      <Button class="group/button" size="xl" variant="outline" onclick={handleSkip}>
+      <Button
+        class="group/button"
+        size="xl"
+        variant="outline"
+        onclick={handleSkip}
+        disabled={!canAdvance}
+      >
         {m.onboarding_githubStep_skipForNow_label()}
         <span class="ml-1 opacity-50">⌘↵</span>
       </Button>
       <p class="text-xs text-muted-foreground">
-        {m.onboarding_githubStep_connectLater_description()}
+        {m.onboarding_sourceControl_connectLater_description()}
       </p>
     {/if}
   </div>

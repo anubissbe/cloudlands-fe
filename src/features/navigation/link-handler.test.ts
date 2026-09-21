@@ -1,10 +1,18 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import type { ForgeConnectionIdentity } from '$shared/utils/source-control-url';
 import { handleLink, createGlobalLinkClickHandler, createLinkClickHandler } from './link-handler';
 import { openWorkspaceFile } from '$store/renderer/slices/workspace-navigation/workspace-navigation-slice';
 import type { WorkspaceId } from '$shared/types/branded-ids';
 import type { Workspace } from '$shared/types';
 import { setShowCreateModal } from '$store/renderer/slices/sidebar-nav/sidebar-nav-slice';
 import { setWorkspaceInitializerPendingGitHubPrefill } from '$store/renderer/slices/workspace-initializer/workspace-initializer-slice';
+
+const forgeConnections = vi.hoisted(() => ({
+  value: [] as ForgeConnectionIdentity[],
+}));
+vi.mock('$store/renderer/slices/source-control/source-control-selectors', () => ({
+  selectSourceControlConnections: { select: () => forgeConnections.value },
+}));
 
 const TEST_WORKSPACE_ID = 'ws-1' as WorkspaceId;
 const TEST_WORKTREE_ROOT = '/repo/root';
@@ -922,5 +930,44 @@ describe('handleLink – flipped http(s) routing and link action menu', () => {
     expect(result).toBe(true);
     expect(showLinkActionMenuMock).not.toHaveBeenCalled();
     expect(invokeIpcMock).toHaveBeenCalledWith('shell:openExternal', { url });
+  });
+});
+
+describe('registered GitLab link routing', () => {
+  afterEach(() => {
+    forgeConnections.value = [];
+  });
+  it('starts a workspace from a nested self-hosted MR without losing the server', async () => {
+    forgeConnections.value = [{ provider: 'gitlab', instanceUrl: 'https://git.euraika.net' }];
+    reduxDispatchMock.mockClear();
+    const url = 'https://git.euraika.net/team/platform/camiel/-/merge_requests/17';
+    expect(
+      await handleLink(url, {
+        event: new MouseEvent('click'),
+        githubLinkDefaultAction: 'start-workspace',
+      }),
+    ).toBe(true);
+    expect(reduxDispatchMock).toHaveBeenCalledWith(
+      setWorkspaceInitializerPendingGitHubPrefill({
+        provider: 'gitlab',
+        connectionId: 'https://git.euraika.net',
+        instanceUrl: 'https://git.euraika.net',
+        projectUrl: 'https://git.euraika.net/team/platform/camiel',
+        owner: 'team/platform',
+        repo: 'camiel',
+        kind: 'pr',
+        number: 17,
+        url,
+      }),
+    );
+    expect(reduxDispatchMock).toHaveBeenCalledWith(setShowCreateModal(true));
+  });
+  it('does not reinterpret MR-looking links on an unregistered host', async () => {
+    reduxDispatchMock.mockClear();
+    await handleLink('https://other.example/team/camiel/-/merge_requests/17', {
+      event: new MouseEvent('click'),
+      githubLinkDefaultAction: 'start-workspace',
+    });
+    expect(reduxDispatchMock).not.toHaveBeenCalledWith(setShowCreateModal(true));
   });
 });

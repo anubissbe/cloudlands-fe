@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { selectSourceControlConnection } from '$store/renderer/slices/source-control/source-control-slice';
+  import SourceControlConnectionPicker from '$features/source-control/SourceControlConnectionPicker.svelte';
   /**
    * GitHubRepoTab — GitHub repository picker for onboarding.
    *
@@ -26,11 +28,24 @@
   import { Button } from '$lib/components/ui/button';
   import { menuItem } from '$lib/components/ui/menu';
   import { IntentMarkLoader } from '$lib/components/ui/indicators';
-  import GitHubAuthBanner from '$lib/components/GitHubAuthBanner.svelte';
+  import SourceControlAuthBanner from '$features/source-control/SourceControlAuthBanner.svelte';
+  import SourceControlIcon from '$features/source-control/SourceControlIcon.svelte';
+  import { sourceControlInstanceLabel } from '$features/source-control/utils/presentation';
+  import {
+    normalizeRepositoryInput,
+    repositoryInputUrl,
+    repositoryUrl,
+    parseRepositoryInput,
+    repositoryInputReference,
+    repositoryBaseUrl,
+  } from '$features/source-control/utils/repository';
   import GitHubAvatar from '$lib/components/ui/GitHubAvatar.svelte';
 
   import { initializeGitHubAuth } from '$store/renderer/slices/github-auth/github-auth-slice';
-  import { selectGitHubAuthIsAuthenticated } from '$store/renderer/slices/github-auth/github-auth-selectors';
+  import {
+    selectSourceControlIsAuthenticated,
+    selectSourceControlSettings,
+  } from '$store/renderer/slices/github-auth/github-auth-selectors';
   import {
     loadGithubRepos,
     type GithubRepoItem,
@@ -47,7 +62,6 @@
     selectGithubRepoSearchLoading,
     selectGithubRepoSearchResults,
   } from '$store/renderer/slices/github-repo-search/github-repo-search-selectors';
-  import { faGithub } from '@fortawesome/free-brands-svg-icons';
   import { faArrowRotateRight, faArrowUpRightFromSquare } from '@fortawesome/free-solid-svg-icons';
   import Fa from 'svelte-fa';
   import { store as appStore } from '$store/renderer/store';
@@ -65,7 +79,11 @@
   // onboarding flow (see `+page.svelte`). This tab only collects data.
   let { githubUrl, onGithubUrlChange, onSelectAndAdvance }: Props = $props();
 
-  const isAuthenticated$ = selectGitHubAuthIsAuthenticated();
+  const isAuthenticated$ = selectSourceControlIsAuthenticated();
+  const sourceControl$ = selectSourceControlSettings();
+  const provider = $derived($sourceControl$.provider);
+  const providerName = $derived(provider === 'gitlab' ? 'GitLab' : 'GitHub');
+  const instanceLabel = $derived(sourceControlInstanceLabel(repositoryBaseUrl($sourceControl$)));
   const repos$ = selectGithubRepos();
   const reposLoading$ = selectGithubReposLoading();
   const reposError$ = selectGithubReposError();
@@ -75,7 +93,7 @@
   const searchLastQuery$ = selectGithubRepoSearchLastQuery();
 
   // svelte-ignore state_referenced_locally - intentional: seed the editable input from the prop at mount (component re-mounts per tab switch)
-  let githubInput = $state(githubUrl.replace(/^https?:\/\/github\.com\//, ''));
+  let githubInput = $state(normalizeRepositoryInput(githubUrl, $sourceControl$));
 
   /**
    * Auto-focus the GitHub URL input when this tab becomes active. The parent
@@ -92,7 +110,9 @@
    * state that does not belong in Redux.
    */
   const filteredRepos = $derived.by<GithubRepoItem[]>(() => {
-    const all = $repos$;
+    const all = $repos$.filter(
+      (repo) => !!parseRepositoryInput(repositoryUrl(repo, $sourceControl$), $sourceControl$),
+    );
     if (!all.length) return [];
     const q = githubInput.trim().toLowerCase();
     if (!q) return all;
@@ -110,7 +130,11 @@
     const results = $searchResults$;
     if (!results.length) return [];
     const ownedIds = new Set($repos$.map((r) => r.id));
-    return results.filter((r) => !ownedIds.has(r.id));
+    return results.filter(
+      (r) =>
+        !ownedIds.has(r.id) &&
+        !!parseRepositoryInput(repositoryUrl(r, $sourceControl$), $sourceControl$),
+    );
   });
 
   /**
@@ -158,10 +182,13 @@
       const repo = combinedRepos[focusedIndex];
       if (repo) {
         e.preventDefault();
-        handleSelectRepo(repo);
-        if (onSelectAndAdvance) {
-          onSelectAndAdvance(`https://github.com/${repo.owner}/${repo.name}`);
-        }
+        const typed = parseRepositoryInput(githubUrl, $sourceControl$);
+        const url =
+          typed?.owner === repo.owner && typed.repo === repo.name
+            ? githubUrl
+            : repositoryUrl(repo, $sourceControl$);
+        onGithubUrlChange(url);
+        onSelectAndAdvance?.(url);
       }
     }
   }
@@ -182,17 +209,12 @@
   });
 
   function handleInputChange(value: string) {
-    // Strip full URL prefix if user pastes a full URL
-    let cleaned = value.replace(/^https?:\/\/github\.com\//, '');
-    // Remove trailing .git
-    cleaned = cleaned.replace(/\.git$/, '');
+    const identity = repositoryInputReference(value, $sourceControl$);
+    if (identity && identity.connectionId !== $sourceControl$.connectionId)
+      appStore.dispatch(selectSourceControlConnection(identity.connectionId));
+    const cleaned = normalizeRepositoryInput(value, $sourceControl$);
     githubInput = cleaned;
-
-    if (cleaned) {
-      onGithubUrlChange(`https://github.com/${cleaned}`);
-    } else {
-      onGithubUrlChange('');
-    }
+    onGithubUrlChange(repositoryInputUrl(value, $sourceControl$));
 
     // Global GitHub search — the search side effect debounces at 300ms, so we
     // can dispatch freely on every keystroke. Short queries are short-circuited
@@ -203,28 +225,17 @@
 
   function handlePaste(e: ClipboardEvent) {
     const pasted = e.clipboardData?.getData('text') || '';
-    if (pasted.includes('github.com/')) {
+    const parsed = parseRepositoryInput(pasted, $sourceControl$);
+    if (parsed) {
       e.preventDefault();
       handleInputChange(pasted);
-
-      // Auto-select if the pasted URL resolves to a known repo
-      const cleaned = pasted
-        .replace(/^https?:\/\/github\.com\//, '')
-        .replace(/\.git$/, '')
-        .replace(/\/$/, '');
-      const parts = cleaned.split('/');
-      if (parts.length >= 2 && parts[0] && parts[1]) {
-        const owner = parts[0].toLowerCase();
-        const name = parts[1].split(/[?#]/)[0].toLowerCase();
-        const match = $repos$.find(
-          (r) => r.owner.toLowerCase() === owner && r.name.toLowerCase() === name,
-        );
-        if (match) {
-          handleSelectRepo(match);
-          if (onSelectAndAdvance) {
-            onSelectAndAdvance(`https://github.com/${match.owner}/${match.name}`);
-          }
-        }
+      const match = $repos$.find(
+        (r) =>
+          r.owner.toLowerCase() === parsed.owner.toLowerCase() &&
+          r.name.toLowerCase() === parsed.repo.toLowerCase(),
+      );
+      if (match) {
+        onSelectAndAdvance?.(repositoryInputUrl(pasted, $sourceControl$));
       }
     }
   }
@@ -233,7 +244,7 @@
    *  selection without changing the search input so the user can keep
    *  browsing. */
   function handleSelectRepo(repo: GithubRepoItem) {
-    onGithubUrlChange(`https://github.com/${repo.owner}/${repo.name}`);
+    onGithubUrlChange(repositoryUrl(repo, $sourceControl$));
   }
 
   /** User-initiated refresh (also drives the error "Try again" action). The
@@ -266,9 +277,10 @@
 </script>
 
 <div class="space-y-3">
+  <SourceControlConnectionPicker />
   <div class="w-full flex space-between items-center">
     <p class="text-base text-muted-foreground pb-3 flex-1">
-      {m.onboarding_githubRepoTab_clone_description()}
+      {m.onboarding_sourceControl_clone_description({ provider: providerName })}
     </p>
   </div>
   <!-- GitHub URL input — the only control; the daemon owns the checkout location. -->
@@ -276,9 +288,10 @@
     <div
       class="flex-1 flex items-center rounded-lg py-1 border border-border bg-card/50 overflow-hidden focus-within:border-ring"
     >
-      <Fa icon={faGithub} class="ml-3 text-muted-foreground" />
+      <SourceControlIcon {provider} class="ml-3 text-muted-foreground" />
       <!-- i18n-ignore (domain name prefix) -->
-      <span class="text-sm pl-1.5 shrink-0 select-none text-muted-foreground">github.com/</span>
+      <span class="text-sm pl-1.5 shrink-0 select-none text-muted-foreground">{instanceLabel}/</span
+      >
       <Input
         bind:ref={githubInputRef}
         type="text"
@@ -307,7 +320,9 @@
     list an accessible combobox popup driven from the URL input above.
   -->
   {#if !$isAuthenticated$}
-    <GitHubAuthBanner message={m.onboarding_githubRepoTab_signIn_description()} />
+    <SourceControlAuthBanner
+      message={m.onboarding_sourceControl_signIn_description({ provider: providerName })}
+    />
   {:else if $reposError$}
     <div
       class="rounded-lg border border-danger/30 bg-danger-background/5 px-3 py-2.5 text-xs text-danger space-y-2"
@@ -328,14 +343,14 @@
       bind:this={listContainerRef}
       id="github-repo-list"
       role="listbox"
-      aria-label={m.onboarding_githubRepoTab_repoList_ariaLabel()}
+      aria-label={m.onboarding_sourceControl_repoList_ariaLabel({ provider: providerName })}
       class="max-h-70 overflow-y-auto -mx-1 px-1"
     >
       {#if combinedRepos.length > 0}
         <div class="divide-y divide-border">
           {#each combinedRepos as repo, index (repo.id)}
             {@const isFocused = index === focusedIndex}
-            {@const isCommitted = githubUrl === `https://github.com/${repo.owner}/${repo.name}`}
+            {@const isCommitted = githubUrl === repositoryUrl(repo, $sourceControl$)}
             <Button
               variant="ghost"
               type="button"
@@ -355,12 +370,16 @@
               }}
               onmousemove={() => (focusedIndex = index)}
             >
-              <GitHubAvatar
-                identity={repo.owner}
-                alt={repo.owner}
-                size={24}
-                class="w-6 h-6 rounded-full shrink-0"
-              />
+              {#if provider === 'github'}
+                <GitHubAvatar
+                  identity={repo.owner}
+                  alt={repo.owner}
+                  size={24}
+                  class="w-6 h-6 rounded-full shrink-0"
+                />
+              {:else}
+                <SourceControlIcon {provider} size={24} class="shrink-0" />
+              {/if}
               <div class="flex-1 min-w-0">
                 <div
                   class={cn(
@@ -381,16 +400,17 @@
                 class="p-1 rounded shrink-0 transition-colors cursor-pointer {isCommitted
                   ? 'text-background/0 group-hover/row:text-background/60 hover:!text-background /* a11y-ignore */'
                   : 'text-muted-foreground/0 group-hover/row:text-muted-foreground hover:!text-foreground hover:bg-muted/40 /* a11y-ignore */'}"
-                onclick={(e) => openInBrowser(`https://github.com/${repo.owner}/${repo.name}`, e)}
+                onclick={(e) => openInBrowser(repositoryUrl(repo, $sourceControl$), e)}
                 onkeydown={(e) => {
-                  if (e.key === 'Enter')
-                    openInBrowser(`https://github.com/${repo.owner}/${repo.name}`, e);
+                  if (e.key === 'Enter') openInBrowser(repositoryUrl(repo, $sourceControl$), e);
                 }}
-                title={m.onboarding_githubRepoTab_openOnGithub_tooltip({
+                title={m.onboarding_sourceControl_openRepo_tooltip({
+                  provider: providerName,
                   owner: repo.owner,
                   name: repo.name,
                 })}
-                aria-label={m.onboarding_githubRepoTab_openOnGithub_tooltip({
+                aria-label={m.onboarding_sourceControl_openRepo_tooltip({
+                  provider: providerName,
                   owner: repo.owner,
                   name: repo.name,
                 })}
@@ -416,7 +436,7 @@
         </div>
       {:else}
         <div class="py-4 text-center text-sm text-muted-foreground">
-          {m.onboarding_githubRepoTab_noRepos_label()}
+          {m.onboarding_sourceControl_noRepos_label({ provider: providerName })}
         </div>
       {/if}
     </div>

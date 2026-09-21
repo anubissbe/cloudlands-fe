@@ -1,3 +1,4 @@
+import type { SourceControlRepositoryContext } from '$features/source-control/types';
 /**
  * Live integrations domain backed by the intentd daemon
  * (PROTOCOL §5.27 `github.*`, §5.28 `linear.*`, §5.29 `sentry.*`).
@@ -86,6 +87,10 @@ function pullRequestState(pull: GithubPullWire): GitHubPullRequestState {
   return 'open';
 }
 
+function forgeMethod(method: string, context?: SourceControlRepositoryContext): string {
+  return context ? method.replace(/^github\./, 'sourceControl.') : method;
+}
+
 export class LiveIntegrationsClient implements IntegrationsClient {
   async githubUser(): Promise<GitHubUser | null> {
     try {
@@ -118,19 +123,25 @@ export class LiveIntegrationsClient implements IntegrationsClient {
    * can't change based on the filter and the caller discards it, so per-
    * keystroke searches cost one REST call, not two.
    */
-  async githubBranches(owner: string, repo: string, prefix?: string): Promise<GitHubBranchListing> {
+  async githubBranches(
+    owner: string,
+    repo: string,
+    prefix?: string,
+    context?: SourceControlRepositoryContext,
+  ): Promise<GitHubBranchListing> {
     const [result, defaultBranch] = await Promise.all([
-      backendRequest<{ branches?: unknown }>('github.branches.list', {
+      backendRequest<{ branches?: unknown }>(forgeMethod('github.branches.list', context), {
+        ...context,
         owner,
         repo,
         ...(prefix ? { prefix } : {}),
       }),
       prefix
         ? Promise.resolve(undefined)
-        : backendRequest<{ repo?: { defaultBranch?: unknown } | null }>('github.repos.get', {
-            owner,
-            repo,
-          }).then(
+        : backendRequest<{ repo?: { defaultBranch?: unknown } | null }>(
+            forgeMethod('github.repos.get', context),
+            { ...context, owner, repo },
+          ).then(
             (repoResult) => {
               const value = repoResult?.repo?.defaultBranch;
               return typeof value === 'string' && value.length > 0 ? value : undefined;
@@ -153,14 +164,18 @@ export class LiveIntegrationsClient implements IntegrationsClient {
    * (`{ cached: false, branches: [] }`) so the authoritative
    * `githubBranches` path stays the only error authority.
    */
-  async githubBranchesCached(owner: string, repo: string): Promise<GitHubCachedBranchListing> {
+  async githubBranchesCached(
+    owner: string,
+    repo: string,
+    context?: SourceControlRepositoryContext,
+  ): Promise<GitHubCachedBranchListing> {
     try {
       const result = await backendRequest<{
         cached?: unknown;
         branches?: unknown;
         defaultBranch?: unknown;
         source?: unknown;
-      }>('github.branches.listCached', { owner, repo });
+      }>(forgeMethod('github.branches.listCached', context), { ...context, owner, repo });
       const branches = Array.isArray(result?.branches)
         ? result.branches.filter((branch): branch is string => typeof branch === 'string')
         : [];
@@ -186,10 +201,11 @@ export class LiveIntegrationsClient implements IntegrationsClient {
     owner: string,
     repo: string,
     ref?: string,
+    context?: SourceControlRepositoryContext,
   ): Promise<GitHubRepoConfigResult> {
     const result = await backendRequest<{ config?: unknown; exists?: unknown }>(
-      'github.repoConfig.get',
-      ref ? { owner, repo, ref } : { owner, repo },
+      forgeMethod('github.repoConfig.get', context),
+      { owner, repo, ...(ref ? { ref } : {}), ...context },
     );
     const config =
       result?.config && typeof result.config === 'object' && !Array.isArray(result.config)
@@ -215,12 +231,12 @@ export class LiveIntegrationsClient implements IntegrationsClient {
     owner: string,
     repo: string,
     number: number,
+    context?: SourceControlRepositoryContext,
   ): Promise<GitHubPullRequestDetails> {
-    const result = await backendRequest<{ pull?: GithubPullWire | null }>('github.pulls.get', {
-      owner,
-      repo,
-      number,
-    });
+    const result = await backendRequest<{ pull?: GithubPullWire | null }>(
+      forgeMethod('github.pulls.get', context),
+      { ...context, owner, repo, number },
+    );
     const pull = result?.pull;
     if (!pull) throw new Error(`Pull request ${owner}/${repo}#${number} not found`);
     return {
@@ -242,12 +258,16 @@ export class LiveIntegrationsClient implements IntegrationsClient {
    * `github.issues.get` (§5.27) — one issue for the link hover card. Same
    * propagate-failures contract as `githubPullRequest`.
    */
-  async githubIssue(owner: string, repo: string, number: number): Promise<GitHubIssueDetails> {
-    const result = await backendRequest<{ issue?: GithubIssueWire | null }>('github.issues.get', {
-      owner,
-      repo,
-      number,
-    });
+  async githubIssue(
+    owner: string,
+    repo: string,
+    number: number,
+    context?: SourceControlRepositoryContext,
+  ): Promise<GitHubIssueDetails> {
+    const result = await backendRequest<{ issue?: GithubIssueWire | null }>(
+      forgeMethod('github.issues.get', context),
+      { ...context, owner, repo, number },
+    );
     const issue = result?.issue;
     if (!issue) throw new Error(`Issue ${owner}/${repo}#${number} not found`);
     return {

@@ -1,4 +1,7 @@
 <script lang="ts">
+  import { selectWorkspaceSourceControlIdentities } from '$store/renderer/slices/source-control/source-control-selectors';
+  import { sourceControlResourceUrl } from '$shared/utils/source-control-url';
+  const forgeIdentities$ = selectWorkspaceSourceControlIdentities();
   import { Input } from '$lib/components/ui/input';
   /**
    * CommitsTimeline - Commits section of the sidebar changes panel
@@ -492,7 +495,13 @@
     const repoName = $workspace?.repositoryName;
     let commitUrl: string | null = null;
     if (repoOwner && repoName) {
-      commitUrl = `https://github.com/${repoOwner}/${repoName}/commit/${hash}`;
+      commitUrl = sourceControlResourceUrl(
+        $forgeIdentities$[workspaceId]?.repository,
+        repoOwner,
+        repoName,
+        'commit',
+        hash,
+      );
     }
     if (commitUrl) {
       handleLink(commitUrl, { workspaceId: workspaceId as WorkspaceId, event });

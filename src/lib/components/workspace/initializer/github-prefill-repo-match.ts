@@ -1,21 +1,8 @@
-/**
- * Repo preselection for a pending GitHub issue/PR prefill (chat link action
- * menu → "Start new workspace…"): picks the repository matching the link's
- * `owner/repo`.
- *
- * Matching order:
- *  1. Recent/local candidates whose known GitHub metadata (recent-repo
- *     `owner`/`name` or `githubUrl`) or detected git remote (probed via the
- *     injected `probeRemote`, backed by `git-tracking:get-remote-url`)
- *     matches `owner/repo` → that repo.
- *  2. No match → a picked-repo GitHub selection with
- *     `https://github.com/{owner}/{repo}` (the daemon hydrates the checkout
- *     from its repo cache; `path` carries the `owner/repo` shorthand).
- *  3. Any probe/matching error → `keep` (non-fatal; the caller leaves the
- *     current/last-used repo selected).
- *
- * Pure and dependency-light per FE conventions: the IPC probe is injected.
- */
+/** Match a pending forge link to a recent checkout without losing its authority. */
+import {
+  parseSourceControlLink,
+  type ForgeConnectionIdentity,
+} from '$shared/utils/source-control-url';
 
 export interface GitHubPrefillRepoCandidate {
   path: string;
@@ -24,100 +11,89 @@ export interface GitHubPrefillRepoCandidate {
   owner?: string;
   githubUrl?: string;
 }
-
 export type GitHubPrefillRepoSelection =
   | { kind: 'local'; path: string }
   | { kind: 'github'; githubUrl: string; path: string }
   | { kind: 'keep' };
-
 export interface MatchGitHubPrefillRepoInput {
   owner: string;
   repo: string;
+  url?: string;
+  projectUrl?: string;
+  provider?: 'github' | 'gitlab';
+  instanceUrl?: string;
+  connectionId?: string;
+  connections?: readonly ForgeConnectionIdentity[];
   candidates: GitHubPrefillRepoCandidate[];
-  /** Resolve a local repo's GitHub remote; null when none is detected. */
-  probeRemote: (repoPath: string) => Promise<{ owner: string; repo: string } | null>;
+  probeRemote: (
+    repoPath: string,
+  ) => Promise<{ owner: string; repo: string; remoteUrl?: string; repoUrl?: string } | null>;
 }
-
-/** Cap remote probes so a long recent-repos list cannot fan out IPC calls. */
 const MAX_REMOTE_PROBES = 10;
+const cleanName = (name: string) => name.replace(/\.git$/i, '');
 
-function normalizeRepoName(name: string): string {
-  return name.replace(/\.git$/i, '').toLowerCase();
-}
-
-/** Extract owner/repo from a GitHub URL (https or ssh form). */
-function parseGitHubOwnerRepo(url: string): { owner: string; repo: string } | null {
-  const match = /github\.com[/:]([^/\s]+)\/([^/\s#?]+)/i.exec(url);
-  if (!match) return null;
-  return { owner: match[1], repo: match[2] };
-}
-
-/** Known owner/repo for a candidate from its stored metadata, if conclusive. */
-function candidateMetadataOwnerRepo(
-  candidate: GitHubPrefillRepoCandidate,
-): { owner: string; repo: string } | null {
-  if (candidate.githubUrl) return parseGitHubOwnerRepo(candidate.githubUrl);
-  if (candidate.owner && candidate.name) return { owner: candidate.owner, repo: candidate.name };
-  return null;
-}
-
-function isMatch(
-  detected: { owner: string; repo: string },
-  target: { owner: string; repo: string },
-): boolean {
-  return (
-    detected.owner.toLowerCase() === target.owner &&
-    normalizeRepoName(detected.repo) === target.repo
+export async function matchGitHubPrefillRepo(
+  input: MatchGitHubPrefillRepoInput,
+): Promise<GitHubPrefillRepoSelection> {
+  const { owner, repo, candidates, probeRemote } = input;
+  const identities = [...(input.connections ?? [])];
+  if (input.provider && input.instanceUrl)
+    identities.push({
+      provider: input.provider,
+      instanceUrl: input.instanceUrl,
+      id: input.connectionId,
+    });
+  const explicit = input.projectUrl ?? input.url;
+  const target = parseSourceControlLink(
+    explicit ?? `${input.instanceUrl ?? 'https://github.com'}/${owner}/${cleanName(repo)}`,
+    identities,
   );
-}
-
-function toSelection(
-  candidate: GitHubPrefillRepoCandidate,
-  githubUrl: string,
-): GitHubPrefillRepoSelection {
-  if (candidate.type === 'github') {
-    return { kind: 'github', githubUrl: candidate.githubUrl ?? githubUrl, path: candidate.path };
-  }
-  return { kind: 'local', path: candidate.path };
-}
-
-export async function matchGitHubPrefillRepo({
-  owner,
-  repo,
-  candidates,
-  probeRemote,
-}: MatchGitHubPrefillRepoInput): Promise<GitHubPrefillRepoSelection> {
-  const cleanRepoName = repo.replace(/\.git$/i, '');
-  const githubUrl = `https://github.com/${owner}/${cleanRepoName}`;
+  if (!target) return { kind: 'keep' };
+  const matches = (candidate: {
+    owner: string;
+    repo: string;
+    projectUrl?: string;
+    connectionId?: string;
+  }) =>
+    (target.provider === 'github'
+      ? candidate.owner.toLowerCase() === target.owner.toLowerCase() &&
+        cleanName(candidate.repo).toLowerCase() === target.repo.toLowerCase()
+      : candidate.owner === target.owner && cleanName(candidate.repo) === target.repo) &&
+    (candidate.connectionId === target.connectionId || (!explicit && !candidate.connectionId));
   try {
-    const target = { owner: owner.toLowerCase(), repo: normalizeRepoName(repo) };
-    const seen = new Set<string>();
     const unresolved: GitHubPrefillRepoCandidate[] = [];
-
-    // Pass 1: candidates with conclusive stored metadata — no IPC needed.
+    const seen = new Set<string>();
     for (const candidate of candidates) {
       if (!candidate.path || seen.has(candidate.path)) continue;
       seen.add(candidate.path);
-      const meta = candidateMetadataOwnerRepo(candidate);
-      if (meta) {
-        if (isMatch(meta, target)) return toSelection(candidate, githubUrl);
-        continue; // metadata is conclusive — a mismatch needs no probe
+      if (candidate.githubUrl) {
+        const parsed = parseSourceControlLink(candidate.githubUrl, identities);
+        if (parsed && matches(parsed))
+          return candidate.type === 'local'
+            ? { kind: 'local', path: candidate.path }
+            : { kind: 'github', githubUrl: candidate.githubUrl, path: candidate.path };
+        continue;
+      }
+      // Older callers lacked a URL. Preserve that GH-only contract; an actual
+      // link prefill always carries a URL and must prove a local candidate's host.
+      if (!explicit && candidate.owner && candidate.name) {
+        if (matches({ owner: candidate.owner, repo: candidate.name }))
+          return candidate.type === 'local'
+            ? { kind: 'local', path: candidate.path }
+            : { kind: 'github', githubUrl: target.projectUrl, path: candidate.path };
+        continue;
       }
       if (candidate.type === 'local') unresolved.push(candidate);
     }
-
-    // Pass 2: probe remaining local candidates' git remotes.
     for (const candidate of unresolved.slice(0, MAX_REMOTE_PROBES)) {
       const detected = await probeRemote(candidate.path);
-      if (detected && isMatch(detected, target)) {
-        return { kind: 'local', path: candidate.path };
-      }
+      if (!detected) continue;
+      const url = detected.repoUrl ?? detected.remoteUrl;
+      const parsed = url ? parseSourceControlLink(url, identities) : !explicit ? detected : null;
+      if (parsed && matches(parsed)) return { kind: 'local', path: candidate.path };
     }
-
-    // No local match → picked-repo GitHub selection (owner/repo shorthand as path).
-    return { kind: 'github', githubUrl, path: `${owner}/${cleanRepoName}` };
+    return { kind: 'github', githubUrl: target.projectUrl, path: `${target.owner}/${target.repo}` };
   } catch {
-    // Matching failed — keep the current/last-used repo (non-fatal).
     return { kind: 'keep' };
   }
 }

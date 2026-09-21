@@ -9,19 +9,23 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { fireEvent, render, waitFor } from '@testing-library/svelte';
 
+import { createCollection } from '@augmentcode/themis/utils/collections/collection-utils';
+import { initialState as initialSourceControlState } from '$store/renderer/slices/source-control/source-control-slice';
+import type { SourceControlConnection } from '$features/source-control/types';
 import type { GitHubAuthState } from '$store/renderer/slices/github-auth/github-auth-types';
 
 const mocks = vi.hoisted(() => {
   const dispatch = vi.fn();
   const githubAuth: { value: unknown } = { value: null };
-  return { dispatch, githubAuth };
+  const sourceControl: { value: unknown } = { value: null };
+  return { dispatch, githubAuth, sourceControl };
 });
 
 vi.mock('$store/renderer/store', async () => {
   const { createAppStoreMockModule } =
     await import('$store/renderer/utils/test-helpers/store-mock');
   return createAppStoreMockModule({
-    state: () => ({ githubAuth: mocks.githubAuth.value }),
+    state: () => ({ githubAuth: mocks.githubAuth.value, sourceControl: mocks.sourceControl.value }),
     dispatch: mocks.dispatch,
   });
 });
@@ -47,6 +51,25 @@ const idleState = (): GitHubAuthState => ({
   error: null,
 });
 
+function registryState(connection: Partial<SourceControlConnection> = {}) {
+  const entry: SourceControlConnection = {
+    id: 'https://github.com',
+    instanceUrl: 'https://github.com',
+    provider: 'github',
+    enabled: true,
+    isConfigured: false,
+    tokenSource: 'auto',
+    user: null,
+    ...connection,
+  };
+  return {
+    ...initialSourceControlState,
+    loaded: true,
+    selectedConnectionId: entry.id,
+    connections: createCollection<SourceControlConnection, 'id'>('id', [entry]),
+  };
+}
+
 const baseProps = () => ({ onContinue: vi.fn(), onSkip: vi.fn() });
 
 const findButton = (root: HTMLElement, label: string) =>
@@ -55,6 +78,7 @@ const findButton = (root: HTMLElement, label: string) =>
 beforeEach(() => {
   vi.clearAllMocks();
   mocks.githubAuth.value = idleState();
+  mocks.sourceControl.value = registryState();
 });
 
 describe('OnboardingGitHubStep', () => {
@@ -112,10 +136,14 @@ describe('OnboardingGitHubStep', () => {
   });
 
   it('already connected: shows the connected banner and Continue, no Skip', async () => {
+    mocks.sourceControl.value = registryState({
+      isConfigured: true,
+      user: { login: 'octocat', avatarUrl: '', htmlUrl: 'https://github.com/octocat' },
+    });
     mocks.githubAuth.value = {
       ...idleState(),
       isAuthenticated: true,
-      user: { login: 'octocat', name: 'Octo Cat', email: null, avatar_url: '' },
+      user: { login: 'previous-account', name: null, email: null, avatar_url: '' },
     };
     const props = baseProps();
     const { container } = render(OnboardingGitHubStep, { props });
@@ -123,6 +151,7 @@ describe('OnboardingGitHubStep', () => {
     const banner = container.querySelector('[data-testid="github-step-connected"]');
     expect(banner).toBeTruthy();
     expect(banner!.textContent).toContain('@octocat');
+    expect(banner!.textContent).not.toContain('previous-account');
 
     expect(findButton(container, 'Skip for now')).toBeUndefined();
     const cont = findButton(container, 'Continue');
@@ -159,4 +188,27 @@ describe('OnboardingGitHubStep', () => {
     const { container } = render(OnboardingGitHubStep, { props: baseProps() });
     expect(container.textContent).toContain('Device flow expired');
   });
+});
+
+it('invalidates both Continue and keyboard-advance permission after editing a connected GitLab host', async () => {
+  mocks.githubAuth.value = {
+    ...idleState(),
+    isAuthenticated: false,
+  };
+  mocks.sourceControl.value = registryState({
+    id: 'https://git.euraika.net',
+    instanceUrl: 'https://git.euraika.net',
+    provider: 'gitlab',
+    tokenSource: 'glab-cli',
+    isConfigured: true,
+    user: { login: 'camiel-user', avatarUrl: '', htmlUrl: 'https://git.euraika.net/camiel-user' },
+  });
+  const props = { ...baseProps(), onAdvanceAllowedChange: vi.fn() };
+  const { container } = render(OnboardingGitHubStep, { props });
+  await waitFor(() => expect(findButton(container, 'Continue')?.disabled).toBe(false));
+  const input = container.querySelector<HTMLInputElement>('input[type="url"]')!;
+  await fireEvent.input(input, { target: { value: 'https://another.example.com' } });
+  await waitFor(() => expect(findButton(container, 'Continue')?.disabled).toBe(true));
+  expect(props.onAdvanceAllowedChange).toHaveBeenLastCalledWith(false);
+  expect(props.onContinue).not.toHaveBeenCalled();
 });

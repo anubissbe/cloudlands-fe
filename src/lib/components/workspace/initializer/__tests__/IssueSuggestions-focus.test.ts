@@ -25,6 +25,29 @@ vi.mock('$store/renderer/store', async () => {
   return createAppStoreMockModule({ state: () => ({ theme: { name: 'dark' } }) });
 });
 
+vi.mock('$features/source-control/SourceControlAuthBanner.svelte', async () => ({
+  default: (await import('./mocks/MockComponent.svelte')).default,
+}));
+vi.mock('$store/renderer/slices/source-control/source-control-selectors', () => ({
+  selectSourceControlConnections: mocks.selector([
+    {
+      id: 'https://github.com',
+      provider: 'github',
+      instanceUrl: 'https://github.com',
+      enabled: true,
+      isConfigured: false,
+      user: { login: 'fixture' },
+    },
+  ]),
+  selectSelectedSourceControlConnection: mocks.selector({
+    id: 'https://github.com',
+    provider: 'github',
+    instanceUrl: 'https://github.com',
+    enabled: true,
+    isConfigured: false,
+    user: { login: 'fixture' },
+  }),
+}));
 vi.mock('$store/renderer/slices/github-auth/github-auth-selectors', () => ({
   selectGitHubAuthIsAuthenticated: mocks.selector(false),
   selectGitHubAuthIsAuthenticating: mocks.selector(false),

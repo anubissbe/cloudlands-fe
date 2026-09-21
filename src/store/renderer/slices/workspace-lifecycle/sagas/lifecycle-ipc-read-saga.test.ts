@@ -21,7 +21,9 @@ vi.mock('$lib/utils/client-logger', () => ({
 }));
 
 import { CACHE_TTL_MS, fetchEditors } from '../../external-editors/external-editors-slice';
-import { loadGithubRepos } from '../../github-repos/github-repos-slice';
+import { clearGithubRepos, loadGithubRepos } from '../../github-repos/github-repos-slice';
+import { initialState as initialSourceState } from '../../source-control/source-control-slice';
+import { initialState as initialAuthState } from '../../github-auth/github-auth-slice';
 import { loadKnownRepos } from '../../known-repos/known-repos-slice';
 import { initialState as initialConnectionsState } from '../../connections/connections-slice';
 import { initialState as initialPanelLayoutState } from '../../panel-layout/panel-layout-slice';
@@ -74,6 +76,8 @@ const settle = async () => {
 
 function state(workspaces: Workspace[] = [workspace(WS, '/repo/worktrees/ws-ipc-lifecycle')]) {
   return {
+    githubAuth: initialAuthState,
+    sourceControl: initialSourceState,
     externalEditors: {
       loading: false,
       editors: createCollection('id', []),
@@ -208,7 +212,9 @@ describe('lifecycleIpcReadSaga', () => {
     run.channel.put(loadGithubRepos());
     await settle();
 
-    expect(mocks.listRepos.mock.calls).toEqual([[]]);
+    expect(mocks.listRepos.mock.calls).toEqual([
+      [undefined, { connectionId: 'https://github.com' }],
+    ]);
     expect(run.actions).toEqual([
       { type: 'githubRepos/setLoading', payload: [] },
       {
@@ -230,7 +236,9 @@ describe('lifecycleIpcReadSaga', () => {
     run.channel.put(loadGithubRepos());
     run.channel.put(loadGithubRepos());
     await settle();
-    expect(mocks.listRepos.mock.calls).toEqual([[]]);
+    expect(mocks.listRepos.mock.calls).toEqual([
+      [undefined, { connectionId: 'https://github.com' }],
+    ]);
     await stop(run.task);
     resolve([{ owner: 'late', name: 'late', default_branch: 'main' }]);
     await settle();
@@ -245,6 +253,77 @@ describe('lifecycleIpcReadSaga', () => {
       { type: 'githubRepos/setError', payload: ['github failed'] },
     ]);
     await stop(failed.task);
+  });
+
+  it('replaces an in-flight old-forge load after invalidation and keeps native project URLs', async () => {
+    let resolveOld!: (value: unknown[]) => void;
+    mocks.listRepos.mockReturnValueOnce(
+      new Promise((resolve) => {
+        resolveOld = resolve;
+      }),
+    );
+    mocks.listRepos.mockResolvedValueOnce([
+      {
+        owner: 'euraika/platform',
+        name: 'camiel',
+        default_branch: 'main',
+        html_url: 'https://git.euraika.net/euraika/platform/camiel',
+      },
+    ]);
+    const current = state();
+    const run = start(current);
+    run.channel.put(loadGithubRepos());
+    current.sourceControl = {
+      ...initialSourceState,
+      selectedConnectionId: 'https://git.euraika.net',
+    };
+    run.channel.put(clearGithubRepos());
+    run.channel.put(loadGithubRepos());
+    await settle();
+    resolveOld([{ owner: 'legacy', name: 'repo', default_branch: 'main' }]);
+    await settle();
+    expect(mocks.listRepos).toHaveBeenCalledTimes(2);
+    expect(run.actions.filter((action) => action.type === 'githubRepos/setRepos')).toEqual([
+      {
+        type: 'githubRepos/setRepos',
+        payload: [
+          [
+            {
+              id: 'euraika/platform/camiel',
+              owner: 'euraika/platform',
+              name: 'camiel',
+              defaultBranch: 'main',
+              htmlUrl: 'https://git.euraika.net/euraika/platform/camiel',
+            },
+          ],
+        ],
+      },
+    ]);
+    await stop(run.task);
+  });
+
+  it('rejects a late load when its instance changed before invalidation arrived', async () => {
+    let rejectOld!: (reason: Error) => void;
+    mocks.listRepos.mockReturnValueOnce(
+      new Promise((_resolve, reject) => {
+        rejectOld = reject;
+      }),
+    );
+    const current = state();
+    current.sourceControl = {
+      ...initialSourceState,
+      selectedConnectionId: 'https://git.one.example',
+    };
+    const run = start(current);
+    run.channel.put(loadGithubRepos());
+    current.sourceControl = {
+      ...initialSourceState,
+      selectedConnectionId: 'https://git.two.example',
+    };
+    rejectOld(new Error('old instance failed'));
+    await settle();
+    expect(run.actions).toEqual([{ type: 'githubRepos/setLoading', payload: [] }]);
+    await stop(run.task);
   });
 
   it('detects editors, preserves the protocol payload, and clears loading', async () => {

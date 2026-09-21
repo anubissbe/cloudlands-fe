@@ -23,6 +23,7 @@ export type GithubRepoItem = {
   owner: string;
   name: string;
   defaultBranch?: string;
+  htmlUrl?: string;
 };
 
 export type GithubReposState = {
@@ -41,6 +42,9 @@ export const initialState: GithubReposState = {
 
 /** Trigger: load the authenticated user's GitHub repositories. */
 export const loadGithubRepos = createAction('githubRepos/load');
+
+/** Invalidate cached rows and cancel reads for a previous source-control authority. */
+export const clearGithubRepos = createAction('githubRepos/clear');
 
 /** Mark the slice as loading (clears any previous error). */
 export const setGithubReposLoading = createAction('githubRepos/setLoading');
@@ -70,3 +74,5 @@ githubReposReducer.with(setGithubReposError, (state, { payload: [error] }) => ({
   loading: false,
   error,
 }));
+
+githubReposReducer.with(clearGithubRepos, () => initialState);

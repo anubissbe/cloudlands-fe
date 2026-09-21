@@ -248,6 +248,25 @@ describe('getBranchNameValidationError', () => {
 // ─── constructPrUrl ───────────────────────────────────────────────────────────
 
 describe('constructPrUrl', () => {
+  it('preserves an authoritative GitLab MR URL even with repository metadata', () => {
+    expect(
+      constructPrUrl(
+        42,
+        'group/sub',
+        'project',
+        'https://git.euraika.net/group/sub/project/-/merge_requests/42',
+      ),
+    ).toBe('https://git.euraika.net/group/sub/project/-/merge_requests/42');
+  });
+  it('builds a self-hosted MR URL when the daemon has not supplied one', () => {
+    expect(
+      constructPrUrl(42, 'group/sub', 'project', undefined, {
+        provider: 'gitlab',
+        instanceUrl: 'https://git.euraika.net',
+      }),
+    ).toBe('https://git.euraika.net/group/sub/project/-/merge_requests/42');
+  });
+
   it('constructs URL from owner and repo', () => {
     expect(constructPrUrl(42, 'octocat', 'hello-world')).toBe(
       'https://github.com/octocat/hello-world/pull/42',
@@ -844,6 +863,11 @@ describe('legacyWorkspacePullRequest', () => {
 // ─── prRepoFromUrl ─────────────────────────────────────────────────────────────
 
 describe('prRepoFromUrl', () => {
+  it('retains nested GitLab namespaces in merge-request identity', () => {
+    expect(prRepoFromUrl('https://git.euraika.net/group/sub/project/-/merge_requests/42')).toBe(
+      'group/sub/project',
+    );
+  });
   it('parses owner/name from a canonical GitHub PR URL', () => {
     expect(prRepoFromUrl('https://github.com/acme/widgets/pull/42')).toBe('acme/widgets');
   });

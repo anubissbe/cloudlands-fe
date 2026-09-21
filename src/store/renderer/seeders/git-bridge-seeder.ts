@@ -1,3 +1,4 @@
+import { resolveSourceControlRepository } from '$features/source-control/renderer/source-control.client';
 /**
  * Git IPC bridge — routes the legacy renderer→main `git:*` / `git-tracking:*`
  * working-copy operations onto the daemon so the daemon host stays the single
@@ -230,9 +231,21 @@ registerMockIpcHandler(IPC_CHANNELS.GIT_TRACKING.GET_REMOTE_URL, async (arg) => 
       return { success: true, data: { remoteUrl: '', owner: null, repo: null } };
     }
     const remoteUrl = result.stdout.trim();
-    const match = remoteUrl.match(/github\.com[:/]([^/]+)\/([^/]+?)(?:\.git)?$/);
-    if (match) {
-      return { success: true, data: { remoteUrl, owner: match[1], repo: match[2] } };
+    try {
+      const resolved = await resolveSourceControlRepository({ repoUrl: remoteUrl });
+      return {
+        success: true,
+        data: {
+          remoteUrl,
+          owner: resolved.repo.owner,
+          repo: resolved.repo.name,
+          repoUrl: resolved.repo.htmlUrl,
+          connectionId: resolved.connectionId,
+          provider: resolved.provider,
+        },
+      };
+    } catch {
+      /* An unregistered forge is still a valid local Git remote. */
     }
     return { success: true, data: { remoteUrl, owner: null, repo: null } };
   } catch (error) {

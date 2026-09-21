@@ -41,7 +41,10 @@
     selectPostMergeState,
     selectGitOperationFlags,
   } from '$store/renderer/slices/git/git-selectors';
-  import { selectGitHubAuthIsAuthenticated } from '$store/renderer/slices/github-auth/github-auth-selectors';
+  import {
+    selectWorkspaceSourceControlIsAuthenticated,
+    selectWorkspaceSourceControlSettings,
+  } from '$store/renderer/slices/source-control/source-control-selectors';
   import { initializeGitHubAuth } from '$store/renderer/slices/github-auth/github-auth-slice';
   import {
     addTerminal,
@@ -197,6 +200,7 @@
       $workspace?.repositoryOwner,
       $workspace?.repositoryName,
       fallbackUrl,
+      $sourceControl$,
     );
   };
 
@@ -310,7 +314,8 @@
   const isContentMergedToTrunk = $derived($postMergeState$.isContentMergedToTrunk);
   const hasResetToTrunk = $derived($postMergeState$.hasResetToTrunk);
 
-  const githubAuthIsAuthenticated$ = selectGitHubAuthIsAuthenticated();
+  const githubAuthIsAuthenticated$ = selectWorkspaceSourceControlIsAuthenticated(workspaceIdStore);
+  const sourceControl$ = selectWorkspaceSourceControlSettings(workspaceIdStore);
 
   $effect(() => {
     const visibleWorkspaceId = workspaceId;

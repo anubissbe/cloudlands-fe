@@ -22,6 +22,12 @@ const mocks = vi.hoisted(() => {
     return Object.assign(fn, { select: () => getter() });
   };
   return {
+    sourceControl: {
+      provider: 'github' as 'github' | 'gitlab',
+      instanceUrl: 'https://github.com',
+      tokenSource: 'auto',
+      gitlabSupported: true,
+    },
     selector,
     dispatch: vi.fn(),
     isAuthenticated: true,
@@ -53,7 +59,9 @@ vi.mock('$store/renderer/slices/github-auth/github-auth-slice', () => ({
   clearGitHubAuthError: () => ({ type: 'githubAuth/clearError' }),
 }));
 vi.mock('$store/renderer/slices/github-auth/github-auth-selectors', () => ({
+  selectSourceControlSettings: mocks.selector(() => mocks.sourceControl),
   selectGitHubAuthIsAuthenticated: mocks.selector(() => mocks.isAuthenticated),
+  selectSourceControlIsAuthenticated: mocks.selector(() => mocks.isAuthenticated),
   selectGitHubAuthIsAuthenticating: mocks.selector(() => false),
   selectGitHubAuthDeviceFlow: mocks.selector(() => null),
   selectGitHubAuthError: mocks.selector(() => null),
@@ -156,6 +164,8 @@ async function openGithubTab(props: Record<string, unknown> = {}) {
 
 describe('RepoSelector "Pick a repo" autocomplete', () => {
   beforeEach(() => {
+    mocks.sourceControl.provider = 'github';
+    mocks.sourceControl.instanceUrl = 'https://github.com';
     mocks.isAuthenticated = true;
     mocks.reposLoaded = true;
     mocks.reposError = null;
@@ -458,4 +468,31 @@ describe('RepoSelector trigger avatar', () => {
     expect(triggerAvatar(container)!.src).toContain('/other.png');
     expect(container.querySelector('button')!.textContent).toContain('other/gamma');
   });
+});
+
+it('selects an authenticated nested GitLab repository using its original API URL', async () => {
+  mocks.sourceControl.provider = 'gitlab';
+  mocks.sourceControl.instanceUrl = 'https://git.euraika.net';
+  mocks.repos = [
+    {
+      id: 'euraika/platform/camiel',
+      owner: 'euraika/platform',
+      name: 'camiel',
+      htmlUrl: 'https://git.euraika.net/euraika/platform/camiel',
+    } as (typeof mocks.repos)[number],
+  ];
+  const onchange = vi.fn();
+  await openGithubTab({ onchange });
+  await fireEvent.click(suggestions()[0]);
+  expect(onchange).toHaveBeenCalledWith(
+    expect.objectContaining({
+      detail: {
+        path: 'euraika/platform/camiel',
+        type: 'github',
+        githubUrl: 'https://git.euraika.net/euraika/platform/camiel',
+        isNewRepo: false,
+        isValidPath: true,
+      },
+    }),
+  );
 });

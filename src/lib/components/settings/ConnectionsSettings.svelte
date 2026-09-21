@@ -5,23 +5,24 @@
   import { initializeGitHubAuth } from '$store/renderer/slices/github-auth/github-auth-slice';
   import { initializeLinearAuth } from '$store/renderer/slices/linear-auth/linear-auth-slice';
   import { initializeSentryAuth } from '$store/renderer/slices/sentry-auth/sentry-auth-slice';
-  import { faGithub } from '@fortawesome/free-brands-svg-icons';
-  import Fa from 'svelte-fa';
+  import SourceControlIcon from '$features/source-control/SourceControlIcon.svelte';
+  import { selectSourceControlSettings } from '$store/renderer/slices/github-auth/github-auth-selectors';
   import LinearIcon from '$lib/components/icons/LinearIcon.svelte';
   import SentryIcon from '$lib/components/icons/SentryIcon.svelte';
-  import GitHubAuthConnection from './GitHubAuthConnection.svelte';
+  import SourceControlSettings from './SourceControlSettings.svelte';
   import LinearAuthConnection from './LinearAuthConnection.svelte';
   import SentryAuthConnection from './SentryAuthConnection.svelte';
 
   // Track if initial load is complete
   let isLoading = $state(true);
+  const sourceControl$ = selectSourceControlSettings();
 
-  // Integration metadata for skeleton rendering (names are brand names — not translated)
+  // Integration metadata for skeleton rendering.
   const integrations = [
     {
-      icon: 'github',
-      name: 'GitHub',
-      description: m.settings_connections_github_description(),
+      icon: 'source-control',
+      name: m.settings_sourceControl_title(),
+      description: m.settings_sourceControl_description(),
     },
     {
       icon: 'linear',
@@ -46,8 +47,8 @@
     {#each integrations as integration}
       <div class="grid grid-cols-[1rem_minmax(0,1fr)_auto] items-start gap-x-3 gap-y-1 py-3">
         <div class="flex size-4 items-center justify-center text-ghost">
-          {#if integration.icon === 'github'}
-            <Fa icon={faGithub} class="size-4" />
+          {#if integration.icon === 'source-control'}
+            <SourceControlIcon provider={$sourceControl$.provider} />
           {:else if integration.icon === 'linear'}
             <LinearIcon size={16} />
           {:else if integration.icon === 'sentry'}
@@ -66,7 +67,7 @@
   </div>
 {:else}
   <div class="divide-y divide-border [&>*:first-child]:pt-0 [&>*:last-child]:pb-0">
-    <GitHubAuthConnection />
+    <SourceControlSettings />
     <LinearAuthConnection />
     <SentryAuthConnection />
   </div>

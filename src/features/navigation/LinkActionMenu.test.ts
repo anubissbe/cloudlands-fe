@@ -162,6 +162,29 @@ describe('LinkActionMenu', () => {
     expect(screen.getAllByRole('menuitem')[0].textContent).toContain('PR #7');
   });
 
+  it('labels GitLab merge requests and preserves their full identity in the workspace prefill', async () => {
+    render(LinkActionMenu);
+    const ref = {
+      owner: 'euraika/platform',
+      repo: 'camiel',
+      number: 7,
+      kind: 'pr' as const,
+      provider: 'gitlab' as const,
+      connectionId: 'https://git.euraika.net',
+      instanceUrl: 'https://git.euraika.net',
+      projectUrl: 'https://git.euraika.net/euraika/platform/camiel',
+    };
+    const url = `${ref.projectUrl}/-/merge_requests/7`;
+    showLinkActionMenu({ url, gitHubRef: ref, x: 10, y: 10, workspaceId: TEST_WORKSPACE_ID });
+    await waitFor(() => expect(screen.getByRole('menu')).toBeTruthy());
+    const action = screen.getAllByRole('menuitem')[0];
+    expect(action.textContent).toContain('Start workspace from merge request');
+    await fireEvent.click(action);
+    expect(reduxDispatchMock).toHaveBeenCalledWith(
+      setWorkspaceInitializerPendingGitHubPrefill({ ...ref, url }),
+    );
+  });
+
   it('uses canonical arrow navigation and restores focus to the invoking element', async () => {
     const anchor = document.createElement('button');
     document.body.append(anchor);

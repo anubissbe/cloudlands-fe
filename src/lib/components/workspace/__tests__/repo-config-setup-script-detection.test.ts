@@ -26,7 +26,14 @@ const mocks = vi.hoisted(() => {
     savedFormState: null as Record<string, unknown> | null,
     fetchRepoConfig: vi.fn<(repoPath: string) => Promise<string | null>>(),
     fetchGitHubRepoConfig:
-      vi.fn<(owner: string, repo: string, ref?: string) => Promise<string | null>>(),
+      vi.fn<
+        (
+          owner: string,
+          repo: string,
+          ref?: string,
+          context?: { repoUrl?: string },
+        ) => Promise<string | null>
+      >(),
     lastUsedSelect: vi.fn(),
     create: vi.fn<(params: Record<string, unknown>) => Promise<unknown>>(),
   };
@@ -37,8 +44,11 @@ vi.mock('$app/navigation', () => ({ goto: mocks.goto }));
 vi.mock('$store/renderer/store', async () => {
   const { createAppStoreMockModule } =
     await import('$store/renderer/utils/test-helpers/store-mock');
+  const { initialState: githubAuth } =
+    await import('$store/renderer/slices/github-auth/github-auth-slice');
   return createAppStoreMockModule({
     state: () => ({
+      githubAuth,
       hardwareConsole: { pttRecording: false, voiceTranscribing: false },
       workspaceCreateProgress: { byProgressId: {} },
     }),
@@ -272,7 +282,9 @@ describe('CompactWorkspaceInitializer repo-config setup script detection', () =>
     await waitFor(() => {
       expect(result.getByText(SPINNER_LABEL)).toBeTruthy();
     });
-    expect(mocks.fetchGitHubRepoConfig).toHaveBeenCalledWith('owner', 'repo', 'release-1.x');
+    expect(mocks.fetchGitHubRepoConfig).toHaveBeenCalledWith('owner', 'repo', 'release-1.x', {
+      repoUrl: 'https://github.com/owner/repo',
+    });
     expect(mocks.fetchRepoConfig).not.toHaveBeenCalled();
 
     probe.resolve('echo gh-config');
@@ -339,14 +351,18 @@ describe('CompactWorkspaceInitializer repo-config setup script detection', () =>
     // Selecting a GitHub repo probes at once (repo default branch — no ref).
     selectGitHubRepo();
     await waitFor(() => {
-      expect(mocks.fetchGitHubRepoConfig).toHaveBeenCalledWith('owner', 'repo', undefined);
+      expect(mocks.fetchGitHubRepoConfig).toHaveBeenCalledWith('owner', 'repo', undefined, {
+        repoUrl: 'https://github.com/owner/repo',
+      });
     });
 
     // Picking a branch re-probes (debounced) with the new ref and applies
     // that branch's config script.
     pickerCallbacks().onBranchChange({ detail: { branch: 'release-1.x' } });
     await waitFor(() => {
-      expect(mocks.fetchGitHubRepoConfig).toHaveBeenCalledWith('owner', 'repo', 'release-1.x');
+      expect(mocks.fetchGitHubRepoConfig).toHaveBeenCalledWith('owner', 'repo', 'release-1.x', {
+        repoUrl: 'https://github.com/owner/repo',
+      });
     });
     await waitFor(() => {
       expect(result.getByText(REPO_CONFIG_SCRIPT_NAME)).toBeTruthy();
@@ -369,13 +385,17 @@ describe('CompactWorkspaceInitializer repo-config setup script detection', () =>
 
     const result = renderInitializer();
     await waitFor(() => {
-      expect(mocks.fetchGitHubRepoConfig).toHaveBeenCalledWith('owner', 'repo', 'main');
+      expect(mocks.fetchGitHubRepoConfig).toHaveBeenCalledWith('owner', 'repo', 'main', {
+        repoUrl: 'https://github.com/owner/repo',
+      });
     });
 
     // Change the branch while main's read is in flight, then resolve it late.
     pickerCallbacks().onBranchChange({ detail: { branch: 'release-1.x' } });
     await waitFor(() => {
-      expect(mocks.fetchGitHubRepoConfig).toHaveBeenCalledWith('owner', 'repo', 'release-1.x');
+      expect(mocks.fetchGitHubRepoConfig).toHaveBeenCalledWith('owner', 'repo', 'release-1.x', {
+        repoUrl: 'https://github.com/owner/repo',
+      });
     });
     probeMain.resolve('echo main-config');
     await Promise.resolve();

@@ -7,12 +7,15 @@
  *
  * The probe reads the repo's committed `.intent/config.json` for a setup
  * script: local repos read the file directly (absolute paths only — `~`
- * never expands in host.exec argv, no shell); GitHub repos have no local
+ * never expands in host.exec argv, no shell); hosted repos have no local
  * checkout, so the daemon reads it via `github.repoConfig.get`
  * (PROTOCOL §5.27).
  */
 import { untrack } from 'svelte';
-import { parseGitHubUrl } from '$lib/utils/workspace-validation';
+import {
+  parseRepositoryInput,
+  repositoryInputReference,
+} from '$features/source-control/utils/repository';
 import { fetchGitHubRepoConfigSetupScript, fetchRepoConfigSetupScript } from './repo-config';
 
 /**
@@ -28,6 +31,8 @@ export interface RepoIdentity {
    */
   type: 'local' | 'github' | (string & {}) | null | undefined;
   githubUrl?: string | null;
+  /** Selected forge authority; defaults to GitHub for legacy callers. */
+  sourceControl?: Parameters<typeof parseRepositoryInput>[1];
   /**
    * Selected branch/ref. Part of the probe identity for GitHub selections
    * (monorepo#835): `.intent/config.json` can differ between branches, so a
@@ -46,9 +51,13 @@ export interface RepoIdentity {
  * (last-used restore, cache invalidation).
  */
 export function repoIdentityKey(identity: RepoIdentity): string | null {
-  return identity.type === 'github'
-    ? `${identity.path}\u0000${identity.githubUrl || ''}`
-    : identity.path;
+  if (identity.type !== 'github') return identity.path;
+  return [
+    identity.path,
+    identity.githubUrl || '',
+    identity.sourceControl?.provider ?? 'github',
+    identity.sourceControl?.provider === 'gitlab' ? identity.sourceControl.instanceUrl : '',
+  ].join('\u0000');
 }
 
 /**
@@ -113,17 +122,32 @@ export function probeRepoConfigSetupScript(options: RepoConfigProbeOptions): Pro
 
   options.setLoading(false);
   const isLocalProbe = !!path && type === 'local' && path.startsWith('/');
-  const github = !!path && type === 'github' ? parseGitHubUrl(identity.githubUrl || path) : null;
-  if (!isLocalProbe && !github) return Promise.resolve();
+  const repository =
+    !!path && type === 'github'
+      ? parseRepositoryInput(
+          identity.githubUrl || path,
+          identity.sourceControl ?? {
+            provider: 'github',
+            instanceUrl: 'https://gitlab.com',
+          },
+        )
+      : null;
+  if (!isLocalProbe && !repository) return Promise.resolve();
   const scriptAtFetchStart = untrack(options.getSetupScript);
   options.setLoading(true);
   return (async () => {
     const script = isLocalProbe
       ? await fetchRepoConfigSetupScript(path)
       : await fetchGitHubRepoConfigSetupScript(
-          github!.owner,
-          github!.repo,
+          repository!.owner,
+          repository!.repo,
           identity.branch || undefined,
+          {
+            repoUrl: repositoryInputReference(
+              identity.githubUrl || identity.path || '',
+              identity.sourceControl,
+            )?.projectUrl,
+          },
         );
     // Staleness guard: user switched repos — or, for GitHub, the branch —
     // while the read was in flight (compare the full ref-aware identity;

@@ -104,3 +104,23 @@ describe('GitHubAvatar', () => {
     expect(img.getAttribute('loading')).toBe('lazy');
   });
 });
+
+describe('forge identity isolation', () => {
+  it('never requests a GitHub image for a GitLab identity and resets on server changes', async () => {
+    const { container, rerender } = render(GitHubAvatar, {
+      props: { identity: 'bert', provider: 'gitlab' },
+    });
+    expect(visibleImage(container)).toBeNull();
+    expect(container.textContent).toContain('B');
+    await rerender({
+      identity: 'bert',
+      provider: 'gitlab',
+      avatarUrl: 'https://git.example/avatar/42.png',
+    });
+    expect(visibleImage(container)?.src).toBe('https://git.example/avatar/42.png');
+    await fireEvent.error(visibleImage(container)!);
+    expect(visibleImage(container)).toBeNull();
+    await rerender({ identity: 'bert', provider: 'github', avatarUrl: null });
+    expect(visibleImage(container)?.src).toContain('github.com/bert.png');
+  });
+});

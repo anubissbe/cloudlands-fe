@@ -35,7 +35,10 @@
     selectPostMergeState,
     selectGitOperationFlags,
   } from '$store/renderer/slices/git/git-selectors';
-  import { selectGitHubAuthIsAuthenticated } from '$store/renderer/slices/github-auth/github-auth-selectors';
+  import {
+    selectWorkspaceSourceControlIsAuthenticated,
+    selectWorkspaceSourceControlSettings,
+  } from '$store/renderer/slices/source-control/source-control-selectors';
   import { initializeGitHubAuth } from '$store/renderer/slices/github-auth/github-auth-slice';
   import { getPanelLayoutManager } from '$features/layout/panel-layout-adapter';
   import { handleLink } from '$features/navigation/link-handler';
@@ -49,7 +52,7 @@
   import { selectAllWorkspaceAgents } from '$store/renderer/slices/workspace-agents/workspace-agents-selectors';
   import { workspaceClient } from '$store/renderer/slices/workspace/utils/workspace.client';
 
-  import GitHubAuthBanner from '$lib/components/GitHubAuthBanner.svelte';
+  import SourceControlAuthBanner from '$features/source-control/SourceControlAuthBanner.svelte';
   import FileRow from '$lib/components/file-tracking/accept-changes/FileRow.svelte';
   import type { PRInfo } from '$lib/components/file-tracking/accept-changes/types';
   import LineChangesBadge from '$lib/components/shared/LineChangesBadge.svelte';
@@ -193,7 +196,22 @@
     workspaceIdStore.set(workspaceId);
   });
 
-  const githubAuthIsAuthenticated$ = selectGitHubAuthIsAuthenticated();
+  const githubAuthIsAuthenticated$ = selectWorkspaceSourceControlIsAuthenticated(workspaceIdStore);
+  const sourceControl$ = selectWorkspaceSourceControlSettings(workspaceIdStore);
+  const isGitLab = $derived($sourceControl$.provider === 'gitlab');
+  const createRepositoryUrl = $derived(
+    isGitLab
+      ? `${$sourceControl$.instanceUrl.replace(/\/$/, '')}/projects/new`
+      : 'https://github.com/new',
+  );
+  const connectMessage = $derived(
+    isGitLab
+      ? m.settings_sourceControl_gitlabConnect_description()
+      : m.workspace_prSection_connectGithub_label(),
+  );
+  const createRequestLabel = $derived(
+    isGitLab ? m.workspace_prSection_createMr_label() : m.workspace_prSection_createPr_label(),
+  );
   const workspace$ = selectWorkspaceById(workspaceIdStore);
   // Agent attribution for monitored PR rows (PROTOCOL §6.9).
   const workspaceAgents$ = selectAllWorkspaceAgents(workspaceIdStore);
@@ -384,7 +402,7 @@
       }
       if (!$githubAuthIsAuthenticated$) {
         pendingActionAfterAuth = 'refresh-pr';
-        notify.info(m.workspace_prSection_connectGithub_label());
+        notify.info(connectMessage);
         return;
       }
       try {
@@ -420,7 +438,7 @@
     if (!$githubAuthIsAuthenticated$) {
       pendingActionAfterAuth = 'create-pr';
       pendingPRWorkspaceId = wsId;
-      notify.info(m.workspace_prSection_connectGithub_label());
+      notify.info(connectMessage);
       return;
     }
     isCreatingPR = true;
@@ -439,7 +457,7 @@
       } else if (result.needsAuth) {
         pendingActionAfterAuth = 'create-pr';
         pendingPRWorkspaceId = wsId;
-        notify.info(m.workspace_prSection_connectGithub_label());
+        notify.info(connectMessage);
       } else {
         notify.error(result.error || m.workspace_prCreator_createFailed_error());
       }
@@ -750,7 +768,7 @@
           expanded={prDrawerOpen}
           disabled={!hasStaged && !hasCommits}
         >
-          {m.workspace_prSection_createPr_label()}
+          {createRequestLabel}
         </DividerButton>
         <DividerButton
           data-testid="pr-merge-button"
@@ -769,7 +787,10 @@
       </div>
       <DividerPanel open={prDrawerOpen}>
         {#if !$githubAuthIsAuthenticated$}
-          <GitHubAuthBanner onSuccess={() => {}} />
+          <SourceControlAuthBanner
+            connectionId={$sourceControl$.connectionId}
+            onSuccess={() => {}}
+          />
         {:else}
           {@const stagedDescription = hasStaged
             ? stagedChanges.length === 1
@@ -860,7 +881,7 @@
                 >
               {:else}
                 <Fa icon={faCodePullRequest} size="xs" class="opacity-50" />
-                <span>{m.workspace_prSection_createPr_label()}</span>
+                <span>{createRequestLabel}</span>
               {/if}
             </Button>
             {#if isGeneratingPR}
@@ -1039,7 +1060,9 @@
 {#if hasAnyPRs}
   <div transition:slide={{ tier: 'moderate' }}>
     <TimelineSection
-      title={m.workspace_prSection_pullRequests_label()}
+      title={isGitLab
+        ? m.workspace_prSection_mergeRequests_label()
+        : m.workspace_prSection_pullRequests_label()}
       active={hasAnyPRs}
       activeColor="bg-purple-500"
     >
@@ -1068,7 +1091,7 @@
             disabled={isRefreshingPR}
             title={$githubAuthIsAuthenticated$
               ? m.workspace_prSection_refreshPrStatus_tooltip()
-              : m.workspace_prSection_connectToGithub_label()}
+              : connectMessage}
           >
             <Fa icon={faArrowsRotate} class="opacity-50 text-ui" />
           </Button>
@@ -1077,8 +1100,9 @@
       {#snippet children()}
         {#if isOwner && !$githubAuthIsAuthenticated$}
           {#key authBannerKey}
-            <GitHubAuthBanner
-              message={m.workspace_prSection_connectToGithub_label()}
+            <SourceControlAuthBanner
+              connectionId={$sourceControl$.connectionId}
+              message={connectMessage}
               onSuccess={handleGitHubAuthSuccess}
               autoStart={authBannerKey > 0}
             />
@@ -1327,17 +1351,19 @@
       <p class="text-xs text-subtle">
         {m.workspace_prSection_noRepo_label()}
         <a
-          href="https://github.com/new"
+          href={createRepositoryUrl}
           class="text-primary-ink hover:underline inline-flex items-center gap-0.5"
           onclick={(e) => {
             e.preventDefault();
-            handleLink('https://github.com/new', {
+            handleLink(createRepositoryUrl, {
               workspaceId: workspaceId as WorkspaceId,
               event: e,
             });
           }}
         >
-          {m.workspace_prSection_createOnGithub_label()}
+          {isGitLab
+            ? m.workspace_prSection_createOnGitlab_label()
+            : m.workspace_prSection_createOnGithub_label()}
           <Fa icon={faArrowUpRightFromSquare} size="xs" class="opacity-70" />
         </a>
       </p>

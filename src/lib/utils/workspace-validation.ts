@@ -2,6 +2,8 @@
  * Utilities for validating workspace initialization inputs
  */
 
+import { parseRepositoryInput } from '$features/source-control/utils/repository';
+import type { SourceControlSettings } from '$features/source-control/types';
 import { createLogger } from './client-logger';
 import { invoke } from '$shared/generated/ipc-client';
 import { m } from '$shared/paraglide/messages.js';
@@ -39,6 +41,7 @@ export interface RepoValidationResult extends ValidationResult {
 export async function validateRepoPath(
   path: string,
   allowNewRepo: boolean = false,
+  sourceControl?: Pick<SourceControlSettings, 'provider' | 'instanceUrl'>,
 ): Promise<RepoValidationResult> {
   if (!path || path.trim().length === 0) {
     return {
@@ -49,6 +52,16 @@ export async function validateRepoPath(
   }
 
   const trimmedPath = path.trim();
+
+  if (sourceControl?.provider === 'gitlab') {
+    if (parseRepositoryInput(trimmedPath, sourceControl)) return { valid: true };
+    if (/^(https?:\/\/|ssh:\/\/|git@)/i.test(trimmedPath)) {
+      return {
+        valid: false,
+        error: m.onboarding_sourceControl_enterRepo_label({ provider: 'GitLab' }),
+      };
+    }
+  }
 
   // Check if it's a GitHub URL
   if (isGitHubUrl(trimmedPath)) {

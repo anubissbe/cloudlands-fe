@@ -23,6 +23,7 @@
   import { setWorkspaceEntity } from '$store/renderer/slices/workspace/workspace-slice';
   import { workspaceClient } from '$store/renderer/slices/workspace/utils/workspace.client';
 
+  import { selectWorkspaceSourceControlSettings } from '$store/renderer/slices/source-control/source-control-selectors';
   import { selectSidebarMergeWhenReady } from '$store/renderer/slices/changes/changes-selectors';
   import BranchSelector from '$lib/components/workspace/initializer/BranchSelector.svelte';
   import { Button } from '$lib/components/ui/button';
@@ -82,6 +83,13 @@
     workspaceIdStore.set(workspaceId);
   });
 
+  const sourceControl$ = selectWorkspaceSourceControlSettings(workspaceIdStore);
+  const isGitLab = $derived($sourceControl$.provider === 'gitlab');
+  const mergeFailedMessage = $derived(
+    isGitLab
+      ? m.workspace_mergePanel_mrMergeFailed_error()
+      : m.workspace_mergePanel_prMergeFailed_error(),
+  );
   const workspace = selectWorkspaceById(workspaceIdStore);
   const mergeExecState$ = selectExecutorState(workspaceIdStore, readable('commit-merge'));
   const mergeWhenReady$ = selectSidebarMergeWhenReady(workspaceIdStore);
@@ -251,11 +259,15 @@
     }
   }
 
-  async function handleMergePROnGitHub(options?: { mergeMethod?: 'merge' | 'squash' | 'rebase' }) {
+  async function handleMergeRequest(options?: { mergeMethod?: 'merge' | 'squash' | 'rebase' }) {
     if (!workspaceId) return;
     const openPR = pullRequests.find((pr) => pr.status === 'open' || pr.status === 'draft');
     if (!openPR) {
-      notify.error(m.workspace_mergePanel_noOpenPr_error());
+      notify.error(
+        isGitLab
+          ? m.workspace_mergePanel_noOpenMr_error()
+          : m.workspace_mergePanel_noOpenPr_error(),
+      );
       return;
     }
 
@@ -263,6 +275,7 @@
     try {
       const result = await AcceptChangesClient.mergePR(workspaceId as WorkspaceId, openPR.number, {
         mergeMethod: options?.mergeMethod || (mergeOptions.squash ? 'squash' : 'merge'),
+        expectedHeadSha: openPR.headSha ?? allCommits[0]?.hash,
       });
       if (result.success) {
         dispatchPostMergeUpdate({
@@ -279,13 +292,17 @@
         } catch {
           /* Refresh failed but merge succeeded */
         }
-        notify.success(m.workspace_mergePanel_prMergedOnGithub_label({ number: openPR.number }));
+        notify.success(
+          isGitLab
+            ? m.workspace_mergePanel_mrMergedOnGitlab_label({ number: openPR.number })
+            : m.workspace_mergePanel_prMergedOnGithub_label({ number: openPR.number }),
+        );
         celebrateMerge();
       } else {
-        notify.error(result.error || m.workspace_mergePanel_prMergeFailed_error());
+        notify.error(result.error || mergeFailedMessage);
       }
     } catch {
-      notify.error(m.workspace_mergePanel_prMergeFailed_error());
+      notify.error(mergeFailedMessage);
     } finally {
       mergeOptions.mergingPR = false;
     }
@@ -332,7 +349,7 @@
         : 'bg-transparent text-muted-foreground hover:text-foreground hover:bg-muted'}"
       onclick={() => (mergeOptions.viaPR = true)}
     >
-      {m.workspace_mergePanel_viaPr_label()}
+      {isGitLab ? m.workspace_mergePanel_viaMr_label() : m.workspace_mergePanel_viaPr_label()}
     </Button>
     <Button
       variant="ghost"
@@ -347,11 +364,13 @@
 {/if}
 
 {#if mergeOptions.viaPR && hasOpenPR && hasRemote}
-  <!-- GitHub merge: merge the PR via the GitHub API -->
+  <!-- Merge the request through the active source-control provider. -->
   {@const openPR = pullRequests.find((pr) => pr.status === 'open' || pr.status === 'draft')}
   {#if openPR}
     <p class="text-xs text-subtle">
-      {m.workspace_mergePanel_prMergedInto_before({ number: openPR.number })}
+      {isGitLab
+        ? m.workspace_mergePanel_mrMergedInto_before({ number: openPR.number })
+        : m.workspace_mergePanel_prMergedInto_before({ number: openPR.number })}
       <!-- i18n-ignore (intentional default branch fallback) -->
       <span class="font-medium text-foreground">{targetBranch || trunkBranch || 'main'}</span>.
     </p>
@@ -396,18 +415,26 @@
         variant="default"
         size="xs"
         onclick={() =>
-          handleMergePROnGitHub({ mergeMethod: mergeOptions.squash ? 'squash' : 'merge' })}
+          handleMergeRequest({ mergeMethod: mergeOptions.squash ? 'squash' : 'merge' })}
         disabled={mergeOptions.mergingPR}
       >
         {#if mergeOptions.mergingPR}
           <IntentMarkLoader size={12} />
-          <span>{m.workspace_mergePanel_mergingOnGithub_label()}</span>
+          <span
+            >{isGitLab
+              ? m.workspace_mergePanel_mergingOnGitlab_label()
+              : m.workspace_mergePanel_mergingOnGithub_label()}</span
+          >
         {:else}
           <Fa icon={faCodeMerge} size="xs" class="opacity-50" />
           <span
             >{mergeOptions.squash
-              ? m.workspace_mergePanel_squashMergePr_label()
-              : m.workspace_mergePanel_mergePr_label()}</span
+              ? isGitLab
+                ? m.workspace_mergePanel_squashMergeMr_label()
+                : m.workspace_mergePanel_squashMergePr_label()
+              : isGitLab
+                ? m.workspace_mergePanel_mergeMr_label()
+                : m.workspace_mergePanel_mergePr_label()}</span
           >
         {/if}
       </Button>

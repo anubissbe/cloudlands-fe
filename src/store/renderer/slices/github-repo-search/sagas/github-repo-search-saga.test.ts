@@ -17,7 +17,12 @@ import {
   clearGithubRepoSearch,
   searchGithubRepos,
 } from '$store/renderer/slices/github-repo-search/github-repo-search-slice';
+import {
+  initialState as initialAuthState,
+  setGitHubAuthState,
+} from '../../github-auth/github-auth-slice';
 import { getItems } from '@augmentcode/themis/utils/collections/collection-utils';
+import { selectSourceControlConnection } from '../../source-control/source-control-slice';
 import { githubRepoSearchSaga, SEARCH_DEBOUNCE_MS } from './github-repo-search-saga';
 
 type Fn = ReturnType<typeof vi.fn>;
@@ -57,6 +62,8 @@ describe('githubRepoSearchSaga (fake seam, real store)', () => {
   beforeEach(() => {
     vi.useFakeTimers();
     appStore.dispatch(clearGithubRepoSearch());
+    appStore.dispatch(setGitHubAuthState(initialAuthState));
+    appStore.dispatch(selectSourceControlConnection('https://github.com'));
   });
   afterEach(() => {
     vi.useRealTimers();
@@ -73,7 +80,9 @@ describe('githubRepoSearchSaga (fake seam, real store)', () => {
 
     await vi.advanceTimersByTimeAsync(1);
     expect(searchApi.searchRepos).toHaveBeenCalledTimes(1);
-    expect(searchApi.searchRepos).toHaveBeenCalledWith('svelte');
+    expect(searchApi.searchRepos).toHaveBeenCalledWith('svelte', {
+      connectionId: 'https://github.com',
+    });
   });
 
   it('stores the mapped results for the searched query', async () => {
@@ -86,7 +95,9 @@ describe('githubRepoSearchSaga (fake seam, real store)', () => {
     await flush();
 
     // The trimmed query is what reaches the wire and the slice.
-    expect(searchApi.searchRepos).toHaveBeenCalledWith('svelte');
+    expect(searchApi.searchRepos).toHaveBeenCalledWith('svelte', {
+      connectionId: 'https://github.com',
+    });
     expect(appStore.state.githubRepoSearch.lastQuery).toBe('svelte');
     expect(appStore.state.githubRepoSearch.loading).toBe(false);
     expect(appStore.state.githubRepoSearch.error).toBeNull();
@@ -221,6 +232,38 @@ describe('githubRepoSearchSaga (fake seam, real store)', () => {
 
     expect(appStore.state.githubRepoSearch.lastQuery).toBe('');
     expect(appStore.state.githubRepoSearch.loading).toBe(false);
+    expect(getItems(appStore.state.githubRepoSearch.results)).toEqual([]);
+  });
+  it('clears and cancels an in-flight search when source-control cache is invalidated', async () => {
+    let resolveOld!: (value: unknown) => void;
+    searchApi.searchRepos.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveOld = resolve;
+        }),
+    );
+    appStore.dispatch(searchGithubRepos('camiel'));
+    await vi.advanceTimersByTimeAsync(SEARCH_DEBOUNCE_MS);
+    appStore.dispatch(clearGithubRepoSearch());
+    resolveOld(ok(wireRepo('old-forge', 'camiel')));
+    await flush();
+    expect(appStore.state.githubRepoSearch.lastQuery).toBe('');
+    expect(getItems(appStore.state.githubRepoSearch.results)).toEqual([]);
+  });
+
+  it('rejects an old-instance response even before the invalidation action arrives', async () => {
+    let resolveOld!: (value: unknown) => void;
+    searchApi.searchRepos.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveOld = resolve;
+        }),
+    );
+    appStore.dispatch(searchGithubRepos('camiel'));
+    await vi.advanceTimersByTimeAsync(SEARCH_DEBOUNCE_MS);
+    appStore.dispatch(selectSourceControlConnection('https://git.euraika.net'));
+    resolveOld(ok(wireRepo('old-forge', 'camiel')));
+    await flush();
     expect(getItems(appStore.state.githubRepoSearch.results)).toEqual([]);
   });
 });

@@ -1,3 +1,4 @@
+import { selectSelectedSourceControlConnectionId } from '$store/renderer/slices/source-control/source-control-selectors';
 import type { Task } from 'redux-saga';
 import type { SagaGenerator } from 'typed-redux-saga';
 import {
@@ -43,12 +44,14 @@ import {
   setFileExplorerLoading,
 } from '../../file-explorer/file-explorer-slice';
 import {
+  clearGithubRepos,
   loadGithubRepos,
   setGithubRepos,
   setGithubReposError,
   setGithubReposLoading,
   type GithubRepoItem,
 } from '../../github-repos/github-repos-slice';
+import { selectSourceControlRepositoryNamespace } from '../../github-auth/github-auth-selectors';
 import { loadKnownRepos, setRepos } from '../../known-repos/known-repos-slice';
 import { selectPanels } from '../../panel-layout/panel-layout-selectors';
 import {
@@ -112,20 +115,40 @@ function normalizeRepo(repo: GithubRepo): GithubRepoItem {
     owner: repo.owner,
     name: repo.name,
     defaultBranch: repo.default_branch,
+    ...(repo.html_url ? { htmlUrl: repo.html_url } : {}),
   };
 }
 
 function* refreshGithubRepos(): SagaGenerator<void> {
+  const namespace = yield* selectSourceControlRepositoryNamespace.effect();
+  const connectionId = yield* selectSelectedSourceControlConnectionId.effect();
   yield* put(setGithubReposLoading());
   try {
-    const repos: Awaited<ReturnType<typeof githubAuthClient.listRepos>> = yield* call([
-      githubAuthClient,
-      githubAuthClient.listRepos,
-    ]);
+    const repos: Awaited<ReturnType<typeof githubAuthClient.listRepos>> = yield* call(
+      [githubAuthClient, githubAuthClient.listRepos],
+      undefined,
+      { connectionId },
+    );
+    if (namespace !== (yield* selectSourceControlRepositoryNamespace.effect())) return;
     yield* put(setGithubRepos(repos.map(normalizeRepo)));
   } catch (error) {
+    if (namespace !== (yield* selectSourceControlRepositoryNamespace.effect())) return;
     yield* put(setGithubReposError(error instanceof Error ? error.message : String(error)));
   }
+}
+
+/** Preserve single-flight loading, but let an authority reset cancel the old request. */
+function* watchGithubRepos(): SagaGenerator<void> {
+  let pending: Task | undefined;
+  yield* all([
+    takeEvery(loadGithubRepos, function* (): SagaGenerator<void> {
+      if (!pending?.isRunning()) pending = yield* fork(refreshGithubRepos);
+    }),
+    takeEvery(clearGithubRepos, function* (): SagaGenerator<void> {
+      if (pending?.isRunning()) yield* cancel(pending);
+      pending = undefined;
+    }),
+  ]);
 }
 
 function* refreshEditors(forceRefresh: boolean): SagaGenerator<void> {
@@ -553,7 +576,7 @@ export function* lifecycleIpcReadSaga(): SagaGenerator<void> {
   const coordinator: DeferredHydrationCoordinator = { tasks: new Map(), generations: new Map() };
   const backend = { id: yield* selectActiveBackendId() };
   yield* all([
-    takeLeading(loadGithubRepos, refreshGithubRepos),
+    fork(watchGithubRepos),
     takeLeading(fetchEditors, refreshEditorsWorker),
     takeLeading(loadKnownRepos, refreshKnownRepos),
     takeEvery(workspaceHydrationRequested, workspaceHydrationRequestedWorker),

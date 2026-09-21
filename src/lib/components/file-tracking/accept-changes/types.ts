@@ -108,6 +108,7 @@ type PRDisplayStatus = 'open' | 'merged' | 'closed' | 'draft';
 
 /** Pull request info for display */
 export interface PRInfo {
+  headSha?: string;
   number: number;
   title: string;
   url: string;

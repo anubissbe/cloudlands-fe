@@ -242,9 +242,14 @@ function toLegacyRepo(repo: GithubRepoWire): GithubRepo {
 // The legacy channel pages with `{ page }`; the daemon paginates with an
 // opaque `nextToken` cursor, so the first daemon page (default limit 50)
 // serves every legacy page request.
-registerMockIpcHandler(GITHUB_AUTH_CHANNELS.LIST_REPOS, async () => {
+registerMockIpcHandler(GITHUB_AUTH_CHANNELS.LIST_REPOS, async (arg) => {
   try {
-    const result = await backendRequest<{ repos?: GithubRepoWire[] }>('github.repos.list');
+    const params = asRecord(arg);
+    const connectionId = typeof params.connectionId === 'string' ? params.connectionId : undefined;
+    const result = await backendRequest<{ repos?: GithubRepoWire[] }>(
+      connectionId ? 'sourceControl.repos.list' : 'github.repos.list',
+      connectionId ? { connectionId } : undefined,
+    );
     return { success: true, data: (result?.repos ?? []).map(toLegacyRepo) };
   } catch (error) {
     return { success: false, error: errorMessage(error) };
@@ -257,9 +262,15 @@ registerMockIpcHandler(GITHUB_AUTH_CHANNELS.SEARCH_REPOS, async (arg) => {
     return { success: false, error: 'query is required' };
   }
   try {
-    const result = await backendRequest<{ repos?: GithubRepoWire[] }>('github.repos.search', {
-      query,
-    });
+    const params = asRecord(arg);
+    const connectionId = typeof params.connectionId === 'string' ? params.connectionId : undefined;
+    const result = await backendRequest<{ repos?: GithubRepoWire[] }>(
+      connectionId ? 'sourceControl.repos.search' : 'github.repos.search',
+      {
+        query,
+        ...(connectionId ? { connectionId } : {}),
+      },
+    );
     return { success: true, data: (result?.repos ?? []).map(toLegacyRepo) };
   } catch (error) {
     return { success: false, error: errorMessage(error) };
@@ -358,10 +369,25 @@ function asRepoRef(value: unknown): GithubRepoRef | null {
   return { owner, repo };
 }
 
+function repositoryContext(arg: unknown): { connectionId?: string; repoUrl?: string } {
+  const params = asRecord(arg);
+  return {
+    ...(typeof params.connectionId === 'string' ? { connectionId: params.connectionId } : {}),
+    ...(typeof params.repoUrl === 'string' ? { repoUrl: params.repoUrl } : {}),
+  };
+}
+function sourceControlMethod(method: string, arg: unknown): string {
+  return Object.keys(repositoryContext(arg)).length
+    ? method.replace(/^github\./, 'sourceControl.')
+    : method;
+}
+
 /** Legacy search params sent by IssueSuggestions: `{ owner, repo, options }`. */
 function searchParams(arg: unknown): {
   owner: string;
   repo: string;
+  connectionId?: string;
+  repoUrl?: string;
   filter?: string;
   state?: string;
   query?: string;
@@ -380,6 +406,7 @@ function searchParams(arg: unknown): {
   return {
     owner,
     repo,
+    ...repositoryContext(params),
     filter: typeof options.filter === 'string' ? options.filter : undefined,
     state: typeof options.state === 'string' ? options.state : undefined,
     query: typeof options.query === 'string' && options.query ? options.query : undefined,
@@ -406,7 +433,7 @@ registerMockIpcHandler(IPC_CHANNELS.GIT_TRACKING.SEARCH_GITHUB_ISSUES, async (ar
   if (!params) return { success: false, error: 'owner and repo are required' };
   try {
     const result = await backendRequest<{ issues: GithubIssueWire[]; nextToken?: string | null }>(
-      'github.issues.search',
+      sourceControlMethod('github.issues.search', params),
       params,
     );
     const data = result.issues.map((issue) => {
@@ -442,7 +469,7 @@ registerMockIpcHandler(IPC_CHANNELS.GIT_TRACKING.SEARCH_PULL_REQUESTS, async (ar
   if (!params) return { success: false, error: 'owner and repo are required' };
   try {
     const result = await backendRequest<{ pulls: GithubPullWire[]; nextToken?: string | null }>(
-      'github.pulls.search',
+      sourceControlMethod('github.pulls.search', params),
       params,
     );
     const data = result.pulls.map((pull) => {
@@ -481,7 +508,7 @@ registerMockIpcHandler(IPC_CHANNELS.GIT_TRACKING.LIST_RELATED_REPOS, async (arg)
   try {
     const result = await backendRequest<{
       repos?: (GithubRepoRef & { path: string })[];
-    }>('github.relatedRepos.list', ref);
+    }>(sourceControlMethod('github.relatedRepos.list', arg), { ...ref, ...repositoryContext(arg) });
     return { success: true, data: result?.repos ?? [] };
   } catch (error) {
     return { success: false, error: errorMessage(error) };
@@ -501,11 +528,15 @@ registerMockIpcHandler(IPC_CHANNELS.GIT_TRACKING.GET_PULL_REQUEST, async (arg) =
     return { success: false, error: 'number is required' };
   }
   try {
-    const result = await backendRequest<{ pull?: GithubPullWire | null }>('github.pulls.get', {
-      owner,
-      repo,
-      number,
-    });
+    const result = await backendRequest<{ pull?: GithubPullWire | null }>(
+      sourceControlMethod('github.pulls.get', params),
+      {
+        ...repositoryContext(params),
+        owner,
+        repo,
+        number,
+      },
+    );
     const pull = result?.pull;
     if (!pull) return { success: false, error: `Pull request #${number} not found` };
     return {

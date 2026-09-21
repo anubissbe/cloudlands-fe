@@ -1,3 +1,4 @@
+import { parseSourceControlLink, type ForgeConnectionIdentity } from './source-control-url';
 import type { WorkspaceId } from '$shared/types/branded-ids';
 
 export const GITHUB_LINK_DEFAULT_ACTIONS = [
@@ -106,6 +107,10 @@ type GitHubIssueOrPrKind = 'issue' | 'pr';
 
 /** A GitHub issue or pull-request reference parsed from a github.com URL. */
 export interface GitHubIssueOrPrRef {
+  provider?: 'github' | 'gitlab';
+  connectionId?: string;
+  instanceUrl?: string;
+  projectUrl?: string;
   owner: string;
   repo: string;
   number: number;
@@ -134,6 +139,25 @@ export function parseGitHubIssueOrPrUrl(url: string): GitHubIssueOrPrRef | null 
   } catch {
     return null;
   }
+}
+
+/** Route issue/MR links only for known forge authorities; retain the legacy GH shape. */
+export function parseSourceControlIssueOrPrUrl(
+  url: string,
+  connections: readonly ForgeConnectionIdentity[],
+): GitHubIssueOrPrRef | null {
+  const parsed = parseSourceControlLink(url, connections);
+  if (!parsed || parsed.kind === 'project' || !parsed.number) return null;
+  const ref = { owner: parsed.owner, repo: parsed.repo, number: parsed.number, kind: parsed.kind };
+  return parsed.provider === 'github'
+    ? ref
+    : {
+        ...ref,
+        provider: parsed.provider,
+        connectionId: parsed.connectionId,
+        instanceUrl: parsed.instanceUrl,
+        projectUrl: parsed.projectUrl,
+      };
 }
 
 /** Detect whether the platform-appropriate "Cmd" modifier is held. */

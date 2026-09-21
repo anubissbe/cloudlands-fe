@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { selectSourceControlConnection } from '$store/renderer/slices/source-control/source-control-slice';
+  import SourceControlConnectionPicker from '$features/source-control/SourceControlConnectionPicker.svelte';
   /* eslint-disable max-lines */
   import { workspaceClient } from '$store/renderer/slices/workspace/utils/workspace.client';
   import { isElectronPlatform } from '$lib/utils/platform-capabilities';
@@ -43,9 +45,22 @@
   import DirectoryPickerModal from '$features/onboarding/messages/DirectoryPickerModal.svelte';
   import { pickDirectory } from '$lib/directory-picker-service';
   import { selectIsFeatureEnabled } from '$store/renderer/slices/feature-codes/feature-codes-selectors';
-  import GitHubAuthBanner from '$lib/components/GitHubAuthBanner.svelte';
+  import SourceControlAuthBanner from '$features/source-control/SourceControlAuthBanner.svelte';
+  import SourceControlIcon from '$features/source-control/SourceControlIcon.svelte';
+  import { sourceControlInstanceLabel } from '$features/source-control/utils/presentation';
+  import {
+    parseRepositoryInput,
+    repositoryInputReference,
+    normalizeRepositoryInput,
+    repositoryInputUrl,
+    repositoryUrl,
+    repositoryBaseUrl,
+  } from '$features/source-control/utils/repository';
   import { initializeGitHubAuth } from '$store/renderer/slices/github-auth/github-auth-slice';
-  import { selectGitHubAuthIsAuthenticated } from '$store/renderer/slices/github-auth/github-auth-selectors';
+  import {
+    selectSourceControlIsAuthenticated,
+    selectSourceControlSettings,
+  } from '$store/renderer/slices/github-auth/github-auth-selectors';
   import {
     loadGithubRepos,
     type GithubRepoItem,
@@ -97,7 +112,11 @@
 
   // GitHub autocomplete sources for the "Pick a repo" tab: the user's own
   // repos (client-side filtered) plus a debounced global search.
-  const isGithubAuthenticated$ = selectGitHubAuthIsAuthenticated();
+  const isGithubAuthenticated$ = selectSourceControlIsAuthenticated();
+  const sourceControl$ = selectSourceControlSettings();
+  const provider = $derived($sourceControl$.provider);
+  const providerName = $derived(provider === 'gitlab' ? 'GitLab' : 'GitHub');
+  const instanceLabel = $derived(sourceControlInstanceLabel(repositoryBaseUrl($sourceControl$)));
   const githubRepos$ = selectGithubRepos();
   const githubReposLoading$ = selectGithubReposLoading();
   const githubReposLoaded$ = selectGithubReposLoaded();
@@ -166,6 +185,10 @@
   }: Props = $props();
 
   function onchangeWithTracking(detail: RepoChangeDetail) {
+    if (detail.githubUrl) {
+      const identity = repositoryInputReference(detail.githubUrl, $sourceControl$);
+      if (identity) appStore.dispatch(selectSourceControlConnection(identity.connectionId));
+    }
     if (!onchange) return;
     onchange(new CustomEvent('change', { detail }));
   }
@@ -381,7 +404,14 @@
   const filteredRepos = $derived(() => {
     // First filter by tab type
     const typeFilter = activeTab === 'local' ? 'local' : activeTab === 'github' ? 'github' : null;
-    const typeFiltered = typeFilter ? recentRepos.filter((repo) => repo.type === typeFilter) : [];
+    const typeFiltered = typeFilter
+      ? recentRepos.filter(
+          (repo) =>
+            repo.type === typeFilter &&
+            (repo.type !== 'github' ||
+              !!parseRepositoryInput(repo.githubUrl || repo.path, $sourceControl$)),
+        )
+      : [];
 
     // Then filter by search term
     if (searchTerm === '') {
@@ -400,7 +430,9 @@
   const githubQuery = $derived(githubUrlInput.trim());
 
   const ownedGithubSuggestions = $derived.by<GithubRepoItem[]>(() => {
-    const all = $githubRepos$;
+    const all = $githubRepos$.filter(
+      (repo) => !!parseRepositoryInput(repositoryUrl(repo, $sourceControl$), $sourceControl$),
+    );
     if (!all.length) return [];
     const q = githubQuery.toLowerCase();
     return q ? all.filter((r) => `${r.owner}/${r.name}`.toLowerCase().includes(q)) : all;
@@ -411,7 +443,11 @@
     const results = $githubSearchResults$;
     if (!results.length) return [];
     const ownedIds = new Set($githubRepos$.map((r) => r.id));
-    return results.filter((r) => !ownedIds.has(r.id));
+    return results.filter(
+      (r) =>
+        !ownedIds.has(r.id) &&
+        !!parseRepositoryInput(repositoryUrl(r, $sourceControl$), $sourceControl$),
+    );
   });
 
   /** Single combined suggestion list rendered under the GitHub input. */
@@ -471,7 +507,7 @@
     detectedGitHub = {
       owner: repo.owner,
       repo: repo.name,
-      url: `https://github.com/${repo.owner}/${repo.name}`,
+      url: repositoryUrl(repo, $sourceControl$),
     };
     handleConfirmGitHubPick();
   }
@@ -568,7 +604,7 @@
           githubUrlInput = `${githubInfo.owner}/${githubInfo.repo}`;
           // Pass an empty search term: the open-time pre-fill must not filter
           // the Recent list — only actual typing should (see handleGitHubInputChange).
-          handleInputChange(`https://github.com/${githubInfo.owner}/${githubInfo.repo}`, '');
+          handleInputChange(repositoryInputUrl(inputValue, $sourceControl$), '');
         }
       }
     } else {
@@ -720,8 +756,13 @@
       // Dedup key: GitHub entries by case-insensitive owner/repo shorthand so a
       // workspace-derived pick merges with its repos.known registration; local
       // entries stay keyed by checkout path.
-      const entryKey = (repo: Pick<RecentEntry, 'path' | 'type'>) =>
-        repo.type === 'github' ? `github:${repo.path.toLowerCase()}` : `local:${repo.path}`;
+      const entryKey = (repo: Pick<RecentEntry, 'path' | 'type' | 'githubUrl'>) =>
+        repo.type === 'github'
+          ? `forge:${(repo.githubUrl || repo.path)
+              .replace(/\.git$/, '')
+              .replace(/\/$/, '')
+              .toLowerCase()}`
+          : `local:${repo.path}`;
 
       // Build a map of repos (persisted recents, then registry, then workspace-derived)
       const repoMap = new Map<string, RecentEntry>();
@@ -784,10 +825,17 @@
             // the sidebar card's classification (recent-repos.ts).
             if (!repo.owner || !repo.name) continue;
             const shorthand = `${repo.owner}/${repo.name}`;
+            const known = Array.from(repoMap.values()).find(
+              (entry) =>
+                entry.type === 'github' &&
+                entry.path === shorthand &&
+                !!parseRepositoryInput(entry.githubUrl || '', $sourceControl$),
+            );
+            if (!known?.githubUrl && provider !== 'github') continue;
             const entry: RecentEntry = {
               path: shorthand,
               type: 'github' as const,
-              githubUrl: `https://github.com/${shorthand}`,
+              githubUrl: known?.githubUrl ?? `https://github.com/${shorthand}`,
               name: repo.name,
               owner: repo.owner,
             };
@@ -838,145 +886,14 @@
     }
   });
 
-  // Parse GitHub URL using the URL API for robust parsing
   function parseGitHubUrl(input: string): { owner: string; repo: string } | null {
-    const trimmed = input.trim();
-    if (!trimmed) return null;
-
-    // Handle SSH format: git@github.com:owner/repo.git
-    if (trimmed.startsWith('git@github.com:')) {
-      const sshPath = trimmed.slice('git@github.com:'.length);
-      const parts = sshPath.replace(/\.git$/, '').split('/');
-      if (parts.length >= 2 && parts[0] && parts[1]) {
-        return { owner: parts[0], repo: parts[1] };
-      }
-      return null;
-    }
-
-    // Try parsing as a URL
-    try {
-      const url = new URL(trimmed);
-
-      // Must be GitHub
-      if (url.hostname !== 'github.com' && url.hostname !== 'www.github.com') {
-        return null;
-      }
-
-      // Must be http or https
-      if (url.protocol !== 'http:' && url.protocol !== 'https:') {
-        return null;
-      }
-
-      // Parse the pathname: /owner/repo/... or /owner/repo.git
-      const pathParts = url.pathname.split('/').filter(Boolean);
-      if (pathParts.length < 2) {
-        return null;
-      }
-
-      const owner = pathParts[0];
-      // Remove .git suffix if present
-      const repo = pathParts[1].replace(/\.git$/, '');
-
-      if (owner && repo) {
-        return { owner, repo };
-      }
-    } catch {
-      // Not a valid URL, check for simple owner/repo shorthand
-    }
-
-    // Check for simple owner/repo format (e.g., "facebook/react")
-    // Must not look like a file path
-    if (
-      !trimmed.includes('\\') &&
-      !trimmed.includes(':') &&
-      !trimmed.startsWith('.') &&
-      !trimmed.startsWith('/')
-    ) {
-      const parts = trimmed.split('/');
-      if (parts.length === 2 && parts[0] && parts[1]) {
-        // Validate that both parts look like valid GitHub identifiers
-        const validIdentifier = (s: string) =>
-          /^[a-zA-Z0-9]([a-zA-Z0-9\-_\.]*[a-zA-Z0-9])?$/.test(s) || /^[a-zA-Z0-9]$/.test(s);
-        if (validIdentifier(parts[0]) && validIdentifier(parts[1])) {
-          return { owner: parts[0], repo: parts[1] };
-        }
-      }
-    }
-
-    return null;
+    return parseRepositoryInput(input, $sourceControl$);
   }
 
-  /**
-   * Normalize GitHub input to just "owner/repo" format.
-   * Handles all common input patterns:
-   * - Full URLs: https://github.com/owner/repo → owner/repo
-   * - URLs with www: https://www.github.com/owner/repo → owner/repo
-   * - URLs with .git: https://github.com/owner/repo.git → owner/repo
-   * - URLs with extra paths: https://github.com/owner/repo/tree/main → owner/repo
-   * - SSH URLs: git@github.com:owner/repo.git → owner/repo
-   * - With prefix: github.com/owner/repo → owner/repo
-   * - Plain: owner/repo → owner/repo
-   * - With trailing slash: owner/repo/ → owner/repo
-   */
-  function normalizeGitHubInput(input: string): string {
-    const trimmed = input.trim();
-    if (!trimmed) return '';
-
-    // Try to parse as a full GitHub URL first
-    const parsed = parseGitHubUrl(trimmed);
-    if (parsed) {
-      return `${parsed.owner}/${parsed.repo}`;
-    }
-
-    // Handle "github.com/owner/repo" without protocol
-    if (trimmed.toLowerCase().startsWith('github.com/')) {
-      const path = trimmed.slice('github.com/'.length);
-      const parts = path.split('/').filter(Boolean);
-      if (parts.length >= 2) {
-        return `${parts[0]}/${parts[1].replace(/\.git$/, '')}`;
-      }
-      return path.replace(/\/$/, ''); // Return what we have, trimming trailing slash
-    }
-
-    // Handle "www.github.com/owner/repo" without protocol
-    if (trimmed.toLowerCase().startsWith('www.github.com/')) {
-      const path = trimmed.slice('www.github.com/'.length);
-      const parts = path.split('/').filter(Boolean);
-      if (parts.length >= 2) {
-        return `${parts[0]}/${parts[1].replace(/\.git$/, '')}`;
-      }
-      return path.replace(/\/$/, '');
-    }
-
-    // Already in owner/repo format or partial - just clean it up
-    return trimmed.replace(/\/$/, '').replace(/\.git$/, '');
-  }
-
-  // Handle GitHub input change - only light normalization for typing
   function handleGitHubInputChange(value: string) {
-    // Don't normalize on every keystroke - just update the value
-    // Only strip obvious URL prefixes if user types/pastes them directly
-    let cleaned = value;
-
-    // If user somehow types a full URL, extract just the path
-    if (cleaned.toLowerCase().startsWith('https://github.com/')) {
-      cleaned = cleaned.slice('https://github.com/'.length);
-    } else if (cleaned.toLowerCase().startsWith('http://github.com/')) {
-      cleaned = cleaned.slice('http://github.com/'.length);
-    } else if (cleaned.toLowerCase().startsWith('github.com/')) {
-      cleaned = cleaned.slice('github.com/'.length);
-    }
-
+    const cleaned = normalizeRepositoryInput(value, $sourceControl$);
     githubUrlInput = cleaned;
-
-    // Trigger detection with the full URL for the existing logic; pass the
-    // raw typed text as the search term so the Recent list filters by it
-    if (cleaned) {
-      handleInputChange(`https://github.com/${cleaned}`, cleaned);
-    } else {
-      handleInputChange('');
-    }
-
+    handleInputChange(repositoryInputUrl(value, $sourceControl$), cleaned);
     dispatchGithubSearch(cleaned);
   }
 
@@ -995,12 +912,12 @@
     const pasted = e.clipboardData?.getData('text') || '';
     if (pasted) {
       e.preventDefault();
-      const normalized = normalizeGitHubInput(pasted);
+      const normalized = normalizeRepositoryInput(pasted, $sourceControl$);
       githubUrlInput = normalized;
 
       // Trigger detection
       if (normalized) {
-        handleInputChange(`https://github.com/${normalized}`, normalized);
+        handleInputChange(repositoryInputUrl(pasted, $sourceControl$), normalized);
       }
       dispatchGithubSearch(normalized);
     }
@@ -1057,13 +974,7 @@
   // Debounced detection of paths and URLs
   // Check if value is an explicit GitHub URL (not shorthand like owner/repo)
   function isExplicitGitHubUrl(value: string): boolean {
-    return (
-      value.startsWith('https://github.com') ||
-      value.startsWith('http://github.com') ||
-      value.startsWith('github.com') ||
-      value.startsWith('github:') ||
-      value.startsWith('git@github.com')
-    );
+    return /^(https?:\/\/|ssh:\/\/|git@)/i.test(value) && !!parseGitHubUrl(value);
   }
 
   async function detectPathOrUrl(value: string) {
@@ -1093,7 +1004,7 @@
     if (isExplicitGitHubUrl(value)) {
       const githubInfo = parseGitHubUrl(value);
       if (githubInfo) {
-        const githubUrl = `https://github.com/${githubInfo.owner}/${githubInfo.repo}`;
+        const githubUrl = repositoryInputUrl(value, $sourceControl$);
 
         detectedLocalPath = null;
         detectedGitHub = {
@@ -1333,7 +1244,9 @@
         picked = {
           owner: parsed.owner,
           repo: parsed.repo,
-          url: `https://github.com/${parsed.owner}/${parsed.repo}`,
+          url:
+            repositoryInputUrl(inputValue, $sourceControl$) ||
+            repositoryInputUrl(githubUrlInput, $sourceControl$),
         };
       }
     }
@@ -1456,7 +1369,11 @@
         {/if}
         {#if !triggerIcon && triggerAvatarOwner}
           <!-- Decorative: the adjacent label already names the owner. -->
-          <GitHubAvatar identity={triggerAvatarOwner} class="w-4 h-4 rounded-full shrink-0" />
+          {#if provider === 'github'}
+            <GitHubAvatar identity={triggerAvatarOwner} class="w-4 h-4 rounded-full shrink-0" />
+          {:else}
+            <SourceControlIcon {provider} class="shrink-0" />
+          {/if}
         {/if}
         {#if !triggerIcon && (selectedValue || emptyLabel)}
           <span class="flex-1 text-left truncate">
@@ -1528,13 +1445,14 @@
             <Fa icon={faFolder} class="text-ghost opacity-50" />
           </Button>
         {:else if activeTab === 'github'}
+          <SourceControlConnectionPicker />
           <!-- GitHub: URL input with prefix (path-less pick — no clone destination) -->
           <div
             class="flex items-center rounded-lg bg-sidebar focus-within:ring-1 focus-within:ring-ring"
           >
-            <Fa icon={faGithub} class="ml-3" />
+            <SourceControlIcon {provider} class="ml-3" />
             <!-- i18n-ignore (domain prefix) -->
-            <span class="text-sm pl-1.5 shrink-0 select-none">github.com/</span>
+            <span class="text-sm pl-1.5 shrink-0 select-none">{instanceLabel}/</span>
             <Input
               placeholder={/* i18n-ignore (GitHub path format example placeholder) */ 'owner/repo'}
               bind:this={inputElement}
@@ -1561,9 +1479,11 @@
             get a connect hint instead; manual owner/repo entry keeps working.
           -->
           {#if !$isGithubAuthenticated$}
-            <GitHubAuthBanner
+            <SourceControlAuthBanner
               class="mt-2"
-              message={m.workspace_repoSelector_githubSignIn_description()}
+              message={provider === 'github'
+                ? m.workspace_repoSelector_githubSignIn_description()
+                : m.onboarding_sourceControl_signIn_description({ provider: providerName })}
             />
           {:else if $githubReposError$}
             <div class="mt-2 px-1 text-sm text-subtle flex items-center gap-2">
@@ -1581,7 +1501,9 @@
             <div
               id="repo-selector-github-suggestions"
               role="listbox"
-              aria-label={m.workspace_repoSelector_githubSuggestions_ariaLabel()}
+              aria-label={m.workspace_repoSelector_providerSuggestions_ariaLabel({
+                provider: providerName,
+              })}
               class="mt-2 max-h-56 overflow-y-auto"
             >
               {#each githubSuggestions as repo, index (repo.id)}
@@ -1597,11 +1519,15 @@
                   onclick={() => handleSelectGithubSuggestion(repo)}
                   onmousemove={() => (suggestionIndex = index)}
                 >
-                  <GitHubAvatar
-                    identity={repo.owner}
-                    alt={repo.owner}
-                    class="w-4 h-4 rounded-full shrink-0"
-                  />
+                  {#if provider === 'github'}
+                    <GitHubAvatar
+                      identity={repo.owner}
+                      alt={repo.owner}
+                      class="w-4 h-4 rounded-full shrink-0"
+                    />
+                  {:else}
+                    <SourceControlIcon {provider} class="shrink-0" />
+                  {/if}
                   <span class="text-sm text-foreground truncate">
                     <span class="text-subtle mr-1">{repo.owner} /</span>{repo.name}
                   </span>
@@ -1611,7 +1537,12 @@
           {:else if githubQuery && $githubSearchLoading$}
             <div class="mt-2 flex items-center gap-2 px-1 text-sm text-subtle">
               <IntentMarkLoader size={12} />
-              <span>{m.workspace_repoSelector_searchingGithub_label({ query: githubQuery })}</span>
+              <span
+                >{m.workspace_repoSelector_searchingProvider_label({
+                  provider: providerName,
+                  query: githubQuery,
+                })}</span
+              >
             </div>
           {/if}
           <!-- Detected repo + select button (hidden when it would duplicate a
@@ -1836,8 +1767,14 @@
                     onclick={() => handleSelectRepo(repo)}
                   >
                     {#snippet leading()}
-                      {#if label.ownerPrefix}
-                        <GitHubAvatar identity={label.ownerPrefix} class="size-4 rounded-full">
+                      {#if repo.type === 'github' && provider === 'gitlab'}
+                        <SourceControlIcon {provider} class="text-subtle" />
+                      {:else if label.ownerPrefix}
+                        <GitHubAvatar
+                          provider={repo.type === 'github' ? provider : 'unknown'}
+                          identity={label.ownerPrefix}
+                          class="size-4 rounded-full"
+                        >
                           {#snippet fallback()}
                             <Fa icon={faGithub} class="text-subtle opacity-50" size={12} />
                           {/snippet}

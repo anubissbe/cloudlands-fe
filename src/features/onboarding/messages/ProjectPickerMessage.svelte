@@ -9,6 +9,8 @@
    *   - triggers sidebar slide-in
    *   - reveals Message 3
    */
+  import { selectSourceControlSettings } from '$store/renderer/slices/github-auth/github-auth-selectors';
+  import { parseRepositoryInput } from '$features/source-control/utils/repository';
   import { onMount } from 'svelte';
   import { m } from '$shared/paraglide/messages.js';
   import { createLogger } from '$lib/utils/client-logger';
@@ -25,6 +27,8 @@
   } from '$store/renderer/slices/workspace-initializer/workspace-initializer-selectors';
   import type { WorkspaceInitializerRepoSelection } from '$store/renderer/slices/workspace-initializer/workspace-initializer-types';
 
+  const sourceControl$ = selectSourceControlSettings();
+  const providerName = $derived($sourceControl$.provider === 'gitlab' ? 'GitLab' : 'GitHub');
   const logger = createLogger('ProjectPickerMessage');
 
   const WORKSPACE_PREFILL_KEY = 'workspace-prefill';
@@ -177,17 +181,11 @@
     }
   });
 
-  // Repo name parsed from the GitHub URL
-  const githubRepoName = $derived(
-    githubUrl.match(/github\.com\/[^/]+\/([^/\s#?]+)/i)?.[1]?.replace(/\.git$/, '') ?? '',
+  const parsedRepository = $derived(parseRepositoryInput(githubUrl, $sourceControl$));
+  const githubRepoName = $derived(parsedRepository?.repo ?? '');
+  const githubOwnerRepo = $derived(
+    parsedRepository ? `${parsedRepository.owner}/${parsedRepository.repo}` : '',
   );
-
-  // owner/repo shorthand parsed from the GitHub URL — used as the selection's
-  // repoPath (matches CompactWorkspaceInitializer's picked-repo convention).
-  const githubOwnerRepo = $derived.by(() => {
-    const match = githubUrl.match(/github\.com\/([^/]+)\/([^/\s#?]+)/i);
-    return match ? `${match[1]}/${match[2].replace(/\.git$/, '')}` : '';
-  });
 
   function applyPersistedRepoSelection(data: WorkspaceInitializerRepoSelection | null) {
     if (!data) return;
@@ -308,7 +306,7 @@
     {
       id: 'github',
       get label() {
-        return m.onboarding_projectPicker_githubRepo_label();
+        return m.onboarding_sourceControl_repoTab_label({ provider: providerName });
       },
     },
     {

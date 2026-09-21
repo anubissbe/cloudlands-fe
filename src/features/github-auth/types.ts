@@ -104,6 +104,7 @@ export interface StartAuthResult {
  * Full GitHub authentication state for the UI
  */
 export interface GitHubAuthState {
+  /** Active forge configuration; legacy GitHub RPC names remain wire-compatible. */
   /** Whether user is authenticated with GitHub via the daemon */
   isAuthenticated: boolean;
   /** Whether user needs to authenticate with the daemon first */

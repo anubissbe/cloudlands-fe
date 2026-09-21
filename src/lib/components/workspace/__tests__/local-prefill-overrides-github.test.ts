@@ -33,7 +33,9 @@ vi.mock('$app/navigation', () => ({ goto: mocks.goto }));
 vi.mock('$store/renderer/store', async () => {
   const { createAppStoreMockModule } =
     await import('$store/renderer/utils/test-helpers/store-mock');
-  return createAppStoreMockModule({ state: () => ({}), dispatch: mocks.dispatch });
+  const { initialState: githubAuth } =
+    await import('$store/renderer/slices/github-auth/github-auth-slice');
+  return createAppStoreMockModule({ state: () => ({ githubAuth }), dispatch: mocks.dispatch });
 });
 
 vi.mock('$store/renderer/slices/workspace-initializer/workspace-initializer-selectors', () => ({

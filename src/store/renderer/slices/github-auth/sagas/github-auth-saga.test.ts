@@ -276,7 +276,7 @@ describe('githubAuthSaga', () => {
     await run.task.toPromise();
   });
 
-  it('runs repeated status requests concurrently like the middleware', async () => {
+  it('ignores a late auth result from an older initialization', async () => {
     let resolveFirst!: (value: unknown) => void;
     mocks.getAuthState
       .mockReturnValueOnce(
@@ -305,16 +305,6 @@ describe('githubAuthSaga', () => {
           isAuthenticated: false,
           requiresDaemonAuth: false,
           user: null,
-          needsScopeUpdate: false,
-          oauthUrl: null,
-        },
-      },
-      {
-        type: 'githubAuth/setAuthState',
-        payload: {
-          isAuthenticated: true,
-          requiresDaemonAuth: false,
-          user: { login: 'octo', name: null, email: null, avatar_url: 'avatar' },
           needsScopeUpdate: false,
           oauthUrl: null,
         },

@@ -36,7 +36,14 @@ const mocks = vi.hoisted(() => {
     goto: vi.fn(),
     fetchRepoConfig: vi.fn<(repoPath: string) => Promise<string | null>>(),
     fetchGitHubRepoConfig:
-      vi.fn<(owner: string, repo: string, ref?: string) => Promise<string | null>>(),
+      vi.fn<
+        (
+          owner: string,
+          repo: string,
+          ref?: string,
+          context?: { repoUrl?: string },
+        ) => Promise<string | null>
+      >(),
     lastUsedSelect: vi.fn(),
     getRemoteUrl: vi.fn<(repoPath: string) => Promise<unknown>>(),
     workspaceCreate: vi.fn<(params: Record<string, unknown>) => Promise<unknown>>(),
@@ -71,6 +78,16 @@ const mocks = vi.hoisted(() => {
     // Store-visible active provider for the submit-time default commit
     // (selectActiveProviderId reads state.model.defaultProviderId).
     activeProviderId: '',
+    sourceControl: {
+      provider: 'github' as 'github' | 'gitlab',
+      instanceUrl: 'https://github.com',
+      connections: [
+        { provider: 'github' as const, instanceUrl: 'https://github.com' },
+        { provider: 'gitlab' as const, instanceUrl: 'https://git.euraika.net' },
+      ],
+      tokenSource: 'explicit',
+      gitlabSupported: true,
+    },
   };
 });
 
@@ -99,6 +116,7 @@ vi.mock('$store/renderer/slices/workspace-initializer/workspace-initializer-sele
 
 vi.mock('$store/renderer/slices/github-auth/github-auth-selectors', () => ({
   selectGitHubAuthIsAuthenticating: { select: vi.fn(() => false) },
+  selectSourceControlSettings: () => mocks.readable(() => mocks.sourceControl),
 }));
 
 vi.mock('$features/setup-scripts/last-used', () => ({
@@ -279,6 +297,8 @@ const dispatchedActions = () =>
  * and re-install the happy-path defaults each test starts from.
  */
 function installDefaultMockImplementations() {
+  mocks.sourceControl.provider = 'github';
+  mocks.sourceControl.instanceUrl = 'https://github.com';
   for (const value of Object.values(mocks)) {
     if (vi.isMockFunction(value)) value.mockReset();
   }
@@ -442,7 +462,9 @@ describe('onboarding repo-config setup script detection', () => {
       expect(textOf(result, 'setup-script-name')).toBe(REPO_CONFIG_SCRIPT_NAME);
     });
     expect(mocks.fetchRepoConfig).not.toHaveBeenCalled();
-    expect(mocks.fetchGitHubRepoConfig).toHaveBeenCalledWith('owner', 'repo', 'release-1.x');
+    expect(mocks.fetchGitHubRepoConfig).toHaveBeenCalledWith('owner', 'repo', 'release-1.x', {
+      repoUrl: 'https://github.com/owner/repo',
+    });
     expect(textOf(result, 'setup-script')).toBe('echo gh-config');
     expect(textOf(result, 'repo-config-script')).toBe('echo gh-config');
     // Repo-config default applied silently — the control stays hidden.
@@ -454,7 +476,9 @@ describe('onboarding repo-config setup script detection', () => {
     selectGitHubRepo({ branch: '' });
 
     await waitFor(() => {
-      expect(mocks.fetchGitHubRepoConfig).toHaveBeenCalledWith('owner', 'repo', undefined);
+      expect(mocks.fetchGitHubRepoConfig).toHaveBeenCalledWith('owner', 'repo', undefined, {
+        repoUrl: 'https://github.com/owner/repo',
+      });
     });
   });
 
@@ -640,34 +664,46 @@ describe('onboarding repo-config setup script detection', () => {
     });
   });
 
-  it('submits a picked-repo create with its detected non-main branch', async () => {
-    // Picked-repo flow: the daemon hydrates the checkout from its repo
-    // cache. The create request must carry the GitHub URL and MUST NOT
-    // carry a local repositoryPath or any clonePath (the selection's
-    // repoPath is the owner/repo shorthand, not a local path).
-    mocks.workspaceCreate.mockResolvedValue({ ok: false, error: 'stop after payload capture' });
+  it.each([
+    ['github', 'owner', 'https://github.com/owner/repo'],
+    ['gitlab', 'team/subgroup', 'https://git.euraika.net/team/subgroup/repo'],
+  ] as const)(
+    'submits a picked %s repo with its URL and detected non-main branch',
+    async (provider, owner, url) => {
+      // Picked-repo flow: the daemon hydrates the checkout from its repo
+      // cache. The create request must carry the GitHub URL and MUST NOT
+      // carry a local repositoryPath or any clonePath (the selection's
+      // repoPath is the owner/repo shorthand, not a local path).
+      mocks.workspaceCreate.mockResolvedValue({ ok: false, error: 'stop after payload capture' });
+      mocks.sourceControl.provider = provider;
+      mocks.sourceControl.instanceUrl =
+        provider === 'gitlab' ? 'https://git.euraika.net' : 'https://github.com';
 
-    renderPage();
-    selectGitHubRepo({ branch: 'master' });
+      renderPage();
+      selectGitHubRepo({ branch: 'master', repoPath: `${owner}/repo`, githubUrl: url });
 
-    const captured = (
-      window as unknown as {
-        __mockOnboardingPromptStep: {
-          onSubmit: () => void;
-          setInputValue: (value: string) => void;
-        };
-      }
-    ).__mockOnboardingPromptStep;
-    captured.setInputValue('build the thing');
-    captured.onSubmit();
+      const captured = (
+        window as unknown as {
+          __mockOnboardingPromptStep: {
+            onSubmit: () => void;
+            setInputValue: (value: string) => void;
+          };
+        }
+      ).__mockOnboardingPromptStep;
+      captured.setInputValue('build the thing');
+      captured.onSubmit();
 
-    await waitFor(() => expect(mocks.workspaceCreate).toHaveBeenCalled());
-    const request = mocks.workspaceCreate.mock.calls[0][0];
-    expect(request.githubUrl).toBe('https://github.com/owner/repo');
-    expect(request.repositoryPath).toBeUndefined();
-    expect(request).not.toHaveProperty('clonePath');
-    expect(request.baseRef).toBe('master');
-  });
+      await waitFor(() => expect(mocks.workspaceCreate).toHaveBeenCalled());
+      const request = mocks.workspaceCreate.mock.calls[0][0];
+      expect(request.githubUrl).toBe(url);
+      expect(request.repositoryPath).toBeUndefined();
+      expect(request).not.toHaveProperty('clonePath');
+      expect(request.baseRef).toBe('master');
+      expect(mocks.fetchGitHubRepoConfig).toHaveBeenCalledWith(owner, 'repo', 'master', {
+        repoUrl: url,
+      });
+    },
+  );
 
   it('explains blocked submission until an existing-repo branch resolves, then creates with it', async () => {
     mocks.workspaceCreate.mockResolvedValue({ ok: false, error: 'stop after payload capture' });
@@ -901,7 +937,9 @@ describe('onboarding repo-config setup script detection', () => {
     const result = renderPage();
     selectGitHubRepo({ branch: 'main' });
     await waitFor(() => {
-      expect(mocks.fetchGitHubRepoConfig).toHaveBeenCalledWith('owner', 'repo', 'main');
+      expect(mocks.fetchGitHubRepoConfig).toHaveBeenCalledWith('owner', 'repo', 'main', {
+        repoUrl: 'https://github.com/owner/repo',
+      });
     });
     await waitFor(() => {
       expect(textOf(result, 'setup-script')).toBe('echo main-config');
@@ -910,7 +948,9 @@ describe('onboarding repo-config setup script detection', () => {
     // Same repo, new branch — re-probes (debounced) with the new ref.
     selectGitHubRepo({ branch: 'release-1.x' });
     await waitFor(() => {
-      expect(mocks.fetchGitHubRepoConfig).toHaveBeenCalledWith('owner', 'repo', 'release-1.x');
+      expect(mocks.fetchGitHubRepoConfig).toHaveBeenCalledWith('owner', 'repo', 'release-1.x', {
+        repoUrl: 'https://github.com/owner/repo',
+      });
     });
     await waitFor(() => {
       expect(textOf(result, 'setup-script')).toBe('echo release-config');
@@ -923,12 +963,16 @@ describe('onboarding repo-config setup script detection', () => {
     renderPage();
     selectGitHubRepo({ branch: 'main' });
     await waitFor(() => {
-      expect(mocks.fetchGitHubRepoConfig).toHaveBeenCalledWith('owner', 'repo', 'main');
+      expect(mocks.fetchGitHubRepoConfig).toHaveBeenCalledWith('owner', 'repo', 'main', {
+        repoUrl: 'https://github.com/owner/repo',
+      });
     });
 
     selectGitHubRepo({ branch: '' });
     await waitFor(() => {
-      expect(mocks.fetchGitHubRepoConfig).toHaveBeenCalledWith('owner', 'repo', undefined);
+      expect(mocks.fetchGitHubRepoConfig).toHaveBeenCalledWith('owner', 'repo', undefined, {
+        repoUrl: 'https://github.com/owner/repo',
+      });
     });
   });
 
@@ -942,13 +986,17 @@ describe('onboarding repo-config setup script detection', () => {
     const result = renderPage();
     selectGitHubRepo({ branch: 'main' });
     await waitFor(() => {
-      expect(mocks.fetchGitHubRepoConfig).toHaveBeenCalledWith('owner', 'repo', 'main');
+      expect(mocks.fetchGitHubRepoConfig).toHaveBeenCalledWith('owner', 'repo', 'main', {
+        repoUrl: 'https://github.com/owner/repo',
+      });
     });
 
     // Change the branch while main's read is in flight, then resolve it late.
     selectGitHubRepo({ branch: 'release-1.x' });
     await waitFor(() => {
-      expect(mocks.fetchGitHubRepoConfig).toHaveBeenCalledWith('owner', 'repo', 'release-1.x');
+      expect(mocks.fetchGitHubRepoConfig).toHaveBeenCalledWith('owner', 'repo', 'release-1.x', {
+        repoUrl: 'https://github.com/owner/repo',
+      });
     });
     probeMain.resolve('echo main-config');
     await Promise.resolve();
@@ -997,13 +1045,17 @@ describe('onboarding repo-config setup script detection', () => {
     // Both selections use the same clone destination path.
     selectGitHubRepo({ githubUrl: 'https://github.com/owner-a/repo', branch: '' });
     await waitFor(() =>
-      expect(mocks.fetchGitHubRepoConfig).toHaveBeenCalledWith('owner-a', 'repo', undefined),
+      expect(mocks.fetchGitHubRepoConfig).toHaveBeenCalledWith('owner-a', 'repo', undefined, {
+        repoUrl: 'https://github.com/owner-a/repo',
+      }),
     );
 
     // Switching repo identity (same path, different URL) must trigger a new probe.
     selectGitHubRepo({ githubUrl: 'https://github.com/owner-b/repo', branch: '' });
     await waitFor(() =>
-      expect(mocks.fetchGitHubRepoConfig).toHaveBeenCalledWith('owner-b', 'repo', undefined),
+      expect(mocks.fetchGitHubRepoConfig).toHaveBeenCalledWith('owner-b', 'repo', undefined, {
+        repoUrl: 'https://github.com/owner-b/repo',
+      }),
     );
 
     // A's late result must be dropped even though the path still matches.

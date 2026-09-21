@@ -1,6 +1,6 @@
 <script lang="ts">
   /**
-   * GitHub owner avatar with a load-failure fallback.
+   * Forge owner avatar with a load-failure fallback.
    *
    * The failure state is cleared whenever the identity changes, so switching the
    * same node to another login (or back again) retries the load instead of
@@ -12,6 +12,8 @@
   interface Props {
     /** GitHub login (user or organization) whose avatar is rendered. */
     identity: string;
+    provider?: 'github' | 'gitlab' | 'unknown';
+    avatarUrl?: string | null;
     /** Rendered size in CSS px; the image is requested at 2x for HiDPI screens. */
     size?: number;
     /** Layout classes for the `<img>` (dimensions, rounding, object-fit). */
@@ -26,19 +28,50 @@
     fallback?: Snippet;
   }
 
-  let { identity, size = 16, class: className = '', alt, fallback }: Props = $props();
+  let {
+    identity,
+    provider = 'github',
+    avatarUrl,
+    size = 16,
+    class: className = '',
+    alt,
+    fallback,
+  }: Props = $props();
 
   let failed = $state(false);
-  const src = $derived(`https://github.com/${identity}.png?size=${size * 2}`);
+  const src = $derived.by(() => {
+    if (avatarUrl) {
+      try {
+        const url = new URL(avatarUrl);
+        if (url.protocol === 'https:' && !url.username && !url.password) return avatarUrl;
+      } catch {
+        /* Use fallback. */
+      }
+    }
+    return provider === 'github' && /^[A-Za-z0-9-]+$/.test(identity)
+      ? `https://github.com/${identity}.png?size=${size * 2}`
+      : null;
+  });
 
   $effect.pre(() => {
-    void identity;
+    void src;
     failed = false;
   });
 </script>
 
-{#if failed}
-  {@render fallback?.()}
+{#if failed || !src}
+  {#if fallback}
+    {@render fallback()}
+  {:else}
+    <span
+      class={`inline-flex shrink-0 items-center justify-center bg-muted text-muted-foreground ${className}`}
+      style:font-size={`${Math.max(9, Math.round(size / 2))}px`}
+      style:width={`${size}px`}
+      style:height={`${size}px`}
+      aria-label={alt}
+      aria-hidden={alt === undefined ? 'true' : undefined}>{identity.charAt(0).toUpperCase()}</span
+    >
+  {/if}
 {:else}
   <img
     {src}

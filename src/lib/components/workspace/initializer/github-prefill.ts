@@ -67,6 +67,8 @@ export async function resolveGitHubPrefillSelection(
       owner,
       repo,
       number,
+      ...(prefill.connectionId ? { connectionId: prefill.connectionId } : {}),
+      ...(prefill.projectUrl ? { repoUrl: prefill.projectUrl } : {}),
     });
     if (response?.success && response.data) {
       const { title, state, sourceBranch, targetBranch } = response.data;

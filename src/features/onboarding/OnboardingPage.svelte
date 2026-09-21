@@ -56,7 +56,8 @@
   import ProjectPickerMessage from '$features/onboarding/messages/ProjectPickerMessage.svelte';
   import type { IssueSelectionData } from '$lib/components/workspace/initializer/IssueSuggestions.svelte';
   import RichTextarea from '$lib/components/ui/RichTextarea.svelte';
-  import { parseGitHubUrl } from '$lib/utils/workspace-validation';
+  import { parseRepositoryInput } from '$features/source-control/utils/repository';
+  import { selectSourceControlSettings } from '$store/renderer/slices/github-auth/github-auth-selectors';
 
   import PullConflictDialog, {
     type PullErrorType,
@@ -183,6 +184,9 @@
   // Onboarding State
   // ============================================================================
 
+  const sourceControl$ = selectSourceControlSettings();
+  const providerName = $derived($sourceControl$.provider === 'gitlab' ? 'GitLab' : 'GitHub');
+  let sourceControlAdvanceAllowed = $state(true);
   const onboardingStep$ = selectOnboardingStep();
   const onboardingState$ = selectOnboardingState();
   const workspaceInitializerHydrated$ = selectWorkspaceInitializerHydrated();
@@ -197,7 +201,13 @@
       return projectSelection.projectName;
     }
     if (projectSelection.type === 'github') {
-      return projectSelection.githubUrl?.split('/').pop() || '';
+      return (
+        projectSelection.projectName ||
+        (projectSelection.githubUrl
+          ? parseRepositoryInput(projectSelection.githubUrl, $sourceControl$)?.repo
+          : '') ||
+        ''
+      );
     }
     if (projectSelection.type === 'local') {
       return projectSelection.repoPath.split('/').pop() || '';
@@ -264,7 +274,7 @@
   // Derived GitHub owner/repo for IssueSuggestions
   const onboardingGithubRepoInfo = $derived.by(() => {
     if (projectSelection?.githubUrl) {
-      return parseGitHubUrl(projectSelection.githubUrl);
+      return parseRepositoryInput(projectSelection.githubUrl, $sourceControl$);
     }
     if (detectedGitHubOwner && detectedGitHubRepo) {
       return { owner: detectedGitHubOwner, repo: detectedGitHubRepo };
@@ -285,6 +295,7 @@
     const identity = {
       path,
       type,
+      sourceControl: $sourceControl$,
       githubUrl: type === 'github' ? projectSelection?.githubUrl : null,
       branch: type === 'github' ? projectSelection?.branch : null,
     };
@@ -314,6 +325,7 @@
       getCurrentIdentity: () => ({
         path: projectSelection?.repoPath ?? null,
         type: projectSelection?.type,
+        sourceControl: $sourceControl$,
         githubUrl: projectSelection?.githubUrl,
         branch: projectSelection?.branch,
       }),
@@ -1030,6 +1042,7 @@
       e.preventDefault();
       advanceFromWelcomeStep();
     } else if (isGitHubStep) {
+      if (!sourceControlAdvanceAllowed) return;
       // Continue when connected, skip otherwise — both advance to project.
       // Skipping abandons a still-pending device flow, so cancel it rather
       // than leaving it polling in the background (and resurfacing in
@@ -1697,12 +1710,10 @@
                         <div in:fly={{ tier: 'slow', distance: 10 }} style="order: 2">
                           <div class="space-y-3">
                             <h2 class="text-5xl font-semibold tracking-tight leading-tight">
-                              {m.onboarding_page_connectGithub_title()}
+                              {m.onboarding_sourceControl_title()}
                             </h2>
                             <p class="text-lg text-muted-foreground">
-                              {m.onboarding_page_connectGithub_before()}
-                              <br />
-                              {m.onboarding_page_connectGithub_after()}
+                              {m.onboarding_sourceControl_description()}
                             </p>
                           </div>
                         </div>
@@ -1827,6 +1838,8 @@
                       {:else if isGitHubStep}
                         <div class="max-w-5xl mx-auto">
                           <OnboardingGitHubStep
+                            onAdvanceAllowedChange={(allowed) =>
+                              (sourceControlAdvanceAllowed = allowed)}
                             onContinue={() => appStore.dispatch(goToStep('project'))}
                             onSkip={() => appStore.dispatch(goToStep('project'))}
                           />
@@ -1864,7 +1877,9 @@
                                 {#if projectSelection?.type === 'local'}
                                   {m.onboarding_page_pickProject_label()}
                                 {:else if projectSelection?.type === 'github'}
-                                  {m.onboarding_page_enterGithubRepo_label()}
+                                  {m.onboarding_sourceControl_enterRepo_label({
+                                    provider: providerName,
+                                  })}
                                 {:else}
                                   {m.onboarding_page_nameProject_label()}
                                 {/if}

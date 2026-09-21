@@ -1,5 +1,6 @@
 import { all, call, put, takeEvery, type SagaGenerator } from 'typed-redux-saga';
 
+import { loadWorkspaceSourceControl } from '../../source-control/source-control-slice';
 import { AcceptChangesClient } from '$features/accept-changes/accept-changes.client';
 import { createLogger } from '$lib/utils/client-logger';
 import type { WorkspaceId } from '$shared/types/branded-ids';
@@ -110,6 +111,7 @@ function* consumerMounted(
   const [workspaceId] = action.payload;
   const entry = entryFor(coordinator, workspaceId);
   entry.consumers += 1;
+  if (entry.consumers === 1) yield* put(loadWorkspaceSourceControl(workspaceId));
   const cached = yield* selectAcceptChangesStatus.effect(workspaceId);
   if (entry.consumers === 1 && (!cached || entry.dirty))
     yield* refreshIfVisible(coordinator, workspaceId);

@@ -88,6 +88,10 @@ export interface WorkspaceInitializerOnboardingFormState {
  * cleared as soon as the initializer consumes it.
  */
 export interface WorkspaceInitializerPendingGitHubPrefill {
+  provider?: 'github' | 'gitlab';
+  connectionId?: string;
+  instanceUrl?: string;
+  projectUrl?: string;
   owner: string;
   repo: string;
   number: number;

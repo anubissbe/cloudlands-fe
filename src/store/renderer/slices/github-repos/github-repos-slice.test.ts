@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { createCollection } from '@augmentcode/themis/utils/collections/collection-utils';
 import {
+  clearGithubRepos,
   githubReposReducer,
   initialState,
   setGithubRepos,
@@ -58,5 +59,11 @@ describe('githubReposReducer', () => {
       loading: false,
       error: 'boom',
     });
+  });
+  it('clears loaded rows and errors so a new authority can load its own repositories', () => {
+    const loaded = githubReposReducer(initialState, setGithubRepos([mockRepo('legacy', 'repo')]));
+    expect(
+      githubReposReducer({ ...loaded, loading: true, error: 'old failure' }, clearGithubRepos()),
+    ).toEqual(initialState);
   });
 });

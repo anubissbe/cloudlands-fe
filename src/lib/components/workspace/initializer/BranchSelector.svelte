@@ -12,7 +12,13 @@
   import { createLogger } from '$lib/utils/client-logger';
   import { appClient } from '$lib/client';
   import { performanceMonitor } from '$lib/utils/performance';
-  import { parseGitHubUrl } from '$lib/utils/workspace-validation';
+  import {
+    repositoryInputReference,
+    parseRepositoryInput,
+    repositoryInputUrl,
+  } from '$features/source-control/utils/repository';
+  import { selectSourceControlSettings } from '$store/renderer/slices/github-auth/github-auth-selectors';
+  import SourceControlAuthBanner from '$features/source-control/SourceControlAuthBanner.svelte';
 
   import { setWorkspaceInitializerBranchForRepo } from '$store/renderer/slices/workspace-initializer/workspace-initializer-slice';
   import { selectWorkspaceInitializerBranchByRepo } from '$store/renderer/slices/workspace-initializer/workspace-initializer-selectors';
@@ -38,6 +44,7 @@
   import { slide } from '$lib/motion';
   import { store as appStore } from '$store/renderer/store';
 
+  const sourceControl$ = selectSourceControlSettings();
   const logger = createLogger('BranchSelector');
   const branchByRepo$ = selectWorkspaceInitializerBranchByRepo();
 
@@ -119,6 +126,9 @@
     triggerChevronClass = 'ml-2 opacity-50',
     triggerContentClass = 'gap-0.75',
   }: Props = $props();
+  const repositoryIdentity = $derived(
+    repositoryInputReference(githubUrl || repoPath || '', $sourceControl$),
+  );
 
   // State
   let internalSelectedBranch = $state('');
@@ -372,12 +382,17 @@
     }, FETCH_BRANCHES_DEBOUNCE_MS);
   }
 
+  let previousSourceControl = '';
+
   // Fetch branches when repo changes
   $effect(() => {
     // Capture current values (read these first to establish dependencies)
     const currentRepoPath = repoPath;
     const currentRepoType = repoType;
     const currentGithubUrl = githubUrl;
+    const authority = `${$sourceControl$.provider}:${$sourceControl$.instanceUrl}`;
+    const authorityChanged = repoType === 'github' && authority !== previousSourceControl;
+    previousSourceControl = authority;
 
     // Detect if we need to refetch (repo changed, or type/url changed for same repo)
     const repoChanged = currentRepoPath !== previousRepoPath;
@@ -385,7 +400,8 @@
     const urlChanged = currentGithubUrl !== previousGithubUrl;
 
     // Check if anything actually changed
-    const needsRefetch = repoChanged || (currentRepoPath && (typeChanged || urlChanged));
+    const needsRefetch =
+      repoChanged || (currentRepoPath && (typeChanged || urlChanged || authorityChanged));
 
     // Update previous values BEFORE any async operations
     previousRepoPath = currentRepoPath;
@@ -503,22 +519,14 @@
 
     // Check if repoPath matches GitHub shorthand pattern (owner/repo)
     // Must contain exactly one slash, and NOT look like a file path
-    const isGitHubShorthand =
-      repoPath &&
-      repoPath.includes('/') &&
-      !repoPath.startsWith('/') &&
-      !repoPath.startsWith('~') &&
-      !repoPath.startsWith('.') &&
-      !repoPath.includes(':\\') &&
-      repoPath.split('/').length === 2 &&
-      /^[a-zA-Z0-9_-]+\/[a-zA-Z0-9._-]+$/.test(repoPath);
+    const isGitHubShorthand = !!parseRepositoryInput(repoPath, $sourceControl$);
 
     if (isGitHubShorthand) {
       // This looks like a GitHub shorthand - treat it as GitHub even if repoType is wrong
       effectiveRepoType = 'github';
       if (!effectiveGithubUrl) {
         // Reconstruct the GitHub URL from the shorthand
-        effectiveGithubUrl = `https://github.com/${repoPath}`;
+        effectiveGithubUrl = repositoryInputUrl(repoPath, $sourceControl$);
         logger.debug('Reconstructed GitHub URL from shorthand', {
           repoPath,
           effectiveGithubUrl,
@@ -528,7 +536,11 @@
 
     // Check cache first (if caching is enabled)
     if (debugConfig.get('enableBranchCaching')) {
-      const cached = branchCache.get(repoPath);
+      const cached = branchCache.get(
+        repoType === 'github'
+          ? `${$sourceControl$.provider}:${$sourceControl$.instanceUrl}:${githubUrl || repoPath}`
+          : repoPath,
+      );
       if (cached && Date.now() - cached.timestamp < CACHE_DURATION) {
         branches = cached.branches;
         remoteBranches = cached.remoteBranches || [];
@@ -624,9 +636,9 @@
         }
       } else if (effectiveRepoType === 'github' && effectiveGithubUrl) {
         // Parse GitHub URL to get owner and repo
-        const parsed = parseGitHubUrl(effectiveGithubUrl);
+        const parsed = parseRepositoryInput(effectiveGithubUrl, $sourceControl$);
         if (!parsed) {
-          throw new Error('Invalid GitHub URL format');
+          throw new Error('Invalid repository URL for the selected source control provider');
         }
         const { owner, repo } = parsed;
 
@@ -636,37 +648,39 @@
         // render instantly while the authoritative GitHub API list loads in
         // parallel. The seam folds failures to a cold-cache miss, so this
         // never surfaces an error.
-        void appClient.integrations.githubBranchesCached(owner, repo).then((cachedListing) => {
-          // A superseded fetch must not clobber a newer repo's state, and the
-          // authoritative list wins once it has settled (either way).
-          if (abortController.signal.aborted || freshListingSettled) return;
-          // Paint whatever branches came back (warm cache OR ls-remote
-          // fallback); an empty listing keeps today's behavior (skeleton
-          // until the API responds).
-          if (cachedListing.branches.length === 0) return;
-          branches = cachedListing.branches;
-          defaultBranch = cachedListing.defaultBranch || '';
-          isLoading = false;
-          if (!pendingGithubSelection) {
-            const savedBranchBeforePaint = getSavedBranchForRepo(repoPath);
-            const valueBeforePaint = value;
-            const explicitSelectionRevision = explicitBranchSelectionRevision;
-            applyGithubBranchSelection();
-            pendingGithubSelection = {
-              autoSelectedBranch: internalSelectedBranch,
-              valueBeforePaint,
-              savedBranchBeforePaint,
-              explicitSelectionRevision,
-            };
-          }
-          notifyBranchesLoaded();
-          logger.debug('Rendered cached branches via github.branches.listCached', {
-            owner,
-            repo,
-            count: cachedListing.branches.length,
-            source: cachedListing.source,
+        void appClient.integrations
+          .githubBranchesCached(owner, repo, { repoUrl: effectiveGithubUrl || repoPath })
+          .then((cachedListing) => {
+            // A superseded fetch must not clobber a newer repo's state, and the
+            // authoritative list wins once it has settled (either way).
+            if (abortController.signal.aborted || freshListingSettled) return;
+            // Paint whatever branches came back (warm cache OR ls-remote
+            // fallback); an empty listing keeps today's behavior (skeleton
+            // until the API responds).
+            if (cachedListing.branches.length === 0) return;
+            branches = cachedListing.branches;
+            defaultBranch = cachedListing.defaultBranch || '';
+            isLoading = false;
+            if (!pendingGithubSelection) {
+              const savedBranchBeforePaint = getSavedBranchForRepo(repoPath);
+              const valueBeforePaint = value;
+              const explicitSelectionRevision = explicitBranchSelectionRevision;
+              applyGithubBranchSelection();
+              pendingGithubSelection = {
+                autoSelectedBranch: internalSelectedBranch,
+                valueBeforePaint,
+                savedBranchBeforePaint,
+                explicitSelectionRevision,
+              };
+            }
+            notifyBranchesLoaded();
+            logger.debug('Rendered cached branches via github.branches.listCached', {
+              owner,
+              repo,
+              count: cachedListing.branches.length,
+              source: cachedListing.source,
+            });
           });
-        });
 
         // URL-only GitHub repo (no local clone to ask git): the daemon lists
         // remote branch names via `github.branches.list` and the default
@@ -674,7 +688,9 @@
         // GitHub API fallback — failures surface as an explicit error/auth
         // state, never fabricated branches.
         try {
-          const listing = await appClient.integrations.githubBranches(owner, repo);
+          const listing = await appClient.integrations.githubBranches(owner, repo, undefined, {
+            repoUrl: effectiveGithubUrl || repoPath,
+          });
           // Check if we were aborted while waiting for the response
           if (abortController.signal.aborted) {
             logger.debug('Branch fetch aborted after response');
@@ -711,13 +727,18 @@
 
       // Cache the results (if caching is enabled)
       if (debugConfig.get('enableBranchCaching')) {
-        branchCache.set(repoPath, {
-          branches,
-          remoteBranches,
-          default: defaultBranch,
-          current: currentBranch,
-          timestamp: Date.now(),
-        });
+        branchCache.set(
+          repoType === 'github'
+            ? `${$sourceControl$.provider}:${$sourceControl$.instanceUrl}:${githubUrl || repoPath}`
+            : repoPath,
+          {
+            branches,
+            remoteBranches,
+            default: defaultBranch,
+            current: currentBranch,
+            timestamp: Date.now(),
+          },
+        );
       }
 
       // For GitHub repos, ensure a valid branch is selected
@@ -866,15 +887,10 @@
         // Use the separate remoteBranches field from the response (already filtered & sorted)
         remoteBranches = result.remoteBranches || [];
 
-        // Update cache with remote branches
+        // This path is only used for local checkouts.
         if (debugConfig.get('enableBranchCaching')) {
           const cached = branchCache.get(repoPath);
-          if (cached) {
-            branchCache.set(repoPath, {
-              ...cached,
-              remoteBranches,
-            });
-          }
+          if (cached) branchCache.set(repoPath, { ...cached, remoteBranches });
         }
 
         logger.debug('Fetched remote branches', { count: remoteBranches.length });
@@ -1101,7 +1117,11 @@
 
   async function handleRefresh() {
     // Clear cache for this repo
-    branchCache.delete(repoPath);
+    branchCache.delete(
+      repoType === 'github'
+        ? `${$sourceControl$.provider}:${$sourceControl$.instanceUrl}:${githubUrl || repoPath}`
+        : repoPath,
+    );
     githubAuthNeeded = 'none'; // Reset auth state
     await fetchBranches();
   }
@@ -1266,10 +1286,10 @@
     // reconstructs it from a shorthand repoPath (lines 541-546) — match that.
     const url =
       githubUrl ||
-      (repoPath && /^[a-zA-Z0-9_-]+\/[a-zA-Z0-9._-]+$/.test(repoPath)
-        ? `https://github.com/${repoPath}`
+      (repoPath && parseRepositoryInput(repoPath, $sourceControl$)
+        ? repositoryInputUrl(repoPath, $sourceControl$)
         : undefined);
-    return url ? parseGitHubUrl(url) : null;
+    return url ? parseRepositoryInput(url, $sourceControl$) : null;
   }
 
   // Server-side prefix search: when the user types in a GitHub repo's search
@@ -1300,7 +1320,9 @@
     // stale beyond-page branches must not linger under a different prefix.
     githubSearchBranches = [];
     void appClient.integrations
-      .githubBranches(parsed.owner, parsed.repo, prefix)
+      .githubBranches(parsed.owner, parsed.repo, prefix, {
+        repoUrl: repositoryInputUrl(githubUrl || repoPath, $sourceControl$),
+      })
       .then((listing) => {
         if (requestId !== githubSearchRequestId) return; // Superseded by a newer prefix
         githubSearchBranches = listing.branches;
@@ -1593,7 +1615,12 @@
         </div>
 
         <div class="min-h-16 overflow-y-auto flex-1" data-testid="branch-results">
-          {#if githubAuthNeeded === 'not-authenticated' && !isConnectingGitHub}
+          {#if githubAuthNeeded === 'not-authenticated' && repositoryIdentity?.provider === 'gitlab'}
+            <SourceControlAuthBanner
+              connectionId={repositoryIdentity?.connectionId}
+              onSuccess={handleRefresh}
+            />
+          {:else if githubAuthNeeded === 'not-authenticated' && !isConnectingGitHub}
             <!-- Connect with GitHub prompt for private repos -->
             <Button
               variant="ghost"

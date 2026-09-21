@@ -189,6 +189,9 @@
 </script>
 
 <script lang="ts">
+  import { selectWorkspaceSourceControlIdentities } from '$store/renderer/slices/source-control/source-control-selectors';
+  import { sourceControlResourceUrl } from '$shared/utils/source-control-url';
+  const forgeIdentities$ = selectWorkspaceSourceControlIdentities();
   /* eslint-disable max-lines */
   /**
    * Chat Changes Panel
@@ -2496,7 +2499,14 @@
     const repoName = workspace?.repositoryName;
     const wsId = workspace?.id;
     if (repoOwner && repoName && wsId) {
-      const url = `https://github.com/${repoOwner}/${repoName}/commit/${commitInfo.hash}`;
+      const url = sourceControlResourceUrl(
+        $forgeIdentities$[wsId]?.repository,
+        repoOwner,
+        repoName,
+        'commit',
+        commitInfo.hash,
+      );
+      if (!url) return;
       const layoutManager = getPanelLayoutManager(wsId);
       layoutManager.openTab({
         type: 'browser',
@@ -2511,7 +2521,16 @@
   // Derive commit GitHub URL availability
   const hasCommitUrl = $derived(() => {
     const workspace = $workspace$;
-    return !!(commitInfo?.hash && workspace?.repositoryOwner && workspace?.repositoryName);
+    return !!(
+      workspace &&
+      sourceControlResourceUrl(
+        $forgeIdentities$[workspace.id]?.repository,
+        workspace.repositoryOwner,
+        workspace.repositoryName,
+        'commit',
+        commitInfo?.hash,
+      )
+    );
   });
 
   // Extract GitHub username from email (noreply pattern) for avatar
@@ -2691,6 +2710,10 @@
                         >
                           {#if groupAuthorLogin}
                             <GitHubAvatar
+                              provider={$workspace$
+                                ? ($forgeIdentities$[$workspace$.id]?.repository?.provider ??
+                                  'unknown')
+                                : 'unknown'}
                               identity={groupAuthorLogin}
                               alt={group.author || ''}
                               size={20}
@@ -2878,6 +2901,9 @@
       >
         {#if commitAuthorLogin}
           <GitHubAvatar
+            provider={$workspace$
+              ? ($forgeIdentities$[$workspace$.id]?.repository?.provider ?? 'unknown')
+              : 'unknown'}
             identity={commitAuthorLogin}
             alt={commitInfo?.author || ''}
             size={28}

@@ -257,7 +257,7 @@ function* githubAuthChangedWorker(
 }
 
 export function* githubAuthSaga(): SagaGenerator<void> {
-  yield* takeEvery(initializeGitHubAuth, initializeGitHubAuthWorker);
+  yield* takeLatest(initializeGitHubAuth, initializeGitHubAuthWorker);
   yield* takeEvery(startGitHubAuth, startGitHubAuthWorker);
   yield* takeEvery(checkGitHubAuthStatus, checkGitHubAuthStatusWorker);
   yield* takeEvery(cancelGitHubAuth, cancelGitHubAuthWorker);

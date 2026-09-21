@@ -4,6 +4,7 @@
 
 import { describe, it, expect } from 'vitest';
 import {
+  validateRepoPath,
   validateBranchPrefix,
   sanitizeBranchPrefix,
   getGitErrorMessage,
@@ -253,4 +254,17 @@ describe('workspace-validation', () => {
       });
     });
   });
+});
+
+it('validates registered GitLab transports and GitHub independently of the selected account', async () => {
+  const sourceControl = { provider: 'gitlab' as const, instanceUrl: 'https://git.euraika.net' };
+  expect(
+    await validateRepoPath('https://git.euraika.net/euraika/platform/camiel', false, sourceControl),
+  ).toEqual({ valid: true });
+  expect(
+    await validateRepoPath('git@git.euraika.net:euraika/platform/camiel.git', false, sourceControl),
+  ).toEqual({ valid: true });
+  expect(
+    (await validateRepoPath('https://github.com/euraika/camiel', false, sourceControl)).valid,
+  ).toBe(true);
 });

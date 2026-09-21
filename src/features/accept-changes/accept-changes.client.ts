@@ -152,6 +152,7 @@ export class AcceptChangesClient {
       mergeMethod?: 'merge' | 'squash' | 'rebase';
       commitTitle?: string;
       commitMessage?: string;
+      expectedHeadSha?: string;
     },
   ): Promise<AcceptChangesResult> {
     try {
@@ -161,6 +162,7 @@ export class AcceptChangesClient {
         mergeMethod: options?.mergeMethod,
         commitTitle: options?.commitTitle,
         commitMessage: options?.commitMessage,
+        ...(options?.expectedHeadSha ? { expectedHeadSha: options.expectedHeadSha } : {}),
       });
     } catch (error) {
       return toFailureResult(error, m.acceptChanges_client_mergePrFailed_error());

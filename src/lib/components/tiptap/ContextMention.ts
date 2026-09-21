@@ -18,6 +18,7 @@ import { m } from '$shared/paraglide/messages.js';
  * Contains author, assignee, labels, state, and other issue properties
  */
 export interface ContextMentionMetadata {
+  forgeProvider?: 'github' | 'gitlab';
   /** Author/creator of the issue */
   author?: string;
   /** Assignee name */

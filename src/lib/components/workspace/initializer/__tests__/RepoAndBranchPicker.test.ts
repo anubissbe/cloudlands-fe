@@ -4,6 +4,19 @@
 import { render, screen } from '@testing-library/svelte';
 import { describe, expect, it, vi } from 'vitest';
 
+const sourceControl = vi.hoisted(() => ({
+  provider: 'github' as 'github' | 'gitlab',
+  instanceUrl: 'https://gitlab.com',
+}));
+vi.mock('$store/renderer/slices/github-auth/github-auth-selectors', () => ({
+  selectSourceControlSettings: () => ({
+    subscribe(run: (value: unknown) => void) {
+      run(sourceControl);
+      return () => {};
+    },
+  }),
+}));
+
 vi.mock('../RepoSelector.svelte', async () => ({
   default: (await import('./mocks/MockRepoSelector.svelte')).default,
 }));
@@ -259,4 +272,36 @@ describe('RepoAndBranchPicker', () => {
     ).toContain('pr-5');
     expect(screen.getByRole('status')).toBeTruthy();
   });
+});
+
+it('shows nested GitLab namespaces without the installation subpath', () => {
+  sourceControl.provider = 'gitlab';
+  sourceControl.instanceUrl = 'https://forge.example/x/gitlab';
+  const { container } = render(RepoAndBranchPicker, {
+    props: {
+      repoType: 'github',
+      githubUrl: 'https://forge.example/x/gitlab/group/subgroup/repo.git',
+      presentation: 'metadata',
+      field: 'repo',
+    },
+  });
+  expect(container.querySelector('[data-testid="repo-selector"]')?.textContent?.trim()).toBe(
+    'group/subgroup/repo',
+  );
+  sourceControl.provider = 'github';
+  sourceControl.instanceUrl = 'https://gitlab.com';
+});
+
+it('keeps the first namespace segment of a nested repository shorthand', () => {
+  const { container } = render(RepoAndBranchPicker, {
+    props: {
+      repoType: 'github',
+      githubUrl: 'group/subgroup/repo',
+      presentation: 'metadata',
+      field: 'repo',
+    },
+  });
+  expect(container.querySelector('[data-testid="repo-selector"]')?.textContent?.trim()).toBe(
+    'group/subgroup/repo',
+  );
 });

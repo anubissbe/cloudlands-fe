@@ -147,6 +147,14 @@ vi.mock('$store/renderer/slices/specialists/specialists-selectors', () => ({
 
 vi.mock('$store/renderer/slices/github-auth/github-auth-selectors', () => ({
   selectGitHubAuthIsAuthenticated: () => mocks.readable(true),
+  selectSourceControlIsAuthenticated: () => mocks.readable(true),
+  selectSourceControlSettings: () =>
+    mocks.readable({
+      provider: 'github',
+      instanceUrl: 'https://gitlab.com',
+      tokenSource: 'auto',
+      gitlabSupported: true,
+    }),
 }));
 
 vi.mock('$features/providers/provider-availability.client', () => ({
