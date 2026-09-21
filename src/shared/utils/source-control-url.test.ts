@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest';
-import { parseSourceControlLink } from './source-control-url';
+import {
+  contextMentionUrl,
+  sourceControlResourceUrl,
+  parseSourceControlLink,
+} from './source-control-url';
 const identities = [
   { provider: 'gitlab' as const, instanceUrl: 'https://git.one.example' },
   { provider: 'gitlab' as const, instanceUrl: 'https://git.two.example:8443/gitlab' },
@@ -70,5 +74,26 @@ describe('source-control links', () => {
         { provider: 'gitlab', instanceUrl: 'https://git.one.example/other' },
       ]),
     ).toBeNull();
+  });
+});
+
+describe('forge resource presentation', () => {
+  it('keeps server ports, installation paths and nested namespaces in resource links', () => {
+    const connection = identities[1];
+    expect(sourceControlResourceUrl(connection, 'team/sub', 'camiel', 'pulls')).toBe(
+      'https://git.two.example:8443/gitlab/team/sub/camiel/-/merge_requests',
+    );
+    expect(sourceControlResourceUrl(connection, 'team/sub', 'camiel', 'commit', 'abc123')).toBe(
+      'https://git.two.example:8443/gitlab/team/sub/camiel/-/commit/abc123',
+    );
+    expect(sourceControlResourceUrl(undefined, 'team', 'camiel', 'issues')).toBeNull();
+  });
+  it('does not rewrite saved GitLab context into GitHub even with the legacy provider tag', () => {
+    const url = 'https://git.two.example:8443/gitlab/team/sub/camiel/-/merge_requests/12#note_42';
+    expect(contextMentionUrl(url, 'team/sub/camiel#12', true)).toBe(url);
+    expect(contextMentionUrl('https://github.com/octocat', 'team/camiel#12', true)).toBe(
+      'https://github.com/team/camiel/pull/12',
+    );
+    expect(contextMentionUrl('javascript:alert(1)', 'team/camiel#12', true)).toBe('');
   });
 });

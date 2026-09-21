@@ -101,3 +101,46 @@ export function parseSourceControlLink(
     return null;
   }
 }
+
+/** Build a repository resource link from a resolved daemon identity. */
+export function sourceControlResourceUrl(
+  connection: ForgeConnectionIdentity | null | undefined,
+  owner: string | null | undefined,
+  repo: string | null | undefined,
+  resource: 'issues' | 'pulls' | 'commit',
+  revision?: string,
+): string | null {
+  if (!connection || !owner || !repo) return null;
+  try {
+    const base = new URL(connection.instanceUrl);
+    if (!['https:', 'http:'].includes(base.protocol) || base.username || base.password) return null;
+    const segments = [...owner.split('/'), repo];
+    if (segments.some((part) => !part || part === '.' || part === '..')) return null;
+    const project = `${connection.instanceUrl.replace(/\/+$/, '')}/${segments.map(encodeURIComponent).join('/')}`;
+    const route =
+      connection.provider === 'gitlab'
+        ? `-/${resource === 'pulls' ? 'merge_requests' : resource}`
+        : resource;
+    if (resource === 'commit')
+      return revision ? `${project}/${route}/${encodeURIComponent(revision)}` : null;
+    return `${project}/${route}`;
+  } catch {
+    return null;
+  }
+}
+
+/** Preserve a real forge resource URL; reconstruct only legacy GitHub mentions. */
+export function contextMentionUrl(rawUrl: string, identifier: string, isPull: boolean): string {
+  try {
+    const url = new URL(rawUrl);
+    if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) return '';
+    if (url.hostname !== 'github.com' && url.hostname !== 'www.github.com') return rawUrl;
+    if (/^\/[^/]+\/[^/]+\/(pull|issues)\/[1-9]\d*(?:[/?#]|$)/.test(url.pathname)) return rawUrl;
+  } catch {
+    return rawUrl;
+  }
+  const match = /^([^/#]+)\/([^/#]+)#([1-9]\d*)$/.exec(identifier);
+  return match
+    ? `https://github.com/${match[1]}/${match[2]}/${isPull ? 'pull' : 'issues'}/${match[3]}`
+    : rawUrl;
+}

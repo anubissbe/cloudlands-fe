@@ -1,4 +1,4 @@
-import { expect, test } from '@playwright/experimental-ct-svelte';
+import { expect, test } from '../../../test/ct-test';
 import GitlabOnboardingHost from './GitlabOnboardingHost.svelte';
 
 test('onboarding adds a second GitLab connection alongside GitHub and browses the selected server', async ({

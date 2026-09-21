@@ -33,6 +33,7 @@ const mocks = vi.hoisted(() => {
   };
   return {
     dispatch,
+    forgeIdentities: {} as Record<string, unknown>,
     workspaceEntity,
     ftCommits,
     boundarySha,
@@ -58,6 +59,10 @@ vi.mock('$store/renderer/store', async () => {
     dispatch,
   });
 });
+
+vi.mock('$store/renderer/slices/source-control/source-control-selectors', () => ({
+  selectWorkspaceSourceControlIdentities: mocks.selector(() => mocks.forgeIdentities),
+}));
 
 vi.mock('$store/renderer/slices/workspace/workspace-selectors', () => ({
   selectWorkspaceById: mocks.selector(() => mocks.workspaceEntity),
@@ -256,8 +261,27 @@ describe('CommitsTimeline', () => {
     mockCommitDetails.mockReset().mockResolvedValue(null);
     mocks.ftCommits.splice(0, mocks.ftCommits.length);
     mocks.workspaceEntity.baseCommitSha = '';
+    mocks.workspaceEntity.repositoryOwner = 'octocat';
+    mocks.forgeIdentities = {};
     mocks.postMergeState.hasRemote = true;
     mocks.gitOps.isPushing = false;
+  });
+
+  it('opens a pushed GitLab commit on the resolved instance including its subpath', async () => {
+    mocks.workspaceEntity.repositoryOwner = 'team/platform';
+    mocks.forgeIdentities = {
+      'ws-1': {
+        repository: { provider: 'gitlab', instanceUrl: 'https://git.example:8443/gitlab' },
+      },
+    };
+    mocks.ftCommits.push(makeCommit('abc123', 'GitLab change', { isPushed: true }));
+    const { getByRole } = await renderTimeline();
+    await fireEvent.click(getByRole('button', { name: /open.*browser/i }));
+    const { handleLink } = await import('$features/navigation/link-handler');
+    expect(handleLink).toHaveBeenCalledWith(
+      'https://git.example:8443/gitlab/team/platform/demo/-/commit/abc123',
+      expect.objectContaining({ workspaceId: 'ws-1' }),
+    );
   });
 
   it('renders commits from the selector with correct messages', async () => {

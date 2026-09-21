@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { selectWorkspaceSourceControlIdentities } from '$store/renderer/slices/source-control/source-control-selectors';
+  const forgeIdentities$ = selectWorkspaceSourceControlIdentities();
   import { Input } from '$lib/components/ui/input';
   import { goto } from '$app/navigation';
   import { scrollFade } from '$lib/actions/scroll-fade';
@@ -592,6 +594,8 @@
                   <span class="size-3.5 shrink-0">
                     {#if repositoryGroup.group.owner}
                       <GitHubAvatar
+                        provider={$forgeIdentities$[repositoryGroup.visibleWorkspaces[0]?.id]
+                          ?.repository?.provider ?? 'unknown'}
                         identity={repositoryGroup.group.owner}
                         alt=""
                         size={14}

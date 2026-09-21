@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { contextMentionUrl } from '$shared/utils/source-control-url';
+  import SourceControlIcon from '$features/source-control/SourceControlIcon.svelte';
   import { Button } from '$lib/components/ui/button';
   /**
    * ContextMentionNodeView - Renders a context mention as a clickable pill
@@ -70,23 +72,18 @@
     }
   });
 
-  // Compute the correct URL for GitHub items based on identifier
-  // The stored URL may be incorrect (e.g., author's profile instead of PR/issue URL)
-  // Identifier format: "owner/repo#number" -> URL: "https://github.com/owner/repo/pull/number" or "/issues/number"
-  const url = $derived(() => {
-    if (provider === 'github' && identifier) {
-      const match = identifier.match(/^([^/]+)\/([^#]+)#(\d+)$/);
-      if (match) {
-        const [, owner, repo, number] = match;
-        // Use 'pull' for PRs, 'issues' for issues
-        // Check if metadata has sourceBranch (indicates it's a PR)
-        const isPR = Boolean(metadata()?.sourceBranch);
-        const pathType = isPR ? 'pull' : 'issues';
-        return `https://github.com/${owner}/${repo}/${pathType}/${number}`;
-      }
-    }
-    return rawUrl;
-  });
+  const url = $derived(() =>
+    provider === 'github'
+      ? contextMentionUrl(
+          rawUrl,
+          identifier,
+          Boolean(metadata()?.sourceBranch) || itemType === 'github-pr',
+        )
+      : rawUrl,
+  );
+  const isGitLab = $derived(
+    metadata()?.forgeProvider === 'gitlab' || /\/-\/(merge_requests|issues)\//.test(rawUrl),
+  );
 
   // Get the PR's source branch (check for non-empty string)
   const prSourceBranch = $derived(() => {
@@ -203,7 +200,7 @@
       case 'linear':
         return 'Linear'; // i18n-ignore (brand name)
       case 'github':
-        return 'GitHub'; // i18n-ignore (brand name)
+        return isGitLab ? 'GitLab' : 'GitHub'; // i18n-ignore (brand names)
       case 'sentry':
         return 'Sentry'; // i18n-ignore (brand name)
       case 'browser':
@@ -220,12 +217,10 @@
     e.stopPropagation();
     const targetUrl = url();
     if (targetUrl) {
-      if (workspaceId) {
-        await handleLink(targetUrl, {
-          workspaceId: WorkspaceId(workspaceId),
-          event: e,
-        });
-      }
+      await handleLink(targetUrl, {
+        ...(workspaceId ? { workspaceId: WorkspaceId(workspaceId) } : {}),
+        event: e,
+      });
     }
   }
 </script>
@@ -246,7 +241,11 @@
             ? 'bg-primary/20 text-primary ring-1 ring-primary/30'
             : 'bg-muted/60 text-foreground/80 hover:bg-muted hover:text-foreground'}"
         >
-          <ProviderIcon {provider} size={12} class="shrink-0 opacity-30" />
+          {#if isGitLab}<SourceControlIcon
+              provider="gitlab"
+              size={12}
+              class="shrink-0 opacity-30"
+            />{:else}<ProviderIcon {provider} size={12} class="shrink-0 opacity-30" />{/if}
           {#if identifier && itemType !== 'browser-url'}
             <span class="text-subtle shrink-0">{identifier}</span>
           {/if}
@@ -260,7 +259,11 @@
         <div class="space-y-2.5 max-w-80 min-w-56">
           <!-- Header row: provider + identifier -->
           <div class="flex items-center gap-1.5">
-            <ProviderIcon {provider} size={10} class="opacity-40" />
+            {#if isGitLab}<SourceControlIcon
+                provider="gitlab"
+                size={10}
+                class="opacity-40"
+              />{:else}<ProviderIcon {provider} size={10} class="opacity-40" />{/if}
             <span class="text-ui font-medium text-muted-foreground">{providerName()}</span>
             {#if identifier && itemType !== 'browser-url'}
               <span class="text-ui font-medium text-subtle">·</span>

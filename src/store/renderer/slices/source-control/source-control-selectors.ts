@@ -77,3 +77,7 @@ export const selectWorkspaceSourceControlIsAuthenticated = store.createSelector(
     return connection?.enabled === true && connection.isConfigured;
   },
 );
+
+export const selectWorkspaceSourceControlIdentities = store.createSelector(
+  (state) => (state.sourceControl ?? initialState).byWorkspaceId,
+);

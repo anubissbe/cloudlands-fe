@@ -1,4 +1,4 @@
-import { expect, test } from '@playwright/experimental-ct-svelte';
+import { expect, test } from '../../../../test/ct-test';
 import SourceControlSettingsHost from './SourceControlSettingsHost.svelte';
 
 test('keeps GitHub and two GitLab servers connected, and disconnects only the addressed server', async ({

@@ -1770,7 +1770,11 @@
                       {#if repo.type === 'github' && provider === 'gitlab'}
                         <SourceControlIcon {provider} class="text-subtle" />
                       {:else if label.ownerPrefix}
-                        <GitHubAvatar identity={label.ownerPrefix} class="size-4 rounded-full">
+                        <GitHubAvatar
+                          provider={repo.type === 'github' ? provider : 'unknown'}
+                          identity={label.ownerPrefix}
+                          class="size-4 rounded-full"
+                        >
                           {#snippet fallback()}
                             <Fa icon={faGithub} class="text-subtle opacity-50" size={12} />
                           {/snippet}

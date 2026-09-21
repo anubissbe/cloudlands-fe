@@ -297,7 +297,10 @@
   import { linearAuthClient } from '$features/linear-auth/renderer/linear-auth.client';
   import { handleLink } from '$features/navigation/link-handler';
   import { sentryAuthClient } from '$features/sentry-auth/renderer/sentry-auth.client';
-  import { parseSourceControlLink } from '$shared/utils/source-control-url';
+  import {
+    sourceControlResourceUrl,
+    parseSourceControlLink,
+  } from '$shared/utils/source-control-url';
   import {
     selectSourceControlConnections,
     selectSelectedSourceControlConnection,
@@ -350,6 +353,7 @@
 
   /** Metadata for hover cards - contains author, assignee, labels, etc. */
   export interface IssueMetadata {
+    forgeProvider?: 'github' | 'gitlab';
     author?: string;
     assignee?: string;
     state?: string;
@@ -1419,6 +1423,7 @@
       url: issue.url,
       description: issue.body,
       metadata: {
+        forgeProvider: repositoryConnection?.provider,
         state: issue.state,
         author: issue.author,
         labels: issue.labels,
@@ -1469,6 +1474,7 @@
       url: pr.url,
       description: pr.body,
       metadata: {
+        forgeProvider: repositoryConnection?.provider,
         state: pr.state,
         author: pr.authorName || pr.authorLogin,
         assignee: pr.assignees?.join(', '),
@@ -1990,9 +1996,17 @@
               <Button
                 variant="ghost"
                 onclick={() => {
-                  handleLink(`https://github.com/${repositoryOwner}/${repositoryName}/issues`, {
-                    workspaceId: workspaceId as WorkspaceId | undefined,
-                  });
+                  handleLink(
+                    sourceControlResourceUrl(
+                      repositoryConnection,
+                      repositoryOwner,
+                      repositoryName,
+                      'issues',
+                    ) ?? '',
+                    {
+                      workspaceId: workspaceId as WorkspaceId | undefined,
+                    },
+                  );
                 }}
                 class="underline underline-offset-2 decoration-muted-foreground/20 cursor-pointer"
                 >{repositoryOwner}/{repositoryName}</Button
@@ -2005,9 +2019,17 @@
               <Button
                 variant="ghost"
                 onclick={() => {
-                  handleLink(`https://github.com/${repositoryOwner}/${repositoryName}/pulls`, {
-                    workspaceId: workspaceId as WorkspaceId | undefined,
-                  });
+                  handleLink(
+                    sourceControlResourceUrl(
+                      repositoryConnection,
+                      repositoryOwner,
+                      repositoryName,
+                      'pulls',
+                    ) ?? '',
+                    {
+                      workspaceId: workspaceId as WorkspaceId | undefined,
+                    },
+                  );
                 }}
                 class="underline underline-offset-2 decoration-muted-foreground/20 cursor-pointer"
                 >{repositoryOwner}/{repositoryName}</Button

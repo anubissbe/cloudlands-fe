@@ -317,6 +317,7 @@
             <div class="size-6 shrink-0">
               {#if repo.owner}
                 <GitHubAvatar
+                  provider="unknown"
                   identity={repo.owner}
                   alt={repo.owner}
                   size={24}
