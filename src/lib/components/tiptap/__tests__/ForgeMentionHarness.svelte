@@ -4,7 +4,7 @@
   import StarterKit from '@tiptap/starter-kit';
   import { ContextMention } from '../ContextMention';
   import GitHubAvatar from '$lib/components/ui/GitHubAvatar.svelte';
-  import { installForgeMentionFixture } from './forge-mention.fixture';
+  import { installForgeMentionFixture } from '../../../../test/ct-forge-mention-fixture';
   import '$lib/styles/tiptap-editor.css';
 
   let { theme = 'dark' }: { theme?: 'dark' | 'light' } = $props();

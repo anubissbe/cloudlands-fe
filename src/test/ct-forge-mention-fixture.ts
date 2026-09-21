@@ -1,5 +1,5 @@
 import { registerMockIpcHandler, unregisterMockIpcHandler } from '$shared/ipc-mock-router';
-import { installMockElectronBridge } from '../../../../test/ct-mock-electron-bridge';
+import { installMockElectronBridge } from './ct-mock-electron-bridge';
 
 export function installForgeMentionFixture(onOpen: (url: string) => void): () => void {
   const previous = window.electronAPI;
