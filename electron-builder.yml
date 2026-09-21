@@ -119,6 +119,7 @@ mac:
     # macOS 26 uses the native Assets.car icon. Older versions use icon.icns.
     CFBundleIconName: Intent
     CFBundleIconFile: icon.icns
+    NSLocalNetworkUsageDescription: Intent connects to local Intent daemons and self-hosted Git servers on your network.
     NSMicrophoneUsageDescription: Intent uses the microphone to transcribe your voice into text for dictation.
     # Speech recognition usage string for the OS dictation engine (local
     # Speech.framework transcription via the bundled speech helper).
